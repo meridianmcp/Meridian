@@ -5601,7 +5601,7 @@ def test_update_task_accepts_in_progress(client):
 
 def test_dashboard_static_js_served(client):
     """GET /static/dashboard.js returns the dashboard JS."""
-    r = client.get("/static/dashboard.js")
+    r = client.get("/static/dashboard.ts")
     assert r.status_code == 200
     assert "javascript" in r.headers.get("content-type", "").lower() or len(r.content) > 100
 
@@ -5751,8 +5751,8 @@ def test_timeline_tasks_newest_first(client):
 def test_work_queue_vtab_in_dashboard(client):
     """Dashboard JS restores the 4-group sprint queue with paged done items."""
     js = dashboard_source()
-    js_sprint = client.get("/static/dashboard-sprint.js").text
-    js_utils = client.get("/static/dashboard-utils.js").text
+    js_sprint = client.get("/static/dashboard-sprint.ts").text
+    js_utils = client.get("/static/dashboard-utils.ts").text
     assert 'data-vtab="queue"' in js, (
         "v1.4.0: queue vtab button missing from buildTabBody"
     )
@@ -6279,10 +6279,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_session_note_kind",
         "_migrate_pg_handoffs_table",
         "_migrate_pg_decision_assumption",
+        "_migrate_pg_github_connections",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 67
+    assert len(allnames) == len(set(allnames)) == 68
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -6875,7 +6876,7 @@ def test_session_notes_rest_endpoint(client):
 
 def test_dashboard_js_handles_future_status_in_render_queue(client):
     """dashboard-sprint.js renderQueue segments future tasks into a Future section."""
-    js = client.get("/static/dashboard-sprint.js").text
+    js = client.get("/static/dashboard-sprint.ts").text
     assert "future" in js.lower(), "renderQueue must handle future status"
     assert "'future'" in js or '"future"' in js, "future filter must be present"
 
@@ -7752,7 +7753,7 @@ def test_landing_page_has_solution_dashboard_shot(client):
     """G6.27 — landing page shows the real dashboard screenshot, not a mockup."""
     r = client.get("/")
     assert r.status_code == 200
-    assert "/static/dashboard-hero-screenshot.png" in r.text
+    assert "/static/dashboard-queue.png" in r.text
     assert "solution-shot" in r.text
 
 
@@ -12479,7 +12480,7 @@ def test_generate_handoff_accepts_commit_messages(db, tmp_path):
 
 def test_dashboard_js_has_reconcile_button():
     """dashboard.js contains the reconcile button and runReconcile function."""
-    js_path = Path(__file__).parent.parent / "meridian" / "static" / "dashboard.js"
+    js_path = Path(__file__).parent.parent / "meridian" / "static" / "dashboard.ts"
     src = js_path.read_text(encoding="utf-8")
     assert "queue-reconcile-" in src
     assert "runReconcile" in src
@@ -14534,3 +14535,247 @@ async def test_thinking_mcp_roundtrip(db, tmp_path):
     )
     assert len(fetched) == 1
     assert fetched[0]["note_kind"] == "thinking"
+
+
+# ---------------------------------------------------------------------------
+# 26c38b8e — HOTFIX: claude.ai MCP session broken
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_log_task_unknown_session_raises_clean_error(db, tmp_path):
+    """log_task with a bogus session_id raises a human-readable ValueError."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    p = await db_module.create_project(db, "hotfix-logtask")
+    with pytest.raises(ValueError, match="start_session first"):
+        await _dispatch_mcp_tool(
+            "log_task",
+            {
+                "session_id": "00000000-0000-0000-0000-000000000000",
+                "project_id": p["id"],
+                "description": "should fail",
+            },
+            db, str(tmp_path), tenant=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_active_repo_no_tunnel_raises_actionable_error(db, tmp_path, monkeypatch):
+    """set_active_repo raises a descriptive error when no tunnel is connected."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    from meridian.routes import tunnel as tunnel_mod
+
+    async def _not_connected(tenant_id: str, repo_path: str):
+        return {"status": "not_connected", "message": "no active extract tunnel"}
+
+    monkeypatch.setattr(tunnel_mod, "send_active_repo_control", _not_connected)
+
+    fake_tenant = {"id": "tenant-test-01"}
+    with pytest.raises(ValueError, match="tunnel not connected"):
+        await _dispatch_mcp_tool(
+            "set_active_repo",
+            {"repo_path": "/home/user/repo"},
+            db, str(tmp_path), tenant=fake_tenant,
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_active_repo_also_expands_fs_roots(db, tmp_path, monkeypatch):
+    """set_active_repo calls send_add_fs_roots_control to unlock the FS connector."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    from meridian.routes import tunnel as tunnel_mod
+
+    async def _ok_extract(tenant_id: str, repo_path: str):
+        return {"status": "ok", "repo_path": repo_path}
+
+    fs_roots_calls: list[list[str]] = []
+
+    async def _capture_fs(tenant_id: str, roots: list[str]):
+        fs_roots_calls.append(roots)
+        return {"status": "ok", "roots": roots}
+
+    monkeypatch.setattr(tunnel_mod, "send_active_repo_control", _ok_extract)
+    monkeypatch.setattr(tunnel_mod, "send_add_fs_roots_control", _capture_fs)
+
+    fake_tenant = {"id": "tenant-test-02"}
+    result = await _dispatch_mcp_tool(
+        "set_active_repo",
+        {"repo_path": "/home/user/myrepo"},
+        db, str(tmp_path), tenant=fake_tenant,
+    )
+    assert result["status"] == "ok"
+    assert fs_roots_calls == [["/home/user/myrepo"]]
+
+
+# ---------------------------------------------------------------------------
+# 0b061f45 — Multi-account GitHub OAuth DB layer
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_github_connections_add_and_list(db):
+    """add_github_connection upserts; get_github_connections returns list."""
+    await db_module.add_github_connection(db, "tenant-a", "acme-bot", "token-xyz", "repo")
+    conns = await db_module.get_github_connections(db, "tenant-a")
+    assert len(conns) == 1
+    assert conns[0]["account_login"] == "acme-bot"
+    # tokens are NOT returned
+    assert "token" not in conns[0]
+
+
+@pytest.mark.asyncio
+async def test_github_connections_upsert_replaces_token(db):
+    """Adding the same account twice updates the token (upsert)."""
+    await db_module.add_github_connection(db, "tenant-b", "user1", "old-token")
+    await db_module.add_github_connection(db, "tenant-b", "user1", "new-token")
+    conns = await db_module.get_github_connections(db, "tenant-b")
+    assert len(conns) == 1  # not duplicated
+
+
+@pytest.mark.asyncio
+async def test_github_connections_remove(db):
+    """remove_github_connection deletes the row."""
+    await db_module.add_github_connection(db, "tenant-c", "bob", "tok")
+    await db_module.remove_github_connection(db, "tenant-c", "bob")
+    conns = await db_module.get_github_connections(db, "tenant-c")
+    assert conns == []
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_for_project_pinned(db):
+    """get_github_token_for_project returns pinned account token when set."""
+    p = await db_module.create_project(db, "gh-pin-test")
+    await db_module.add_github_connection(db, "t1", "alice", "alice-tok")
+    await db_module.add_github_connection(db, "t1", "bob", "bob-tok")
+    await db_module.update_project_settings(db, p["id"], github_account_login="alice")
+    token, login = await db_module.get_github_token_for_project(db, "t1", p["id"])
+    assert login == "alice"
+    assert token == "alice-tok"  # decrypted
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_for_project_fallback_first(db):
+    """Falls back to first connected account when no project pin is set."""
+    p = await db_module.create_project(db, "gh-fallback-test")
+    await db_module.add_github_connection(db, "t2", "first-user", "first-tok")
+    token, login = await db_module.get_github_token_for_project(db, "t2", p["id"])
+    assert login == "first-user"
+    assert token == "first-tok"
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_for_project_none_when_no_connections(db):
+    """Returns (None, None) when no connections exist."""
+    p = await db_module.create_project(db, "gh-empty-test")
+    token, login = await db_module.get_github_token_for_project(db, "t3-nobody", p["id"])
+    assert token is None
+    assert login is None
+
+
+# ---------------------------------------------------------------------------
+# f5f2a89d — Cross-entity backlinks + code prospects UI
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_note_and_decision_are_valid_resource_types(db):
+    """'note' and 'decision' are now valid touches_resources prefixes."""
+    rtype, value = db_module.parse_resource_identifier("note:my-design-doc")
+    assert rtype == "note"
+    assert value == "my-design-doc"
+    rtype2, value2 = db_module.parse_resource_identifier("decision:abc123")
+    assert rtype2 == "decision"
+    assert value2 == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_parse_note_backlinks_extracts_slugs(db):
+    """parse_note_backlinks returns all [[slug]] matches from a body."""
+    body = "See [[auth-design]] and [[deploy-plan]] for context."
+    slugs = db_module.parse_note_backlinks(body)
+    assert slugs == ["auth-design", "deploy-plan"]
+
+
+@pytest.mark.asyncio
+async def test_parse_note_backlinks_empty(db):
+    """parse_note_backlinks returns [] for bodies with no [[...]] links."""
+    assert db_module.parse_note_backlinks("No backlinks here.") == []
+    assert db_module.parse_note_backlinks("") == []
+
+
+@pytest.mark.asyncio
+async def test_get_notes_backlinked_to(db):
+    """get_notes_backlinked_to returns notes whose body contains [[slug]]."""
+    p = await db_module.create_project(db, "backlink-proj")
+    await db_module.add_project_note(db, p["id"], "Auth Design", "See [[deploy-plan]] for infra")
+    await db_module.add_project_note(db, p["id"], "Deploy Plan", "Our deploy plan details")
+    await db_module.add_project_note(db, p["id"], "Other Note", "no links here")
+    refs = await db_module.get_notes_backlinked_to(db, p["id"], "deploy-plan")
+    assert len(refs) == 1
+    assert refs[0]["title"] == "Auth Design"
+
+
+@pytest.mark.asyncio
+async def test_get_project_note_by_slug_includes_referenced_by(db):
+    """get_project_note_by_slug includes a referenced_by list."""
+    p = await db_module.create_project(db, "ref-by-proj")
+    note_a = await db_module.add_project_note(db, p["id"], "Note A", "See [[note-b]] for details")
+    note_b = await db_module.add_project_note(db, p["id"], "Note B", "Original content")
+    result = await db_module.get_project_note_by_slug(db, p["id"], note_b["slug"])
+    assert result is not None
+    assert "referenced_by" in result
+    assert any(r["id"] == note_a["id"] for r in result["referenced_by"])
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_for_resource(db):
+    """get_sprint_items_for_resource finds items by touches_resources."""
+    p = await db_module.create_project(db, "res-lookup-proj")
+    it = await db_module.add_sprint_item(db, p["id"], "v1", "Do the DB work",
+                                          touches_resources=["file:meridian/db/__init__.py",
+                                                             "note:auth-design"])
+    await db_module.add_sprint_item(db, p["id"], "v1", "Unrelated task")
+    results = await db_module.get_sprint_items_for_resource(
+        db, p["id"], "file:meridian/db/__init__.py"
+    )
+    assert len(results) == 1
+    assert results[0]["id"] == it["id"]
+    # note: prefix also works
+    results2 = await db_module.get_sprint_items_for_resource(db, p["id"], "note:auth-design")
+    assert len(results2) == 1
+
+
+def test_sprint_items_for_resource_endpoint(client):
+    """GET /projects/{id}/resources/sprint-items?resource=... returns matches."""
+    r = client.post("/projects", json={"name": "res-ep-proj"})
+    assert r.status_code == 201
+    pid = r.json()["id"]
+    client.post(f"/projects/{pid}/sprint-items", json={
+        "version": "v1",
+        "title": "Work on auth",
+        "touches_resources": ["note:auth-design", "file:meridian/server.py"],
+    })
+    r = client.get(f"/projects/{pid}/resources/sprint-items?resource=note:auth-design")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 1
+    assert "auth" in data[0]["title"]
+
+
+def test_sprint_items_for_resource_invalid_type_returns_422(client):
+    """GET /projects/{id}/resources/sprint-items with unknown type → 422."""
+    r = client.post("/projects", json={"name": "res-422-proj"})
+    pid = r.json()["id"]
+    r = client.get(f"/projects/{pid}/resources/sprint-items?resource=badtype:foo")
+    assert r.status_code == 422
+
+
+def test_patch_sprint_item_touches_resources(client):
+    """PATCH sprint item with touches_resources updates the field."""
+    r = client.post("/projects", json={"name": "res-patch-proj"})
+    pid = r.json()["id"]
+    it = client.post(f"/projects/{pid}/sprint-items", json={"version": "v1", "title": "Patch me"}).json()
+    r = client.patch(f"/projects/{pid}/sprint-items/{it['id']}",
+                     json={"touches_resources": ["note:my-note", "decision:d1"]})
+    assert r.status_code == 200
+    data = r.json()
+    resources = json.loads(data["touches_resources"] or "[]")
+    assert "note:my-note" in resources
+    assert "decision:d1" in resources

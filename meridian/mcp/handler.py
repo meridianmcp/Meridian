@@ -1348,6 +1348,15 @@ async def _handle_task_tools(
     """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
+        _log_sid = args.get("session_id", "")
+        async with db.execute(
+            "SELECT id FROM sessions WHERE id = ?", (_log_sid,)
+        ) as _cur:
+            if not await _cur.fetchone():
+                raise ValueError(
+                    "session not found — call start_session first to register "
+                    "your session before calling log_task"
+                )
         task = await db_module.log_task(
             db, args["session_id"], args["project_id"],
             args["description"], args.get("status", "done"),
@@ -3296,6 +3305,18 @@ async def _handle_tunnel_tools(
         tenant_id = tenant.get("id", "")
         from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
         result = await _tunnel_mod.send_active_repo_control(tenant_id, repo_path)
+        if result.get("status") == "not_connected":
+            raise ValueError(
+                "tunnel not connected — run `meridian --tunnel` in your terminal "
+                "to start the tunnel, then retry"
+            )
+        if result.get("status") == "error":
+            raise ValueError(
+                f"tunnel error while switching repo: {result.get('message', 'unknown error')}"
+            )
+        # Also expand the FS connector's allowed roots so filesystem tools can
+        # access the new repo path without requiring --repo to be set at startup.
+        await _tunnel_mod.send_add_fs_roots_control(tenant_id, [repo_path])
         return result
     return _MISS
 

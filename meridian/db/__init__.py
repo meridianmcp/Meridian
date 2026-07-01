@@ -829,6 +829,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_session_note_kind(db)
     await _migrate_handoffs_table(db)
     await _migrate_decision_assumption(db)
+    await _migrate_github_connections(db)
     return db
 
 
@@ -1050,6 +1051,7 @@ async def update_project_settings(
     execution_mode: str | None = None,
     github_repo: str | None = _UNSET,
     github_branch: str | None = _UNSET,
+    github_account_login: str | None = _UNSET,
 ) -> dict[str, Any] | None:
     """Persist project settings and return the updated values."""
     project = await get_project(db, project_id)
@@ -1086,6 +1088,9 @@ async def update_project_settings(
     if github_branch is not _UNSET:
         updates.append("github_branch = ?")
         params.append(github_branch or None)
+    if github_account_login is not _UNSET:
+        updates.append("github_account_login = ?")
+        params.append(github_account_login or None)
     if updates:
         params.append(project_id)
         await db.execute(
@@ -1105,6 +1110,93 @@ async def get_executor_config(
         raise ValueError(f"unknown project: {project_id}")
     cfg = settings.get("executor_config") or {}
     return cfg if isinstance(cfg, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# 0b061f45 — Multi-account GitHub OAuth
+# ---------------------------------------------------------------------------
+
+async def add_github_connection(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    account_login: str,
+    token: str,
+    scope: str | None = None,
+) -> dict[str, Any]:
+    """Upsert a GitHub account connection for a tenant (encrypted token)."""
+    conn_id = _new_id()
+    await db.execute(
+        "INSERT INTO github_connections (id, tenant_id, account_login, token, scope) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(tenant_id, account_login) DO UPDATE "
+        "SET token = excluded.token, scope = excluded.scope",
+        (conn_id, tenant_id, account_login, encrypt_field(token), scope),
+    )
+    await db.commit()
+    return {"tenant_id": tenant_id, "account_login": account_login, "scope": scope}
+
+
+async def get_github_connections(
+    db: aiosqlite.Connection, tenant_id: str
+) -> list[dict[str, Any]]:
+    """List all connected GitHub accounts for a tenant (tokens are not returned)."""
+    async with db.execute(
+        "SELECT id, account_login, scope, connected_at FROM github_connections "
+        "WHERE tenant_id = ? ORDER BY connected_at",
+        (tenant_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+async def remove_github_connection(
+    db: aiosqlite.Connection, tenant_id: str, account_login: str
+) -> None:
+    """Remove a GitHub account connection."""
+    await db.execute(
+        "DELETE FROM github_connections WHERE tenant_id = ? AND account_login = ?",
+        (tenant_id, account_login),
+    )
+    await db.commit()
+
+
+async def get_github_token_for_project(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    project_id: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve the GitHub token for a project. Returns (token, account_login).
+
+    Resolution order:
+    1. Project's pinned github_account_login → that account's token.
+    2. First connected account in github_connections (ordered by connected_at).
+    3. Returns (None, None) — callers fall back to tenants.github_pat legacy.
+    """
+    if project_id:
+        project = await get_project(db, project_id)
+        pinned_login = (project or {}).get("github_account_login") or ""
+        if pinned_login:
+            async with db.execute(
+                "SELECT token FROM github_connections "
+                "WHERE tenant_id = ? AND account_login = ?",
+                (tenant_id, pinned_login),
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                r = _row_to_dict(row)
+                return (decrypt_field(r.get("token")), pinned_login)
+
+    async with db.execute(
+        "SELECT account_login, token FROM github_connections "
+        "WHERE tenant_id = ? ORDER BY connected_at LIMIT 1",
+        (tenant_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row:
+        r = _row_to_dict(row)
+        return (decrypt_field(r.get("token")), r.get("account_login"))
+
+    return (None, None)
 
 
 async def set_executor_config(
@@ -5670,6 +5762,8 @@ RESOURCE_TYPES = (
     "route",      # route:POST:/projects
     "pypi",       # pypi:publish
     "github",     # github:tag
+    "note",       # note:<slug>  — project note
+    "decision",   # decision:<id>  — pinned decision
 )
 
 
@@ -5858,6 +5952,51 @@ def serialize_touches_resources(raw: Any) -> str | None:
             seen.add(norm)
             normalized.append(marker + norm)
     return json.dumps(normalized) if normalized else None
+
+
+# f5f2a89d — [[slug]] backlink parsing for notes/decisions
+_BACKLINK_RE = re.compile(r'\[\[([^\]]+)\]\]')
+
+
+def parse_note_backlinks(body: str) -> list[str]:
+    """Extract [[slug]] references from a note or decision body."""
+    return _BACKLINK_RE.findall(body or "")
+
+
+async def get_notes_backlinked_to(
+    db: aiosqlite.Connection, project_id: str, slug: str
+) -> list[dict[str, Any]]:
+    """Return lightweight records for notes whose body references [[slug]]."""
+    pattern = f"%[[{slug}]]%"
+    async with db.execute(
+        "SELECT id, slug, title FROM project_notes "
+        "WHERE project_id = ? AND body LIKE ?",
+        (project_id, pattern),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [{"id": r[0], "slug": r[1], "title": r[2]} for r in (rows or [])]
+
+
+async def get_sprint_items_for_resource(
+    db: aiosqlite.Connection, project_id: str, resource_id: str
+) -> list[dict[str, Any]]:
+    """Return sprint items whose touches_resources includes resource_id.
+
+    f5f2a89d — reverse lookup used by the dashboard chip popover.
+    Candidates are pre-filtered with LIKE, then confirmed with parse_touches_resources
+    so inferred: markers and case don't produce false positives.
+    """
+    pattern = f"%{resource_id}%"
+    async with db.execute(
+        "SELECT * FROM sprint_items WHERE project_id = ? AND touches_resources LIKE ?",
+        (project_id, pattern),
+    ) as cur:
+        rows = await cur.fetchall()
+    items = [_row_to_dict(r) for r in (rows or []) if r]
+    return [
+        it for it in items
+        if resource_id in parse_touches_resources(it.get("touches_resources"))
+    ]
 
 
 async def expire_resource_locks(db: aiosqlite.Connection) -> int:
@@ -7823,13 +7962,19 @@ async def get_project_note_by_slug(
 
     Backs the ``read_note(slug)`` MCP tool — the pull half of the list→read
     model. Returns None when no note with that slug exists in the project.
+
+    f5f2a89d — includes ``referenced_by``: lightweight list of notes whose body
+    contains ``[[slug]]`` linking back to this note.
     """
     async with db.execute(
         "SELECT * FROM project_notes WHERE project_id = ? AND slug = ?",
         (project_id, slug),
     ) as cur:
         row = await cur.fetchone()
-    return _row_to_dict(row)
+    note = _row_to_dict(row)
+    if note is not None:
+        note["referenced_by"] = await get_notes_backlinked_to(db, project_id, slug)
+    return note
 
 
 async def update_project_note(

@@ -35,9 +35,15 @@ async def github_connect(project_id: str, request: Request) -> dict[str, Any]:
     branch = (body.get("branch") or "main").strip()
     if not repo or "/" not in repo:
         raise HTTPException(status_code=422, detail="repo must be owner/repo format")
-    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+    tenant_db = request.app.state.db
+    fresh = await db_module.get_tenant_by_id(tenant_db, tenant["id"])
+    # Resolve: new PAT > first github_connection token > legacy tenant.github_pat
+    db = await _db(request)
+    conn_token, _conn_login = await db_module.get_github_token_for_project(
+        db, tenant["id"], project_id
+    )
     stored_pat = db_module.decrypt_field((fresh or {}).get("github_pat"))
-    validate_pat = pat or stored_pat or ""
+    validate_pat = pat or conn_token or stored_pat or ""
     github_user = ""
     avatar_url = ""
     repos: list[dict[str, Any]] = []
@@ -61,16 +67,18 @@ async def github_connect(project_id: str, request: Request) -> dict[str, Any]:
     except RuntimeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    if pat:
+    if pat and github_user:
+        # Save to multi-account connections table and legacy field for back-compat.
+        await db_module.add_github_connection(db, tenant["id"], github_user, pat)
         await db_module.update_tenant(
-            request.app.state.db, tenant["id"],
+            tenant_db, tenant["id"],
             github_pat=db_module.encrypt_field(pat),
         )
-    db = await _db(request)
     await db_module.update_project_settings(
         db, project_id,
         github_repo=repo,
         github_branch=branch,
+        github_account_login=github_user or None,
     )
     return {
         "connected": True,
@@ -96,8 +104,14 @@ async def github_status(project_id: str, request: Request) -> dict[str, Any]:
         if not fresh:
             return {"connected": False, "pat_linked": False, "repo": "", "branch": "main",
                     "github_user": "", "avatar_url": "", "repos": [], "last_verified": None}
-        token = db_module.decrypt_field(fresh.get("github_pat"))
-        project = await db_module.get_project(await _db(request), project_id)
+        db = await _db(request)
+        # Multi-account: resolve token for this project.
+        conn_token, conn_login = await db_module.get_github_token_for_project(
+            db, tenant["id"], project_id
+        )
+        legacy_token = db_module.decrypt_field(fresh.get("github_pat"))
+        token = conn_token or legacy_token
+        project = await db_module.get_project(db, project_id)
         selected_repo = (project or {}).get("github_repo") or ""
         selected_branch = (project or {}).get("github_branch") or "main"
         snapshot: dict[str, Any] | None = None
@@ -109,19 +123,22 @@ async def github_status(project_id: str, request: Request) -> dict[str, Any]:
         repos = (snapshot or {}).get("repos") or []
         if selected_repo and repos and not any(r.get("full_name") == selected_repo for r in repos):
             repos = [{"full_name": selected_repo, "name": selected_repo.split("/")[-1], "owner": selected_repo.split("/")[0] if "/" in selected_repo else "", "html_url": "", "default_branch": selected_branch, "private": False, "updated_at": ""}] + repos
+        connections = await db_module.get_github_connections(db, tenant["id"])
         return {
             "connected": bool(token and selected_repo),
             "pat_linked": bool(token),
             "repo": selected_repo,
             "branch": selected_branch,
-            "github_user": (snapshot or {}).get("login", ""),
+            "github_user": conn_login or (snapshot or {}).get("login", ""),
             "avatar_url": (snapshot or {}).get("avatar_url", ""),
             "repos": repos,
+            "connections": connections,
             "last_verified": None,
         }
     except Exception:
         return {"connected": False, "pat_linked": False, "repo": "", "branch": "main",
-                "github_user": "", "avatar_url": "", "repos": [], "last_verified": None}
+                "github_user": "", "avatar_url": "", "repos": [], "connections": [],
+                "last_verified": None}
 
 
 @router.get("/projects/{project_id}/repo-image")
@@ -143,9 +160,13 @@ async def repo_image_proxy(project_id: str, request: Request, path: str = ""):
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         raise HTTPException(401, "not authenticated")
+    db = await _db(request)
+    conn_token, _conn_login = await db_module.get_github_token_for_project(
+        db, tenant["id"], project_id
+    )
     fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    pat = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
-    project = await db_module.get_project(await _db(request), project_id)
+    pat = conn_token or (db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None)
+    project = await db_module.get_project(db, project_id)
     repo = (project or {}).get("github_repo") or ""
     branch = (project or {}).get("github_branch") or "main"
     if not repo or not pat:
@@ -193,14 +214,16 @@ async def push_mcp_template(project_id: str, request: Request) -> dict[str, Any]
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
 
+    db = await _db(request)
+    conn_token, _conn_login = await db_module.get_github_token_for_project(
+        db, tenant["id"], project_id
+    )
     fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    project = await db_module.get_project(await _db(request), project_id)
-    pat = (fresh or {}).get("github_pat")
+    token = conn_token or db_module.decrypt_field((fresh or {}).get("github_pat"))
+    project = await db_module.get_project(db, project_id)
     repo = (project or {}).get("github_repo")
-    if not pat or not repo:
+    if not repo:
         raise HTTPException(status_code=400, detail="No GitHub repo connected. Connect one in Settings first.")
-
-    token = db_module.decrypt_field(pat)
     if not token:
         raise HTTPException(status_code=400, detail="GitHub token could not be decrypted. Reconnect your repo.")
 
@@ -280,8 +303,12 @@ async def github_repos(project_id: str, request: Request) -> dict[str, Any]:
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
+    db = await _db(request)
+    conn_token, _conn_login = await db_module.get_github_token_for_project(
+        db, tenant["id"], project_id
+    )
     fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    token = db_module.decrypt_field((fresh or {}).get("github_pat"))
+    token = conn_token or db_module.decrypt_field((fresh or {}).get("github_pat"))
     if not token:
         return {"connected": False, "repos": [], "synced_at": None}
     force = request.query_params.get("refresh") in ("1", "true", "yes")
@@ -320,11 +347,15 @@ async def github_branches(project_id: str, request: Request) -> dict[str, Any]:
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
+    db = await _db(request)
+    conn_token, _conn_login = await db_module.get_github_token_for_project(
+        db, tenant["id"], project_id
+    )
     fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    project = await db_module.get_project(await _db(request), project_id)
+    project = await db_module.get_project(db, project_id)
     repo = (request.query_params.get("repo") or (project or {}).get("github_repo") or "").strip()
     default_branch = (project or {}).get("github_branch") or "main"
-    token = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
+    token = conn_token or (db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None)
     branches: list[str] = []
     source = "fallback"
     if token and repo and "/" in repo:
@@ -341,3 +372,48 @@ async def github_branches(project_id: str, request: Request) -> dict[str, Any]:
                 seen.add(b)
                 branches.append(b)
     return {"repo": repo, "branches": branches, "default_branch": default_branch, "source": source}
+
+
+# ---------------------------------------------------------------------------
+# 0b061f45 — Multi-account GitHub OAuth management routes
+# ---------------------------------------------------------------------------
+
+@router.get("/github/connections")
+async def list_github_connections(request: Request) -> dict[str, Any]:
+    """List all connected GitHub accounts for the current tenant."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    db = await _db(request)
+    connections = await db_module.get_github_connections(db, tenant["id"])
+    return {"connections": connections}
+
+
+@router.delete("/github/connections/{account_login}", status_code=200)
+async def remove_github_connection(account_login: str, request: Request) -> dict[str, Any]:
+    """Remove a connected GitHub account."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    db = await _db(request)
+    await db_module.remove_github_connection(db, tenant["id"], account_login)
+    return {"removed": True, "account_login": account_login}
+
+
+@router.patch("/projects/{project_id}/github/account")
+async def set_project_github_account(project_id: str, request: Request) -> dict[str, Any]:
+    """Pin a specific GitHub account to a project (or clear the pin)."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    body = await request.json()
+    account_login = (body.get("account_login") or "").strip() or None
+    db = await _db(request)
+    await db_module.update_project_settings(db, project_id, github_account_login=account_login)
+    return {"project_id": project_id, "github_account_login": account_login}

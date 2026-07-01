@@ -790,3 +790,60 @@ def test_planner_handoff_endpoint_timeout_returns_504(client, monkeypatch):
     )
     r = client.get(f"/projects/{project['id']}/handoff/planner")
     assert r.status_code == 504
+
+
+# ---------------------------------------------------------------------------
+# ddd8b9bf — hitl_auto_answer_mode adapts /goal HITL clause + agent_instructions
+# ---------------------------------------------------------------------------
+
+def test_build_quick_start_goal_hitl_mode_0_says_stop():
+    """Mode 0: /goal ends with 'or if HITL triggered'."""
+    goal = handoff_module._build_quick_start_goal(
+        [{"id": "item-1"}], hitl_auto_answer_mode=0
+    )
+    assert "or if HITL triggered." in goal
+    assert "Do NOT file HITLs" not in goal
+
+
+def test_build_quick_start_goal_hitl_mode_1_says_skip():
+    """Mode 1: /goal says 'Do NOT file HITLs — auto-answer is on'."""
+    goal = handoff_module._build_quick_start_goal(
+        [{"id": "item-1"}], hitl_auto_answer_mode=1
+    )
+    assert "Do NOT file HITLs" in goal
+    assert "or if HITL triggered." not in goal
+
+
+def test_build_quick_start_goal_hitl_mode_2_says_skip():
+    """Mode 2 (aggressive): same skip clause as mode 1."""
+    goal = handoff_module._build_quick_start_goal(
+        [{"id": "item-1"}], hitl_auto_answer_mode=2
+    )
+    assert "Do NOT file HITLs" in goal
+
+
+def test_build_quick_start_goal_empty_items_hitl_mode_adapts():
+    """Empty-items fallback path also adapts the HITL clause."""
+    empty_mode0 = handoff_module._build_quick_start_goal([], hitl_auto_answer_mode=0)
+    assert "or if HITL triggered." in empty_mode0
+    empty_mode2 = handoff_module._build_quick_start_goal([], hitl_auto_answer_mode=2)
+    assert "Do NOT file HITLs" in empty_mode2
+
+
+def test_start_session_agent_instructions_includes_hitl_directive(client):
+    """start_session agent_instructions leads with both execution-mode and HITL directives."""
+    import json as _json
+    project = client.post("/projects", json={"name": "hitl-instr-proj"}).json()
+    pid = project["id"]
+    r = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "start_session",
+                   "arguments": {"project_id": pid, "session_name": "hitl-test"}}
+    })
+    assert r.status_code == 200
+    body = r.json()
+    result_text = body.get("result", {}).get("content", [{}])[0].get("text", "{}")
+    data = _json.loads(result_text)
+    ai = data.get("agent_instructions", "")
+    assert "EXECUTION MODE:" in ai
+    assert "HITL:" in ai

@@ -255,7 +255,7 @@ def test_signout_link_created_unconditionally_for_hosted_users(js, client):
         "appears for free-tier users without waiting on /me."
     )
     # _renderPlanBadge was extracted to dashboard-sprint.js — check it there.
-    js_sprint = client.get("/static/dashboard-sprint.js").text
+    js_sprint = client.get("/static/dashboard-sprint.ts").text
     plan_badge_start = js_sprint.index("function _renderPlanBadge")
     import re as _re
     _next = _re.search(r"\n(?:export )?function ", js_sprint[plan_badge_start + 1:])
@@ -322,7 +322,7 @@ def test_dashboard_sidebar_has_no_translatex(client):
 def test_files_vtab_gated_for_hosted_without_repo(client):
     """1332fe4d — the Files vtab is hidden for hosted users with no GitHub repo
     connected (an empty Files tab is dead weight on the hosted dashboard)."""
-    js = client.get("/static/dashboard.js").text
+    js = client.get("/static/dashboard.ts").text
     assert 'data-vtab="files"' in js, "Files vtab button missing from buildTabBody"
     # Button must be wrapped in a hosted + github-repo guard.
     assert "MERIDIAN_HOSTED && !(project.github_repo" in js, (
@@ -338,7 +338,7 @@ def test_dashboard_live_tab_exists(client):
     tasks) with an add-task input and per-row cancel.  Header buttons:
     [Pause] / [Run All] (stubs).  WebSocket-driven — no setInterval.
     """
-    js = client.get("/static/dashboard.js").text
+    js = client.get("/static/dashboard.ts").text
     css = client.get("/static/dashboard.css").text
     assert 'data-vtab="live"' in js, "LIVE vtab button missing from buildTabBody"
     assert "drawer-live-" in js, "LIVE drawer panel missing"
@@ -373,7 +373,7 @@ def test_dashboard_claude_tab_has_session_controls(client):
     (4) open in claude.ai as a narrow secondary action.  All wireup lives in
     dashboard.js and the markup is generated dynamically per project tab.
     """
-    js = client.get("/static/dashboard.js").text
+    js = client.get("/static/dashboard.ts").text
     html = client.get("/dashboard").text
     # Section 1 — continue session controls
     assert "continue-session-" in js, "continue session dropdown ID missing"
@@ -412,7 +412,7 @@ def test_dashboard_claude_tab_has_session_controls(client):
 
 
 def test_dashboard_settings_has_os_detection_banner(client):
-    js = client.get("/static/dashboard.js").text
+    js = client.get("/static/dashboard.ts").text
     # OS hint lives inside the Meridian Connect tab only (osExecutorHintBanner),
     # not duplicated at the top of settings. The old standalone
     # detectHookInstallOS helper + settings-top banner were removed; the Connect
@@ -479,10 +479,10 @@ def test_dashboard_constants_in_utils(client):
     """
     from pathlib import Path
     utils_src = (
-        Path(__file__).parent.parent / "meridian" / "static" / "dashboard-utils.js"
+        Path(__file__).parent.parent / "meridian" / "static" / "dashboard-utils.ts"
     ).read_text(encoding="utf-8")
     dashboard_src = (
-        Path(__file__).parent.parent / "meridian" / "static" / "dashboard.js"
+        Path(__file__).parent.parent / "meridian" / "static" / "dashboard.ts"
     ).read_text(encoding="utf-8")
 
     assert "DEFAULT_CONTEXT_THRESHOLD" in utils_src, (
@@ -515,8 +515,8 @@ def test_settings_tab_renderer_is_not_duplicated():
     from pathlib import Path
 
     static = Path(__file__).parent.parent / "meridian" / "static"
-    dashboard_src = (static / "dashboard.js").read_text(encoding="utf-8")
-    settings_src = (static / "dashboard-settings.js").read_text(encoding="utf-8")
+    dashboard_src = (static / "dashboard.ts").read_text(encoding="utf-8")
+    settings_src = (static / "dashboard-settings.ts").read_text(encoding="utf-8")
 
     # The full settings renderer is defined once, in the module.
     assert re.search(r"function loadSettingsTab\s*\(", settings_src), (

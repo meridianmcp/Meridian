@@ -958,7 +958,7 @@ def test_feedback_submit_persists_and_validates(monkeypatch, tmp_path):
 def test_dashboard_js_has_feedback_button():
     """dashboard-demo.js wires the sidebar Send-feedback button + modal."""
     import pathlib
-    js = pathlib.Path("meridian/static/dashboard-demo.js").read_text(encoding="utf-8")
+    js = pathlib.Path("meridian/static/dashboard-demo.ts").read_text(encoding="utf-8")
     assert "ensureFeedbackButton" in js
     assert "showFeedbackModal" in js
     assert "/feedback" in js

@@ -739,6 +739,86 @@ def test_send_active_repo_control_send_error():
 
 
 # ---------------------------------------------------------------------------
+# 4d9ad87b — _tenant_active_repo cache + X-Meridian-Repo-Path injection
+# ---------------------------------------------------------------------------
+
+def test_send_active_repo_control_updates_cache():
+    """send_active_repo_control always updates _tenant_active_repo (even without a WS)."""
+    tn._tenant_active_repo.pop("rpc-tenant", None)
+    tn._tunnel_extract_sockets.pop("rpc-tenant", None)
+    asyncio.run(tn.send_active_repo_control("rpc-tenant", "/cached/repo"))
+    assert tn._tenant_active_repo.get("rpc-tenant") == "/cached/repo"
+
+
+def test_send_active_repo_control_with_ws_updates_cache_and_sends(monkeypatch):
+    """send_active_repo_control with a live WS updates the cache AND sends the control msg."""
+    ws = _FakeExtractWS()
+    tn._tunnel_extract_sockets["rpc-ws-tenant"] = ws
+    tn._tenant_active_repo.pop("rpc-ws-tenant", None)
+    result = asyncio.run(tn.send_active_repo_control("rpc-ws-tenant", "/ws/repo"))
+    assert result["status"] == "ok"
+    assert tn._tenant_active_repo.get("rpc-ws-tenant") == "/ws/repo"
+    assert ws.sent[0]["repo_path"] == "/ws/repo"
+
+
+def test_call_tunnel_tool_injects_repo_path_header(monkeypatch):
+    """call_tunnel_tool injects X-Meridian-Repo-Path from _tenant_active_repo cache."""
+    tn._tunnel_extract_sockets["rph-tenant"] = object()
+    tn._tunnel_tool_routes["rph-tenant"] = {"extractor__find_symbol": "extract"}
+    tn._tenant_active_repo["rph-tenant"] = "/my/active/repo"
+    captured_headers = {}
+
+    async def fake_do_proxy(tenant_id, method, path, query, headers, body, sockets, pending, label):
+        captured_headers.update(headers)
+        return Response(
+            content=json.dumps({"result": {"content": [{"type": "text", "text": "ok"}]}}).encode(),
+            status_code=200, media_type="application/json",
+        )
+
+    monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
+    asyncio.run(tn.call_tunnel_tool("rph-tenant", "extractor__find_symbol", {"name": "foo"}))
+    assert captured_headers.get("x-meridian-repo-path") == "/my/active/repo"
+
+
+def test_call_tunnel_tool_explicit_repo_path_overrides_cache(monkeypatch):
+    """An explicit repo_path arg overrides the cached value."""
+    tn._tunnel_extract_sockets["rph2"] = object()
+    tn._tunnel_tool_routes["rph2"] = {"extractor__find_symbol": "extract"}
+    tn._tenant_active_repo["rph2"] = "/cached/repo"
+    captured_headers = {}
+
+    async def fake_do_proxy(tenant_id, method, path, query, headers, body, sockets, pending, label):
+        captured_headers.update(headers)
+        return Response(
+            content=json.dumps({"result": {"content": []}}).encode(),
+            status_code=200, media_type="application/json",
+        )
+
+    monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
+    asyncio.run(tn.call_tunnel_tool("rph2", "extractor__find_symbol", {}, repo_path="/explicit/repo"))
+    assert captured_headers.get("x-meridian-repo-path") == "/explicit/repo"
+
+
+def test_call_tunnel_tool_no_repo_path_no_header(monkeypatch):
+    """Without a repo_path (no cache, no arg) the header is not injected."""
+    tn._tunnel_extract_sockets["rph3"] = object()
+    tn._tunnel_tool_routes["rph3"] = {"extractor__find_symbol": "extract"}
+    tn._tenant_active_repo.pop("rph3", None)
+    captured_headers = {}
+
+    async def fake_do_proxy(tenant_id, method, path, query, headers, body, sockets, pending, label):
+        captured_headers.update(headers)
+        return Response(
+            content=json.dumps({"result": {"content": []}}).encode(),
+            status_code=200, media_type="application/json",
+        )
+
+    monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
+    asyncio.run(tn.call_tunnel_tool("rph3", "extractor__find_symbol", {}))
+    assert "x-meridian-repo-path" not in captured_headers
+
+
+# ---------------------------------------------------------------------------
 # 9f6aec5f — codebase-context injection for start_session orientation
 # ---------------------------------------------------------------------------
 
