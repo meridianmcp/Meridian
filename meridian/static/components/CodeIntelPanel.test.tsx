@@ -2,7 +2,12 @@
 // One test per view state plus the Generate Map lifecycle and zoom controls.
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/preact";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CodeIntelPanel, buildLayers, mountCodeIntelPanel } from "./CodeIntelPanel";
+import {
+  CodeIntelPanel, buildLayers, mountCodeIntelPanel,
+  buildCytoscapeElements, filterCyElements, mountCytoscapeGraph,
+  CI_EDGE_COLORS, CI_EDGE_TYPES,
+} from "./CodeIntelPanel";
+import type { CiEdgeType } from "./CodeIntelPanel";
 import type { Architecture } from "./types";
 
 afterEach(() => cleanup());
@@ -113,5 +118,88 @@ describe("mountCodeIntelPanel", () => {
     expect(host.textContent).toContain("routes");
     expect(host.textContent).toContain("Package Graph");
     document.body.removeChild(host);
+  });
+});
+
+describe("buildCytoscapeElements (455b7970 compound model)", () => {
+  it("emits a compound layer parent per rank and package children under it", () => {
+    const els = buildCytoscapeElements(ARCH);
+    const layerNodes = els.filter((e) => e.group === "nodes" && e.data.kind === "layer");
+    // One compound parent per distinct layer (2,1,0,other).
+    expect(layerNodes.map((n) => n.data.id).sort()).toEqual(
+      ["layer:0", "layer:1", "layer:2", "layer:other"].sort(),
+    );
+    // Packages are children of their layer parent.
+    const routes = els.find((e) => e.data.id === "pkg:routes");
+    expect(routes?.data.parent).toBe("layer:2");
+    expect(routes?.data.kind).toBe("package");
+  });
+
+  it("emits boundary call edges as typed/colored 'invokes' edges", () => {
+    const els = buildCytoscapeElements(ARCH);
+    const edge = els.find((e) => e.group === "edges");
+    expect(edge?.data.source).toBe("pkg:routes");
+    expect(edge?.data.target).toBe("pkg:db");
+    expect(edge?.data.etype).toBe("invokes");
+    expect(edge?.data.color).toBe(CI_EDGE_COLORS.invokes);
+  });
+
+  it("descends into File/Class/Method children with inherits/imports edges when present", () => {
+    const arch: Architecture = {
+      packages: [{
+        name: "svc", layer: 1,
+        // deeper hierarchy the get_architecture payload will surface later
+        children: [{ name: "a.py", kind: "file", children: [
+          { name: "Base", kind: "class" },
+          { name: "Impl", kind: "class", inherits: ["pkg:svc/a.py/Base"] },
+        ] }],
+      } as any],
+    };
+    const els = buildCytoscapeElements(arch);
+    const impl = els.find((e) => e.data.label === "Impl");
+    expect(impl?.data.parent).toBe("pkg:svc/a.py");
+    const inh = els.find((e) => e.group === "edges" && e.data.etype === "inherits");
+    expect(inh?.data.target).toBe("pkg:svc/a.py/Base");
+  });
+});
+
+describe("filterCyElements + edge-type model", () => {
+  it("declares all four edge types with distinct colors", () => {
+    expect(CI_EDGE_TYPES).toEqual(["contains", "imports", "inherits", "invokes"]);
+    const colors = new Set(CI_EDGE_TYPES.map((t) => CI_EDGE_COLORS[t]));
+    expect(colors.size).toBe(4);
+  });
+
+  it("drops edges of disabled types but keeps every node", () => {
+    const els = buildCytoscapeElements(ARCH);
+    const nodeCount = els.filter((e) => e.group === "nodes").length;
+    const enabled = new Set<CiEdgeType>(["contains"]); // invokes disabled
+    const filtered = filterCyElements(els, enabled);
+    expect(filtered.filter((e) => e.group === "nodes").length).toBe(nodeCount);
+    expect(filtered.some((e) => e.group === "edges" && e.data.etype === "invokes")).toBe(false);
+  });
+});
+
+describe("mountCytoscapeGraph guard", () => {
+  it("returns null when window.cytoscape is unavailable (jsdom/SSR)", () => {
+    const host = document.createElement("div");
+    expect((window as any).cytoscape).toBeUndefined();
+    expect(mountCytoscapeGraph(host, buildCytoscapeElements(ARCH))).toBeNull();
+  });
+
+  it("mounts and passes filtered elements when a cytoscape global is present", () => {
+    const captured: any = {};
+    const fakeCy = (cfg: any) => { captured.cfg = cfg; return { destroy() {} }; };
+    (window as any).cytoscape = fakeCy;
+    try {
+      const enabled = new Set<CiEdgeType>(["contains"]); // invokes filtered out
+      const inst = mountCytoscapeGraph(document.createElement("div"),
+        buildCytoscapeElements(ARCH), { edgeFilter: enabled });
+      expect(inst).not.toBeNull();
+      const edgeEls = captured.cfg.elements.filter((e: any) => e.group === "edges");
+      expect(edgeEls.every((e: any) => e.data.etype !== "invokes")).toBe(true);
+    } finally {
+      delete (window as any).cytoscape;
+    }
   });
 });

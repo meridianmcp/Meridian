@@ -11,7 +11,7 @@
 // host (dashboard.js) fetches architecture over the code MCP tunnel and mounts
 // this with mountCodeIntelPanel().
 import { render } from "preact";
-import { useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import type { Architecture, ArchPackage } from "./types";
 
 export interface CodeIntelPanelProps {
@@ -78,12 +78,165 @@ function labelForRank(arch: Architecture | null | undefined, rank: string): stri
   return rank === "other" ? "unlayered" : `layer ${rank}`;
 }
 
+// ---------------------------------------------------------------------------
+// 455b7970 — Cytoscape.js compound-node model.
+//
+// Containment (Layer ⊃ Package ⊃ File ⊃ Class ⊃ Method) is expressed as the
+// compound *parent* relationship, so it reads as nesting rather than an edge
+// tangle. The four relationship edge types below are colored and independently
+// filterable. `buildCytoscapeElements` degrades to Layer→Package from the
+// package-level get_architecture payload available today, and emits the deeper
+// File/Class/Method levels automatically when a package carries a `children`
+// tree — so the renderer scales without a rewrite once that data is surfaced.
+// ---------------------------------------------------------------------------
+
+export type CiEdgeType = "contains" | "imports" | "inherits" | "invokes";
+
+export const CI_EDGE_TYPES: CiEdgeType[] = ["contains", "imports", "inherits", "invokes"];
+
+export const CI_EDGE_COLORS: Record<CiEdgeType, string> = {
+  contains: "#64748b",
+  imports: "#38bdf8",
+  inherits: "#a78bfa",
+  invokes: "#f59e0b",
+};
+
+/** An optional deeper node (file/class/method) hanging off a package. */
+export interface CiChild {
+  name?: string;
+  kind?: "file" | "class" | "method";
+  children?: CiChild[];
+  imports?: string[];
+  inherits?: string[];
+}
+
+export interface CyElement {
+  group: "nodes" | "edges";
+  data: Record<string, any>;
+}
+
+function _emitChildren(els: CyElement[], parentId: string, children?: CiChild[]): void {
+  if (!Array.isArray(children)) return;
+  for (const c of children) {
+    if (!c || !c.name) continue;
+    const id = `${parentId}/${c.name}`;
+    els.push({ group: "nodes", data: { id, parent: parentId, label: c.name, kind: c.kind || "node" } });
+    for (const imp of c.imports || []) {
+      els.push({ group: "edges", data: { id: `imports:${id}->${imp}`, source: id, target: imp, etype: "imports", color: CI_EDGE_COLORS.imports } });
+    }
+    for (const base of c.inherits || []) {
+      els.push({ group: "edges", data: { id: `inherits:${id}->${base}`, source: id, target: base, etype: "inherits", color: CI_EDGE_COLORS.inherits } });
+    }
+    _emitChildren(els, id, c.children);
+  }
+}
+
+/** Build Cytoscape compound elements (nodes + typed edges) from an Architecture. */
+export function buildCytoscapeElements(arch?: Architecture | null): CyElement[] {
+  const rows = buildLayers(arch);
+  const els: CyElement[] = [];
+  const pkgIds = new Set<string>();
+  for (const layer of rows) {
+    const parentId = `layer:${layer.rank}`;
+    els.push({ group: "nodes", data: { id: parentId, label: layer.label, kind: "layer" } });
+    for (const p of layer.packages) {
+      const pid = `pkg:${p.name}`;
+      pkgIds.add(String(p.name));
+      els.push({
+        group: "nodes",
+        data: { id: pid, parent: parentId, label: p.name, kind: "package", node_count: p.node_count ?? 0 },
+      });
+      _emitChildren(els, pid, (p as ArchPackage & { children?: CiChild[] }).children);
+    }
+  }
+  const boundaries = arch && Array.isArray(arch.boundaries) ? arch.boundaries : [];
+  for (const b of boundaries) {
+    if (!b || !b.from || !b.to) continue;
+    if (!pkgIds.has(String(b.from)) || !pkgIds.has(String(b.to))) continue;
+    els.push({
+      group: "edges",
+      data: {
+        id: `invokes:${b.from}->${b.to}`,
+        source: `pkg:${b.from}`,
+        target: `pkg:${b.to}`,
+        etype: "invokes",
+        weight: b.call_count ?? 1,
+        color: CI_EDGE_COLORS.invokes,
+      },
+    });
+  }
+  return els;
+}
+
+/** Drop edges whose type is not in `enabled` (compound parent nodes are kept). */
+export function filterCyElements(elements: CyElement[], enabled: Set<CiEdgeType>): CyElement[] {
+  return elements.filter((el) =>
+    el.group === "nodes" || enabled.has(el.data.etype as CiEdgeType),
+  );
+}
+
+/**
+ * Mount a Cytoscape compound graph into `container`. Uses the global
+ * `window.cytoscape` (loaded via CDN) + the fcose layout when present. Returns
+ * the cy instance, or null when Cytoscape isn't available (e.g. jsdom / SSR) so
+ * the caller can fall back to the accessible layered DAG. Never throws.
+ */
+export function mountCytoscapeGraph(
+  container: HTMLElement,
+  elements: CyElement[],
+  opts: { edgeFilter?: Set<CiEdgeType> } = {},
+): any | null {
+  const w: any = typeof window !== "undefined" ? window : undefined;
+  const cy = w && w.cytoscape;
+  if (!cy || !container) return null;
+  try {
+    const fcose = w.cytoscapeFcose;
+    if (fcose && !cy.__meridianFcose) {
+      cy.use(fcose);
+      cy.__meridianFcose = true;
+    }
+  } catch { /* fcose optional — fall back to built-in cose */ }
+  const els = opts.edgeFilter ? filterCyElements(elements, opts.edgeFilter) : elements;
+  try {
+    return cy({
+      container,
+      elements: els.map((e) => ({ group: e.group, data: e.data })),
+      style: [
+        { selector: "node", style: { "background-color": "#334155", label: "data(label)", color: "#cbd5e1", "font-size": 8, "text-valign": "center" } },
+        { selector: ":parent", style: { "background-opacity": 0.12, "border-color": "#475569", label: "data(label)", "text-valign": "top" } },
+        { selector: "edge", style: { width: 1, "line-color": "data(color)", "target-arrow-color": "data(color)", "target-arrow-shape": "triangle", "curve-style": "bezier" } },
+      ],
+      layout: { name: w.cytoscapeFcose ? "fcose" : "cose", animate: false },
+    });
+  } catch {
+    return null;
+  }
+}
+
 export function CodeIntelPanel(props: CodeIntelPanelProps) {
   const { status, error, architecture, onGenerateMap } = props;
   const [zoom, setZoom] = useState(1);
   const [mapStatus, setMapStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [mapUrl, setMapUrl] = useState("");
   const [mapError, setMapError] = useState("");
+  // 455b7970 — Cytoscape compound view: per-edge-type filters + a container that
+  // upgrades to the interactive graph when window.cytoscape is present, falling
+  // back to the accessible layered DAG otherwise (jsdom/SSR, or CDN blocked).
+  const [enabled, setEnabled] = useState<Record<CiEdgeType, boolean>>({
+    contains: true, imports: true, inherits: true, invokes: true,
+  });
+  const cyRef = useRef<HTMLDivElement | null>(null);
+  const [cyMounted, setCyMounted] = useState(false);
+  const cyAvailable = typeof window !== "undefined" && !!(window as any).cytoscape;
+
+  useEffect(() => {
+    if (status !== "ready" || !cyRef.current) return;
+    const elements = buildCytoscapeElements(architecture);
+    const edgeFilter = new Set<CiEdgeType>(CI_EDGE_TYPES.filter((t) => enabled[t]));
+    const cy = mountCytoscapeGraph(cyRef.current, elements, { edgeFilter });
+    setCyMounted(!!cy);
+    return () => { try { if (cy) cy.destroy(); } catch { /* noop */ } };
+  }, [status, architecture, enabled]);
 
   if (status === "loading") {
     return (
@@ -163,7 +316,36 @@ export function CodeIntelPanel(props: CodeIntelPanelProps) {
         </div>
       </div>
 
-      {hasGraph ? (
+      {cyAvailable && hasGraph ? (
+        <div class="ci-edge-filters" style={{ display: "flex", gap: "8px", flexWrap: "wrap", margin: "0 0 6px" }}>
+          {CI_EDGE_TYPES.map((t) => (
+            <label
+              key={t}
+              class="ci-edge-filter"
+              style={{ display: "flex", alignItems: "center", gap: "3px", fontSize: "9px", color: CI_EDGE_COLORS[t], fontFamily: "var(--font-mono)" }}
+            >
+              <input type="checkbox" checked={enabled[t]} aria-label={t} onChange={() => setEnabled((e) => ({ ...e, [t]: !e[t] }))} />
+              {t}
+            </label>
+          ))}
+        </div>
+      ) : null}
+
+      {cyAvailable ? (
+        <div
+          class="ci-cy"
+          ref={cyRef}
+          style={{
+            width: "100%",
+            height: hasGraph ? "360px" : "0",
+            background: "var(--surface-1)",
+            border: hasGraph ? "1px solid var(--border)" : "none",
+            borderRadius: "4px",
+          }}
+        />
+      ) : null}
+
+      {hasGraph && (!cyAvailable || !cyMounted) ? (
         <div
           class="ci-dag"
           style={{
@@ -215,11 +397,13 @@ export function CodeIntelPanel(props: CodeIntelPanelProps) {
             ))}
           </div>
         </div>
-      ) : (
+      ) : null}
+
+      {!hasGraph ? (
         <div class="ci-state ci-empty" style={{ ...STATE_STYLE, color: "var(--muted)" }}>
           No package graph yet — index the repo to populate it.
         </div>
-      )}
+      ) : null}
 
       {mapStatus === "ready" && mapUrl ? (
         <div class="ci-map" style={{ marginTop: "8px" }}>

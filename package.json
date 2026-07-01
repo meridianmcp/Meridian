@@ -8,6 +8,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "cytoscape": "^3.30.0",
+    "cytoscape-fcose": "^2.2.0",
     "preact": "^10.24.0",
     "zustand": "^5.0.0"
   },

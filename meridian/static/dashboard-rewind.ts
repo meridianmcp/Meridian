@@ -1,6 +1,9 @@
 // dashboard-rewind.js — rewind/analytics tab extracted from dashboard.js
 // Re-exposes its symbols on window so inline handlers + cross-file references resolve after esbuild IIFE bundling.
 
+// 233bae67 — historical sprint-execution gantt (CSS bars from a pure model).
+import { ganttBars, sprintStatusColor } from "./components/sprintGraph";
+
 export function initRewindTab(projectId: string) {
 
   const p = window.state.panels[projectId];
@@ -419,7 +422,24 @@ export function renderRewindSprint(projectId: string, data: any) {
 
 
 
+  // 233bae67 — execution-timeline gantt across all versions (bars positioned by
+  // claimed_at→completed_at). Pure geometry from ganttBars(); no charting lib.
   let html = '';
+  try {
+    const bars = ganttBars(allItems);
+    if (bars.length) {
+      html += '<div class="rewind-gantt" style="margin:8px 0;padding:8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px">'
+        + `<div style="font-size:10px;color:var(--muted);margin-bottom:6px">⏱ Execution timeline (${bars.length} items)</div>`
+        + bars.map(b =>
+            '<div style="position:relative;height:14px;margin-bottom:2px">'
+            + `<div title="${escapeHtml(b.title)}" style="position:absolute;left:${b.leftPct}%;width:${b.widthPct}%;height:12px;`
+            + `background:${sprintStatusColor(b.status)};border-radius:2px;overflow:hidden;white-space:nowrap;`
+            + `font-size:8px;line-height:12px;color:#0b0e14;padding:0 3px;box-sizing:border-box">${escapeHtml(b.title)}</div>`
+            + '</div>',
+          ).join('')
+        + '</div>';
+    }
+  } catch (e) { /* gantt is best-effort */ }
 
   // Sort versions: current first, then descending
 

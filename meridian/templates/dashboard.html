@@ -14,6 +14,11 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <!-- ECharts for the Timeline swimlane. -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<!-- 455b7970: Cytoscape.js + fcose layout for the Code Intel compound graph and
+     the sprint dependency DAG. Loaded as globals (window.cytoscape) so they stay
+     out of the esbuild bundle; the panels degrade gracefully when absent. -->
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3/dist/cytoscape.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose@2/cytoscape-fcose.js"></script>
 <link rel="stylesheet" href="/static/dashboard.css?v={{ asset_version or version }}">
 </head>
 <body>

@@ -1,6 +1,9 @@
 // dashboard-sprint.js — sprint/queue renderers extracted from dashboard.js
 // Depends on: dashboard-utils.js (escapeHtml, getPanelState, formatRelativeTime, _PLAN_LABELS)
 
+// 233bae67 — sprint dependency DAG (Cytoscape, guarded/CDN-global).
+import { buildSprintDagElements, mountSprintDag } from "./components/sprintGraph";
+
 // c2fe20c3 — history-signal badges for a sprint item so pending items aren't
 // indistinguishable: a stall counter (↻N), a "retried" tag (claimed before, now
 // back to pending), and a live pulse dot for an in-progress (claimed) item. Pure
@@ -730,6 +733,31 @@ export function renderSprintProgress(projectId: string, items: any) {
     () => addSprintItemFromInput(projectId);
 
   wireSprintAddEnter(projectId, root);
+
+  // 233bae67 — collapsible dependency DAG below the board. Lazy-mounts a
+  // Cytoscape graph (depends_on + file-conflict edges, status colors, critical
+  // path) on first open, when window.cytoscape is present. Best-effort: any
+  // failure leaves the board untouched.
+  try {
+    if (Array.isArray(items) && items.length) {
+      const dag = document.createElement('details');
+      dag.className = 'sprint-dag-wrap';
+      dag.style.marginTop = '8px';
+      dag.innerHTML =
+        '<summary style="cursor:pointer;font-size:10px;color:var(--muted)">Dependency graph</summary>' +
+        `<div id="sprint-dag-${escapeHtml(projectId)}" class="sprint-dag" ` +
+        'style="width:100%;height:320px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;margin-top:4px"></div>';
+      root.appendChild(dag);
+      dag.addEventListener('toggle', () => {
+        if (!dag.open) return;
+        const host = dag.querySelector('.sprint-dag') as HTMLElement | null;
+        if (host && !host.dataset.mounted) {
+          const cy = mountSprintDag(host, buildSprintDagElements(items));
+          if (cy) host.dataset.mounted = '1';
+        }
+      });
+    }
+  } catch (e) { /* dependency graph is best-effort */ }
 
 }
 
