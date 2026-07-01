@@ -18,10 +18,22 @@ _STATIC = Path(__file__).parent.parent / "meridian" / "static"
 
 
 def dashboard_source() -> str:
-    """Return dashboard.js + every dashboard-*.js module concatenated (raw)."""
-    parts = [(_STATIC / "dashboard.js").read_text(encoding="utf-8")]
-    for mod in sorted(_STATIC.glob("dashboard-*.js")):
+    """Return dashboard entry + every dashboard-* module concatenated (raw).
+
+    423f5929 — the modules migrated from .js to .ts. We glob both extensions so
+    white-box assertions keep working across the migration, and read whichever
+    entry file exists (dashboard.ts after the migration, dashboard.js before).
+    """
+    entry = _STATIC / "dashboard.ts"
+    if not entry.exists():
+        entry = _STATIC / "dashboard.js"
+    parts = [entry.read_text(encoding="utf-8")]
+    seen = {entry.name}
+    for mod in sorted(_STATIC.glob("dashboard-*.*")):
+        if mod.suffix not in (".js", ".ts") or mod.name in seen:
+            continue
         if mod.name == "dashboard.bundle.js":
             continue
+        seen.add(mod.name)
         parts.append(mod.read_text(encoding="utf-8"))
     return "\n".join(parts)

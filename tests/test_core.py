@@ -5601,7 +5601,7 @@ def test_update_task_accepts_in_progress(client):
 
 def test_dashboard_static_js_served(client):
     """GET /static/dashboard.js returns the dashboard JS."""
-    r = client.get("/static/dashboard.js")
+    r = client.get("/static/dashboard.ts")
     assert r.status_code == 200
     assert "javascript" in r.headers.get("content-type", "").lower() or len(r.content) > 100
 
@@ -5751,8 +5751,8 @@ def test_timeline_tasks_newest_first(client):
 def test_work_queue_vtab_in_dashboard(client):
     """Dashboard JS restores the 4-group sprint queue with paged done items."""
     js = dashboard_source()
-    js_sprint = client.get("/static/dashboard-sprint.js").text
-    js_utils = client.get("/static/dashboard-utils.js").text
+    js_sprint = client.get("/static/dashboard-sprint.ts").text
+    js_utils = client.get("/static/dashboard-utils.ts").text
     assert 'data-vtab="queue"' in js, (
         "v1.4.0: queue vtab button missing from buildTabBody"
     )
@@ -6876,7 +6876,7 @@ def test_session_notes_rest_endpoint(client):
 
 def test_dashboard_js_handles_future_status_in_render_queue(client):
     """dashboard-sprint.js renderQueue segments future tasks into a Future section."""
-    js = client.get("/static/dashboard-sprint.js").text
+    js = client.get("/static/dashboard-sprint.ts").text
     assert "future" in js.lower(), "renderQueue must handle future status"
     assert "'future'" in js or '"future"' in js, "future filter must be present"
 
@@ -12480,7 +12480,7 @@ def test_generate_handoff_accepts_commit_messages(db, tmp_path):
 
 def test_dashboard_js_has_reconcile_button():
     """dashboard.js contains the reconcile button and runReconcile function."""
-    js_path = Path(__file__).parent.parent / "meridian" / "static" / "dashboard.js"
+    js_path = Path(__file__).parent.parent / "meridian" / "static" / "dashboard.ts"
     src = js_path.read_text(encoding="utf-8")
     assert "queue-reconcile-" in src
     assert "runReconcile" in src

@@ -495,7 +495,7 @@ async def test_finalize_session_appends_devlog_and_commits(db, tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 def test_dashboard_js_has_md_section_update_ui(client):
-    js = client.get("/static/dashboard.js").text
+    js = client.get("/static/dashboard.ts").text
     assert "md_section_update" in js
     assert "hitl-approve-btn" in js
     assert "renderDiff" in js

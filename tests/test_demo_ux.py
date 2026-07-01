@@ -130,7 +130,7 @@ def test_config_no_cookie_is_not_demo(client):
 def test_demo_gates_setup_hooks_and_planning_chat(client):
     """Phase 3: in demo mode the Setup Hooks and Planning Chat buttons are
     disabled with a sign-in toast, alongside the other write actions."""
-    js = client.get("/static/dashboard.js").text
+    js = client.get("/static/dashboard.ts").text
     # Both buttons must be present in the demo-disable block (the list that
     # rewires onclick to showDemoReadonlyToast()).
     assert "setupHooksBtn," in js
@@ -140,7 +140,7 @@ def test_demo_gates_setup_hooks_and_planning_chat(client):
 def test_hosted_connection_switch_does_not_restart_server(client):
     """Phase 3: hosted instances must never trigger a full-server restart when
     switching DB connections — that would kill the shared Fly machine."""
-    js = client.get("/static/dashboard.js").text
+    js = client.get("/static/dashboard.ts").text
     assert "applies on next server restart" in js
     # The hosted branch must guard the _doRestart() call in the switcher.
     assert "if (isHostedMode()) {" in js
