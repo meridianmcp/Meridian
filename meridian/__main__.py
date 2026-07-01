@@ -80,6 +80,28 @@ if sys.platform == "win32":
     asyncio.set_event_loop(loop)
 
 
+def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
+    """Return the thread's event loop, creating one if none is set or it's closed.
+
+    Python 3.12 makes ``asyncio.get_event_loop()`` raise ``RuntimeError`` when no
+    loop is set for the current thread (e.g. after another test closed it under
+    pytest-xdist, or on a non-Windows entrypoint where the module-scope loop
+    above never ran). The CLI dispatch drives its own loop via
+    ``run_until_complete``, so it just needs *a* usable loop regardless of
+    ambient state — this keeps that robust without changing Windows behaviour
+    (the module-scope SelectorEventLoop is returned unchanged when present).
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("event loop is closed")
+        return loop
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI dispatch: HTTP server by default, MCP stdio with ``--mcp``."""
     parser = argparse.ArgumentParser(
@@ -159,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
                 _kill_port(_p)
         from .tunnel_client import run_tunnel
 
-        loop = asyncio.get_event_loop()
+        loop = _ensure_event_loop()
         # cbbd0eb4 — --repo is nargs='+': first = active repo, rest = extra fs roots.
         _repo_list = args.repo if isinstance(args.repo, list) else ([args.repo] if args.repo else [])
         _repo_path = _repo_list[0] if _repo_list else None
@@ -184,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         _, run_stdio = build_mcp_server()
         # On Windows asyncio.run() creates a new ProactorEventLoop, breaking psycopg3.
         # Use the SelectorEventLoop we set at module scope instead.
-        loop = asyncio.get_event_loop()
+        loop = _ensure_event_loop()
         loop.run_until_complete(run_stdio())
         return 0
 
@@ -205,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
             loop="none",
         )
         server = uvicorn.Server(config)
-        loop = asyncio.get_event_loop()  # SelectorEventLoop set above in module scope
+        loop = _ensure_event_loop()  # SelectorEventLoop set above in module scope on win32
         loop.run_until_complete(server.serve())
     else:
         uvicorn.run(

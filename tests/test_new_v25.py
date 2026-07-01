@@ -1106,6 +1106,29 @@ def test_main_tunnel_default_kills_stale_ports(monkeypatch):
     assert killed == [8808, 8809, 8810, 8811, 8812, 8813]
 
 
+def test_main_tunnel_recovers_from_closed_event_loop(monkeypatch):
+    """Regression: main(--tunnel) must recover when the thread's event loop was
+    closed by a prior test (Python 3.12 get_event_loop() raises) — this surfaced
+    under pytest-xdist on Linux CI. _ensure_event_loop() creates a fresh loop."""
+    import asyncio
+    from meridian import __main__ as m
+    from meridian import tunnel_client
+
+    async def _fake_run_tunnel(**_kwargs):
+        return 0
+
+    monkeypatch.setattr(tunnel_client, "run_tunnel", _fake_run_tunnel)
+    monkeypatch.setattr(m, "_kill_port", lambda p: None)
+    # Reproduce the failure mode: the current loop is set but closed.
+    dead = asyncio.new_event_loop()
+    asyncio.set_event_loop(dead)
+    dead.close()
+
+    rc = m.main(["--tunnel", "--no-kill", "--token", "sk_x"])
+    assert rc == 0
+    assert not asyncio.get_event_loop().is_closed()
+
+
 def test_kill_port_probe_has_timeout(monkeypatch):
     """The free-port probe sets a short timeout so a dropped SYN can't hang. (a887155d)"""
     import socket as _socket
