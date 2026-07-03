@@ -2548,6 +2548,18 @@ def _magic_rate_limited(email: str) -> bool:
     return False
 
 
+def _magic_email_subject() -> str:
+    """88affef6 — unique, timestamped subject line so Gmail/Outlook don't thread
+    or collapse repeated 'Sign in to Meridian' emails (which hides the newest
+    link and hurts deliverability). The SPF/DKIM/DMARC DNS records are a separate
+    manual operator step."""
+    return (
+        "Sign in to Meridian ("
+        + datetime.now(timezone.utc).strftime("%b %d, %H:%M:%S UTC")
+        + ")"
+    )
+
+
 # 925909aa — persistent per-IP signup limit (defence in depth beyond the slowapi
 # 5/min IP window; survives restarts via the signup_attempts table).
 _SIGNUP_IP_WINDOW_HOURS = 24
@@ -2707,7 +2719,7 @@ async def auth_magic_request(request: Request):
                         "Meridian <hello@usemeridian.us>",
                     ),
                     "to": [email],
-                    "subject": "Sign in to Meridian",
+                    "subject": _magic_email_subject(),
                     "html": (
                         f"<p>Click below to sign in to Meridian:</p>"
                         f"<p><a href='{link}'>{link}</a></p>"

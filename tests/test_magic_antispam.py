@@ -94,3 +94,14 @@ def test_disposable_email_rejected_no_dev_link(client):
     body = resp.json()
     assert body["status"] == "ok"           # generic response — no enumeration
     assert not body.get("dev_link")         # no token created → no link surfaced
+
+
+# ---------------------------------------------------------------------------
+# 88affef6 — unique, timestamped magic-link subject (deliverability)
+# ---------------------------------------------------------------------------
+
+def test_magic_email_subject_is_unique_timestamped():
+    s = hosted._magic_email_subject()
+    assert s.startswith("Sign in to Meridian (")   # brand text preserved as prefix
+    assert s.endswith(")")
+    assert "UTC" in s                              # carries a UTC timestamp
