@@ -1286,6 +1286,22 @@ async def _migrate_pg_provision_queue(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_codebase_graph_entities(conn: PostgresConnection) -> None:
+    """c00b1ccf — cached codebase-graph snapshot (mirrors SQLite)."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS codebase_graph_entities ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    qualified_name TEXT NOT NULL,"
+        "    file TEXT,"
+        "    kind TEXT,"
+        "    signature TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_cge_project ON codebase_graph_entities(project_id);"
+    )
+
+
 async def _migrate_pg_notes_priority(conn: PostgresConnection) -> None:
     """Sprint-4 — project_notes.priority: high/normal/low ranking for generate_handoff."""
     await conn.executescript(
@@ -2304,4 +2320,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_signup_attempts,
     _migrate_pg_user_session_metadata,
     _migrate_pg_provision_queue,
+    _migrate_pg_codebase_graph_entities,
 )

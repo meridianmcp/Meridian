@@ -354,6 +354,19 @@ async def lifespan(app: FastAPI):
         db = await db_module.init_db(db_path)
     app.state.db = db
 
+    # c00b1ccf — wire the offline codebase-graph-snapshot searcher into handoff
+    # code-pointer enrichment. Fallback used when generate_handoff isn't handed a
+    # live tunnel searcher; it reads the persisted snapshot so a fresh session
+    # still gets code pointers. Fully guarded + degrades to [].
+    try:
+        from . import handoff as _handoff_mod  # noqa: PLC0415
+        from .graph_snapshot import make_snapshot_searcher as _mk_snap_searcher  # noqa: PLC0415
+        _handoff_mod.set_graph_searcher_resolver(
+            lambda pid: _mk_snap_searcher(db, pid)
+        )
+    except Exception:  # noqa: BLE001 — never block startup on enrichment wiring
+        pass
+
     # Per-tenant neon_db_url re-key (security item 3dbe23e3). NO-OP unless
     # MERIDIAN_MASTER_SECRET is set — so this is a zero-behavior-change deploy
     # in prod (where the secret is currently unset). Guarded + never crashes

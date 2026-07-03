@@ -841,6 +841,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_signup_attempts(db)
     await _migrate_user_session_metadata(db)
     await _migrate_provision_queue(db)
+    await _migrate_codebase_graph_entities(db)
     return db
 
 
@@ -5269,6 +5270,74 @@ async def count_pending_provisions(db: aiosqlite.Connection) -> int:
     ) as cur:
         row = await cur.fetchone()
     return int(row[0]) if row else 0
+
+
+async def upsert_graph_entities(
+    db: aiosqlite.Connection,
+    project_id: str,
+    entities: list[dict[str, Any]],
+    cap: int = 500,
+) -> int:
+    """c00b1ccf — replace a project's cached graph snapshot with up to ``cap``
+    entities (each: qualified_name + optional file/kind/signature). Returns the
+    number stored. Entities beyond the cap are dropped."""
+    cap = max(0, int(cap))
+    await db.execute(
+        "DELETE FROM codebase_graph_entities WHERE project_id = ?", (project_id,)
+    )
+    stored = 0
+    for ent in (entities or [])[:cap]:
+        qn = str(ent.get("qualified_name") or ent.get("name") or "").strip()
+        if not qn:
+            continue
+        await db.execute(
+            "INSERT INTO codebase_graph_entities "
+            "(id, project_id, qualified_name, file, kind, signature) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (_new_id(), project_id, qn,
+             (ent.get("file") or None), (ent.get("kind") or None),
+             (ent.get("signature") or None)),
+        )
+        stored += 1
+    await db.commit()
+    return stored
+
+
+async def count_graph_entities(db: aiosqlite.Connection, project_id: str) -> int:
+    """c00b1ccf — number of cached graph entities for a project."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM codebase_graph_entities WHERE project_id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def search_graph_entities(
+    db: aiosqlite.Connection, project_id: str, query: str, limit: int = 10
+) -> list[dict[str, Any]]:
+    """c00b1ccf — keyword search over a project's cached graph snapshot. Matches
+    tokens (>=3 chars) of ``query`` against qualified_name/file. Returns entity
+    rows (each carrying ``file``) for handoff code-pointer enrichment."""
+    import re as _re
+    tokens = [t for t in _re.split(r"[^A-Za-z0-9_]+", (query or "")) if len(t) >= 3]
+    if not tokens:
+        return []
+    clauses: list[str] = []
+    params: list[Any] = [project_id]
+    for tok in tokens[:6]:
+        clauses.append("(qualified_name LIKE ? OR file LIKE ?)")
+        like = f"%{tok}%"
+        params.extend([like, like])
+    sql = (
+        "SELECT * FROM codebase_graph_entities WHERE project_id = ? AND ("
+        + " OR ".join(clauses)
+        + ") LIMIT ?"
+    )
+    params.append(int(limit))
+    async with db.execute(sql, params) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
 async def delete_api_tokens_by_label(
