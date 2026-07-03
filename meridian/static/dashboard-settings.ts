@@ -195,6 +195,10 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     if (age < 30000) return;
   }
 
+  // Concurrency guard: if another loadSettingsTab call wins the race, let it render.
+  if (!('_loadTok' in (body as any))) (body as any)._loadTok = 0;
+  const _myTok = ++(body as any)._loadTok;
+
   // Disconnect any MutationObserver from a previous render before replacing innerHTML.
   // Without this, the observer moves every newly-added child to orphaned pane elements,
   // leaving the body blank on the second (and any subsequent) settings tab open.
@@ -3420,6 +3424,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     `<span style="margin-left:auto">© 2026 Meridian</span>` +
     `</div>`;
 
+  // Bail if a newer loadSettingsTab call started while we were fetching.
+  if ((body as any)._loadTok !== _myTok) return;
+
   try {
     body.innerHTML = html;
   } catch (renderErr) {
@@ -4457,17 +4464,21 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         });
 
-        loadSettingsTab(projectId, { force: true });
+        await loadSettingsTab(projectId, { force: true });
 
       } catch (e: any) {
 
-        if (statusEl) statusEl.textContent = e.message || 'Save failed';
+        if (statusEl && statusEl.isConnected) statusEl.textContent = e.message || 'Save failed';
 
       } finally {
 
-        ghSaveBtn.disabled = false;
+        if (ghSaveBtn.isConnected) {
 
-        ghSaveBtn.textContent = 'Save repo';
+          ghSaveBtn.disabled = false;
+
+          ghSaveBtn.textContent = 'Save repo';
+
+        }
 
       }
 
@@ -4493,13 +4504,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         await api(`/projects/${projectId}/github/disconnect`, { method: 'DELETE' });
 
-        loadSettingsTab(projectId, { force: true });
+        await loadSettingsTab(projectId, { force: true });
 
       } catch (e: any) {
 
-        if (statusEl) statusEl.textContent = 'error disconnecting';
+        if (statusEl && statusEl.isConnected) statusEl.textContent = 'error disconnecting';
 
-        ghDisconnectBtn.disabled = false;
+        if (ghDisconnectBtn.isConnected) ghDisconnectBtn.disabled = false;
 
       }
 

@@ -2160,6 +2160,8 @@
       const age = Date.now() - parseInt(body.dataset.settingsTs || "0", 10);
       if (age < 3e4) return;
     }
+    if (!("_loadTok" in body)) body._loadTok = 0;
+    const _myTok = ++body._loadTok;
     if (body._settingsObs) {
       body._settingsObs.disconnect();
       body._settingsObs = null;
@@ -4504,6 +4506,7 @@ project_id = "${displayPid}"`;
         html += `<details id="settings-grp-blog-${projectId}" style="margin-bottom:12px;border:2px solid var(--border);border-radius:8px"><summary style="cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:8px;background:var(--surface-2);border-radius:8px"><span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">BLOG <span style="color:var(--muted)">(admin)</span></span></summary><div style="padding:10px"><div style="font-size:10px;color:var(--muted);margin-bottom:8px">Authoring is admin-only. Publish makes a post live at <code>/blog/&lt;slug&gt;</code> immediately.</div><input id="blog-edit-id" type="hidden"><input id="blog-title" type="text" placeholder="Post title" style="${_inp};margin-bottom:6px"><textarea id="blog-body" rows="8" placeholder="# Heading&#10;&#10;Markdown body. **bold**, \`code\`, fenced blocks." style="${_inp};resize:vertical"></textarea><div style="display:flex;gap:6px;margin-top:6px;align-items:center;flex-wrap:wrap"><button id="blog-save" class="primary" style="font-size:10px;padding:3px 10px">Save draft</button><button id="blog-gen" class="secondary" style="font-size:10px;padding:3px 10px">Generate from activity</button><button id="blog-new" class="secondary" style="font-size:10px;padding:3px 10px">New</button><span id="blog-status" style="font-size:10px;color:var(--muted)"></span></div><div id="blog-list" style="margin-top:12px;font-size:11px"><div style="color:var(--muted)">loading\u2026</div></div></div></details>`;
       }
       html += `<div style="margin-top:20px;padding-top:12px;border-top:1px solid var(--border);display:flex;gap:12px;font-size:9px;color:var(--muted)"><a href="/terms" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Terms of Service</a><a href="/privacy" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Privacy Policy</a><span style="margin-left:auto">\xA9 2026 Meridian</span></div>`;
+      if (body._loadTok !== _myTok) return;
       try {
         body.innerHTML = html;
       } catch (renderErr) {
@@ -5217,12 +5220,14 @@ project_id = "${displayPid}"`;
               method: "POST",
               body: JSON.stringify({ repo, branch })
             });
-            loadSettingsTab2(projectId, { force: true });
+            await loadSettingsTab2(projectId, { force: true });
           } catch (e3) {
-            if (statusEl) statusEl.textContent = e3.message || "Save failed";
+            if (statusEl && statusEl.isConnected) statusEl.textContent = e3.message || "Save failed";
           } finally {
-            ghSaveBtn.disabled = false;
-            ghSaveBtn.textContent = "Save repo";
+            if (ghSaveBtn.isConnected) {
+              ghSaveBtn.disabled = false;
+              ghSaveBtn.textContent = "Save repo";
+            }
           }
         };
       }
@@ -5233,10 +5238,10 @@ project_id = "${displayPid}"`;
           ghDisconnectBtn.disabled = true;
           try {
             await api(`/projects/${projectId}/github/disconnect`, { method: "DELETE" });
-            loadSettingsTab2(projectId, { force: true });
+            await loadSettingsTab2(projectId, { force: true });
           } catch (e3) {
-            if (statusEl) statusEl.textContent = "error disconnecting";
-            ghDisconnectBtn.disabled = false;
+            if (statusEl && statusEl.isConnected) statusEl.textContent = "error disconnecting";
+            if (ghDisconnectBtn.isConnected) ghDisconnectBtn.disabled = false;
           }
         };
       }
