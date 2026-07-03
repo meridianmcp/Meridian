@@ -1805,13 +1805,16 @@ async def generate_default_session_name(
     """599d0097 — derive a meaningful session name when start_session gets none.
 
     Uses the first pending/todo sprint item's title (slugified to its first few
-    words) plus a UTC timestamp, so an unnamed session reads as e.g.
-    ``wire-billing-oauth-20260701-2130`` instead of forcing the caller to invent
-    a string. Falls back to ``session-<timestamp>`` when the board is empty. The
-    timestamp keeps the name unique (the board rejects duplicate active names).
+    words) plus a short UTC timestamp, so an unnamed session reads as e.g.
+    ``wire-billing-oauth-0701-2130`` instead of forcing the caller to invent a
+    string. 2bce89ed — when the board is empty, falls back to a memorable
+    adjective+noun+timestamp slug (e.g. ``brisk-otter-0701-213045``) instead of
+    the anonymous ``session-<ts>``. The timestamp keeps the name unique (the
+    board rejects duplicate active names); year is dropped for brevity but
+    seconds are kept so two sessions in the same minute don't collide.
     """
     from datetime import datetime, timezone  # local: db/__init__ has no top import
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%m%d-%H%M%S")
     try:
         items = await get_sprint_items(db, project_id, include_human=False)
     except Exception:  # noqa: BLE001 — naming must never block start_session
@@ -1826,7 +1829,14 @@ async def generate_default_session_name(
     if words:
         slug = "-".join(words[:5])[:48].strip("-") or "session"
         return f"{slug}-{ts}"
-    return f"session-{ts}"
+    # 2bce89ed — memorable adjective+noun for an empty board, chosen
+    # deterministically from the timestamp (readable + unique via the ts suffix).
+    _adj = ("brisk", "calm", "clever", "bold", "quiet", "swift", "warm", "keen",
+            "bright", "steady", "nimble", "lucid")
+    _noun = ("otter", "harbor", "cedar", "falcon", "meadow", "ember", "delta",
+             "willow", "quartz", "sparrow", "atlas", "cove")
+    _h = sum(ord(c) for c in ts)
+    return f"{_adj[_h % len(_adj)]}-{_noun[(_h // len(_adj)) % len(_noun)]}-{ts}"
 
 
 def build_worker_context_xml(

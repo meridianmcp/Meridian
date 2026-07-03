@@ -1369,13 +1369,17 @@ def test_generate_default_session_name_from_pending_item():
 
 
 def test_generate_default_session_name_empty_board():
-    """599d0097 — empty board falls back to session-<timestamp>."""
+    """2bce89ed — empty board falls back to a memorable adjective+noun+timestamp
+    (e.g. 'brisk-otter-0701-213045'), not the anonymous 'session-<ts>'."""
+    import re
     import meridian.db as db_module
     db = _make_db()
     try:
         proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "eb"}, db, "/tmp"))
         name = _run(db_module.generate_default_session_name(db, proj["id"]))
-        assert name.startswith("session-")
+        assert not name.startswith("session-")
+        # adjective-noun-mmdd-hhmmss
+        assert re.match(r"^[a-z]+-[a-z]+-\d{4}-\d{6}$", name), name
     finally:
         _run(db.close())
 
