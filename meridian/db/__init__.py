@@ -8349,6 +8349,77 @@ async def get_project_notes(
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
+def _note_relevance_score(
+    reference_count: int, age_days: float, has_decision_link: bool, read_count: int = 0
+) -> float:
+    """98890df1 — PageRank-ish note relevance. Reference/read counts pass through a
+    saturating transform so a heavily-referenced note ranks high without a single
+    outlier dominating; recency decays on a ~30-day scale. read_count stays 0 until
+    note-read tracking lands (semantic similarity is the pgvector Phase 2)."""
+    ref = 1.0 - 1.0 / (1.0 + max(0, reference_count))
+    rec = 1.0 / (1.0 + max(0.0, age_days) / 30.0)
+    read = 1.0 - 1.0 / (1.0 + max(0, read_count))
+    dec = 1.0 if has_decision_link else 0.0
+    return 0.45 * ref + 0.30 * rec + 0.15 * read + 0.10 * dec
+
+
+async def get_project_notes_ranked(
+    db: aiosqlite.Connection,
+    project_id: str,
+    tag: str | None = None,
+    query: str | None = None,
+    bodies: bool = False,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """98890df1 — like get_project_notes but ordered by a relevance score
+    (reference_count / recency / decision-link) instead of pure recency, so
+    heavily cross-referenced notes surface and stale ones sink. Each returned row
+    carries a ``relevance`` float."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+    where, params = _project_notes_where(db, project_id, tag, query)
+    # Fetch full rows (bodies are needed to count [[slug]] references) unpaged so
+    # scoring sees the whole corpus, then trim after ranking.
+    sql = f"SELECT * FROM project_notes WHERE {where}"
+    async with db.execute(sql, params or None) as cur:
+        rows = await cur.fetchall()
+    notes = [_row_to_dict(r) for r in rows if r is not None]
+    combined_bodies = " ".join((n.get("body") or "") for n in notes)
+    try:
+        decisions = await get_pinned_decisions(db, project_id)
+        decision_blob = " ".join((d.get("body") or "") for d in (decisions or []))
+    except Exception:  # noqa: BLE001
+        decision_blob = ""
+    now = datetime.now(timezone.utc)
+    for n in notes:
+        slug = n.get("slug") or ""
+        marker = f"[[{slug}]]"
+        # count references from OTHER notes (subtract self-references in own body)
+        ref_count = 0
+        if slug:
+            ref_count = combined_bodies.count(marker) - (n.get("body") or "").count(marker)
+        has_dec = bool(slug) and (marker in decision_blob)
+        age_days = 0.0
+        created = n.get("created_at")
+        if created:
+            try:
+                cdt = datetime.strptime(
+                    str(created)[:19], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+                age_days = max(0.0, (now - cdt).total_seconds() / 86400.0)
+            except (ValueError, TypeError):
+                pass
+        n["relevance"] = round(
+            _note_relevance_score(max(0, ref_count), age_days, has_dec), 4
+        )
+    notes.sort(key=lambda x: (x.get("relevance", 0.0), x.get("created_at") or ""), reverse=True)
+    if not bodies:
+        for n in notes:
+            n.pop("body", None)
+    if limit is not None:
+        notes = notes[: max(1, min(int(limit), 500))]
+    return notes
+
+
 async def get_project_notes_page(
     db: aiosqlite.Connection,
     project_id: str,

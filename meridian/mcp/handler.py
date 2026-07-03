@@ -1758,6 +1758,14 @@ async def _handle_notes_decisions(
         # ``cursor`` and/or ``limit`` to get the {notes, has_more, next_cursor}
         # envelope, then re-call with cursor=next_cursor for the next page.
         # Without either arg the legacy bare list is returned for back-compat.
+        # 98890df1 — relevance sort (reference_count/recency/decision-link) takes
+        # precedence over cursor/limit paging.
+        if args.get("sort") == "relevance":
+            return await db_module.get_project_notes_ranked(
+                db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+                bodies=bool(args.get("bodies", False)),
+                limit=(int(args["limit"]) if "limit" in args else None),
+            )
         if "cursor" in args or "limit" in args:
             return await db_module.get_project_notes_page(
                 db, args["project_id"], tag=args.get("tag"), query=args.get("query"),

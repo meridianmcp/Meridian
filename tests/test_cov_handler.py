@@ -964,6 +964,43 @@ def test_add_note_extracts_hashtags_as_tags():
         _run(db.close())
 
 
+def test_note_relevance_score_weights():
+    """98890df1 — more references / recency / a decision link each raise the score."""
+    from meridian.db import _note_relevance_score
+    base = _note_relevance_score(0, 100.0, False)
+    assert _note_relevance_score(5, 100.0, False) > base   # references help
+    assert _note_relevance_score(0, 0.0, False) > base     # recency helps
+    assert _note_relevance_score(0, 100.0, True) > base    # decision link helps
+
+
+def test_get_notes_relevance_sort_surfaces_referenced_note():
+    """98890df1 — get_notes(sort=relevance) ranks a heavily cross-referenced note
+    above unreferenced ones (relevance > pure recency)."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "rank-proj"))
+        a = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"], "title": "Core architecture decision",
+            "body": "The keystone note.",
+        }, db, "/tmp"))
+        a_slug = a["slug"]
+        for i in range(2):
+            _run(mh._dispatch_mcp_tool("add_note", {
+                "project_id": proj["id"], "title": f"Follow-up note number {i}",
+                "body": f"See [[{a_slug}]] for the rationale.",
+            }, db, "/tmp"))
+        ranked = _run(mh._dispatch_mcp_tool("get_notes", {
+            "project_id": proj["id"], "sort": "relevance",
+        }, db, "/tmp"))
+        assert isinstance(ranked, list)
+        assert ranked[0]["slug"] == a_slug
+        assert "relevance" in ranked[0]
+        assert ranked[0]["relevance"] > ranked[-1]["relevance"]
+    finally:
+        _run(db.close())
+
+
 def test_planning_brief_new_handoff_signal():
     # ab514e43 — new-handoff signal: latest_handoff + since-based new flag.
     import meridian.db as db_module

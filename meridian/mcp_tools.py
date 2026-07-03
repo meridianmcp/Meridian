@@ -355,7 +355,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "query": {"type": "string", "description": "Text search across note title and body (case-insensitive)."},
          "bodies": {"type": "boolean", "description": "Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug)."},
          "limit": {"type": "integer", "description": "Page size (default 100, clamped 1..500). Passing limit or cursor switches the result to the {notes, has_more, next_cursor} pagination envelope."},
-         "cursor": {"type": "integer", "description": "Offset cursor from a prior page's next_cursor. Passing it switches the result to the {notes, has_more, next_cursor} envelope."}},
+         "cursor": {"type": "integer", "description": "Offset cursor from a prior page's next_cursor. Passing it switches the result to the {notes, has_more, next_cursor} envelope."},
+         "sort": {"type": "string", "enum": ["recency", "relevance"], "description": "98890df1 — 'relevance' ranks notes by reference_count/recency/decision-link (heavily cross-referenced notes surface, stale ones sink) and returns a bare list with a per-note 'relevance' score; default 'recency'."}},
          "required": []}},
     {"name": "read_note", "description":
         "Read-only: Fetch one project note's full body by its per-project slug "
