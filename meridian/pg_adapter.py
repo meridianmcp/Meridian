@@ -1271,6 +1271,21 @@ async def _migrate_pg_user_session_metadata(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_provision_queue(conn: PostgresConnection) -> None:
+    """4c559d4e — durable provisioning queue (mirrors SQLite provision_queue)."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS provision_queue ("
+        "    tenant_id TEXT PRIMARY KEY,"
+        "    status TEXT NOT NULL DEFAULT 'pending',"
+        "    attempts INTEGER NOT NULL DEFAULT 0,"
+        "    last_error TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_provision_queue_status ON provision_queue(status);"
+    )
+
+
 async def _migrate_pg_notes_priority(conn: PostgresConnection) -> None:
     """Sprint-4 — project_notes.priority: high/normal/low ranking for generate_handoff."""
     await conn.executescript(
@@ -2288,4 +2303,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_parallel_primitives,
     _migrate_pg_signup_attempts,
     _migrate_pg_user_session_metadata,
+    _migrate_pg_provision_queue,
 )

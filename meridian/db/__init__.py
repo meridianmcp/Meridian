@@ -840,6 +840,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_project_status_priority(db)
     await _migrate_signup_attempts(db)
     await _migrate_user_session_metadata(db)
+    await _migrate_provision_queue(db)
     return db
 
 
@@ -5208,6 +5209,66 @@ async def revoke_user_session(
     )
     await db.commit()
     return (cur.rowcount or 0) > 0
+
+
+async def enqueue_provision(
+    db: aiosqlite.Connection, tenant_id: str, last_error: str | None = None
+) -> None:
+    """4c559d4e — record a tenant needing (re)provisioning. Bumps attempts and
+    resets status to 'pending' so a background drain can retry it later."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async with db.execute(
+        "SELECT attempts FROM provision_queue WHERE tenant_id = ?", (tenant_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        await db.execute(
+            "INSERT INTO provision_queue "
+            "(tenant_id, status, attempts, last_error, updated_at) "
+            "VALUES (?, 'pending', 1, ?, ?)",
+            (tenant_id, last_error, now),
+        )
+    else:
+        await db.execute(
+            "UPDATE provision_queue SET status = 'pending', attempts = attempts + 1, "
+            "last_error = ?, updated_at = ? WHERE tenant_id = ?",
+            (last_error, now, tenant_id),
+        )
+    await db.commit()
+
+
+async def mark_provision_done(db: aiosqlite.Connection, tenant_id: str) -> None:
+    """4c559d4e — mark a tenant's provisioning complete (clears it from pending)."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE provision_queue SET status = 'done', updated_at = ? WHERE tenant_id = ?",
+        (now, tenant_id),
+    )
+    await db.commit()
+
+
+async def get_pending_provisions(
+    db: aiosqlite.Connection, limit: int = 50
+) -> list[dict[str, Any]]:
+    """4c559d4e — tenants still awaiting provisioning, oldest first."""
+    async with db.execute(
+        "SELECT * FROM provision_queue WHERE status = 'pending' "
+        "ORDER BY created_at ASC LIMIT ?",
+        (int(limit),),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def count_pending_provisions(db: aiosqlite.Connection) -> int:
+    """4c559d4e — number of tenants awaiting (re)provisioning."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM provision_queue WHERE status = 'pending'"
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def delete_api_tokens_by_label(

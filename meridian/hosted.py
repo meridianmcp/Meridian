@@ -1430,18 +1430,69 @@ async def create_stripe_billing_portal_session(tenant: dict) -> str:
     return session.url
 
 
+async def provision_with_retry(
+    tenant_id: str,
+    db: Any,
+    *,
+    attempts: int = 3,
+    base_delay: float = 1.0,
+    _sleep: Any = None,
+) -> dict[str, Any]:
+    """4c559d4e — provision a tenant's Neon DB with exponential backoff. On the
+    final failure, enqueue the tenant to provision_queue for durable later retry,
+    then re-raise. ``_sleep`` is injectable for tests (no real delays)."""
+    import asyncio as _asyncio
+    from . import db as db_module
+    sleep = _sleep or _asyncio.sleep
+    n = max(1, int(attempts))
+    last_exc: Exception | None = None
+    for i in range(n):
+        try:
+            result = await provision_neon_db(tenant_id, db)
+            try:
+                await db_module.mark_provision_done(db, tenant_id)
+            except Exception:  # noqa: BLE001
+                pass
+            return result
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if i < n - 1:
+                await sleep(base_delay * (2 ** i))
+    try:
+        await db_module.enqueue_provision(
+            db, tenant_id, last_error=(str(last_exc)[:500] if last_exc else None)
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("provisioning failed")  # pragma: no cover
+
+
+async def provisioning_health(db: Any) -> dict[str, Any]:
+    """4c559d4e — provisioning-queue health for /health/deep monitoring."""
+    from . import db as db_module
+    try:
+        pending = await db_module.count_pending_provisions(db)
+    except Exception:  # noqa: BLE001
+        pending = None
+    return {"pending_provisions": pending}
+
+
 async def _provision_tenant_background(tenant_id: str, db: Any) -> None:
     """Best-effort background provisioning called from OAuth callbacks.
 
     Silently swallows errors — login must never fail due to provisioning issues.
-    Logs failures at WARNING level for ops visibility.
+    Logs failures at WARNING level for ops visibility. 4c559d4e — retries with
+    backoff and enqueues to provision_queue on final failure (durable retry).
     """
     import logging as _logging
     try:
-        await provision_neon_db(tenant_id, db)
+        await provision_with_retry(tenant_id, db)
     except Exception as exc:  # noqa: BLE001
         _logging.getLogger(__name__).warning(
-            "Background Neon provisioning failed for tenant %s: %s", tenant_id, exc
+            "Background Neon provisioning failed for tenant %s (queued for retry): %s",
+            tenant_id, exc,
         )
 
 
