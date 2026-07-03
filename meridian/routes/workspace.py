@@ -164,6 +164,8 @@ async def update_workspace_settings_endpoint(
         # 0bf67524 — cascade defaults seeded onto new projects.
         execution_mode_default=body.get("execution_mode_default"),
         code_intel_enabled_default=body.get("code_intel_enabled_default"),
+        # 76cf8bda — /loop auto-continue workspace default.
+        loop_enabled_default=body.get("loop_enabled_default"),
         tenant_id=await _tenant_id(request),
     )
 

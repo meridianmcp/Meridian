@@ -141,14 +141,16 @@ _DEFAULT_GOAL_MAX_TURNS = 200
 
 
 def _max_turns_from_settings(proj_settings: dict[str, Any] | None) -> int:
-    """Extract executor_config.max_turns (default 200). (d2c47f43)"""
+    """Extract executor_config.max_turns (default 200, clamped to 1-500). (d2c47f43,
+    76cf8bda)"""
     cfg = (proj_settings or {}).get("executor_config") or {}
     if not isinstance(cfg, dict):
         return _DEFAULT_GOAL_MAX_TURNS
     raw = cfg.get("max_turns")
     try:
         val = int(raw)
-        return val if val > 0 else _DEFAULT_GOAL_MAX_TURNS
+        # 76cf8bda — clamp to the 1-500 dashboard-slider range.
+        return min(500, val) if val > 0 else _DEFAULT_GOAL_MAX_TURNS
     except (TypeError, ValueError):
         return _DEFAULT_GOAL_MAX_TURNS
 
@@ -167,6 +169,30 @@ def _goal_group_style_from_settings(proj_settings: dict[str, Any] | None) -> str
     cfg = (proj_settings or {}).get("executor_config") or {}
     val = cfg.get("goal_group_style") if isinstance(cfg, dict) else None
     return "waves" if str(val).lower() == "waves" else "flat"
+
+
+def _loop_enabled_from_settings(
+    proj_settings: dict[str, Any] | None,
+    workspace_settings: dict[str, Any] | None = None,
+) -> bool:
+    """76cf8bda — effective /loop auto-continue flag (project override → workspace
+    default). executor_config.loop_enabled of True/False is an explicit override;
+    'workspace' (or a missing value) defers to workspace_settings.loop_enabled_default
+    (which itself defaults to True). Tri-state must not collapse 'workspace' to falsy."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    raw = cfg.get("loop_enabled") if isinstance(cfg, dict) else None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in ("true", "on", "1", "yes"):
+            return True
+        if low in ("false", "off", "0", "no"):
+            return False
+        # "workspace" (or anything unrecognized) → defer to the workspace default.
+    ws = workspace_settings or {}
+    default = ws.get("loop_enabled_default")
+    return True if default is None else bool(default)
 
 
 def _partition_into_waves(
@@ -263,6 +289,7 @@ def _build_quick_start_goal(
     hitl_auto_answer_mode: int = 0,
     completion_mode: str = "strict",
     goal_group_style: str = "flat",
+    loop_enabled: bool = False,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -290,8 +317,12 @@ def _build_quick_start_goal(
         _turns = int(max_turns)
         if _turns <= 0:
             _turns = _DEFAULT_GOAL_MAX_TURNS
+        else:
+            _turns = min(500, _turns)  # 76cf8bda — clamp to the 1-500 slider range
     except (TypeError, ValueError):
         _turns = _DEFAULT_GOAL_MAX_TURNS
+    # 76cf8bda — prepend /loop when auto-continue is effective for this project.
+    _loop_prefix = "/loop " if loop_enabled else ""
     # ddd8b9bf — HITL clause differs by mode.
     _hitl_clause = (
         "Do NOT file HITLs — auto-answer is on, skip blocked items and continue."
@@ -306,9 +337,9 @@ def _build_quick_start_goal(
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     if not item_ids:
         return (
-            "/goal Verify remaining work is complete. Done when pixi run test "
-            f"passes {test_floor}+, and generate_handoff() is called at the "
-            f"end. Stop after {_turns} turns {_hitl_clause}"
+            f"{_loop_prefix}/goal Verify remaining work is complete. Done when "
+            f"pixi run test passes {test_floor}+, and generate_handoff() is called "
+            f"at the end. Stop after {_turns} turns {_hitl_clause}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -355,7 +386,7 @@ def _build_quick_start_goal(
         )
     )
     return (
-        f"/goal {directive}"
+        f"{_loop_prefix}/goal {directive}"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
         # board query keeps a resumed session honest about mid-run injections
         # and already-claimed items instead of trusting a stale list.
@@ -1648,6 +1679,13 @@ async def generate_handoff(
         _hitl_aa_mode = int(await db_module._project_hitl_auto_answer_mode(db, project_id))
     except Exception:  # noqa: BLE001
         pass
+    # 76cf8bda — effective /loop flag merges the project override with the
+    # workspace default. Guarded: a missing settings row degrades to the default.
+    _ws_settings_for_loop = None
+    try:
+        _ws_settings_for_loop = await db_module.get_workspace_settings(db)
+    except Exception:  # noqa: BLE001
+        _ws_settings_for_loop = None
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=db_module.normalize_execution_mode(
@@ -1657,6 +1695,7 @@ async def generate_handoff(
         hitl_auto_answer_mode=_hitl_aa_mode,
         completion_mode=_completion_mode_from_settings(proj_settings),
         goal_group_style=_goal_group_style_from_settings(proj_settings),
+        loop_enabled=_loop_enabled_from_settings(proj_settings, _ws_settings_for_loop),
     )
 
     # Split tasks into L1 (last 10) and L2 (older).
@@ -2041,6 +2080,11 @@ async def _generate_starter_handoff(
         )
     except Exception:  # noqa: BLE001
         pass
+    _s_ws_settings = None
+    try:
+        _s_ws_settings = await db_module.get_workspace_settings(db)
+    except Exception:  # noqa: BLE001
+        _s_ws_settings = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=db_module.normalize_execution_mode(
@@ -2050,6 +2094,7 @@ async def _generate_starter_handoff(
         hitl_auto_answer_mode=_s_hitl_mode,
         completion_mode=_completion_mode_from_settings(settings),
         goal_group_style=_goal_group_style_from_settings(settings),
+        loop_enabled=_loop_enabled_from_settings(settings, _s_ws_settings),
     )
     content = _render_starter_handoff(
         project,

@@ -1905,6 +1905,8 @@ async def _handle_notes_decisions(
             # 0bf67524 — cascade defaults for new projects.
             execution_mode_default=args.get("execution_mode_default"),
             code_intel_enabled_default=args.get("code_intel_enabled_default"),
+            # 76cf8bda — /loop auto-continue workspace default.
+            loop_enabled_default=args.get("loop_enabled_default"),
             tenant_id=_mcp_tenant_id,
         )
     if name == "add_workspace_sprint_item":

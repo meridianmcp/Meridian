@@ -365,6 +365,10 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
     # code_intel_enabled_default ∈ {0, 1}.
     await _migrate_add_column_if_missing(db, "workspace_settings", "execution_mode_default", "TEXT")
     await _migrate_add_column_if_missing(db, "workspace_settings", "code_intel_enabled_default", "INTEGER")
+    # 76cf8bda — /loop auto-continue workspace default (1 = on for new sessions).
+    await _migrate_add_column_if_missing(
+        db, "workspace_settings", "loop_enabled_default", "INTEGER NOT NULL DEFAULT 1"
+    )
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:

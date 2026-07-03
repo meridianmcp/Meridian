@@ -693,6 +693,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     handoff_template TEXT,
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
+    loop_enabled_default INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -1891,7 +1892,9 @@ async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> No
         "log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS handoff_template TEXT;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS execution_mode_default TEXT;"
-        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS code_intel_enabled_default INTEGER"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS code_intel_enabled_default INTEGER;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "loop_enabled_default INTEGER NOT NULL DEFAULT 1"
     )
 
 

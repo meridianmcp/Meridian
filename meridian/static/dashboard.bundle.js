@@ -3506,9 +3506,27 @@ project_id = "${displayPid}"`;
 
       Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns
 
-      <input id="exec-max_turns-${projectId}" type="range" min="40" max="400" step="20" value="${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      <input id="exec-max_turns-${projectId}" type="range" min="40" max="500" step="20" value="${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
 
       <span id="exec-max_turns-warn-${projectId}" style="font-size:9px;color:var(--muted)"></span>
+
+    </label>
+
+    <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
+
+      Auto-continue (<code>/loop</code>)
+
+      <select id="exec-loop_enabled-${projectId}" style="width:100%;max-width:320px;margin-top:4px;display:block;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
+
+        <option value="workspace"${execCfg.loop_enabled !== true && execCfg.loop_enabled !== false ? " selected" : ""}>Use workspace default</option>
+
+        <option value="true"${execCfg.loop_enabled === true ? " selected" : ""}>Always on</option>
+
+        <option value="false"${execCfg.loop_enabled === false ? " selected" : ""}>Always off</option>
+
+      </select>
+
+      <span style="font-size:9px;color:var(--muted)">Prepends <code>/loop</code> to the session /goal so it auto-continues after each response.</span>
 
     </label>
 
@@ -3536,16 +3554,18 @@ project_id = "${displayPid}"`;
         const mtVal = document.getElementById(`exec-max_turns-val-${projectId}`);
         const mtWarn = document.getElementById(`exec-max_turns-warn-${projectId}`);
         const _renderMtWarn = (v3) => {
-          if (!mtWarn) return;
           const n2 = parseInt(v3 || "", 10);
-          if (n2 >= 300) {
-            mtWarn.textContent = "\u26A0 Very long sprint (300+ turns) \u2014 high context/token cost; checkpoint frequently and expect drift.";
-            mtWarn.style.color = "var(--danger, #e5534b)";
+          const band = n2 >= 350 ? "var(--danger, #e5534b)" : n2 >= 200 ? "var(--warning, #d29922)" : "var(--success, #3fb950)";
+          if (mtVal) mtVal.style.color = band;
+          if (!mtWarn) return;
+          if (n2 >= 350) {
+            mtWarn.textContent = "\u26A0 Very long sprint (350+ turns) \u2014 high context/token cost; checkpoint frequently and expect drift.";
+            mtWarn.style.color = band;
           } else if (n2 >= 200) {
             mtWarn.textContent = "\u26A0 Long sprint (200+ turns) \u2014 set a checkpoint cadence so context does not overflow mid-run.";
-            mtWarn.style.color = "var(--warning, #d29922)";
+            mtWarn.style.color = band;
           } else {
-            mtWarn.textContent = "Turns before the /goal auto-stops. Raise for megasprints.";
+            mtWarn.textContent = "Turns before the /goal auto-stops. Raise for megasprints (max 500).";
             mtWarn.style.color = "var(--muted)";
           }
         };
@@ -3666,7 +3686,9 @@ project_id = "${displayPid}"`;
           const ctxRaw = ctxSlider ? parseInt(ctxSlider.value || "", 10) : NaN;
           if (!isNaN(ctxRaw)) cfg.context_threshold = Math.min(200, Math.max(10, ctxRaw));
           const mtRaw = mtSlider ? parseInt(mtSlider.value || "", 10) : NaN;
-          if (!isNaN(mtRaw)) cfg.max_turns = Math.min(400, Math.max(40, mtRaw));
+          if (!isNaN(mtRaw)) cfg.max_turns = Math.min(500, Math.max(40, mtRaw));
+          const loopSel = document.getElementById(`exec-loop_enabled-${projectId}`);
+          if (loopSel) cfg.loop_enabled = loopSel.value === "true" ? true : loopSel.value === "false" ? false : "workspace";
           try {
             await saveProjectSettings(projectId, { executor_config: cfg });
             if (statusEl) statusEl.textContent = "Saved.";
@@ -3688,6 +3710,7 @@ project_id = "${displayPid}"`;
         const handoffTplIn = document.getElementById("ws-handoff-template");
         const execModeIn = document.getElementById("ws-exec-mode-default");
         const codeIntelCb = document.getElementById("ws-code-intel-default");
+        const loopCb = document.getElementById("ws-loop-default");
         const saveBtn = document.getElementById("ws-settings-save");
         const saveStatus = document.getElementById("ws-settings-status");
         (async () => {
@@ -3700,6 +3723,7 @@ project_id = "${displayPid}"`;
             if (handoffTplIn) handoffTplIn.value = s3.handoff_template || "";
             if (execModeIn) execModeIn.value = s3.execution_mode_default || "";
             if (codeIntelCb) codeIntelCb.checked = !!s3.code_intel_enabled_default;
+            if (loopCb) loopCb.checked = s3.loop_enabled_default !== false;
           } catch (e3) {
             if (saveStatus) saveStatus.textContent = "Could not load workspace defaults.";
           }
@@ -3718,7 +3742,9 @@ project_id = "${displayPid}"`;
                 handoff_template: handoffTplIn && handoffTplIn.value.trim() || "",
                 // 0bf67524 — "" clears the default; a value seeds new projects.
                 execution_mode_default: execModeIn ? execModeIn.value : "",
-                code_intel_enabled_default: codeIntelCb && codeIntelCb.checked ? 1 : 0
+                code_intel_enabled_default: codeIntelCb && codeIntelCb.checked ? 1 : 0,
+                // 76cf8bda — workspace /loop auto-continue default.
+                loop_enabled_default: !!(loopCb && loopCb.checked)
               })
             });
             if (saveStatus) saveStatus.textContent = "Saved.";
@@ -4009,6 +4035,16 @@ project_id = "${displayPid}"`;
           <span style="font-size:9px;color:var(--muted)">Seeds new projects' code-intel toggle on.</span>
         </span>
       </label>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
+        <input type="checkbox" id="ws-loop-default" style="margin-top:2px">
+        <span>Auto-continue (<code>/loop</code>) by default<br>
+          <span style="font-size:9px;color:var(--muted)">Sessions prepend <code>/loop</code> to the /goal so they auto-continue after each response. Projects set to "Use workspace default" inherit this. Recommended for sprint sessions.</span>
+        </span>
+      </label>
+      <div style="display:flex;gap:6px;align-items:flex-start;margin-bottom:8px">
+        <span id="ws-stophook-badge" style="font-size:9px;padding:2px 6px;border-radius:3px;white-space:nowrap;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">Stop hook: sprint_guard</span>
+        <span style="font-size:9px;color:var(--muted)">Auto-written to <code>.claude/hooks/sprint_guard.sh</code>/<code>.ps1</code> by <code>generate_handoff</code> \u2014 blocks early-stop while sprint items are pending. (Regenerated on the machine running the tunnel/server; a hosted dashboard can't inspect your local files.)</span>
+      </div>
       <label style="font-size:10px;color:var(--muted);display:block">Default sprint name<br>
         <input id="ws-sprint-default" type="text" placeholder="e.g. june-sprint" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
       </label>

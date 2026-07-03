@@ -599,20 +599,22 @@ def test_known_locations_has_manual_path_entry(js):
 
 
 def test_max_turns_slider_supports_megasprints():
-    """47af402c — Executor Config exposes a max_turns slider (ceiling 400) with
-    escalating warnings at 200+/300+, and the checkpoint (context_threshold)
-    slider ceiling is raised to 200 to match megasprints."""
+    """47af402c / 76cf8bda — Executor Config exposes a max_turns slider (ceiling
+    500) with escalating warnings at 200+/350+, an Auto-continue (/loop) dropdown,
+    and the checkpoint (context_threshold) slider ceiling raised to 200."""
     from pathlib import Path
     static = Path(__file__).parent.parent / "meridian" / "static"
     settings_src = (static / "dashboard-settings.ts").read_text(encoding="utf-8")
-    # max_turns slider present with a 400 ceiling.
+    # max_turns slider present with a 500 ceiling (76cf8bda raised 400 -> 500).
     assert "exec-max_turns-" in settings_src, "max_turns slider missing"
-    assert 'type="range" min="40" max="400"' in settings_src, "max_turns ceiling must be 400"
-    # Escalating inline warnings at 200+/300+.
-    assert "Very long sprint (300+" in settings_src, "300+ warning missing"
+    assert 'type="range" min="40" max="500"' in settings_src, "max_turns ceiling must be 500"
+    # Escalating inline warnings at 200+/350+ (color bands green/amber/red).
+    assert "Very long sprint (350+" in settings_src, "350+ warning missing"
     assert "Long sprint (200+" in settings_src, "200+ warning missing"
-    # Saved value is clamped to [40, 400].
-    assert "Math.min(400, Math.max(40, mtRaw))" in settings_src, "max_turns must clamp to [40,400]"
+    # Saved value is clamped to [40, 500].
+    assert "Math.min(500, Math.max(40, mtRaw))" in settings_src, "max_turns must clamp to [40,500]"
+    # 76cf8bda — Auto-continue (/loop) dropdown persists loop_enabled per project.
+    assert "exec-loop_enabled-" in settings_src, "Auto-continue dropdown missing"
     # Checkpoint slider ceiling raised 100 -> 200 to match.
     assert 'id="exec-context_threshold-${projectId}" type="range" min="10" max="200"' in settings_src, (
         "checkpoint slider ceiling must be raised to 200"

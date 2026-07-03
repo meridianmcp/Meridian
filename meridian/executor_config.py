@@ -18,6 +18,8 @@ EXECUTOR_CONFIG_KEYS = (
     "context_threshold",
     "isolation",
     "max_turns",  # d2c47f43 — /goal "Stop after N turns" ceiling (default 200)
+    "loop_enabled",  # 76cf8bda — per-project /loop override: "workspace"|True|False
+    "checkpoint_turns",  # 76cf8bda — checkpoint() cadence hint (ceiling matches max_turns)
 )
 
 EXECUTOR_CREDENTIALS_RULE = (

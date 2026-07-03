@@ -5119,6 +5119,90 @@ def test_load_handoff_tool_returns_stored_handoff(tmp_path):
         asyncio.run(db.close())
 
 
+# ---------------------------------------------------------------------------
+# 76cf8bda — /loop auto-continue: workspace default + project override + max_turns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_loop_enabled_default_roundtrip(db):
+    """workspace_settings.loop_enabled_default defaults True and is updatable."""
+    ws = await db_module.get_workspace_settings(db)
+    assert ws["loop_enabled_default"] is True
+    ws = await db_module.update_workspace_settings(db, loop_enabled_default=False)
+    assert ws["loop_enabled_default"] is False
+    assert (await db_module.get_workspace_settings(db))["loop_enabled_default"] is False
+    ws = await db_module.update_workspace_settings(db, loop_enabled_default=True)
+    assert ws["loop_enabled_default"] is True
+
+
+def test_loop_enabled_from_settings_merge():
+    """Project override wins; 'workspace'/missing defers to the workspace default."""
+    from meridian import handoff as h
+    ws_on = {"loop_enabled_default": True}
+    ws_off = {"loop_enabled_default": False}
+    # Explicit bool override ignores the workspace default.
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": True}}, ws_off) is True
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": False}}, ws_on) is False
+    # String override forms.
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "off"}}, ws_on) is False
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "on"}}, ws_off) is True
+    # 'workspace' (or a missing key) defers to the workspace default — never falsy.
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "workspace"}}, ws_on) is True
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "workspace"}}, ws_off) is False
+    assert h._loop_enabled_from_settings({"executor_config": {}}, ws_off) is False
+    # No workspace settings at all → default True.
+    assert h._loop_enabled_from_settings(None, None) is True
+
+
+def test_max_turns_from_settings_clamps_to_500():
+    from meridian import handoff as h
+    assert h._max_turns_from_settings({"executor_config": {"max_turns": 999}}) == 500
+    assert h._max_turns_from_settings({"executor_config": {"max_turns": 300}}) == 300
+    assert h._max_turns_from_settings({"executor_config": {"max_turns": 0}}) == 200
+    assert h._max_turns_from_settings(None) == 200
+
+
+def test_build_quick_start_goal_loop_prefix():
+    from meridian import handoff as h
+    # Empty-board path.
+    assert h._build_quick_start_goal([], loop_enabled=False).startswith("/goal ")
+    assert h._build_quick_start_goal([], loop_enabled=True).startswith("/loop /goal ")
+    # Items path.
+    items = [{"id": "abc123", "version": None}]
+    assert h._build_quick_start_goal(items, loop_enabled=False).startswith("/goal ")
+    assert h._build_quick_start_goal(items, loop_enabled=True).startswith("/loop /goal ")
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_prepends_loop_when_workspace_default_on(db, tmp_path):
+    """The /goal in a generated handoff carries a leading /loop when the effective
+    loop flag (workspace default here) is on, and omits it when off."""
+    from meridian import handoff as handoff_module
+    p = await db_module.create_project(db, "loop-proj")
+    await db_module.add_sprint_item(db, p["id"], "v1", "an item")
+    await db_module.update_workspace_settings(db, loop_enabled_default=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal ")
+    # Workspace default OFF (and no project override) → no /loop.
+    await db_module.update_workspace_settings(db, loop_enabled_default=False)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    stored2 = await db_module.get_pending_goal(db, p["id"])
+    assert stored2.startswith("/goal ") and not stored2.startswith("/loop")
+
+
+def test_workspace_settings_http_loop_default(client):
+    """PATCH /workspace/settings forwards loop_enabled_default end-to-end (the
+    path the dashboard Workspace toggle uses)."""
+    assert client.get("/workspace/settings").json()["loop_enabled_default"] is True
+    r = client.patch("/workspace/settings", json={"loop_enabled_default": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["loop_enabled_default"] is False
+    assert client.get("/workspace/settings").json()["loop_enabled_default"] is False
+    client.patch("/workspace/settings", json={"loop_enabled_default": True})
+    assert client.get("/workspace/settings").json()["loop_enabled_default"] is True
+
+
 def test_queue_session_http_roundtrip(client):
     pid = client.post("/projects", json={"name": "qhttp"}).json()["id"]
     assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None

@@ -651,6 +651,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     handoff_template TEXT,
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
+    loop_enabled_default INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -9177,7 +9178,8 @@ async def get_workspace_settings(
     _cols = (
         "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
         "log_task_sprint_nudge_threshold, handoff_template, "
-        "execution_mode_default, code_intel_enabled_default, updated_at "
+        "execution_mode_default, code_intel_enabled_default, "
+        "loop_enabled_default, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -9198,6 +9200,9 @@ async def get_workspace_settings(
     # projects keep their own built-in default); a value ⇒ seed new projects.
     _emode = data.get("execution_mode_default")
     _ci_default = data.get("code_intel_enabled_default")
+    # 76cf8bda — /loop auto-continue workspace default. Missing column/row ⇒
+    # True (Meridian sessions default to auto-continue); a stored 0 turns it off.
+    _loop_default = data.get("loop_enabled_default")
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -9208,6 +9213,7 @@ async def get_workspace_settings(
         "handoff_template": data.get("handoff_template"),
         "execution_mode_default": _emode if _emode in ("autonomous", "interactive") else None,
         "code_intel_enabled_default": (None if _ci_default is None else bool(_ci_default)),
+        "loop_enabled_default": (True if _loop_default is None else bool(_loop_default)),
         "updated_at": data.get("updated_at"),
     }
 
@@ -9222,6 +9228,7 @@ async def update_workspace_settings(
     handoff_template: str | None = None,
     execution_mode_default: str | None = None,
     code_intel_enabled_default: "bool | int | str | None" = None,
+    loop_enabled_default: "bool | int | str | None" = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -9268,6 +9275,10 @@ async def update_workspace_settings(
             params.append(None)
         else:
             params.append(1 if code_intel_enabled_default and code_intel_enabled_default not in ("0", "false", "False") else 0)
+    if loop_enabled_default is not None:
+        # 76cf8bda — /loop auto-continue default. Truthy/1 → 1, falsey/0 → 0.
+        updates.append("loop_enabled_default = ?")
+        params.append(1 if loop_enabled_default and loop_enabled_default not in ("0", "false", "False") else 0)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

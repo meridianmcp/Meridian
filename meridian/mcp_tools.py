@@ -441,13 +441,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "execution_mode_default ('autonomous'|'interactive', '' to clear) and "
         "code_intel_enabled_default (bool) are cascade defaults seeded onto NEW "
         "projects in this workspace (existing projects are unchanged). "
+        "loop_enabled_default (bool) is the workspace default for /loop auto-continue "
+        "that projects inherit when their loop_enabled is 'workspace'. "
         "Pass an empty string to revert a field to the server default.",
      "inputSchema": {"type": "object", "properties": {
          "hitl_auto_answer_default": {"type": "boolean"},
          "sprint_name_default": {"type": "string"},
          "handoff_template": {"type": "string"},
          "execution_mode_default": {"type": "string", "description": "Seed new projects' execution mode: 'autonomous', 'interactive', or '' to clear."},
-         "code_intel_enabled_default": {"type": "boolean", "description": "Seed new projects' code-intel toggle."}},
+         "code_intel_enabled_default": {"type": "boolean", "description": "Seed new projects' code-intel toggle."},
+         "loop_enabled_default": {"type": "boolean", "description": "Workspace default for /loop auto-continue; projects with loop_enabled='workspace' inherit it. True = sessions auto-continue."}},
          "required": []}},
     {"name": "add_workspace_sprint_item", "description":
         "Add an item to the workspace-level personal backlog — a cross-project board NOT "
