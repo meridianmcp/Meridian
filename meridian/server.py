@@ -1710,6 +1710,21 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
             expired = delta.total_seconds() <= 0
         except ValueError:
             pass
+    # 509d9de1 — free/trial users who haven't created a project yet have no
+    # inactivity_expires_at, so the banner showed "limited time" with no number.
+    # Fall back to a 30-day window anchored on trial_started_at (or the tenant's
+    # created_at) so an actual day count always renders. Display-only.
+    if days_remaining is None and plan in ("free", "trial"):
+        _anchor = tenant.get("trial_started_at") or tenant.get("created_at")
+        if _anchor:
+            try:
+                _anchor_dt = datetime.strptime(
+                    str(_anchor)[:19], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+                _elapsed = (datetime.now(timezone.utc) - _anchor_dt).days
+                days_remaining = max(0, 30 - _elapsed)
+            except (ValueError, TypeError):
+                pass
     # G2.10 — internal tenants never see the "expired" / "days remaining"
     # banner. The lifecycle jobs already skip them, but a positive UX cue
     # is cleaner than leaving the expired flag set with no consequence.
