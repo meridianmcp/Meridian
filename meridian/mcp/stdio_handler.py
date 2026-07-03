@@ -821,6 +821,26 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="get_document_structure",
+                description=(
+                    "13462df2 — return the heading outline of a Word .docx WITHOUT "
+                    "ingesting it as a note. Parsed server-side (stdlib only, no "
+                    "python-docx, no persistent index); returns paragraph_count, "
+                    "heading_count, and an ordered list of headings (level, text, "
+                    "para_id) — a fast structural map of a thesis chapter / spec."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to a server-accessible .docx file.",
+                        },
+                    },
+                    "required": ["file_path"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1694,7 +1714,7 @@ def build_mcp_server():
                 "list_hitl_requests", "answer_hitl", "dismiss_hitl",
                 "update_md_section",
                 "list_sessions",
-                "add_note", "ingest_document", "get_notes", "read_note", "delete_note",
+                "add_note", "ingest_document", "get_document_structure", "get_notes", "read_note", "delete_note",
                 "add_workspace_note", "get_workspace_notes",
                 "pin_workspace_decision", "get_workspace_decisions",
             ):

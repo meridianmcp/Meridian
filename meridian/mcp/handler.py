@@ -1718,6 +1718,21 @@ async def _handle_notes_decisions(
             )
         except (ValueError, DocExtractionError, FileNotFoundError) as exc:
             return {"error": str(exc)}
+    if name == "get_document_structure":
+        # 13462df2 — stateless docs_intel: heading outline of a server-side .docx
+        # (no sidecar index). Same server-side file access as ingest_document
+        # (self-hosted / tunnel).
+        validate_input_size(args.get("file_path"), "document file_path", 2_000)
+        fp = args.get("file_path")
+        if not fp:
+            return {"error": "file_path is required"}
+        try:
+            from ..docs_intel import document_outline  # noqa: PLC0415
+            return document_outline(fp)
+        except FileNotFoundError:
+            return {"error": f"file not found: {fp}"}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not parse document: {exc}"}
     if name == "capture_insight":
         # db9edba3 — one-call insight capture for planning (claude.ai) sessions:
         # persists a kind='insight' note (prominent in the dashboard + surfaced in

@@ -79,6 +79,28 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     return paragraphs
 
 
+def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
+    """13462df2 — stateless heading outline of a .docx (path or raw bytes). No
+    sidecar index: a pure parse. Returns ``paragraph_count`` + ``heading_count``
+    + an ordered ``headings`` list (level/text/para_id) — the queryable document
+    structure docs_intel exposes without building a persistent index."""
+    paras = parse_docx(source)
+    headings = [
+        {
+            "level": _heading_level(p.get("style")),
+            "text": p.get("text", ""),
+            "para_id": p.get("para_id"),
+        }
+        for p in paras
+        if _is_heading(p.get("style"))
+    ]
+    return {
+        "paragraph_count": len(paras),
+        "heading_count": len(headings),
+        "headings": headings,
+    }
+
+
 def _connect(index_db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(index_db_path)
     conn.execute(

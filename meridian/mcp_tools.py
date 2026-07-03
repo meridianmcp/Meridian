@@ -30,6 +30,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
     "ingest_document": 'ingest_document(project_id="abc-123", file_path="docs/spec.docx", tags="spec")  # or, for a PDF: ingest_document(project_id="abc-123", content="<text you extracted>", title="Q3 report", source="https://example.com/q3.pdf")',
+    "get_document_structure": 'get_document_structure(file_path="thesis/chapter1.docx")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -297,6 +298,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "source": {"type": "string", "description": "Provenance URL/path stored on the note. Defaults to file_path."},
          "tags": {"type": "string", "description": "Comma-separated tags."}},
          "required": []}},
+    {"name": "get_document_structure", "description":
+        "13462df2 — return the heading outline of a Word .docx WITHOUT ingesting "
+        "it as a note. Meridian parses the .docx server-side (stdlib only, no "
+        "python-docx, no persistent index) and returns paragraph_count, "
+        "heading_count, and an ordered list of headings (level, text, para_id) — a "
+        "fast structural map of a thesis chapter / spec before deciding what to "
+        "read or ingest. Pass file_path to a server-accessible .docx.",
+     "inputSchema": {"type": "object", "properties": {
+         "file_path": {"type": "string", "description": "Path to a server-accessible .docx file."}},
+         "required": ["file_path"]}},
     {"name": "capture_insight", "description":
         "Save a key takeaway from a planning (claude.ai) conversation in one call — "
         "persists a prominent kind='insight' note that's searchable, filterable, and "

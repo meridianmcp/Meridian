@@ -50,6 +50,42 @@ def test_parse_docx_extracts_paraids_styles_and_joined_text():
     assert paras[1]["text"] == "Meridian coordinates AI sessions."
 
 
+def test_document_outline_headings():
+    # 13462df2 — stateless heading outline (no sidecar index).
+    out = docs_intel.document_outline(_synthetic_docx())
+    assert out["paragraph_count"] == 4
+    assert out["heading_count"] == 2
+    assert [h["level"] for h in out["headings"]] == [1, 2]
+    assert out["headings"][0]["text"] == "Introduction"
+    assert out["headings"][0]["para_id"] == "00000001"
+
+
+def test_get_document_structure_mcp_tool(tmp_path):
+    # 13462df2 — exposed as an MCP tool (server-side file path, like ingest_document).
+    import asyncio
+    from meridian import server as mh
+    from meridian import db as db_module
+
+    docx_path = tmp_path / "chapter.docx"
+    docx_path.write_bytes(_synthetic_docx())
+    db = asyncio.run(db_module.init_db(":memory:"))
+    try:
+        res = asyncio.run(mh._dispatch_mcp_tool(
+            "get_document_structure", {"file_path": str(docx_path)}, db, str(tmp_path)))
+        assert res["heading_count"] == 2 and res["paragraph_count"] == 4
+        # Missing file -> error dict, never a crash.
+        err = asyncio.run(mh._dispatch_mcp_tool(
+            "get_document_structure",
+            {"file_path": str(tmp_path / "nope.docx")}, db, str(tmp_path)))
+        assert "error" in err
+        # Missing file_path -> error.
+        err2 = asyncio.run(mh._dispatch_mcp_tool(
+            "get_document_structure", {}, db, str(tmp_path)))
+        assert "error" in err2
+    finally:
+        asyncio.run(db.close())
+
+
 def test_index_and_navigate_by_paraid(tmp_path):
     db = str(tmp_path / "doc.idx.sqlite")
     summary = docs_intel.index_docx(_synthetic_docx(), db)
