@@ -15,13 +15,18 @@ import "./dashboard-files";
 import "./dashboard-rewind";
 // ff8ff615 — Preact Code Intel panel (layered package DAG, replaces ECharts circles).
 import { mountCodeIntelPanel } from "./components/CodeIntelPanel";
+import { createStore } from "zustand/vanilla";
 ﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
 
 // const _PLAN_LABELS -- moved to dashboard-utils.js
 
-const state: {
+// 88e66aa9 — Phase 1: back window.state with a Zustand (vanilla) store so all
+// dashboard state flows through one store. UI panels are untouched — they still
+// read/write window.state.xxx; a Proxy bridges the legacy object API to the
+// store (reassignments call setState; in-place mutations share the same refs).
+interface DashboardState {
   projects: any[];
   tabs: any[];
   activeTab: any;
@@ -30,30 +35,44 @@ const state: {
   serverConfig: { server_url: string; host: string; port: number; version: string };
   activeWorkspaceTenantId: any;
   [k: string]: any;
-} = {
+}
 
+const _initialDashboardState: DashboardState = {
   projects: [],
-
-  tabs: [], // [{id, project}]
-
+  tabs: [],            // [{id, project}]
   activeTab: null,
-
-  panels: {}, // tabId -> { ws, taskCache, sessionName, goalRaw, goalIsJson }
-
+  panels: {},          // tabId -> { ws, taskCache, sessionName, goalRaw, goalIsJson }
   apiKeyConfigured: false,
-
   // v0.6.5 — server runtime config fetched from /config on startup.
-
   serverConfig: { server_url: '', host: '', port: 0, version: '' },
-
-  // workspace switcher — tenant_id of the currently active workspace (null = own)
-
+  // workspace switcher — tenant_id of the active workspace (null = own)
   activeWorkspaceTenantId: null,
-
 };
 
-// Expose state on window so esbuild IIFE modules can access it via window.state
+const dashboardStore = createStore<DashboardState>(() => ({ ..._initialDashboardState }));
+
+// Proxy bridging the legacy `state.xxx` object API to the Zustand store.
+const state: DashboardState = new Proxy(_initialDashboardState, {
+  get: (_t, prop) => (dashboardStore.getState() as any)[prop as any],
+  set: (_t, prop, value) => { dashboardStore.setState({ [prop as any]: value } as any); return true; },
+  has: (_t, prop) => (prop as any) in dashboardStore.getState(),
+  deleteProperty: (_t, prop) => {
+    const next: any = { ...dashboardStore.getState() };
+    delete next[prop as any];
+    dashboardStore.setState(next, true);
+    return true;
+  },
+  ownKeys: () => Reflect.ownKeys(dashboardStore.getState()),
+  getOwnPropertyDescriptor: (_t, prop) => ({
+    enumerable: true, configurable: true,
+    value: (dashboardStore.getState() as any)[prop as any],
+  }),
+}) as DashboardState;
+
+// Expose state (+ the underlying store, for later slice migration) on window so
+// esbuild IIFE modules can access it via window.state.
 window.state = state;
+(window as any).dashboardStore = dashboardStore;
 
 
 

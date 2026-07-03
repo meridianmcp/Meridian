@@ -7414,10 +7414,34 @@ ${n2.tags || ""}`.toLowerCase();
     R(/* @__PURE__ */ u3(CodeIntelPanel, { ...props }), container);
   }
 
+  // node_modules/zustand/esm/vanilla.mjs
+  var createStoreImpl = (createState) => {
+    let state2;
+    const listeners = /* @__PURE__ */ new Set();
+    const setState = (partial, replace) => {
+      const nextState = typeof partial === "function" ? partial(state2) : partial;
+      if (!Object.is(nextState, state2)) {
+        const previousState = state2;
+        state2 = (replace != null ? replace : typeof nextState !== "object" || nextState === null) ? nextState : Object.assign({}, state2, nextState);
+        listeners.forEach((listener) => listener(state2, previousState));
+      }
+    };
+    const getState = () => state2;
+    const getInitialState = () => initialState;
+    const subscribe = (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    };
+    const api3 = { setState, getState, getInitialState, subscribe };
+    const initialState = state2 = createState(setState, getState, api3);
+    return api3;
+  };
+  var createStore = ((createState) => createState ? createStoreImpl(createState) : createStoreImpl);
+
   // meridian/static/dashboard.ts
   var TABS_KEY = "meridian.openTabs";
   var ACTIVE_PROJECT_KEY = "meridian.activeProject";
-  var state = {
+  var _initialDashboardState = {
     projects: [],
     tabs: [],
     // [{id, project}]
@@ -7427,10 +7451,32 @@ ${n2.tags || ""}`.toLowerCase();
     apiKeyConfigured: false,
     // v0.6.5 — server runtime config fetched from /config on startup.
     serverConfig: { server_url: "", host: "", port: 0, version: "" },
-    // workspace switcher — tenant_id of the currently active workspace (null = own)
+    // workspace switcher — tenant_id of the active workspace (null = own)
     activeWorkspaceTenantId: null
   };
+  var dashboardStore = createStore(() => ({ ..._initialDashboardState }));
+  var state = new Proxy(_initialDashboardState, {
+    get: (_t, prop) => dashboardStore.getState()[prop],
+    set: (_t, prop, value) => {
+      dashboardStore.setState({ [prop]: value });
+      return true;
+    },
+    has: (_t, prop) => prop in dashboardStore.getState(),
+    deleteProperty: (_t, prop) => {
+      const next = { ...dashboardStore.getState() };
+      delete next[prop];
+      dashboardStore.setState(next, true);
+      return true;
+    },
+    ownKeys: () => Reflect.ownKeys(dashboardStore.getState()),
+    getOwnPropertyDescriptor: (_t, prop) => ({
+      enumerable: true,
+      configurable: true,
+      value: dashboardStore.getState()[prop]
+    })
+  });
   window.state = state;
+  window.dashboardStore = dashboardStore;
   async function hideHostedAdminControls() {
     const toHide = [
       "#restart-server-btn",
