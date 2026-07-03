@@ -4152,6 +4152,15 @@ async def _start_session_composite(
                     if _c_first else ""
                 )
             )
+        # dc462628 — surface GitHub connection status so executors know upfront
+        # whether search_code / read_file / etc. are usable for this project.
+        _c_github_repo = (_c_project or {}).get("github_repo") or ""
+        _c_github_branch = (_c_project or {}).get("github_branch") or "main"
+        _c_github_status = (
+            f"connected (repo: {_c_github_repo}, branch: {_c_github_branch})"
+            if _c_github_repo
+            else "not connected — GitHub tools (search_code, read_file, etc.) will error until you connect a repo in Settings"
+        )
         _c_payload = {
             "session_id": session["id"],
             "compact": True,
@@ -4161,6 +4170,7 @@ async def _start_session_composite(
             "execute_immediately_signal": _c_execute_signal,
             "hitl_auto_answer_mode": _c_hitl_mode,
             "hitl_auto_answer_directive": _hitl_mode_directive(_c_hitl_mode),
+            "github_status": _c_github_status,
             "sprint": (str(_c_sprint)[:300] if _c_sprint else None),
             "sprint_version": scoped_version,
             "sprint_summary": {
@@ -5511,7 +5521,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "search_code",
-            "description": "Search code in the project's connected GitHub repository using GitHub code search.",
+            "description": "Search code in the project's connected GitHub repository using GitHub code search. Returns helpful error if no GitHub repo is connected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

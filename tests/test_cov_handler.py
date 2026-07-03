@@ -474,6 +474,24 @@ def test_dispatch_github_tool_no_repo_connected():
     assert out["error"] == "no_github_repo"
 
 
+def test_dispatch_github_tool_search_code_no_repo_connected():
+    """dc462628 — search_code hits the shared no-repo guard and returns a clear
+    error rather than a misleading empty result (removes the 'false confidence'
+    the tool description now documents)."""
+    import meridian.db as db_module
+
+    tenant = {"id": "t", "plan": "pro", "github_pat": db_module.encrypt_field("ghp_fake")}
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "gh-search-proj"))
+        out = _run(mh._dispatch_github_tool(
+            "search_code", {"project_id": proj["id"], "query": "foo"}, tenant, db,
+        ))
+    finally:
+        _run(db.close())
+    assert out["error"] == "no_github_repo"
+
+
 def test_dispatch_github_tool_unknown_name():
     import meridian.db as db_module
 
