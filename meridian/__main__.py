@@ -29,6 +29,16 @@ import socket
 import subprocess
 import sys
 
+# Allow running as `python meridian --tunnel` (script mode) in addition to
+# the canonical `python -m meridian --tunnel` (module mode).
+# Without this, all relative imports (from .tunnel_client import ...) raise
+# "attempted relative import with no known parent package".
+if __package__ is None or __package__ == "":
+    _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _pkg_dir not in sys.path:
+        sys.path.insert(0, _pkg_dir)
+    __package__ = "meridian"
+
 
 def _kill_port(port: int) -> None:
     """Kill any process listening on the given port before starting.
