@@ -11645,6 +11645,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
       ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? "s" : ""}</span>` : ""}
     </div>`;
+      let _docsCount = 0;
+      try {
+        const _dp = await api(`/projects/${projectId}/notes?paginate=true&limit=200`);
+        _docsCount = (_dp && _dp.notes || []).filter((n2) => String(n2.note_kind || "").toLowerCase() === "document").length;
+      } catch (_2) {
+      }
+      const _cwds = repoPaths.map((rp) => typeof rp === "string" ? rp : rp.cwd || "").filter(Boolean);
+      html += `<div style="margin-bottom:16px;padding:10px 12px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px">
+      <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Resources</div>
+      <div style="font-size:11px;color:var(--text);line-height:1.7">
+        <div>Codebases: <b>${_cwds.length}</b> repo path${_cwds.length !== 1 ? "s" : ""}${_cwds.length ? ` \u2014 ${escapeHtml(_cwds.join(", "))}` : ' <span style="color:var(--muted)">(add in Settings \u2192 Executor Config)</span>'}</div>
+        <div>Documents: <b>${_docsCount}</b> ingested <span style="color:var(--muted)">(kind=document)</span></div>
+      </div>
+    </div>`;
       html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
       html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
       if (repoPaths.length) {

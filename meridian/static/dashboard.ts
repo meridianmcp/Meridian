@@ -7117,6 +7117,24 @@ async function loadCodeIntelTab(projectId: any) {
       ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? 's' : ''}</span>` : ''}
     </div>`;
 
+    // 3e28f593 — Resources: unified codebase + documents summary so the scattered
+    // repo-path / document fields have one coherent view (which repo(s) this
+    // project indexes + how many ingested documents).
+    let _docsCount = 0;
+    try {
+      const _dp = await api(`/projects/${projectId}/notes?paginate=true&limit=200`);
+      _docsCount = (((_dp && _dp.notes) || []) as any[])
+        .filter(n => String(n.note_kind || '').toLowerCase() === 'document').length;
+    } catch (_) { /* docs count is best-effort */ }
+    const _cwds = repoPaths.map((rp: any) => typeof rp === 'string' ? rp : (rp.cwd || '')).filter(Boolean);
+    html += `<div style="margin-bottom:16px;padding:10px 12px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px">
+      <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Resources</div>
+      <div style="font-size:11px;color:var(--text);line-height:1.7">
+        <div>Codebases: <b>${_cwds.length}</b> repo path${_cwds.length !== 1 ? 's' : ''}${_cwds.length ? ` — ${escapeHtml(_cwds.join(', '))}` : ' <span style="color:var(--muted)">(add in Settings → Executor Config)</span>'}</div>
+        <div>Documents: <b>${_docsCount}</b> ingested <span style="color:var(--muted)">(kind=document)</span></div>
+      </div>
+    </div>`;
+
     // ff8ff615 — the Preact CodeIntelPanel renders the layered package DAG +
     // zoom + Generate Map into this mount point (mounted after body.innerHTML).
     html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
