@@ -7812,11 +7812,32 @@ def test_install_mcp_page(client):
 
 
 def test_landing_page_footer_uses_meridian_email(client):
-    """Landing page footer contact uses hello@usemeridian.us, not personal email."""
+    """71c70308 — landing footer contact is JS-obfuscated: it assembles to
+    hello@usemeridian.us from data attributes (never plaintext) and is never a
+    personal email."""
     r = client.get("/")
     assert r.status_code == 200
-    assert "hello@usemeridian.us" in r.text
+    assert 'data-user="hello"' in r.text
+    assert 'data-domain="usemeridian.us"' in r.text
+    # The full address must NOT appear as plaintext / mailto in served HTML.
+    assert "mailto:hello@usemeridian.us" not in r.text
+    assert "hello@usemeridian.us" not in r.text
     assert "ajc3xc@" not in r.text  # no personal emails in landing page
+
+
+def test_landing_page_anti_solicitation_hardening(client):
+    """71c70308 — noai/noarchive meta, anti-solicitation footer notice, and a
+    honeypot trap on the landing page; robots.txt blocks AI/LLM crawlers."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "noai" in r.text and "noarchive" in r.text
+    assert "does not accept unsolicited" in r.text
+    assert "hp-trap" in r.text
+    rb = client.get("/robots.txt")
+    assert rb.status_code == 200
+    assert "GPTBot" in rb.text and "ClaudeBot" in rb.text
+    assert "Google-Extended" in rb.text
+    assert "Disallow: /" in rb.text
 
 
 def test_auth_login_page_has_google_button(client, monkeypatch):

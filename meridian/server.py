@@ -1269,7 +1269,22 @@ async def landing_page(request: Request) -> HTMLResponse:
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
 async def robots_txt() -> str:
-    return "User-agent: *\nAllow: /\nSitemap: https://usemeridian.us/sitemap.xml"
+    # 71c70308 — search crawlers welcome; AI/LLM training + scraping crawlers are
+    # disallowed. Compliance is voluntary, but this documents intent and the
+    # well-behaved ones honor it. Pairs with the noai/noarchive landing meta tags.
+    _ai_bots = (
+        "GPTBot", "OAI-SearchBot", "ChatGPT-User", "ClaudeBot", "anthropic-ai",
+        "Claude-Web", "CCBot", "Google-Extended", "PerplexityBot", "Amazonbot",
+        "Bytespider", "meta-externalagent", "Applebot-Extended", "cohere-ai",
+        "Diffbot", "ImagesiftBot", "Omgilibot", "FriendlyCrawler",
+    )
+    blocks = "\n\n".join(f"User-agent: {b}\nDisallow: /" for b in _ai_bots)
+    return (
+        "# Search crawlers welcome; AI/LLM training crawlers are not (71c70308).\n"
+        "User-agent: *\nAllow: /\n\n"
+        f"{blocks}\n\n"
+        "Sitemap: https://usemeridian.us/sitemap.xml\n"
+    )
 
 
 @app.get("/favicon.ico")
