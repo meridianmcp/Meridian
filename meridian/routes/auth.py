@@ -122,6 +122,7 @@ async def auth_magic_request(request: Request):
 
 
 @router.get("/auth/magic/verify")
+@_rate_limit("10/minute")
 async def auth_magic_verify(request: Request, token: str = ""):
     """v0.9 — consume a magic-link token, create a session, redirect.
 

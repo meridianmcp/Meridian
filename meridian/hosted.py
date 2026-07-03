@@ -2483,6 +2483,38 @@ def _magic_rate_limited(email: str) -> bool:
     return False
 
 
+# 925909aa — persistent per-IP signup limit (defence in depth beyond the slowapi
+# 5/min IP window; survives restarts via the signup_attempts table).
+_SIGNUP_IP_WINDOW_HOURS = 24
+_SIGNUP_IP_MAX_PER_WINDOW = 20
+
+
+async def _verify_turnstile(token: object) -> bool:
+    """925909aa — verify a Cloudflare Turnstile token. Returns True (allow) when
+    no ``TURNSTILE_SECRET_KEY`` is configured (self-host / dev / tests skip the
+    challenge). When a key IS set, POSTs to Cloudflare's siteverify and returns
+    its success flag; a network error fails OPEN (True) so a Cloudflare outage
+    can never lock everyone out of signup. A configured key with a missing/blank
+    token fails closed (False)."""
+    secret = _cfg("TURNSTILE_SECRET_KEY", "") or ""
+    if not secret:
+        return True
+    tok = token.strip() if isinstance(token, str) else ""
+    if not tok:
+        return False
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=8) as http:
+            resp = await http.post(
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                data={"secret": secret, "response": tok},
+            )
+            data = resp.json()
+        return bool(data.get("success"))
+    except Exception:  # noqa: BLE001 — fail open on Cloudflare/network error
+        return True
+
+
 async def auth_magic_request(request: Request):
     """v0.9 — POST /auth/magic.
 
@@ -2504,6 +2536,17 @@ async def auth_magic_request(request: Request):
     if not email or "@" not in email or len(email) > 320:
         raise HTTPException(status_code=400, detail="valid email required")
 
+    # 925909aa — reject known disposable/throwaway domains. Generic 200 so the
+    # rejection reason is never revealed (no enumeration signal).
+    from .email_blocklist import is_disposable_email
+    if is_disposable_email(email):
+        return JSONResponse({"status": "ok", "message": "check your inbox"})
+
+    # 925909aa — Cloudflare Turnstile: enforced only when TURNSTILE_SECRET_KEY is
+    # set (prod). Self-host / dev / tests have no key → skipped (allowed).
+    if not await _verify_turnstile(body.get("turnstile_token")):
+        return JSONResponse({"status": "ok", "message": "check your inbox"})
+
     if _magic_rate_limited(email):
         # Always return 200 — don't leak whether the email is registered
         # or whether they're rate-limited.
@@ -2512,6 +2555,25 @@ async def auth_magic_request(request: Request):
         )
 
     db = request.app.state.db
+
+    # 925909aa — persistent per-IP signup limit (survives restarts; complements
+    # the slowapi 5/min window). Salted hashes only — never store raw IP/email.
+    try:
+        _ip = (request.client.host if request.client else "") or ""
+        _salt = _cfg("MERIDIAN_HASH_SALT", "meridian-signup") or "meridian-signup"
+        _ip_hash = hashlib.sha256(f"{_salt}:{_ip}".encode()).hexdigest()
+        _since = (
+            datetime.now(timezone.utc) - timedelta(hours=_SIGNUP_IP_WINDOW_HOURS)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        if await db_module.count_recent_signup_attempts(
+            db, _ip_hash, _since
+        ) >= _SIGNUP_IP_MAX_PER_WINDOW:
+            return JSONResponse({"status": "ok", "message": "check your inbox"})
+        _email_hash = hashlib.sha256(f"{_salt}:{email}".encode()).hexdigest()
+        await db_module.record_signup_attempt(db, _ip_hash, _email_hash)
+    except Exception:  # noqa: BLE001 — never block signup on the limiter failing
+        pass
+
     # If a fresh unused token exists, reuse the side-effect (email is
     # already in their inbox) — don't insert another row.
     existing = await db_module.get_active_magic_token(db, email)

@@ -838,6 +838,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_quality_gates(db)
     await _migrate_parallel_primitives(db)
     await _migrate_project_status_priority(db)
+    await _migrate_signup_attempts(db)
     return db
 
 
@@ -9309,6 +9310,31 @@ async def store_magic_token(
     )
     await db.commit()
     return {"id": tid, "email": email.lower(), "expires_at": expires_at}
+
+
+async def record_signup_attempt(
+    db: aiosqlite.Connection, ip_hash: str, email_hash: str
+) -> None:
+    """925909aa — log one magic-link signup attempt keyed by salted IP/email
+    hashes, for persistent per-IP rate limiting (survives restarts)."""
+    await db.execute(
+        "INSERT INTO signup_attempts (id, ip_hash, email_hash) VALUES (?, ?, ?)",
+        (_new_id(), ip_hash, email_hash),
+    )
+    await db.commit()
+
+
+async def count_recent_signup_attempts(
+    db: aiosqlite.Connection, ip_hash: str, since_iso: str
+) -> int:
+    """Count signup attempts from ``ip_hash`` at or after ``since_iso``
+    (``YYYY-MM-DD HH:MM:SS`` UTC)."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM signup_attempts WHERE ip_hash = ? AND created_at >= ?",
+        (ip_hash, since_iso),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def consume_magic_token(

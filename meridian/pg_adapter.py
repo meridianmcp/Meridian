@@ -1248,6 +1248,20 @@ async def _migrate_pg_project_status_priority(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_signup_attempts(conn: PostgresConnection) -> None:
+    """925909aa — persistent per-IP signup-attempt log (mirrors the SQLite
+    signup_attempts table) for magic-link abuse limiting. Salted hashes only."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS signup_attempts ("
+        "    id TEXT PRIMARY KEY,"
+        "    ip_hash TEXT NOT NULL,"
+        "    email_hash TEXT NOT NULL,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_signup_attempts_ip ON signup_attempts(ip_hash, created_at);"
+    )
+
+
 async def _migrate_pg_notes_priority(conn: PostgresConnection) -> None:
     """Sprint-4 — project_notes.priority: high/normal/low ranking for generate_handoff."""
     await conn.executescript(
@@ -2263,4 +2277,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_blog_posts,
     _migrate_pg_sprint_item_quality_gates,
     _migrate_pg_parallel_primitives,
+    _migrate_pg_signup_attempts,
 )
