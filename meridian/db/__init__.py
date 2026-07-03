@@ -809,6 +809,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_sprint_board(db)
     await _migrate_registered_hostnames(db)
     await _migrate_queued_session(db)
+    await _migrate_pending_goal(db)
     await _migrate_parallel_safety(db)
     await _migrate_changelog_entries(db)
     await _migrate_agent_instructions(db)
@@ -9425,6 +9426,53 @@ async def pop_queued_session(
     if goal:
         await db.execute(
             "UPDATE projects SET queued_session = NULL WHERE id = ?", (project_id,)
+        )
+        await db.commit()
+    return goal
+
+
+# ---------------------------------------------------------------------------
+# 5efe254b — trusted handoff channel (projects.pending_goal)
+# ---------------------------------------------------------------------------
+
+
+async def set_pending_goal(
+    db: aiosqlite.Connection, project_id: str, goal: str | None
+) -> None:
+    """Persist the handoff /goal so the next start_session can surface it through
+    a trusted MCP tool result (keyed on project_id) instead of a copy-pasted,
+    spoofable chat string. Empty/None clears it. Read-once via pop_pending_goal."""
+    await db.execute(
+        "UPDATE projects SET pending_goal = ? WHERE id = ?",
+        ((goal or None), project_id),
+    )
+    await db.commit()
+
+
+async def get_pending_goal(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the stored handoff /goal, or None when nothing is pending."""
+    async with db.execute(
+        "SELECT pending_goal FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    val = row["pending_goal"] if isinstance(row, dict) else row[0]
+    return val or None
+
+
+async def pop_pending_goal(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the pending /goal and clear it (read-once) so start_session
+    surfaces it exactly once and a stale goal never resurfaces in a later
+    session."""
+    goal = await get_pending_goal(db, project_id)
+    if goal:
+        await db.execute(
+            "UPDATE projects SET pending_goal = NULL WHERE id = ?", (project_id,)
         )
         await db.commit()
     return goal

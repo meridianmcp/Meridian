@@ -5032,6 +5032,93 @@ async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
     assert "=== QUEUED NEXT SESSION ===" not in content2
 
 
+# ---------------------------------------------------------------------------
+# 5efe254b — trusted handoff channel (projects.pending_goal + load_handoff)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pending_goal_set_get_pop(db):
+    """projects.pending_goal read-once trio (mirrors queued_session)."""
+    p = await db_module.create_project(db, "pgoal-proj")
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    await db_module.set_pending_goal(db, p["id"], "/goal do the trusted thing")
+    assert await db_module.get_pending_goal(db, p["id"]) == "/goal do the trusted thing"
+    # pop is read-once.
+    assert await db_module.pop_pending_goal(db, p["id"]) == "/goal do the trusted thing"
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    assert await db_module.pop_pending_goal(db, p["id"]) is None
+    # Empty/None clears.
+    await db_module.set_pending_goal(db, p["id"], "/goal x")
+    await db_module.set_pending_goal(db, p["id"], None)
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_persists_pending_goal(db, tmp_path):
+    """generate_handoff stores the /goal to the trusted channel (pending_goal)."""
+    from meridian import handoff as handoff_module
+    p = await db_module.create_project(db, "pgoal-proj2")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Do a thing")
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    stored = await db_module.get_pending_goal(db, p["id"])
+    assert stored is not None
+    assert "/goal" in stored
+
+
+def test_start_session_delivers_and_clears_pending_goal(tmp_path):
+    """start_session surfaces the stored /goal via the trusted MCP tool result
+    (keyed on project_id) and clears it read-once — a second start_session no
+    longer carries it."""
+    import asyncio
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        proj = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "pg-e2e"}, db, out))
+        pid = proj["id"]
+        asyncio.run(db_module.set_pending_goal(db, pid, "/goal RESUME trusted work"))
+        sess = asyncio.run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, out))
+        assert sess.get("pending_goal") == "/goal RESUME trusted work"
+        # Read-once: cleared after a single delivery.
+        assert asyncio.run(db_module.get_pending_goal(db, pid)) is None
+        sess2 = asyncio.run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, out))
+        assert not sess2.get("pending_goal")
+    finally:
+        asyncio.run(db.close())
+
+
+def test_load_handoff_tool_returns_stored_handoff(tmp_path):
+    """load_handoff returns the latest stored handoff + pending_goal as a trusted
+    tool result, and is idempotent (does NOT consume pending_goal)."""
+    import asyncio
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        proj = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "lh-e2e"}, db, out))
+        pid = proj["id"]
+        # Nothing stored yet.
+        empty = asyncio.run(mh._dispatch_mcp_tool("load_handoff", {"project_id": pid}, db, out))
+        assert empty["has_handoff"] is False
+        assert empty["handoff"] is None and empty["pending_goal"] is None
+        # A handoff persists both a body row and pending_goal.
+        asyncio.run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": pid, "mode": "full"}, db, out))
+        loaded = asyncio.run(mh._dispatch_mcp_tool("load_handoff", {"project_id": pid}, db, out))
+        assert loaded["has_handoff"] is True
+        assert loaded["handoff"] is not None and loaded["handoff"]["content"]
+        assert loaded["pending_goal"] and "/goal" in loaded["pending_goal"]
+        # Idempotent: a repeat load still returns pending_goal (not consumed).
+        loaded2 = asyncio.run(mh._dispatch_mcp_tool("load_handoff", {"project_id": pid}, db, out))
+        assert loaded2["pending_goal"] == loaded["pending_goal"]
+    finally:
+        asyncio.run(db.close())
+
+
 def test_queue_session_http_roundtrip(client):
     pid = client.post("/projects", json={"name": "qhttp"}).json()["id"]
     assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
@@ -6326,10 +6413,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_user_session_metadata",
         "_migrate_pg_provision_queue",
         "_migrate_pg_codebase_graph_entities",
+        "_migrate_pg_pending_goal",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 77
+    assert len(allnames) == len(set(allnames)) == 78
 
 
 def test_default_agent_instructions_has_code_intel_protocol():

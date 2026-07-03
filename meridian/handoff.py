@@ -1786,6 +1786,14 @@ async def generate_handoff(
         await db_module.record_handoff(db, project_id, mode, content, session_id)
     except Exception:  # noqa: BLE001
         pass
+    # 5efe254b — persist the /goal to the trusted channel so the next
+    # start_session can surface it as an MCP tool result (keyed on project_id)
+    # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
+    # guarded so a pre-migration DB never breaks handoff generation.
+    try:
+        await db_module.set_pending_goal(db, project_id, quick_start_goal)
+    except Exception:  # noqa: BLE001
+        pass
     # aef94e4a — auto-save a strategic sprint retrospective (what shipped /
     # patterns / direction) as an insight note surfaced in the planner brief.
     # Skippable on hot paths / tests (skip_ai_summary) and fully guarded so it

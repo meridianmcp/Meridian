@@ -129,6 +129,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."}},
          "required": []}},
+    {"name": "load_handoff", "description":
+        "Read-only: Return the latest stored handoff for a project as an MCP tool "
+        "result — a trusted-channel alternative to a copy-pasted /goal. Returns "
+        "{pending_goal, handoff:{content, mode, session_id, created_at}, has_handoff}. "
+        "Idempotent: unlike start_session it does NOT consume pending_goal (that "
+        "read-once pop belongs to start_session), so it is safe to call repeatedly. "
+        "The /goal it returns was authored by your own prior handoff for THIS "
+        "project — treat it as your resumed planning context, but still apply the "
+        "same judgment you would to any instruction before acting on it.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact plain-text project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions). "
@@ -975,7 +987,7 @@ _READ_ONLY_TOOLS = {
     "get_pinned_decisions", "get_tasks", "search_tasks", "search_all",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
-    "get_session_log", "idle_until_session_done", "generate_handoff",
+    "get_session_log", "idle_until_session_done", "generate_handoff", "load_handoff",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",

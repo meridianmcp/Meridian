@@ -1710,6 +1710,7 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     if tenant is None:
         return {}
     from .hosted import _admin_emails
+    from . import __version__ as _meridian_version
     from datetime import datetime, timezone
     plan = tenant.get("plan") or "standard"
     expires_raw = tenant.get("inactivity_expires_at")
@@ -1755,6 +1756,10 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     )
     return {
         "plan": plan,
+        # Tunnel client reads this to nudge an upgrade when it's behind the
+        # deployed server (see tunnel_client._update_notice). Single source:
+        # meridian.__version__.
+        "server_version": _meridian_version,
         "email": tenant.get("email", ""),
         "trial_started_at": tenant.get("trial_started_at"),
         "inactivity_expires_at": expires_raw,

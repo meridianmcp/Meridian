@@ -1409,3 +1409,93 @@ def test_extract_pool_set_active_repo_blank_is_noop():
         pool.default_repo_path = pool._normalize(new_path)
 
     assert pool.default_repo_path == original
+
+
+# ---------------------------------------------------------------------------
+# Script-mode entrypoint — `python meridian/__main__.py` (regression for 9ec44f0)
+# ---------------------------------------------------------------------------
+
+def test_tunnel_script_mode_import():
+    """`python meridian/__main__.py --help` must run in script mode (no package
+    context) without tripping the relative-import guard.
+
+    Regression for 9ec44f0: before the __package__ shim in __main__.py, a
+    script-mode invocation (`python meridian/__main__.py --tunnel`, or the
+    installer's `python meridian ...`) raised "attempted relative import with no
+    known parent package" the moment it hit `from .tunnel_client import ...`.
+    --help is the hermetic smoke test: it exercises module import + the shim
+    without needing Node/npx or the network.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    main_py = root / "meridian" / "__main__.py"
+    proc = subprocess.run(
+        [sys.executable, str(main_py), "--help"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"script-mode --help exited {proc.returncode}\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    # The exact failure 9ec44f0 fixed, and any adjacent import breakage.
+    assert "attempted relative import" not in proc.stderr, proc.stderr
+    assert "ImportError" not in proc.stderr, proc.stderr
+    assert "ModuleNotFoundError" not in proc.stderr, proc.stderr
+    # argparse writes usage to stdout on --help.
+    assert "usage" in proc.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# Version check — _version_tuple / _update_notice (4bde9437)
+# ---------------------------------------------------------------------------
+
+def test_version_tuple_parses_dotted():
+    assert tc._version_tuple("0.1.6") == (0, 1, 6)
+    assert tc._version_tuple("1.2.3") == (1, 2, 3)
+    assert tc._version_tuple("2.0") == (2, 0)
+
+
+def test_version_tuple_truncates_at_nonnumeric_segment():
+    # PEP 440 pre-release suffixes: leading digits of a segment count, the rest
+    # is ignored; a fully non-numeric segment stops parsing.
+    assert tc._version_tuple("0.2.0rc1") == (0, 2, 0)
+    assert tc._version_tuple("1.4.0.dev1") == (1, 4, 0)
+    assert tc._version_tuple("1.2.beta") == (1, 2)
+
+
+def test_version_tuple_unparseable_is_empty():
+    assert tc._version_tuple("") == ()
+    assert tc._version_tuple("nightly") == ()
+    assert tc._version_tuple("   ") == ()
+
+
+def test_update_notice_when_server_newer():
+    notice = tc._update_notice("0.1.6", "0.1.7")
+    assert notice is not None
+    assert "0.1.7" in notice and "0.1.6" in notice
+    assert "upgrade" in notice.lower()
+
+
+def test_update_notice_none_when_equal_or_ahead():
+    assert tc._update_notice("0.1.6", "0.1.6") is None
+    assert tc._update_notice("0.2.0", "0.1.9") is None  # local ahead of server
+
+
+def test_update_notice_none_on_missing_or_bad_version():
+    # Fail-open: any missing/unparseable version yields no nag, never raises.
+    assert tc._update_notice("0.1.6", "") is None
+    assert tc._update_notice("", "0.1.7") is None
+    assert tc._update_notice("0.1.6", "unknown") is None
+    assert tc._update_notice("0.1.6", None) is None  # type: ignore[arg-type]
+
+
+def test_update_notice_minor_and_major_bumps():
+    assert tc._update_notice("0.1.6", "0.2.0") is not None   # minor
+    assert tc._update_notice("0.9.9", "1.0.0") is not None   # major
+    assert tc._update_notice("1.0.0", "1.0.1") is not None   # patch

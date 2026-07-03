@@ -1394,6 +1394,18 @@ async def _handle_project_tools(
                         )
             except Exception:  # noqa: BLE001 — orientation must not break
                 pass
+        # 5efe254b — deliver any pending handoff /goal through this trusted tool
+        # result (keyed on project_id) rather than as a spoofable copy-pasted
+        # chat string. Read-once: pop clears it so it surfaces exactly once.
+        # Outside the tenant gate so self-hosted sessions receive it too.
+        # Guarded so a pre-migration DB never breaks the orientation.
+        try:
+            if isinstance(result, dict):
+                _pg = await db_module.pop_pending_goal(db, args["project_id"])
+                if _pg:
+                    result["pending_goal"] = _pg
+        except Exception:  # noqa: BLE001
+            pass
         return result
     if name == "list_projects":
         return await db_module.list_project_summaries(db)
@@ -1544,6 +1556,37 @@ async def _handle_task_tools(
             "template_stale": _tpl_stale,
             "insight_hints": _insight_hints[:5],
             "goal_length_warning": _goal_warn,
+        }
+    if name == "load_handoff":
+        # 5efe254b — trusted retrieval of the latest stored handoff for a project
+        # as an MCP tool result: an explicit, idempotent alternative to
+        # start_session's pending_goal delivery. Read-only — it does NOT clear
+        # pending_goal (start_session's pop owns read-once consumption), so it is
+        # safe to call repeatedly.
+        _pid = args["project_id"]
+        _latest = None
+        try:
+            _rows = await db_module.get_handoffs(db, _pid, limit=1)
+            _latest = _rows[0] if _rows else None
+        except Exception:  # noqa: BLE001
+            _latest = None
+        _pending = None
+        try:
+            _pending = await db_module.get_pending_goal(db, _pid)
+        except Exception:  # noqa: BLE001
+            _pending = None
+        return {
+            "pending_goal": _pending,
+            "handoff": (
+                {
+                    "content": _latest.get("body"),
+                    "mode": _latest.get("mode"),
+                    "session_id": _latest.get("session_id"),
+                    "created_at": _latest.get("created_at"),
+                }
+                if _latest else None
+            ),
+            "has_handoff": bool(_latest) or bool(_pending),
         }
     return _MISS
 

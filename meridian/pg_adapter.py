@@ -456,6 +456,7 @@ CREATE TABLE IF NOT EXISTS projects (
     github_repo TEXT,
     github_branch TEXT,
     queued_session TEXT,
+    pending_goal TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'parked', 'archived')),
     priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN ('P0', 'P1', 'P2')),
@@ -1042,6 +1043,15 @@ async def _migrate_pg_queued_session(conn: PostgresConnection) -> None:
     """10e6b265 — projects.queued_session for back-to-back /goal runs."""
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS queued_session TEXT"
+    )
+
+
+async def _migrate_pg_pending_goal(conn: PostgresConnection) -> None:
+    """5efe254b — projects.pending_goal: the handoff /goal delivered through a
+    trusted MCP tool result (keyed on project_id) instead of a spoofable
+    copy-pasted chat string. Read-once. Nullable."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS pending_goal TEXT"
     )
 
 
@@ -2321,4 +2331,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_user_session_metadata,
     _migrate_pg_provision_queue,
     _migrate_pg_codebase_graph_entities,
+    _migrate_pg_pending_goal,
 )
