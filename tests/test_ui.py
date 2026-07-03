@@ -638,6 +638,20 @@ def test_documents_tab_present():
     assert "/document-structure?path=" in src, "structure fetch missing"
 
 
+def test_insights_tab_present():
+    """0b711a9d — the dashboard exposes an Insights tab: a vtab button, a drawer
+    panel, and a loadInsightsTab loader reading /projects/{id}/insights."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    src = (static / "dashboard.ts").read_text(encoding="utf-8")
+    assert 'data-vtab="insights"' in src, "Insights vtab button missing"
+    assert "drawer-insights-${project.id}" in src, "Insights drawer panel missing"
+    assert "insights-body-${project.id}" in src, "Insights body container missing"
+    assert "async function loadInsightsTab" in src, "loadInsightsTab loader missing"
+    assert "if (vtab === 'insights') loadInsightsTab" in src, "Insights tab dispatch missing"
+    assert "/projects/${projectId}/insights" in src, "insights fetch missing"
+
+
 def test_execution_mode_toggle_present(js):
     """ecf69de8 — the settings tab renders an Execution Mode select (autonomous
     vs interactive) that persists via saveProjectSettings (PATCH settings)."""

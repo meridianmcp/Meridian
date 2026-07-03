@@ -1796,6 +1796,19 @@ async def _handle_notes_decisions(
             _ins_tags, kind="insight",
             priority=args.get("priority", "normal"),
         )
+    if name == "add_insight":
+        # 0b711a9d — durable strategic insight (dedicated table, not a note).
+        validate_input_size(args.get("title"), "insight title", 500)
+        validate_input_size(args.get("body"), "insight body", 1_000_000)
+        return await db_module.create_insight(
+            db, args["project_id"], args["title"], args.get("body") or "",
+            horizon=args.get("horizon", "quarter"),
+            tags=args.get("tags"),
+        )
+    if name == "get_insights":
+        return await db_module.get_insights(
+            db, args["project_id"], horizon=args.get("horizon")
+        )
     if name == "save_finding":
         # e1f43ee7 — phase-agnostic capture primitive (decoupled from search).
         validate_input_size(args.get("summary"), "finding summary", 1_000_000)
@@ -2801,11 +2814,11 @@ async def _handle_sprint_tools(
             "skipped": _counts.get("skipped", 0),
             "percent_complete": _pct,
             "by_status": _counts,
-            "items": [
-                {"id": it["id"], "title": (it.get("title") or "")[:80], "status": it.get("status")}
-                for it in _all
-            ],
         }
+        # 1da83459 — summary-only: the per-item list scaled ~100 chars/item and
+        # bloated every between-item progress poll on a large board. Counts +
+        # by_status + board_change are what an executor needs; call
+        # get_sprint_items(status="pending") for the live item list.
         _bc = await _board_change_for_session(db, args["project_id"], args.get("session_id"))
         if _bc:
             _resp_progress["board_change"] = _bc
@@ -3326,6 +3339,19 @@ async def _handle_planning_tools(
             for d in pinned
             if d.get("assumption") and d.get("assumption_status") != "confirmed"
         ]
+        # 0b711a9d — permanent strategic insights ALWAYS surface in the planning
+        # brief (durable understanding that shapes future decisions). Guarded so a
+        # pre-migration DB never breaks the brief; never truncated by a list cap.
+        permanent_insights: list[dict[str, Any]] = []
+        try:
+            for _ins in await db_module.get_insights(db, project_id, horizon="permanent"):
+                permanent_insights.append({
+                    "id": _ins.get("id"),
+                    "title": (_ins.get("title") or "")[:120],
+                    "body": (_ins.get("body") or "")[:400],
+                })
+        except Exception:  # noqa: BLE001
+            permanent_insights = []
         # 81170c84 — "what did the last session do": surface the most recent
         # session's completed items + task log + recent decisions so a planner
         # sees executor output without manual copy-paste.
@@ -3403,6 +3429,7 @@ async def _handle_planning_tools(
             ],
             "recent_decisions": recent_decisions,
             "unvalidated_assumptions": unvalidated_assumptions,
+            "permanent_insights": permanent_insights,
             "last_session": last_session,
             "latest_retrospective": latest_retrospective,
             "generated_at": brief_generated_at,

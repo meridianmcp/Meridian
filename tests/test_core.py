@@ -5174,6 +5174,114 @@ def test_build_quick_start_goal_loop_prefix():
     assert h._build_quick_start_goal(items, loop_enabled=True).startswith("/loop /goal ")
 
 
+def test_build_quick_start_goal_parallel_batches():
+    """e20db0be — get_parallelizable_groups batches render as parallel-safe in the
+    /goal; without groups the flat clause is unchanged (so existing callers that
+    pass no groups keep the current behaviour)."""
+    from meridian import handoff as h
+    items = [{"id": "a1", "version": None}, {"id": "b2", "version": None}, {"id": "c3", "version": None}]
+    groups = {
+        "group_count": 2,
+        "groups": [
+            [{"id": "a1", "title": "x"}, {"id": "b2", "title": "y"}],  # parallel-safe pair
+            [{"id": "c3", "title": "z"}],
+        ],
+    }
+    goal = h._build_quick_start_goal(items, parallel_groups=groups)
+    assert "resource-conflict-free batches" in goal
+    assert "batch 1: a1, b2" in goal
+    assert "batch 2: c3" in goal
+    # No parallel_groups → the flat clause, no batch language (unchanged default).
+    goal_flat = h._build_quick_start_goal(items)
+    assert "resource-conflict-free batches" not in goal_flat
+    assert "Complete sprint items: a1, b2, c3" in goal_flat
+    # A single group (no genuine cross-item parallelism) does NOT trigger batches.
+    single = {"group_count": 1, "groups": [[{"id": "a1"}, {"id": "b2"}, {"id": "c3"}]]}
+    assert "resource-conflict-free batches" not in h._build_quick_start_goal(items, parallel_groups=single)
+    # A batched id outside the /goal's item list is filtered; a leftover pending id
+    # is still listed so the /goal never drops an item.
+    groups2 = {"group_count": 2, "groups": [[{"id": "a1"}, {"id": "zzz"}], [{"id": "b2"}]]}
+    goal2 = h._build_quick_start_goal(items, parallel_groups=groups2)
+    assert "zzz" not in goal2  # out-of-scope id filtered
+    assert "c3" in goal2       # leftover pending id preserved
+
+
+# ---------------------------------------------------------------------------
+# 0b711a9d — strategic insights (table + tools + planning brief)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_insights_create_get_horizon_filter(db):
+    """create_insight + get_insights: horizon filter, tag join, bad-horizon coercion."""
+    p = await db_module.create_project(db, "insights-proj")
+    pid = p["id"]
+    assert await db_module.get_insights(db, pid) == []
+    i1 = await db_module.create_insight(
+        db, pid, "Perm truth", "always matters", horizon="permanent", tags=["strategy", "core"]
+    )
+    assert i1["horizon"] == "permanent"
+    assert i1["title"] == "Perm truth"
+    assert i1["tags"] == "strategy,core"  # list joined
+    await db_module.create_insight(db, pid, "Q insight", "this quarter", horizon="quarter")
+    # An invalid horizon coerces to the default 'quarter' (Python-validated, no CHECK).
+    i3 = await db_module.create_insight(db, pid, "Bad h", "x", horizon="decade")
+    assert i3["horizon"] == "quarter"
+    assert len(await db_module.get_insights(db, pid)) == 3
+    perms = await db_module.get_insights(db, pid, horizon="permanent")
+    assert len(perms) == 1 and perms[0]["title"] == "Perm truth"
+    assert len(await db_module.get_insights(db, pid, horizon="quarter")) == 2
+
+
+def test_insights_mcp_tools_and_planning_brief(tmp_path):
+    """add_insight/get_insights MCP tools + permanent insights surface in get_planning_brief."""
+    import asyncio
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        pid = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "ins-mcp"}, db, out))["id"]
+        asyncio.run(mh._dispatch_mcp_tool(
+            "add_insight",
+            {"project_id": pid, "title": "North star holds", "body": "durable", "horizon": "permanent"},
+            db, out))
+        asyncio.run(mh._dispatch_mcp_tool(
+            "add_insight",
+            {"project_id": pid, "title": "Q thing", "body": "temp", "horizon": "quarter"}, db, out))
+        got = asyncio.run(mh._dispatch_mcp_tool("get_insights", {"project_id": pid}, db, out))
+        assert len(got) == 2
+        perms = asyncio.run(mh._dispatch_mcp_tool(
+            "get_insights", {"project_id": pid, "horizon": "permanent"}, db, out))
+        assert len(perms) == 1 and perms[0]["title"] == "North star holds"
+        # Permanent insight is injected into the planning brief.
+        brief = asyncio.run(mh._dispatch_mcp_tool("get_planning_brief", {"project_id": pid}, db, out))
+        assert "permanent_insights" in brief
+        assert any(pi["title"] == "North star holds" for pi in brief["permanent_insights"])
+        # The quarter insight is NOT in the permanent list.
+        assert all(pi["title"] != "Q thing" for pi in brief["permanent_insights"])
+    finally:
+        asyncio.run(db.close())
+
+
+def test_insights_rest_roundtrip(client):
+    """0b711a9d — POST/GET /projects/{id}/insights + horizon filter + guards."""
+    pid = client.post("/projects", json={"name": "ins-rest"}).json()["id"]
+    assert client.get(f"/projects/{pid}/insights").json() == []
+    r = client.post(
+        f"/projects/{pid}/insights",
+        json={"title": "Perm", "body": "b", "horizon": "permanent"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["horizon"] == "permanent"
+    client.post(f"/projects/{pid}/insights", json={"title": "Q", "horizon": "quarter"})
+    assert len(client.get(f"/projects/{pid}/insights").json()) == 2
+    perms = client.get(f"/projects/{pid}/insights?horizon=permanent").json()
+    assert len(perms) == 1 and perms[0]["title"] == "Perm"
+    # Title required → 400; unknown project → 404.
+    assert client.post(f"/projects/{pid}/insights", json={"body": "no title"}).status_code == 400
+    assert client.get("/projects/does-not-exist/insights").status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_generate_handoff_prepends_loop_when_workspace_default_on(db, tmp_path):
     """The /goal in a generated handoff carries a leading /loop when the effective
@@ -6498,10 +6606,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_provision_queue",
         "_migrate_pg_codebase_graph_entities",
         "_migrate_pg_pending_goal",
+        "_migrate_pg_insights_table",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 78
+    assert len(allnames) == len(set(allnames)) == 79
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -13126,7 +13235,9 @@ async def test_get_sprint_progress_basic(db):
     assert res["done"] == 1
     assert res["pending"] == 1
     assert res["percent_complete"] == 50
-    assert len(res["items"]) == 2
+    # 1da83459 — get_sprint_progress is summary-only now (no per-item list).
+    assert "items" not in res
+    assert res["by_status"]["done"] == 1
 
 
 @pytest.mark.asyncio
@@ -13141,8 +13252,9 @@ async def test_get_sprint_progress_version_filter(db):
     res = await srv._dispatch_mcp_tool(
         "get_sprint_progress", {"project_id": pid, "version": "v1"}, db, "/tmp"
     )
-    assert res["total"] == 1
-    assert res["items"][0]["title"].startswith("v1 task")
+    assert res["total"] == 1  # v1-only scoping (v2 item excluded)
+    assert "items" not in res  # 1da83459 — summary-only
+    assert res["by_status"].get("pending") == 1
 
 
 # ---------------------------------------------------------------------------

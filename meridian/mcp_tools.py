@@ -335,6 +335,27 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "tags": {"type": "string", "description": "Optional comma-separated tags (an 'insight' tag is always added)."},
          "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes appear first in planner context and generate_handoff."}},
          "required": ["title"]}},
+    {"name": "add_insight", "description":
+        "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
+        "decisions. A first-class knowledge type SEPARATE from decisions (choices with a "
+        "lifecycle) and notes (reference). horizon sets its shelf-life: 'permanent' insights "
+        "ALWAYS surface in get_planning_brief; 'year'/'quarter' are time-boxed. Returns the "
+        "stored insight. (Distinct from capture_insight, which saves a planner note.)",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "title": {"type": "string"},
+         "body": {"type": "string", "description": "The insight (markdown)."},
+         "horizon": {"type": "string", "enum": ["permanent", "year", "quarter"], "description": "Shelf-life. 'permanent' always appears in the planning brief. Default 'quarter'."},
+         "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags."}},
+         "required": ["title"]}},
+    {"name": "get_insights", "description":
+        "Read-only: List a project's strategic insights (newest first), optionally filtered by "
+        "horizon (permanent|year|quarter). Review accumulated understanding before planning. "
+        "permanent insights also appear automatically in get_planning_brief.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "horizon": {"type": "string", "enum": ["permanent", "year", "quarter"], "description": "Optional horizon filter."}},
+         "required": []}},
     {"name": "save_finding", "description":
         "Phase-agnostic capture primitive: turn a finding into a durable, "
         "addressable note with provenance — works with ANY source (Claude's "
@@ -575,9 +596,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                    "description": "Skip the unstarted-items guard and overwrite the sprint anyway."}},
          "required": ["sprint"]}},
     {"name": "get_sprint_progress", "description":
-        "Read-only: Return summary of sprint items by status (pending/in_progress/done/failed) "
+        "Read-only: Return a SUMMARY of sprint items by status (pending/in_progress/done/failed) "
         "optionally filtered by version or item_group. Returns total, done, in_progress, pending, "
-        "failed, percent_complete, and item list. Useful for planning sessions to see how far "
+        "failed, percent_complete, and by_status (counts only — no per-item list; call "
+        "get_sprint_items(status=\"pending\") for the live item list). Useful to see how far "
         "through the sprint we are without listing all items. Pass session_id to also get a "
         "board_change field reporting items added since that session started (live-queue signal "
         "— call this between sprint items to pick up mid-run injections).",
@@ -991,6 +1013,7 @@ _READ_ONLY_TOOLS = {
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "idle_until_session_done", "generate_handoff", "load_handoff",
+    "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
