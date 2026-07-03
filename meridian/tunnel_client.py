@@ -267,6 +267,24 @@ def _classify_serena_failure(err: object) -> "tuple[str, str] | None":
     return None
 
 
+async def _reprobe_once(proxy, probe) -> bool:
+    """One slot-recovery attempt (a898710a). Ensure the proxy is running, probe
+    its health, and — critically — if it is running but UNHEALTHY (a persistent
+    slot like Desktop Commander whose inner MCP server died while the parent
+    ``cmd /c npx`` stays alive, so ``ensure_running()`` is a no-op) force a
+    kill + respawn and re-probe. Without this a stuck persistent slot never
+    recovers. Returns True when healthy. ``probe`` is an async fn(port) -> bool.
+    """
+    if not proxy.is_running:
+        await proxy.ensure_running()
+    healthy = proxy.is_running and await probe(proxy.port)
+    if not healthy and proxy.is_running:
+        proxy.kill()
+        await proxy.ensure_running()
+        healthy = proxy.is_running and await probe(proxy.port)
+    return healthy
+
+
 async def _preflight_slot(ws, port: int, label: str) -> bool:
     """Probe a slot after its first spawn; report unhealthy on failure. Returns
     the health result so callers can log it. (d71ba2e7)"""
@@ -324,9 +342,11 @@ async def _run_connection_lazy(
         while True:
             await asyncio.sleep(_SLOT_REPROBE_INTERVAL)
             try:
-                if not proxy.is_running:
-                    await proxy.ensure_running()
-                if proxy.is_running and await _probe_slot_health(proxy.port, attempts=1):
+                # a898710a — _reprobe_once force-restarts a persistent slot that's
+                # alive-but-unhealthy (parent process up, inner MCP server dead).
+                if await _reprobe_once(
+                    proxy, lambda port: _probe_slot_health(port, attempts=1)
+                ):
                     _unhealthy = False
                     _reprobe_task = None
                     await _report_slot_health(ws, label, True)

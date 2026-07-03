@@ -1074,6 +1074,70 @@ def test_build_proxy_for_inner_stateless_default_true():
     assert "--stateless" in cmd
 
 
+def test_reprobe_once_kills_and_respawns_stuck_persistent_slot():
+    """a898710a — a persistent slot that's is_running=True but failing its health
+    probe (inner server dead, parent alive) is force-restarted via kill+respawn
+    and recovers on the re-probe."""
+    class FakeProxy:
+        def __init__(self):
+            self.port = 8813
+            self.is_running = True
+            self.killed = 0
+            self.ensured = 0
+
+        def kill(self):
+            self.killed += 1
+            self.is_running = False
+
+        async def ensure_running(self):
+            self.ensured += 1
+            self.is_running = True
+
+    proxy = FakeProxy()
+    calls = {"n": 0}
+
+    async def probe(_port):
+        calls["n"] += 1
+        return calls["n"] >= 2  # unhealthy first, healthy after kill+respawn
+
+    loop = asyncio.new_event_loop()
+    try:
+        healthy = loop.run_until_complete(tc._reprobe_once(proxy, probe))
+    finally:
+        loop.close()
+    assert healthy is True
+    assert proxy.killed == 1
+    assert proxy.ensured == 1
+    assert calls["n"] == 2
+
+
+def test_reprobe_once_no_kill_when_healthy_first_probe():
+    """a898710a — a slot healthy on the first probe is not needlessly killed."""
+    class FakeProxy:
+        port = 8813
+        is_running = True
+        killed = 0
+
+        def kill(self):
+            type(self).killed += 1
+
+        async def ensure_running(self):
+            pass
+
+    proxy = FakeProxy()
+
+    async def probe(_port):
+        return True
+
+    loop = asyncio.new_event_loop()
+    try:
+        healthy = loop.run_until_complete(tc._reprobe_once(proxy, probe))
+    finally:
+        loop.close()
+    assert healthy is True
+    assert proxy.killed == 0
+
+
 def test_builtin_plugins_session_mode():
     from meridian.tunnel_plugins import BUILTIN_PLUGINS
     by_name = {p["name"]: p for p in BUILTIN_PLUGINS}

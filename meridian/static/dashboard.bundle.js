@@ -5416,7 +5416,7 @@ project_id = "${displayPid}"`;
       const slotStatus = data && data.slot_status || {};
       const renderRow = (p3) => {
         const cmd = Array.isArray(p3.command) ? p3.command.join(" ") : "";
-        const lifecycleState = _pluginLifecycleState(p3, active);
+        const lifecycleState = _pluginLifecycleState(p3, active, slotStatus);
         const hint = _OPTIN_SLOT_HINTS[p3.slot];
         const installCmd = hint ? hint.pkg : cmd || "";
         const lifecycleBadge = _renderLifecycleBadge(p3, lifecycleState, installCmd);
@@ -5873,8 +5873,11 @@ project_id = "${displayPid}"`;
     }
   }
   window._wireRegistryBrowse = _wireRegistryBrowse;
-  function _pluginLifecycleState(plugin, active) {
-    if (active && active[plugin.slot]) return "active";
+  function _pluginLifecycleState(plugin, active, slotStatus) {
+    if (active && active[plugin.slot]) {
+      if (slotStatus && slotStatus[plugin.slot]) return "unhealthy";
+      return "active";
+    }
     if (plugin.enabled !== false) return "installed_inactive";
     return "not_installed";
   }
@@ -5882,6 +5885,7 @@ project_id = "${displayPid}"`;
   function _renderLifecycleBadge(plugin, lifecycleState, installCmd) {
     const styles = {
       active: { dot: "var(--success, #3fb950)", label: "active", labelColor: "var(--success, #3fb950)" },
+      unhealthy: { dot: "var(--danger, #f85149)", label: "unhealthy", labelColor: "var(--danger, #f85149)" },
       installed_inactive: { dot: "#f59e0b", label: "inactive", labelColor: "#f59e0b" },
       not_installed: { dot: "var(--muted)", label: "not installed", labelColor: "var(--muted)" }
     };
@@ -5894,6 +5898,8 @@ project_id = "${displayPid}"`;
       actionBtn = `<button class="secondary tp-install-btn" data-install-cmd="${safeCmd}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Copy install command">Install</button>`;
     } else if (lifecycleState === "installed_inactive") {
       actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">start tunnel to activate</span>`;
+    } else if (lifecycleState === "unhealthy") {
+      actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">recovering\u2026</span>`;
     }
     return `<span style="display:inline-flex;align-items:center;gap:4px">${dotHtml}${labelHtml}${actionBtn ? " " + actionBtn : ""}</span>`;
   }

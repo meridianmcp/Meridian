@@ -171,7 +171,7 @@ async function loadTunnelPluginsSection(projectId: string, hostname: any) {
       // active → tunnel running and slot connected
       // installed_inactive → enabled in config but tunnel not running
       // not_installed → disabled or binary not available
-      const lifecycleState = _pluginLifecycleState(p, active);
+      const lifecycleState = _pluginLifecycleState(p, active, slotStatus);
       // Derive install command from opt-in hint or existing command.
       const hint = _OPTIN_SLOT_HINTS[p.slot];
       const installCmd = hint ? hint.pkg : (cmd || '');
@@ -710,8 +710,13 @@ window._wireRegistryBrowse = _wireRegistryBrowse;
  * @param {object} active  - map of slot → bool (connected sockets)
  * @returns {'active'|'installed_inactive'|'not_installed'}
  */
-function _pluginLifecycleState(plugin: any, active: any) {
-  if (active && active[plugin.slot]) return 'active';
+function _pluginLifecycleState(plugin: any, active: any, slotStatus?: any) {
+  if (active && active[plugin.slot]) {
+    // a898710a — connected but a plugin_status marked it unhealthy (failed
+    // pre-flight / dead inner server): surface 'unhealthy', not 'active'.
+    if (slotStatus && slotStatus[plugin.slot]) return 'unhealthy';
+    return 'active';
+  }
   if (plugin.enabled !== false) return 'installed_inactive';
   return 'not_installed';
 }
@@ -725,6 +730,7 @@ window._pluginLifecycleState = _pluginLifecycleState;
 function _renderLifecycleBadge(plugin: any, lifecycleState: any, installCmd: any) {
   const styles = {
     active:             { dot: 'var(--success, #3fb950)', label: 'active',    labelColor: 'var(--success, #3fb950)' },
+    unhealthy:          { dot: 'var(--danger, #f85149)',  label: 'unhealthy', labelColor: 'var(--danger, #f85149)' },
     installed_inactive: { dot: '#f59e0b',                 label: 'inactive',  labelColor: '#f59e0b' },
     not_installed:      { dot: 'var(--muted)',             label: 'not installed', labelColor: 'var(--muted)' },
   };
@@ -738,6 +744,8 @@ function _renderLifecycleBadge(plugin: any, lifecycleState: any, installCmd: any
     actionBtn = `<button class="secondary tp-install-btn" data-install-cmd="${safeCmd}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Copy install command">Install</button>`;
   } else if (lifecycleState === 'installed_inactive') {
     actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">start tunnel to activate</span>`;
+  } else if (lifecycleState === 'unhealthy') {
+    actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">recovering…</span>`;
   }
 
   return `<span style="display:inline-flex;align-items:center;gap:4px">${dotHtml}${labelHtml}${actionBtn ? ' ' + actionBtn : ''}</span>`;
