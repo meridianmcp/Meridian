@@ -270,13 +270,10 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "2. [pending] Second fix" in content
     assert f"Depends on item 1 (`{first['id']}`): First fix" in content
     assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
-    # 3726cf70 — a depends_on relationship renders the /goal as ordered waves
-    # (finish wave 1 before wave 2), which IS the dependency order made explicit.
-    assert "wave order" in content
-    assert (
-        f"Wave 1: {first['id']}; Wave 2: {second['id']}."
-        in content
-    )
+    # eeee02c6 — a depends_on relationship renders the /goal as a flattened
+    # dependency-ordered id list (no "Wave" headers, which invite stopping).
+    assert "dependency order" in content
+    assert f"{first['id']}, {second['id']}." in content
     # f628b880 — the /goal leads with the non-deferential executor directive.
     assert "/goal You are an executor. Claim and execute" in content
     assert "complete_sprint_item()" in content
@@ -14420,6 +14417,32 @@ async def test_list_plugins_returns_builtin_plugins(db, tmp_path):
     # No tunnel active → tool_count=0 for all
     assert all(p["tool_count"] == 0 for p in plugins)
     assert result["tunnel_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_invocation_note_and_invocable_flag(db, tmp_path):
+    """8f66d85e — list_plugins clarifies how plugin tools are invoked and flags
+    each plugin's invocability (False when no tunnel is active)."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    result = await _dispatch_mcp_tool("list_plugins", {}, db, str(tmp_path), tenant=None)
+    assert "invocation_note" in result
+    assert "tunnel connector" in result["invocation_note"]
+    for p in result["plugins"]:
+        assert "invocable" in p
+        assert p["invocable"] is False  # no tunnel active
+
+
+def test_agent_instructions_include_reindex_at_session_start():
+    """eacf7063 — default executor instructions tell agents to reindex at session
+    start; the standard version + marker are bumped so stored copies detect it."""
+    from meridian.agent_defaults import (
+        DEFAULT_AGENT_INSTRUCTIONS,
+        AGENT_INSTRUCTIONS_STANDARD_VERSION,
+    )
+    assert 'index_repository(mode="fast")' in DEFAULT_AGENT_INSTRUCTIONS
+    assert AGENT_INSTRUCTIONS_STANDARD_VERSION >= 3
+    assert "meridian-executor-standard: v3" in DEFAULT_AGENT_INSTRUCTIONS
 
 
 @pytest.mark.asyncio

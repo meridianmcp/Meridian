@@ -20,7 +20,7 @@ import re
 #
 #   v1 — pre-versioning baseline (implicit; stored copies with no marker).
 #   v2 — project_name-first start_session idiom + code-intel protocol; marker added.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 2
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 3
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -81,6 +81,9 @@ in the Meridian dashboard → Settings → Executor Rules.
   `detect_changes`) over raw file reads — they are faster and use far fewer tokens.
 - Fall back to reading files only when a graph query is insufficient.
 - If `trace_path` is not in your tool list, ignore this section.
+- At session start, if `index_repository` is in your tool list and you will touch
+  source files, run `index_repository(mode="fast")` once — the codebase graph goes
+  stale after commits, so a fresh index keeps prospecting accurate (eacf7063).
 
 ## MANDATORY CODE INTEL PROTOCOL
 When `search_graph`, `get_function_tool`, or `get_code_snippet` are in your tool
@@ -91,7 +94,7 @@ files when code intel tools are present is a protocol violation. For non-code
 files (documents, presentations, spreadsheets, config, data), use filesystem
 tools directly.
 
-<!-- meridian-executor-standard: v2 -->
+<!-- meridian-executor-standard: v3 -->
 """
 
 

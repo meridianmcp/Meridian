@@ -681,6 +681,30 @@ async def test_post_login_redirect_explicit_zero_closes_launch(db, monkeypatch):
     assert any(row["email"] == "explicit-closed@example.com" for row in waitlist)
 
 
+@pytest.mark.asyncio
+async def test_post_login_redirect_logs_provision_failure(db, monkeypatch, caplog):
+    """9f584879 — a failed Neon provision is logged at WARNING (not swallowed
+    silently), and the login flow still returns a destination."""
+    import logging
+    from meridian import hosted as hosted_module
+
+    tenant = await db_module.upsert_tenant(db, "prov-fail@example.com")
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("neon down")
+
+    monkeypatch.delenv("MERIDIAN_LAUNCH_OPEN", raising=False)  # default open
+    monkeypatch.delenv("MERIDIAN_FREE_LAUNCH_CAP", raising=False)
+    monkeypatch.setattr(hosted_module, "provision_neon_db", boom)
+
+    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
+        dest = await hosted_module._post_login_redirect(tenant, db)
+
+    assert dest == "/dashboard"  # flow survives the failed provision
+    assert "provisioning failed" in caplog.text
+    assert "prov-fail@example.com" not in caplog.text  # logs the id, not the email
+
+
 def test_build_login_page_hides_unconfigured_oauth_buttons(monkeypatch):
     """98c45dd0 BUG 2 — no OAuth button renders for a provider whose client-id
     env var is unset, and the 'or' divider is dropped when none are configured."""

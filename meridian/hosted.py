@@ -685,8 +685,16 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
                     return "/waitlist-pending?message=Early%20access%20is%20full"
                 try:
                     tenant = await provision_neon_db(tenant["id"], db)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # 9f584879 — don't swallow silently: a failed provision lands
+                    # the user without a DB (503 on every API call). Log at WARNING
+                    # so operators can see and retry instead of guessing.
+                    import logging as _logging
+                    _logging.getLogger("meridian.hosted").warning(
+                        "provisioning failed for tenant %s: %s — user will land "
+                        "without a DB (likely 503 until retried)",
+                        (tenant or {}).get("id"), exc,
+                    )
         if next_url and next_url.startswith("/") and not next_url.startswith("//"):
             return next_url
         return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")

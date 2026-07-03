@@ -301,22 +301,26 @@ def _build_quick_start_goal(
     # /goal into ordered waves (finish a wave before the next; within-wave items
     # are parallel-safe). With no dependencies there's a single wave, so the flat
     # "Complete sprint items: …" phrasing is preserved (no behaviour change).
+    # eeee02c6 — no "Wave N" headers (they invite stopping between waves); flatten
+    # the dependency order into one ordered id list so the executor runs straight
+    # through without treating a wave boundary as a stopping point.
     waves = _partition_into_waves(pending_sprint_items)
     if len(waves) > 1:
-        wave_txt = "; ".join(
-            f"Wave {i + 1}: {', '.join(it['id'] for it in wave if it.get('id'))}"
-            for i, wave in enumerate(waves)
-        )
+        ordered_ids = [it["id"] for wave in waves for it in wave if it.get("id")]
         items_clause = (
-            "Complete sprint items in wave order — finish each wave before "
-            "starting the next; items within a wave are parallel-safe: "
-            f"{wave_txt}. "
+            "Complete sprint items in dependency order (finish each before the "
+            f"next; earlier items unblock later ones): {', '.join(ordered_ids)}. "
         )
     else:
         items_clause = f"Complete sprint items: {', '.join(item_ids)}. "
     # f9fa00e4 — tag the /goal with an inferred sprint type + tailored guidance.
     _stype = _infer_sprint_type(pending_sprint_items)
     _type_clause = f" [sprint:{_stype}] {_SPRINT_TYPE_NOTES.get(_stype, '')}".rstrip()
+    # eeee02c6 — anti-stop failure framing: stopping with items pending is a failure.
+    _fail_clause = (
+        " You are DONE only when complete_sprint_item() has been called for every "
+        "listed item — stopping early or handing off with items pending is a FAILURE."
+    )
     return (
         f"/goal {directive}"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
@@ -329,6 +333,7 @@ def _build_quick_start_goal(
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
         f"generate_handoff() is called at the end. Stop after {_turns} turns "
         f"{_hitl_clause}"
+        f"{_fail_clause}"
         f"{_type_clause}"
     )
 

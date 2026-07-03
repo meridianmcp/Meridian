@@ -184,17 +184,21 @@ def test_partition_into_waves_topological_layers():
     assert sum(len(w) for w in cyc) == 2
 
 
-def test_build_quick_start_goal_wave_structured_with_deps():
-    """3726cf70 — a dependency graph yields a wave-structured /goal; a flat list
-    (no deps) keeps the legacy phrasing."""
+def test_build_quick_start_goal_flattens_deps_no_wave_headers():
+    """eeee02c6 — a dependency graph flattens into one ordered id list (no 'Wave'
+    headers, which invite stopping between waves); a flat list keeps the legacy
+    phrasing. Both carry the anti-stop failure framing."""
     flat = handoff_module._build_quick_start_goal([{"id": "a1"}, {"id": "a2"}])
     assert "Complete sprint items: a1, a2." in flat
     assert "Wave" not in flat
+    assert "is a FAILURE" in flat
     waved = handoff_module._build_quick_start_goal([
         {"id": "a1"}, {"id": "a2", "depends_on": "a1"},
     ])
-    assert "wave order" in waved
-    assert "Wave 1: a1" in waved and "Wave 2: a2" in waved
+    assert "dependency order" in waved
+    assert "a1, a2" in waved
+    assert "Wave" not in waved
+    assert "is a FAILURE" in waved
 
 
 def test_agent_instructions_stale_detection():

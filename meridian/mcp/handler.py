@@ -3474,6 +3474,10 @@ async def _handle_plugin_tools(
                 "description": plugin.get("description", ""),
                 "tool_count": tool_count,
                 "active": slot in slot_tool_counts,
+                # 8f66d85e — plugin tools are connector-proxied; they are only
+                # invocable while the tunnel is live (otherwise they appear in the
+                # list but calling one returns "unknown tool").
+                "invocable": slot in slot_tool_counts,
             }
             if skill:
                 entry["skill_note"] = {
@@ -3487,6 +3491,14 @@ async def _handle_plugin_tools(
             "plugins": result_plugins,
             "tunnel_active": bool(tenant_id and _tunnel_mod.has_active_tunnel(tenant_id)),
             "hint": "Call get_plugin_details(name=<plugin_name>) for full tool schema.",
+            # 8f66d85e — clarify HOW plugin tools are called so agents stop trying
+            # to invoke them as native Meridian tools.
+            "invocation_note": (
+                "Plugin tools are invoked through the tunnel connector (claude.ai) "
+                "using slot-prefixed names like 'filesystem__read_file' — not as "
+                "native Meridian MCP tools. Each is callable only while the tunnel "
+                "is connected (see each plugin's 'invocable' flag)."
+            ),
         }
 
     if name == "get_plugin_details":
