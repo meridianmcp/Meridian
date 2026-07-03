@@ -5303,7 +5303,7 @@ project_id = "${displayPid}"`;
   // meridian/static/dashboard-plugins.ts
   var _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812, dc: 8813 };
   var _OPTIN_SLOT_HINTS = {
-    word: { pkg: "uvx word-mcp-live", note: "Live Word editing with tracked changes \u2014 needs uv (uvx)." },
+    word: { pkg: "uvx docx-mcp-server", note: "Word / DOCX editing \u2014 needs uv (uvx)." },
     ppt: { pkg: "uvx powerpoint-mcp", note: "PowerPoint authoring \u2014 needs uv (uvx)." },
     dc: { pkg: "npx -y @wonderwhy-er/desktop-commander@latest", note: "Desktop Commander, local only \u2014 needs Node (npx)." }
   };

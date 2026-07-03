@@ -17,7 +17,7 @@ const _TUNNEL_DEFAULT_PORTS: Record<string, number> = { fs: 8808, code: 8809, ex
 // step. These per-slot hints give a clear path to fix: the exact launcher command
 // + what it needs. Rendered under the slot row only while it isn't connected.
 const _OPTIN_SLOT_HINTS: Record<string, any> = {
-  word: { pkg: 'uvx word-mcp-live', note: 'Live Word editing with tracked changes — needs uv (uvx).' },
+  word: { pkg: 'uvx docx-mcp-server', note: 'Word / DOCX editing — needs uv (uvx).' },
   ppt: { pkg: 'uvx powerpoint-mcp', note: 'PowerPoint authoring — needs uv (uvx).' },
   dc: { pkg: 'npx -y @wonderwhy-er/desktop-commander@latest', note: 'Desktop Commander, local only — needs Node (npx).' },
 };

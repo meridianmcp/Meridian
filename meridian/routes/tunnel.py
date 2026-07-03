@@ -521,7 +521,7 @@ async def tunnel_ppt_ws(ws: WebSocket, tenant_id: str) -> None:
 
 @router.websocket("/tunnel-word/{tenant_id}")
 async def tunnel_word_ws(ws: WebSocket, tenant_id: str) -> None:
-    """Hold open a WebSocket for one tenant's word-mcp-live proxy."""
+    """Hold open a WebSocket for one tenant's docx-mcp-server proxy."""
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_word_sockets, _pending_word_reqs, "word")
 
 
@@ -972,7 +972,7 @@ async def ppt_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> 
 @router.post("/word/mcp/{tenant_id}")
 @router.options("/word/mcp/{tenant_id}")
 async def word_mcp_proxy(tenant_id: str, request: Request) -> Response:
-    """Proxy requests to the tenant's word-mcp-live over the word tunnel."""
+    """Proxy requests to the tenant's docx-mcp-server over the word tunnel."""
     prefix = f"/word/mcp/{tenant_id}"
     local_path = request.url.path[len(prefix):] or "/"
     return await _office_proxy(tenant_id, local_path, request,

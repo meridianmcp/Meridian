@@ -153,12 +153,15 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": ["uvx", "--from", "word-mcp-live", "word_mcp_server.exe"],
+        # ba02a1f7 — swapped word-mcp-live -> docx-mcp-server: a single uvx-
+        # installable, cross-platform DOCX server (no Windows-only .exe entry
+        # point), for local thesis / Word authoring.
+        "command": ["uvx", "docx-mcp-server"],
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
-        # word-mcp-live self-prefixes its tools — leave empty.
+        # docx-mcp-server self-prefixes its tools — leave empty.
         "prefix": None,
         "session_mode": "stateless",
-        "description": "Word authoring (word-mcp-live)",
+        "description": "Word / DOCX authoring (docx-mcp-server)",
         "description_overrides": {},
     },
     {
@@ -426,7 +429,7 @@ def select_host_config(default_config: Any, by_host_raw: Any, hostname: str | No
 
 
 # Office slots auto-enable when their MCP launcher is on PATH (sprint 6c2b3562).
-OFFICE_BINARIES = {"ppt": "powerpoint-mcp", "word": "word-mcp-live"}
+OFFICE_BINARIES = {"ppt": "powerpoint-mcp", "word": "docx-mcp-server"}
 
 
 def detect_office_binaries(which: Any = None) -> set[str]:
