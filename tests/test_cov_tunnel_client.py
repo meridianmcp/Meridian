@@ -1205,6 +1205,24 @@ def test_run_tunnel_all_slots_disabled_returns_1(monkeypatch, tmp_path):
     assert rc == 1
 
 
+def test_plugin_spawn_env_merges_over_parent_and_coerces(monkeypatch):
+    # 194a7776 — plugin env overrides merge over the parent process env; keys
+    # and values are coerced to str.
+    monkeypatch.setenv("PARENT_ONLY", "keep")
+    out = tc._plugin_spawn_env({"ZOTERO_LOCAL": "true", "N": 5})
+    assert out is not None
+    assert out["ZOTERO_LOCAL"] == "true"
+    assert out["N"] == "5"
+    assert out["PARENT_ONLY"] == "keep"
+
+
+def test_plugin_spawn_env_none_when_nothing_to_override():
+    assert tc._plugin_spawn_env(None) is None
+    assert tc._plugin_spawn_env({}) is None
+    assert tc._plugin_spawn_env("nope") is None
+    assert tc._plugin_spawn_env({"": "blankkey"}) is None
+
+
 def test_run_tunnel_command_overrides_and_index(monkeypatch, tmp_path):
     """Custom commands for all three slots + code_dirs auto-index."""
     procs = _stub_run_tunnel_spawn(monkeypatch)

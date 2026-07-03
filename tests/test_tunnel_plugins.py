@@ -381,6 +381,28 @@ def test_custom_plugin_empty_and_garbage_config():
     assert tp.resolve_custom_plugins("nonsense") == []
 
 
+def test_custom_plugin_carries_env_dict():
+    # 194a7776 — a local Zotero MCP needs ZOTERO_LOCAL=true passed at spawn.
+    cfg = [{"name": "zotero-mcp", "command": "uvx zotero-mcp", "port": 8814,
+            "env": {"ZOTERO_LOCAL": "true"}}]
+    custom = tp.resolve_custom_plugins(cfg)
+    assert len(custom) == 1
+    assert custom[0]["env"] == {"ZOTERO_LOCAL": "true"}
+
+
+def test_custom_plugin_coerces_and_drops_bad_env():
+    # Non-dict / empty / blank-key env is dropped so the descriptor shape is
+    # unchanged for envless entries.
+    for bad in ("notadict", {}, {"": "x"}, 5, None):
+        cfg = [{"name": "p", "command": "x", "port": 8814, "env": bad}]
+        custom = tp.resolve_custom_plugins(cfg)
+        assert len(custom) == 1 and "env" not in custom[0]
+    # Keys/values are coerced to str.
+    cfg = [{"name": "p", "command": "x", "port": 8814, "env": {"N": 1, "B": True}}]
+    custom = tp.resolve_custom_plugins(cfg)
+    assert custom[0]["env"] == {"N": "1", "B": "True"}
+
+
 def test_custom_plugin_command_and_port_round_trip_through_normalize():
     # normalize_plugins_config must preserve a custom entry's command + port so
     # the config round-trips (PUT → store → GET → resolve_custom_plugins).

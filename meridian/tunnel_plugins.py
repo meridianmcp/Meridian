@@ -304,8 +304,9 @@ def resolve_custom_plugins(raw_config: Any) -> list[dict]:
 
     Returns validated descriptors
     ``{"name", "command" (list[str]), "port" (int), "enabled" (bool),
-    "builtin": False, "custom": True}``. Invalid entries are dropped silently
-    (they simply don't run); validation rules:
+    "builtin": False, "custom": True}``, plus an optional ``"env"`` dict when the
+    entry carries valid environment overrides. Invalid entries are dropped
+    silently (they simply don't run); validation rules:
 
     - ``name``: non-empty (stripped), not a built-in name, unique (first wins).
     - ``command``: coerced via :func:`_coerce_command`; must be non-empty. The
@@ -314,6 +315,10 @@ def resolve_custom_plugins(raw_config: Any) -> list[dict]:
     - ``port``: a real ``int`` (``bool`` rejected), in 1024–65535, and not one of
       the built-in default ports (8808–8813) so a custom proxy can't collide
       with a built-in slot.
+    - ``env`` (optional): a dict of ``{VAR: value}`` (keys/values coerced to
+      str, blank keys dropped) merged into the plugin's spawn environment by the
+      client — e.g. ``{"ZOTERO_LOCAL": "true"}`` for a local Zotero MCP. A
+      non-dict or empty env is omitted so the descriptor shape is unchanged.
 
     Pure: no I/O, no subprocess. An empty/absent/garbage config yields ``[]``.
     """
@@ -334,15 +339,24 @@ def resolve_custom_plugins(raw_config: Any) -> list[dict]:
             continue
         if not (1024 <= port <= 65535) or port in _BUILTIN_DEFAULT_PORTS:
             continue
-        seen.add(name)
-        out.append({
+        descriptor: dict[str, Any] = {
             "name": name,
             "command": cmd,
             "port": port,
             "enabled": bool(it.get("enabled", True)),
             "builtin": False,
             "custom": True,
-        })
+        }
+        # ba02a1f7/194a7776 — carry optional per-plugin env (e.g. a local
+        # Zotero MCP needs ZOTERO_LOCAL=true). Only attach when it coerces to a
+        # non-empty dict, so entries without env keep the historical shape.
+        env = it.get("env")
+        if isinstance(env, dict):
+            coerced = {str(k): str(v) for k, v in env.items() if str(k)}
+            if coerced:
+                descriptor["env"] = coerced
+        seen.add(name)
+        out.append(descriptor)
     return out
 
 

@@ -702,6 +702,20 @@ def _spawn_kwargs() -> dict:
     return {}
 
 
+def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
+    """Merge a plugin's optional ``env`` overrides over the parent process env
+    for ``subprocess.Popen``. Returns ``None`` (inherit the parent env) when
+    there is nothing valid to override. Keys/values are coerced to str and blank
+    keys dropped. Shared by the Office and custom local-plugin spawns (194a7776
+    — a local Zotero MCP needs ``ZOTERO_LOCAL=true``)."""
+    if not isinstance(env, dict) or not env:
+        return None
+    coerced = {str(k): str(v) for k, v in env.items() if str(k)}
+    if not coerced:
+        return None
+    return {**os.environ, **coerced}
+
+
 def _terminate_proc_tree(proc: "subprocess.Popen | None") -> None:
     """Stop a spawned proxy *and its whole child tree*. Best-effort; never raises.
 
@@ -2305,10 +2319,7 @@ async def run_tunnel(
         if not cmd:
             continue
         oport = office_ports[slot]
-        plugin_env = plugin.get("env") or {}
-        spawn_env = None
-        if plugin_env:
-            spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
+        spawn_env = _plugin_spawn_env(plugin.get("env"))
         # 4ea1b9d5 — persistent slots omit --stateless so their inner process
         # keeps state across requests (DC terminal sessions).
         _persistent = plugin.get("session_mode") == "persistent"
@@ -2336,10 +2347,13 @@ async def run_tunnel(
         if not cmd_inner:
             continue
         cmd_custom = _build_proxy_for_inner(npx, list(cmd_inner), cport)
+        # 194a7776 — merge the plugin's optional env over the parent env at spawn
+        # (e.g. a local Zotero MCP needs ZOTERO_LOCAL=true). None inherits parent.
+        spawn_env = _plugin_spawn_env(cp.get("env"))
         print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
         try:
-            proc_custom = subprocess.Popen(cmd_custom, **_spawn_kwargs())
-            proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": None, "label": f"custom:{cname}"})
+            proc_custom = subprocess.Popen(cmd_custom, env=spawn_env, **_spawn_kwargs())
+            proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": spawn_env, "label": f"custom:{cname}"})
             running_custom.append({"name": cname, "port": cport})
         except Exception as exc:
             print(f"  warning: could not start custom plugin {cname!r}: {exc}", file=sys.stderr)
