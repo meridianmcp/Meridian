@@ -13,8 +13,11 @@ omit =
     meridian/mcp/stdio_handler.py
 
 [report]
-# 807d8c28 — ratcheted 80 -> 82 (measured 82.38%). The 85% target needs a
-# dedicated coverage sprint on server.py / routes/tunnel.py (the big gaps).
+# 807d8c28 — ratcheted 80 -> 82 (measured 82.38%). 3bbc13f7 — now 82.51% after
+# adding real-flow integration tests (tests/test_integration_flow.py). The 90%
+# target stays deferred: setting fail_under=90 now would red-line CI. Reaching it
+# needs a dedicated coverage sprint on server.py / routes/tunnel.py (the big gaps)
+# plus un-omitting hosted.py / pg_adapter.py above.
 fail_under = 82
 exclude_lines =
     pragma: no cover
