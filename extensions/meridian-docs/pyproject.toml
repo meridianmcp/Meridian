@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meridian-docs"
+version = "0.1.0"
+description = "Standalone, stdlib-only OOXML (DOCX) intelligence as an MCP server — the parser layer extracted from Meridian."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Adam Camerer" }]
+keywords = ["mcp", "docx", "ooxml", "documents", "thesis"]
+# The DOCX parser (docs_intel) is stdlib-only; the only runtime dep is the MCP SDK.
+dependencies = ["mcp>=1.0"]
+
+[project.scripts]
+meridian-docs = "meridian_docs.server:main"
+
+[project.urls]
+Homepage = "https://usemeridian.us"
+Source = "https://github.com/meridianmcp/meridian-docs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["meridian_docs"]
