@@ -1601,10 +1601,25 @@ async def _handle_notes_decisions(
         validate_input_size(args.get("file_path"), "note file_path", 2_000)
         validate_input_size(args.get("symbol"), "note symbol", 500)
         validate_input_size(args.get("source"), "note source", 2_000)
+        # 41b8a927 — recognise #hashtags in the title/body as tags so a note is
+        # searchable by tag without a separate tags argument.
+        import re as _re_ht  # noqa: PLC0415
+        _ht = _re_ht.findall(
+            r"(?<!\w)#([A-Za-z][\w-]{1,40})",
+            f"{args.get('title') or ''} {args.get('body') or ''}",
+        )
+        _tags_arg = args.get("tags")
+        if _ht:
+            _have = {t.strip().lower() for t in (_tags_arg or "").split(",") if t.strip()}
+            _add = [h for h in _ht if h.lower() not in _have]
+            if _add:
+                _tags_arg = ", ".join(
+                    [p for p in [(_tags_arg or "").strip()] if p] + _add
+                )
         try:
             result = await db_module.add_project_note(
                 db, args["project_id"], args["title"], args["body"],
-                args.get("tags"), kind=args.get("kind"),
+                _tags_arg, kind=args.get("kind"),
                 priority=args.get("priority", "normal"),
                 file_path=args.get("file_path"), symbol=args.get("symbol"),
                 source=args.get("source"),

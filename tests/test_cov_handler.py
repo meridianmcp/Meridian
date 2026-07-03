@@ -932,6 +932,38 @@ def test_add_note_warns_on_similar_existing_note():
         _run(db.close())
 
 
+def test_add_note_extracts_hashtags_as_tags():
+    """41b8a927 — #hashtags in a note's title/body are recognised as tags so
+    the note is searchable by tag; explicit tags are preserved alongside them."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "hashtag-proj"))
+        created = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Windows fix",
+            "body": "Use SelectorEventLoop. #windows #eventloop",
+        }, db, "/tmp"))
+        slug = created.get("slug")
+        by_win = _run(db_module.get_project_notes(db, proj["id"], tag="windows"))
+        assert any(n.get("slug") == slug for n in by_win)
+        by_evl = _run(db_module.get_project_notes(db, proj["id"], tag="eventloop"))
+        assert any(n.get("slug") == slug for n in by_evl)
+        created2 = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Billing",
+            "body": "Stripe overage #billing",
+            "tags": "finance",
+        }, db, "/tmp"))
+        slug2 = created2.get("slug")
+        assert any(n.get("slug") == slug2
+                   for n in _run(db_module.get_project_notes(db, proj["id"], tag="finance")))
+        assert any(n.get("slug") == slug2
+                   for n in _run(db_module.get_project_notes(db, proj["id"], tag="billing")))
+    finally:
+        _run(db.close())
+
+
 def test_planning_brief_new_handoff_signal():
     # ab514e43 — new-handoff signal: latest_handoff + since-based new flag.
     import meridian.db as db_module
