@@ -902,6 +902,36 @@ def test_generate_handoff_surfaces_insight_hints(tmp_path):
         _run(db.close())
 
 
+def test_add_note_warns_on_similar_existing_note():
+    """6e4e2371 — adding a note whose title closely matches an existing one
+    returns a similar_notes warning (never blocks the write)."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "dedup-proj"))
+        _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Windows event loop deadlock gotcha",
+            "body": "Use SelectorEventLoop on Windows.",
+        }, db, "/tmp"))
+        dup = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Windows event loop deadlock gotchas",  # near-identical
+            "body": "Different body entirely.",
+        }, db, "/tmp"))
+        assert "similar_notes" in dup
+        assert dup["similar_notes"][0]["similarity"] >= 0.82
+        # A clearly different note does not trigger the warning.
+        fresh = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Stripe billing overage metering",
+            "body": "unrelated",
+        }, db, "/tmp"))
+        assert "similar_notes" not in fresh
+    finally:
+        _run(db.close())
+
+
 def test_planning_brief_new_handoff_signal():
     # ab514e43 — new-handoff signal: latest_handoff + since-based new flag.
     import meridian.db as db_module

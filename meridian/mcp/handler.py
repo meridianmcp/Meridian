@@ -1617,6 +1617,47 @@ async def _handle_notes_decisions(
         # e5592013 — lint: "MANUAL" notes are usually human tasks, not wiki.
         if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
             result = {**result, "lint": _MANUAL_NOTE_LINT}
+        # 6e4e2371 — warn (never block) when a near-duplicate note already exists,
+        # so notes don't accumulate repetitive near-copies. Advisory: any failure
+        # here must not fail the write.
+        if isinstance(result, dict) and not result.get("error"):
+            try:
+                import difflib as _difflib  # noqa: PLC0415
+                _new_title = (args.get("title") or "").strip().lower()
+                if _new_title:
+                    _new_id = result.get("id")
+                    _new_slug = result.get("slug")
+                    _existing = await db_module.get_project_notes(
+                        db, args["project_id"], limit=200
+                    )
+                    _similar = []
+                    for _n in (_existing or []):
+                        if (_new_id and _n.get("id") == _new_id) or (
+                            _new_slug and _n.get("slug") == _new_slug
+                        ):
+                            continue  # skip the note we just created
+                        _et = (_n.get("title") or "").strip().lower()
+                        if not _et:
+                            continue
+                        _ratio = _difflib.SequenceMatcher(None, _new_title, _et).ratio()
+                        if _ratio >= 0.82:
+                            _similar.append({
+                                "slug": _n.get("slug"),
+                                "title": _n.get("title"),
+                                "similarity": round(_ratio, 2),
+                            })
+                    if _similar:
+                        _similar.sort(key=lambda s: s["similarity"], reverse=True)
+                        result = {
+                            **result,
+                            "similar_notes": _similar[:3],
+                            "similar_notes_warning": (
+                                "A similar note already exists — consider updating it "
+                                "instead of accumulating near-duplicates."
+                            ),
+                        }
+            except Exception:  # noqa: BLE001 — dedup is advisory
+                pass
         return result
     if name == "ingest_document":
         # e3f150d0 — extract a Word/PDF/text document into a kind='document'
