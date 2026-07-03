@@ -182,6 +182,7 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
             pass
 
     _tunnel_sockets[tenant_id] = ws
+    _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd — reconnect: rebuild tool routes
     try:
         await db_module.update_tenant(auth_db, tenant_id, tunnel_active=1)
     except Exception:
@@ -229,6 +230,8 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     finally:
         _tunnel_sockets.pop(tenant_id, None)
         _clear_slot_health(tenant_id, "fs")
+        if not has_active_tunnel(tenant_id):
+            _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd
         # Cancel any in-flight proxy requests for this tenant
         for fut in list(_pending_reqs.values()):
             if not fut.done():
@@ -450,6 +453,9 @@ async def _serve_tunnel_ws(
             pass
 
     sockets[tenant_id] = ws
+    # 4331f9cd — a (re)connect may change the slot's tool set; drop the cached
+    # routes so the next tools/list rebuilds them for this tenant.
+    _tunnel_tool_routes.pop(tenant_id, None)
     _log.info("tunnel-%s: tenant %s connected", label, tenant_id[:8])
 
     try:
@@ -468,6 +474,15 @@ async def _serve_tunnel_ws(
             msg_type = msg.get("type")
             if msg_type == "ping":
                 continue
+            if msg_type == "plugin_status":
+                # a898710a — dc/ppt/word slots report health too; record it so a
+                # failed pre-flight surfaces as "unhealthy" (not "inactive"), and
+                # a later healthy report clears the diagnostic.
+                _record_slot_health(
+                    tenant_id, msg.get("slot") or label, msg.get("healthy", True),
+                    reason=msg.get("reason"), detail=msg.get("detail"),
+                )
+                continue
             if msg_type == "response":
                 req_id = msg.get("id")
                 fut = pending.get(req_id)
@@ -480,6 +495,11 @@ async def _serve_tunnel_ws(
         _log.debug("tunnel-%s: tenant %s disconnected: %s", label, tenant_id[:8], exc)
     finally:
         sockets.pop(tenant_id, None)
+        _clear_slot_health(tenant_id, label)
+        # 4331f9cd — slot dropped; if no tunnel remains, drop cached routes so the
+        # next tools/list rebuilds cleanly.
+        if not has_active_tunnel(tenant_id):
+            _tunnel_tool_routes.pop(tenant_id, None)
         for fut in list(pending.values()):
             if not fut.done():
                 fut.cancel()

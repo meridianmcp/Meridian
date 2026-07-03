@@ -71,6 +71,22 @@ def test_has_active_tunnel():
     assert tn.has_active_tunnel("t1") is True
 
 
+def test_slot_health_tracks_non_fs_slots():
+    """a898710a — dc/ppt/word slots (served by _serve_tunnel_ws) can now record
+    health via plugin_status, so a failed pre-flight surfaces as 'unhealthy'
+    rather than falling back to 'inactive'. A later healthy report clears it."""
+    try:
+        # Default: assumed healthy until a plugin_status says otherwise.
+        assert tn._slot_is_healthy("t-dc", "dc") is True
+        tn._record_slot_health("t-dc", "dc", False, reason="preflight failed", detail="port 8813")
+        assert tn._slot_is_healthy("t-dc", "dc") is False
+        # Recovery / healthy report flips it back and clears any diagnostic.
+        tn._record_slot_health("t-dc", "dc", True)
+        assert tn._slot_is_healthy("t-dc", "dc") is True
+    finally:
+        tn._clear_slot_health("t-dc")
+
+
 # ---------------------------------------------------------------------------
 # list_tunnel_tools / call_tunnel_tool
 # ---------------------------------------------------------------------------
