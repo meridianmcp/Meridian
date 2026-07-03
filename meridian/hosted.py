@@ -121,6 +121,14 @@ def _read_session_cookie(cookie_value: str) -> str | None:
         return None
 
 
+def _session_meta(request: Request) -> tuple[str | None, str | None]:
+    """3c28450d — best-effort ``(user_agent, ip)`` for a new web session, shown
+    in the active-sessions view. UA is truncated; IP is the direct client host."""
+    ua = (request.headers.get("user-agent") or "")[:400] or None
+    ip = (request.client.host if request.client else None) or None
+    return ua, ip
+
+
 # ---------------------------------------------------------------------------
 # Google OAuth helpers (authlib)
 # ---------------------------------------------------------------------------
@@ -788,7 +796,9 @@ async def auth_callback(request: Request) -> RedirectResponse:
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
     ).isoformat()
-    session = await db_module.create_user_session(db, tenant["id"], expires_at)
+    session = await db_module.create_user_session(
+        db, tenant["id"], expires_at, *_session_meta(request)
+    )
     cookie_value = _make_session_cookie(session["id"])
 
     import base64 as _b64
@@ -897,7 +907,9 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
     ).isoformat()
-    session = await db_module.create_user_session(db, tenant["id"], expires_at)
+    session = await db_module.create_user_session(
+        db, tenant["id"], expires_at, *_session_meta(request)
+    )
     cookie_value = _make_session_cookie(session["id"])
 
     _invite_url = await _consume_pending_invite_cookie(request, db)
@@ -1046,7 +1058,9 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
     ).isoformat()
-    session = await db_module.create_user_session(db, tenant["id"], expires_at)
+    session = await db_module.create_user_session(
+        db, tenant["id"], expires_at, *_session_meta(request)
+    )
     cookie_value = _make_session_cookie(session["id"])
 
     _invite_url = await _consume_pending_invite_cookie(request, db)
@@ -2515,6 +2529,45 @@ async def _verify_turnstile(token: object) -> bool:
         return True
 
 
+async def account_sessions_list(request: Request):
+    """3c28450d — list the current tenant's active web sessions with device
+    metadata, marking the session making this request as ``current``. Hosted-only;
+    get_current_tenant raises 401 without a valid session cookie."""
+    from fastapi.responses import JSONResponse
+    from . import db as db_module
+
+    tenant = await get_current_tenant(request)
+    db = request.app.state.db
+    cookie_val = request.cookies.get(_SESSION_COOKIE)
+    current_sid = _read_session_cookie(cookie_val) if cookie_val else None
+    sessions = await db_module.get_user_sessions_for_tenant(db, tenant["id"])
+    out = [
+        {
+            "id": s["id"],
+            "current": s["id"] == current_sid,
+            "user_agent": s.get("user_agent"),
+            "ip": s.get("ip"),
+            "created_at": s.get("created_at"),
+            "last_seen_at": s.get("last_seen_at"),
+            "expires_at": s.get("expires_at"),
+        }
+        for s in sessions
+    ]
+    return JSONResponse({"sessions": out})
+
+
+async def account_session_revoke(request: Request, session_id: str):
+    """3c28450d — revoke (sign out) one of the current tenant's web sessions.
+    Tenant-scoped: a user can never revoke another tenant's session."""
+    from fastapi.responses import JSONResponse
+    from . import db as db_module
+
+    tenant = await get_current_tenant(request)
+    db = request.app.state.db
+    revoked = await db_module.revoke_user_session(db, session_id, tenant["id"])
+    return JSONResponse({"status": "ok", "revoked": bool(revoked)})
+
+
 async def auth_magic_request(request: Request):
     """v0.9 — POST /auth/magic.
 
@@ -2713,7 +2766,9 @@ async def auth_magic_verify(request: Request, token: str = ""):
         expires_at = (
             datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
         ).isoformat()
-        session = await db_module.create_user_session(db, tenant["id"], expires_at)
+        session = await db_module.create_user_session(
+        db, tenant["id"], expires_at, *_session_meta(request)
+    )
         cookie_value = _make_session_cookie(session["id"])
         redirect_to = await _post_login_redirect(tenant, db)
     except Exception:

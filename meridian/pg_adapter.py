@@ -1262,6 +1262,15 @@ async def _migrate_pg_signup_attempts(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_user_session_metadata(conn: PostgresConnection) -> None:
+    """3c28450d — device metadata on user_sessions (mirrors SQLite)."""
+    await conn.executescript(
+        "ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS user_agent TEXT;"
+        "ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS ip TEXT;"
+        "ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS last_seen_at TEXT"
+    )
+
+
 async def _migrate_pg_notes_priority(conn: PostgresConnection) -> None:
     """Sprint-4 — project_notes.priority: high/normal/low ranking for generate_handoff."""
     await conn.executescript(
@@ -2278,4 +2287,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_quality_gates,
     _migrate_pg_parallel_primitives,
     _migrate_pg_signup_attempts,
+    _migrate_pg_user_session_metadata,
 )

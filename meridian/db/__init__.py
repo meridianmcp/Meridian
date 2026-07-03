@@ -839,6 +839,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_parallel_primitives(db)
     await _migrate_project_status_priority(db)
     await _migrate_signup_attempts(db)
+    await _migrate_user_session_metadata(db)
     return db
 
 
@@ -5115,12 +5116,22 @@ async def create_user_session(
     db: aiosqlite.Connection,
     tenant_id: str,
     expires_at: str,
+    user_agent: str | None = None,
+    ip: str | None = None,
 ) -> dict[str, Any]:
-    """Create a web session for a tenant. Returns the session dict."""
+    """Create a web session for a tenant. Returns the session dict.
+
+    3c28450d — optional device metadata (``user_agent``/``ip``) is stored for
+    the active-sessions view; ``last_seen_at`` is seeded to now."""
     sid = _new_id()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
-        "INSERT INTO user_sessions (id, tenant_id, expires_at) VALUES (?, ?, ?)",
-        (sid, tenant_id, expires_at),
+        "INSERT INTO user_sessions "
+        "(id, tenant_id, expires_at, user_agent, ip, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (sid, tenant_id, expires_at,
+         (user_agent or None), (ip or None), now),
     )
     await db.commit()
     async with db.execute("SELECT * FROM user_sessions WHERE id = ?", (sid,)) as cur:
@@ -5155,6 +5166,48 @@ async def delete_user_session(
     """Delete a web session (logout)."""
     await db.execute("DELETE FROM user_sessions WHERE id = ?", (session_id,))
     await db.commit()
+
+
+async def get_user_sessions_for_tenant(
+    db: aiosqlite.Connection, tenant_id: str
+) -> list[dict[str, Any]]:
+    """3c28450d — all non-expired web sessions for a tenant, most-recently-seen
+    first, for the active-sessions view."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    async with db.execute(
+        "SELECT * FROM user_sessions WHERE tenant_id = ? AND expires_at > ? "
+        "ORDER BY COALESCE(last_seen_at, created_at) DESC",
+        (tenant_id, now),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def touch_user_session(
+    db: aiosqlite.Connection, session_id: str
+) -> None:
+    """3c28450d — bump last_seen_at so the active-sessions view shows recency."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE user_sessions SET last_seen_at = ? WHERE id = ?", (now, session_id)
+    )
+    await db.commit()
+
+
+async def revoke_user_session(
+    db: aiosqlite.Connection, session_id: str, tenant_id: str
+) -> bool:
+    """3c28450d — delete a session only if it belongs to ``tenant_id`` (so a user
+    can never revoke another tenant's session). Returns True if a row was
+    removed."""
+    cur = await db.execute(
+        "DELETE FROM user_sessions WHERE id = ? AND tenant_id = ?",
+        (session_id, tenant_id),
+    )
+    await db.commit()
+    return (cur.rowcount or 0) > 0
 
 
 async def delete_api_tokens_by_label(
