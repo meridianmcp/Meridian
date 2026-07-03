@@ -83,6 +83,35 @@ export function _colorForHuman(humanId: string): string {
   return _HUMAN_COLORS[Math.abs(h) % _HUMAN_COLORS.length] as string;
 }
 
+/**
+ * Repo-path directories a project already tracks that aren't yet filesystem
+ * roots — surfaced in Project Config as one-click "add" chips so a user never
+ * has to retype a path Meridian already knows (77999d60). Pulls from
+ * executor_config.repo_paths[].cwd plus the legacy single repo_path, trims,
+ * dedupes, and drops anything already present in `currentRoots`.
+ */
+export function suggestedFsRoots(execCfg: any, currentRoots: any): string[] {
+  const have = new Set(
+    (Array.isArray(currentRoots) ? currentRoots : [])
+      .map((r: any) => String(r ?? '').trim())
+      .filter(Boolean),
+  );
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: any) => {
+    const v = String(raw ?? '').trim();
+    if (!v || have.has(v) || seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  };
+  const cfg = execCfg && typeof execCfg === 'object' ? execCfg : {};
+  if (Array.isArray(cfg.repo_paths)) {
+    for (const p of cfg.repo_paths) add(p && typeof p === 'object' ? p.cwd : p);
+  }
+  add(cfg.repo_path);
+  return out;
+}
+
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline handlers
 // and cross-file references keep resolving after IIFE bundling.
 try {
@@ -90,6 +119,6 @@ try {
     getPanelState, toast, escapeHtml, formatRelativeTime, sessionAgeMs, isLiveSession,
     _colorForHuman, _PLAN_LABELS, QUEUE_DONE_PAGE_SIZE, SESSION_LIVE_WINDOW_MS,
     _HUMAN_COLORS, DEFAULT_MAX_PINNED_DECISIONS, DEFAULT_CONTEXT_THRESHOLD,
-    DEFAULT_MAX_TURNS,
+    DEFAULT_MAX_TURNS, suggestedFsRoots,
   });
 } catch (e) { /* window unavailable (non-browser) */ }

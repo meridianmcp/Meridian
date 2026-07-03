@@ -1995,6 +1995,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       </div>
 
+      <div id="exec-fs-roots-suggest-${projectId}" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px"></div>
+
     </div>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
@@ -2133,10 +2135,29 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
           <td style="padding:2px 0;text-align:right"><button class="exec-del-fs-row" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
         </tr>`).join('') + '</table>';
       _fsTblEl.querySelectorAll('.exec-del-fs-row').forEach(b => {
-        b.onclick = () => { _execFsRoots.splice(parseInt(b.dataset.idx, 10), 1); _rerenderFsTbl(); };
+        b.onclick = () => { _execFsRoots.splice(parseInt(b.dataset.idx, 10), 1); _rerenderFsTbl(); _rerenderFsSuggest(); };
       });
     };
     _rerenderFsTbl();
+    // 77999d60 — one-click chips for repo paths Meridian already tracks, so a
+    // user never has to retype a known repo dir to grant the FS connector access.
+    const _fsSuggestEl = document.getElementById(`exec-fs-roots-suggest-${projectId}`);
+    const _rerenderFsSuggest = () => {
+      if (!_fsSuggestEl) return;
+      const sugg = suggestedFsRoots(execCfg, _execFsRoots);
+      if (!sugg.length) { _fsSuggestEl.innerHTML = ''; return; }
+      _fsSuggestEl.innerHTML = '<span style="font-size:9px;color:var(--muted);align-self:center">Add tracked repo path:</span>' +
+        sugg.map((p: string) => `<button class="exec-add-fs-suggest" data-root="${escapeHtml(p)}" style="font-size:9px;padding:1px 8px;background:transparent;border:1px dashed var(--border);border-radius:3px;color:var(--accent);cursor:pointer;font-family:var(--font-mono)">+ ${escapeHtml(p)}</button>`).join('');
+      _fsSuggestEl.querySelectorAll('.exec-add-fs-suggest').forEach(b => {
+        b.onclick = () => {
+          const root = (b as HTMLElement).dataset.root || '';
+          if (root && !_execFsRoots.includes(root)) _execFsRoots.push(root);
+          _rerenderFsTbl();
+          _rerenderFsSuggest();
+        };
+      });
+    };
+    _rerenderFsSuggest();
     const _fsInput = document.getElementById(`exec-fs-roots-input-${projectId}`);
     const _fsAddBtn = document.getElementById(`exec-fs-roots-add-${projectId}`);
     const _addFsRoot = () => {
@@ -2145,6 +2166,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       if (!_execFsRoots.includes(v)) _execFsRoots.push(v);
       if (_fsInput) _fsInput.value = '';
       _rerenderFsTbl();
+      _rerenderFsSuggest();
     };
     if (_fsAddBtn) _fsAddBtn.onclick = _addFsRoot;
     if (_fsInput) _fsInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); _addFsRoot(); } });

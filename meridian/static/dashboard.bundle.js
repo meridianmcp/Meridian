@@ -117,6 +117,25 @@
     for (let i3 = 0; i3 < id.length; i3++) h3 = (h3 << 5) - h3 + id.charCodeAt(i3) | 0;
     return _HUMAN_COLORS[Math.abs(h3) % _HUMAN_COLORS.length];
   }
+  function suggestedFsRoots2(execCfg, currentRoots) {
+    const have = new Set(
+      (Array.isArray(currentRoots) ? currentRoots : []).map((r3) => String(r3 ?? "").trim()).filter(Boolean)
+    );
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    const add = (raw) => {
+      const v3 = String(raw ?? "").trim();
+      if (!v3 || have.has(v3) || seen.has(v3)) return;
+      seen.add(v3);
+      out.push(v3);
+    };
+    const cfg = execCfg && typeof execCfg === "object" ? execCfg : {};
+    if (Array.isArray(cfg.repo_paths)) {
+      for (const p3 of cfg.repo_paths) add(p3 && typeof p3 === "object" ? p3.cwd : p3);
+    }
+    add(cfg.repo_path);
+    return out;
+  }
   try {
     Object.assign(window, {
       getPanelState: getPanelState2,
@@ -132,7 +151,8 @@
       _HUMAN_COLORS,
       DEFAULT_MAX_PINNED_DECISIONS: DEFAULT_MAX_PINNED_DECISIONS2,
       DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2,
-      DEFAULT_MAX_TURNS: DEFAULT_MAX_TURNS2
+      DEFAULT_MAX_TURNS: DEFAULT_MAX_TURNS2,
+      suggestedFsRoots: suggestedFsRoots2
     });
   } catch (e3) {
   }
@@ -3454,6 +3474,8 @@ project_id = "${displayPid}"`;
 
       </div>
 
+      <div id="exec-fs-roots-suggest-${projectId}" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px"></div>
+
     </div>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
@@ -3586,10 +3608,30 @@ project_id = "${displayPid}"`;
             b2.onclick = () => {
               _execFsRoots.splice(parseInt(b2.dataset.idx, 10), 1);
               _rerenderFsTbl();
+              _rerenderFsSuggest();
             };
           });
         };
         _rerenderFsTbl();
+        const _fsSuggestEl = document.getElementById(`exec-fs-roots-suggest-${projectId}`);
+        const _rerenderFsSuggest = () => {
+          if (!_fsSuggestEl) return;
+          const sugg = suggestedFsRoots(execCfg, _execFsRoots);
+          if (!sugg.length) {
+            _fsSuggestEl.innerHTML = "";
+            return;
+          }
+          _fsSuggestEl.innerHTML = '<span style="font-size:9px;color:var(--muted);align-self:center">Add tracked repo path:</span>' + sugg.map((p3) => `<button class="exec-add-fs-suggest" data-root="${escapeHtml(p3)}" style="font-size:9px;padding:1px 8px;background:transparent;border:1px dashed var(--border);border-radius:3px;color:var(--accent);cursor:pointer;font-family:var(--font-mono)">+ ${escapeHtml(p3)}</button>`).join("");
+          _fsSuggestEl.querySelectorAll(".exec-add-fs-suggest").forEach((b2) => {
+            b2.onclick = () => {
+              const root = b2.dataset.root || "";
+              if (root && !_execFsRoots.includes(root)) _execFsRoots.push(root);
+              _rerenderFsTbl();
+              _rerenderFsSuggest();
+            };
+          });
+        };
+        _rerenderFsSuggest();
         const _fsInput = document.getElementById(`exec-fs-roots-input-${projectId}`);
         const _fsAddBtn = document.getElementById(`exec-fs-roots-add-${projectId}`);
         const _addFsRoot = () => {
@@ -3598,6 +3640,7 @@ project_id = "${displayPid}"`;
           if (!_execFsRoots.includes(v3)) _execFsRoots.push(v3);
           if (_fsInput) _fsInput.value = "";
           _rerenderFsTbl();
+          _rerenderFsSuggest();
         };
         if (_fsAddBtn) _fsAddBtn.onclick = _addFsRoot;
         if (_fsInput) _fsInput.addEventListener("keydown", (e3) => {

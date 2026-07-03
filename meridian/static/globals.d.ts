@@ -57,6 +57,7 @@ declare global {
   const githubIconSvg: any;
   const displayNotifyTarget: any;
   const suggestNtfyTopic: any;
+  const suggestedFsRoots: (execCfg: any, currentRoots: any) => string[];
   const osExecutorHintBanner: any;
 
   const isDemoMode: any;
