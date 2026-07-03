@@ -622,6 +622,22 @@ def test_max_turns_slider_supports_megasprints():
     assert "Math.min(200, Math.max(10, ctxRaw))" in settings_src, "checkpoint clamp must be raised to 200"
 
 
+def test_documents_tab_present():
+    """3f596f81 — the dashboard exposes a Documents tab: a vtab button, a drawer
+    panel, a loadDocumentsTab loader that reads project_notes (note_kind=document),
+    and an on-demand heading-tree structure view via /document-structure."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    src = (static / "dashboard.ts").read_text(encoding="utf-8")
+    assert 'data-vtab="documents"' in src, "Documents vtab button missing"
+    assert "drawer-documents-${project.id}" in src, "Documents drawer panel missing"
+    assert "documents-body-${project.id}" in src, "Documents body container missing"
+    assert "async function loadDocumentsTab" in src, "loadDocumentsTab loader missing"
+    assert "if (vtab === 'documents') loadDocumentsTab" in src, "Documents tab dispatch missing"
+    assert "note_kind || '').toLowerCase() === 'document'" in src, "document filter missing"
+    assert "/document-structure?path=" in src, "structure fetch missing"
+
+
 def test_execution_mode_toggle_present(js):
     """ecf69de8 — the settings tab renders an Execution Mode select (autonomous
     vs interactive) that persists via saveProjectSettings (PATCH settings)."""

@@ -47,6 +47,39 @@ async def list_project_notes_endpoint(
     )
 
 
+@router.get("/projects/{project_id}/document-structure")
+async def document_structure_endpoint(
+    project_id: str,
+    request: Request,
+    path: str,
+) -> dict[str, Any]:
+    """3f596f81 — heading-tree structure of an ingested .docx for the Documents
+    panel. Calls the stateless docs_intel.document_outline (paragraph_count +
+    heading_count + an ordered heading list). Returns ``{"error": ...}`` on a
+    missing/unreadable/non-docx file rather than a 500 so the panel renders the
+    failure inline.
+
+    NOTE: ``path`` is resolved on the SERVER — this works for self-hosted / tunnel
+    setups where the server can see the file; a hosted server has no access to
+    the user's local filesystem, so it returns an error the panel surfaces.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    fp = (path or "").strip()
+    validate_input_size(fp, "path", 2000)
+    if not fp:
+        return {"error": "path is required"}
+    from .. import docs_intel  # local: pure-stdlib parse, cheap import
+    try:
+        return docs_intel.document_outline(fp)
+    except FileNotFoundError:
+        return {"error": f"file not found on server: {fp}"}
+    except Exception as exc:  # noqa: BLE001 — surface parse errors inline
+        return {"error": f"could not parse document: {exc}"}
+
+
 @router.post("/projects/{project_id}/notes", status_code=201)
 async def create_project_note_endpoint(
     project_id: str, body: dict[str, Any], request: Request

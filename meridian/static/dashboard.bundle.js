@@ -9157,6 +9157,8 @@ Current: ${current || "(none)"}`,
 
       <button class="vtab-btn" data-vtab="codeintel" title="Code Intel \u2014 codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">\u{1F50D}</button>
 
+      <button class="vtab-btn" data-vtab="documents" title="Documents \u2014 ingested docs &amp; structure">\u{1F4C4}</button>
+
     </div>
 
     <div class="vtab-drawer open" id="drawer-${project.id}">
@@ -9905,6 +9907,22 @@ Current: ${current || "(none)"}`,
 
       </div>
 
+      <div class="drawer-panel" id="drawer-documents-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>DOCUMENTS \xB7 ${escapeHtml(project.name)}</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="documents-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading\u2026</div>
+
+        </div>
+
+      </div>
+
     </div>
 
     <section class="claude-handoff-panel">
@@ -10098,6 +10116,7 @@ Current: ${current || "(none)"}`,
           if (vtab === "docs") loadDocsTab(project.id);
           if (vtab === "settings") loadSettingsTab(project.id);
           if (vtab === "codeintel") loadCodeIntelTab(project.id);
+          if (vtab === "documents") loadDocumentsTab(project.id);
         };
       });
       try {
@@ -11705,6 +11724,72 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   if (typeof window !== "undefined") window._generateCodebaseMap = _generateCodebaseMap;
+  async function loadDocumentsTab(projectId) {
+    const body = document.getElementById(`documents-body-${projectId}`);
+    if (!body) return;
+    body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    let docs = [];
+    try {
+      const dp = await api(`/projects/${projectId}/notes?paginate=true&limit=200`);
+      docs = (dp && dp.notes || []).filter((n2) => String(n2.note_kind || "").toLowerCase() === "document");
+    } catch (e3) {
+      body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load documents: ${escapeHtml(String(e3))}</div>`;
+      return;
+    }
+    const _srcBadge = (src) => {
+      const s3 = String(src || "local").toLowerCase();
+      const label = s3.includes("onedrive") ? "OneDrive" : s3.includes("gdrive") || s3.includes("google") ? "GDrive" : src || "local";
+      return `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">${escapeHtml(String(label))}</span>`;
+    };
+    let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? "" : "s"} <span style="color:var(--muted)">(note_kind=document)</span></div>
+  </div>`;
+    if (!docs.length) {
+      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) \u2014 it is stored as a project note with kind=document and appears here. (Local/OneDrive/GDrive pickers are not yet wired; ingestion is via the MCP tool for now.)</div>`;
+    } else {
+      for (const d3 of docs) {
+        const title = d3.title || d3.slug || d3.id;
+        const fp = d3.file_path || "";
+        const tags = Array.isArray(d3.tags) ? d3.tags : [];
+        const did = String(d3.id);
+        html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(title))}</span>
+          ${_srcBadge(d3.source)}
+        </div>
+        ${fp ? `<div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px;word-break:break-all">${escapeHtml(String(fp))}</div>` : ""}
+        ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t3) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(String(t3))}</span>`).join("")}</div>` : ""}
+        ${fp ? `<div style="margin-top:6px"><button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button></div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div>` : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path \u2014 structure view unavailable.</div>'}
+      </div>`;
+      }
+      html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
+    }
+    body.innerHTML = html;
+    body.querySelectorAll(".doc-struct-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const fp = btn.dataset.fp || "";
+        const did = btn.dataset.did || "";
+        const target = document.getElementById(`doc-struct-${did}`);
+        if (!target) return;
+        target.innerHTML = '<span style="font-size:9px;color:var(--muted)">loading structure\u2026</span>';
+        try {
+          const st = await api(`/projects/${projectId}/document-structure?path=${encodeURIComponent(fp)}`);
+          if (st && st.error) {
+            target.innerHTML = `<span style="font-size:9px;color:var(--warning,#d29922)">${escapeHtml(String(st.error))}</span>`;
+            return;
+          }
+          const headings = st && st.headings || [];
+          const tree = headings.map((h3) => {
+            const lvl = Math.max(1, Math.min(6, parseInt(h3.level, 10) || 1));
+            return `<div style="font-size:10px;color:var(--text);padding-left:${(lvl - 1) * 12}px">${escapeHtml(String(h3.text || ""))}</div>`;
+          }).join("");
+          target.innerHTML = `<div style="font-size:9px;color:var(--muted);margin-bottom:3px">${st.paragraph_count} paragraphs \xB7 ${st.heading_count} headings</div>${tree || '<span style="font-size:9px;color:var(--muted)">No headings found.</span>'}`;
+        } catch (e3) {
+          target.innerHTML = `<span style="font-size:9px;color:var(--error)">Failed: ${escapeHtml(String(e3))}</span>`;
+        }
+      });
+    });
+  }
   async function loadCodeIntelTab(projectId) {
     const body = document.getElementById(`codeintel-body-${projectId}`);
     if (!body) return;

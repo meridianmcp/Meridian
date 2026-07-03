@@ -86,6 +86,34 @@ def test_get_document_structure_mcp_tool(tmp_path):
         asyncio.run(db.close())
 
 
+def test_document_structure_endpoint(client, tmp_path):
+    """3f596f81 — GET /projects/{id}/document-structure returns the docx outline
+    for the Documents panel; failures are returned inline, not as 500s."""
+    docx_path = tmp_path / "ch.docx"
+    docx_path.write_bytes(_synthetic_docx())
+    pid = client.post("/projects", json={"name": "docs-panel"}).json()["id"]
+    # Happy path — server-side parse of a real .docx.
+    r = client.get(f"/projects/{pid}/document-structure", params={"path": str(docx_path)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["paragraph_count"] == 4
+    assert body["heading_count"] == 2
+    assert [h["level"] for h in body["headings"]] == [1, 2]
+    assert body["headings"][0]["text"] == "Introduction"
+    # Missing file → inline error, not a 500.
+    r2 = client.get(
+        f"/projects/{pid}/document-structure",
+        params={"path": str(tmp_path / "nope.docx")},
+    )
+    assert r2.status_code == 200 and "error" in r2.json()
+    # Unknown project → 404.
+    r3 = client.get(
+        "/projects/does-not-exist/document-structure",
+        params={"path": str(docx_path)},
+    )
+    assert r3.status_code == 404
+
+
 def test_index_and_navigate_by_paraid(tmp_path):
     db = str(tmp_path / "doc.idx.sqlite")
     summary = docs_intel.index_docx(_synthetic_docx(), db)
