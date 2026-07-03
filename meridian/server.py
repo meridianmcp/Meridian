@@ -4161,9 +4161,14 @@ async def _start_session_composite(
             if _c_github_repo
             else "not connected — GitHub tools (search_code, read_file, etc.) will error until you connect a repo in Settings"
         )
+        from datetime import datetime as _dt, timezone as _tz  # de193a81
+        _c_now = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
         _c_payload = {
             "session_id": session["id"],
             "compact": True,
+            # de193a81 — anchor the executor to the real date/time so a session
+            # spanning multiple calendar days doesn't drift on "today".
+            "current_timestamp": _c_now,
             "execution_mode": _c_mode,  # ecf69de8 — structured posture field
             "execution_mode_directive": _c_mode_directive,
             "execute_immediately": _c_execute_now,

@@ -3221,6 +3221,9 @@ async def _handle_planning_tools(
             "unvalidated_assumptions": unvalidated_assumptions,
             "last_session": last_session,
             "generated_at": brief_generated_at,
+            # de193a81 — explicit "now" so a planner spanning multiple calendar
+            # days never guesses at "today"/"yesterday".
+            "current_timestamp": brief_generated_at,
             "latest_handoff": latest_handoff,
             "new_handoff_available": new_handoff_available,
             "handoff_signal": handoff_signal,

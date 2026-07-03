@@ -978,3 +978,21 @@ def test_start_session_agent_instructions_includes_hitl_directive(client):
     ai = data.get("agent_instructions", "")
     assert "EXECUTION MODE:" in ai
     assert "HITL:" in ai
+
+
+def test_start_session_includes_current_timestamp(client):
+    """de193a81 — the start_session response carries current_timestamp so an
+    executor session spanning calendar days is anchored to the real date."""
+    import json as _json
+    import re
+    project = client.post("/projects", json={"name": "ts-instr-proj"}).json()
+    pid = project["id"]
+    r = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "start_session",
+                   "arguments": {"project_id": pid, "session_name": "ts-test"}}
+    })
+    assert r.status_code == 200
+    data = _json.loads(r.json()["result"]["content"][0]["text"])
+    assert "current_timestamp" in data
+    assert re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", data["current_timestamp"])

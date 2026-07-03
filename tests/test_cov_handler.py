@@ -828,6 +828,24 @@ def test_planning_brief_last_session_none_when_no_sessions():
         _run(db.close())
 
 
+def test_planning_brief_includes_current_timestamp():
+    """de193a81 — get_planning_brief returns current_timestamp so a planner
+    spanning multiple calendar days never guesses 'today'/'yesterday'."""
+    import re
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "ts-proj"))
+        brief = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert "current_timestamp" in brief
+        assert re.match(
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", brief["current_timestamp"]
+        )
+    finally:
+        _run(db.close())
+
+
 def test_planning_brief_new_handoff_signal():
     # ab514e43 — new-handoff signal: latest_handoff + since-based new flag.
     import meridian.db as db_module
