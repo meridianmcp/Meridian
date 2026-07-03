@@ -3178,6 +3178,8 @@ function buildTabBody(project: any) {
 
       <button class="vtab-btn" data-vtab="documents" title="Documents — ingested docs &amp; structure">📄</button>
 
+      <button class="vtab-btn" data-vtab="insights" title="Insights — durable strategic understanding">💡</button>
+
     </div>
 
     <div class="vtab-drawer open" id="drawer-${project.id}">
@@ -3942,6 +3944,22 @@ function buildTabBody(project: any) {
 
       </div>
 
+      <div class="drawer-panel" id="drawer-insights-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>INSIGHTS · ${escapeHtml(project.name)}</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="insights-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading…</div>
+
+        </div>
+
+      </div>
+
     </div>
 
     <section class="claude-handoff-panel">
@@ -4187,6 +4205,8 @@ function buildTabBody(project: any) {
         if (vtab === 'codeintel') loadCodeIntelTab(project.id);
 
         if (vtab === 'documents') loadDocumentsTab(project.id);
+
+        if (vtab === 'insights') loadInsightsTab(project.id);
 
       };
 
@@ -7085,6 +7105,58 @@ if (typeof window !== 'undefined') window._generateCodebaseMap = _generateCodeba
 // via GET /projects/{id}/document-structure (docs_intel.document_outline).
 // Honest scope: structure = heading tree + paragraph/heading counts only;
 // figures/cross-refs/equations/comments are not extracted by docs_intel Phase 1.
+// 0b711a9d — Project Insights panel. Lists durable strategic insights (the
+// dedicated insights table) grouped by horizon (permanent / year / quarter).
+// Permanent insights always surface in the planning brief; add via add_insight.
+async function loadInsightsTab(projectId: any) {
+  const body = document.getElementById(`insights-body-${projectId}`);
+  if (!body) return;
+  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+
+  let insights: any[] = [];
+  try {
+    insights = ((await api(`/projects/${projectId}/insights`)) as any[]) || [];
+  } catch (e: any) {
+    body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load insights: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+
+  const HORIZON: Record<string, { label: string; color: string }> = {
+    permanent: { label: 'PERMANENT', color: 'var(--accent)' },
+    year: { label: 'YEAR', color: 'var(--warning, #d29922)' },
+    quarter: { label: 'QUARTER', color: 'var(--muted)' },
+  };
+  const _pill = (h: any) => {
+    const m = HORIZON[String(h)] || { label: String(h || 'quarter').toUpperCase(), color: 'var(--muted)' };
+    return `<span style="font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid ${m.color};color:${m.color};letter-spacing:.04em">${m.label}</span>`;
+  };
+
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <div style="font-size:11px;color:var(--text)"><b>${insights.length}</b> insight${insights.length === 1 ? '' : 's'}</div>
+  </div>
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Durable strategic understanding — separate from decisions (choices) and notes (reference). Add via the <code>add_insight</code> MCP tool. Permanent insights always appear in the planning brief.</div>`;
+
+  if (!insights.length) {
+    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No insights yet. Capture accumulated understanding with <code>add_insight(project_id, title, body, horizon)</code>.</div>`;
+  } else {
+    const order: Record<string, number> = { permanent: 0, year: 1, quarter: 2 };
+    const sorted = [...insights].sort((a, b) => (order[String(a.horizon)] ?? 3) - (order[String(b.horizon)] ?? 3));
+    for (const ins of sorted) {
+      const tags = String(ins.tags || '').split(',').map((t: string) => t.trim()).filter(Boolean);
+      html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(ins.title || ''))}</span>
+          ${_pill(ins.horizon)}
+        </div>
+        ${ins.body ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;white-space:pre-wrap">${escapeHtml(String(ins.body))}</div>` : ''}
+        ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t: string) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(t)}</span>`).join('')}</div>` : ''}
+      </div>`;
+    }
+  }
+  body.innerHTML = html;
+}
+
+
 async function loadDocumentsTab(projectId: any) {
   const body = document.getElementById(`documents-body-${projectId}`);
   if (!body) return;

@@ -289,6 +289,23 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 0b711a9d — insights: durable strategic understanding, a first-class knowledge
+-- type distinct from decisions (choices w/ lifecycle) and notes (reference).
+-- horizon ∈ permanent|year|quarter (validated in Python, no DB CHECK so the
+-- vocabulary can grow without a table rebuild). permanent insights always
+-- surface in get_planning_brief.
+CREATE TABLE IF NOT EXISTS insights (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    horizon TEXT NOT NULL DEFAULT 'quarter',
+    tags TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- v0.9 — project_notes: per-project wiki for setup, gotchas, env vars,
 -- how-tos. Plain table; no goal hierarchy, no version, no history.
 -- Tags are comma-separated free-form (setup, gotcha, howto, env, ...).
@@ -844,6 +861,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_user_session_metadata(db)
     await _migrate_provision_queue(db)
     await _migrate_codebase_graph_entities(db)
+    await _migrate_insights_table(db)
     return db
 
 
@@ -7634,6 +7652,71 @@ async def get_pinned_decisions(
     # band. urgent (0) < normal (1) < low (2).
     decisions.sort(key=lambda d: _DECISION_PRIORITY_RANK.get(d["priority"], 1))  # type: ignore[index,union-attr]
     return decisions  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# 0b711a9d — strategic insights (first-class knowledge type)
+# ---------------------------------------------------------------------------
+
+_INSIGHT_HORIZONS = ("permanent", "year", "quarter")
+
+
+async def create_insight(
+    db: aiosqlite.Connection,
+    project_id: str,
+    title: str,
+    body: str,
+    horizon: str = "quarter",
+    tags: "list | str | None" = None,
+) -> dict[str, Any]:
+    """Create a durable strategic insight. horizon is coerced to a valid value
+    (permanent|year|quarter, default quarter). tags may be a list or a
+    comma-string; stored comma-joined."""
+    iid = _new_id()
+    _horizon = horizon if horizon in _INSIGHT_HORIZONS else "quarter"
+    if isinstance(tags, (list, tuple)):
+        _tags = ",".join(str(t).strip() for t in tags if str(t).strip()) or None
+    else:
+        _tags = (str(tags).strip() or None) if tags else None
+    await db.execute(
+        "INSERT INTO insights (id, project_id, title, body, horizon, tags) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (iid, project_id, title, body or "", _horizon, _tags),
+    )
+    await db.commit()
+    _publish_project_event(project_id, "insight_added", {"insight_id": iid, "horizon": _horizon})
+    return (await get_insight(db, iid)) or {"id": iid}
+
+
+async def get_insight(db: aiosqlite.Connection, insight_id: str) -> dict[str, Any] | None:
+    """Fetch a single insight row by id."""
+    async with db.execute("SELECT * FROM insights WHERE id = ?", (insight_id,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_insights(
+    db: aiosqlite.Connection,
+    project_id: str,
+    horizon: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return active insights for a project, newest first. Optional horizon filter
+    (permanent|year|quarter); any other value is ignored (returns all horizons)."""
+    if horizon in _INSIGHT_HORIZONS:
+        sql = (
+            "SELECT * FROM insights WHERE project_id = ? AND horizon = ? "
+            "AND status = 'active' ORDER BY created_at DESC"
+        )
+        args: tuple[Any, ...] = (project_id, horizon)
+    else:
+        sql = (
+            "SELECT * FROM insights WHERE project_id = ? AND status = 'active' "
+            "ORDER BY created_at DESC"
+        )
+        args = (project_id,)
+    async with db.execute(sql, args) as cur:
+        rows = await cur.fetchall()
+    return [d for d in (_row_to_dict(r) for r in rows) if d is not None]
 
 
 async def get_decisions_for_file(

@@ -536,6 +536,19 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
+-- 0b711a9d — insights: durable strategic understanding (mirrors SQLite).
+CREATE TABLE IF NOT EXISTS insights (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    horizon TEXT NOT NULL DEFAULT 'quarter',
+    tags TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS})
+);
+
 -- v2.4 — hitl_requests: human-in-the-loop coordination queue.
 CREATE TABLE IF NOT EXISTS hitl_requests (
     id TEXT PRIMARY KEY,
@@ -1053,6 +1066,24 @@ async def _migrate_pg_pending_goal(conn: PostgresConnection) -> None:
     copy-pasted chat string. Read-once. Nullable."""
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS pending_goal TEXT"
+    )
+
+
+async def _migrate_pg_insights_table(conn: PostgresConnection) -> None:
+    """0b711a9d — strategic insights table (mirrors SQLite). Idempotent."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS insights ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    title TEXT NOT NULL,"
+        "    body TEXT NOT NULL,"
+        "    horizon TEXT NOT NULL DEFAULT 'quarter',"
+        "    tags TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'active',"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project_id, horizon);"
     )
 
 
@@ -2335,4 +2366,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_provision_queue,
     _migrate_pg_codebase_graph_entities,
     _migrate_pg_pending_goal,
+    _migrate_pg_insights_table,
 )

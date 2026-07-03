@@ -290,6 +290,7 @@ def _build_quick_start_goal(
     completion_mode: str = "strict",
     goal_group_style: str = "flat",
     loop_enabled: bool = False,
+    parallel_groups: dict[str, Any] | None = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -354,7 +355,39 @@ def _build_quick_start_goal(
     # the dependency order into one ordered id list so the executor runs straight
     # through without treating a wave boundary as a stopping point.
     waves = _partition_into_waves(pending_sprint_items)
-    if len(waves) > 1 and goal_group_style == "waves":
+    # e20db0be — when get_parallelizable_groups() resolved resource-conflict-free
+    # batches (each batch's items touch disjoint files/symbols), advertise them as
+    # parallel-safe. Unlike _partition_into_waves (depends_on ordering only), these
+    # batches are genuinely fan-out-safe. Any pending id not in a batch (blocked /
+    # undeclared) is appended so the /goal never drops an item.
+    _pgroups = (parallel_groups or {}).get("groups") or []
+    _has_parallel = bool(
+        parallel_groups
+        and (parallel_groups.get("group_count") or 0) > 1
+        and any(len(g) > 1 for g in _pgroups)
+    )
+    if _has_parallel:
+        _item_id_set = set(item_ids)
+        _batched: set[str] = set()
+        _batches: list[str] = []
+        for _i, _g in enumerate(_pgroups):
+            # Only ids in this /goal's (possibly version-scoped) item list.
+            _gids = [it.get("id") for it in _g if it.get("id") in _item_id_set]
+            _batched.update(_gids)
+            if _gids:
+                _batches.append(f"batch {len(_batches) + 1}: {', '.join(_gids)}")
+        _leftover = [iid for iid in item_ids if iid not in _batched]
+        _left_txt = (
+            f"; then, once their dependencies clear: {', '.join(_leftover)}"
+            if _leftover else ""
+        )
+        items_clause = (
+            "Complete sprint items in resource-conflict-free batches — the items "
+            "within a batch touch disjoint resources and are parallel-safe (fan "
+            "them out); finish a batch before starting the next: "
+            f"{'; '.join(_batches)}{_left_txt}. "
+        )
+    elif len(waves) > 1 and goal_group_style == "waves":
         # 9f57374b — opt-in wave grouping (default 'flat' per eeee02c6).
         wave_txt = "; ".join(
             f"Wave {i + 1}: {', '.join(it['id'] for it in wave if it.get('id'))}"
@@ -1686,6 +1719,13 @@ async def generate_handoff(
         _ws_settings_for_loop = await db_module.get_workspace_settings(db)
     except Exception:  # noqa: BLE001
         _ws_settings_for_loop = None
+    # e20db0be — feed resource-conflict-free parallel batches into the /goal.
+    # Guarded + fail-open: any failure degrades to the depends_on wave ordering.
+    _parallel_groups = None
+    try:
+        _parallel_groups = await db_module.get_parallelizable_groups(db, project_id)
+    except Exception:  # noqa: BLE001
+        _parallel_groups = None
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=db_module.normalize_execution_mode(
@@ -1696,6 +1736,7 @@ async def generate_handoff(
         completion_mode=_completion_mode_from_settings(proj_settings),
         goal_group_style=_goal_group_style_from_settings(proj_settings),
         loop_enabled=_loop_enabled_from_settings(proj_settings, _ws_settings_for_loop),
+        parallel_groups=_parallel_groups,
     )
 
     # Split tasks into L1 (last 10) and L2 (older).
@@ -2085,6 +2126,12 @@ async def _generate_starter_handoff(
         _s_ws_settings = await db_module.get_workspace_settings(db)
     except Exception:  # noqa: BLE001
         _s_ws_settings = None
+    # e20db0be — parallel batches for the starter /goal too (guarded, fail-open).
+    _s_parallel_groups = None
+    try:
+        _s_parallel_groups = await db_module.get_parallelizable_groups(db, project["id"])
+    except Exception:  # noqa: BLE001
+        _s_parallel_groups = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=db_module.normalize_execution_mode(
@@ -2095,6 +2142,7 @@ async def _generate_starter_handoff(
         completion_mode=_completion_mode_from_settings(settings),
         goal_group_style=_goal_group_style_from_settings(settings),
         loop_enabled=_loop_enabled_from_settings(settings, _s_ws_settings),
+        parallel_groups=_s_parallel_groups,
     )
     content = _render_starter_handoff(
         project,

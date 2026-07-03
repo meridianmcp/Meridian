@@ -639,6 +639,7 @@ app = FastAPI(
 # Include these BEFORE middleware so route matching is registered correctly.
 # ---------------------------------------------------------------------------
 from .routes.notes import router as _notes_router            # noqa: E402
+from .routes.insights import router as _insights_router      # noqa: E402
 from .routes.hitl import router as _hitl_router              # noqa: E402
 from .routes.sprint import router as _sprint_router          # noqa: E402
 from .routes.sessions import router as _sessions_router      # noqa: E402
@@ -662,6 +663,7 @@ from .routes.a2a import router as _a2a_router                # noqa: E402
 
 app.include_router(_oauth_router)
 app.include_router(_notes_router)
+app.include_router(_insights_router)
 app.include_router(_hitl_router)
 app.include_router(_sprint_router)
 app.include_router(_sessions_router)
@@ -3813,7 +3815,8 @@ async def _build_orchestration_hint(
     strategy = "parallel" if any_multi else "sequential"
     compact_groups = [
         [
-            {"id": it.get("id"), "title": it.get("title", "")}
+            # 1da83459 — cap title length to keep the orientation hint compact.
+            {"id": it.get("id"), "title": (it.get("title") or "")[:80]}
             for it in group
         ]
         for group in groups
@@ -4232,7 +4235,12 @@ async def _start_session_composite(
                 "in_progress": _c_counts.get("in_progress", 0),
                 "pending": _c_pending,
             },
-            "recent_tasks": recent_tasks[:3],
+            # 1da83459 — truncate each task's description so a verbose executor
+            # log can't bloat the compact orientation (context-budget guard).
+            "recent_tasks": [
+                {**_t, "description": ((_t.get("description") or "")[:200])}
+                for _t in recent_tasks[:3]
+            ],
             "board_change": _c_board_change,
             "note": (
                 "Compact orientation. For full goal/decisions/instructions call "
