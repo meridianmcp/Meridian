@@ -7114,7 +7114,7 @@ async function loadCodeIntelTab(projectId: any) {
     html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
 
     // Index status per repo path
-    html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Index Status</div>`;
+    html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
     if (repoPaths.length) {
       for (const rp of repoPaths) {
         const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
@@ -7210,6 +7210,26 @@ async function loadCodeIntelTab(projectId: any) {
           if (!b.image) throw new Error('No image returned.');
           return b.image;
         },
+      });
+    }
+
+    // 31d0caa6 — manual reindex button: re-run index_repository for each repo
+    // path via the code MCP, then reload the tab to show fresh index status.
+    const _reindexBtn = document.getElementById(`${_cgId}-reindex`) as HTMLButtonElement | null;
+    if (_reindexBtn) {
+      _reindexBtn.addEventListener('click', async () => {
+        _reindexBtn.disabled = true;
+        _reindexBtn.textContent = 'Reindexing…';
+        try {
+          for (const rp of repoPaths) {
+            const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
+            if (cwd) await _codeMcpCall('tools/call', { name: 'index_repository', arguments: { path: cwd } });
+          }
+          loadCodeIntelTab(projectId);
+        } catch (e: any) {
+          _reindexBtn.disabled = false;
+          _reindexBtn.textContent = 'Reindex failed — retry';
+        }
       });
     }
 
