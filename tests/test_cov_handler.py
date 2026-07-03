@@ -902,6 +902,27 @@ def test_generate_handoff_surfaces_insight_hints(tmp_path):
         _run(db.close())
 
 
+def test_generate_handoff_warns_on_long_goal(tmp_path):
+    """0fe01e93 — generate_handoff flags a /goal text over the 4000-char limit."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "longgoal-proj"))
+        _run(db_module.set_goal(db, proj["id"], "", sprint="x" * 4100))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
+        assert out["goal_length_warning"] is not None
+        assert "4000" in out["goal_length_warning"]
+
+        proj2 = _run(db_module.create_project(db, "shortgoal-proj"))
+        _run(db_module.set_goal(db, proj2["id"], "", sprint="short and tidy"))
+        out2 = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj2["id"]}, db, str(tmp_path)))
+        assert out2["goal_length_warning"] is None
+    finally:
+        _run(db.close())
+
+
 def test_add_note_warns_on_similar_existing_note():
     """6e4e2371 — adding a note whose title closely matches an existing one
     returns a similar_notes warning (never blocks the write)."""

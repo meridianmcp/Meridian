@@ -138,6 +138,32 @@ def test_build_quick_start_goal_tags_sprint_type():
     assert "Stop after" in goal
 
 
+def test_build_quick_start_goal_completion_mode_and_group_style():
+    """9f57374b — completion_mode='lenient' drops the anti-stop failure framing;
+    goal_group_style='waves' restores Wave headers for a dependency graph; the
+    executor_config extractors default to strict/flat."""
+    from meridian.handoff import (
+        _build_quick_start_goal,
+        _completion_mode_from_settings,
+        _goal_group_style_from_settings,
+    )
+    assert "is a FAILURE" in _build_quick_start_goal([{"id": "a1"}])
+    assert "is a FAILURE" not in _build_quick_start_goal(
+        [{"id": "a1"}], completion_mode="lenient")
+
+    deps = [{"id": "a1"}, {"id": "a2", "depends_on": "a1"}]
+    assert "Wave" not in _build_quick_start_goal(deps)  # default flat
+    waved = _build_quick_start_goal(deps, goal_group_style="waves")
+    assert "Wave 1: a1" in waved and "Wave 2: a2" in waved
+
+    assert _completion_mode_from_settings(
+        {"executor_config": {"completion_mode": "lenient"}}) == "lenient"
+    assert _completion_mode_from_settings({}) == "strict"
+    assert _goal_group_style_from_settings(
+        {"executor_config": {"goal_group_style": "waves"}}) == "waves"
+    assert _goal_group_style_from_settings(None) == "flat"
+
+
 def test_resolve_graph_searcher_uses_registered_resolver():
     """4cfaecc2 — _resolve_graph_searcher consults the injectable resolver and is
     guarded so a resolver that raises can never break the mandatory handoff."""

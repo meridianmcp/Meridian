@@ -153,6 +153,22 @@ def _max_turns_from_settings(proj_settings: dict[str, Any] | None) -> int:
         return _DEFAULT_GOAL_MAX_TURNS
 
 
+def _completion_mode_from_settings(proj_settings: dict[str, Any] | None) -> str:
+    """9f57374b — executor_config.completion_mode ('strict'|'lenient', default
+    'strict'). 'strict' keeps the anti-stop failure framing on the /goal."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    val = cfg.get("completion_mode") if isinstance(cfg, dict) else None
+    return "lenient" if str(val).lower() == "lenient" else "strict"
+
+
+def _goal_group_style_from_settings(proj_settings: dict[str, Any] | None) -> str:
+    """9f57374b — executor_config.goal_group_style ('flat'|'waves', default
+    'flat'). 'waves' groups dependency-ordered items under Wave headers."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    val = cfg.get("goal_group_style") if isinstance(cfg, dict) else None
+    return "waves" if str(val).lower() == "waves" else "flat"
+
+
 def _partition_into_waves(
     items: list[dict[str, Any]],
 ) -> list[list[dict[str, Any]]]:
@@ -245,6 +261,8 @@ def _build_quick_start_goal(
     execution_mode: str = "autonomous",
     max_turns: int = _DEFAULT_GOAL_MAX_TURNS,
     hitl_auto_answer_mode: int = 0,
+    completion_mode: str = "strict",
+    goal_group_style: str = "flat",
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -305,7 +323,17 @@ def _build_quick_start_goal(
     # the dependency order into one ordered id list so the executor runs straight
     # through without treating a wave boundary as a stopping point.
     waves = _partition_into_waves(pending_sprint_items)
-    if len(waves) > 1:
+    if len(waves) > 1 and goal_group_style == "waves":
+        # 9f57374b — opt-in wave grouping (default 'flat' per eeee02c6).
+        wave_txt = "; ".join(
+            f"Wave {i + 1}: {', '.join(it['id'] for it in wave if it.get('id'))}"
+            for i, wave in enumerate(waves)
+        )
+        items_clause = (
+            "Complete sprint items in wave order — finish each wave before the "
+            f"next; items within a wave are parallel-safe: {wave_txt}. "
+        )
+    elif len(waves) > 1:
         ordered_ids = [it["id"] for wave in waves for it in wave if it.get("id")]
         items_clause = (
             "Complete sprint items in dependency order (finish each before the "
@@ -316,10 +344,15 @@ def _build_quick_start_goal(
     # f9fa00e4 — tag the /goal with an inferred sprint type + tailored guidance.
     _stype = _infer_sprint_type(pending_sprint_items)
     _type_clause = f" [sprint:{_stype}] {_SPRINT_TYPE_NOTES.get(_stype, '')}".rstrip()
-    # eeee02c6 — anti-stop failure framing: stopping with items pending is a failure.
+    # eeee02c6/9f57374b — anti-stop failure framing, unless completion_mode='lenient'.
     _fail_clause = (
-        " You are DONE only when complete_sprint_item() has been called for every "
-        "listed item — stopping early or handing off with items pending is a FAILURE."
+        ""
+        if completion_mode == "lenient"
+        else (
+            " You are DONE only when complete_sprint_item() has been called for "
+            "every listed item — stopping early or handing off with items pending "
+            "is a FAILURE."
+        )
     )
     return (
         f"/goal {directive}"
@@ -1398,6 +1431,8 @@ async def generate_handoff(
         ),
         max_turns=_max_turns_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_aa_mode,
+        completion_mode=_completion_mode_from_settings(proj_settings),
+        goal_group_style=_goal_group_style_from_settings(proj_settings),
     )
 
     # Split tasks into L1 (last 10) and L2 (older).
@@ -1758,6 +1793,8 @@ async def _generate_starter_handoff(
         ),
         max_turns=_max_turns_from_settings(settings),
         hitl_auto_answer_mode=_s_hitl_mode,
+        completion_mode=_completion_mode_from_settings(settings),
+        goal_group_style=_goal_group_style_from_settings(settings),
     )
     content = _render_starter_handoff(
         project,

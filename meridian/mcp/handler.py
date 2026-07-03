@@ -1515,12 +1515,29 @@ async def _handle_task_tools(
                     _insight_hints.append({"signal": _sig, "text": _desc[:160]})
         except Exception:  # noqa: BLE001
             _insight_hints = []
+        # 0fe01e93 — warn when the project's /goal text is over the 4000-char soft
+        # limit (a bloated goal crowds out sprint context); the dashboard live
+        # counter + auto-bury handle the editing UX.
+        _goal_warn = None
+        try:
+            _gh_goal = await db_module.get_goal(db, args["project_id"])
+            _goal_len = len((_gh_goal or {}).get("sprint") or "") + len(
+                (_gh_goal or {}).get("north_star") or ""
+            )
+            if _goal_len > 4000:
+                _goal_warn = (
+                    f"/goal text is {_goal_len} chars (>4000) — bury step detail into "
+                    "sprint-item notes so the goal stays scannable."
+                )
+        except Exception:  # noqa: BLE001
+            _goal_warn = None
         return {
             "file_path": path,
             "content": content,
             "mode": mode,
             "template_stale": _tpl_stale,
             "insight_hints": _insight_hints[:5],
+            "goal_length_warning": _goal_warn,
         }
     return _MISS
 
