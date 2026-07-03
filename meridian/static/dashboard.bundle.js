@@ -5935,7 +5935,6 @@ project_id = "${displayPid}"`;
     const searchInput = document.getElementById(`notes-search-${projectId}`);
     const tagSelect = document.getElementById(`notes-tagsel-${projectId}`);
     const kindSelect = document.getElementById(`notes-kindsel-${projectId}`);
-    const showAuto = document.getElementById(`notes-show-auto-${projectId}`);
     const KIND_STYLE = {
       wiki: { label: "wiki", color: "var(--muted)", border: "var(--border)" },
       insight: { label: "insight", color: "var(--accent)", border: "var(--accent)" },
@@ -5957,6 +5956,12 @@ project_id = "${displayPid}"`;
       return title.startsWith("checkpoint:") || title.startsWith("session summary") || tags.includes("checkpoint") || tags.includes("auto-capture");
     };
     const noteTags = (n2) => String(n2.tags || "").split(",").map((t3) => t3.trim()).filter(Boolean);
+    const isArchived = (n2) => String(n2.tags || "").split(",").map((t3) => t3.trim().toLowerCase()).includes("archived");
+    const activeTabEl = document.getElementById(`notes-active-tab-${projectId}`);
+    const tabButtons = ["notes", "log", "archive"].map(
+      (t3) => document.getElementById(`notes-tab-${t3}-${projectId}`)
+    );
+    const getActiveTab = () => (activeTabEl?.textContent || "notes").trim() || "notes";
     let allNotes = [];
     const NOTES_PAGE = 100;
     let nextCursor = 0;
@@ -5978,7 +5983,6 @@ project_id = "${displayPid}"`;
       const prev = tagSelect.value;
       const seen = /* @__PURE__ */ new Set();
       for (const n2 of allNotes) {
-        if (!showAuto?.checked && isAutoCapture(n2)) continue;
         for (const t3 of noteTags(n2)) seen.add(t3);
       }
       const tags = [...seen].sort((a3, b2) => a3.localeCompare(b2));
@@ -5989,9 +5993,13 @@ project_id = "${displayPid}"`;
       const q2 = (searchInput?.value || "").trim().toLowerCase();
       const selectedTag = (tagSelect?.value || "").trim().toLowerCase();
       const selectedKind = (kindSelect?.value || "").trim().toLowerCase();
-      const includeAuto = !!showAuto?.checked;
+      const tab = getActiveTab();
       const visible = allNotes.filter((n2) => {
-        if (!includeAuto && isAutoCapture(n2)) return false;
+        if (tab === "log") {
+          if (!isAutoCapture(n2)) return false;
+        } else if (tab === "archive") {
+          if (!isArchived(n2)) return false;
+        } else if (isAutoCapture(n2) || isArchived(n2)) return false;
         if (selectedKind && noteKind(n2) !== selectedKind) return false;
         if (selectedTag && !noteTags(n2).map((t3) => t3.toLowerCase()).includes(selectedTag)) return false;
         if (q2) {
@@ -6004,10 +6012,10 @@ ${n2.tags || ""}`.toLowerCase();
       });
       setVtabCountBadge(
         `.notes-vtab-badge[data-pid="${projectId}"]`,
-        allNotes.filter((n2) => !isAutoCapture(n2)).length
+        allNotes.filter((n2) => !isAutoCapture(n2) && !isArchived(n2)).length
       );
       if (!visible.length) {
-        const reason = allNotes.length ? `(no notes match \u2014 clear the search/tag filter${!includeAuto ? " or tick \u201Csummaries\u201D" : ""})` : `(no notes yet \u2014 use the form below or <code>add_note</code> MCP tool)`;
+        const reason = allNotes.length ? `(no notes in this tab match \u2014 clear the search/tag filter or switch tabs)` : `(no notes yet \u2014 use the form below or <code>add_note</code> MCP tool)`;
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
         renderLoadMore();
         return;
@@ -6098,10 +6106,20 @@ ${n2.tags || ""}`.toLowerCase();
     }
     if (tagSelect) tagSelect.onchange = applyFilters;
     if (kindSelect) kindSelect.onchange = applyFilters;
-    if (showAuto) showAuto.onchange = () => {
-      refreshTagOptions();
-      applyFilters();
-    };
+    tabButtons.forEach((btn) => {
+      if (!btn) return;
+      btn.onclick = () => {
+        const tab = btn.getAttribute("data-notes-tab") || "notes";
+        if (activeTabEl) activeTabEl.textContent = tab;
+        tabButtons.forEach((b2) => {
+          if (!b2) return;
+          const on = b2 === btn;
+          b2.style.borderBottom = on ? "2px solid var(--accent)" : "2px solid transparent";
+          b2.style.color = on ? "var(--text)" : "var(--muted)";
+        });
+        applyFilters();
+      };
+    });
     if (addBtn) addBtn.onclick = async () => {
       const title = (addTitle && addTitle.value || "").trim();
       const text = (addBody && addBody.value || "").trim();
@@ -9586,10 +9604,18 @@ Current: ${current || "(none)"}`,
 
             <select id="notes-tagsel-${project.id}" title="Filter by tag" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;max-width:130px"><option value="">all tags</option></select>
 
-            <label title="Show auto-captured session summaries (checkpoint notes)" style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--muted);cursor:pointer;user-select:none"><input type="checkbox" id="notes-show-auto-${project.id}" style="margin:0;cursor:pointer">summaries</label>
+            <!-- 42e9f7b5 \u2014 the "summaries" toggle is replaced by the Notes/Log/Archive tab bar below -->
+            <input type="checkbox" id="notes-show-auto-${project.id}" style="display:none">
+            <span data-notes-tab-active="notes" id="notes-active-tab-${project.id}" style="display:none">notes</span>
 
           </span>
 
+        </div>
+
+        <div class="notes-tabbar" style="display:flex;gap:6px;padding:6px 14px 0;border-bottom:1px solid var(--border)">
+          <button data-notes-tab="notes" id="notes-tab-notes-${project.id}" class="notes-tab-btn" style="background:none;border:none;border-bottom:2px solid var(--accent);color:var(--text);font-size:10px;font-weight:600;padding:3px 6px;cursor:pointer">Notes</button>
+          <button data-notes-tab="log" id="notes-tab-log-${project.id}" class="notes-tab-btn" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);font-size:10px;font-weight:600;padding:3px 6px;cursor:pointer">Log</button>
+          <button data-notes-tab="archive" id="notes-tab-archive-${project.id}" class="notes-tab-btn" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);font-size:10px;font-weight:600;padding:3px 6px;cursor:pointer">Archive</button>
         </div>
 
         <div style="flex:1;overflow-y:auto;overflow-x:hidden;word-break:break-word;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="notes-body-${project.id}">
