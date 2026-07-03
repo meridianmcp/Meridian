@@ -108,6 +108,36 @@ def test_build_quick_start_goal_max_turns():
     assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}], max_turns="bad")
 
 
+def test_infer_sprint_type_heuristics():
+    """f9fa00e4 — sprint-type inference by count / item_group / title keyword."""
+    from meridian.handoff import _infer_sprint_type
+    assert _infer_sprint_type([]) == "feature"
+    assert _infer_sprint_type(
+        [{"id": str(i), "title": "feat x"} for i in range(12)]) == "megasprint"
+    assert _infer_sprint_type(
+        [{"id": "1", "item_group": "research"}, {"id": "2", "item_group": "paper"}]) == "research"
+    assert _infer_sprint_type(
+        [{"id": "1", "title": "REFACTOR: split module"},
+         {"id": "2", "title": "refactor dashboard"}]) == "refactor"
+    assert _infer_sprint_type(
+        [{"id": "1", "item_group": "ops"}, {"id": "2", "item_group": "release"}]) == "ops"
+    assert _infer_sprint_type([{"id": "1", "title": "hotfix: crash on start"}]) == "hotfix"
+    assert _infer_sprint_type(
+        [{"id": "1", "title": "add button"}, {"id": "2", "title": "add page"}]) == "feature"
+
+
+def test_build_quick_start_goal_tags_sprint_type():
+    """f9fa00e4 — the /goal carries an inferred [sprint:TYPE] tag + guidance,
+    without disturbing the existing structure."""
+    from meridian.handoff import _build_quick_start_goal
+    goal = _build_quick_start_goal([{"id": "a1", "title": "hotfix: crash on start"}])
+    assert "[sprint:hotfix]" in goal
+    assert "HOTFIX sprint" in goal
+    assert "a1" in goal
+    assert 'get_sprint_items(status="pending")' in goal
+    assert "Stop after" in goal
+
+
 def test_resolve_graph_searcher_uses_registered_resolver():
     """4cfaecc2 — _resolve_graph_searcher consults the injectable resolver and is
     guarded so a resolver that raises can never break the mandatory handoff."""

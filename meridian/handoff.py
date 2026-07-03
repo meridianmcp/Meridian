@@ -194,6 +194,49 @@ def _partition_into_waves(
     return [w for w in waves if w]
 
 
+_SPRINT_TYPE_NOTES = {
+    "hotfix": "HOTFIX sprint: ship the smallest correct fix per item with a regression test; commit and deploy fast.",
+    "feature": "FEATURE sprint: implement each item production-quality with tests — no stubs.",
+    "megasprint": "MEGASPRINT: large board — checkpoint() periodically, commit per item, and generate a delta handoff if you run low on context.",
+    "research": "RESEARCH sprint: capture findings via capture_research_finding()/save_finding(), cite sources, and validate before concluding.",
+    "refactor": "REFACTOR sprint: preserve behaviour — keep tests green at every step; change structure, not semantics.",
+    "ops": "OPS sprint: release/deploy work — never push prod without the deploy gate; confirm CI is green before promoting.",
+    "orchestrator": "ORCHESTRATOR sprint: items have dependencies — finish each wave before the next and fan out parallel-safe items.",
+}
+
+
+def _infer_sprint_type(items: list[dict[str, Any]]) -> str:
+    """f9fa00e4 — infer a sprint 'type' from the pending items so the /goal can
+    carry type-appropriate guidance. Heuristic (no LLM): dependency graph →
+    orchestrator; large count → megasprint; else by dominant item_group / title
+    keyword (research/refactor/ops/hotfix); default feature."""
+    n = len(items)
+    if n == 0:
+        return "feature"
+    groups = [(it.get("item_group") or "").lower() for it in items]
+    titles = [(it.get("title") or "").lower() for it in items]
+
+    def frac_group(names: "frozenset[str] | set[str]") -> float:
+        return sum(1 for g in groups if g in names) / n
+
+    def frac_title(kw: str) -> float:
+        return sum(1 for t in titles if kw in t) / n
+
+    if len(_partition_into_waves(items)) > 1 and n >= 4:
+        return "orchestrator"
+    if n >= 12:
+        return "megasprint"
+    if frac_group({"research", "paper"}) >= 0.5:
+        return "research"
+    if frac_title("refactor") >= 0.5:
+        return "refactor"
+    if frac_group({"ops", "infra", "release", "deploy"}) >= 0.5:
+        return "ops"
+    if n <= 3 and (frac_title("hotfix") + frac_title("bug") + frac_title("fix:")) >= 0.5:
+        return "hotfix"
+    return "feature"
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -271,6 +314,9 @@ def _build_quick_start_goal(
         )
     else:
         items_clause = f"Complete sprint items: {', '.join(item_ids)}. "
+    # f9fa00e4 — tag the /goal with an inferred sprint type + tailored guidance.
+    _stype = _infer_sprint_type(pending_sprint_items)
+    _type_clause = f" [sprint:{_stype}] {_SPRINT_TYPE_NOTES.get(_stype, '')}".rstrip()
     return (
         f"/goal {directive}"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
@@ -283,6 +329,7 @@ def _build_quick_start_goal(
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
         f"generate_handoff() is called at the end. Stop after {_turns} turns "
         f"{_hitl_clause}"
+        f"{_type_clause}"
     )
 
 
