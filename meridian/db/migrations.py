@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -195,6 +195,87 @@ async def _migrate_add_column_if_missing(
         await db.commit()
 
 
+async def _migrate_project_status_priority(db: aiosqlite.Connection) -> None:
+    """8db00fcb — project organization: status (active|parked|archived) +
+    priority (P0|P1|P2). Enums are enforced at the app layer (SQLite ADD COLUMN
+    can't carry a CHECK); fresh DBs get the CHECK from the CREATE TABLE."""
+    await _migrate_add_column_if_missing(
+        db, "projects", "status", "TEXT NOT NULL DEFAULT 'active'"
+    )
+    await _migrate_add_column_if_missing(
+        db, "projects", "priority", "TEXT NOT NULL DEFAULT 'P2'"
+    )
+
+
+async def _migrate_signup_attempts(db: aiosqlite.Connection) -> None:
+    """925909aa — persistent per-IP signup-attempt log for magic-link abuse
+    limiting (survives restarts, unlike the in-process slowapi window). Stores
+    only salted hashes of the IP + email, never the raw values."""
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS signup_attempts (
+            id TEXT PRIMARY KEY,
+            ip_hash TEXT NOT NULL,
+            email_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_signup_attempts_ip
+            ON signup_attempts(ip_hash, created_at);
+        """
+    )
+    await db.commit()
+
+
+async def _migrate_user_session_metadata(db: aiosqlite.Connection) -> None:
+    """3c28450d — device metadata on user_sessions for the active-sessions view:
+    user_agent, ip, and last_seen_at (all nullable, best-effort)."""
+    await _migrate_add_column_if_missing(db, "user_sessions", "user_agent", "TEXT")
+    await _migrate_add_column_if_missing(db, "user_sessions", "ip", "TEXT")
+    await _migrate_add_column_if_missing(db, "user_sessions", "last_seen_at", "TEXT")
+
+
+async def _migrate_provision_queue(db: aiosqlite.Connection) -> None:
+    """4c559d4e — durable provisioning queue so a failed Neon provision is
+    retried later instead of being lost (fixes Kyle-class onboarding failures)."""
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS provision_queue (
+            tenant_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_provision_queue_status
+            ON provision_queue(status);
+        """
+    )
+    await db.commit()
+
+
+async def _migrate_codebase_graph_entities(db: aiosqlite.Connection) -> None:
+    """c00b1ccf — opt-in cached codebase-graph snapshot: entities (symbols/files)
+    persisted per project so handoffs can surface code pointers offline (no live
+    code-intel tunnel needed)."""
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS codebase_graph_entities (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            file TEXT,
+            kind TEXT,
+            signature TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cge_project
+            ON codebase_graph_entities(project_id);
+        """
+    )
+    await db.commit()
+
+
 def _slugify_note(title: str) -> str:
     """Kebab-case a note title into a URL/handle-safe slug.
 
@@ -284,6 +365,10 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
     # code_intel_enabled_default ∈ {0, 1}.
     await _migrate_add_column_if_missing(db, "workspace_settings", "execution_mode_default", "TEXT")
     await _migrate_add_column_if_missing(db, "workspace_settings", "code_intel_enabled_default", "INTEGER")
+    # 76cf8bda — /loop auto-continue workspace default (1 = on for new sessions).
+    await _migrate_add_column_if_missing(
+        db, "workspace_settings", "loop_enabled_default", "INTEGER NOT NULL DEFAULT 1"
+    )
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:
@@ -1544,6 +1629,14 @@ async def _migrate_queued_session(db: aiosqlite.Connection) -> None:
     appended to the handoff (then cleared) so multi-sprint days don't need a
     manual paste loop. Nullable. 2026-06-13."""
     await _migrate_add_column_if_missing(db, "projects", "queued_session", "TEXT")
+
+
+async def _migrate_pending_goal(db: aiosqlite.Connection) -> None:
+    """projects.pending_goal — the handoff /goal string persisted by
+    generate_handoff so the next start_session can deliver it through a trusted
+    MCP tool result (keyed on project_id) instead of a spoofable copy-pasted
+    chat string. Read-once (cleared on read). Nullable. 5efe254b."""
+    await _migrate_add_column_if_missing(db, "projects", "pending_goal", "TEXT")
 
 
 async def _migrate_registered_hostnames(db: aiosqlite.Connection) -> None:

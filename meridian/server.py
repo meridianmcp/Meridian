@@ -354,6 +354,19 @@ async def lifespan(app: FastAPI):
         db = await db_module.init_db(db_path)
     app.state.db = db
 
+    # c00b1ccf — wire the offline codebase-graph-snapshot searcher into handoff
+    # code-pointer enrichment. Fallback used when generate_handoff isn't handed a
+    # live tunnel searcher; it reads the persisted snapshot so a fresh session
+    # still gets code pointers. Fully guarded + degrades to [].
+    try:
+        from . import handoff as _handoff_mod  # noqa: PLC0415
+        from .graph_snapshot import make_snapshot_searcher as _mk_snap_searcher  # noqa: PLC0415
+        _handoff_mod.set_graph_searcher_resolver(
+            lambda pid: _mk_snap_searcher(db, pid)
+        )
+    except Exception:  # noqa: BLE001 — never block startup on enrichment wiring
+        pass
+
     # Per-tenant neon_db_url re-key (security item 3dbe23e3). NO-OP unless
     # MERIDIAN_MASTER_SECRET is set — so this is a zero-behavior-change deploy
     # in prod (where the secret is currently unset). Guarded + never crashes
@@ -738,7 +751,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/setup/health", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -1269,7 +1282,22 @@ async def landing_page(request: Request) -> HTMLResponse:
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
 async def robots_txt() -> str:
-    return "User-agent: *\nAllow: /\nSitemap: https://usemeridian.us/sitemap.xml"
+    # 71c70308 — search crawlers welcome; AI/LLM training + scraping crawlers are
+    # disallowed. Compliance is voluntary, but this documents intent and the
+    # well-behaved ones honor it. Pairs with the noai/noarchive landing meta tags.
+    _ai_bots = (
+        "GPTBot", "OAI-SearchBot", "ChatGPT-User", "ClaudeBot", "anthropic-ai",
+        "Claude-Web", "CCBot", "Google-Extended", "PerplexityBot", "Amazonbot",
+        "Bytespider", "meta-externalagent", "Applebot-Extended", "cohere-ai",
+        "Diffbot", "ImagesiftBot", "Omgilibot", "FriendlyCrawler",
+    )
+    blocks = "\n\n".join(f"User-agent: {b}\nDisallow: /" for b in _ai_bots)
+    return (
+        "# Search crawlers welcome; AI/LLM training crawlers are not (71c70308).\n"
+        "User-agent: *\nAllow: /\n\n"
+        f"{blocks}\n\n"
+        "Sitemap: https://usemeridian.us/sitemap.xml\n"
+    )
 
 
 @app.get("/favicon.ico")
@@ -1682,6 +1710,7 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     if tenant is None:
         return {}
     from .hosted import _admin_emails
+    from . import __version__ as _meridian_version
     from datetime import datetime, timezone
     plan = tenant.get("plan") or "standard"
     expires_raw = tenant.get("inactivity_expires_at")
@@ -1695,6 +1724,21 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
             expired = delta.total_seconds() <= 0
         except ValueError:
             pass
+    # 509d9de1 — free/trial users who haven't created a project yet have no
+    # inactivity_expires_at, so the banner showed "limited time" with no number.
+    # Fall back to a 30-day window anchored on trial_started_at (or the tenant's
+    # created_at) so an actual day count always renders. Display-only.
+    if days_remaining is None and plan in ("free", "trial"):
+        _anchor = tenant.get("trial_started_at") or tenant.get("created_at")
+        if _anchor:
+            try:
+                _anchor_dt = datetime.strptime(
+                    str(_anchor)[:19], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+                _elapsed = (datetime.now(timezone.utc) - _anchor_dt).days
+                days_remaining = max(0, 30 - _elapsed)
+            except (ValueError, TypeError):
+                pass
     # G2.10 — internal tenants never see the "expired" / "days remaining"
     # banner. The lifecycle jobs already skip them, but a positive UX cue
     # is cleaner than leaving the expired flag set with no consequence.
@@ -1712,6 +1756,10 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     )
     return {
         "plan": plan,
+        # Tunnel client reads this to nudge an upgrade when it's behind the
+        # deployed server (see tunnel_client._update_notice). Single source:
+        # meridian.__version__.
+        "server_version": _meridian_version,
         "email": tenant.get("email", ""),
         "trial_started_at": tenant.get("trial_started_at"),
         "inactivity_expires_at": expires_raw,
@@ -4152,15 +4200,30 @@ async def _start_session_composite(
                     if _c_first else ""
                 )
             )
+        # dc462628 — surface GitHub connection status so executors know upfront
+        # whether search_code / read_file / etc. are usable for this project.
+        _c_github_repo = (_c_project or {}).get("github_repo") or ""
+        _c_github_branch = (_c_project or {}).get("github_branch") or "main"
+        _c_github_status = (
+            f"connected (repo: {_c_github_repo}, branch: {_c_github_branch})"
+            if _c_github_repo
+            else "not connected — GitHub tools (search_code, read_file, etc.) will error until you connect a repo in Settings"
+        )
+        from datetime import datetime as _dt, timezone as _tz  # de193a81
+        _c_now = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
         _c_payload = {
             "session_id": session["id"],
             "compact": True,
+            # de193a81 — anchor the executor to the real date/time so a session
+            # spanning multiple calendar days doesn't drift on "today".
+            "current_timestamp": _c_now,
             "execution_mode": _c_mode,  # ecf69de8 — structured posture field
             "execution_mode_directive": _c_mode_directive,
             "execute_immediately": _c_execute_now,
             "execute_immediately_signal": _c_execute_signal,
             "hitl_auto_answer_mode": _c_hitl_mode,
             "hitl_auto_answer_directive": _hitl_mode_directive(_c_hitl_mode),
+            "github_status": _c_github_status,
             "sprint": (str(_c_sprint)[:300] if _c_sprint else None),
             "sprint_version": scoped_version,
             "sprint_summary": {
@@ -5511,7 +5574,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "search_code",
-            "description": "Search code in the project's connected GitHub repository using GitHub code search.",
+            "description": "Search code in the project's connected GitHub repository using GitHub code search. Returns helpful error if no GitHub repo is connected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

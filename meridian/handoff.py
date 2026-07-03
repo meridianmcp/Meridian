@@ -43,6 +43,30 @@ _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
 
 
+# 2d932f60 — lightweight keyword detector for "this reads like a decision/insight
+# worth capturing." No LLM, no auto-write; callers surface a suggestion only so a
+# critical planning insight doesn't evaporate at session end.
+_INSIGHT_SIGNALS = (
+    "insight:", "decision:", "we decided", "we chose", "decided to",
+    "turns out", "turned out", "root cause", "gotcha", "key learning",
+    "learned that", "realized that", "trade-off", "tradeoff",
+    "important:", "the catch is", "the trick is", "strategy:",
+)
+
+
+def detect_insight_candidate(text: "str | None") -> "str | None":
+    """Return the first insight-signalling phrase in ``text`` (case-insensitive),
+    or None. Used to PROPOSE (never auto-write) a capture_insight()/pin_decision()
+    so critical planning insights aren't lost at session end (2d932f60)."""
+    if not text:
+        return None
+    low = text.lower()
+    for sig in _INSIGHT_SIGNALS:
+        if sig in low:
+            return sig
+    return None
+
+
 def _slugify(name: str) -> str:
     """Turn a project name into a safe filename fragment."""
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-")
@@ -117,16 +141,58 @@ _DEFAULT_GOAL_MAX_TURNS = 200
 
 
 def _max_turns_from_settings(proj_settings: dict[str, Any] | None) -> int:
-    """Extract executor_config.max_turns (default 200). (d2c47f43)"""
+    """Extract executor_config.max_turns (default 200, clamped to 1-500). (d2c47f43,
+    76cf8bda)"""
     cfg = (proj_settings or {}).get("executor_config") or {}
     if not isinstance(cfg, dict):
         return _DEFAULT_GOAL_MAX_TURNS
     raw = cfg.get("max_turns")
     try:
         val = int(raw)
-        return val if val > 0 else _DEFAULT_GOAL_MAX_TURNS
+        # 76cf8bda — clamp to the 1-500 dashboard-slider range.
+        return min(500, val) if val > 0 else _DEFAULT_GOAL_MAX_TURNS
     except (TypeError, ValueError):
         return _DEFAULT_GOAL_MAX_TURNS
+
+
+def _completion_mode_from_settings(proj_settings: dict[str, Any] | None) -> str:
+    """9f57374b — executor_config.completion_mode ('strict'|'lenient', default
+    'strict'). 'strict' keeps the anti-stop failure framing on the /goal."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    val = cfg.get("completion_mode") if isinstance(cfg, dict) else None
+    return "lenient" if str(val).lower() == "lenient" else "strict"
+
+
+def _goal_group_style_from_settings(proj_settings: dict[str, Any] | None) -> str:
+    """9f57374b — executor_config.goal_group_style ('flat'|'waves', default
+    'flat'). 'waves' groups dependency-ordered items under Wave headers."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    val = cfg.get("goal_group_style") if isinstance(cfg, dict) else None
+    return "waves" if str(val).lower() == "waves" else "flat"
+
+
+def _loop_enabled_from_settings(
+    proj_settings: dict[str, Any] | None,
+    workspace_settings: dict[str, Any] | None = None,
+) -> bool:
+    """76cf8bda — effective /loop auto-continue flag (project override → workspace
+    default). executor_config.loop_enabled of True/False is an explicit override;
+    'workspace' (or a missing value) defers to workspace_settings.loop_enabled_default
+    (which itself defaults to True). Tri-state must not collapse 'workspace' to falsy."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    raw = cfg.get("loop_enabled") if isinstance(cfg, dict) else None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in ("true", "on", "1", "yes"):
+            return True
+        if low in ("false", "off", "0", "no"):
+            return False
+        # "workspace" (or anything unrecognized) → defer to the workspace default.
+    ws = workspace_settings or {}
+    default = ws.get("loop_enabled_default")
+    return True if default is None else bool(default)
 
 
 def _partition_into_waves(
@@ -170,6 +236,49 @@ def _partition_into_waves(
     return [w for w in waves if w]
 
 
+_SPRINT_TYPE_NOTES = {
+    "hotfix": "HOTFIX sprint: ship the smallest correct fix per item with a regression test; commit and deploy fast.",
+    "feature": "FEATURE sprint: implement each item production-quality with tests — no stubs.",
+    "megasprint": "MEGASPRINT: large board — checkpoint() periodically, commit per item, and generate a delta handoff if you run low on context.",
+    "research": "RESEARCH sprint: capture findings via capture_research_finding()/save_finding(), cite sources, and validate before concluding.",
+    "refactor": "REFACTOR sprint: preserve behaviour — keep tests green at every step; change structure, not semantics.",
+    "ops": "OPS sprint: release/deploy work — never push prod without the deploy gate; confirm CI is green before promoting.",
+    "orchestrator": "ORCHESTRATOR sprint: items have dependencies — finish each wave before the next and fan out parallel-safe items.",
+}
+
+
+def _infer_sprint_type(items: list[dict[str, Any]]) -> str:
+    """f9fa00e4 — infer a sprint 'type' from the pending items so the /goal can
+    carry type-appropriate guidance. Heuristic (no LLM): dependency graph →
+    orchestrator; large count → megasprint; else by dominant item_group / title
+    keyword (research/refactor/ops/hotfix); default feature."""
+    n = len(items)
+    if n == 0:
+        return "feature"
+    groups = [(it.get("item_group") or "").lower() for it in items]
+    titles = [(it.get("title") or "").lower() for it in items]
+
+    def frac_group(names: "frozenset[str] | set[str]") -> float:
+        return sum(1 for g in groups if g in names) / n
+
+    def frac_title(kw: str) -> float:
+        return sum(1 for t in titles if kw in t) / n
+
+    if len(_partition_into_waves(items)) > 1 and n >= 4:
+        return "orchestrator"
+    if n >= 12:
+        return "megasprint"
+    if frac_group({"research", "paper"}) >= 0.5:
+        return "research"
+    if frac_title("refactor") >= 0.5:
+        return "refactor"
+    if frac_group({"ops", "infra", "release", "deploy"}) >= 0.5:
+        return "ops"
+    if n <= 3 and (frac_title("hotfix") + frac_title("bug") + frac_title("fix:")) >= 0.5:
+        return "hotfix"
+    return "feature"
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -178,6 +287,9 @@ def _build_quick_start_goal(
     execution_mode: str = "autonomous",
     max_turns: int = _DEFAULT_GOAL_MAX_TURNS,
     hitl_auto_answer_mode: int = 0,
+    completion_mode: str = "strict",
+    goal_group_style: str = "flat",
+    loop_enabled: bool = False,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -205,8 +317,12 @@ def _build_quick_start_goal(
         _turns = int(max_turns)
         if _turns <= 0:
             _turns = _DEFAULT_GOAL_MAX_TURNS
+        else:
+            _turns = min(500, _turns)  # 76cf8bda — clamp to the 1-500 slider range
     except (TypeError, ValueError):
         _turns = _DEFAULT_GOAL_MAX_TURNS
+    # 76cf8bda — prepend /loop when auto-continue is effective for this project.
+    _loop_prefix = "/loop " if loop_enabled else ""
     # ddd8b9bf — HITL clause differs by mode.
     _hitl_clause = (
         "Do NOT file HITLs — auto-answer is on, skip blocked items and continue."
@@ -221,9 +337,9 @@ def _build_quick_start_goal(
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     if not item_ids:
         return (
-            "/goal Verify remaining work is complete. Done when pixi run test "
-            f"passes {test_floor}+, and generate_handoff() is called at the "
-            f"end. Stop after {_turns} turns {_hitl_clause}"
+            f"{_loop_prefix}/goal Verify remaining work is complete. Done when "
+            f"pixi run test passes {test_floor}+, and generate_handoff() is called "
+            f"at the end. Stop after {_turns} turns {_hitl_clause}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -234,21 +350,43 @@ def _build_quick_start_goal(
     # /goal into ordered waves (finish a wave before the next; within-wave items
     # are parallel-safe). With no dependencies there's a single wave, so the flat
     # "Complete sprint items: …" phrasing is preserved (no behaviour change).
+    # eeee02c6 — no "Wave N" headers (they invite stopping between waves); flatten
+    # the dependency order into one ordered id list so the executor runs straight
+    # through without treating a wave boundary as a stopping point.
     waves = _partition_into_waves(pending_sprint_items)
-    if len(waves) > 1:
+    if len(waves) > 1 and goal_group_style == "waves":
+        # 9f57374b — opt-in wave grouping (default 'flat' per eeee02c6).
         wave_txt = "; ".join(
             f"Wave {i + 1}: {', '.join(it['id'] for it in wave if it.get('id'))}"
             for i, wave in enumerate(waves)
         )
         items_clause = (
-            "Complete sprint items in wave order — finish each wave before "
-            "starting the next; items within a wave are parallel-safe: "
-            f"{wave_txt}. "
+            "Complete sprint items in wave order — finish each wave before the "
+            f"next; items within a wave are parallel-safe: {wave_txt}. "
+        )
+    elif len(waves) > 1:
+        ordered_ids = [it["id"] for wave in waves for it in wave if it.get("id")]
+        items_clause = (
+            "Complete sprint items in dependency order (finish each before the "
+            f"next; earlier items unblock later ones): {', '.join(ordered_ids)}. "
         )
     else:
         items_clause = f"Complete sprint items: {', '.join(item_ids)}. "
+    # f9fa00e4 — tag the /goal with an inferred sprint type + tailored guidance.
+    _stype = _infer_sprint_type(pending_sprint_items)
+    _type_clause = f" [sprint:{_stype}] {_SPRINT_TYPE_NOTES.get(_stype, '')}".rstrip()
+    # eeee02c6/9f57374b — anti-stop failure framing, unless completion_mode='lenient'.
+    _fail_clause = (
+        ""
+        if completion_mode == "lenient"
+        else (
+            " You are DONE only when complete_sprint_item() has been called for "
+            "every listed item — stopping early or handing off with items pending "
+            "is a FAILURE."
+        )
+    )
     return (
-        f"/goal {directive}"
+        f"{_loop_prefix}/goal {directive}"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
         # board query keeps a resumed session honest about mid-run injections
         # and already-claimed items instead of trusting a stale list.
@@ -259,6 +397,8 @@ def _build_quick_start_goal(
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
         f"generate_handoff() is called at the end. Stop after {_turns} turns "
         f"{_hitl_clause}"
+        f"{_fail_clause}"
+        f"{_type_clause}"
     )
 
 
@@ -995,6 +1135,230 @@ async def _generate_ai_summary(
         return fallback
 
 
+# ---------------------------------------------------------------------------
+# aef94e4a — sprint retrospective: a strategic narrative (what shipped /
+# patterns revealed / direction confirmed) auto-saved at generate_handoff and
+# surfaced in the planner brief. Distinct from per-session summaries: it is
+# sprint-scoped, cumulative, and stored as a strategic 'insight' project note.
+# ---------------------------------------------------------------------------
+
+RETRO_NOTE_TAGS = "retrospective,strategy"
+
+
+def _retro_note_title(sprint: str | None) -> str:
+    label = (sprint or "").strip() or "current sprint"
+    return f"Sprint Retrospective — {label}"
+
+
+def _retro_shipped_lines(completed_items: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for it in completed_items[:20]:
+        title = (it.get("title") or "").strip().replace("\n", " ")
+        if len(title) > 140:
+            title = title[:140].rstrip() + "…"
+        status = (it.get("status") or "done").upper()
+        if title:
+            lines.append(f"- [{status}] {title}")
+    return lines
+
+
+def _build_retro_prompt(
+    completed_items: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    sprint: str | None,
+) -> str:
+    """Prompt for the sprint retrospective. Names three explicit sections so the
+    model returns a structured strategic narrative, not a task dump."""
+    shipped = _retro_shipped_lines(completed_items) or ["- (nothing marked complete yet)"]
+    decision_lines: list[str] = []
+    for d in decisions[:8]:
+        if (d.get("status") or "active") != "active":
+            continue
+        txt = (d.get("decision") or d.get("title") or "").strip().replace("\n", " ")
+        if len(txt) > 140:
+            txt = txt[:140].rstrip() + "…"
+        if txt:
+            decision_lines.append(f"- {txt}")
+    sprint_line = f"Sprint: {sprint.strip()}" if sprint else "Sprint: (unversioned)"
+    return (
+        "Write a concise sprint retrospective (no preamble, ~120 words) with "
+        "exactly these three short sections, each 1-2 sentences:\n"
+        "What shipped: the through-line of the completed work (not a list).\n"
+        "Patterns revealed: recurring themes, friction, or wins worth carrying forward.\n"
+        "Direction confirmed: what the shipped work implies about the next move.\n\n"
+        f"{sprint_line}\n\n"
+        "Completed this sprint:\n" + "\n".join(shipped) + "\n\n"
+        "Key decisions:\n" + ("\n".join(decision_lines) or "- (none pinned)")
+    )
+
+
+def _render_retro_fallback(
+    completed_items: list[dict[str, Any]],
+    sprint: str | None,
+) -> str:
+    """Deterministic retrospective body used when no summarizer / API key is
+    available (tests, offline). Never empty."""
+    shipped = _retro_shipped_lines(completed_items)
+    header = f"Sprint {sprint.strip()}: " if sprint else ""
+    if shipped:
+        summary = (
+            f"{header}{len(completed_items)} item(s) completed this sprint. "
+            "What shipped is captured below; patterns and direction are best "
+            "reviewed against the pinned decisions."
+        )
+        return summary + "\n\nWhat shipped:\n" + "\n".join(shipped)
+    return f"{header}No items completed yet this sprint."
+
+
+async def _generate_sprint_retrospective(
+    completed_items: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    sprint: str | None,
+    summarizer: Callable[[str], Any] | None = None,
+) -> str:
+    """Strategic sprint narrative. Tries the injected summarizer / Haiku; always
+    degrades to a deterministic fallback so the note body is never empty. Mirrors
+    the guarded seam of _generate_ai_summary."""
+    fallback = _render_retro_fallback(completed_items, sprint)
+    prompt = _build_retro_prompt(completed_items, decisions, sprint)
+    if summarizer is not None:
+        try:
+            result = summarizer(prompt)
+            if hasattr(result, "__await__"):
+                result = await result  # type: ignore[misc]
+            if isinstance(result, dict):
+                text = result.get("text") or result.get("summary") or ""
+            else:
+                text = str(result)
+            text = text.strip()
+            if text:
+                return text
+        except Exception:  # noqa: BLE001 — never break handoff on summary fail
+            return fallback
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return fallback
+    try:
+        import anthropic  # type: ignore[import]
+
+        def _sync_call() -> str:
+            client = anthropic.Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=320,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return "".join(getattr(b, "text", "") for b in resp.content).strip()
+
+        loop = asyncio.get_event_loop()
+        text = await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_call), timeout=30.0
+        )
+        return text or fallback
+    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+        return fallback
+
+
+async def _persist_sprint_retrospective(
+    db: aiosqlite.Connection,
+    project_id: str,
+    sprint: str | None,
+    body: str,
+) -> dict[str, Any] | None:
+    """Idempotently store the retrospective as a strategic insight note (one per
+    sprint title): update the existing note in place, else insert. Guarded by the
+    caller; returns the note row or None."""
+    title = _retro_note_title(sprint)
+    existing = await db_module.get_project_notes(
+        db, project_id, tag="retrospective", bodies=False
+    )
+    match = next((n for n in existing if (n.get("title") or "") == title), None)
+    if match is not None:
+        return await db_module.update_project_note(
+            db, match["id"], body=body, priority="high"
+        )
+    return await db_module.add_project_note(
+        db, project_id, title, body,
+        tags=RETRO_NOTE_TAGS, kind="insight", priority="high",
+    )
+
+
+# ---------------------------------------------------------------------------
+# c0d2356d — Stop-hook sprint guard. generate_handoff() writes these scripts
+# into the repo's .claude/hooks with the project's ID baked in, so a Claude Code
+# Stop hook can block early-stopping while sprint items are still pending.
+# ---------------------------------------------------------------------------
+
+_SPRINT_GUARD_SH = """#!/usr/bin/env bash
+# c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
+# session from stopping while this project has pending sprint items. Fails OPEN.
+# This is NOT hooks.sh (the token-rotation installer).
+set -uo pipefail
+PROJECT_ID="__PROJECT_ID__"
+MERIDIAN_URL="${MERIDIAN_URL:-__URL__}"
+payload="$(cat 2>/dev/null || true)"
+if printf '%s' "$payload" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then
+  exit 0
+fi
+resp="$(curl -sf --max-time 5 "$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count" 2>/dev/null || true)"
+[ -z "$resp" ] && exit 0
+pending="$(printf '%s' "$resp" | grep -oE '"pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
+[ -z "$pending" ] && exit 0
+if [ "$pending" -gt 0 ] 2>/dev/null; then
+  echo "Meridian: $pending sprint item(s) still pending — complete or skip them (complete_sprint_item) before stopping." >&2
+  exit 2
+fi
+exit 0
+"""
+
+_SPRINT_GUARD_PS1 = """# c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
+# session from stopping while this project has pending sprint items. Fails OPEN.
+# This is NOT hooks.ps1 (the token-rotation installer).
+$ErrorActionPreference = 'SilentlyContinue'
+$ProjectId = '__PROJECT_ID__'
+$Url = if ($env:MERIDIAN_URL) { $env:MERIDIAN_URL } else { '__URL__' }
+$raw = [Console]::In.ReadToEnd()
+try { $payload = $raw | ConvertFrom-Json } catch { $payload = $null }
+if ($payload -and $payload.stop_hook_active -eq $true) { exit 0 }
+try {
+    $r = Invoke-RestMethod -Method GET -Uri "$Url/projects/$ProjectId/sprint/pending_count" -TimeoutSec 5
+} catch { exit 0 }
+if ($null -eq $r -or $null -eq $r.pending_count) { exit 0 }
+$pending = [int]$r.pending_count
+if ($pending -gt 0) {
+    [Console]::Error.WriteLine("Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping.")
+    exit 2
+}
+exit 0
+"""
+
+
+def _write_sprint_guard_hooks(project_id: str, root: Path | None = None) -> None:
+    """c0d2356d — write .claude/hooks/sprint_guard.{sh,ps1} into the repo with
+    ``project_id`` + MERIDIAN_URL baked in. Best-effort: a read-only /
+    site-packages install (no writable .claude) must never break the mandatory
+    handoff, so all failures are swallowed. Only ever writes the sprint_guard.*
+    files — never the token-rotation hooks.* scripts.
+
+    Skips the repo-side write during the test suite (it would dirty the committed
+    .claude/hooks); tests pass an isolated ``root`` to exercise it directly."""
+    if root is None and "PYTEST_CURRENT_TEST" in os.environ:
+        return
+    try:
+        repo_root = root if root is not None else Path(__file__).parent.parent
+        if root is None and not (repo_root / ".claude").exists():
+            return  # not a repo checkout with a .claude dir — nothing to do
+        hooks_dir = repo_root / ".claude" / "hooks"
+        url = os.environ.get("MERIDIAN_URL") or "http://localhost:7878"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        sh = _SPRINT_GUARD_SH.replace("__PROJECT_ID__", project_id).replace("__URL__", url)
+        ps1 = _SPRINT_GUARD_PS1.replace("__PROJECT_ID__", project_id).replace("__URL__", url)
+        (hooks_dir / "sprint_guard.sh").write_text(sh, encoding="utf-8")
+        (hooks_dir / "sprint_guard.ps1").write_text(ps1, encoding="utf-8")
+    except Exception:  # noqa: BLE001 — never break handoff on a hook-write failure
+        pass
+
+
 async def _generate_handoff_l0(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1315,6 +1679,13 @@ async def generate_handoff(
         _hitl_aa_mode = int(await db_module._project_hitl_auto_answer_mode(db, project_id))
     except Exception:  # noqa: BLE001
         pass
+    # 76cf8bda — effective /loop flag merges the project override with the
+    # workspace default. Guarded: a missing settings row degrades to the default.
+    _ws_settings_for_loop = None
+    try:
+        _ws_settings_for_loop = await db_module.get_workspace_settings(db)
+    except Exception:  # noqa: BLE001
+        _ws_settings_for_loop = None
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=db_module.normalize_execution_mode(
@@ -1322,6 +1693,9 @@ async def generate_handoff(
         ),
         max_turns=_max_turns_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_aa_mode,
+        completion_mode=_completion_mode_from_settings(proj_settings),
+        goal_group_style=_goal_group_style_from_settings(proj_settings),
+        loop_enabled=_loop_enabled_from_settings(proj_settings, _ws_settings_for_loop),
     )
 
     # Split tasks into L1 (last 10) and L2 (older).
@@ -1451,6 +1825,37 @@ async def generate_handoff(
         await db_module.record_handoff(db, project_id, mode, content, session_id)
     except Exception:  # noqa: BLE001
         pass
+    # 5efe254b — persist the /goal to the trusted channel so the next
+    # start_session can surface it as an MCP tool result (keyed on project_id)
+    # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
+    # guarded so a pre-migration DB never breaks handoff generation.
+    try:
+        await db_module.set_pending_goal(db, project_id, quick_start_goal)
+    except Exception:  # noqa: BLE001
+        pass
+    # aef94e4a — auto-save a strategic sprint retrospective (what shipped /
+    # patterns / direction) as an insight note surfaced in the planner brief.
+    # Skippable on hot paths / tests (skip_ai_summary) and fully guarded so it
+    # never breaks handoff generation.
+    if not skip_ai_summary:
+        try:
+            retro_completed = [
+                it for it in sprint_items_all
+                if it.get("status") in {"done", "skipped", "failed", "pushed"}
+            ]
+            if retro_completed:
+                retro_text = await _generate_sprint_retrospective(
+                    retro_completed, pinned_decisions, goal.get("sprint"),
+                    summarizer=summarizer,
+                )
+                await _persist_sprint_retrospective(
+                    db, project_id, goal.get("sprint"), retro_text
+                )
+        except Exception:  # noqa: BLE001 — retrospective is best-effort
+            pass
+    # c0d2356d — refresh the repo's Stop-hook sprint guard with this project's ID
+    # (self-guarded; never breaks handoff).
+    _write_sprint_guard_hooks(project_id)
     return str(out_path.resolve()), content
 
 
@@ -1675,6 +2080,11 @@ async def _generate_starter_handoff(
         )
     except Exception:  # noqa: BLE001
         pass
+    _s_ws_settings = None
+    try:
+        _s_ws_settings = await db_module.get_workspace_settings(db)
+    except Exception:  # noqa: BLE001
+        _s_ws_settings = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=db_module.normalize_execution_mode(
@@ -1682,6 +2092,9 @@ async def _generate_starter_handoff(
         ),
         max_turns=_max_turns_from_settings(settings),
         hitl_auto_answer_mode=_s_hitl_mode,
+        completion_mode=_completion_mode_from_settings(settings),
+        goal_group_style=_goal_group_style_from_settings(settings),
+        loop_enabled=_loop_enabled_from_settings(settings, _s_ws_settings),
     )
     content = _render_starter_handoff(
         project,

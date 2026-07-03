@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **84 tools** over MCP.
+Meridian exposes **86 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -600,6 +600,7 @@ Read-only: List project notes (newest first), LIGHTWEIGHT by default — id/slug
 | `bodies` | boolean | optional | Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug). |
 | `limit` | integer | optional | Page size (default 100, clamped 1..500). Passing limit or cursor switches the result to the {notes, has_more, next_cursor} pagination envelope. |
 | `cursor` | integer | optional | Offset cursor from a prior page's next_cursor. Passing it switches the result to the {notes, has_more, next_cursor} envelope. |
+| `sort` | string | optional | 98890df1 — 'relevance' ranks notes by reference_count/recency/decision-link (heavily cross-referenced notes surface, stale ones sink) and returns a bare list with a per-note 'relevance' score; default 'recency'. |
 
 **Example:**
 ```

@@ -613,6 +613,112 @@ def test_admin_health_403_when_password_required(monkeypatch, tmp_path):
         assert "password" in r.text.lower()
 
 
+def test_admin_stats_403_when_unauthenticated(client):
+    """d1cb1100 — GET /admin/stats returns 403 with no session."""
+    r = client.get("/admin/stats")
+    assert r.status_code == 403
+
+
+def test_admin_stats_json_for_admin(monkeypatch, tmp_path):
+    """d1cb1100 — admin gets launch/user stats: free_count, cap (+percent),
+    total_tenants, provisioned, waitlist."""
+    from meridian import db as db_module
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        monkeypatch.delenv("MERIDIAN_ADMIN_PASSWORD", raising=False)
+        monkeypatch.setenv("MERIDIAN_FREE_LAUNCH_CAP", "1000")
+        _auth_admin_session(client, monkeypatch, "stats-admin@example.com")
+        db = client.app.state.db
+
+        async def _seed():
+            t = await db_module.upsert_tenant(db, "free-user@example.com")
+            await db_module.update_tenant(
+                db, t["id"], neon_project_id="neon-x", neon_db_url="enc",
+            )
+            await db_module.add_waitlist_entry(db, "waiter@example.com", note="test")
+
+        _run(_seed())
+        r = client.get("/admin/stats")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["cap"] == 1000
+        assert body["free_count"] >= 1
+        assert body["provisioned"] >= 1
+        assert body["waitlist"] >= 1
+        assert body["total_tenants"] >= 1
+        assert 0.0 <= body["percent"] <= 100.0
+
+
+def test_me_endpoint_shows_trial_days_for_free_tenant(monkeypatch, tmp_path):
+    """509d9de1 — a free tenant with no inactivity_expires_at still gets a real
+    days_remaining (30-day window anchored on created_at), not None, so the
+    banner shows an actual number instead of 'limited time'."""
+    from meridian import db as db_module
+    from meridian import hosted as hosted_module
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        auth_db = client.app.state.db
+
+        async def _setup():
+            tenant = await db_module.upsert_tenant(auth_db, "free-days@example.com")
+            session = await db_module.create_user_session(
+                auth_db, tenant["id"], "2099-01-01T00:00:00+00:00")
+            return session
+
+        session = _run(_setup())
+        client.cookies.set(
+            hosted_module._SESSION_COOKIE,
+            hosted_module._make_session_cookie(session["id"]))
+        body = client.get("/me").json()
+        assert body.get("plan") == "free"
+        assert isinstance(body.get("days_remaining"), int)
+        assert 0 <= body["days_remaining"] <= 30
+
+
+def test_open_tenant_db_retries_init_before_503(monkeypatch, tmp_path):
+    """894f7645 — _open_tenant_db_by_id retries init_pg_db on a transient failure
+    (provisioning race) before returning 503, so a freshly-provisioned tenant's
+    first request doesn't hard-fail."""
+    import types
+    from meridian import _deps
+    from meridian import db as db_module
+    import meridian.tenant_crypto as _tc
+    import meridian.pg_adapter as _pg
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        auth_db = client.app.state.db
+
+        async def _seed():
+            t = await db_module.upsert_tenant(auth_db, "retry@example.com")
+            await db_module.update_tenant(auth_db, t["id"], neon_db_url="enc-blob")
+            return t
+
+        tenant = _run(_seed())
+        tid = tenant["id"]
+        _deps._tenant_db_cache.pop(tid, None)
+
+        monkeypatch.setattr(_tc, "decrypt_tenant_db_url", lambda _t, _b: "postgres://fake")
+        calls = {"n": 0}
+        sentinel = object()
+
+        async def flaky_init(_url):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("db not accepting connections yet")
+            return sentinel
+
+        monkeypatch.setattr(_pg, "init_pg_db", flaky_init)
+
+        req = types.SimpleNamespace(
+            app=types.SimpleNamespace(state=types.SimpleNamespace(db=auth_db)))
+        try:
+            conn = _run(_deps._open_tenant_db_by_id(req, tid))
+            assert conn is sentinel
+            assert calls["n"] == 3
+        finally:
+            _deps._tenant_db_cache.pop(tid, None)
+
+
 def test_admin_git_status_returns_shape(client):
     """GET /admin/git-status returns a dict with ahead/behind keys (ok either way)."""
     r = client.get("/admin/git-status")

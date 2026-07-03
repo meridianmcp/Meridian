@@ -228,7 +228,9 @@ def test_tunnel_plugins_get_returns_resolved_defaults(monkeypatch, tmp_path):
         ]
         assert body["config"] == {}
         assert body["active"] == {
-            "fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False
+            "fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False,
+            # 8fb69d54 — 4 pre-allocated custom slots
+            "p0": False, "p1": False, "p2": False, "p3": False,
         }
 
 

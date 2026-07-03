@@ -222,6 +222,105 @@ def test_status_server_badge(client):
     assert body["message"] == "online"
 
 
+# ---------------------------------------------------------------------------
+# 13583103 — /setup/health self-hosted auth diagnostics
+# ---------------------------------------------------------------------------
+
+_AUTH_ENV_VARS = (
+    "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+    "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
+    "MICROSOFT_CLIENT_ID", "MICROSOFT_CLIENT_SECRET",
+    "RESEND_API_KEY", "SESSION_SECRET", "MERIDIAN_SESSION_SECRET",
+)
+
+
+def test_setup_health_all_missing(client, monkeypatch):
+    for var in _AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    r = client.get("/setup/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["auth_available"] is False
+    assert body["session_secret_configured"] is False
+    assert body["providers"]["google"]["configured"] is False
+    assert body["providers"]["google"]["missing_env"] == [
+        "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"
+    ]
+    assert body["providers"]["magic_link"]["missing_env"] == ["RESEND_API_KEY"]
+
+
+def test_setup_health_google_configured(client, monkeypatch):
+    for var in _AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "goog-secret")
+    r = client.get("/setup/health")
+    body = r.json()
+    assert body["providers"]["google"]["configured"] is True
+    assert body["providers"]["google"]["missing_env"] == []
+    assert body["providers"]["github"]["configured"] is False
+    assert body["auth_available"] is True
+
+
+def test_setup_health_magic_link_configured(client, monkeypatch):
+    for var in _AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("RESEND_API_KEY", "re_fake")
+    body = client.get("/setup/health").json()
+    assert body["providers"]["magic_link"]["configured"] is True
+    assert body["auth_available"] is True
+
+
+def test_setup_health_session_secret_alias(client, monkeypatch):
+    for var in _AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    assert client.get("/setup/health").json()["session_secret_configured"] is False
+    # SESSION_SECRET resolves through _cfg's alias to MERIDIAN_SESSION_SECRET.
+    monkeypatch.setenv("SESSION_SECRET", "s3cr3t")
+    assert client.get("/setup/health").json()["session_secret_configured"] is True
+
+
+def test_setup_health_public_under_site_password(client, monkeypatch):
+    """The diagnostics endpoint must stay reachable even when SITE_PASSWORD is
+    set — otherwise a locked-out self-hoster can't see why auth is failing."""
+    monkeypatch.setenv("SITE_PASSWORD", "letmein")
+    r = client.get("/setup/health")
+    assert r.status_code == 200
+    assert "providers" in r.json()
+
+
+@pytest.mark.asyncio
+async def test_project_status_priority_default_and_set(db):
+    """8db00fcb — projects default to active/P2; set_project_status updates and
+    validates the enums."""
+    import meridian.db as db_module
+    proj = await db_module.create_project(db, "org-proj")
+    p = await db_module.get_project(db, proj["id"])
+    assert p["status"] == "active"
+    assert p["priority"] == "P2"
+    updated = await db_module.set_project_status(
+        db, proj["id"], status="parked", priority="P0")
+    assert updated["status"] == "parked"
+    assert updated["priority"] == "P0"
+    with pytest.raises(ValueError):
+        await db_module.set_project_status(db, proj["id"], status="bogus")
+
+
+def test_patch_project_organization_route(client):
+    """8db00fcb — PATCH /projects/{id}/organization sets status/priority and the
+    Project response carries them; an invalid enum is a 422."""
+    proj = client.post("/projects", json={"name": "org-route-proj"}).json()
+    pid = proj["id"]
+    r = client.patch(
+        f"/projects/{pid}/organization", json={"status": "archived", "priority": "P1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "archived"
+    assert body["priority"] == "P1"
+    r2 = client.patch(f"/projects/{pid}/organization", json={"status": "nope"})
+    assert r2.status_code == 422
+
+
 def test_status_tools_badge(client):
     r = client.get("/status/tools")
     assert r.status_code == 200

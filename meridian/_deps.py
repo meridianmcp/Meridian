@@ -173,7 +173,26 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
             status_code=503,
             detail="tenant database not provisioned - please wait or contact support",
         )
-    conn = await init_pg_db(url)
+    # 894f7645 — provisioning can race the first request (the DB URL is written
+    # but Postgres isn't accepting connections yet). Retry a few times before
+    # surfacing the 503 so a freshly-provisioned tenant doesn't hard-fail.
+    import asyncio  # noqa: PLC0415
+    conn = None
+    for _attempt in range(3):
+        try:
+            conn = await init_pg_db(url)
+            break
+        except Exception as exc:  # noqa: BLE001
+            if _attempt == 2:
+                _log.warning(
+                    "tenant %s DB init failed after %d attempts: %s",
+                    tenant_id, _attempt + 1, exc,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="tenant database is provisioning — please retry in a moment",
+                )
+            await asyncio.sleep(0.5 * (_attempt + 1))
     _tenant_db_cache[tenant_id] = conn
     return conn
 

@@ -195,6 +195,10 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     if (age < 30000) return;
   }
 
+  // Concurrency guard: if another loadSettingsTab call wins the race, let it render.
+  if (!('_loadTok' in (body as any))) (body as any)._loadTok = 0;
+  const _myTok = ++(body as any)._loadTok;
+
   // Disconnect any MutationObserver from a previous render before replacing innerHTML.
   // Without this, the observer moves every newly-added child to orphaned pane elements,
   // leaving the body blank on the second (and any subsequent) settings tab open.
@@ -1991,6 +1995,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       </div>
 
+      <div id="exec-fs-roots-suggest-${projectId}" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px"></div>
+
     </div>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
@@ -2021,9 +2027,27 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns
 
-      <input id="exec-max_turns-${projectId}" type="range" min="40" max="400" step="20" value="${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      <input id="exec-max_turns-${projectId}" type="range" min="40" max="500" step="20" value="${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
 
       <span id="exec-max_turns-warn-${projectId}" style="font-size:9px;color:var(--muted)"></span>
+
+    </label>
+
+    <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
+
+      Auto-continue (<code>/loop</code>)
+
+      <select id="exec-loop_enabled-${projectId}" style="width:100%;max-width:320px;margin-top:4px;display:block;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
+
+        <option value="workspace"${execCfg.loop_enabled !== true && execCfg.loop_enabled !== false ? ' selected' : ''}>Use workspace default</option>
+
+        <option value="true"${execCfg.loop_enabled === true ? ' selected' : ''}>Always on</option>
+
+        <option value="false"${execCfg.loop_enabled === false ? ' selected' : ''}>Always off</option>
+
+      </select>
+
+      <span style="font-size:9px;color:var(--muted)">Prepends <code>/loop</code> to the session /goal so it auto-continues after each response.</span>
 
     </label>
 
@@ -2066,16 +2090,21 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     const mtVal = document.getElementById(`exec-max_turns-val-${projectId}`);
     const mtWarn = document.getElementById(`exec-max_turns-warn-${projectId}`);
     const _renderMtWarn = (v: any) => {
-      if (!mtWarn) return;
       const n = parseInt(v || '', 10);
-      if (n >= 300) {
-        mtWarn.textContent = '⚠ Very long sprint (300+ turns) — high context/token cost; checkpoint frequently and expect drift.';
-        mtWarn.style.color = 'var(--danger, #e5534b)';
+      // 76cf8bda — color bands: green <200, amber 200-350, red 350+ (ceiling 500).
+      const band = n >= 350 ? 'var(--danger, #e5534b)'
+        : n >= 200 ? 'var(--warning, #d29922)'
+        : 'var(--success, #3fb950)';
+      if (mtVal) mtVal.style.color = band;
+      if (!mtWarn) return;
+      if (n >= 350) {
+        mtWarn.textContent = '⚠ Very long sprint (350+ turns) — high context/token cost; checkpoint frequently and expect drift.';
+        mtWarn.style.color = band;
       } else if (n >= 200) {
         mtWarn.textContent = '⚠ Long sprint (200+ turns) — set a checkpoint cadence so context does not overflow mid-run.';
-        mtWarn.style.color = 'var(--warning, #d29922)';
+        mtWarn.style.color = band;
       } else {
-        mtWarn.textContent = 'Turns before the /goal auto-stops. Raise for megasprints.';
+        mtWarn.textContent = 'Turns before the /goal auto-stops. Raise for megasprints (max 500).';
         mtWarn.style.color = 'var(--muted)';
       }
     };
@@ -2129,10 +2158,29 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
           <td style="padding:2px 0;text-align:right"><button class="exec-del-fs-row" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
         </tr>`).join('') + '</table>';
       _fsTblEl.querySelectorAll('.exec-del-fs-row').forEach(b => {
-        b.onclick = () => { _execFsRoots.splice(parseInt(b.dataset.idx, 10), 1); _rerenderFsTbl(); };
+        b.onclick = () => { _execFsRoots.splice(parseInt(b.dataset.idx, 10), 1); _rerenderFsTbl(); _rerenderFsSuggest(); };
       });
     };
     _rerenderFsTbl();
+    // 77999d60 — one-click chips for repo paths Meridian already tracks, so a
+    // user never has to retype a known repo dir to grant the FS connector access.
+    const _fsSuggestEl = document.getElementById(`exec-fs-roots-suggest-${projectId}`);
+    const _rerenderFsSuggest = () => {
+      if (!_fsSuggestEl) return;
+      const sugg = suggestedFsRoots(execCfg, _execFsRoots);
+      if (!sugg.length) { _fsSuggestEl.innerHTML = ''; return; }
+      _fsSuggestEl.innerHTML = '<span style="font-size:9px;color:var(--muted);align-self:center">Add tracked repo path:</span>' +
+        sugg.map((p: string) => `<button class="exec-add-fs-suggest" data-root="${escapeHtml(p)}" style="font-size:9px;padding:1px 8px;background:transparent;border:1px dashed var(--border);border-radius:3px;color:var(--accent);cursor:pointer;font-family:var(--font-mono)">+ ${escapeHtml(p)}</button>`).join('');
+      _fsSuggestEl.querySelectorAll('.exec-add-fs-suggest').forEach(b => {
+        b.onclick = () => {
+          const root = (b as HTMLElement).dataset.root || '';
+          if (root && !_execFsRoots.includes(root)) _execFsRoots.push(root);
+          _rerenderFsTbl();
+          _rerenderFsSuggest();
+        };
+      });
+    };
+    _rerenderFsSuggest();
     const _fsInput = document.getElementById(`exec-fs-roots-input-${projectId}`);
     const _fsAddBtn = document.getElementById(`exec-fs-roots-add-${projectId}`);
     const _addFsRoot = () => {
@@ -2141,6 +2189,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       if (!_execFsRoots.includes(v)) _execFsRoots.push(v);
       if (_fsInput) _fsInput.value = '';
       _rerenderFsTbl();
+      _rerenderFsSuggest();
     };
     if (_fsAddBtn) _fsAddBtn.onclick = _addFsRoot;
     if (_fsInput) _fsInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); _addFsRoot(); } });
@@ -2177,7 +2226,11 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       const mtRaw = mtSlider ? parseInt(mtSlider.value || '', 10) : NaN;
 
-      if (!isNaN(mtRaw)) cfg.max_turns = Math.min(400, Math.max(40, mtRaw));
+      if (!isNaN(mtRaw)) cfg.max_turns = Math.min(500, Math.max(40, mtRaw));
+
+      const loopSel = document.getElementById(`exec-loop_enabled-${projectId}`) as HTMLSelectElement | null;
+
+      if (loopSel) cfg.loop_enabled = loopSel.value === 'true' ? true : (loopSel.value === 'false' ? false : 'workspace');
 
       try {
 
@@ -2226,6 +2279,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
     const codeIntelCb = document.getElementById('ws-code-intel-default');
 
+    const loopCb = document.getElementById('ws-loop-default');
+
     const saveBtn = document.getElementById('ws-settings-save');
 
     const saveStatus = document.getElementById('ws-settings-status');
@@ -2249,6 +2304,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         if (execModeIn) execModeIn.value = s.execution_mode_default || '';
 
         if (codeIntelCb) codeIntelCb.checked = !!s.code_intel_enabled_default;
+
+        // 76cf8bda — loop default is True unless explicitly stored False.
+        if (loopCb) loopCb.checked = s.loop_enabled_default !== false;
 
       } catch (e: any) {
         // A failed load must not masquerade as "saved defaults" — surface it so
@@ -2286,6 +2344,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
             execution_mode_default: (execModeIn ? execModeIn.value : ''),
 
             code_intel_enabled_default: (codeIntelCb && codeIntelCb.checked) ? 1 : 0,
+
+            // 76cf8bda — workspace /loop auto-continue default.
+            loop_enabled_default: !!(loopCb && loopCb.checked),
 
           }),
 
@@ -2646,6 +2707,16 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
           <span style="font-size:9px;color:var(--muted)">Seeds new projects' code-intel toggle on.</span>
         </span>
       </label>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
+        <input type="checkbox" id="ws-loop-default" style="margin-top:2px">
+        <span>Auto-continue (<code>/loop</code>) by default<br>
+          <span style="font-size:9px;color:var(--muted)">Sessions prepend <code>/loop</code> to the /goal so they auto-continue after each response. Projects set to "Use workspace default" inherit this. Recommended for sprint sessions.</span>
+        </span>
+      </label>
+      <div style="display:flex;gap:6px;align-items:flex-start;margin-bottom:8px">
+        <span id="ws-stophook-badge" style="font-size:9px;padding:2px 6px;border-radius:3px;white-space:nowrap;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">Stop hook: sprint_guard</span>
+        <span style="font-size:9px;color:var(--muted)">Auto-written to <code>.claude/hooks/sprint_guard.sh</code>/<code>.ps1</code> by <code>generate_handoff</code> — blocks early-stop while sprint items are pending. (Regenerated on the machine running the tunnel/server; a hosted dashboard can't inspect your local files.)</span>
+      </div>
       <label style="font-size:10px;color:var(--muted);display:block">Default sprint name<br>
         <input id="ws-sprint-default" type="text" placeholder="e.g. june-sprint" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
       </label>
@@ -3419,6 +3490,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     `<a href="/privacy" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Privacy Policy</a>` +
     `<span style="margin-left:auto">© 2026 Meridian</span>` +
     `</div>`;
+
+  // Bail if a newer loadSettingsTab call started while we were fetching.
+  if ((body as any)._loadTok !== _myTok) return;
 
   try {
     body.innerHTML = html;
@@ -4457,17 +4531,21 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         });
 
-        loadSettingsTab(projectId, { force: true });
+        await loadSettingsTab(projectId, { force: true });
 
       } catch (e: any) {
 
-        if (statusEl) statusEl.textContent = e.message || 'Save failed';
+        if (statusEl && statusEl.isConnected) statusEl.textContent = e.message || 'Save failed';
 
       } finally {
 
-        ghSaveBtn.disabled = false;
+        if (ghSaveBtn.isConnected) {
 
-        ghSaveBtn.textContent = 'Save repo';
+          ghSaveBtn.disabled = false;
+
+          ghSaveBtn.textContent = 'Save repo';
+
+        }
 
       }
 
@@ -4493,13 +4571,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         await api(`/projects/${projectId}/github/disconnect`, { method: 'DELETE' });
 
-        loadSettingsTab(projectId, { force: true });
+        await loadSettingsTab(projectId, { force: true });
 
       } catch (e: any) {
 
-        if (statusEl) statusEl.textContent = 'error disconnecting';
+        if (statusEl && statusEl.isConnected) statusEl.textContent = 'error disconnecting';
 
-        ghDisconnectBtn.disabled = false;
+        if (ghDisconnectBtn.isConnected) ghDisconnectBtn.disabled = false;
 
       }
 

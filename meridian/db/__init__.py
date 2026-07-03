@@ -178,6 +178,10 @@ CREATE TABLE IF NOT EXISTS projects (
     agent_instructions TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous'
         CHECK (execution_mode IN ('autonomous', 'interactive')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'parked', 'archived')),
+    priority TEXT NOT NULL DEFAULT 'P2'
+        CHECK (priority IN ('P0', 'P1', 'P2')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -647,6 +651,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     handoff_template TEXT,
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
+    loop_enabled_default INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -805,6 +810,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_sprint_board(db)
     await _migrate_registered_hostnames(db)
     await _migrate_queued_session(db)
+    await _migrate_pending_goal(db)
     await _migrate_parallel_safety(db)
     await _migrate_changelog_entries(db)
     await _migrate_agent_instructions(db)
@@ -833,6 +839,11 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_github_connections(db)
     await _migrate_sprint_item_quality_gates(db)
     await _migrate_parallel_primitives(db)
+    await _migrate_project_status_priority(db)
+    await _migrate_signup_attempts(db)
+    await _migrate_user_session_metadata(db)
+    await _migrate_provision_queue(db)
+    await _migrate_codebase_graph_entities(db)
     return db
 
 
@@ -913,6 +924,43 @@ async def get_project(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+_PROJECT_STATUSES = ("active", "parked", "archived")
+_PROJECT_PRIORITIES = ("P0", "P1", "P2")
+
+
+async def set_project_status(
+    db: aiosqlite.Connection,
+    project_id: str,
+    status: str | None = None,
+    priority: str | None = None,
+) -> dict[str, Any] | None:
+    """8db00fcb — update a project's organization fields (status/priority).
+    Validates the enums; only the provided fields change."""
+    sets: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        if status not in _PROJECT_STATUSES:
+            raise ValueError(
+                f"invalid status {status!r}; expected one of {_PROJECT_STATUSES}"
+            )
+        sets.append("status = ?")
+        params.append(status)
+    if priority is not None:
+        if priority not in _PROJECT_PRIORITIES:
+            raise ValueError(
+                f"invalid priority {priority!r}; expected one of {_PROJECT_PRIORITIES}"
+            )
+        sets.append("priority = ?")
+        params.append(priority)
+    if sets:
+        params.append(project_id)
+        await db.execute(
+            f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
+        )
+        await db.commit()
+    return await get_project(db, project_id)
 
 
 async def get_agent_instructions(
@@ -3886,6 +3934,22 @@ def _NEG_TS(ts: str) -> tuple[int, str]:
     return (1, inverted)
 
 
+async def count_pending_sprint_items(
+    db: aiosqlite.Connection, project_id: str
+) -> int:
+    """c0d2356d — count of not-yet-done sprint items (status pending/todo) for a
+    project. Backs the Stop-hook sprint guard's /sprint/pending_count endpoint."""
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM sprint_items "
+        "WHERE project_id = ? AND status IN ('pending', 'todo')",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0
+    return int(row["c"] if isinstance(row, dict) else row[0])
+
+
 async def get_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
@@ -5072,12 +5136,22 @@ async def create_user_session(
     db: aiosqlite.Connection,
     tenant_id: str,
     expires_at: str,
+    user_agent: str | None = None,
+    ip: str | None = None,
 ) -> dict[str, Any]:
-    """Create a web session for a tenant. Returns the session dict."""
+    """Create a web session for a tenant. Returns the session dict.
+
+    3c28450d — optional device metadata (``user_agent``/``ip``) is stored for
+    the active-sessions view; ``last_seen_at`` is seeded to now."""
     sid = _new_id()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
-        "INSERT INTO user_sessions (id, tenant_id, expires_at) VALUES (?, ?, ?)",
-        (sid, tenant_id, expires_at),
+        "INSERT INTO user_sessions "
+        "(id, tenant_id, expires_at, user_agent, ip, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (sid, tenant_id, expires_at,
+         (user_agent or None), (ip or None), now),
     )
     await db.commit()
     async with db.execute("SELECT * FROM user_sessions WHERE id = ?", (sid,)) as cur:
@@ -5112,6 +5186,176 @@ async def delete_user_session(
     """Delete a web session (logout)."""
     await db.execute("DELETE FROM user_sessions WHERE id = ?", (session_id,))
     await db.commit()
+
+
+async def get_user_sessions_for_tenant(
+    db: aiosqlite.Connection, tenant_id: str
+) -> list[dict[str, Any]]:
+    """3c28450d — all non-expired web sessions for a tenant, most-recently-seen
+    first, for the active-sessions view."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    async with db.execute(
+        "SELECT * FROM user_sessions WHERE tenant_id = ? AND expires_at > ? "
+        "ORDER BY COALESCE(last_seen_at, created_at) DESC",
+        (tenant_id, now),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def touch_user_session(
+    db: aiosqlite.Connection, session_id: str
+) -> None:
+    """3c28450d — bump last_seen_at so the active-sessions view shows recency."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE user_sessions SET last_seen_at = ? WHERE id = ?", (now, session_id)
+    )
+    await db.commit()
+
+
+async def revoke_user_session(
+    db: aiosqlite.Connection, session_id: str, tenant_id: str
+) -> bool:
+    """3c28450d — delete a session only if it belongs to ``tenant_id`` (so a user
+    can never revoke another tenant's session). Returns True if a row was
+    removed."""
+    cur = await db.execute(
+        "DELETE FROM user_sessions WHERE id = ? AND tenant_id = ?",
+        (session_id, tenant_id),
+    )
+    await db.commit()
+    return (cur.rowcount or 0) > 0
+
+
+async def enqueue_provision(
+    db: aiosqlite.Connection, tenant_id: str, last_error: str | None = None
+) -> None:
+    """4c559d4e — record a tenant needing (re)provisioning. Bumps attempts and
+    resets status to 'pending' so a background drain can retry it later."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async with db.execute(
+        "SELECT attempts FROM provision_queue WHERE tenant_id = ?", (tenant_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        await db.execute(
+            "INSERT INTO provision_queue "
+            "(tenant_id, status, attempts, last_error, updated_at) "
+            "VALUES (?, 'pending', 1, ?, ?)",
+            (tenant_id, last_error, now),
+        )
+    else:
+        await db.execute(
+            "UPDATE provision_queue SET status = 'pending', attempts = attempts + 1, "
+            "last_error = ?, updated_at = ? WHERE tenant_id = ?",
+            (last_error, now, tenant_id),
+        )
+    await db.commit()
+
+
+async def mark_provision_done(db: aiosqlite.Connection, tenant_id: str) -> None:
+    """4c559d4e — mark a tenant's provisioning complete (clears it from pending)."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE provision_queue SET status = 'done', updated_at = ? WHERE tenant_id = ?",
+        (now, tenant_id),
+    )
+    await db.commit()
+
+
+async def get_pending_provisions(
+    db: aiosqlite.Connection, limit: int = 50
+) -> list[dict[str, Any]]:
+    """4c559d4e — tenants still awaiting provisioning, oldest first."""
+    async with db.execute(
+        "SELECT * FROM provision_queue WHERE status = 'pending' "
+        "ORDER BY created_at ASC LIMIT ?",
+        (int(limit),),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def count_pending_provisions(db: aiosqlite.Connection) -> int:
+    """4c559d4e — number of tenants awaiting (re)provisioning."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM provision_queue WHERE status = 'pending'"
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def upsert_graph_entities(
+    db: aiosqlite.Connection,
+    project_id: str,
+    entities: list[dict[str, Any]],
+    cap: int = 500,
+) -> int:
+    """c00b1ccf — replace a project's cached graph snapshot with up to ``cap``
+    entities (each: qualified_name + optional file/kind/signature). Returns the
+    number stored. Entities beyond the cap are dropped."""
+    cap = max(0, int(cap))
+    await db.execute(
+        "DELETE FROM codebase_graph_entities WHERE project_id = ?", (project_id,)
+    )
+    stored = 0
+    for ent in (entities or [])[:cap]:
+        qn = str(ent.get("qualified_name") or ent.get("name") or "").strip()
+        if not qn:
+            continue
+        await db.execute(
+            "INSERT INTO codebase_graph_entities "
+            "(id, project_id, qualified_name, file, kind, signature) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (_new_id(), project_id, qn,
+             (ent.get("file") or None), (ent.get("kind") or None),
+             (ent.get("signature") or None)),
+        )
+        stored += 1
+    await db.commit()
+    return stored
+
+
+async def count_graph_entities(db: aiosqlite.Connection, project_id: str) -> int:
+    """c00b1ccf — number of cached graph entities for a project."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM codebase_graph_entities WHERE project_id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def search_graph_entities(
+    db: aiosqlite.Connection, project_id: str, query: str, limit: int = 10
+) -> list[dict[str, Any]]:
+    """c00b1ccf — keyword search over a project's cached graph snapshot. Matches
+    tokens (>=3 chars) of ``query`` against qualified_name/file. Returns entity
+    rows (each carrying ``file``) for handoff code-pointer enrichment."""
+    import re as _re
+    tokens = [t for t in _re.split(r"[^A-Za-z0-9_]+", (query or "")) if len(t) >= 3]
+    if not tokens:
+        return []
+    clauses: list[str] = []
+    params: list[Any] = [project_id]
+    for tok in tokens[:6]:
+        clauses.append("(qualified_name LIKE ? OR file LIKE ?)")
+        like = f"%{tok}%"
+        params.extend([like, like])
+    sql = (
+        "SELECT * FROM codebase_graph_entities WHERE project_id = ? AND ("
+        + " OR ".join(clauses)
+        + ") LIMIT ?"
+    )
+    params.append(int(limit))
+    async with db.execute(sql, params) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
 async def delete_api_tokens_by_label(
@@ -8349,6 +8593,77 @@ async def get_project_notes(
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
+def _note_relevance_score(
+    reference_count: int, age_days: float, has_decision_link: bool, read_count: int = 0
+) -> float:
+    """98890df1 — PageRank-ish note relevance. Reference/read counts pass through a
+    saturating transform so a heavily-referenced note ranks high without a single
+    outlier dominating; recency decays on a ~30-day scale. read_count stays 0 until
+    note-read tracking lands (semantic similarity is the pgvector Phase 2)."""
+    ref = 1.0 - 1.0 / (1.0 + max(0, reference_count))
+    rec = 1.0 / (1.0 + max(0.0, age_days) / 30.0)
+    read = 1.0 - 1.0 / (1.0 + max(0, read_count))
+    dec = 1.0 if has_decision_link else 0.0
+    return 0.45 * ref + 0.30 * rec + 0.15 * read + 0.10 * dec
+
+
+async def get_project_notes_ranked(
+    db: aiosqlite.Connection,
+    project_id: str,
+    tag: str | None = None,
+    query: str | None = None,
+    bodies: bool = False,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """98890df1 — like get_project_notes but ordered by a relevance score
+    (reference_count / recency / decision-link) instead of pure recency, so
+    heavily cross-referenced notes surface and stale ones sink. Each returned row
+    carries a ``relevance`` float."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+    where, params = _project_notes_where(db, project_id, tag, query)
+    # Fetch full rows (bodies are needed to count [[slug]] references) unpaged so
+    # scoring sees the whole corpus, then trim after ranking.
+    sql = f"SELECT * FROM project_notes WHERE {where}"
+    async with db.execute(sql, params or None) as cur:
+        rows = await cur.fetchall()
+    notes = [_row_to_dict(r) for r in rows if r is not None]
+    combined_bodies = " ".join((n.get("body") or "") for n in notes)
+    try:
+        decisions = await get_pinned_decisions(db, project_id)
+        decision_blob = " ".join((d.get("body") or "") for d in (decisions or []))
+    except Exception:  # noqa: BLE001
+        decision_blob = ""
+    now = datetime.now(timezone.utc)
+    for n in notes:
+        slug = n.get("slug") or ""
+        marker = f"[[{slug}]]"
+        # count references from OTHER notes (subtract self-references in own body)
+        ref_count = 0
+        if slug:
+            ref_count = combined_bodies.count(marker) - (n.get("body") or "").count(marker)
+        has_dec = bool(slug) and (marker in decision_blob)
+        age_days = 0.0
+        created = n.get("created_at")
+        if created:
+            try:
+                cdt = datetime.strptime(
+                    str(created)[:19], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+                age_days = max(0.0, (now - cdt).total_seconds() / 86400.0)
+            except (ValueError, TypeError):
+                pass
+        n["relevance"] = round(
+            _note_relevance_score(max(0, ref_count), age_days, has_dec), 4
+        )
+    notes.sort(key=lambda x: (x.get("relevance", 0.0), x.get("created_at") or ""), reverse=True)
+    if not bodies:
+        for n in notes:
+            n.pop("body", None)
+    if limit is not None:
+        notes = notes[: max(1, min(int(limit), 500))]
+    return notes
+
+
 async def get_project_notes_page(
     db: aiosqlite.Connection,
     project_id: str,
@@ -8863,7 +9178,8 @@ async def get_workspace_settings(
     _cols = (
         "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
         "log_task_sprint_nudge_threshold, handoff_template, "
-        "execution_mode_default, code_intel_enabled_default, updated_at "
+        "execution_mode_default, code_intel_enabled_default, "
+        "loop_enabled_default, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -8884,6 +9200,9 @@ async def get_workspace_settings(
     # projects keep their own built-in default); a value ⇒ seed new projects.
     _emode = data.get("execution_mode_default")
     _ci_default = data.get("code_intel_enabled_default")
+    # 76cf8bda — /loop auto-continue workspace default. Missing column/row ⇒
+    # True (Meridian sessions default to auto-continue); a stored 0 turns it off.
+    _loop_default = data.get("loop_enabled_default")
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -8894,6 +9213,7 @@ async def get_workspace_settings(
         "handoff_template": data.get("handoff_template"),
         "execution_mode_default": _emode if _emode in ("autonomous", "interactive") else None,
         "code_intel_enabled_default": (None if _ci_default is None else bool(_ci_default)),
+        "loop_enabled_default": (True if _loop_default is None else bool(_loop_default)),
         "updated_at": data.get("updated_at"),
     }
 
@@ -8908,6 +9228,7 @@ async def update_workspace_settings(
     handoff_template: str | None = None,
     execution_mode_default: str | None = None,
     code_intel_enabled_default: "bool | int | str | None" = None,
+    loop_enabled_default: "bool | int | str | None" = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -8954,6 +9275,10 @@ async def update_workspace_settings(
             params.append(None)
         else:
             params.append(1 if code_intel_enabled_default and code_intel_enabled_default not in ("0", "false", "False") else 0)
+    if loop_enabled_default is not None:
+        # 76cf8bda — /loop auto-continue default. Truthy/1 → 1, falsey/0 → 0.
+        updates.append("loop_enabled_default = ?")
+        params.append(1 if loop_enabled_default and loop_enabled_default not in ("0", "false", "False") else 0)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -9118,6 +9443,53 @@ async def pop_queued_session(
 
 
 # ---------------------------------------------------------------------------
+# 5efe254b — trusted handoff channel (projects.pending_goal)
+# ---------------------------------------------------------------------------
+
+
+async def set_pending_goal(
+    db: aiosqlite.Connection, project_id: str, goal: str | None
+) -> None:
+    """Persist the handoff /goal so the next start_session can surface it through
+    a trusted MCP tool result (keyed on project_id) instead of a copy-pasted,
+    spoofable chat string. Empty/None clears it. Read-once via pop_pending_goal."""
+    await db.execute(
+        "UPDATE projects SET pending_goal = ? WHERE id = ?",
+        ((goal or None), project_id),
+    )
+    await db.commit()
+
+
+async def get_pending_goal(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the stored handoff /goal, or None when nothing is pending."""
+    async with db.execute(
+        "SELECT pending_goal FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    val = row["pending_goal"] if isinstance(row, dict) else row[0]
+    return val or None
+
+
+async def pop_pending_goal(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the pending /goal and clear it (read-once) so start_session
+    surfaces it exactly once and a stale goal never resurfaces in a later
+    session."""
+    goal = await get_pending_goal(db, project_id)
+    if goal:
+        await db.execute(
+            "UPDATE projects SET pending_goal = NULL WHERE id = ?", (project_id,)
+        )
+        await db.commit()
+    return goal
+
+
+# ---------------------------------------------------------------------------
 # v3.1 — per-session checkpoint snapshots (sessions.checkpoint_data)
 # ---------------------------------------------------------------------------
 
@@ -9196,6 +9568,31 @@ async def store_magic_token(
     )
     await db.commit()
     return {"id": tid, "email": email.lower(), "expires_at": expires_at}
+
+
+async def record_signup_attempt(
+    db: aiosqlite.Connection, ip_hash: str, email_hash: str
+) -> None:
+    """925909aa — log one magic-link signup attempt keyed by salted IP/email
+    hashes, for persistent per-IP rate limiting (survives restarts)."""
+    await db.execute(
+        "INSERT INTO signup_attempts (id, ip_hash, email_hash) VALUES (?, ?, ?)",
+        (_new_id(), ip_hash, email_hash),
+    )
+    await db.commit()
+
+
+async def count_recent_signup_attempts(
+    db: aiosqlite.Connection, ip_hash: str, since_iso: str
+) -> int:
+    """Count signup attempts from ``ip_hash`` at or after ``since_iso``
+    (``YYYY-MM-DD HH:MM:SS`` UTC)."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM signup_attempts WHERE ip_hash = ? AND created_at >= ?",
+        (ip_hash, since_iso),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def consume_magic_token(

@@ -108,6 +108,62 @@ def test_build_quick_start_goal_max_turns():
     assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}], max_turns="bad")
 
 
+def test_infer_sprint_type_heuristics():
+    """f9fa00e4 — sprint-type inference by count / item_group / title keyword."""
+    from meridian.handoff import _infer_sprint_type
+    assert _infer_sprint_type([]) == "feature"
+    assert _infer_sprint_type(
+        [{"id": str(i), "title": "feat x"} for i in range(12)]) == "megasprint"
+    assert _infer_sprint_type(
+        [{"id": "1", "item_group": "research"}, {"id": "2", "item_group": "paper"}]) == "research"
+    assert _infer_sprint_type(
+        [{"id": "1", "title": "REFACTOR: split module"},
+         {"id": "2", "title": "refactor dashboard"}]) == "refactor"
+    assert _infer_sprint_type(
+        [{"id": "1", "item_group": "ops"}, {"id": "2", "item_group": "release"}]) == "ops"
+    assert _infer_sprint_type([{"id": "1", "title": "hotfix: crash on start"}]) == "hotfix"
+    assert _infer_sprint_type(
+        [{"id": "1", "title": "add button"}, {"id": "2", "title": "add page"}]) == "feature"
+
+
+def test_build_quick_start_goal_tags_sprint_type():
+    """f9fa00e4 — the /goal carries an inferred [sprint:TYPE] tag + guidance,
+    without disturbing the existing structure."""
+    from meridian.handoff import _build_quick_start_goal
+    goal = _build_quick_start_goal([{"id": "a1", "title": "hotfix: crash on start"}])
+    assert "[sprint:hotfix]" in goal
+    assert "HOTFIX sprint" in goal
+    assert "a1" in goal
+    assert 'get_sprint_items(status="pending")' in goal
+    assert "Stop after" in goal
+
+
+def test_build_quick_start_goal_completion_mode_and_group_style():
+    """9f57374b — completion_mode='lenient' drops the anti-stop failure framing;
+    goal_group_style='waves' restores Wave headers for a dependency graph; the
+    executor_config extractors default to strict/flat."""
+    from meridian.handoff import (
+        _build_quick_start_goal,
+        _completion_mode_from_settings,
+        _goal_group_style_from_settings,
+    )
+    assert "is a FAILURE" in _build_quick_start_goal([{"id": "a1"}])
+    assert "is a FAILURE" not in _build_quick_start_goal(
+        [{"id": "a1"}], completion_mode="lenient")
+
+    deps = [{"id": "a1"}, {"id": "a2", "depends_on": "a1"}]
+    assert "Wave" not in _build_quick_start_goal(deps)  # default flat
+    waved = _build_quick_start_goal(deps, goal_group_style="waves")
+    assert "Wave 1: a1" in waved and "Wave 2: a2" in waved
+
+    assert _completion_mode_from_settings(
+        {"executor_config": {"completion_mode": "lenient"}}) == "lenient"
+    assert _completion_mode_from_settings({}) == "strict"
+    assert _goal_group_style_from_settings(
+        {"executor_config": {"goal_group_style": "waves"}}) == "waves"
+    assert _goal_group_style_from_settings(None) == "flat"
+
+
 def test_resolve_graph_searcher_uses_registered_resolver():
     """4cfaecc2 — _resolve_graph_searcher consults the injectable resolver and is
     guarded so a resolver that raises can never break the mandatory handoff."""
@@ -154,17 +210,21 @@ def test_partition_into_waves_topological_layers():
     assert sum(len(w) for w in cyc) == 2
 
 
-def test_build_quick_start_goal_wave_structured_with_deps():
-    """3726cf70 — a dependency graph yields a wave-structured /goal; a flat list
-    (no deps) keeps the legacy phrasing."""
+def test_build_quick_start_goal_flattens_deps_no_wave_headers():
+    """eeee02c6 — a dependency graph flattens into one ordered id list (no 'Wave'
+    headers, which invite stopping between waves); a flat list keeps the legacy
+    phrasing. Both carry the anti-stop failure framing."""
     flat = handoff_module._build_quick_start_goal([{"id": "a1"}, {"id": "a2"}])
     assert "Complete sprint items: a1, a2." in flat
     assert "Wave" not in flat
+    assert "is a FAILURE" in flat
     waved = handoff_module._build_quick_start_goal([
         {"id": "a1"}, {"id": "a2", "depends_on": "a1"},
     ])
-    assert "wave order" in waved
-    assert "Wave 1: a1" in waved and "Wave 2: a2" in waved
+    assert "dependency order" in waved
+    assert "a1, a2" in waved
+    assert "Wave" not in waved
+    assert "is a FAILURE" in waved
 
 
 def test_agent_instructions_stale_detection():
@@ -623,6 +683,118 @@ async def test_generate_handoff_delta_empty(db, tmp_path):
     assert "- none" in content
 
 
+# ---------------------------------------------------------------------------
+# aef94e4a — sprint retrospective note
+# ---------------------------------------------------------------------------
+
+
+def test_build_retro_prompt_names_three_sections():
+    items = [{"title": "Ship auth fix", "status": "done"},
+             {"title": "Add graph snapshot", "status": "done"}]
+    decisions = [{"decision": "Use psycopg3", "status": "active"}]
+    prompt = handoff_module._build_retro_prompt(items, decisions, "v0.1.x")
+    assert "What shipped" in prompt
+    assert "Patterns revealed" in prompt
+    assert "Direction confirmed" in prompt
+    assert "Ship auth fix" in prompt
+    assert "v0.1.x" in prompt
+    assert "Use psycopg3" in prompt
+    # the retro prompt is a stable discriminator vs. the ai_summary prompt
+    assert "sprint retrospective" in prompt
+
+
+def test_render_retro_fallback_lists_shipped_and_handles_empty():
+    items = [{"title": "Ship auth fix", "status": "done"}]
+    body = handoff_module._render_retro_fallback(items, "v1")
+    assert "Ship auth fix" in body
+    assert "1 item" in body
+    assert handoff_module._render_retro_fallback([], None).startswith("No items")
+
+
+def _retro_summarizer(prompt):
+    # Discriminate the retro prompt from the ai_summary prompt (both share the
+    # injected summarizer) so tests assert on the retrospective body only.
+    if "sprint retrospective" in prompt:
+        return "RETRO STUB: what shipped, patterns, direction."
+    return "AI SUMMARY STUB."
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_writes_retrospective_note(db, tmp_path):
+    p = await db_module.create_project(db, "retro-proj")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v0.1.x")
+    it = await db_module.add_sprint_item(db, p["id"], "v0.1.x", "Ship the retro")
+    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), summarizer=_retro_summarizer,
+        skip_ai_summary=False,
+    )
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 1
+    n = notes[0]
+    assert n["body"] == "RETRO STUB: what shipped, patterns, direction."
+    assert (n.get("note_kind") or n.get("kind")) == "insight"
+    assert "retrospective" in (n.get("tags") or "")
+    assert n["priority"] == "high"
+    assert n["title"] == "Sprint Retrospective — v0.1.x"
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_retrospective_is_idempotent(db, tmp_path):
+    p = await db_module.create_project(db, "retro-idem")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v9")
+    it = await db_module.add_sprint_item(db, p["id"], "v9", "Item one")
+    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+
+    seq = {"n": 0}
+
+    def _seq_summarizer(prompt):
+        if "sprint retrospective" in prompt:
+            seq["n"] += 1
+            return f"RETRO#{seq['n']}"
+        return "AI SUMMARY STUB."
+
+    for _ in range(2):
+        await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), summarizer=_seq_summarizer,
+            skip_ai_summary=False,
+        )
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 1  # updated in place, not duplicated
+    assert notes[0]["body"] == "RETRO#2"
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_skip_ai_summary_no_retrospective(db, tmp_path):
+    p = await db_module.create_project(db, "retro-skip")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v1")
+    it = await db_module.add_sprint_item(db, p["id"], "v1", "Item")
+    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+    )
+    notes = await db_module.get_project_notes(db, p["id"], tag="retrospective")
+    assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_no_completed_items_no_retrospective(db, tmp_path):
+    p = await db_module.create_project(db, "retro-none")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v1")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Still pending")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), summarizer=_retro_summarizer,
+        skip_ai_summary=False,
+    )
+    notes = await db_module.get_project_notes(db, p["id"], tag="retrospective")
+    assert notes == []
+
+
 @pytest.mark.asyncio
 async def test_generate_handoff_planner_mode_full_content(db, tmp_path):
     """Planner mode emits a directive planning prompt: tool-order protocol,
@@ -978,3 +1150,21 @@ def test_start_session_agent_instructions_includes_hitl_directive(client):
     ai = data.get("agent_instructions", "")
     assert "EXECUTION MODE:" in ai
     assert "HITL:" in ai
+
+
+def test_start_session_includes_current_timestamp(client):
+    """de193a81 — the start_session response carries current_timestamp so an
+    executor session spanning calendar days is anchored to the real date."""
+    import json as _json
+    import re
+    project = client.post("/projects", json={"name": "ts-instr-proj"}).json()
+    pid = project["id"]
+    r = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "start_session",
+                   "arguments": {"project_id": pid, "session_name": "ts-test"}}
+    })
+    assert r.status_code == 200
+    data = _json.loads(r.json()["result"]["content"][0]["text"])
+    assert "current_timestamp" in data
+    assert re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", data["current_timestamp"])

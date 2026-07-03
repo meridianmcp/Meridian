@@ -474,6 +474,24 @@ def test_dispatch_github_tool_no_repo_connected():
     assert out["error"] == "no_github_repo"
 
 
+def test_dispatch_github_tool_search_code_no_repo_connected():
+    """dc462628 — search_code hits the shared no-repo guard and returns a clear
+    error rather than a misleading empty result (removes the 'false confidence'
+    the tool description now documents)."""
+    import meridian.db as db_module
+
+    tenant = {"id": "t", "plan": "pro", "github_pat": db_module.encrypt_field("ghp_fake")}
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "gh-search-proj"))
+        out = _run(mh._dispatch_github_tool(
+            "search_code", {"project_id": proj["id"], "query": "foo"}, tenant, db,
+        ))
+    finally:
+        _run(db.close())
+    assert out["error"] == "no_github_repo"
+
+
 def test_dispatch_github_tool_unknown_name():
     import meridian.db as db_module
 
@@ -806,6 +824,246 @@ def test_planning_brief_last_session_none_when_no_sessions():
         brief = _run(mh._dispatch_mcp_tool(
             "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
         assert brief["last_session"] is None
+    finally:
+        _run(db.close())
+
+
+def test_planning_brief_latest_retrospective_present_and_absent():
+    """aef94e4a — get_planning_brief surfaces the latest sprint retrospective
+    note (tag=retrospective), and None when none exists."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "retro-brief"))
+        b0 = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert "latest_retrospective" in b0
+        assert b0["latest_retrospective"] is None
+        _run(db_module.add_project_note(
+            db, proj["id"], "Sprint Retrospective — v1",
+            "What shipped: lots. Patterns: good. Direction: forward.",
+            tags="retrospective,strategy", kind="insight", priority="high"))
+        b1 = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        lr = b1["latest_retrospective"]
+        assert lr is not None
+        assert lr["title"] == "Sprint Retrospective — v1"
+        assert "What shipped" in lr["body"]
+        assert lr["slug"]
+    finally:
+        _run(db.close())
+
+
+def test_planning_brief_includes_current_timestamp():
+    """de193a81 — get_planning_brief returns current_timestamp so a planner
+    spanning multiple calendar days never guesses 'today'/'yesterday'."""
+    import re
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "ts-proj"))
+        brief = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert "current_timestamp" in brief
+        assert re.match(
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", brief["current_timestamp"]
+        )
+    finally:
+        _run(db.close())
+
+
+def test_detect_insight_candidate_matches_and_ignores():
+    """2d932f60 — the keyword detector flags decision/insight phrasing and
+    ignores neutral text."""
+    from meridian.handoff import detect_insight_candidate
+    assert detect_insight_candidate("We decided to use psycopg3") == "we decided"
+    assert detect_insight_candidate("Root cause: event-loop deadlock") == "root cause"
+    assert detect_insight_candidate("Add a logout button") is None
+    assert detect_insight_candidate("") is None
+    assert detect_insight_candidate(None) is None
+
+
+def test_add_sprint_item_proposes_insight_capture():
+    """2d932f60 — add_sprint_item surfaces an insight_hint when the title reads
+    like a decision, and stays quiet for a plain title."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "insight-proj"))
+        hinted = _run(mh._dispatch_mcp_tool("add_sprint_item", {
+            "project_id": proj["id"], "version": "v1",
+            "title": "Decision: we chose Cytoscape over ECharts for the graph",
+            "force": True,
+        }, db, "/tmp"))
+        assert "insight_hint" in hinted
+        assert "capture_insight" in hinted["insight_hint"]
+        plain = _run(mh._dispatch_mcp_tool("add_sprint_item", {
+            "project_id": proj["id"], "version": "v1",
+            "title": "Add a logout button to the header",
+            "force": True,
+        }, db, "/tmp"))
+        assert "insight_hint" not in plain
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_surfaces_insight_hints(tmp_path):
+    """2d932f60 — generate_handoff scans the session task log and surfaces
+    insight candidates so they aren't lost at session end."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "ih-handoff-proj"))
+        sess = _run(db_module.register_session(db, proj["id"], "exec-ih"))
+        _run(db_module.log_task(
+            db, sess["id"], proj["id"],
+            "Turns out the ProactorEventLoop deadlocks watchfiles on Windows"))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff",
+            {"project_id": proj["id"], "session_id": sess["id"]},
+            db, str(tmp_path)))
+        assert "insight_hints" in out
+        assert any(h["signal"] == "turns out" for h in out["insight_hints"])
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_warns_on_long_goal(tmp_path):
+    """0fe01e93 — generate_handoff flags a /goal text over the 4000-char limit."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "longgoal-proj"))
+        _run(db_module.set_goal(db, proj["id"], "", sprint="x" * 4100))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
+        assert out["goal_length_warning"] is not None
+        assert "4000" in out["goal_length_warning"]
+
+        proj2 = _run(db_module.create_project(db, "shortgoal-proj"))
+        _run(db_module.set_goal(db, proj2["id"], "", sprint="short and tidy"))
+        out2 = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj2["id"]}, db, str(tmp_path)))
+        assert out2["goal_length_warning"] is None
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_content_is_fence_free(tmp_path):
+    """642b1818 — generate_handoff returns a single plain-text copyable block:
+    markdown code-fence lines are stripped so it pastes cleanly into a fenced
+    chat / dashboard textarea."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "fence-proj"))
+        _run(db_module.set_goal(db, proj["id"], "", sprint="do the thing"))
+        # a strategic note whose body has a fenced block that the handoff renders
+        _run(db_module.add_project_note(
+            db, proj["id"], "Config", "```json\n{\"a\": 1}\n```", "planning",
+            priority="high"))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
+        assert "```" not in out["content"]
+    finally:
+        _run(db.close())
+
+
+def test_add_note_warns_on_similar_existing_note():
+    """6e4e2371 — adding a note whose title closely matches an existing one
+    returns a similar_notes warning (never blocks the write)."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "dedup-proj"))
+        _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Windows event loop deadlock gotcha",
+            "body": "Use SelectorEventLoop on Windows.",
+        }, db, "/tmp"))
+        dup = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Windows event loop deadlock gotchas",  # near-identical
+            "body": "Different body entirely.",
+        }, db, "/tmp"))
+        assert "similar_notes" in dup
+        assert dup["similar_notes"][0]["similarity"] >= 0.82
+        # A clearly different note does not trigger the warning.
+        fresh = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Stripe billing overage metering",
+            "body": "unrelated",
+        }, db, "/tmp"))
+        assert "similar_notes" not in fresh
+    finally:
+        _run(db.close())
+
+
+def test_add_note_extracts_hashtags_as_tags():
+    """41b8a927 — #hashtags in a note's title/body are recognised as tags so
+    the note is searchable by tag; explicit tags are preserved alongside them."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "hashtag-proj"))
+        created = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Windows fix",
+            "body": "Use SelectorEventLoop. #windows #eventloop",
+        }, db, "/tmp"))
+        slug = created.get("slug")
+        by_win = _run(db_module.get_project_notes(db, proj["id"], tag="windows"))
+        assert any(n.get("slug") == slug for n in by_win)
+        by_evl = _run(db_module.get_project_notes(db, proj["id"], tag="eventloop"))
+        assert any(n.get("slug") == slug for n in by_evl)
+        created2 = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Billing",
+            "body": "Stripe overage #billing",
+            "tags": "finance",
+        }, db, "/tmp"))
+        slug2 = created2.get("slug")
+        assert any(n.get("slug") == slug2
+                   for n in _run(db_module.get_project_notes(db, proj["id"], tag="finance")))
+        assert any(n.get("slug") == slug2
+                   for n in _run(db_module.get_project_notes(db, proj["id"], tag="billing")))
+    finally:
+        _run(db.close())
+
+
+def test_note_relevance_score_weights():
+    """98890df1 — more references / recency / a decision link each raise the score."""
+    from meridian.db import _note_relevance_score
+    base = _note_relevance_score(0, 100.0, False)
+    assert _note_relevance_score(5, 100.0, False) > base   # references help
+    assert _note_relevance_score(0, 0.0, False) > base     # recency helps
+    assert _note_relevance_score(0, 100.0, True) > base    # decision link helps
+
+
+def test_get_notes_relevance_sort_surfaces_referenced_note():
+    """98890df1 — get_notes(sort=relevance) ranks a heavily cross-referenced note
+    above unreferenced ones (relevance > pure recency)."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "rank-proj"))
+        a = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"], "title": "Core architecture decision",
+            "body": "The keystone note.",
+        }, db, "/tmp"))
+        a_slug = a["slug"]
+        for i in range(2):
+            _run(mh._dispatch_mcp_tool("add_note", {
+                "project_id": proj["id"], "title": f"Follow-up note number {i}",
+                "body": f"See [[{a_slug}]] for the rationale.",
+            }, db, "/tmp"))
+        ranked = _run(mh._dispatch_mcp_tool("get_notes", {
+            "project_id": proj["id"], "sort": "relevance",
+        }, db, "/tmp"))
+        assert isinstance(ranked, list)
+        assert ranked[0]["slug"] == a_slug
+        assert "relevance" in ranked[0]
+        assert ranked[0]["relevance"] > ranked[-1]["relevance"]
     finally:
         _run(db.close())
 

@@ -1394,6 +1394,18 @@ async def _handle_project_tools(
                         )
             except Exception:  # noqa: BLE001 — orientation must not break
                 pass
+        # 5efe254b — deliver any pending handoff /goal through this trusted tool
+        # result (keyed on project_id) rather than as a spoofable copy-pasted
+        # chat string. Read-once: pop clears it so it surfaces exactly once.
+        # Outside the tenant gate so self-hosted sessions receive it too.
+        # Guarded so a pre-migration DB never breaks the orientation.
+        try:
+            if isinstance(result, dict):
+                _pg = await db_module.pop_pending_goal(db, args["project_id"])
+                if _pg:
+                    result["pending_goal"] = _pg
+        except Exception:  # noqa: BLE001
+            pass
         return result
     if name == "list_projects":
         return await db_module.list_project_summaries(db)
@@ -1503,11 +1515,78 @@ async def _handle_task_tools(
             _tpl_stale = agent_instructions_stale(_stored_ai)
         except Exception:  # noqa: BLE001
             _tpl_stale = False
+        # 2d932f60 — scan this session's task log for insight candidates so the
+        # handoff prompts a capture_insight()/pin_decision() before context is lost.
+        _insight_hints: list[dict[str, str]] = []
+        try:
+            _ih_tasks = await db_module.get_tasks(db, args["project_id"], limit=15)
+            for _t in _ih_tasks:
+                _desc = _t.get("description") or ""
+                _sig = handoff_module_local.detect_insight_candidate(_desc)
+                if _sig:
+                    _insight_hints.append({"signal": _sig, "text": _desc[:160]})
+        except Exception:  # noqa: BLE001
+            _insight_hints = []
+        # 0fe01e93 — warn when the project's /goal text is over the 4000-char soft
+        # limit (a bloated goal crowds out sprint context); the dashboard live
+        # counter + auto-bury handle the editing UX.
+        _goal_warn = None
+        try:
+            _gh_goal = await db_module.get_goal(db, args["project_id"])
+            _goal_len = len((_gh_goal or {}).get("sprint") or "") + len(
+                (_gh_goal or {}).get("north_star") or ""
+            )
+            if _goal_len > 4000:
+                _goal_warn = (
+                    f"/goal text is {_goal_len} chars (>4000) — bury step detail into "
+                    "sprint-item notes so the goal stays scannable."
+                )
+        except Exception:  # noqa: BLE001
+            _goal_warn = None
+        # 642b1818 — hotfix: return the handoff as one plain-text copyable block
+        # (strip markdown code-fence markers anywhere they appear — incl. inline in
+        # rendered note bodies — so it pastes cleanly into a fenced chat / a
+        # dashboard textarea without breaking the surrounding fence).
+        import re as _re_fence  # noqa: PLC0415
+        _plain_content = _re_fence.sub(r"```[A-Za-z0-9_+.-]*", "", content)
         return {
             "file_path": path,
-            "content": content,
+            "content": _plain_content,
             "mode": mode,
             "template_stale": _tpl_stale,
+            "insight_hints": _insight_hints[:5],
+            "goal_length_warning": _goal_warn,
+        }
+    if name == "load_handoff":
+        # 5efe254b — trusted retrieval of the latest stored handoff for a project
+        # as an MCP tool result: an explicit, idempotent alternative to
+        # start_session's pending_goal delivery. Read-only — it does NOT clear
+        # pending_goal (start_session's pop owns read-once consumption), so it is
+        # safe to call repeatedly.
+        _pid = args["project_id"]
+        _latest = None
+        try:
+            _rows = await db_module.get_handoffs(db, _pid, limit=1)
+            _latest = _rows[0] if _rows else None
+        except Exception:  # noqa: BLE001
+            _latest = None
+        _pending = None
+        try:
+            _pending = await db_module.get_pending_goal(db, _pid)
+        except Exception:  # noqa: BLE001
+            _pending = None
+        return {
+            "pending_goal": _pending,
+            "handoff": (
+                {
+                    "content": _latest.get("body"),
+                    "mode": _latest.get("mode"),
+                    "session_id": _latest.get("session_id"),
+                    "created_at": _latest.get("created_at"),
+                }
+                if _latest else None
+            ),
+            "has_handoff": bool(_latest) or bool(_pending),
         }
     return _MISS
 
@@ -1588,10 +1667,25 @@ async def _handle_notes_decisions(
         validate_input_size(args.get("file_path"), "note file_path", 2_000)
         validate_input_size(args.get("symbol"), "note symbol", 500)
         validate_input_size(args.get("source"), "note source", 2_000)
+        # 41b8a927 — recognise #hashtags in the title/body as tags so a note is
+        # searchable by tag without a separate tags argument.
+        import re as _re_ht  # noqa: PLC0415
+        _ht = _re_ht.findall(
+            r"(?<!\w)#([A-Za-z][\w-]{1,40})",
+            f"{args.get('title') or ''} {args.get('body') or ''}",
+        )
+        _tags_arg = args.get("tags")
+        if _ht:
+            _have = {t.strip().lower() for t in (_tags_arg or "").split(",") if t.strip()}
+            _add = [h for h in _ht if h.lower() not in _have]
+            if _add:
+                _tags_arg = ", ".join(
+                    [p for p in [(_tags_arg or "").strip()] if p] + _add
+                )
         try:
             result = await db_module.add_project_note(
                 db, args["project_id"], args["title"], args["body"],
-                args.get("tags"), kind=args.get("kind"),
+                _tags_arg, kind=args.get("kind"),
                 priority=args.get("priority", "normal"),
                 file_path=args.get("file_path"), symbol=args.get("symbol"),
                 source=args.get("source"),
@@ -1604,6 +1698,47 @@ async def _handle_notes_decisions(
         # e5592013 — lint: "MANUAL" notes are usually human tasks, not wiki.
         if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
             result = {**result, "lint": _MANUAL_NOTE_LINT}
+        # 6e4e2371 — warn (never block) when a near-duplicate note already exists,
+        # so notes don't accumulate repetitive near-copies. Advisory: any failure
+        # here must not fail the write.
+        if isinstance(result, dict) and not result.get("error"):
+            try:
+                import difflib as _difflib  # noqa: PLC0415
+                _new_title = (args.get("title") or "").strip().lower()
+                if _new_title:
+                    _new_id = result.get("id")
+                    _new_slug = result.get("slug")
+                    _existing = await db_module.get_project_notes(
+                        db, args["project_id"], limit=200
+                    )
+                    _similar = []
+                    for _n in (_existing or []):
+                        if (_new_id and _n.get("id") == _new_id) or (
+                            _new_slug and _n.get("slug") == _new_slug
+                        ):
+                            continue  # skip the note we just created
+                        _et = (_n.get("title") or "").strip().lower()
+                        if not _et:
+                            continue
+                        _ratio = _difflib.SequenceMatcher(None, _new_title, _et).ratio()
+                        if _ratio >= 0.82:
+                            _similar.append({
+                                "slug": _n.get("slug"),
+                                "title": _n.get("title"),
+                                "similarity": round(_ratio, 2),
+                            })
+                    if _similar:
+                        _similar.sort(key=lambda s: s["similarity"], reverse=True)
+                        result = {
+                            **result,
+                            "similar_notes": _similar[:3],
+                            "similar_notes_warning": (
+                                "A similar note already exists — consider updating it "
+                                "instead of accumulating near-duplicates."
+                            ),
+                        }
+            except Exception:  # noqa: BLE001 — dedup is advisory
+                pass
         return result
     if name == "ingest_document":
         # e3f150d0 — extract a Word/PDF/text document into a kind='document'
@@ -1626,6 +1761,21 @@ async def _handle_notes_decisions(
             )
         except (ValueError, DocExtractionError, FileNotFoundError) as exc:
             return {"error": str(exc)}
+    if name == "get_document_structure":
+        # 13462df2 — stateless docs_intel: heading outline of a server-side .docx
+        # (no sidecar index). Same server-side file access as ingest_document
+        # (self-hosted / tunnel).
+        validate_input_size(args.get("file_path"), "document file_path", 2_000)
+        fp = args.get("file_path")
+        if not fp:
+            return {"error": "file_path is required"}
+        try:
+            from ..docs_intel import document_outline  # noqa: PLC0415
+            return document_outline(fp)
+        except FileNotFoundError:
+            return {"error": f"file not found: {fp}"}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not parse document: {exc}"}
     if name == "capture_insight":
         # db9edba3 — one-call insight capture for planning (claude.ai) sessions:
         # persists a kind='insight' note (prominent in the dashboard + surfaced in
@@ -1689,6 +1839,14 @@ async def _handle_notes_decisions(
         # ``cursor`` and/or ``limit`` to get the {notes, has_more, next_cursor}
         # envelope, then re-call with cursor=next_cursor for the next page.
         # Without either arg the legacy bare list is returned for back-compat.
+        # 98890df1 — relevance sort (reference_count/recency/decision-link) takes
+        # precedence over cursor/limit paging.
+        if args.get("sort") == "relevance":
+            return await db_module.get_project_notes_ranked(
+                db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+                bodies=bool(args.get("bodies", False)),
+                limit=(int(args["limit"]) if "limit" in args else None),
+            )
         if "cursor" in args or "limit" in args:
             return await db_module.get_project_notes_page(
                 db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
@@ -1747,6 +1905,8 @@ async def _handle_notes_decisions(
             # 0bf67524 — cascade defaults for new projects.
             execution_mode_default=args.get("execution_mode_default"),
             code_intel_enabled_default=args.get("code_intel_enabled_default"),
+            # 76cf8bda — /loop auto-continue workspace default.
+            loop_enabled_default=args.get("loop_enabled_default"),
             tenant_id=_mcp_tenant_id,
         )
     if name == "add_workspace_sprint_item":
@@ -2504,6 +2664,15 @@ async def _handle_sprint_tools(
                 "WARNING: " + "; ".join(_active_session_warnings)
                 + " — new item added but may not be picked up until next session start."
             )
+        # 2d932f60 — if the title reads like a decision/insight, propose capturing
+        # it (no auto-write; the planner confirms).
+        from .. import handoff as _handoff_ins  # noqa: PLC0415
+        _ins_sig = _handoff_ins.detect_insight_candidate(args.get("title") or "")
+        if _ins_sig:
+            _extra["insight_hint"] = (
+                f"The wording ('{_ins_sig}') looks like a decision/insight — consider "
+                "capture_insight() or pin_decision() so it isn't lost at session end."
+            )
         if _extra:
             _new_item = {**_new_item, **_extra}
         return _new_item
@@ -3161,6 +3330,21 @@ async def _handle_planning_tools(
         # session's completed items + task log + recent decisions so a planner
         # sees executor output without manual copy-paste.
         last_session = await db_module.get_last_session_brief(db, project_id)
+        # aef94e4a — surface the latest auto-generated sprint retrospective so a
+        # planner sees the strategic through-line (what shipped / patterns /
+        # direction) without opening the note.
+        _retro_notes = await db_module.get_project_notes(
+            db, project_id, tag="retrospective", bodies=True, limit=1
+        )
+        latest_retrospective = None
+        if _retro_notes:
+            _r = _retro_notes[0]
+            latest_retrospective = {
+                "title": _r.get("title"),
+                "body": (_r.get("body") or "")[:800],
+                "updated_at": _r.get("updated_at") or _r.get("created_at"),
+                "slug": _r.get("slug"),
+            }
         # ab514e43 — "new handoff available" signal. ``generated_at`` lets the
         # planner pass it back as ``since`` next call; a handoff filed after
         # ``since`` (or any handoff when ``since`` is omitted) flags as new.
@@ -3220,7 +3404,11 @@ async def _handle_planning_tools(
             "recent_decisions": recent_decisions,
             "unvalidated_assumptions": unvalidated_assumptions,
             "last_session": last_session,
+            "latest_retrospective": latest_retrospective,
             "generated_at": brief_generated_at,
+            # de193a81 — explicit "now" so a planner spanning multiple calendar
+            # days never guesses at "today"/"yesterday".
+            "current_timestamp": brief_generated_at,
             "latest_handoff": latest_handoff,
             "new_handoff_available": new_handoff_available,
             "handoff_signal": handoff_signal,
@@ -3393,6 +3581,10 @@ async def _handle_plugin_tools(
                 "description": plugin.get("description", ""),
                 "tool_count": tool_count,
                 "active": slot in slot_tool_counts,
+                # 8f66d85e — plugin tools are connector-proxied; they are only
+                # invocable while the tunnel is live (otherwise they appear in the
+                # list but calling one returns "unknown tool").
+                "invocable": slot in slot_tool_counts,
             }
             if skill:
                 entry["skill_note"] = {
@@ -3406,6 +3598,14 @@ async def _handle_plugin_tools(
             "plugins": result_plugins,
             "tunnel_active": bool(tenant_id and _tunnel_mod.has_active_tunnel(tenant_id)),
             "hint": "Call get_plugin_details(name=<plugin_name>) for full tool schema.",
+            # 8f66d85e — clarify HOW plugin tools are called so agents stop trying
+            # to invoke them as native Meridian tools.
+            "invocation_note": (
+                "Plugin tools are invoked through the tunnel connector (claude.ai) "
+                "using slot-prefixed names like 'filesystem__read_file' — not as "
+                "native Meridian MCP tools. Each is callable only while the tunnel "
+                "is connected (see each plugin's 'invocable' flag)."
+            ),
         }
 
     if name == "get_plugin_details":

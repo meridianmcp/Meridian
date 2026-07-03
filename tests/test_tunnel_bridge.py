@@ -71,6 +71,50 @@ def test_has_active_tunnel():
     assert tn.has_active_tunnel("t1") is True
 
 
+def test_slot_health_tracks_non_fs_slots():
+    """a898710a — dc/ppt/word slots (served by _serve_tunnel_ws) can now record
+    health via plugin_status, so a failed pre-flight surfaces as 'unhealthy'
+    rather than falling back to 'inactive'. A later healthy report clears it."""
+    try:
+        # Default: assumed healthy until a plugin_status says otherwise.
+        assert tn._slot_is_healthy("t-dc", "dc") is True
+        tn._record_slot_health("t-dc", "dc", False, reason="preflight failed", detail="port 8813")
+        assert tn._slot_is_healthy("t-dc", "dc") is False
+        # Recovery / healthy report flips it back and clears any diagnostic.
+        tn._record_slot_health("t-dc", "dc", True)
+        assert tn._slot_is_healthy("t-dc", "dc") is True
+    finally:
+        tn._clear_slot_health("t-dc")
+
+
+def test_custom_slots_registered_and_routed():
+    """8fb69d54 — the 4 custom slots (p0-p3) are in _TUNNEL_LABELS + display names,
+    _label_maps routes each to its own registry, has_active_tunnel detects a live
+    custom socket, and CUSTOM_SLOT_PORTS pre-allocates ports 8814-8817."""
+    from meridian.tunnel_plugins import CUSTOM_SLOT_PORTS
+    assert CUSTOM_SLOT_PORTS == {"p0": 8814, "p1": 8815, "p2": 8816, "p3": 8817}
+    for s in ("p0", "p1", "p2", "p3"):
+        assert s in tn._TUNNEL_LABELS
+        assert s in tn.SLOT_DISPLAY_NAMES
+        sockets, pending = tn._label_maps(s)
+        assert sockets is tn._tunnel_custom_sockets[s]
+        assert pending is tn._pending_custom_reqs[s]
+    assert tn.has_active_tunnel("t-custom") is False
+    tn._tunnel_custom_sockets["p1"]["t-custom"] = object()
+    try:
+        assert tn.has_active_tunnel("t-custom") is True
+    finally:
+        tn._tunnel_custom_sockets["p1"].pop("t-custom", None)
+
+
+def test_custom_slot_ws_routes_registered():
+    """8fb69d54 — the /tunnel-p0 … /tunnel-p3 WebSocket routes exist on the app."""
+    import meridian.server as _srv
+    paths = [getattr(r, "path", "") for r in _srv.app.routes]
+    for s in ("p0", "p1", "p2", "p3"):
+        assert any(f"/tunnel-{s}/" in p for p in paths), f"missing route for {s}"
+
+
 # ---------------------------------------------------------------------------
 # list_tunnel_tools / call_tunnel_tool
 # ---------------------------------------------------------------------------

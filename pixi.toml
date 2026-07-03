@@ -94,6 +94,10 @@ test-auth = "python scripts/test_auth_flow.py"
 test-waitlist = "python scripts/test_waitlist_db.py"
 test-hooks = "python scripts/test_hooks_live.py --skip-live"
 test-hooks-live = "python scripts/test_hooks_live.py"
+# d188b408 — k6 load smoke tests (needs the k6 binary + a live target; never run
+# against prod). Override the target: BASE_URL=https://... pixi run load-k6-signup
+load-k6-signup = "k6 run k6/signup_smoke.js"
+load-k6-mcp = "k6 run k6/mcp_tools.js"
 test-mcp-tools = "python scripts/test_mcp_tools.py"
 test-tenancy = "python scripts/test_tenancy.py"
 launch = "python scripts/launch_morning.py"

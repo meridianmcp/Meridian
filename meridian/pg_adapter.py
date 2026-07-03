@@ -456,7 +456,10 @@ CREATE TABLE IF NOT EXISTS projects (
     github_repo TEXT,
     github_branch TEXT,
     queued_session TEXT,
+    pending_goal TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'parked', 'archived')),
+    priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN ('P0', 'P1', 'P2')),
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -690,6 +693,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     handoff_template TEXT,
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
+    loop_enabled_default INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -1043,6 +1047,15 @@ async def _migrate_pg_queued_session(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_pending_goal(conn: PostgresConnection) -> None:
+    """5efe254b — projects.pending_goal: the handoff /goal delivered through a
+    trusted MCP tool result (keyed on project_id) instead of a spoofable
+    copy-pasted chat string. Read-once. Nullable."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS pending_goal TEXT"
+    )
+
+
 async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
     """G5.19 / G5.20 — drop the legacy role CHECK (which excluded 'admin')
     and add github_access. Idempotent.
@@ -1235,6 +1248,68 @@ async def _migrate_pg_code_intel(conn: PostgresConnection) -> None:
     """Sprint-2/3 — projects.code_intel_enabled: per-project Code Intelligence toggle."""
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS code_intel_enabled INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_project_status_priority(conn: PostgresConnection) -> None:
+    """8db00fcb — projects.status (active|parked|archived) + priority (P0|P1|P2)."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'P2'"
+    )
+
+
+async def _migrate_pg_signup_attempts(conn: PostgresConnection) -> None:
+    """925909aa — persistent per-IP signup-attempt log (mirrors the SQLite
+    signup_attempts table) for magic-link abuse limiting. Salted hashes only."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS signup_attempts ("
+        "    id TEXT PRIMARY KEY,"
+        "    ip_hash TEXT NOT NULL,"
+        "    email_hash TEXT NOT NULL,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_signup_attempts_ip ON signup_attempts(ip_hash, created_at);"
+    )
+
+
+async def _migrate_pg_user_session_metadata(conn: PostgresConnection) -> None:
+    """3c28450d — device metadata on user_sessions (mirrors SQLite)."""
+    await conn.executescript(
+        "ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS user_agent TEXT;"
+        "ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS ip TEXT;"
+        "ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS last_seen_at TEXT"
+    )
+
+
+async def _migrate_pg_provision_queue(conn: PostgresConnection) -> None:
+    """4c559d4e — durable provisioning queue (mirrors SQLite provision_queue)."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS provision_queue ("
+        "    tenant_id TEXT PRIMARY KEY,"
+        "    status TEXT NOT NULL DEFAULT 'pending',"
+        "    attempts INTEGER NOT NULL DEFAULT 0,"
+        "    last_error TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_provision_queue_status ON provision_queue(status);"
+    )
+
+
+async def _migrate_pg_codebase_graph_entities(conn: PostgresConnection) -> None:
+    """c00b1ccf — cached codebase-graph snapshot (mirrors SQLite)."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS codebase_graph_entities ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    qualified_name TEXT NOT NULL,"
+        "    file TEXT,"
+        "    kind TEXT,"
+        "    signature TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_cge_project ON codebase_graph_entities(project_id);"
     )
 
 
@@ -1817,7 +1892,9 @@ async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> No
         "log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS handoff_template TEXT;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS execution_mode_default TEXT;"
-        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS code_intel_enabled_default INTEGER"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS code_intel_enabled_default INTEGER;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "loop_enabled_default INTEGER NOT NULL DEFAULT 1"
     )
 
 
@@ -2241,6 +2318,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_note_source,
     _migrate_pg_session_sprint_version,
     _migrate_pg_project_execution_mode,
+    _migrate_pg_project_status_priority,
     _migrate_pg_decision_code_anchor,
     _migrate_pg_session_graph_snapshots,
     _migrate_pg_agent_tasks_table,
@@ -2252,4 +2330,9 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_blog_posts,
     _migrate_pg_sprint_item_quality_gates,
     _migrate_pg_parallel_primitives,
+    _migrate_pg_signup_attempts,
+    _migrate_pg_user_session_metadata,
+    _migrate_pg_provision_queue,
+    _migrate_pg_codebase_graph_entities,
+    _migrate_pg_pending_goal,
 )

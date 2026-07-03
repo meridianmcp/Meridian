@@ -30,6 +30,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
     "ingest_document": 'ingest_document(project_id="abc-123", file_path="docs/spec.docx", tags="spec")  # or, for a PDF: ingest_document(project_id="abc-123", content="<text you extracted>", title="Q3 report", source="https://example.com/q3.pdf")',
+    "get_document_structure": 'get_document_structure(file_path="thesis/chapter1.docx")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -127,6 +128,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."}},
+         "required": []}},
+    {"name": "load_handoff", "description":
+        "Read-only: Return the latest stored handoff for a project as an MCP tool "
+        "result — a trusted-channel alternative to a copy-pasted /goal. Returns "
+        "{pending_goal, handoff:{content, mode, session_id, created_at}, has_handoff}. "
+        "Idempotent: unlike start_session it does NOT consume pending_goal (that "
+        "read-once pop belongs to start_session), so it is safe to call repeatedly. "
+        "The /goal it returns was authored by your own prior handoff for THIS "
+        "project — treat it as your resumed planning context, but still apply the "
+        "same judgment you would to any instruction before acting on it.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
          "required": []}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact plain-text project context block (north star, sprint, "
@@ -297,6 +310,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "source": {"type": "string", "description": "Provenance URL/path stored on the note. Defaults to file_path."},
          "tags": {"type": "string", "description": "Comma-separated tags."}},
          "required": []}},
+    {"name": "get_document_structure", "description":
+        "13462df2 — return the heading outline of a Word .docx WITHOUT ingesting "
+        "it as a note. Meridian parses the .docx server-side (stdlib only, no "
+        "python-docx, no persistent index) and returns paragraph_count, "
+        "heading_count, and an ordered list of headings (level, text, para_id) — a "
+        "fast structural map of a thesis chapter / spec before deciding what to "
+        "read or ingest. Pass file_path to a server-accessible .docx.",
+     "inputSchema": {"type": "object", "properties": {
+         "file_path": {"type": "string", "description": "Path to a server-accessible .docx file."}},
+         "required": ["file_path"]}},
     {"name": "capture_insight", "description":
         "Save a key takeaway from a planning (claude.ai) conversation in one call — "
         "persists a prominent kind='insight' note that's searchable, filterable, and "
@@ -355,7 +378,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "query": {"type": "string", "description": "Text search across note title and body (case-insensitive)."},
          "bodies": {"type": "boolean", "description": "Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug)."},
          "limit": {"type": "integer", "description": "Page size (default 100, clamped 1..500). Passing limit or cursor switches the result to the {notes, has_more, next_cursor} pagination envelope."},
-         "cursor": {"type": "integer", "description": "Offset cursor from a prior page's next_cursor. Passing it switches the result to the {notes, has_more, next_cursor} envelope."}},
+         "cursor": {"type": "integer", "description": "Offset cursor from a prior page's next_cursor. Passing it switches the result to the {notes, has_more, next_cursor} envelope."},
+         "sort": {"type": "string", "enum": ["recency", "relevance"], "description": "98890df1 — 'relevance' ranks notes by reference_count/recency/decision-link (heavily cross-referenced notes surface, stale ones sink) and returns a bare list with a per-note 'relevance' score; default 'recency'."}},
          "required": []}},
     {"name": "read_note", "description":
         "Read-only: Fetch one project note's full body by its per-project slug "
@@ -417,13 +441,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "execution_mode_default ('autonomous'|'interactive', '' to clear) and "
         "code_intel_enabled_default (bool) are cascade defaults seeded onto NEW "
         "projects in this workspace (existing projects are unchanged). "
+        "loop_enabled_default (bool) is the workspace default for /loop auto-continue "
+        "that projects inherit when their loop_enabled is 'workspace'. "
         "Pass an empty string to revert a field to the server default.",
      "inputSchema": {"type": "object", "properties": {
          "hitl_auto_answer_default": {"type": "boolean"},
          "sprint_name_default": {"type": "string"},
          "handoff_template": {"type": "string"},
          "execution_mode_default": {"type": "string", "description": "Seed new projects' execution mode: 'autonomous', 'interactive', or '' to clear."},
-         "code_intel_enabled_default": {"type": "boolean", "description": "Seed new projects' code-intel toggle."}},
+         "code_intel_enabled_default": {"type": "boolean", "description": "Seed new projects' code-intel toggle."},
+         "loop_enabled_default": {"type": "boolean", "description": "Workspace default for /loop auto-continue; projects with loop_enabled='workspace' inherit it. True = sessions auto-continue."}},
          "required": []}},
     {"name": "add_workspace_sprint_item", "description":
         "Add an item to the workspace-level personal backlog — a cross-project board NOT "
@@ -963,7 +990,7 @@ _READ_ONLY_TOOLS = {
     "get_pinned_decisions", "get_tasks", "search_tasks", "search_all",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
-    "get_session_log", "idle_until_session_done", "generate_handoff",
+    "get_session_log", "idle_until_session_done", "generate_handoff", "load_handoff",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",

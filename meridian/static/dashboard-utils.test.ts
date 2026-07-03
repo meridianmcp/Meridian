@@ -10,6 +10,7 @@ import {
   getPanelState,
   toast,
   SESSION_LIVE_WINDOW_MS,
+  suggestedFsRoots,
 } from "./dashboard-utils";
 
 describe("escapeHtml", () => {
@@ -104,5 +105,25 @@ describe("getPanelState", () => {
     a.open = true;
     expect(getPanelState("p1").open).toBe(true);
     expect(getPanelState("p2")).toEqual({});
+  });
+});
+
+describe("suggestedFsRoots", () => {
+  it("suggests repo_paths[].cwd not already a root", () => {
+    const cfg = { repo_paths: [{ cwd: "/a/repo", hostname: "h" }, { cwd: "/b/repo" }] };
+    expect(suggestedFsRoots(cfg, ["/b/repo"])).toEqual(["/a/repo"]);
+  });
+  it("includes the legacy single repo_path", () => {
+    expect(suggestedFsRoots({ repo_path: "/solo/repo" }, [])).toEqual(["/solo/repo"]);
+  });
+  it("trims, dedupes, and drops blanks and existing roots", () => {
+    const cfg = { repo_paths: [{ cwd: " /a " }, { cwd: "/a" }, { cwd: "  " }], repo_path: "/a" };
+    expect(suggestedFsRoots(cfg, [])).toEqual(["/a"]);
+    expect(suggestedFsRoots(cfg, ["/a"])).toEqual([]);
+  });
+  it("is null-safe on missing/garbage config", () => {
+    expect(suggestedFsRoots(null, null)).toEqual([]);
+    expect(suggestedFsRoots("nope", ["/x"])).toEqual([]);
+    expect(suggestedFsRoots({ repo_paths: "nope" }, [])).toEqual([]);
   });
 });

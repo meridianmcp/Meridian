@@ -64,6 +64,19 @@ async def list_sprint_items(
         raise HTTPException(status_code=422, detail=str(exc))
 
 
+@router.get("/projects/{project_id}/sprint/pending_count")
+async def sprint_pending_count(project_id: str, request: Request) -> dict[str, Any]:
+    """c0d2356d — count of not-yet-done sprint items for a project. Powers the
+    Stop-hook sprint guard (a session is blocked from stopping while this is > 0).
+    Distinct ``/sprint/`` path so there's no collision with ``/sprint-items``."""
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    n = await db_module.count_pending_sprint_items(db, project_id)
+    return {"pending_count": n}
+
+
 @router.post("/projects/{project_id}/sprint-items", status_code=201)
 async def add_sprint_item_endpoint(
     project_id: str, body: dict[str, Any], request: Request

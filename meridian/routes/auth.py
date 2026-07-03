@@ -122,6 +122,7 @@ async def auth_magic_request(request: Request):
 
 
 @router.get("/auth/magic/verify")
+@_rate_limit("10/minute")
 async def auth_magic_verify(request: Request, token: str = ""):
     """v0.9 — consume a magic-link token, create a session, redirect.
 
@@ -132,3 +133,26 @@ async def auth_magic_verify(request: Request, token: str = ""):
     """
     from ..hosted import auth_magic_verify as _impl
     return await _impl(request, token)
+
+
+@router.get("/account/sessions")
+async def account_sessions(request: Request):
+    """3c28450d — list the account's active web sessions (device + recency)."""
+    from ..hosted import account_sessions_list as _impl
+    return await _impl(request)
+
+
+@router.post("/account/sessions/{session_id}/revoke")
+async def account_session_revoke_route(request: Request, session_id: str):
+    """3c28450d — revoke (sign out) one of the account's web sessions."""
+    from ..hosted import account_session_revoke as _impl
+    return await _impl(request, session_id)
+
+
+@router.get("/setup/health")
+async def setup_health(request: Request):
+    """13583103 — self-hosted diagnostics: which auth providers are configured
+    and which env vars are still missing. Public (reveals no secret values), so
+    a self-hoster can curl it to see why sign-in isn't working."""
+    from ..hosted import auth_setup_health as _impl
+    return _impl()

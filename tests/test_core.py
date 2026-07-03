@@ -270,13 +270,10 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "2. [pending] Second fix" in content
     assert f"Depends on item 1 (`{first['id']}`): First fix" in content
     assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
-    # 3726cf70 — a depends_on relationship renders the /goal as ordered waves
-    # (finish wave 1 before wave 2), which IS the dependency order made explicit.
-    assert "wave order" in content
-    assert (
-        f"Wave 1: {first['id']}; Wave 2: {second['id']}."
-        in content
-    )
+    # eeee02c6 — a depends_on relationship renders the /goal as a flattened
+    # dependency-ordered id list (no "Wave" headers, which invite stopping).
+    assert "dependency order" in content
+    assert f"{first['id']}, {second['id']}." in content
     # f628b880 — the /goal leads with the non-deferential executor directive.
     assert "/goal You are an executor. Claim and execute" in content
     assert "complete_sprint_item()" in content
@@ -5035,6 +5032,177 @@ async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
     assert "=== QUEUED NEXT SESSION ===" not in content2
 
 
+# ---------------------------------------------------------------------------
+# 5efe254b — trusted handoff channel (projects.pending_goal + load_handoff)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pending_goal_set_get_pop(db):
+    """projects.pending_goal read-once trio (mirrors queued_session)."""
+    p = await db_module.create_project(db, "pgoal-proj")
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    await db_module.set_pending_goal(db, p["id"], "/goal do the trusted thing")
+    assert await db_module.get_pending_goal(db, p["id"]) == "/goal do the trusted thing"
+    # pop is read-once.
+    assert await db_module.pop_pending_goal(db, p["id"]) == "/goal do the trusted thing"
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    assert await db_module.pop_pending_goal(db, p["id"]) is None
+    # Empty/None clears.
+    await db_module.set_pending_goal(db, p["id"], "/goal x")
+    await db_module.set_pending_goal(db, p["id"], None)
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_persists_pending_goal(db, tmp_path):
+    """generate_handoff stores the /goal to the trusted channel (pending_goal)."""
+    from meridian import handoff as handoff_module
+    p = await db_module.create_project(db, "pgoal-proj2")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Do a thing")
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    stored = await db_module.get_pending_goal(db, p["id"])
+    assert stored is not None
+    assert "/goal" in stored
+
+
+def test_start_session_delivers_and_clears_pending_goal(tmp_path):
+    """start_session surfaces the stored /goal via the trusted MCP tool result
+    (keyed on project_id) and clears it read-once — a second start_session no
+    longer carries it."""
+    import asyncio
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        proj = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "pg-e2e"}, db, out))
+        pid = proj["id"]
+        asyncio.run(db_module.set_pending_goal(db, pid, "/goal RESUME trusted work"))
+        sess = asyncio.run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, out))
+        assert sess.get("pending_goal") == "/goal RESUME trusted work"
+        # Read-once: cleared after a single delivery.
+        assert asyncio.run(db_module.get_pending_goal(db, pid)) is None
+        sess2 = asyncio.run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, out))
+        assert not sess2.get("pending_goal")
+    finally:
+        asyncio.run(db.close())
+
+
+def test_load_handoff_tool_returns_stored_handoff(tmp_path):
+    """load_handoff returns the latest stored handoff + pending_goal as a trusted
+    tool result, and is idempotent (does NOT consume pending_goal)."""
+    import asyncio
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        proj = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "lh-e2e"}, db, out))
+        pid = proj["id"]
+        # Nothing stored yet.
+        empty = asyncio.run(mh._dispatch_mcp_tool("load_handoff", {"project_id": pid}, db, out))
+        assert empty["has_handoff"] is False
+        assert empty["handoff"] is None and empty["pending_goal"] is None
+        # A handoff persists both a body row and pending_goal.
+        asyncio.run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": pid, "mode": "full"}, db, out))
+        loaded = asyncio.run(mh._dispatch_mcp_tool("load_handoff", {"project_id": pid}, db, out))
+        assert loaded["has_handoff"] is True
+        assert loaded["handoff"] is not None and loaded["handoff"]["content"]
+        assert loaded["pending_goal"] and "/goal" in loaded["pending_goal"]
+        # Idempotent: a repeat load still returns pending_goal (not consumed).
+        loaded2 = asyncio.run(mh._dispatch_mcp_tool("load_handoff", {"project_id": pid}, db, out))
+        assert loaded2["pending_goal"] == loaded["pending_goal"]
+    finally:
+        asyncio.run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# 76cf8bda — /loop auto-continue: workspace default + project override + max_turns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_loop_enabled_default_roundtrip(db):
+    """workspace_settings.loop_enabled_default defaults True and is updatable."""
+    ws = await db_module.get_workspace_settings(db)
+    assert ws["loop_enabled_default"] is True
+    ws = await db_module.update_workspace_settings(db, loop_enabled_default=False)
+    assert ws["loop_enabled_default"] is False
+    assert (await db_module.get_workspace_settings(db))["loop_enabled_default"] is False
+    ws = await db_module.update_workspace_settings(db, loop_enabled_default=True)
+    assert ws["loop_enabled_default"] is True
+
+
+def test_loop_enabled_from_settings_merge():
+    """Project override wins; 'workspace'/missing defers to the workspace default."""
+    from meridian import handoff as h
+    ws_on = {"loop_enabled_default": True}
+    ws_off = {"loop_enabled_default": False}
+    # Explicit bool override ignores the workspace default.
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": True}}, ws_off) is True
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": False}}, ws_on) is False
+    # String override forms.
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "off"}}, ws_on) is False
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "on"}}, ws_off) is True
+    # 'workspace' (or a missing key) defers to the workspace default — never falsy.
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "workspace"}}, ws_on) is True
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "workspace"}}, ws_off) is False
+    assert h._loop_enabled_from_settings({"executor_config": {}}, ws_off) is False
+    # No workspace settings at all → default True.
+    assert h._loop_enabled_from_settings(None, None) is True
+
+
+def test_max_turns_from_settings_clamps_to_500():
+    from meridian import handoff as h
+    assert h._max_turns_from_settings({"executor_config": {"max_turns": 999}}) == 500
+    assert h._max_turns_from_settings({"executor_config": {"max_turns": 300}}) == 300
+    assert h._max_turns_from_settings({"executor_config": {"max_turns": 0}}) == 200
+    assert h._max_turns_from_settings(None) == 200
+
+
+def test_build_quick_start_goal_loop_prefix():
+    from meridian import handoff as h
+    # Empty-board path.
+    assert h._build_quick_start_goal([], loop_enabled=False).startswith("/goal ")
+    assert h._build_quick_start_goal([], loop_enabled=True).startswith("/loop /goal ")
+    # Items path.
+    items = [{"id": "abc123", "version": None}]
+    assert h._build_quick_start_goal(items, loop_enabled=False).startswith("/goal ")
+    assert h._build_quick_start_goal(items, loop_enabled=True).startswith("/loop /goal ")
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_prepends_loop_when_workspace_default_on(db, tmp_path):
+    """The /goal in a generated handoff carries a leading /loop when the effective
+    loop flag (workspace default here) is on, and omits it when off."""
+    from meridian import handoff as handoff_module
+    p = await db_module.create_project(db, "loop-proj")
+    await db_module.add_sprint_item(db, p["id"], "v1", "an item")
+    await db_module.update_workspace_settings(db, loop_enabled_default=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal ")
+    # Workspace default OFF (and no project override) → no /loop.
+    await db_module.update_workspace_settings(db, loop_enabled_default=False)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    stored2 = await db_module.get_pending_goal(db, p["id"])
+    assert stored2.startswith("/goal ") and not stored2.startswith("/loop")
+
+
+def test_workspace_settings_http_loop_default(client):
+    """PATCH /workspace/settings forwards loop_enabled_default end-to-end (the
+    path the dashboard Workspace toggle uses)."""
+    assert client.get("/workspace/settings").json()["loop_enabled_default"] is True
+    r = client.patch("/workspace/settings", json={"loop_enabled_default": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["loop_enabled_default"] is False
+    assert client.get("/workspace/settings").json()["loop_enabled_default"] is False
+    client.patch("/workspace/settings", json={"loop_enabled_default": True})
+    assert client.get("/workspace/settings").json()["loop_enabled_default"] is True
+
+
 def test_queue_session_http_roundtrip(client):
     pid = client.post("/projects", json={"name": "qhttp"}).json()["id"]
     assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
@@ -6313,6 +6481,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_note_source",
         "_migrate_pg_session_sprint_version",
         "_migrate_pg_project_execution_mode",
+        "_migrate_pg_project_status_priority",
         "_migrate_pg_decision_code_anchor",
         "_migrate_pg_session_graph_snapshots",
         "_migrate_pg_agent_tasks_table",
@@ -6324,10 +6493,15 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_blog_posts",
         "_migrate_pg_sprint_item_quality_gates",
         "_migrate_pg_parallel_primitives",
+        "_migrate_pg_signup_attempts",
+        "_migrate_pg_user_session_metadata",
+        "_migrate_pg_provision_queue",
+        "_migrate_pg_codebase_graph_entities",
+        "_migrate_pg_pending_goal",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 72
+    assert len(allnames) == len(set(allnames)) == 78
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -7812,15 +7986,41 @@ def test_install_mcp_page(client):
 
 
 def test_landing_page_footer_uses_meridian_email(client):
-    """Landing page footer contact uses hello@usemeridian.us, not personal email."""
+    """71c70308 — landing footer contact is JS-obfuscated: it assembles to
+    hello@usemeridian.us from data attributes (never plaintext) and is never a
+    personal email."""
     r = client.get("/")
     assert r.status_code == 200
-    assert "hello@usemeridian.us" in r.text
+    assert 'data-user="hello"' in r.text
+    assert 'data-domain="usemeridian.us"' in r.text
+    # The full address must NOT appear as plaintext / mailto in served HTML.
+    assert "mailto:hello@usemeridian.us" not in r.text
+    assert "hello@usemeridian.us" not in r.text
     assert "ajc3xc@" not in r.text  # no personal emails in landing page
 
 
-def test_auth_login_page_has_google_button(client):
-    """GET /auth/login shows Google OAuth button."""
+def test_landing_page_anti_solicitation_hardening(client):
+    """71c70308 — noai/noarchive meta, anti-solicitation footer notice, and a
+    honeypot trap on the landing page; robots.txt blocks AI/LLM crawlers."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "noai" in r.text and "noarchive" in r.text
+    assert "does not accept unsolicited" in r.text
+    assert "hp-trap" in r.text
+    rb = client.get("/robots.txt")
+    assert rb.status_code == 200
+    assert "GPTBot" in rb.text and "ClaudeBot" in rb.text
+    assert "Google-Extended" in rb.text
+    assert "Disallow: /" in rb.text
+
+
+def test_auth_login_page_has_google_button(client, monkeypatch):
+    """GET /auth/login shows the Google OAuth button when GOOGLE_CLIENT_ID is set.
+
+    98c45dd0 — the button only renders for a configured provider, so the test
+    configures the client id first.
+    """
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-fake")
     r = client.get("/auth/login", follow_redirects=False)
     assert r.status_code == 200
     assert "Google" in r.text
@@ -11019,16 +11219,20 @@ def test_remote_mcp_401_invalid_bearer_includes_www_authenticate(client):
     assert "Bearer" in www_auth
 
 
-def test_login_page_preserves_next_param(client):
-    """GET /auth/login?next=/foo injects ?next= into all login button hrefs."""
+def test_login_page_preserves_next_param(client, monkeypatch):
+    """GET /auth/login?next=/foo injects ?next= into all configured login hrefs."""
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-fake")
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "gh-fake")
     r = client.get("/auth/login?next=/oauth/authorize%3Fclient_id%3Dabc")
     assert r.status_code == 200
     assert "/auth/google/login?next=" in r.text
     assert "/auth/github/login?next=" in r.text
 
 
-def test_login_page_no_next_param(client):
+def test_login_page_no_next_param(client, monkeypatch):
     """GET /auth/login without ?next= keeps bare login hrefs (no ?next= appended)."""
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-fake")
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "gh-fake")
     r = client.get("/auth/login")
     assert r.status_code == 200
     assert 'href="/auth/google/login"' in r.text
@@ -14390,6 +14594,32 @@ async def test_list_plugins_returns_builtin_plugins(db, tmp_path):
     # No tunnel active → tool_count=0 for all
     assert all(p["tool_count"] == 0 for p in plugins)
     assert result["tunnel_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_invocation_note_and_invocable_flag(db, tmp_path):
+    """8f66d85e — list_plugins clarifies how plugin tools are invoked and flags
+    each plugin's invocability (False when no tunnel is active)."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    result = await _dispatch_mcp_tool("list_plugins", {}, db, str(tmp_path), tenant=None)
+    assert "invocation_note" in result
+    assert "tunnel connector" in result["invocation_note"]
+    for p in result["plugins"]:
+        assert "invocable" in p
+        assert p["invocable"] is False  # no tunnel active
+
+
+def test_agent_instructions_include_reindex_at_session_start():
+    """eacf7063 — default executor instructions tell agents to reindex at session
+    start; the standard version + marker are bumped so stored copies detect it."""
+    from meridian.agent_defaults import (
+        DEFAULT_AGENT_INSTRUCTIONS,
+        AGENT_INSTRUCTIONS_STANDARD_VERSION,
+    )
+    assert 'index_repository(mode="fast")' in DEFAULT_AGENT_INSTRUCTIONS
+    assert AGENT_INSTRUCTIONS_STANDARD_VERSION >= 3
+    assert "meridian-executor-standard: v3" in DEFAULT_AGENT_INSTRUCTIONS
 
 
 @pytest.mark.asyncio

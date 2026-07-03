@@ -23,7 +23,9 @@ jobs:
           pixi-version: latest
           cache: false
       - run: pixi install
-      - run: pixi run python -m pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
+      # 807d8c28 — coverage floor ratcheted 80 -> 82 (measured ~82.4%). The 85%
+      # aspiration needs a dedicated sprint on server.py / routes/tunnel.py.
+      - run: pixi run python -m pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=82
 
   test-ux:
     runs-on: ubuntu-latest

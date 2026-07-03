@@ -43,6 +43,12 @@ for "what has been decided, claimed, and shipped."
   and `answer_hitl(request_id, "acknowledged")`. Corrections never block an
   unattended run — fail open, log, and keep going. (Plain `kind='question'`
   requests stay blocking/auto-answerable as before.)
+- **`request_hitl(project_id, question)`** when you need a human decision before
+  continuing. This is the **ONLY sanctioned mechanism** for human input.
+  **NEVER ask the user a question in chat** (no inline "What should I do?", no
+  "Should I proceed?"). **NEVER use the client's native question dialog**
+  (e.g. Claude Code's AskUserQuestion). Both bypass the Meridian dashboard and
+  make the request invisible to the human — use `request_hitl` instead, always.
 
 ## ON SESSION START
 

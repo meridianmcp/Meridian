@@ -15,7 +15,7 @@ export async function loadNotesTab(projectId: string) {
   const searchInput = document.getElementById(`notes-search-${projectId}`);
   const tagSelect = document.getElementById(`notes-tagsel-${projectId}`);
   const kindSelect = document.getElementById(`notes-kindsel-${projectId}`);
-  const showAuto = document.getElementById(`notes-show-auto-${projectId}`);
+  // 42e9f7b5 — summaries toggle removed; notes are partitioned by the tab bar.
 
   // 9d44998b — note_kind taxonomy. NULL/unknown renders as the compact "wiki".
   const KIND_STYLE: Record<string, { label: string; color: string; border: string }> = {
@@ -49,6 +49,16 @@ export async function loadNotesTab(projectId: string) {
   const noteTags = (n: any) =>
     String(n.tags || '').split(',').map(t => t.trim()).filter(Boolean);
 
+  // 42e9f7b5 — Notes/Log/Archive tabs replace the "summaries" toggle. Log =
+  // auto-captured session summaries; Archive = notes tagged 'archived';
+  // Notes = everything else.
+  const isArchived = (n: any) =>
+    String(n.tags || '').split(',').map((t: string) => t.trim().toLowerCase()).includes('archived');
+  const activeTabEl = document.getElementById(`notes-active-tab-${projectId}`);
+  const tabButtons = ['notes', 'log', 'archive'].map(
+    t => document.getElementById(`notes-tab-${t}-${projectId}`) as HTMLButtonElement | null);
+  const getActiveTab = () => ((activeTabEl?.textContent || 'notes').trim() || 'notes');
+
   let allNotes: any[] = [];
   // 9fa119dd — cursor pagination: the notes list caps at NOTES_PAGE per fetch
   // and a "Load More" button pulls the next cursor and appends, mirroring the
@@ -80,7 +90,6 @@ export async function loadNotesTab(projectId: string) {
     const prev = tagSelect.value;
     const seen = new Set<string>();
     for (const n of allNotes) {
-      if (!showAuto?.checked && isAutoCapture(n)) continue;
       for (const t of noteTags(n)) seen.add(t);
     }
     const tags = [...seen].sort((a, b) => a.localeCompare(b));
@@ -94,10 +103,13 @@ export async function loadNotesTab(projectId: string) {
     const q = (searchInput?.value || '').trim().toLowerCase();
     const selectedTag = (tagSelect?.value || '').trim().toLowerCase();
     const selectedKind = (kindSelect?.value || '').trim().toLowerCase();
-    const includeAuto = !!showAuto?.checked;
+    const tab = getActiveTab();
 
     const visible = allNotes.filter(n => {
-      if (!includeAuto && isAutoCapture(n)) return false;
+      // 42e9f7b5 — partition by tab: Log=summaries, Archive=archived, Notes=rest.
+      if (tab === 'log') { if (!isAutoCapture(n)) return false; }
+      else if (tab === 'archive') { if (!isArchived(n)) return false; }
+      else if (isAutoCapture(n) || isArchived(n)) return false;
       if (selectedKind && noteKind(n) !== selectedKind) return false;
       if (selectedTag && !noteTags(n).map(t => t.toLowerCase()).includes(selectedTag)) return false;
       if (q) {
@@ -108,11 +120,11 @@ export async function loadNotesTab(projectId: string) {
     });
 
     setVtabCountBadge(`.notes-vtab-badge[data-pid="${projectId}"]`,
-      allNotes.filter(n => !isAutoCapture(n)).length);
+      allNotes.filter(n => !isAutoCapture(n) && !isArchived(n)).length);
 
     if (!visible.length) {
       const reason = allNotes.length
-        ? `(no notes match — clear the search/tag filter${!includeAuto ? ' or tick “summaries”' : ''})`
+        ? `(no notes in this tab match — clear the search/tag filter or switch tabs)`
         : `(no notes yet — use the form below or <code>add_note</code> MCP tool)`;
       body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
       renderLoadMore();
@@ -206,7 +218,21 @@ export async function loadNotesTab(projectId: string) {
   }
   if (tagSelect) tagSelect.onchange = applyFilters;
   if (kindSelect) kindSelect.onchange = applyFilters;
-  if (showAuto) showAuto.onchange = () => { refreshTagOptions(); applyFilters(); };
+  // 42e9f7b5 — tab switching drives the note partition + re-renders the list.
+  tabButtons.forEach(btn => {
+    if (!btn) return;
+    btn.onclick = () => {
+      const tab = btn.getAttribute('data-notes-tab') || 'notes';
+      if (activeTabEl) activeTabEl.textContent = tab;
+      tabButtons.forEach(b => {
+        if (!b) return;
+        const on = b === btn;
+        b.style.borderBottom = on ? '2px solid var(--accent)' : '2px solid transparent';
+        b.style.color = on ? 'var(--text)' : 'var(--muted)';
+      });
+      applyFilters();
+    };
+  });
 
   if (addBtn) addBtn.onclick = async () => {
     const title = (addTitle && addTitle.value || '').trim();

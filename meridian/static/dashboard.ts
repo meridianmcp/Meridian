@@ -15,13 +15,18 @@ import "./dashboard-files";
 import "./dashboard-rewind";
 // ff8ff615 — Preact Code Intel panel (layered package DAG, replaces ECharts circles).
 import { mountCodeIntelPanel } from "./components/CodeIntelPanel";
+import { createStore } from "zustand/vanilla";
 ﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
 
 // const _PLAN_LABELS -- moved to dashboard-utils.js
 
-const state: {
+// 88e66aa9 — Phase 1: back window.state with a Zustand (vanilla) store so all
+// dashboard state flows through one store. UI panels are untouched — they still
+// read/write window.state.xxx; a Proxy bridges the legacy object API to the
+// store (reassignments call setState; in-place mutations share the same refs).
+interface DashboardState {
   projects: any[];
   tabs: any[];
   activeTab: any;
@@ -30,30 +35,44 @@ const state: {
   serverConfig: { server_url: string; host: string; port: number; version: string };
   activeWorkspaceTenantId: any;
   [k: string]: any;
-} = {
+}
 
+const _initialDashboardState: DashboardState = {
   projects: [],
-
-  tabs: [], // [{id, project}]
-
+  tabs: [],            // [{id, project}]
   activeTab: null,
-
-  panels: {}, // tabId -> { ws, taskCache, sessionName, goalRaw, goalIsJson }
-
+  panels: {},          // tabId -> { ws, taskCache, sessionName, goalRaw, goalIsJson }
   apiKeyConfigured: false,
-
   // v0.6.5 — server runtime config fetched from /config on startup.
-
   serverConfig: { server_url: '', host: '', port: 0, version: '' },
-
-  // workspace switcher — tenant_id of the currently active workspace (null = own)
-
+  // workspace switcher — tenant_id of the active workspace (null = own)
   activeWorkspaceTenantId: null,
-
 };
 
-// Expose state on window so esbuild IIFE modules can access it via window.state
+const dashboardStore = createStore<DashboardState>(() => ({ ..._initialDashboardState }));
+
+// Proxy bridging the legacy `state.xxx` object API to the Zustand store.
+const state: DashboardState = new Proxy(_initialDashboardState, {
+  get: (_t, prop) => (dashboardStore.getState() as any)[prop as any],
+  set: (_t, prop, value) => { dashboardStore.setState({ [prop as any]: value } as any); return true; },
+  has: (_t, prop) => (prop as any) in dashboardStore.getState(),
+  deleteProperty: (_t, prop) => {
+    const next: any = { ...dashboardStore.getState() };
+    delete next[prop as any];
+    dashboardStore.setState(next, true);
+    return true;
+  },
+  ownKeys: () => Reflect.ownKeys(dashboardStore.getState()),
+  getOwnPropertyDescriptor: (_t, prop) => ({
+    enumerable: true, configurable: true,
+    value: (dashboardStore.getState() as any)[prop as any],
+  }),
+}) as DashboardState;
+
+// Expose state (+ the underlying store, for later slice migration) on window so
+// esbuild IIFE modules can access it via window.state.
 window.state = state;
+(window as any).dashboardStore = dashboardStore;
 
 
 
@@ -3157,6 +3176,8 @@ function buildTabBody(project: any) {
 
       <button class="vtab-btn" data-vtab="codeintel" title="Code Intel — codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">🔍</button>
 
+      <button class="vtab-btn" data-vtab="documents" title="Documents — ingested docs &amp; structure">📄</button>
+
     </div>
 
     <div class="vtab-drawer open" id="drawer-${project.id}">
@@ -3729,10 +3750,18 @@ function buildTabBody(project: any) {
 
             <select id="notes-tagsel-${project.id}" title="Filter by tag" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;max-width:130px"><option value="">all tags</option></select>
 
-            <label title="Show auto-captured session summaries (checkpoint notes)" style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--muted);cursor:pointer;user-select:none"><input type="checkbox" id="notes-show-auto-${project.id}" style="margin:0;cursor:pointer">summaries</label>
+            <!-- 42e9f7b5 — the "summaries" toggle is replaced by the Notes/Log/Archive tab bar below -->
+            <input type="checkbox" id="notes-show-auto-${project.id}" style="display:none">
+            <span data-notes-tab-active="notes" id="notes-active-tab-${project.id}" style="display:none">notes</span>
 
           </span>
 
+        </div>
+
+        <div class="notes-tabbar" style="display:flex;gap:6px;padding:6px 14px 0;border-bottom:1px solid var(--border)">
+          <button data-notes-tab="notes" id="notes-tab-notes-${project.id}" class="notes-tab-btn" style="background:none;border:none;border-bottom:2px solid var(--accent);color:var(--text);font-size:10px;font-weight:600;padding:3px 6px;cursor:pointer">Notes</button>
+          <button data-notes-tab="log" id="notes-tab-log-${project.id}" class="notes-tab-btn" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);font-size:10px;font-weight:600;padding:3px 6px;cursor:pointer">Log</button>
+          <button data-notes-tab="archive" id="notes-tab-archive-${project.id}" class="notes-tab-btn" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);font-size:10px;font-weight:600;padding:3px 6px;cursor:pointer">Archive</button>
         </div>
 
         <div style="flex:1;overflow-y:auto;overflow-x:hidden;word-break:break-word;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="notes-body-${project.id}">
@@ -3890,6 +3919,22 @@ function buildTabBody(project: any) {
         </div>
 
         <div style="flex:1;overflow-y:auto;padding:14px" id="codeintel-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading…</div>
+
+        </div>
+
+      </div>
+
+      <div class="drawer-panel" id="drawer-documents-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>DOCUMENTS · ${escapeHtml(project.name)}</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="documents-body-${project.id}">
 
           <div class="empty" style="color:var(--muted)">loading…</div>
 
@@ -4140,6 +4185,8 @@ function buildTabBody(project: any) {
         if (vtab === 'settings') loadSettingsTab(project.id);
 
         if (vtab === 'codeintel') loadCodeIntelTab(project.id);
+
+        if (vtab === 'documents') loadDocumentsTab(project.id);
 
       };
 
@@ -7033,6 +7080,89 @@ async function _generateCodebaseMap(projectId: any) {
 if (typeof window !== 'undefined') window._generateCodebaseMap = _generateCodebaseMap;
 
 
+// 3f596f81 — Project Documents panel. Lists ingested documents (project_notes
+// note_kind='document') and, per doc, an on-demand heading-tree structure view
+// via GET /projects/{id}/document-structure (docs_intel.document_outline).
+// Honest scope: structure = heading tree + paragraph/heading counts only;
+// figures/cross-refs/equations/comments are not extracted by docs_intel Phase 1.
+async function loadDocumentsTab(projectId: any) {
+  const body = document.getElementById(`documents-body-${projectId}`);
+  if (!body) return;
+  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+
+  let docs: any[] = [];
+  try {
+    const dp = await api(`/projects/${projectId}/notes?paginate=true&limit=200`);
+    docs = (((dp && dp.notes) || []) as any[])
+      .filter(n => String(n.note_kind || '').toLowerCase() === 'document');
+  } catch (e: any) {
+    body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load documents: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+
+  const _srcBadge = (src: any) => {
+    const s = String(src || 'local').toLowerCase();
+    const label = s.includes('onedrive') ? 'OneDrive'
+      : (s.includes('gdrive') || s.includes('google')) ? 'GDrive'
+      : (src || 'local');
+    return `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">${escapeHtml(String(label))}</span>`;
+  };
+
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? '' : 's'} <span style="color:var(--muted)">(note_kind=document)</span></div>
+  </div>`;
+
+  if (!docs.length) {
+    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) — it is stored as a project note with kind=document and appears here. (Local/OneDrive/GDrive pickers are not yet wired; ingestion is via the MCP tool for now.)</div>`;
+  } else {
+    for (const d of docs) {
+      const title = d.title || d.slug || d.id;
+      const fp = d.file_path || '';
+      const tags = Array.isArray(d.tags) ? d.tags : [];
+      const did = String(d.id);
+      html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(title))}</span>
+          ${_srcBadge(d.source)}
+        </div>
+        ${fp ? `<div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px;word-break:break-all">${escapeHtml(String(fp))}</div>` : ''}
+        ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t: any) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(String(t))}</span>`).join('')}</div>` : ''}
+        ${fp
+          ? `<div style="margin-top:6px"><button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button></div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div>`
+          : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path — structure view unavailable.</div>'}
+      </div>`;
+    }
+    html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
+  }
+  body.innerHTML = html;
+
+  body.querySelectorAll('.doc-struct-btn').forEach(btn => {
+    (btn as HTMLElement).addEventListener('click', async () => {
+      const fp = (btn as HTMLElement).dataset.fp || '';
+      const did = (btn as HTMLElement).dataset.did || '';
+      const target = document.getElementById(`doc-struct-${did}`);
+      if (!target) return;
+      target.innerHTML = '<span style="font-size:9px;color:var(--muted)">loading structure…</span>';
+      try {
+        const st = await api(`/projects/${projectId}/document-structure?path=${encodeURIComponent(fp)}`);
+        if (st && st.error) {
+          target.innerHTML = `<span style="font-size:9px;color:var(--warning,#d29922)">${escapeHtml(String(st.error))}</span>`;
+          return;
+        }
+        const headings = (st && st.headings) || [];
+        const tree = headings.map((h: any) => {
+          const lvl = Math.max(1, Math.min(6, parseInt(h.level, 10) || 1));
+          return `<div style="font-size:10px;color:var(--text);padding-left:${(lvl - 1) * 12}px">${escapeHtml(String(h.text || ''))}</div>`;
+        }).join('');
+        target.innerHTML = `<div style="font-size:9px;color:var(--muted);margin-bottom:3px">${st.paragraph_count} paragraphs · ${st.heading_count} headings</div>${tree || '<span style="font-size:9px;color:var(--muted)">No headings found.</span>'}`;
+      } catch (e: any) {
+        target.innerHTML = `<span style="font-size:9px;color:var(--error)">Failed: ${escapeHtml(String(e))}</span>`;
+      }
+    });
+  });
+}
+
+
 async function loadCodeIntelTab(projectId: any) {
   const body = document.getElementById(`codeintel-body-${projectId}`);
   if (!body) return;
@@ -7109,12 +7239,30 @@ async function loadCodeIntelTab(projectId: any) {
       ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? 's' : ''}</span>` : ''}
     </div>`;
 
+    // 3e28f593 — Resources: unified codebase + documents summary so the scattered
+    // repo-path / document fields have one coherent view (which repo(s) this
+    // project indexes + how many ingested documents).
+    let _docsCount = 0;
+    try {
+      const _dp = await api(`/projects/${projectId}/notes?paginate=true&limit=200`);
+      _docsCount = (((_dp && _dp.notes) || []) as any[])
+        .filter(n => String(n.note_kind || '').toLowerCase() === 'document').length;
+    } catch (_) { /* docs count is best-effort */ }
+    const _cwds = repoPaths.map((rp: any) => typeof rp === 'string' ? rp : (rp.cwd || '')).filter(Boolean);
+    html += `<div style="margin-bottom:16px;padding:10px 12px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px">
+      <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Resources</div>
+      <div style="font-size:11px;color:var(--text);line-height:1.7">
+        <div>Codebases: <b>${_cwds.length}</b> repo path${_cwds.length !== 1 ? 's' : ''}${_cwds.length ? ` — ${escapeHtml(_cwds.join(', '))}` : ' <span style="color:var(--muted)">(add in Settings → Executor Config)</span>'}</div>
+        <div>Documents: <b>${_docsCount}</b> ingested <span style="color:var(--muted)">(kind=document)</span></div>
+      </div>
+    </div>`;
+
     // ff8ff615 — the Preact CodeIntelPanel renders the layered package DAG +
     // zoom + Generate Map into this mount point (mounted after body.innerHTML).
     html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
 
     // Index status per repo path
-    html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Index Status</div>`;
+    html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
     if (repoPaths.length) {
       for (const rp of repoPaths) {
         const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
@@ -7210,6 +7358,26 @@ async function loadCodeIntelTab(projectId: any) {
           if (!b.image) throw new Error('No image returned.');
           return b.image;
         },
+      });
+    }
+
+    // 31d0caa6 — manual reindex button: re-run index_repository for each repo
+    // path via the code MCP, then reload the tab to show fresh index status.
+    const _reindexBtn = document.getElementById(`${_cgId}-reindex`) as HTMLButtonElement | null;
+    if (_reindexBtn) {
+      _reindexBtn.addEventListener('click', async () => {
+        _reindexBtn.disabled = true;
+        _reindexBtn.textContent = 'Reindexing…';
+        try {
+          for (const rp of repoPaths) {
+            const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
+            if (cwd) await _codeMcpCall('tools/call', { name: 'index_repository', arguments: { path: cwd } });
+          }
+          loadCodeIntelTab(projectId);
+        } catch (e: any) {
+          _reindexBtn.disabled = false;
+          _reindexBtn.textContent = 'Reindex failed — retry';
+        }
       });
     }
 

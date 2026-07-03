@@ -210,7 +210,8 @@ async def test_post_login_redirect_launch_open_waitlists_when_capacity_full(
         raise AssertionError("provision_neon_db should not run when free launch is full")
 
     monkeypatch.setenv("MERIDIAN_LAUNCH_OPEN", "true")
-    monkeypatch.delenv("MERIDIAN_FREE_LAUNCH_CAP", raising=False)
+    # d1cb1100 — default cap is now 1000, so pin it to 15 to exercise "full".
+    monkeypatch.setenv("MERIDIAN_FREE_LAUNCH_CAP", "15")
     monkeypatch.setattr(hosted_module, "provision_neon_db", fail_if_called)
 
     dest = await hosted_module._post_login_redirect(new_tenant, db)
@@ -612,3 +613,150 @@ async def test_overage_check_reports_usage(monkeypatch):
     payload = captured.get("payload", {})
     assert payload.get("stripe_customer_id") == "cus_abc123"
     assert float(payload.get("value", 0)) == 2.5
+
+
+# ---------------------------------------------------------------------------
+# 98c45dd0 — self-hosted / launch auth bugs
+# ---------------------------------------------------------------------------
+
+
+def test_truthy_semantics():
+    """_truthy: unset/empty and the off-values are falsy; everything else true.
+
+    This is what lets MERIDIAN_LAUNCH_OPEN default to open ('1') while an
+    explicit '0' still closes it — plain ``if _cfg(...)`` can't, because the
+    string '0' is truthy in Python.
+    """
+    from meridian.hosted import _truthy
+
+    for falsy in (None, "", "  ", "0", "false", "False", "NO", "off", "Off"):
+        assert _truthy(falsy) is False, falsy
+    for truthy in ("1", "true", "TRUE", "yes", "on", "open"):
+        assert _truthy(truthy) is True, truthy
+
+
+@pytest.mark.asyncio
+async def test_post_login_redirect_defaults_open_when_flag_unset(db, monkeypatch):
+    """98c45dd0 BUG 1 — with MERIDIAN_LAUNCH_OPEN unset the launch is OPEN:
+    a fresh free-tier tenant is provisioned and lands on /dashboard rather than
+    the pre-launch waitlist."""
+    from meridian import hosted as hosted_module
+
+    tenant = await db_module.upsert_tenant(db, "default-open@example.com")
+    seen: dict[str, str] = {}
+
+    async def fake_provision(tenant_id, _db):
+        seen["tenant_id"] = tenant_id
+        await db_module.update_tenant(
+            _db, tenant_id, neon_project_id="neon-open-1", neon_db_url="enc-url",
+        )
+        return await db_module.get_tenant_by_id(_db, tenant_id)
+
+    monkeypatch.delenv("MERIDIAN_LAUNCH_OPEN", raising=False)
+    monkeypatch.delenv("MERIDIAN_FREE_LAUNCH_CAP", raising=False)
+    monkeypatch.setattr(hosted_module, "provision_neon_db", fake_provision)
+
+    dest = await hosted_module._post_login_redirect(tenant, db)
+    assert dest == "/dashboard"
+    assert seen["tenant_id"] == tenant["id"]
+
+
+@pytest.mark.asyncio
+async def test_post_login_redirect_explicit_zero_closes_launch(db, monkeypatch):
+    """98c45dd0 BUG 1 — MERIDIAN_LAUNCH_OPEN=0 re-enables the pre-launch
+    waitlist gate (explicit off overrides the open-by-default)."""
+    from meridian import hosted as hosted_module
+
+    tenant = await db_module.upsert_tenant(db, "explicit-closed@example.com")
+
+    async def fail_if_called(*_a, **_k):
+        raise AssertionError("provision must not run when launch is explicitly closed")
+
+    monkeypatch.setenv("MERIDIAN_LAUNCH_OPEN", "0")
+    monkeypatch.setattr(hosted_module, "provision_neon_db", fail_if_called)
+
+    dest = await hosted_module._post_login_redirect(tenant, db)
+    assert dest == "/waitlist-pending"
+    waitlist = await db_module.get_waitlist(db)
+    assert any(row["email"] == "explicit-closed@example.com" for row in waitlist)
+
+
+@pytest.mark.asyncio
+async def test_post_login_redirect_logs_provision_failure(db, monkeypatch, caplog):
+    """9f584879 — a failed Neon provision is logged at WARNING (not swallowed
+    silently), and the login flow still returns a destination."""
+    import logging
+    from meridian import hosted as hosted_module
+
+    tenant = await db_module.upsert_tenant(db, "prov-fail@example.com")
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("neon down")
+
+    monkeypatch.delenv("MERIDIAN_LAUNCH_OPEN", raising=False)  # default open
+    monkeypatch.delenv("MERIDIAN_FREE_LAUNCH_CAP", raising=False)
+    monkeypatch.setattr(hosted_module, "provision_neon_db", boom)
+
+    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
+        dest = await hosted_module._post_login_redirect(tenant, db)
+
+    assert dest == "/dashboard"  # flow survives the failed provision
+    assert "provisioning failed" in caplog.text
+    assert "prov-fail@example.com" not in caplog.text  # logs the id, not the email
+
+
+def test_build_login_page_hides_unconfigured_oauth_buttons(monkeypatch):
+    """98c45dd0 BUG 2 — no OAuth button renders for a provider whose client-id
+    env var is unset, and the 'or' divider is dropped when none are configured."""
+    from meridian import hosted as hosted_module
+
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GITHUB_CLIENT_ID", raising=False)
+    monkeypatch.setattr(hosted_module, "MICROSOFT_CLIENT_ID", "", raising=False)
+
+    page = hosted_module._build_login_page()
+    assert "Continue with Google" not in page
+    assert "Continue with GitHub" not in page
+    assert "Continue with Microsoft" not in page
+    assert '<div class="divider">or</div>' not in page
+    # The magic-link form must survive even with zero OAuth providers.
+    assert 'id="magic-form"' in page
+
+
+def test_build_login_page_shows_configured_oauth_buttons(monkeypatch):
+    """98c45dd0 BUG 2 — a configured provider renders its button, and next_url
+    is injected into the button href."""
+    from meridian import hosted as hosted_module
+
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-abc")
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "gh-abc")
+    monkeypatch.setattr(hosted_module, "MICROSOFT_CLIENT_ID", "", raising=False)
+
+    page = hosted_module._build_login_page(next_url="/oauth/authorize")
+    assert "Continue with Google" in page
+    assert "Continue with GitHub" in page
+    assert '<div class="divider">or</div>' in page
+    # quote() keeps '/' (safe by default), so path slashes survive in ?next=.
+    assert "/auth/google/login?next=/oauth/authorize" in page
+    assert "/auth/github/login?next=/oauth/authorize" in page
+
+
+def test_auth_magic_logs_link_when_email_unavailable(client, monkeypatch, caplog):
+    """98c45dd0 BUG 3 — when email delivery is unavailable the magic link is
+    logged at WARNING (recoverable from stdout) and surfaced as dev_link."""
+    import logging
+
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="meridian.auth"):
+        resp = client.post("/auth/magic", json={"email": "maglog@example.com"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    # dev_link is surfaced when Resend isn't configured and we're not hosted.
+    assert "/auth/magic/verify?token=" in body.get("dev_link", "")
+    # The link is also logged at WARNING so an operator can recover it.
+    assert "maglog@example.com" in caplog.text
+    assert "/auth/magic/verify?token=" in caplog.text

@@ -31,6 +31,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import __version__
 from . import serena_pool as _serena_pool
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
@@ -53,6 +54,54 @@ _IDLE_KILL_SECONDS = 30 * 60
 # (e.g. the missing npx/binary became available). On success the client tells
 # the server to re-advertise the slot's tools.
 _SLOT_REPROBE_INTERVAL = 60.0
+
+
+# ---------------------------------------------------------------------------
+# Version check (4bde9437) — nudge an upgrade when the local tunnel binary is
+# behind the deployed server. Pure + fail-safe: never raises, so a bad/absent
+# version string can never block the tunnel from starting.
+# ---------------------------------------------------------------------------
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """Parse a dotted version into a comparable int tuple.
+
+    Each dot-segment contributes its leading run of digits (so ``0.1.6`` →
+    ``(0, 1, 6)`` and ``0.2.0rc1`` → ``(0, 2, 0)``). Parsing stops at the first
+    segment with no leading digit, and any wholly-unparseable input yields the
+    empty tuple — which callers treat as "unknown, don't nag".
+    """
+    parts: list[int] = []
+    for seg in str(v).strip().split("."):
+        digits = ""
+        for ch in seg:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _update_notice(local: str, server: str) -> str | None:
+    """Return a one-line upgrade notice iff ``server`` is newer than ``local``.
+
+    Returns ``None`` (no nag) when either version is missing/unparseable or when
+    the local version is already >= the server's. Never raises — the whole point
+    is that a version check must never be able to abort ``run_tunnel``.
+    """
+    try:
+        lt = _version_tuple(local)
+        st = _version_tuple(server)
+        if lt and st and st > lt:
+            return (
+                f"  meridian update available: server {server} > local {local} "
+                "— upgrade: uv tool install meridian-server --upgrade"
+            )
+    except Exception:  # noqa: BLE001 — informational only, never block startup
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +316,24 @@ def _classify_serena_failure(err: object) -> "tuple[str, str] | None":
     return None
 
 
+async def _reprobe_once(proxy, probe) -> bool:
+    """One slot-recovery attempt (a898710a). Ensure the proxy is running, probe
+    its health, and — critically — if it is running but UNHEALTHY (a persistent
+    slot like Desktop Commander whose inner MCP server died while the parent
+    ``cmd /c npx`` stays alive, so ``ensure_running()`` is a no-op) force a
+    kill + respawn and re-probe. Without this a stuck persistent slot never
+    recovers. Returns True when healthy. ``probe`` is an async fn(port) -> bool.
+    """
+    if not proxy.is_running:
+        await proxy.ensure_running()
+    healthy = proxy.is_running and await probe(proxy.port)
+    if not healthy and proxy.is_running:
+        proxy.kill()
+        await proxy.ensure_running()
+        healthy = proxy.is_running and await probe(proxy.port)
+    return healthy
+
+
 async def _preflight_slot(ws, port: int, label: str) -> bool:
     """Probe a slot after its first spawn; report unhealthy on failure. Returns
     the health result so callers can log it. (d71ba2e7)"""
@@ -324,9 +391,11 @@ async def _run_connection_lazy(
         while True:
             await asyncio.sleep(_SLOT_REPROBE_INTERVAL)
             try:
-                if not proxy.is_running:
-                    await proxy.ensure_running()
-                if proxy.is_running and await _probe_slot_health(proxy.port, attempts=1):
+                # a898710a — _reprobe_once force-restarts a persistent slot that's
+                # alive-but-unhealthy (parent process up, inner MCP server dead).
+                if await _reprobe_once(
+                    proxy, lambda port: _probe_slot_health(port, attempts=1)
+                ):
                     _unhealthy = False
                     _reprobe_task = None
                     await _report_slot_health(ws, label, True)
@@ -680,6 +749,20 @@ def _spawn_kwargs() -> dict:
         # genuine constant.
         return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)}
     return {}
+
+
+def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
+    """Merge a plugin's optional ``env`` overrides over the parent process env
+    for ``subprocess.Popen``. Returns ``None`` (inherit the parent env) when
+    there is nothing valid to override. Keys/values are coerced to str and blank
+    keys dropped. Shared by the Office and custom local-plugin spawns (194a7776
+    — a local Zotero MCP needs ``ZOTERO_LOCAL=true``)."""
+    if not isinstance(env, dict) or not env:
+        return None
+    coerced = {str(k): str(v) for k, v in env.items() if str(k)}
+    if not coerced:
+        return None
+    return {**os.environ, **coerced}
 
 
 def _terminate_proc_tree(proc: "subprocess.Popen | None") -> None:
@@ -2285,10 +2368,7 @@ async def run_tunnel(
         if not cmd:
             continue
         oport = office_ports[slot]
-        plugin_env = plugin.get("env") or {}
-        spawn_env = None
-        if plugin_env:
-            spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
+        spawn_env = _plugin_spawn_env(plugin.get("env"))
         # 4ea1b9d5 — persistent slots omit --stateless so their inner process
         # keeps state across requests (DC terminal sessions).
         _persistent = plugin.get("session_mode") == "persistent"
@@ -2316,16 +2396,30 @@ async def run_tunnel(
         if not cmd_inner:
             continue
         cmd_custom = _build_proxy_for_inner(npx, list(cmd_inner), cport)
+        # 194a7776 — merge the plugin's optional env over the parent env at spawn
+        # (e.g. a local Zotero MCP needs ZOTERO_LOCAL=true). None inherits parent.
+        spawn_env = _plugin_spawn_env(cp.get("env"))
         print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
         try:
-            proc_custom = subprocess.Popen(cmd_custom, **_spawn_kwargs())
-            proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": None, "label": f"custom:{cname}"})
+            proc_custom = subprocess.Popen(cmd_custom, env=spawn_env, **_spawn_kwargs())
+            proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": spawn_env, "label": f"custom:{cname}"})
             running_custom.append({"name": cname, "port": cport})
         except Exception as exc:
             print(f"  warning: could not start custom plugin {cname!r}: {exc}", file=sys.stderr)
 
     # 5. Print permanent URLs.
     print("", flush=True)
+    # Best-effort update nudge: the server reports its version in /me (already
+    # fetched above). Fully fail-open — a missing/unparseable version, or any
+    # exception, silently skips the notice and never blocks the tunnel.
+    try:
+        _srv_ver = me.get("server_version")
+        if _srv_ver:
+            _notice = _update_notice(__version__, str(_srv_ver))
+            if _notice:
+                print(_notice, flush=True)
+    except Exception:  # noqa: BLE001 — informational only, never block startup
+        pass
     print("  Tunnel URLs (for Cursor / non-claude.ai clients only):", flush=True)
     if proxy_fs is not None:
         print(f"    Filesystem:      {_permanent_url(base_url, tenant_id)}", flush=True)
