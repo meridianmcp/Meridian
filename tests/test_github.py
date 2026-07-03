@@ -300,8 +300,12 @@ def _github_client(tmp_path, monkeypatch):
     return mod, TestClient(mod.app)
 
 
-def test_auth_login_page_has_github_button(client):
-    """GET /auth/login shows GitHub OAuth button."""
+def test_auth_login_page_has_github_button(client, monkeypatch):
+    """GET /auth/login shows the GitHub OAuth button when GITHUB_CLIENT_ID is set.
+
+    98c45dd0 — the button only renders for a configured provider.
+    """
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "gh-fake")
     r = client.get("/auth/login", follow_redirects=False)
     assert r.status_code == 200
     assert "GitHub" in r.text

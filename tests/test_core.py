@@ -7819,8 +7819,13 @@ def test_landing_page_footer_uses_meridian_email(client):
     assert "ajc3xc@" not in r.text  # no personal emails in landing page
 
 
-def test_auth_login_page_has_google_button(client):
-    """GET /auth/login shows Google OAuth button."""
+def test_auth_login_page_has_google_button(client, monkeypatch):
+    """GET /auth/login shows the Google OAuth button when GOOGLE_CLIENT_ID is set.
+
+    98c45dd0 — the button only renders for a configured provider, so the test
+    configures the client id first.
+    """
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-fake")
     r = client.get("/auth/login", follow_redirects=False)
     assert r.status_code == 200
     assert "Google" in r.text
@@ -11019,16 +11024,20 @@ def test_remote_mcp_401_invalid_bearer_includes_www_authenticate(client):
     assert "Bearer" in www_auth
 
 
-def test_login_page_preserves_next_param(client):
-    """GET /auth/login?next=/foo injects ?next= into all login button hrefs."""
+def test_login_page_preserves_next_param(client, monkeypatch):
+    """GET /auth/login?next=/foo injects ?next= into all configured login hrefs."""
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-fake")
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "gh-fake")
     r = client.get("/auth/login?next=/oauth/authorize%3Fclient_id%3Dabc")
     assert r.status_code == 200
     assert "/auth/google/login?next=" in r.text
     assert "/auth/github/login?next=" in r.text
 
 
-def test_login_page_no_next_param(client):
+def test_login_page_no_next_param(client, monkeypatch):
     """GET /auth/login without ?next= keeps bare login hrefs (no ?next= appended)."""
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-fake")
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "gh-fake")
     r = client.get("/auth/login")
     assert r.status_code == 200
     assert 'href="/auth/google/login"' in r.text
