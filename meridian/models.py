@@ -122,6 +122,8 @@ class Project(BaseModel):
     name: str
     creator_human_id: str | None = None
     icon: str | None = None
+    status: str = "active"       # 8db00fcb — active | parked | archived
+    priority: str = "P2"         # 8db00fcb — P0 | P1 | P2
     created_at: str
 
 
@@ -240,6 +242,13 @@ class GoalModeSet(BaseModel):
     """Body for PATCH /projects/{id}/goal-mode."""
 
     mode: Literal["manual", "auto"]
+
+
+class ProjectOrganizationSet(BaseModel):
+    """Body for PATCH /projects/{id}/organization (8db00fcb)."""
+
+    status: Literal["active", "parked", "archived"] | None = None
+    priority: Literal["P0", "P1", "P2"] | None = None
 
 
 class Session(BaseModel):

@@ -20,6 +20,7 @@ from .. import goal_md as goal_md_module
 from ..executor_config import normalize_executor_config
 from ..models import (
     GoalModeSet,
+    ProjectOrganizationSet,
     GoalSet,
     GoalState,
     Project,
@@ -623,6 +624,25 @@ async def get_goal_mode(project_id: str, request: Request) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="project not found")
     mode = await db_module.get_goal_mode(await _db(request), project_id)
     return {"project_id": project_id, "goal_mode": mode}
+
+
+@router.patch("/projects/{project_id}/organization", response_model=Project)
+async def patch_project_organization(
+    project_id: str, body: ProjectOrganizationSet, request: Request
+) -> dict[str, Any]:
+    """8db00fcb — set a project's status (active|parked|archived) and/or
+    priority (P0|P1|P2). Only the provided fields change."""
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        updated = await db_module.set_project_status(
+            db, project_id, status=body.status, priority=body.priority
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return updated
 
 
 @router.post("/projects/{project_id}/goal", response_model=GoalState)

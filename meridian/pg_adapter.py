@@ -457,6 +457,8 @@ CREATE TABLE IF NOT EXISTS projects (
     github_branch TEXT,
     queued_session TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'parked', 'archived')),
+    priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN ('P0', 'P1', 'P2')),
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -1235,6 +1237,14 @@ async def _migrate_pg_code_intel(conn: PostgresConnection) -> None:
     """Sprint-2/3 — projects.code_intel_enabled: per-project Code Intelligence toggle."""
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS code_intel_enabled INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_project_status_priority(conn: PostgresConnection) -> None:
+    """8db00fcb — projects.status (active|parked|archived) + priority (P0|P1|P2)."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'P2'"
     )
 
 
@@ -2241,6 +2251,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_note_source,
     _migrate_pg_session_sprint_version,
     _migrate_pg_project_execution_mode,
+    _migrate_pg_project_status_priority,
     _migrate_pg_decision_code_anchor,
     _migrate_pg_session_graph_snapshots,
     _migrate_pg_agent_tasks_table,

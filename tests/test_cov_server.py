@@ -289,6 +289,38 @@ def test_setup_health_public_under_site_password(client, monkeypatch):
     assert "providers" in r.json()
 
 
+@pytest.mark.asyncio
+async def test_project_status_priority_default_and_set(db):
+    """8db00fcb — projects default to active/P2; set_project_status updates and
+    validates the enums."""
+    import meridian.db as db_module
+    proj = await db_module.create_project(db, "org-proj")
+    p = await db_module.get_project(db, proj["id"])
+    assert p["status"] == "active"
+    assert p["priority"] == "P2"
+    updated = await db_module.set_project_status(
+        db, proj["id"], status="parked", priority="P0")
+    assert updated["status"] == "parked"
+    assert updated["priority"] == "P0"
+    with pytest.raises(ValueError):
+        await db_module.set_project_status(db, proj["id"], status="bogus")
+
+
+def test_patch_project_organization_route(client):
+    """8db00fcb — PATCH /projects/{id}/organization sets status/priority and the
+    Project response carries them; an invalid enum is a 422."""
+    proj = client.post("/projects", json={"name": "org-route-proj"}).json()
+    pid = proj["id"]
+    r = client.patch(
+        f"/projects/{pid}/organization", json={"status": "archived", "priority": "P1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "archived"
+    assert body["priority"] == "P1"
+    r2 = client.patch(f"/projects/{pid}/organization", json={"status": "nope"})
+    assert r2.status_code == 422
+
+
 def test_status_tools_badge(client):
     r = client.get("/status/tools")
     assert r.status_code == 200

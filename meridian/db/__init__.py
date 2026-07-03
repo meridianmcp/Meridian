@@ -178,6 +178,10 @@ CREATE TABLE IF NOT EXISTS projects (
     agent_instructions TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous'
         CHECK (execution_mode IN ('autonomous', 'interactive')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'parked', 'archived')),
+    priority TEXT NOT NULL DEFAULT 'P2'
+        CHECK (priority IN ('P0', 'P1', 'P2')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -833,6 +837,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_github_connections(db)
     await _migrate_sprint_item_quality_gates(db)
     await _migrate_parallel_primitives(db)
+    await _migrate_project_status_priority(db)
     return db
 
 
@@ -913,6 +918,43 @@ async def get_project(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+_PROJECT_STATUSES = ("active", "parked", "archived")
+_PROJECT_PRIORITIES = ("P0", "P1", "P2")
+
+
+async def set_project_status(
+    db: aiosqlite.Connection,
+    project_id: str,
+    status: str | None = None,
+    priority: str | None = None,
+) -> dict[str, Any] | None:
+    """8db00fcb — update a project's organization fields (status/priority).
+    Validates the enums; only the provided fields change."""
+    sets: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        if status not in _PROJECT_STATUSES:
+            raise ValueError(
+                f"invalid status {status!r}; expected one of {_PROJECT_STATUSES}"
+            )
+        sets.append("status = ?")
+        params.append(status)
+    if priority is not None:
+        if priority not in _PROJECT_PRIORITIES:
+            raise ValueError(
+                f"invalid priority {priority!r}; expected one of {_PROJECT_PRIORITIES}"
+            )
+        sets.append("priority = ?")
+        params.append(priority)
+    if sets:
+        params.append(project_id)
+        await db.execute(
+            f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
+        )
+        await db.commit()
+    return await get_project(db, project_id)
 
 
 async def get_agent_instructions(
