@@ -846,6 +846,62 @@ def test_planning_brief_includes_current_timestamp():
         _run(db.close())
 
 
+def test_detect_insight_candidate_matches_and_ignores():
+    """2d932f60 — the keyword detector flags decision/insight phrasing and
+    ignores neutral text."""
+    from meridian.handoff import detect_insight_candidate
+    assert detect_insight_candidate("We decided to use psycopg3") == "we decided"
+    assert detect_insight_candidate("Root cause: event-loop deadlock") == "root cause"
+    assert detect_insight_candidate("Add a logout button") is None
+    assert detect_insight_candidate("") is None
+    assert detect_insight_candidate(None) is None
+
+
+def test_add_sprint_item_proposes_insight_capture():
+    """2d932f60 — add_sprint_item surfaces an insight_hint when the title reads
+    like a decision, and stays quiet for a plain title."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "insight-proj"))
+        hinted = _run(mh._dispatch_mcp_tool("add_sprint_item", {
+            "project_id": proj["id"], "version": "v1",
+            "title": "Decision: we chose Cytoscape over ECharts for the graph",
+            "force": True,
+        }, db, "/tmp"))
+        assert "insight_hint" in hinted
+        assert "capture_insight" in hinted["insight_hint"]
+        plain = _run(mh._dispatch_mcp_tool("add_sprint_item", {
+            "project_id": proj["id"], "version": "v1",
+            "title": "Add a logout button to the header",
+            "force": True,
+        }, db, "/tmp"))
+        assert "insight_hint" not in plain
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_surfaces_insight_hints(tmp_path):
+    """2d932f60 — generate_handoff scans the session task log and surfaces
+    insight candidates so they aren't lost at session end."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "ih-handoff-proj"))
+        sess = _run(db_module.register_session(db, proj["id"], "exec-ih"))
+        _run(db_module.log_task(
+            db, sess["id"], proj["id"],
+            "Turns out the ProactorEventLoop deadlocks watchfiles on Windows"))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff",
+            {"project_id": proj["id"], "session_id": sess["id"]},
+            db, str(tmp_path)))
+        assert "insight_hints" in out
+        assert any(h["signal"] == "turns out" for h in out["insight_hints"])
+    finally:
+        _run(db.close())
+
+
 def test_planning_brief_new_handoff_signal():
     # ab514e43 — new-handoff signal: latest_handoff + since-based new flag.
     import meridian.db as db_module

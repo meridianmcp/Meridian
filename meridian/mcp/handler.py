@@ -1503,11 +1503,24 @@ async def _handle_task_tools(
             _tpl_stale = agent_instructions_stale(_stored_ai)
         except Exception:  # noqa: BLE001
             _tpl_stale = False
+        # 2d932f60 — scan this session's task log for insight candidates so the
+        # handoff prompts a capture_insight()/pin_decision() before context is lost.
+        _insight_hints: list[dict[str, str]] = []
+        try:
+            _ih_tasks = await db_module.get_tasks(db, args["project_id"], limit=15)
+            for _t in _ih_tasks:
+                _desc = _t.get("description") or ""
+                _sig = handoff_module_local.detect_insight_candidate(_desc)
+                if _sig:
+                    _insight_hints.append({"signal": _sig, "text": _desc[:160]})
+        except Exception:  # noqa: BLE001
+            _insight_hints = []
         return {
             "file_path": path,
             "content": content,
             "mode": mode,
             "template_stale": _tpl_stale,
+            "insight_hints": _insight_hints[:5],
         }
     return _MISS
 
@@ -2503,6 +2516,15 @@ async def _handle_sprint_tools(
             _extra["active_session_warning"] = (
                 "WARNING: " + "; ".join(_active_session_warnings)
                 + " — new item added but may not be picked up until next session start."
+            )
+        # 2d932f60 — if the title reads like a decision/insight, propose capturing
+        # it (no auto-write; the planner confirms).
+        from .. import handoff as _handoff_ins  # noqa: PLC0415
+        _ins_sig = _handoff_ins.detect_insight_candidate(args.get("title") or "")
+        if _ins_sig:
+            _extra["insight_hint"] = (
+                f"The wording ('{_ins_sig}') looks like a decision/insight — consider "
+                "capture_insight() or pin_decision() so it isn't lost at session end."
             )
         if _extra:
             _new_item = {**_new_item, **_extra}

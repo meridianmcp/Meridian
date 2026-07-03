@@ -43,6 +43,30 @@ _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
 
 
+# 2d932f60 — lightweight keyword detector for "this reads like a decision/insight
+# worth capturing." No LLM, no auto-write; callers surface a suggestion only so a
+# critical planning insight doesn't evaporate at session end.
+_INSIGHT_SIGNALS = (
+    "insight:", "decision:", "we decided", "we chose", "decided to",
+    "turns out", "turned out", "root cause", "gotcha", "key learning",
+    "learned that", "realized that", "trade-off", "tradeoff",
+    "important:", "the catch is", "the trick is", "strategy:",
+)
+
+
+def detect_insight_candidate(text: "str | None") -> "str | None":
+    """Return the first insight-signalling phrase in ``text`` (case-insensitive),
+    or None. Used to PROPOSE (never auto-write) a capture_insight()/pin_decision()
+    so critical planning insights aren't lost at session end (2d932f60)."""
+    if not text:
+        return None
+    low = text.lower()
+    for sig in _INSIGHT_SIGNALS:
+        if sig in low:
+            return sig
+    return None
+
+
 def _slugify(name: str) -> str:
     """Turn a project name into a safe filename fragment."""
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-")
