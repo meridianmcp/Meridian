@@ -683,6 +683,118 @@ async def test_generate_handoff_delta_empty(db, tmp_path):
     assert "- none" in content
 
 
+# ---------------------------------------------------------------------------
+# aef94e4a — sprint retrospective note
+# ---------------------------------------------------------------------------
+
+
+def test_build_retro_prompt_names_three_sections():
+    items = [{"title": "Ship auth fix", "status": "done"},
+             {"title": "Add graph snapshot", "status": "done"}]
+    decisions = [{"decision": "Use psycopg3", "status": "active"}]
+    prompt = handoff_module._build_retro_prompt(items, decisions, "v0.1.x")
+    assert "What shipped" in prompt
+    assert "Patterns revealed" in prompt
+    assert "Direction confirmed" in prompt
+    assert "Ship auth fix" in prompt
+    assert "v0.1.x" in prompt
+    assert "Use psycopg3" in prompt
+    # the retro prompt is a stable discriminator vs. the ai_summary prompt
+    assert "sprint retrospective" in prompt
+
+
+def test_render_retro_fallback_lists_shipped_and_handles_empty():
+    items = [{"title": "Ship auth fix", "status": "done"}]
+    body = handoff_module._render_retro_fallback(items, "v1")
+    assert "Ship auth fix" in body
+    assert "1 item" in body
+    assert handoff_module._render_retro_fallback([], None).startswith("No items")
+
+
+def _retro_summarizer(prompt):
+    # Discriminate the retro prompt from the ai_summary prompt (both share the
+    # injected summarizer) so tests assert on the retrospective body only.
+    if "sprint retrospective" in prompt:
+        return "RETRO STUB: what shipped, patterns, direction."
+    return "AI SUMMARY STUB."
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_writes_retrospective_note(db, tmp_path):
+    p = await db_module.create_project(db, "retro-proj")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v0.1.x")
+    it = await db_module.add_sprint_item(db, p["id"], "v0.1.x", "Ship the retro")
+    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), summarizer=_retro_summarizer,
+        skip_ai_summary=False,
+    )
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 1
+    n = notes[0]
+    assert n["body"] == "RETRO STUB: what shipped, patterns, direction."
+    assert (n.get("note_kind") or n.get("kind")) == "insight"
+    assert "retrospective" in (n.get("tags") or "")
+    assert n["priority"] == "high"
+    assert n["title"] == "Sprint Retrospective — v0.1.x"
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_retrospective_is_idempotent(db, tmp_path):
+    p = await db_module.create_project(db, "retro-idem")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v9")
+    it = await db_module.add_sprint_item(db, p["id"], "v9", "Item one")
+    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+
+    seq = {"n": 0}
+
+    def _seq_summarizer(prompt):
+        if "sprint retrospective" in prompt:
+            seq["n"] += 1
+            return f"RETRO#{seq['n']}"
+        return "AI SUMMARY STUB."
+
+    for _ in range(2):
+        await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), summarizer=_seq_summarizer,
+            skip_ai_summary=False,
+        )
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 1  # updated in place, not duplicated
+    assert notes[0]["body"] == "RETRO#2"
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_skip_ai_summary_no_retrospective(db, tmp_path):
+    p = await db_module.create_project(db, "retro-skip")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v1")
+    it = await db_module.add_sprint_item(db, p["id"], "v1", "Item")
+    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+    )
+    notes = await db_module.get_project_notes(db, p["id"], tag="retrospective")
+    assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_no_completed_items_no_retrospective(db, tmp_path):
+    p = await db_module.create_project(db, "retro-none")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v1")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Still pending")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), summarizer=_retro_summarizer,
+        skip_ai_summary=False,
+    )
+    notes = await db_module.get_project_notes(db, p["id"], tag="retrospective")
+    assert notes == []
+
+
 @pytest.mark.asyncio
 async def test_generate_handoff_planner_mode_full_content(db, tmp_path):
     """Planner mode emits a directive planning prompt: tool-order protocol,

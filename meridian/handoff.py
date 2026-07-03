@@ -1104,6 +1104,154 @@ async def _generate_ai_summary(
         return fallback
 
 
+# ---------------------------------------------------------------------------
+# aef94e4a — sprint retrospective: a strategic narrative (what shipped /
+# patterns revealed / direction confirmed) auto-saved at generate_handoff and
+# surfaced in the planner brief. Distinct from per-session summaries: it is
+# sprint-scoped, cumulative, and stored as a strategic 'insight' project note.
+# ---------------------------------------------------------------------------
+
+RETRO_NOTE_TAGS = "retrospective,strategy"
+
+
+def _retro_note_title(sprint: str | None) -> str:
+    label = (sprint or "").strip() or "current sprint"
+    return f"Sprint Retrospective — {label}"
+
+
+def _retro_shipped_lines(completed_items: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for it in completed_items[:20]:
+        title = (it.get("title") or "").strip().replace("\n", " ")
+        if len(title) > 140:
+            title = title[:140].rstrip() + "…"
+        status = (it.get("status") or "done").upper()
+        if title:
+            lines.append(f"- [{status}] {title}")
+    return lines
+
+
+def _build_retro_prompt(
+    completed_items: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    sprint: str | None,
+) -> str:
+    """Prompt for the sprint retrospective. Names three explicit sections so the
+    model returns a structured strategic narrative, not a task dump."""
+    shipped = _retro_shipped_lines(completed_items) or ["- (nothing marked complete yet)"]
+    decision_lines: list[str] = []
+    for d in decisions[:8]:
+        if (d.get("status") or "active") != "active":
+            continue
+        txt = (d.get("decision") or d.get("title") or "").strip().replace("\n", " ")
+        if len(txt) > 140:
+            txt = txt[:140].rstrip() + "…"
+        if txt:
+            decision_lines.append(f"- {txt}")
+    sprint_line = f"Sprint: {sprint.strip()}" if sprint else "Sprint: (unversioned)"
+    return (
+        "Write a concise sprint retrospective (no preamble, ~120 words) with "
+        "exactly these three short sections, each 1-2 sentences:\n"
+        "What shipped: the through-line of the completed work (not a list).\n"
+        "Patterns revealed: recurring themes, friction, or wins worth carrying forward.\n"
+        "Direction confirmed: what the shipped work implies about the next move.\n\n"
+        f"{sprint_line}\n\n"
+        "Completed this sprint:\n" + "\n".join(shipped) + "\n\n"
+        "Key decisions:\n" + ("\n".join(decision_lines) or "- (none pinned)")
+    )
+
+
+def _render_retro_fallback(
+    completed_items: list[dict[str, Any]],
+    sprint: str | None,
+) -> str:
+    """Deterministic retrospective body used when no summarizer / API key is
+    available (tests, offline). Never empty."""
+    shipped = _retro_shipped_lines(completed_items)
+    header = f"Sprint {sprint.strip()}: " if sprint else ""
+    if shipped:
+        summary = (
+            f"{header}{len(completed_items)} item(s) completed this sprint. "
+            "What shipped is captured below; patterns and direction are best "
+            "reviewed against the pinned decisions."
+        )
+        return summary + "\n\nWhat shipped:\n" + "\n".join(shipped)
+    return f"{header}No items completed yet this sprint."
+
+
+async def _generate_sprint_retrospective(
+    completed_items: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    sprint: str | None,
+    summarizer: Callable[[str], Any] | None = None,
+) -> str:
+    """Strategic sprint narrative. Tries the injected summarizer / Haiku; always
+    degrades to a deterministic fallback so the note body is never empty. Mirrors
+    the guarded seam of _generate_ai_summary."""
+    fallback = _render_retro_fallback(completed_items, sprint)
+    prompt = _build_retro_prompt(completed_items, decisions, sprint)
+    if summarizer is not None:
+        try:
+            result = summarizer(prompt)
+            if hasattr(result, "__await__"):
+                result = await result  # type: ignore[misc]
+            if isinstance(result, dict):
+                text = result.get("text") or result.get("summary") or ""
+            else:
+                text = str(result)
+            text = text.strip()
+            if text:
+                return text
+        except Exception:  # noqa: BLE001 — never break handoff on summary fail
+            return fallback
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return fallback
+    try:
+        import anthropic  # type: ignore[import]
+
+        def _sync_call() -> str:
+            client = anthropic.Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=320,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return "".join(getattr(b, "text", "") for b in resp.content).strip()
+
+        loop = asyncio.get_event_loop()
+        text = await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_call), timeout=30.0
+        )
+        return text or fallback
+    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+        return fallback
+
+
+async def _persist_sprint_retrospective(
+    db: aiosqlite.Connection,
+    project_id: str,
+    sprint: str | None,
+    body: str,
+) -> dict[str, Any] | None:
+    """Idempotently store the retrospective as a strategic insight note (one per
+    sprint title): update the existing note in place, else insert. Guarded by the
+    caller; returns the note row or None."""
+    title = _retro_note_title(sprint)
+    existing = await db_module.get_project_notes(
+        db, project_id, tag="retrospective", bodies=False
+    )
+    match = next((n for n in existing if (n.get("title") or "") == title), None)
+    if match is not None:
+        return await db_module.update_project_note(
+            db, match["id"], body=body, priority="high"
+        )
+    return await db_module.add_project_note(
+        db, project_id, title, body,
+        tags=RETRO_NOTE_TAGS, kind="insight", priority="high",
+    )
+
+
 async def _generate_handoff_l0(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1562,6 +1710,26 @@ async def generate_handoff(
         await db_module.record_handoff(db, project_id, mode, content, session_id)
     except Exception:  # noqa: BLE001
         pass
+    # aef94e4a — auto-save a strategic sprint retrospective (what shipped /
+    # patterns / direction) as an insight note surfaced in the planner brief.
+    # Skippable on hot paths / tests (skip_ai_summary) and fully guarded so it
+    # never breaks handoff generation.
+    if not skip_ai_summary:
+        try:
+            retro_completed = [
+                it for it in sprint_items_all
+                if it.get("status") in {"done", "skipped", "failed", "pushed"}
+            ]
+            if retro_completed:
+                retro_text = await _generate_sprint_retrospective(
+                    retro_completed, pinned_decisions, goal.get("sprint"),
+                    summarizer=summarizer,
+                )
+                await _persist_sprint_retrospective(
+                    db, project_id, goal.get("sprint"), retro_text
+                )
+        except Exception:  # noqa: BLE001 — retrospective is best-effort
+            pass
     return str(out_path.resolve()), content
 
 

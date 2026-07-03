@@ -828,6 +828,32 @@ def test_planning_brief_last_session_none_when_no_sessions():
         _run(db.close())
 
 
+def test_planning_brief_latest_retrospective_present_and_absent():
+    """aef94e4a — get_planning_brief surfaces the latest sprint retrospective
+    note (tag=retrospective), and None when none exists."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "retro-brief"))
+        b0 = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert "latest_retrospective" in b0
+        assert b0["latest_retrospective"] is None
+        _run(db_module.add_project_note(
+            db, proj["id"], "Sprint Retrospective — v1",
+            "What shipped: lots. Patterns: good. Direction: forward.",
+            tags="retrospective,strategy", kind="insight", priority="high"))
+        b1 = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        lr = b1["latest_retrospective"]
+        assert lr is not None
+        assert lr["title"] == "Sprint Retrospective — v1"
+        assert "What shipped" in lr["body"]
+        assert lr["slug"]
+    finally:
+        _run(db.close())
+
+
 def test_planning_brief_includes_current_timestamp():
     """de193a81 — get_planning_brief returns current_timestamp so a planner
     spanning multiple calendar days never guesses 'today'/'yesterday'."""

@@ -3270,6 +3270,21 @@ async def _handle_planning_tools(
         # session's completed items + task log + recent decisions so a planner
         # sees executor output without manual copy-paste.
         last_session = await db_module.get_last_session_brief(db, project_id)
+        # aef94e4a — surface the latest auto-generated sprint retrospective so a
+        # planner sees the strategic through-line (what shipped / patterns /
+        # direction) without opening the note.
+        _retro_notes = await db_module.get_project_notes(
+            db, project_id, tag="retrospective", bodies=True, limit=1
+        )
+        latest_retrospective = None
+        if _retro_notes:
+            _r = _retro_notes[0]
+            latest_retrospective = {
+                "title": _r.get("title"),
+                "body": (_r.get("body") or "")[:800],
+                "updated_at": _r.get("updated_at") or _r.get("created_at"),
+                "slug": _r.get("slug"),
+            }
         # ab514e43 — "new handoff available" signal. ``generated_at`` lets the
         # planner pass it back as ``since`` next call; a handoff filed after
         # ``since`` (or any handoff when ``since`` is omitted) flags as new.
@@ -3329,6 +3344,7 @@ async def _handle_planning_tools(
             "recent_decisions": recent_decisions,
             "unvalidated_assumptions": unvalidated_assumptions,
             "last_session": last_session,
+            "latest_retrospective": latest_retrospective,
             "generated_at": brief_generated_at,
             # de193a81 — explicit "now" so a planner spanning multiple calendar
             # days never guesses at "today"/"yesterday".
