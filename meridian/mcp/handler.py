@@ -1531,9 +1531,15 @@ async def _handle_task_tools(
                 )
         except Exception:  # noqa: BLE001
             _goal_warn = None
+        # 642b1818 — hotfix: return the handoff as one plain-text copyable block
+        # (strip markdown code-fence markers anywhere they appear — incl. inline in
+        # rendered note bodies — so it pastes cleanly into a fenced chat / a
+        # dashboard textarea without breaking the surrounding fence).
+        import re as _re_fence  # noqa: PLC0415
+        _plain_content = _re_fence.sub(r"```[A-Za-z0-9_+.-]*", "", content)
         return {
             "file_path": path,
-            "content": content,
+            "content": _plain_content,
             "mode": mode,
             "template_stale": _tpl_stale,
             "insight_hints": _insight_hints[:5],

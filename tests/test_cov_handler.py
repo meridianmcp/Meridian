@@ -923,6 +923,26 @@ def test_generate_handoff_warns_on_long_goal(tmp_path):
         _run(db.close())
 
 
+def test_generate_handoff_content_is_fence_free(tmp_path):
+    """642b1818 — generate_handoff returns a single plain-text copyable block:
+    markdown code-fence lines are stripped so it pastes cleanly into a fenced
+    chat / dashboard textarea."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "fence-proj"))
+        _run(db_module.set_goal(db, proj["id"], "", sprint="do the thing"))
+        # a strategic note whose body has a fenced block that the handoff renders
+        _run(db_module.add_project_note(
+            db, proj["id"], "Config", "```json\n{\"a\": 1}\n```", "planning",
+            priority="high"))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
+        assert "```" not in out["content"]
+    finally:
+        _run(db.close())
+
+
 def test_add_note_warns_on_similar_existing_note():
     """6e4e2371 — adding a note whose title closely matches an existing one
     returns a similar_notes warning (never blocks the write)."""
