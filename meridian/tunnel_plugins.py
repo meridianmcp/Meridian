@@ -33,6 +33,12 @@ DEFAULT_PPT_PORT = 8811
 DEFAULT_WORD_PORT = 8812
 DEFAULT_DC_PORT = 8813
 
+# 8fb69d54 — 4 pre-allocated custom slots (p0-p3) on ports 8814-8817 so a custom
+# plugin bound to a slot gets a real server route (/tunnel-p0 … /tunnel-p3) and
+# appears in the claude.ai connector (closes ecf5b8c6). The server-side slot
+# routes/registries live in routes/tunnel.py (_CUSTOM_SLOTS).
+CUSTOM_SLOT_PORTS = {"p0": 8814, "p1": 8815, "p2": 8816, "p3": 8817}
+
 # The code-extractor slot's default launcher: Serena (LSP-based symbol tools —
 # find_symbol / replace_symbol_body, etc.), run ephemerally via uvx. The
 # ``{repo_path}`` placeholder is expanded to the tunnel's working directory at

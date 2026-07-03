@@ -63,6 +63,13 @@ _pending_ppt_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_word_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
 
+# 8fb69d54 — 4 pre-allocated custom tunnel slots (p0-p3, ports 8814-8817) so
+# custom plugins get real server routes and appear in the claude.ai connector
+# (closes ecf5b8c6). Registries are keyed by slot label, mirroring word/dc.
+_CUSTOM_SLOTS = ("p0", "p1", "p2", "p3")
+_tunnel_custom_sockets: dict[str, dict[str, WebSocket]] = {s: {} for s in _CUSTOM_SLOTS}
+_pending_custom_reqs: dict[str, dict[str, "asyncio.Future[dict]"]] = {s: {} for s in _CUSTOM_SLOTS}
+
 # d71ba2e7 — per-tenant core-slot health: tenant_id → {slot_label: healthy}.
 # Absent ⇒ assumed healthy. The client sends a
 # ``{"type":"plugin_status","slot":...,"healthy":false}`` message over a slot's
@@ -522,6 +529,21 @@ async def tunnel_word_ws(ws: WebSocket, tenant_id: str) -> None:
 async def tunnel_dc_ws(ws: WebSocket, tenant_id: str) -> None:
     """Hold open a WebSocket for one tenant's desktop-commander proxy."""
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
+# 8fb69d54 — register the 4 custom-slot WebSocket routes (/tunnel-p0 … /tunnel-p3)
+# so a custom plugin bound to a slot gets a real server route.
+def _make_custom_slot_ws(_slot: str):
+    async def _ws(ws: WebSocket, tenant_id: str) -> None:
+        await _serve_tunnel_ws(
+            ws, tenant_id,
+            _tunnel_custom_sockets[_slot], _pending_custom_reqs[_slot], _slot,
+        )
+    return _ws
+
+
+for _cs in _CUSTOM_SLOTS:
+    router.websocket(f"/tunnel-{_cs}/{{tenant_id}}")(_make_custom_slot_ws(_cs))
 
 
 # ---------------------------------------------------------------------------
@@ -1041,7 +1063,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
     if tenant is None:
         return _json_response({
             "plugins": resolve_plugins(None), "custom": [], "config": {},
-            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False},
+            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False, **{s: False for s in _CUSTOM_SLOTS}},
             "plan": "free",
         })
     # 8660d701 — per-machine config. ?hostname=X scopes to that machine's config
@@ -1087,6 +1109,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "ppt": tid in _tunnel_ppt_sockets,
             "word": tid in _tunnel_word_sockets,
             "dc": tid in _tunnel_dc_sockets,
+            **{s: tid in _tunnel_custom_sockets[s] for s in _CUSTOM_SLOTS},
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
         # uses this to gate the Tunnel Plugins card.
@@ -1457,7 +1480,7 @@ async def send_add_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[st
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc")
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc") + _CUSTOM_SLOTS
 
 # Human-readable connector prefix shown to Claude in tool names (e.g.
 # "filesystem:read_file" instead of "fs:read_file"). The routing cache still
@@ -1470,6 +1493,10 @@ SLOT_DISPLAY_NAMES = {
     "ppt": "powerpoint",
     "word": "word",
     "dc": "desktop-commander",
+    "p0": "custom-p0",
+    "p1": "custom-p1",
+    "p2": "custom-p2",
+    "p3": "custom-p3",
 }
 
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
@@ -1529,6 +1556,8 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_word_sockets, _pending_word_reqs
     if label == "dc":
         return _tunnel_dc_sockets, _pending_dc_reqs
+    if label in _tunnel_custom_sockets:  # 8fb69d54 — custom slots p0-p3
+        return _tunnel_custom_sockets[label], _pending_custom_reqs[label]
     return _tunnel_extract_sockets, _pending_extract_reqs
 
 
@@ -1541,6 +1570,7 @@ def has_active_tunnel(tenant_id: str) -> bool:
         or tenant_id in _tunnel_ppt_sockets
         or tenant_id in _tunnel_word_sockets
         or tenant_id in _tunnel_dc_sockets
+        or any(tenant_id in s for s in _tunnel_custom_sockets.values())
     )
 
 
