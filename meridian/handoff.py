@@ -1252,6 +1252,82 @@ async def _persist_sprint_retrospective(
     )
 
 
+# ---------------------------------------------------------------------------
+# c0d2356d — Stop-hook sprint guard. generate_handoff() writes these scripts
+# into the repo's .claude/hooks with the project's ID baked in, so a Claude Code
+# Stop hook can block early-stopping while sprint items are still pending.
+# ---------------------------------------------------------------------------
+
+_SPRINT_GUARD_SH = """#!/usr/bin/env bash
+# c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
+# session from stopping while this project has pending sprint items. Fails OPEN.
+# This is NOT hooks.sh (the token-rotation installer).
+set -uo pipefail
+PROJECT_ID="__PROJECT_ID__"
+MERIDIAN_URL="${MERIDIAN_URL:-__URL__}"
+payload="$(cat 2>/dev/null || true)"
+if printf '%s' "$payload" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then
+  exit 0
+fi
+resp="$(curl -sf --max-time 5 "$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count" 2>/dev/null || true)"
+[ -z "$resp" ] && exit 0
+pending="$(printf '%s' "$resp" | grep -oE '"pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
+[ -z "$pending" ] && exit 0
+if [ "$pending" -gt 0 ] 2>/dev/null; then
+  echo "Meridian: $pending sprint item(s) still pending — complete or skip them (complete_sprint_item) before stopping." >&2
+  exit 2
+fi
+exit 0
+"""
+
+_SPRINT_GUARD_PS1 = """# c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
+# session from stopping while this project has pending sprint items. Fails OPEN.
+# This is NOT hooks.ps1 (the token-rotation installer).
+$ErrorActionPreference = 'SilentlyContinue'
+$ProjectId = '__PROJECT_ID__'
+$Url = if ($env:MERIDIAN_URL) { $env:MERIDIAN_URL } else { '__URL__' }
+$raw = [Console]::In.ReadToEnd()
+try { $payload = $raw | ConvertFrom-Json } catch { $payload = $null }
+if ($payload -and $payload.stop_hook_active -eq $true) { exit 0 }
+try {
+    $r = Invoke-RestMethod -Method GET -Uri "$Url/projects/$ProjectId/sprint/pending_count" -TimeoutSec 5
+} catch { exit 0 }
+if ($null -eq $r -or $null -eq $r.pending_count) { exit 0 }
+$pending = [int]$r.pending_count
+if ($pending -gt 0) {
+    [Console]::Error.WriteLine("Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping.")
+    exit 2
+}
+exit 0
+"""
+
+
+def _write_sprint_guard_hooks(project_id: str, root: Path | None = None) -> None:
+    """c0d2356d — write .claude/hooks/sprint_guard.{sh,ps1} into the repo with
+    ``project_id`` + MERIDIAN_URL baked in. Best-effort: a read-only /
+    site-packages install (no writable .claude) must never break the mandatory
+    handoff, so all failures are swallowed. Only ever writes the sprint_guard.*
+    files — never the token-rotation hooks.* scripts.
+
+    Skips the repo-side write during the test suite (it would dirty the committed
+    .claude/hooks); tests pass an isolated ``root`` to exercise it directly."""
+    if root is None and "PYTEST_CURRENT_TEST" in os.environ:
+        return
+    try:
+        repo_root = root if root is not None else Path(__file__).parent.parent
+        if root is None and not (repo_root / ".claude").exists():
+            return  # not a repo checkout with a .claude dir — nothing to do
+        hooks_dir = repo_root / ".claude" / "hooks"
+        url = os.environ.get("MERIDIAN_URL") or "http://localhost:7878"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        sh = _SPRINT_GUARD_SH.replace("__PROJECT_ID__", project_id).replace("__URL__", url)
+        ps1 = _SPRINT_GUARD_PS1.replace("__PROJECT_ID__", project_id).replace("__URL__", url)
+        (hooks_dir / "sprint_guard.sh").write_text(sh, encoding="utf-8")
+        (hooks_dir / "sprint_guard.ps1").write_text(ps1, encoding="utf-8")
+    except Exception:  # noqa: BLE001 — never break handoff on a hook-write failure
+        pass
+
+
 async def _generate_handoff_l0(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1730,6 +1806,9 @@ async def generate_handoff(
                 )
         except Exception:  # noqa: BLE001 — retrospective is best-effort
             pass
+    # c0d2356d — refresh the repo's Stop-hook sprint guard with this project's ID
+    # (self-guarded; never breaks handoff).
+    _write_sprint_guard_hooks(project_id)
     return str(out_path.resolve()), content
 
 

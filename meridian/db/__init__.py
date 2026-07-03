@@ -3932,6 +3932,22 @@ def _NEG_TS(ts: str) -> tuple[int, str]:
     return (1, inverted)
 
 
+async def count_pending_sprint_items(
+    db: aiosqlite.Connection, project_id: str
+) -> int:
+    """c0d2356d — count of not-yet-done sprint items (status pending/todo) for a
+    project. Backs the Stop-hook sprint guard's /sprint/pending_count endpoint."""
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM sprint_items "
+        "WHERE project_id = ? AND status IN ('pending', 'todo')",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0
+    return int(row["c"] if isinstance(row, dict) else row[0])
+
+
 async def get_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
