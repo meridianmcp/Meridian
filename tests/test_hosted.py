@@ -210,7 +210,8 @@ async def test_post_login_redirect_launch_open_waitlists_when_capacity_full(
         raise AssertionError("provision_neon_db should not run when free launch is full")
 
     monkeypatch.setenv("MERIDIAN_LAUNCH_OPEN", "true")
-    monkeypatch.delenv("MERIDIAN_FREE_LAUNCH_CAP", raising=False)
+    # d1cb1100 — default cap is now 1000, so pin it to 15 to exercise "full".
+    monkeypatch.setenv("MERIDIAN_FREE_LAUNCH_CAP", "15")
     monkeypatch.setattr(hosted_module, "provision_neon_db", fail_if_called)
 
     dest = await hosted_module._post_login_redirect(new_tenant, db)

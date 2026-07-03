@@ -613,6 +613,42 @@ def test_admin_health_403_when_password_required(monkeypatch, tmp_path):
         assert "password" in r.text.lower()
 
 
+def test_admin_stats_403_when_unauthenticated(client):
+    """d1cb1100 — GET /admin/stats returns 403 with no session."""
+    r = client.get("/admin/stats")
+    assert r.status_code == 403
+
+
+def test_admin_stats_json_for_admin(monkeypatch, tmp_path):
+    """d1cb1100 — admin gets launch/user stats: free_count, cap (+percent),
+    total_tenants, provisioned, waitlist."""
+    from meridian import db as db_module
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        monkeypatch.delenv("MERIDIAN_ADMIN_PASSWORD", raising=False)
+        monkeypatch.setenv("MERIDIAN_FREE_LAUNCH_CAP", "1000")
+        _auth_admin_session(client, monkeypatch, "stats-admin@example.com")
+        db = client.app.state.db
+
+        async def _seed():
+            t = await db_module.upsert_tenant(db, "free-user@example.com")
+            await db_module.update_tenant(
+                db, t["id"], neon_project_id="neon-x", neon_db_url="enc",
+            )
+            await db_module.add_waitlist_entry(db, "waiter@example.com", note="test")
+
+        _run(_seed())
+        r = client.get("/admin/stats")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["cap"] == 1000
+        assert body["free_count"] >= 1
+        assert body["provisioned"] >= 1
+        assert body["waitlist"] >= 1
+        assert body["total_tenants"] >= 1
+        assert 0.0 <= body["percent"] <= 100.0
+
+
 def test_admin_git_status_returns_shape(client):
     """GET /admin/git-status returns a dict with ahead/behind keys (ok either way)."""
     r = client.get("/admin/git-status")

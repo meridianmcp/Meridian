@@ -59,6 +59,39 @@ def _truthy(v: str | None) -> bool:
     return (v or "").strip().lower() not in ("", "0", "false", "no", "off")
 
 
+def auth_setup_health() -> dict[str, Any]:
+    """13583103 — self-hosted auth diagnostics.
+
+    Reports, per provider, whether it's configured and which required env vars
+    are missing, plus whether the session-signing secret is set and whether any
+    provider is usable at all. Returns names and booleans only — never secret
+    values — so it's safe to expose unauthenticated (like /health and /config).
+    """
+    required = {
+        "google": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+        "github": ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET"],
+        "microsoft": ["MICROSOFT_CLIENT_ID", "MICROSOFT_CLIENT_SECRET"],
+        # Magic-link sign-in can generate links without Resend, but can only
+        # deliver them by email when RESEND_API_KEY is set.
+        "magic_link": ["RESEND_API_KEY"],
+    }
+    providers: dict[str, Any] = {}
+    for name, keys in required.items():
+        missing = [k for k in keys if not _cfg(k)]
+        providers[name] = {
+            "configured": not missing,
+            "missing_env": missing,
+            "required_env": list(keys),
+        }
+    return {
+        "providers": providers,
+        # MERIDIAN_SESSION_SECRET (aliases SESSION_SECRET) signs session cookies;
+        # its absence falls back to an insecure dev default.
+        "session_secret_configured": bool(_cfg("MERIDIAN_SESSION_SECRET")),
+        "auth_available": any(p["configured"] for p in providers.values()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Cookie signing (itsdangerous)
 # ---------------------------------------------------------------------------
@@ -611,7 +644,7 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
         if db is not None:
             from . import db as db_module
 
-            free_cap = int(_cfg("MERIDIAN_FREE_LAUNCH_CAP", "15") or "15")
+            free_cap = int(_cfg("MERIDIAN_FREE_LAUNCH_CAP", "1000") or "1000")
             has_slot = bool(
                 (tenant or {}).get("neon_project_id")
                 or (tenant or {}).get("neon_db_url")

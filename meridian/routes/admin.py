@@ -68,6 +68,47 @@ async def admin_health_json(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/admin/stats")
+async def admin_stats_json(request: Request) -> dict[str, Any]:
+    """d1cb1100 — launch/user stats for the admin Users widget: free-tier count
+    vs the launch cap (+ percent), total tenants, provisioned count, waitlist."""
+    from ..hosted import (  # noqa: PLC0415
+        get_current_tenant, is_admin_db, check_admin_password, _cfg,
+    )
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="not authenticated")
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        raise HTTPException(status_code=403, detail="admin only")
+    if not check_admin_password(request):
+        raise HTTPException(status_code=403, detail="admin password required")
+
+    db = request.app.state.db
+
+    async def _count(sql: str) -> int:
+        async with db.execute(sql) as cur:
+            row = await cur.fetchone()
+        return (row[0] if row else 0) or 0
+
+    free_count = await db_module.count_tenants_by_plan(db, "free", provisioned_only=True)
+    cap = int(_cfg("MERIDIAN_FREE_LAUNCH_CAP", "1000") or "1000")
+    total_tenants = await _count("SELECT COUNT(*) FROM tenants")
+    provisioned = await _count(
+        "SELECT COUNT(*) FROM tenants "
+        "WHERE neon_project_id IS NOT NULL OR neon_db_url IS NOT NULL"
+    )
+    waitlist = len(await db_module.get_waitlist(db))
+    return {
+        "free_count": free_count,
+        "cap": cap,
+        "percent": round(100.0 * free_count / cap, 1) if cap else 0.0,
+        "total_tenants": total_tenants,
+        "provisioned": provisioned,
+        "waitlist": waitlist,
+    }
+
+
 @router.get("/admin/git-status")
 async def git_status() -> dict[str, Any]:
     """Check if local repo is behind/ahead of remote."""

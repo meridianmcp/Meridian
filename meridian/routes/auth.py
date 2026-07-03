@@ -132,3 +132,12 @@ async def auth_magic_verify(request: Request, token: str = ""):
     """
     from ..hosted import auth_magic_verify as _impl
     return await _impl(request, token)
+
+
+@router.get("/setup/health")
+async def setup_health(request: Request):
+    """13583103 — self-hosted diagnostics: which auth providers are configured
+    and which env vars are still missing. Public (reveals no secret values), so
+    a self-hoster can curl it to see why sign-in isn't working."""
+    from ..hosted import auth_setup_health as _impl
+    return _impl()
