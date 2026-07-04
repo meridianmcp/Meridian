@@ -943,6 +943,88 @@ async def _maybe_add_log_task_nudge(db: Any, task: dict[str, Any]) -> dict[str, 
     return task
 
 
+async def _build_context_refresh(db: Any, project_id: str) -> dict[str, Any] | None:
+    """Build the compact context-refresh dict for a project.
+
+    d8bd59c4 / bf51b12e — shared builder for both the explicit ``refresh_context``
+    tool and the planner context-refresh dispatch hook. COMPACT by design: counts
+    + ids + slugs, not full bodies. Returns None when the project does not exist.
+    """
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        return None
+    goal = await db_module.get_goal(db, project_id)
+    all_items = await db_module.get_sprint_items(db, project_id)
+    done = sum(1 for it in all_items if it.get("status") == "done")
+    total = len(all_items)
+    pending = [it for it in all_items if it.get("status") == "pending"]
+    active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
+    recent_handoffs = await db_module.get_handoffs(db, project_id, limit=3)
+    pinned = await db_module.get_pinned_decisions(db, project_id)
+    high_priority_decisions = [
+        {"id": d.get("id"), "title": (d.get("title") or "")[:120]}
+        for d in pinned if d.get("priority") == "urgent"
+    ][:5]
+    unvalidated_assumptions = [
+        {
+            "decision_id": d.get("id"),
+            "title": (d.get("title") or "")[:120],
+            "assumption_status": d.get("assumption_status"),
+        }
+        for d in pinned
+        if d.get("assumption") and d.get("assumption_status") != "confirmed"
+    ]
+    notes = await db_module.get_project_notes(db, project_id)
+    _rank = {"high": 0, "normal": 1, "low": 2}
+    key_notes = sorted(
+        [n for n in notes if n.get("slug")],
+        key=lambda n: _rank.get(n.get("priority"), 1),
+    )[:10]
+    key_note_slugs = [
+        {
+            "slug": n.get("slug"),
+            "title": (n.get("title") or "")[:100],
+            "kind": n.get("note_kind") or n.get("kind"),
+        }
+        for n in key_notes
+    ]
+    return {
+        "project_id": project_id,
+        "project_name": project.get("name"),
+        "sprint": (goal.get("sprint") or "") if goal else "",
+        "north_star": (goal.get("north_star") or "") if goal else "",
+        "sprint_progress": {
+            "done": done,
+            "total": total,
+            "pending": len(pending),
+            "percent_complete": round(100 * done / total) if total else 0,
+        },
+        "next_pending_items": [
+            {"id": it["id"], "title": (it.get("title") or "")[:100]}
+            for it in pending[:5]
+        ],
+        "active_session_id": (
+            active_sessions[0]["id"] if active_sessions else None
+        ),
+        "active_sessions": [
+            {"id": s.get("id"), "name": s.get("name")}
+            for s in active_sessions[:5]
+        ],
+        "recent_handoffs": [
+            {
+                "id": h.get("id"),
+                "session_id": h.get("session_id"),
+                "mode": h.get("mode"),
+                "created_at": h.get("created_at"),
+            }
+            for h in recent_handoffs
+        ],
+        "high_priority_decisions": high_priority_decisions,
+        "unvalidated_assumptions": unvalidated_assumptions,
+        "key_note_slugs": key_note_slugs,
+    }
+
+
 def _parse_touches_files(raw: Any) -> list[str]:
     """Decode a sprint item's touches_files field into normalized file paths."""
     if raw is None:
@@ -1278,6 +1360,32 @@ async def _fetch_recent_commits(
 # None, which is a legitimate handler return value (e.g. get_goal).
 _MISS: Any = object()
 
+# bf51b12e — planner context-refresh nudge.
+# Default set of tool names that trigger a compact context-refresh being
+# attached to a planner (non-executor) tool result. A workspace can override
+# this via workspace_settings.refresh_triggers (a JSON list). NOTE: add_insight,
+# not capture_insight — capture_insight was removed by b5ed8a61.
+_PLANNER_REFRESH_TRIGGERS = frozenset({
+    "add_insight",
+    "pin_decision",
+    "pin_workspace_decision",
+    "set_north_star",
+    "set_goal",
+    "generate_handoff",
+})
+
+# In-memory, best-effort per-process state for the planner context-refresh nudge.
+# This is intentionally NOT persisted: turn tracking + gating for a UX refresh
+# nudge is fine as best-effort per-process state (avoids a sessions-table
+# migration + a per-call DB write).
+#   _EXECUTOR_SESSIONS  — session_ids that started with role='executor'; the
+#                         nudge is planner-only, so these are skipped.
+#   _SESSION_REFRESH_STATE — session_id -> {"calls": int, "last_refresh": int};
+#                         "calls" counts tool calls seen, "last_refresh" is the
+#                         call index at which we last attached a refresh.
+_EXECUTOR_SESSIONS: set[str] = set()
+_SESSION_REFRESH_STATE: dict[str, dict] = {}
+
 
 async def _handle_project_tools(
     name: str,
@@ -1332,6 +1440,16 @@ async def _handle_project_tools(
             version=args.get("version"),
             mode=args.get("mode"),
         )
+        # bf51b12e — register executor sessions in-memory so the planner
+        # context-refresh hook skips them (the nudge is planner-only). Best-effort:
+        # any failure here must never break start_session.
+        try:
+            if args.get("role") == "executor" and isinstance(result, dict):
+                _sid = result.get("session_id") or result.get("session", {}).get("id")
+                if _sid:
+                    _EXECUTOR_SESSIONS.add(_sid)
+        except Exception:  # noqa: BLE001 — non-fatal
+            pass
         # b9d1b606 — expand fs proxy roots so the executor's repo_path is
         # accessible without a separate set_active_repo call.
         # b2a417ad — also point the Serena daemon pool at this project's repo so
@@ -3432,82 +3550,13 @@ async def _handle_planning_tools(
         # d8bd59c4 — single-call post-compaction recovery for planning chats.
         # COMPACT by design: counts + ids + slugs, not full bodies, so it can be
         # called the moment a chat feels disoriented without overflowing context.
+        # bf51b12e — the body now lives in the module-level _build_context_refresh
+        # builder so both the explicit tool and the dispatch hook share one path.
         project_id = args["project_id"]
-        project = await db_module.get_project(db, project_id)
-        if project is None:
+        result = await _build_context_refresh(db, project_id)
+        if result is None:
             raise ValueError("project not found")
-        goal = await db_module.get_goal(db, project_id)
-        all_items = await db_module.get_sprint_items(db, project_id)
-        done = sum(1 for it in all_items if it.get("status") == "done")
-        total = len(all_items)
-        pending = [it for it in all_items if it.get("status") == "pending"]
-        active_sessions = await db_module.get_sessions(
-            db, project_id, active_only=True
-        )
-        recent_handoffs = await db_module.get_handoffs(db, project_id, limit=3)
-        pinned = await db_module.get_pinned_decisions(db, project_id)
-        high_priority_decisions = [
-            {"id": d.get("id"), "title": (d.get("title") or "")[:120]}
-            for d in pinned if d.get("priority") == "urgent"
-        ][:5]
-        unvalidated_assumptions = [
-            {
-                "decision_id": d.get("id"),
-                "title": (d.get("title") or "")[:120],
-                "assumption_status": d.get("assumption_status"),
-            }
-            for d in pinned
-            if d.get("assumption") and d.get("assumption_status") != "confirmed"
-        ]
-        notes = await db_module.get_project_notes(db, project_id)
-        _rank = {"high": 0, "normal": 1, "low": 2}
-        key_notes = sorted(
-            [n for n in notes if n.get("slug")],
-            key=lambda n: _rank.get(n.get("priority"), 1),
-        )[:10]
-        key_note_slugs = [
-            {
-                "slug": n.get("slug"),
-                "title": (n.get("title") or "")[:100],
-                "kind": n.get("note_kind") or n.get("kind"),
-            }
-            for n in key_notes
-        ]
-        return {
-            "project_id": project_id,
-            "project_name": project.get("name"),
-            "sprint": (goal.get("sprint") or "") if goal else "",
-            "north_star": (goal.get("north_star") or "") if goal else "",
-            "sprint_progress": {
-                "done": done,
-                "total": total,
-                "pending": len(pending),
-                "percent_complete": round(100 * done / total) if total else 0,
-            },
-            "next_pending_items": [
-                {"id": it["id"], "title": (it.get("title") or "")[:100]}
-                for it in pending[:5]
-            ],
-            "active_session_id": (
-                active_sessions[0]["id"] if active_sessions else None
-            ),
-            "active_sessions": [
-                {"id": s.get("id"), "name": s.get("name")}
-                for s in active_sessions[:5]
-            ],
-            "recent_handoffs": [
-                {
-                    "id": h.get("id"),
-                    "session_id": h.get("session_id"),
-                    "mode": h.get("mode"),
-                    "created_at": h.get("created_at"),
-                }
-                for h in recent_handoffs
-            ],
-            "high_priority_decisions": high_priority_decisions,
-            "unvalidated_assumptions": unvalidated_assumptions,
-            "key_note_slugs": key_note_slugs,
-        }
+        return result
     return _MISS
 
 
@@ -3758,6 +3807,49 @@ async def _dispatch_mcp_tool(
     for _grp in _groups:
         _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
         if _result is not _MISS:
+            # bf51b12e — planner context-refresh nudge. Fully defensive: any error
+            # falls through to the untouched _result. In-memory turn tracking +
+            # gating (best-effort, per-process). Skips executor sessions entirely.
+            try:
+                if isinstance(_result, dict):
+                    session_id = args.get("session_id")
+                    if session_id:
+                        _state = _SESSION_REFRESH_STATE.setdefault(
+                            session_id, {"calls": 0, "last_refresh": 0}
+                        )
+                        _state["calls"] += 1
+                        if session_id not in _EXECUTOR_SESSIONS:
+                            settings = await db_module.get_workspace_settings(
+                                db, tenant_id=_mcp_tenant_id
+                            )
+                            if settings.get("auto_refresh_enabled"):
+                                _triggers = settings.get("refresh_triggers")
+                                enabled_triggers = (
+                                    _triggers if isinstance(_triggers, list)
+                                    else _PLANNER_REFRESH_TRIGGERS
+                                )
+                                _interval = settings.get("refresh_interval_turns") or 10
+                                _calls = _state["calls"]
+                                _last = _state["last_refresh"]
+                                _fire = (
+                                    name in enabled_triggers
+                                    or (_calls - _last) >= _interval
+                                )
+                                # One-per-call: only fire if we haven't already
+                                # refreshed at this call index.
+                                if _fire and _last < _calls:
+                                    project_id = args.get("project_id")
+                                    if project_id:
+                                        _refresh = await _build_context_refresh(
+                                            db, project_id
+                                        )
+                                        if _refresh is not None:
+                                            _state["last_refresh"] = _calls
+                                            r = dict(_result)
+                                            r["_context_refresh"] = _refresh
+                                            return r
+            except Exception:  # noqa: BLE001 — nudge must never break a tool call
+                pass
             return _result
     raise ValueError(f"unknown tool: {name}")
 

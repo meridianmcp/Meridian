@@ -369,6 +369,18 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(
         db, "workspace_settings", "loop_enabled_default", "INTEGER NOT NULL DEFAULT 1"
     )
+    # bf51b12e — planner context-refresh: workspace-global nudge config. When
+    # auto_refresh_enabled, the MCP dispatch hook attaches a compact context
+    # refresh to planner (non-executor) tool results either on a trigger tool or
+    # every refresh_interval_turns calls. refresh_triggers is a JSON list of tool
+    # names (NULL = use the built-in default trigger set).
+    await _migrate_add_column_if_missing(
+        db, "workspace_settings", "auto_refresh_enabled", "INTEGER NOT NULL DEFAULT 0"
+    )
+    await _migrate_add_column_if_missing(
+        db, "workspace_settings", "refresh_interval_turns", "INTEGER NOT NULL DEFAULT 10"
+    )
+    await _migrate_add_column_if_missing(db, "workspace_settings", "refresh_triggers", "TEXT")
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:

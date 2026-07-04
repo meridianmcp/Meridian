@@ -708,6 +708,9 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
     loop_enabled_default INTEGER NOT NULL DEFAULT 1,
+    auto_refresh_enabled INTEGER NOT NULL DEFAULT 0,
+    refresh_interval_turns INTEGER NOT NULL DEFAULT 10,
+    refresh_triggers TEXT,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -1961,7 +1964,13 @@ async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> No
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS execution_mode_default TEXT;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS code_intel_enabled_default INTEGER;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
-        "loop_enabled_default INTEGER NOT NULL DEFAULT 1"
+        "loop_enabled_default INTEGER NOT NULL DEFAULT 1;"
+        # bf51b12e — planner context-refresh config.
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "auto_refresh_enabled INTEGER NOT NULL DEFAULT 0;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "refresh_interval_turns INTEGER NOT NULL DEFAULT 10;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS refresh_triggers TEXT"
     )
 
 

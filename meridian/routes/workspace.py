@@ -154,6 +154,7 @@ async def update_workspace_settings_endpoint(
 ) -> dict[str, Any]:
     """Patch workspace-global defaults. Only the fields passed are changed."""
     nudge_thresh = body.get("log_task_sprint_nudge_threshold")
+    interval = body.get("refresh_interval_turns")
     return await db_module.update_workspace_settings(
         await _db(request),
         hitl_auto_answer_default=body.get("hitl_auto_answer_default"),
@@ -166,6 +167,10 @@ async def update_workspace_settings_endpoint(
         code_intel_enabled_default=body.get("code_intel_enabled_default"),
         # 76cf8bda — /loop auto-continue workspace default.
         loop_enabled_default=body.get("loop_enabled_default"),
+        # bf51b12e — planner context-refresh config.
+        auto_refresh_enabled=body.get("auto_refresh_enabled"),
+        refresh_interval_turns=int(interval) if interval is not None else None,
+        refresh_triggers=body.get("refresh_triggers"),
         tenant_id=await _tenant_id(request),
     )
 

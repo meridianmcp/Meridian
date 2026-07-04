@@ -672,6 +672,9 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
     loop_enabled_default INTEGER NOT NULL DEFAULT 1,
+    auto_refresh_enabled INTEGER NOT NULL DEFAULT 0,
+    refresh_interval_turns INTEGER NOT NULL DEFAULT 10,
+    refresh_triggers TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -9312,7 +9315,8 @@ async def get_workspace_settings(
         "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
         "log_task_sprint_nudge_threshold, handoff_template, "
         "execution_mode_default, code_intel_enabled_default, "
-        "loop_enabled_default, updated_at "
+        "loop_enabled_default, auto_refresh_enabled, refresh_interval_turns, "
+        "refresh_triggers, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -9336,6 +9340,18 @@ async def get_workspace_settings(
     # 76cf8bda — /loop auto-continue workspace default. Missing column/row ⇒
     # True (Meridian sessions default to auto-continue); a stored 0 turns it off.
     _loop_default = data.get("loop_enabled_default")
+    # bf51b12e — planner context-refresh config. refresh_triggers is a JSON list
+    # (NULL ⇒ None ⇒ hook uses its built-in default trigger set).
+    _refresh_triggers_raw = data.get("refresh_triggers")
+    _refresh_triggers: list[str] | None = None
+    if _refresh_triggers_raw:
+        try:
+            _decoded = json.loads(_refresh_triggers_raw)
+            if isinstance(_decoded, list):
+                _refresh_triggers = [str(t) for t in _decoded]
+        except Exception:  # noqa: BLE001 — malformed row ⇒ fall back to default
+            _refresh_triggers = None
+    _interval = data.get("refresh_interval_turns")
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -9347,6 +9363,9 @@ async def get_workspace_settings(
         "execution_mode_default": _emode if _emode in ("autonomous", "interactive") else None,
         "code_intel_enabled_default": (None if _ci_default is None else bool(_ci_default)),
         "loop_enabled_default": (True if _loop_default is None else bool(_loop_default)),
+        "auto_refresh_enabled": bool(data.get("auto_refresh_enabled")),
+        "refresh_interval_turns": (int(_interval) if _interval is not None else 10) or 10,
+        "refresh_triggers": _refresh_triggers,
         "updated_at": data.get("updated_at"),
     }
 
@@ -9362,6 +9381,9 @@ async def update_workspace_settings(
     execution_mode_default: str | None = None,
     code_intel_enabled_default: "bool | int | str | None" = None,
     loop_enabled_default: "bool | int | str | None" = None,
+    auto_refresh_enabled: "bool | int | str | None" = None,
+    refresh_interval_turns: int | None = None,
+    refresh_triggers: "list[str] | str | None" = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -9412,6 +9434,24 @@ async def update_workspace_settings(
         # 76cf8bda — /loop auto-continue default. Truthy/1 → 1, falsey/0 → 0.
         updates.append("loop_enabled_default = ?")
         params.append(1 if loop_enabled_default and loop_enabled_default not in ("0", "false", "False") else 0)
+    if auto_refresh_enabled is not None:
+        # bf51b12e — planner context-refresh toggle. Truthy/1 → 1, falsey/0 → 0.
+        updates.append("auto_refresh_enabled = ?")
+        params.append(1 if auto_refresh_enabled and auto_refresh_enabled not in ("0", "false", "False") else 0)
+    if refresh_interval_turns is not None:
+        # At least 1 turn between interval-based refreshes.
+        updates.append("refresh_interval_turns = ?")
+        params.append(max(1, int(refresh_interval_turns)))
+    if refresh_triggers is not None:
+        # A list ⇒ JSON-encode; "" clears (revert to default trigger set);
+        # any other string is stored verbatim (already JSON).
+        updates.append("refresh_triggers = ?")
+        if isinstance(refresh_triggers, list):
+            params.append(json.dumps(refresh_triggers))
+        elif isinstance(refresh_triggers, str):
+            params.append(refresh_triggers.strip() or None)
+        else:
+            params.append(None)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

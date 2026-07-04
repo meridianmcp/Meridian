@@ -4633,6 +4633,45 @@ async def test_workspace_settings_db_defaults(db):
 
 
 # ---------------------------------------------------------------------------
+# bf51b12e — planner context-refresh config on workspace_settings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_refresh_config_defaults(db):
+    """New context-refresh columns default to off / interval 10 / no triggers."""
+    ws = await db_module.get_workspace_settings(db)
+    assert ws["auto_refresh_enabled"] is False
+    assert ws["refresh_interval_turns"] == 10
+    assert ws["refresh_triggers"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_refresh_config_roundtrip(db):
+    """auto_refresh_enabled / refresh_interval_turns / refresh_triggers roundtrip."""
+    ws = await db_module.update_workspace_settings(
+        db,
+        auto_refresh_enabled=True,
+        refresh_interval_turns=3,
+        refresh_triggers=["pin_decision", "set_goal"],
+    )
+    assert ws["auto_refresh_enabled"] is True
+    assert ws["refresh_interval_turns"] == 3
+    assert ws["refresh_triggers"] == ["pin_decision", "set_goal"]
+    # Persists on re-read.
+    ws2 = await db_module.get_workspace_settings(db)
+    assert ws2["auto_refresh_enabled"] is True
+    assert ws2["refresh_interval_turns"] == 3
+    assert ws2["refresh_triggers"] == ["pin_decision", "set_goal"]
+    # interval is clamped to a minimum of 1.
+    ws3 = await db_module.update_workspace_settings(db, refresh_interval_turns=0)
+    assert ws3["refresh_interval_turns"] == 1
+    # "" clears the trigger list (reverts to the default trigger set → None).
+    ws4 = await db_module.update_workspace_settings(db, refresh_triggers="")
+    assert ws4["refresh_triggers"] is None
+
+
+# ---------------------------------------------------------------------------
 # 637dd900 — workspace layer tenant isolation
 # ---------------------------------------------------------------------------
 
@@ -11794,6 +11833,98 @@ async def test_dispatch_mcp_tool_set_sprint(db):
     assert result["sprint"] == "week-1-auth"
 
 
+# ---------------------------------------------------------------------------
+# bf51b12e — planner context-refresh dispatch hook
+# ---------------------------------------------------------------------------
+
+
+async def _new_project_and_session(db, name):
+    """Create a project + start a session, returning (project_id, session_id)."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, name)
+    sess = await srv._dispatch_mcp_tool(
+        "start_session", {"project_id": p["id"]}, db, "/tmp"
+    )
+    return p["id"], sess["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_fires_on_trigger_tool(db):
+    """auto_refresh_enabled + a trigger tool (add_insight) + a session_id ⇒ the
+    result carries '_context_refresh'."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-trigger")
+    await db_module.update_workspace_settings(db, auto_refresh_enabled=True)
+    result = await srv._dispatch_mcp_tool(
+        "add_insight",
+        {"project_id": pid, "session_id": sid, "title": "T", "body": "B"},
+        db, "/tmp",
+    )
+    assert "_context_refresh" in result
+    assert result["_context_refresh"]["project_id"] == pid
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_absent_when_disabled(db):
+    """auto_refresh disabled ⇒ no '_context_refresh' even on a trigger tool."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-disabled")
+    # auto_refresh_enabled defaults False — do not enable it.
+    result = await srv._dispatch_mcp_tool(
+        "add_insight",
+        {"project_id": pid, "session_id": sid, "title": "T", "body": "B"},
+        db, "/tmp",
+    )
+    assert "_context_refresh" not in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_skips_executor_session(db):
+    """A session registered as role=executor never gets '_context_refresh'."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    p = await db_module.create_project(db, "refresh-executor")
+    sess = await srv._dispatch_mcp_tool(
+        "start_session", {"project_id": p["id"], "role": "executor"}, db, "/tmp"
+    )
+    sid = sess["session_id"]
+    assert sid in mh._EXECUTOR_SESSIONS  # registered by the start_session hook
+    await db_module.update_workspace_settings(db, auto_refresh_enabled=True)
+    result = await srv._dispatch_mcp_tool(
+        "add_insight",
+        {"project_id": p["id"], "session_id": sid, "title": "T", "body": "B"},
+        db, "/tmp",
+    )
+    assert "_context_refresh" not in result
+
+
+@pytest.mark.asyncio
+async def test_build_context_refresh_returns_expected_keys(db):
+    """_build_context_refresh returns the compact orientation dict shape."""
+    from meridian.mcp import handler as mh
+    p = await db_module.create_project(db, "refresh-builder")
+    await db_module.set_goal(db, p["id"], "the goal")
+    ctx = await mh._build_context_refresh(db, p["id"])
+    assert ctx is not None
+    for key in (
+        "project_id", "project_name", "sprint", "north_star",
+        "sprint_progress", "next_pending_items", "recent_handoffs",
+        "high_priority_decisions", "unvalidated_assumptions", "key_note_slugs",
+    ):
+        assert key in ctx, f"missing key {key}"
+    assert ctx["project_id"] == p["id"]
+    # Unknown project ⇒ None (caller raises "project not found").
+    assert await mh._build_context_refresh(db, "no-such-project") is None
+
+
 @pytest.mark.asyncio
 async def test_dispatch_mcp_tool_sprint_items_round_trip(db):
     """add_sprint_item / get_sprint_items / complete_sprint_item via _dispatch_mcp_tool."""
@@ -15297,3 +15428,107 @@ def test_patch_sprint_item_touches_resources(client):
     resources = json.loads(data["touches_resources"] or "[]")
     assert "note:my-note" in resources
     assert "decision:d1" in resources
+
+
+# ---------------------------------------------------------------------------
+# 46c83e55 — meridian.toml self-host config readers (env > toml > default)
+# ---------------------------------------------------------------------------
+
+
+def _point_toml_at(monkeypatch, tmp_path, text):
+    """Write ``text`` to a tmp meridian.toml and make toml_config read it."""
+    import meridian.toml_config as tc
+    p = tmp_path / "meridian.toml"
+    p.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(tc, "_toml_path", lambda: p)
+    return tc
+
+
+def _clear_refresh_env(monkeypatch):
+    for var in (
+        "MERIDIAN_AUTO_REFRESH",
+        "MERIDIAN_REFRESH_INTERVAL_TURNS",
+        "MERIDIAN_REFRESH_TRIGGERS",
+        "MERIDIAN_LOOP_ENABLED",
+        "MERIDIAN_MAX_TURNS",
+        "MERIDIAN_FILESYSTEM_ROOTS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_context_refresh_config_hardcoded_default(monkeypatch):
+    """No env, no toml ⇒ built-in defaults (disabled / 10 / default trigger set)."""
+    import meridian.toml_config as tc
+    _clear_refresh_env(monkeypatch)
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+    cfg = tc.get_context_refresh_config()
+    assert cfg["auto_refresh_enabled"] is False
+    assert cfg["refresh_interval_turns"] == 10
+    assert cfg["refresh_triggers"] == tc._DEFAULT_REFRESH_TRIGGERS
+    assert "pin_decision" in cfg["refresh_triggers"]
+
+
+def test_context_refresh_config_toml_over_default(monkeypatch, tmp_path):
+    """[context_refresh] toml table overrides the hardcoded default."""
+    _clear_refresh_env(monkeypatch)
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[context_refresh]\n"
+        "auto_refresh_enabled = true\n"
+        "refresh_interval_turns = 5\n"
+        'refresh_triggers = ["set_goal", "pin_decision"]\n',
+    )
+    cfg = tc.get_context_refresh_config()
+    assert cfg["auto_refresh_enabled"] is True
+    assert cfg["refresh_interval_turns"] == 5
+    assert cfg["refresh_triggers"] == ["set_goal", "pin_decision"]
+
+
+def test_context_refresh_config_env_over_toml(monkeypatch, tmp_path):
+    """Env vars win over the toml table (env-first precedence)."""
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[context_refresh]\n"
+        "auto_refresh_enabled = false\n"
+        "refresh_interval_turns = 5\n"
+        'refresh_triggers = ["set_goal"]\n',
+    )
+    monkeypatch.setenv("MERIDIAN_AUTO_REFRESH", "1")
+    monkeypatch.setenv("MERIDIAN_REFRESH_INTERVAL_TURNS", "20")
+    monkeypatch.setenv("MERIDIAN_REFRESH_TRIGGERS", "add_insight, generate_handoff")
+    cfg = tc.get_context_refresh_config()
+    assert cfg["auto_refresh_enabled"] is True
+    assert cfg["refresh_interval_turns"] == 20
+    assert cfg["refresh_triggers"] == ["add_insight", "generate_handoff"]
+
+
+def test_self_host_defaults_env_over_toml_over_default(monkeypatch, tmp_path):
+    """get_self_host_defaults resolves loop/max_turns/filesystem_roots env>toml>default."""
+    import meridian.toml_config as tc
+    _clear_refresh_env(monkeypatch)
+    # 1. hardcoded default (no toml, no env).
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+    d = tc.get_self_host_defaults()
+    assert d["loop_enabled_default"] is True
+    assert d["max_turns_default"] == 0
+    assert d["filesystem_roots"] == []
+    # 2. toml over default.
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[meridian]\n"
+        "loop_enabled_default = false\n"
+        "max_turns_default = 25\n"
+        'filesystem_roots = ["/repo", "/outputs"]\n',
+    )
+    d = tc.get_self_host_defaults()
+    assert d["loop_enabled_default"] is False
+    assert d["max_turns_default"] == 25
+    assert d["filesystem_roots"] == ["/repo", "/outputs"]
+    # 3. env over toml.
+    monkeypatch.setenv("MERIDIAN_LOOP_ENABLED", "true")
+    monkeypatch.setenv("MERIDIAN_MAX_TURNS", "7")
+    monkeypatch.setenv("MERIDIAN_FILESYSTEM_ROOTS", "/a,/b,/c")
+    d = tc.get_self_host_defaults()
+    assert d["loop_enabled_default"] is True
+    assert d["max_turns_default"] == 7
+    assert d["filesystem_roots"] == ["/a", "/b", "/c"]
