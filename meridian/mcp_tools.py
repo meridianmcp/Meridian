@@ -320,27 +320,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "file_path": {"type": "string", "description": "Path to a server-accessible .docx file."}},
          "required": ["file_path"]}},
-    {"name": "capture_insight", "description":
-        "Save a key takeaway from a planning (claude.ai) conversation in one call — "
-        "persists a prominent kind='insight' note that's searchable, filterable, and "
-        "surfaced in generate_handoff(mode='planner'), WITHOUT the auto-capture "
-        "'Session summary' noise checkpoint() makes. Pass body (markdown) OR "
-        "bullet_points (a list, joined into a bullet list). Use mid-conversation "
-        "whenever you're afraid of losing context.",
-     "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "title": {"type": "string"},
-         "body": {"type": "string", "description": "Markdown body. Omit if using bullet_points."},
-         "bullet_points": {"type": "array", "items": {"type": "string"}, "description": "Key takeaways, joined into a markdown bullet list."},
-         "tags": {"type": "string", "description": "Optional comma-separated tags (an 'insight' tag is always added)."},
-         "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes appear first in planner context and generate_handoff."}},
-         "required": ["title"]}},
     {"name": "add_insight", "description":
         "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
         "decisions. A first-class knowledge type SEPARATE from decisions (choices with a "
         "lifecycle) and notes (reference). horizon sets its shelf-life: 'permanent' insights "
         "ALWAYS surface in get_planning_brief; 'year'/'quarter' are time-boxed. Returns the "
-        "stored insight. (Distinct from capture_insight, which saves a planner note.)",
+        "stored insight.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "title": {"type": "string"},

@@ -1516,7 +1516,7 @@ async def _handle_task_tools(
         except Exception:  # noqa: BLE001
             _tpl_stale = False
         # 2d932f60 — scan this session's task log for insight candidates so the
-        # handoff prompts a capture_insight()/pin_decision() before context is lost.
+        # handoff prompts an add_insight()/pin_decision() before context is lost.
         _insight_hints: list[dict[str, str]] = []
         try:
             _ih_tasks = await db_module.get_tasks(db, args["project_id"], limit=15)
@@ -1599,7 +1599,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, capture_insight, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -1776,26 +1776,6 @@ async def _handle_notes_decisions(
             return {"error": f"file not found: {fp}"}
         except Exception as exc:  # noqa: BLE001
             return {"error": f"could not parse document: {exc}"}
-    if name == "capture_insight":
-        # db9edba3 — one-call insight capture for planning (claude.ai) sessions:
-        # persists a kind='insight' note (prominent in the dashboard + surfaced in
-        # the planner handoff) WITHOUT the auto-capture "Session summary" noise.
-        validate_input_size(args.get("title"), "insight title", 500)
-        _ins_body = args.get("body")
-        _bullets = args.get("bullet_points")
-        if (not _ins_body) and isinstance(_bullets, list) and _bullets:
-            _ins_body = "\n".join(f"- {str(b).strip()}" for b in _bullets if str(b).strip())
-        _ins_body = _ins_body or ""
-        validate_input_size(_ins_body, "insight body", 10_000_000)
-        if not _ins_body:
-            return {"error": "capture_insight requires body or non-empty bullet_points"}
-        _ins_tags = args.get("tags")
-        _ins_tags = f"{_ins_tags},insight" if _ins_tags else "insight"
-        return await db_module.add_project_note(
-            db, args["project_id"], args["title"], _ins_body,
-            _ins_tags, kind="insight",
-            priority=args.get("priority", "normal"),
-        )
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)
@@ -2684,7 +2664,7 @@ async def _handle_sprint_tools(
         if _ins_sig:
             _extra["insight_hint"] = (
                 f"The wording ('{_ins_sig}') looks like a decision/insight — consider "
-                "capture_insight() or pin_decision() so it isn't lost at session end."
+                "add_insight() or pin_decision() so it isn't lost at session end."
             )
         if _extra:
             _new_item = {**_new_item, **_extra}

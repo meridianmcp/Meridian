@@ -896,7 +896,7 @@ def test_add_sprint_item_proposes_insight_capture():
             "force": True,
         }, db, "/tmp"))
         assert "insight_hint" in hinted
-        assert "capture_insight" in hinted["insight_hint"]
+        assert "add_insight" in hinted["insight_hint"]
         plain = _run(mh._dispatch_mcp_tool("add_sprint_item", {
             "project_id": proj["id"], "version": "v1",
             "title": "Add a logout button to the header",
@@ -1510,32 +1510,6 @@ def test_dispatch_reconcile_sprint_drift_project_not_found_raises():
         _run(db.close())
 
 
-def test_dispatch_capture_insight_requires_body():
-    db = _make_db()
-    try:
-        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ins"}, db, "/tmp"))
-        out = _run(mh._dispatch_mcp_tool(
-            "capture_insight", {"project_id": proj["id"], "title": "t"}, db, "/tmp",
-        ))
-        assert "requires body" in out["error"]
-    finally:
-        _run(db.close())
-
-
-def test_dispatch_capture_insight_from_bullets():
-    db = _make_db()
-    try:
-        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ins2"}, db, "/tmp"))
-        out = _run(mh._dispatch_mcp_tool(
-            "capture_insight",
-            {"project_id": proj["id"], "title": "t", "bullet_points": ["a", "b"]},
-            db, "/tmp",
-        ))
-        assert "error" not in out
-    finally:
-        _run(db.close())
-
-
 def test_dispatch_update_sprint_item_not_found_returns_error():
     db = _make_db()
     try:
@@ -1716,7 +1690,6 @@ def test_broad_tool_happy_paths():
         call("add_note", {"project_id": pid, "title": "wiki", "body": "note body"})
         call("add_note", {"project_id": pid, "title": "MANUAL: do thing", "body": "todo"})
         assert isinstance(call("get_notes", {"project_id": pid}), list)
-        call("capture_insight", {"project_id": pid, "title": "insight", "body": "learned X"})
 
         # Workspace layer
         call("add_workspace_note", {"title": "ws", "body": "b"})

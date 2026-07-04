@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_capture_insight_notes_to_insights']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -2166,6 +2166,48 @@ async def _migrate_insights_table(db: aiosqlite.Connection) -> None:
         ");"
         "CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project_id, horizon);"
     )
+
+
+async def _migrate_sprint_item_slug(db: aiosqlite.Connection) -> None:
+    """b944c905 — sprint_items.slug: a human-readable per-project id derived from
+    the title (UUID stays the primary key). Idempotent; mirrored in
+    pg_adapter._migrate_pg_sprint_item_slug."""
+    await _migrate_add_column_if_missing(db, "sprint_items", "slug", "TEXT")
+
+
+async def _migrate_capture_insight_notes_to_insights(db: aiosqlite.Connection) -> None:
+    """b5ed8a61 — retire the legacy ``capture_insight`` tool: MOVE every
+    ``project_notes`` row with ``note_kind = 'insight'`` into the dedicated
+    ``insights`` table (shipped by 0b711a9d).
+
+    Per row: INSERT into ``insights`` (reusing the note's id, horizon='quarter',
+    status='active') THEN DELETE the note — insert-before-delete so a crash
+    mid-row can never lose data. Reusing the note id makes this a pure MOVE and
+    idempotent: after it runs there are no ``note_kind = 'insight'`` rows left,
+    so a re-run selects nothing and is a no-op (and the reused id would collide
+    on the PRIMARY KEY were it somehow re-attempted). Mirrored in
+    pg_adapter._migrate_pg_capture_insight_notes_to_insights.
+    """
+    async with db.execute(
+        "SELECT id, project_id, title, body, tags FROM project_notes "
+        "WHERE note_kind = 'insight'"
+    ) as cur:
+        rows = list(await cur.fetchall())
+    if not rows:
+        return
+    for r in rows:
+        nid = r["id"] if isinstance(r, dict) else r[0]
+        pid = r["project_id"] if isinstance(r, dict) else r[1]
+        title = r["title"] if isinstance(r, dict) else r[2]
+        body = r["body"] if isinstance(r, dict) else r[3]
+        tags = r["tags"] if isinstance(r, dict) else r[4]
+        await db.execute(
+            "INSERT INTO insights (id, project_id, title, body, horizon, tags, status) "
+            "VALUES (?, ?, ?, ?, 'quarter', ?, 'active')",
+            (nid, pid, title, body or "", tags),
+        )
+        await db.execute("DELETE FROM project_notes WHERE id = ?", (nid,))
+    await db.commit()
 
 
 async def _migrate_github_connections(db: aiosqlite.Connection) -> None:

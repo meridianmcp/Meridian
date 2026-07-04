@@ -518,7 +518,8 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     notes TEXT,
     feedback_thumb SMALLINT,
     feedback_note TEXT,
-    milestone_type TEXT NOT NULL DEFAULT 'task'
+    milestone_type TEXT NOT NULL DEFAULT 'task',
+    slug TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -1085,6 +1086,41 @@ async def _migrate_pg_insights_table(conn: PostgresConnection) -> None:
         ");"
         "CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project_id, horizon);"
     )
+
+
+async def _migrate_pg_sprint_item_slug(conn: PostgresConnection) -> None:
+    """b944c905 — sprint_items.slug human-readable id (mirrors SQLite). Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS slug TEXT"
+    )
+
+
+async def _migrate_pg_capture_insight_notes_to_insights(conn: PostgresConnection) -> None:
+    """b5ed8a61 — retire the legacy ``capture_insight`` tool: MOVE every
+    ``project_notes`` row with ``note_kind = 'insight'`` into the dedicated
+    ``insights`` table (mirrors SQLite _migrate_capture_insight_notes_to_insights).
+
+    Per row: INSERT into ``insights`` (reusing the note's id, horizon='quarter',
+    status='active') THEN DELETE the note — insert-before-delete so a crash
+    mid-row can never lose data. Reusing the note id makes this a pure MOVE and
+    idempotent: after it runs there are no ``note_kind = 'insight'`` rows left,
+    so a re-run selects nothing and is a no-op. PG runs autocommit — no commit.
+    The adapter rewrites ``?`` → ``%s`` in the raw SQL below.
+    """
+    async with conn.execute(
+        "SELECT id, project_id, title, body, tags FROM project_notes "
+        "WHERE note_kind = 'insight'"
+    ) as cur:
+        rows = list(await cur.fetchall())
+    if not rows:
+        return
+    for r in rows:
+        await conn.execute(
+            "INSERT INTO insights (id, project_id, title, body, horizon, tags, status) "
+            "VALUES (?, ?, ?, ?, 'quarter', ?, 'active')",
+            (r["id"], r["project_id"], r["title"], r["body"] or "", r["tags"]),
+        )
+        await conn.execute("DELETE FROM project_notes WHERE id = ?", (r["id"],))
 
 
 async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
@@ -2367,4 +2403,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_codebase_graph_entities,
     _migrate_pg_pending_goal,
     _migrate_pg_insights_table,
+    _migrate_pg_sprint_item_slug,
+    _migrate_pg_capture_insight_notes_to_insights,
 )

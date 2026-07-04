@@ -265,7 +265,10 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- 4f02340e: mixed-ownership task chains. owner of a subtask: 'human' | 'ai'
     -- | NULL (unassigned). Drives the alternating claim/handoff state machine
     -- in _advance_task_chain. NULL on parents and on legacy single-owner items.
-    owner TEXT DEFAULT NULL
+    owner TEXT DEFAULT NULL,
+    -- b944c905: human-readable per-project id (title slug, deduped). UUID stays
+    -- the primary key; slug is the board-facing identifier.
+    slug TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -862,6 +865,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_provision_queue(db)
     await _migrate_codebase_graph_entities(db)
     await _migrate_insights_table(db)
+    await _migrate_sprint_item_slug(db)
+    await _migrate_capture_insight_notes_to_insights(db)
     return db
 
 
@@ -3175,6 +3180,35 @@ async def get_sprint_items_cached(
     return items
 
 
+def _sprint_item_slug_base(text: str) -> str:
+    """b944c905 — kebab-case a title into a short human-readable id base."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return "-".join(words[:6])[:60].strip("-") or "item"
+
+
+async def _unique_sprint_slug(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """b944c905 — ``base``, or base-2/base-3/… if the slug is taken in this
+    project (mirrors _unique_note_slug; slugs are unique per project)."""
+    slug = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM sprint_items WHERE project_id = ? AND slug = ?",
+            (project_id, slug),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
 async def add_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3187,6 +3221,7 @@ async def add_sprint_item(
     milestone_type: str = "task",
     touches_resources: Any = None,
     force: bool = False,
+    slug: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -3245,13 +3280,18 @@ async def add_sprint_item(
     # 501ec93f — normalize + validate typed resource identifiers (raises on bad input).
     resources_json = serialize_touches_resources(touches_resources)
     iid = _new_id()
+    # b944c905 — auto-populate a human-readable slug from the title (or a
+    # caller-supplied one), deduped per project.
+    _item_slug = await _unique_sprint_slug(
+        db, project_id, _sprint_item_slug_base(slug or title)
+    )
     await db.execute(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
-        "failure_mode, milestone_type, touches_resources) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "failure_mode, milestone_type, touches_resources, slug) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
-         depends_on, failure_mode or "continue", milestone_type, resources_json),
+         depends_on, failure_mode or "continue", milestone_type, resources_json, _item_slug),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)

@@ -56,7 +56,7 @@ _INSIGHT_SIGNALS = (
 
 def detect_insight_candidate(text: "str | None") -> "str | None":
     """Return the first insight-signalling phrase in ``text`` (case-insensitive),
-    or None. Used to PROPOSE (never auto-write) a capture_insight()/pin_decision()
+    or None. Used to PROPOSE (never auto-write) an add_insight()/pin_decision()
     so critical planning insights aren't lost at session end (2d932f60)."""
     if not text:
         return None

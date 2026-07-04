@@ -6607,10 +6607,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_codebase_graph_entities",
         "_migrate_pg_pending_goal",
         "_migrate_pg_insights_table",
+        "_migrate_pg_sprint_item_slug",
+        "_migrate_pg_capture_insight_notes_to_insights",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 79
+    assert len(allnames) == len(set(allnames)) == 81
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -13257,6 +13259,23 @@ async def test_get_sprint_progress_version_filter(db):
     assert res["by_status"].get("pending") == 1
 
 
+@pytest.mark.asyncio
+async def test_sprint_item_slug_autopopulated(db):
+    """b944c905 — add_sprint_item auto-populates a human-readable slug from the
+    title (deduped per project). human_id (the assignee) is left untouched."""
+    p = await db_module.create_project(db, "slug-proj")
+    pid = p["id"]
+    a = await db_module.add_sprint_item(db, pid, "v1", "Wire the OAuth Login Flow")
+    assert a["slug"] == "wire-the-oauth-login-flow"
+    assert a.get("human_id") is None  # slug is NOT the assignee field
+    # Same title (forced past the dup guard) → -2 suffix.
+    b = await db_module.add_sprint_item(db, pid, "v1", "Wire the OAuth Login Flow", force=True)
+    assert b["slug"] == "wire-the-oauth-login-flow-2"
+    # A caller-supplied slug base is slugified too.
+    c = await db_module.add_sprint_item(db, pid, "v1", "Something else", slug="Custom Slug")
+    assert c["slug"] == "custom-slug"
+
+
 # ---------------------------------------------------------------------------
 # 2b93cb59 — live-queue hardening: provisional_complete, 10s cache, tier limits
 # ---------------------------------------------------------------------------
@@ -13627,50 +13646,53 @@ async def test_claim_sprint_item_soft_file_overlap_warning(db):
 
 
 # ---------------------------------------------------------------------------
-# Planning chat save mechanism (db9edba3)
+# capture_insight retirement — legacy note_kind='insight' → insights table (b5ed8a61)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_capture_insight_body(db):
-    import meridian.server as srv
+async def test_migrate_capture_insight_notes_to_insights(db):
+    """b5ed8a61 — the migration MOVES legacy kind='insight' project_notes into the
+    dedicated insights table: the note is gone afterward and the insight is present."""
+    from meridian.db.migrations import _migrate_capture_insight_notes_to_insights
 
-    p = await db_module.create_project(db, "ins-body")
-    res = await srv._dispatch_mcp_tool(
-        "capture_insight",
-        {"project_id": p["id"], "title": "Pricing", "body": "Workspace tiers, not per-seat."},
-        db, "/tmp",
+    p = await db_module.create_project(db, "insight-migrate")
+    note = await db_module.add_project_note(
+        db, p["id"], "Pricing takeaway", "Workspace tiers, not per-seat.",
+        "strategy", kind="insight",
     )
-    assert res["note_kind"] == "insight"
-    assert "Workspace tiers" in res["body"]
-    assert "insight" in (res.get("tags") or "")
+    # Precondition: the note exists as a kind='insight' project_note.
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM project_notes WHERE note_kind = 'insight'"
+    ) as cur:
+        pre = await cur.fetchone()
+    assert (pre["c"] if isinstance(pre, dict) else pre[0]) == 1
 
+    await _migrate_capture_insight_notes_to_insights(db)
 
-@pytest.mark.asyncio
-async def test_capture_insight_bullet_points(db):
-    import meridian.server as srv
+    # The note is gone from project_notes...
+    gone = await db_module.get_project_note(db, note["id"])
+    assert gone is None
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM project_notes WHERE note_kind = 'insight'"
+    ) as cur:
+        post = await cur.fetchone()
+    assert (post["c"] if isinstance(post, dict) else post[0]) == 0
 
-    p = await db_module.create_project(db, "ins-bullets")
-    res = await srv._dispatch_mcp_tool(
-        "capture_insight",
-        {"project_id": p["id"], "title": "Takeaways",
-         "bullet_points": ["Ship device flow", "Defer WS tunnel"]},
-        db, "/tmp",
-    )
-    assert res["note_kind"] == "insight"
-    assert "- Ship device flow" in res["body"]
-    assert "- Defer WS tunnel" in res["body"]
+    # ...and present in the insights table (id reused → pure MOVE).
+    insights = await db_module.get_insights(db, p["id"])
+    assert len(insights) == 1
+    moved = insights[0]
+    assert moved["id"] == note["id"]
+    assert moved["title"] == "Pricing takeaway"
+    assert moved["body"] == "Workspace tiers, not per-seat."
+    assert moved["horizon"] == "quarter"
+    assert moved["status"] == "active"
+    assert moved["tags"] == "strategy"
 
-
-@pytest.mark.asyncio
-async def test_capture_insight_requires_content(db):
-    import meridian.server as srv
-
-    p = await db_module.create_project(db, "ins-empty")
-    res = await srv._dispatch_mcp_tool(
-        "capture_insight", {"project_id": p["id"], "title": "Empty"}, db, "/tmp",
-    )
-    assert "error" in res
+    # Idempotent: a second run is a no-op (no rows to move, no duplicate insight).
+    await _migrate_capture_insight_notes_to_insights(db)
+    assert len(await db_module.get_insights(db, p["id"])) == 1
 
 
 def test_select_strategic_notes_includes_insights():
