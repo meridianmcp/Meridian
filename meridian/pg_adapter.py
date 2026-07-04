@@ -695,7 +695,10 @@ CREATE TABLE IF NOT EXISTS workspace_sprint_items (
     updated_at TEXT NOT NULL DEFAULT ({_TS}),
     completed_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant ON workspace_sprint_items(tenant_id, status);
+-- idx_workspace_sprint_items_tenant is created by _migrate_pg_workspace_sprint_board,
+-- NOT inline here: a pre-tenant_id copy of this table would make this unguarded
+-- executescript CREATE INDEX crash startup (see the init_pg_db note above about the
+-- 2026-06-13 outage). The migration runs in _run_pg_migrations, which survives it.
 
 -- v3.4 — workspace-level settings singleton (tenant-global defaults).
 CREATE TABLE IF NOT EXISTS workspace_settings (
@@ -728,7 +731,11 @@ CREATE TABLE IF NOT EXISTS blog_posts (
     published_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
-CREATE INDEX IF NOT EXISTS idx_blog_posts_tenant ON blog_posts(tenant_id);
+-- idx_blog_posts_tenant is created by _migrate_pg_blog_posts_tenant (which also
+-- ALTERs the column onto pre-8843250f blog_posts tables). It must NOT be inline
+-- here: blog_posts predates tenant_id, so on an existing DB this unguarded
+-- executescript CREATE INDEX hit a missing column and crash-looped startup
+-- (exit 3) on the 2026-07-04 promote. The guarded migration handles both paths.
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).

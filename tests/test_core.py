@@ -6684,6 +6684,88 @@ def test_pg_migration_registry_matches_historical_order():
     assert len(allnames) == len(set(allnames)) == 82
 
 
+def test_core_schema_literals_have_no_inline_tenant_id_indexes():
+    """Regression guard for the 2026-07-04 prod outage.
+
+    Both base schema literals — Postgres ``CREATE_TABLES_CORE`` and SQLite
+    ``CREATE_TABLES`` — are applied via an *unguarded* ``executescript`` at
+    startup, so one failing statement aborts the whole boot (Postgres
+    crash-looped every prod machine, exit 3; SQLite raised 'no such column:
+    tenant_id'). ``tenant_id`` is added to ``blog_posts`` /
+    ``workspace_sprint_items`` by later ALTER migrations, so on an existing DB
+    ``CREATE TABLE IF NOT EXISTS`` keeps the old columnless table and an inline
+    ``CREATE INDEX ... (tenant_id)`` fails. Those indexes must live ONLY in the
+    guarded ``_migrate_*`` migrations. CI runs SQLite-only (PG fixtures skip
+    without TEST_DATABASE_URL), so this static check guards both literals.
+    """
+    from meridian.pg_adapter import CREATE_TABLES_CORE
+    from meridian.db import CREATE_TABLES
+
+    def _executable_sql(sql: str) -> str:
+        # Drop ``--`` comment lines so the assertions match executable SQL only,
+        # not the explanatory comments that (intentionally) name these indexes.
+        return "\n".join(
+            ln for ln in sql.splitlines() if not ln.lstrip().startswith("--")
+        )
+
+    for name, literal in (
+        ("CREATE_TABLES_CORE", CREATE_TABLES_CORE),
+        ("CREATE_TABLES", CREATE_TABLES),
+    ):
+        body = _executable_sql(literal)
+        assert "blog_posts(tenant_id)" not in body, name
+        assert "workspace_sprint_items(tenant_id" not in body, name
+        assert "idx_blog_posts_tenant" not in body, name
+        assert "idx_workspace_sprint_items_tenant" not in body, name
+
+
+@pytest.mark.asyncio
+async def test_create_tables_survives_pre_tenant_id_blog_posts():
+    """Behavioral regression for the 2026-07-04 outage.
+
+    Exercises the exact statement that crashed startup —
+    ``executescript(CREATE_TABLES)`` in ``init_db`` — against a connection that
+    already holds a ``blog_posts`` predating the ``tenant_id`` column. Before the
+    fix this raised 'no such column: tenant_id' from the inline
+    ``CREATE INDEX ... (tenant_id)`` (and, because ``init_db`` never closed the
+    half-open connection, left a non-daemon aiosqlite worker thread that hung
+    interpreter shutdown for hours). The connection is closed in ``finally`` so a
+    re-broken literal fails fast instead of zombie-hanging the suite.
+    """
+    import aiosqlite
+    from meridian.db import CREATE_TABLES
+    from meridian.db import migrations as _mig
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        conn.row_factory = aiosqlite.Row
+        # A blog_posts from before 8843250f added tenant_id.
+        await conn.executescript(
+            "CREATE TABLE blog_posts ("
+            " id TEXT PRIMARY KEY, title TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,"
+            " body_md TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft',"
+            " created_at TEXT, updated_at TEXT, published_at TEXT);"
+            "INSERT INTO blog_posts (id,title,slug) VALUES ('b1','Old Post','old-post');"
+        )
+        await conn.commit()
+        # The base schema literal must apply cleanly over the pre-existing table.
+        await conn.executescript(CREATE_TABLES)
+        await conn.commit()
+        # The guarded migration then ALTERs tenant_id + its index idempotently.
+        await _mig._migrate_blog_posts_tenant(conn)
+        async with conn.execute("PRAGMA table_info(blog_posts)") as cur:
+            cols = {r["name"] for r in await cur.fetchall()}
+        assert "tenant_id" in cols
+        # Pre-existing data survived the upgrade.
+        async with conn.execute(
+            "SELECT title FROM blog_posts WHERE id='b1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["title"] == "Old Post"
+    finally:
+        await conn.close()
+
+
 def test_default_agent_instructions_has_code_intel_protocol():
     """Phase 4 — the mandatory code-intel protocol ships in the default rules."""
     from meridian.agent_defaults import DEFAULT_AGENT_INSTRUCTIONS

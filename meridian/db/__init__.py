@@ -594,7 +594,12 @@ CREATE TABLE IF NOT EXISTS blog_posts (
     published_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
-CREATE INDEX IF NOT EXISTS idx_blog_posts_tenant ON blog_posts(tenant_id);
+-- idx_blog_posts_tenant is created by _migrate_blog_posts_tenant (which ALTERs
+-- tenant_id onto pre-8843250f tables first). It must NOT be inline here: this
+-- literal is run via an unguarded executescript, and on an existing DB
+-- CREATE TABLE IF NOT EXISTS keeps the old columnless blog_posts, so an inline
+-- CREATE INDEX ... (tenant_id) crashes startup ('no such column: tenant_id').
+-- Same missing-column class took prod down on the 2026-07-04 promote.
 
 CREATE TABLE IF NOT EXISTS active_worktrees (
     id TEXT PRIMARY KEY,
@@ -658,8 +663,10 @@ CREATE TABLE IF NOT EXISTS workspace_sprint_items (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     completed_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant
-    ON workspace_sprint_items(tenant_id, status);
+-- idx_workspace_sprint_items_tenant is created by _migrate_workspace_sprint_board.
+-- Not inline here for the same reason as idx_blog_posts_tenant above: an inline
+-- CREATE INDEX on tenant_id in this unguarded literal would crash startup on any
+-- pre-existing copy of this table that lacks the column.
 
 -- v3.4 — workspace-level settings: tenant-global defaults that every project
 -- session can read at startup (e.g. a default HITL auto-answer posture, a

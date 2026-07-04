@@ -1112,9 +1112,12 @@ async def _migrate_blog_posts(db: aiosqlite.Connection) -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status)"
     )
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_blog_posts_tenant ON blog_posts(tenant_id)"
-    )
+    # idx_blog_posts_tenant is created by _migrate_blog_posts_tenant, which first
+    # ALTERs tenant_id onto pre-8843250f tables. Creating it here would crash on an
+    # existing blog_posts that predates the column (CREATE TABLE IF NOT EXISTS
+    # can't add it) — the same missing-column crash that took prod down on the
+    # 2026-07-04 promote via the Postgres CORE schema. Mirror PG: index lives in
+    # the tenant migration only.
     await db.commit()
 
 
