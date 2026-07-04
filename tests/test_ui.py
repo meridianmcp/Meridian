@@ -269,6 +269,26 @@ def test_dashboard_has_timeline_tab(soup, js):
     )
 
 
+def test_dashboard_has_connection_health_dot(soup, js):
+    """bb16f9a7 — the connection-health indicator dot is present and wired.
+
+    The dashboard has no persistent SSE/WebSocket, so the dot is driven off the
+    central api() REST helper: green on a recent success, red on failure, amber
+    when no successful call landed within the stale window.
+    """
+    # 1) The element exists in the sidebar-footer connection indicator.
+    dot = soup.find(id="connection-health-dot")
+    assert dot is not None, (
+        "dashboard.html must include the #connection-health-dot element (bb16f9a7)"
+    )
+    # 2) The frontend source drives it from api() success/failure + staleness.
+    assert "connection-health-dot" in js, (
+        "health dot must be referenced/updated by the frontend source"
+    )
+    assert "_refreshHealthDot" in js
+    assert "bb16f9a7" in js
+
+
 def test_dashboard_js_has_github_connect_card(js):
     """dashboard.js includes the GitHub connect card in Settings."""
     assert "github/connect" in js

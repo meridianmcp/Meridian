@@ -2209,25 +2209,16 @@ async def _migrate_capture_insight_notes_to_insights(db: aiosqlite.Connection) -
     on the PRIMARY KEY were it somehow re-attempted). Mirrored in
     pg_adapter._migrate_pg_capture_insight_notes_to_insights.
     """
-    async with db.execute(
-        "SELECT id, project_id, title, body, tags FROM project_notes "
-        "WHERE note_kind = 'insight'"
-    ) as cur:
-        rows = list(await cur.fetchall())
-    if not rows:
-        return
-    for r in rows:
-        nid = r["id"] if isinstance(r, dict) else r[0]
-        pid = r["project_id"] if isinstance(r, dict) else r[1]
-        title = r["title"] if isinstance(r, dict) else r[2]
-        body = r["body"] if isinstance(r, dict) else r[3]
-        tags = r["tags"] if isinstance(r, dict) else r[4]
-        await db.execute(
-            "INSERT INTO insights (id, project_id, title, body, horizon, tags, status) "
-            "VALUES (?, ?, ?, ?, 'quarter', ?, 'active')",
-            (nid, pid, title, body or "", tags),
-        )
-        await db.execute("DELETE FROM project_notes WHERE id = ?", (nid,))
+    # bb16f9a7 — set-based (was a per-row loop) so a large project_notes table
+    # can't slow-loop and delay init_db past the deploy health-check window.
+    # Still a pure idempotent MOVE: reuse the note id, insert-before-delete, and
+    # a re-run selects nothing (no insight-kind rows left).
+    await db.execute(
+        "INSERT INTO insights (id, project_id, title, body, horizon, tags, status) "
+        "SELECT id, project_id, title, COALESCE(body, ''), 'quarter', tags, 'active' "
+        "FROM project_notes WHERE note_kind = 'insight'"
+    )
+    await db.execute("DELETE FROM project_notes WHERE note_kind = 'insight'")
     await db.commit()
 
 

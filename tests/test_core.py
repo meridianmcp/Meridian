@@ -11356,6 +11356,87 @@ def test_mcp_sse_cors_headers_on_post(client):
     assert r.headers.get("access-control-allow-origin") == "*"
 
 
+# ---------------------------------------------------------------------------
+# bb16f9a7 — SSE keepalive heartbeat wrapper (_with_sse_heartbeat)
+# ---------------------------------------------------------------------------
+
+
+async def _collect(agen, limit):
+    """Drain up to ``limit`` frames from an async generator, then stop it."""
+    out = []
+    async for frame in agen:
+        out.append(frame)
+        if len(out) >= limit:
+            break
+    await agen.aclose()
+    return out
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_passes_data_through_without_ping():
+    """Frames from a fast upstream pass through promptly — no spurious pings."""
+    async def upstream():
+        yield "event: endpoint\ndata: /x\n\n"
+        yield "data: real\n\n"
+
+    # Long interval so the timer never fires while real data is flowing.
+    frames = [f async for f in server_module._with_sse_heartbeat(upstream(), interval=30)]
+    assert frames == ["event: endpoint\ndata: /x\n\n", "data: real\n\n"]
+    assert server_module._SSE_HEARTBEAT_FRAME not in frames
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_emits_ping_after_idle_interval():
+    """A silent upstream triggers a ``: ping`` keepalive after the interval."""
+    started = asyncio.Event()
+
+    async def idle_upstream():
+        # Never yields until cancelled/closed — simulates an idle SSE connection.
+        started.set()
+        while True:
+            await asyncio.sleep(3600)
+        yield  # pragma: no cover - unreachable, marks this an async generator
+
+    # Tiny interval keeps the test fast; the wrapper must still emit exactly one
+    # ping per idle interval with no upstream data.
+    frames = await _collect(
+        server_module._with_sse_heartbeat(idle_upstream(), interval=0.02),
+        limit=3,
+    )
+    assert started.is_set()
+    assert frames == [server_module._SSE_HEARTBEAT_FRAME] * 3
+    assert server_module._SSE_HEARTBEAT_FRAME == ": ping\n\n"
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_interleaves_ping_then_delivers_data():
+    """After an idle ping, a subsequent real frame is still delivered (shielded read)."""
+    async def slow_then_data():
+        await asyncio.sleep(0.05)   # idle gap longer than the interval → ping
+        yield "data: after-idle\n\n"
+
+    frames = await _collect(
+        server_module._with_sse_heartbeat(slow_then_data(), interval=0.02),
+        limit=4,
+    )
+    # At least one ping fired during the idle gap, and the real frame arrived.
+    assert server_module._SSE_HEARTBEAT_FRAME in frames
+    assert "data: after-idle\n\n" in frames
+    # The real data frame comes after the ping(s).
+    assert frames.index("data: after-idle\n\n") == len(frames) - 1
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_stops_when_upstream_exhausts():
+    """An empty upstream ends the wrapper cleanly (no hang, no ping)."""
+    async def empty():
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    frames = [f async for f in server_module._with_sse_heartbeat(empty(), interval=0.01)]
+    assert frames == []
+
+
 def test_mcp_responses_carry_csp_header(client):
     """All /mcp route responses carry a strict Content-Security-Policy header.
 

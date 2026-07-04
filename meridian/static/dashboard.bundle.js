@@ -1,18 +1,64 @@
 "use strict";
 (() => {
   // meridian/static/dashboard-core.ts
+  var _HEALTH_STALE_MS = 45e3;
+  var _lastApiOkAt = 0;
+  var _lastApiFailed = false;
+  function _setHealthDot(color, title) {
+    const dot = document.getElementById("connection-health-dot");
+    if (!dot) return;
+    dot.style.background = color;
+    dot.title = title;
+  }
+  function _refreshHealthDot() {
+    if (_lastApiFailed) {
+      _setHealthDot("#ef4444", "Disconnected \u2014 last request failed");
+      return;
+    }
+    if (_lastApiOkAt === 0) {
+      _setHealthDot("#6b7280", "Connecting\u2026");
+      return;
+    }
+    const age = Date.now() - _lastApiOkAt;
+    if (age > _HEALTH_STALE_MS) {
+      _setHealthDot("#f59e0b", "Idle / stale \u2014 no recent server response");
+    } else {
+      _setHealthDot("#22c55e", "Connected");
+    }
+  }
+  window._refreshHealthDot = _refreshHealthDot;
+  function _markApiOk() {
+    _lastApiOkAt = Date.now();
+    _lastApiFailed = false;
+    _refreshHealthDot();
+  }
+  function _markApiFail() {
+    _lastApiFailed = true;
+    _refreshHealthDot();
+  }
+  if (typeof window !== "undefined" && !window._healthDotTimer) {
+    window._healthDotTimer = setInterval(_refreshHealthDot, 5e3);
+  }
   async function api2(path, opts = {}) {
     const state2 = window.state || {};
     const headers = { "Content-Type": "application/json" };
     if (state2.activeWorkspaceTenantId) {
       headers["X-Workspace-Tenant-Id"] = state2.activeWorkspaceTenantId;
     }
-    const r3 = await fetch(path, { headers, ...opts });
+    let r3;
+    try {
+      r3 = await fetch(path, { headers, ...opts });
+    } catch (netErr) {
+      _markApiFail();
+      throw netErr;
+    }
     if (!r3.ok) {
       if (r3.status === 403 && (typeof isDemoMode === "function" ? isDemoMode() : false)) {
         if (typeof showDemoReadonlyToast === "function") showDemoReadonlyToast();
         throw new Error("demo_readonly");
       }
+      if (r3.status >= 500) _markApiFail();
+      else _markApiOk();
       const text = await r3.text();
       const err = new Error(`${r3.status}: ${text}`);
       err.status = r3.status;
@@ -20,6 +66,7 @@
       err.responseText = text;
       throw err;
     }
+    _markApiOk();
     return r3.status === 204 ? null : r3.json();
   }
   window.api = api2;

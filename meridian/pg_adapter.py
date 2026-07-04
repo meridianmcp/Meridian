@@ -994,16 +994,38 @@ async def _run_pg_migrations(conn: PostgresConnection, migrations: tuple) -> Non
     A migration error must never abort startup — see init_pg_db for the
     outage that motivated this. Each migration is idempotent, so a failure
     here is retried on the next boot.
+
+    bb16f9a7/1280c66e — bound how long any single migration statement may wait
+    on a lock or run, so a canary deploy can't HANG the app past Fly's health
+    check when the still-live old machine holds a lock on a hot table (e.g. an
+    ``ALTER TABLE sprint_items ADD COLUMN`` behind active sprint-board queries).
+    A timed-out statement raises → caught below → logged → retried next boot once
+    contention clears. Reset afterward so app queries keep the pool's defaults.
     """
-    for migration in migrations:
-        try:
-            await migration(conn)
-        except Exception as exc:  # noqa: BLE001 — startup must survive any migration error
-            logger.warning(
-                "pg migration %s failed (continuing startup): %s",
-                getattr(migration, "__name__", repr(migration)),
-                exc,
-            )
+    _timeouts_set = False
+    try:
+        await conn.execute("SET lock_timeout = '5s'")
+        await conn.execute("SET statement_timeout = '120s'")
+        _timeouts_set = True
+    except Exception:  # noqa: BLE001 — best-effort guard; never block startup
+        pass
+    try:
+        for migration in migrations:
+            try:
+                await migration(conn)
+            except Exception as exc:  # noqa: BLE001 — startup must survive any migration error
+                logger.warning(
+                    "pg migration %s failed (continuing startup): %s",
+                    getattr(migration, "__name__", repr(migration)),
+                    exc,
+                )
+    finally:
+        if _timeouts_set:
+            try:
+                await conn.execute("SET lock_timeout = DEFAULT")
+                await conn.execute("SET statement_timeout = DEFAULT")
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def _migrate_pg_sprint_items_claimed_at(conn: PostgresConnection) -> None:
@@ -1113,20 +1135,14 @@ async def _migrate_pg_capture_insight_notes_to_insights(conn: PostgresConnection
     so a re-run selects nothing and is a no-op. PG runs autocommit — no commit.
     The adapter rewrites ``?`` → ``%s`` in the raw SQL below.
     """
-    async with conn.execute(
-        "SELECT id, project_id, title, body, tags FROM project_notes "
-        "WHERE note_kind = 'insight'"
-    ) as cur:
-        rows = list(await cur.fetchall())
-    if not rows:
-        return
-    for r in rows:
-        await conn.execute(
-            "INSERT INTO insights (id, project_id, title, body, horizon, tags, status) "
-            "VALUES (?, ?, ?, ?, 'quarter', ?, 'active')",
-            (r["id"], r["project_id"], r["title"], r["body"] or "", r["tags"]),
-        )
-        await conn.execute("DELETE FROM project_notes WHERE id = ?", (r["id"],))
+    # bb16f9a7 — set-based (was per-row) so it can't slow-loop and delay startup
+    # on a large table. Pure idempotent MOVE (id reuse; re-run selects nothing).
+    await conn.execute(
+        "INSERT INTO insights (id, project_id, title, body, horizon, tags, status) "
+        "SELECT id, project_id, title, COALESCE(body, ''), 'quarter', tags, 'active' "
+        "FROM project_notes WHERE note_kind = 'insight'"
+    )
+    await conn.execute("DELETE FROM project_notes WHERE note_kind = 'insight'")
 
 
 async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
