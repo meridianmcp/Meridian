@@ -354,6 +354,11 @@ async def lifespan(app: FastAPI):
         db = await db_module.init_db(db_path)
     app.state.db = db
 
+    # 1d69d5d9 — seed workspace_settings from meridian.toml on first boot so the
+    # 46c83e55 toml keys actually take effect (self-host). Guarded; no-op when a
+    # settings row already exists or no toml/env config is present.
+    await db_module.seed_workspace_settings_from_toml(db)
+
     # c00b1ccf — wire the offline codebase-graph-snapshot searcher into handoff
     # code-pointer enrichment. Fallback used when generate_handoff isn't handed a
     # live tunnel searcher; it reads the persisted snapshot so a fresh session

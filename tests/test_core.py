@@ -5350,6 +5350,35 @@ def test_workspace_settings_http_loop_default(client):
     assert client.get("/workspace/settings").json()["loop_enabled_default"] is True
 
 
+def test_seed_workspace_settings_from_toml(monkeypatch):
+    """1d69d5d9 — meridian.toml (via env) seeds the singleton workspace_settings on
+    first boot; once the row exists the DB is authoritative (idempotent)."""
+    import asyncio
+    from meridian import toml_config
+    db = asyncio.run(db_module.init_db(":memory:"))
+    try:
+        monkeypatch.setattr(toml_config, "load_toml", lambda: None)
+        for k in ("MERIDIAN_AUTO_REFRESH", "MERIDIAN_REFRESH_INTERVAL_TURNS",
+                  "MERIDIAN_REFRESH_TRIGGERS", "MERIDIAN_LOOP_ENABLED",
+                  "MERIDIAN_MAX_TURNS", "MERIDIAN_FILESYSTEM_ROOTS"):
+            monkeypatch.delenv(k, raising=False)
+        # No config present → no seed (nothing to consume).
+        asyncio.run(db_module.seed_workspace_settings_from_toml(db))
+        # Provide config via env → the singleton row is seeded from it.
+        monkeypatch.setenv("MERIDIAN_AUTO_REFRESH", "true")
+        monkeypatch.setenv("MERIDIAN_REFRESH_INTERVAL_TURNS", "7")
+        asyncio.run(db_module.seed_workspace_settings_from_toml(db))
+        ws = asyncio.run(db_module.get_workspace_settings(db))
+        assert ws["auto_refresh_enabled"] is True
+        assert ws["refresh_interval_turns"] == 7
+        # Idempotent: a second boot with different env does NOT overwrite the DB.
+        monkeypatch.setenv("MERIDIAN_REFRESH_INTERVAL_TURNS", "40")
+        asyncio.run(db_module.seed_workspace_settings_from_toml(db))
+        assert asyncio.run(db_module.get_workspace_settings(db))["refresh_interval_turns"] == 7
+    finally:
+        asyncio.run(db.close())
+
+
 def test_queue_session_http_roundtrip(client):
     pid = client.post("/projects", json={"name": "qhttp"}).json()["id"]
     assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None

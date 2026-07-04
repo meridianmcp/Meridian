@@ -9569,6 +9569,43 @@ async def update_workspace_settings(
     return await get_workspace_settings(db, tenant_id=tenant_id)
 
 
+async def seed_workspace_settings_from_toml(db: aiosqlite.Connection) -> None:
+    """1d69d5d9 — seed the self-host singleton workspace_settings row from
+    meridian.toml (env > toml > default, via toml_config) on first boot. This is
+    what makes the 46c83e55 toml readers actually take effect. No-op when the
+    singleton row already exists (the DB is authoritative once configured) or
+    when no self-host config (a meridian.toml file or MERIDIAN_* env var) is
+    present. Fully guarded — a seed failure must never block server startup."""
+    try:
+        from .. import toml_config  # local: avoid import cycle at module load
+        _has_cfg = toml_config.load_toml() is not None or any(
+            os.environ.get(k) for k in (
+                "MERIDIAN_AUTO_REFRESH", "MERIDIAN_REFRESH_INTERVAL_TURNS",
+                "MERIDIAN_REFRESH_TRIGGERS", "MERIDIAN_LOOP_ENABLED",
+                "MERIDIAN_MAX_TURNS", "MERIDIAN_FILESYSTEM_ROOTS",
+            )
+        )
+        if not _has_cfg:
+            return
+        async with db.execute(
+            "SELECT id FROM workspace_settings WHERE id = ?", ("singleton",)
+        ) as cur:
+            if await cur.fetchone() is not None:
+                return  # already configured — the DB row wins over toml
+        refresh = toml_config.get_context_refresh_config()
+        defaults = toml_config.get_self_host_defaults()
+        await update_workspace_settings(
+            db,
+            auto_refresh_enabled=bool(refresh.get("auto_refresh_enabled")),
+            refresh_interval_turns=int(refresh.get("refresh_interval_turns") or 10),
+            refresh_triggers=refresh.get("refresh_triggers"),
+            loop_enabled_default=bool(defaults.get("loop_enabled_default", True)),
+            tenant_id=None,
+        )
+    except Exception:  # noqa: BLE001 — seeding must never block startup
+        pass
+
+
 # ---------------------------------------------------------------------------
 # registered_hostnames — token-based OAuth hooks (control-plane / auth DB)
 # ---------------------------------------------------------------------------
