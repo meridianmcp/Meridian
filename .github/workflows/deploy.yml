@@ -192,10 +192,12 @@ jobs:
       - name: Record pre-deploy image
         id: pre_deploy
         run: |
-          # 1280c66e — flyctl emits PascalCase keys (Ref), so the old d.get('ref')
-          # was always empty and rollback could never fire. Parse defensively:
-          # handle a dict or a single-element list, try Ref/ref/Reference.
-          IMAGE=$(flyctl image show --app meridian-hosted --json 2>/dev/null | python3 -c "import sys,json; raw=sys.stdin.read().strip(); d=json.loads(raw) if raw else {}; d=(d[0] if isinstance(d,list) and d else d); print((d.get('Ref') or d.get('ref') or d.get('Reference') or '') if isinstance(d,dict) else '')" 2>/dev/null || echo "")
+          # flyctl image show --json returns a LIST of machine image records with
+          # NO Ref key — the keys are Registry/Repository/Tag/Digest. Build the
+          # image ref ourselves (digest-pinned for an immutable rollback target,
+          # tag as fallback). The old Ref/ref/Reference parse always yielded '' so
+          # rollback could never fire (observed on the 2026-07-04 promote).
+          IMAGE=$(flyctl image show --app meridian-hosted --json 2>/dev/null | python3 -c "import sys,json; raw=sys.stdin.read().strip(); d=json.loads(raw) if raw else []; m=(d[0] if isinstance(d,list) and d else (d if isinstance(d,dict) else {})); reg=m.get('Registry',''); repo=m.get('Repository',''); tag=m.get('Tag',''); dig=m.get('Digest',''); print((reg+'/'+repo+'@'+dig) if (reg and repo and dig) else ((reg+'/'+repo+':'+tag) if (reg and repo and tag) else ''))" 2>/dev/null || echo "")
           echo "Pre-deploy image: ${IMAGE:-<none>}"
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
         env:
@@ -213,12 +215,14 @@ jobs:
         id: smoke
         run: |
           if [ "${{ inputs.hotfix }}" = "yes" ]; then sleep 5; else sleep 10; fi
-          # 1280c66e — a canary rollout can briefly 403/5xx at the edge before the
-          # new machine is fully in rotation; retry so a transient blip doesn't
-          # trigger a false rollback. Only fail after sustained non-200.
+          # Hit the Fly ORIGIN, not the Cloudflare-fronted usemeridian.us: the
+          # edge 403s GitHub Actions runner IPs (bot rule), which caused a false
+          # rollback trigger on the 2026-07-04 promote even though prod was healthy
+          # (the preview smoke already hits *.fly.dev for this same reason). Retry
+          # so a brief canary-rotation blip doesn't fail the deploy.
           STATUS=000
           for i in $(seq 1 6); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://usemeridian.us/health || echo 000)
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://meridian-hosted.fly.dev/health || echo 000)
             echo "Attempt $i: /health = $STATUS"
             [ "$STATUS" = "200" ] && break
             sleep 10
