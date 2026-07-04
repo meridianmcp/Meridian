@@ -580,18 +580,21 @@ CREATE INDEX IF NOT EXISTS idx_file_symbol_claims_session
     ON file_symbol_claims(session_id);
 
 -- Blog CMS (6234f9b8): admin-authored posts; draft until published.
+-- 8843250f: workspace-scoped via tenant_id + archived lifecycle status.
 CREATE TABLE IF NOT EXISTS blog_posts (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     slug TEXT NOT NULL UNIQUE,
     body_md TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'draft'
-        CHECK (status IN ('draft','published')),
+        CHECK (status IN ('draft','published','archived')),
+    tenant_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     published_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
+CREATE INDEX IF NOT EXISTS idx_blog_posts_tenant ON blog_posts(tenant_id);
 
 CREATE TABLE IF NOT EXISTS active_worktrees (
     id TEXT PRIMARY KEY,
@@ -870,6 +873,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_insights_table(db)
     await _migrate_sprint_item_slug(db)
     await _migrate_capture_insight_notes_to_insights(db)
+    await _migrate_blog_posts_tenant(db)
     return db
 
 
@@ -7488,6 +7492,105 @@ async def delete_blog_post(db: aiosqlite.Connection, post_id: str) -> bool:
     cur = await db.execute("DELETE FROM blog_posts WHERE id = ?", (post_id,))
     await db.commit()
     return cur.rowcount > 0
+
+
+_BLOG_STATUSES = ("draft", "published", "archived")
+
+
+def _blog_url(post: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Attach a computed ``url`` (``/blog/<slug>``) to a blog-post dict."""
+    if post is None:
+        return None
+    slug = post.get("slug")
+    post["url"] = f"/blog/{slug}" if slug else None
+    return post
+
+
+async def save_blog_post(
+    db: aiosqlite.Connection,
+    title: str,
+    body: str = "",
+    *,
+    status: str = "draft",
+    tenant_id: str | None = None,
+    slug: str | None = None,
+    post_id: str | None = None,
+) -> dict[str, Any]:
+    """8843250f — create (or update, when ``post_id`` is given) a
+    workspace-scoped blog post with a draft|published|archived lifecycle.
+
+    Workspace-scoped by ``tenant_id`` like ``add_workspace_note``. Reuses the
+    existing ``_slugify_title`` / ``_unique_blog_slug`` helpers. Sets
+    ``published_at`` the first time a post becomes 'published'. Returns the
+    stored row with a computed ``/blog/<slug>`` ``url`` field.
+    """
+    title = (title or "").strip() or "Untitled"
+    status = status if status in _BLOG_STATUSES else "draft"
+
+    if post_id:
+        existing = await get_blog_post(db, post_id)
+        if existing is None:
+            raise ValueError("blog post not found")
+        new_slug = await _unique_blog_slug(
+            db, _slugify_title(slug or existing.get("slug") or title), exclude_id=post_id
+        )
+        # First publish stamps published_at; keep it once set.
+        pub = existing.get("published_at")
+        pub_sql = ", published_at = COALESCE(published_at, datetime('now'))" if status == "published" else ""
+        await db.execute(
+            "UPDATE blog_posts SET title = ?, body_md = ?, slug = ?, status = ?, "
+            "tenant_id = ?, updated_at = datetime('now')" + pub_sql + " WHERE id = ?",
+            (title, body or "", new_slug, status, tenant_id, post_id),
+        )
+        await db.commit()
+        return _blog_url(await get_blog_post(db, post_id))
+
+    bid = _new_id()
+    new_slug = await _unique_blog_slug(db, _slugify_title(slug or title))
+    if status == "published":
+        await db.execute(
+            "INSERT INTO blog_posts (id, title, slug, body_md, status, tenant_id, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            (bid, title, new_slug, body or "", status, tenant_id),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO blog_posts (id, title, slug, body_md, status, tenant_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (bid, title, new_slug, body or "", status, tenant_id),
+        )
+    await db.commit()
+    return _blog_url(await get_blog_post(db, bid))
+
+
+async def get_blog_posts(
+    db: aiosqlite.Connection,
+    tenant_id: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """8843250f — list workspace-scoped blog posts, newest first.
+
+    Scoped to ``tenant_id`` (like ``get_workspace_notes``) and optionally
+    filtered by ``status`` (draft|published|archived). Each row carries a
+    computed ``url`` (``/blog/<slug>``) rather than a stored column.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status in _BLOG_STATUSES:
+        clauses.append("status = ?")
+        params.append(status)
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    if scope:
+        clauses.append(scope)
+        params.extend(scope_params)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db.execute(
+        "SELECT * FROM blog_posts" + where
+        + " ORDER BY COALESCE(published_at, updated_at) DESC, created_at DESC",
+        params or None,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_blog_url(r) for r in (_row_to_dict(row) for row in rows) if r]  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------

@@ -1717,7 +1717,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -2019,6 +2019,20 @@ async def _handle_notes_decisions(
             # 76cf8bda — /loop auto-continue workspace default.
             loop_enabled_default=args.get("loop_enabled_default"),
             tenant_id=_mcp_tenant_id,
+        )
+    if name == "save_blog_post":
+        validate_input_size(args.get("title"), "blog title", 500)
+        validate_input_size(args.get("body"), "blog body", 1_000_000)
+        return await db_module.save_blog_post(
+            db, args["title"], args.get("body", ""),
+            status=args.get("status", "draft"),
+            slug=args.get("slug"),
+            post_id=args.get("id"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "get_blog_posts":
+        return await db_module.get_blog_posts(
+            db, tenant_id=_mcp_tenant_id, status=args.get("status"),
         )
     if name == "add_workspace_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)

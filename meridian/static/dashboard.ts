@@ -3180,6 +3180,8 @@ function buildTabBody(project: any) {
 
       <button class="vtab-btn" data-vtab="insights" title="Insights — durable strategic understanding">💡</button>
 
+      <button class="vtab-btn" data-vtab="blog" title="Blog — workspace posts (draft/published/archived)">✍️</button>
+
     </div>
 
     <div class="vtab-drawer open" id="drawer-${project.id}">
@@ -3960,6 +3962,22 @@ function buildTabBody(project: any) {
 
       </div>
 
+      <div class="drawer-panel" id="drawer-blog-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>BLOG · workspace</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="blog-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading…</div>
+
+        </div>
+
+      </div>
+
     </div>
 
     <section class="claude-handoff-panel">
@@ -4207,6 +4225,8 @@ function buildTabBody(project: any) {
         if (vtab === 'documents') loadDocumentsTab(project.id);
 
         if (vtab === 'insights') loadInsightsTab(project.id);
+
+        if (vtab === 'blog') loadBlogTab(project.id);
 
       };
 
@@ -7151,6 +7171,53 @@ async function loadInsightsTab(projectId: any) {
         ${ins.body ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;white-space:pre-wrap">${escapeHtml(String(ins.body))}</div>` : ''}
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t: string) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(t)}</span>`).join('')}</div>` : ''}
       </div>`;
+    }
+  }
+  body.innerHTML = html;
+}
+
+
+async function loadBlogTab(projectId: any) {
+  // Blog is WORKSPACE-scoped, not per-project — read the workspace endpoint.
+  const body = document.getElementById(`blog-body-${projectId}`);
+  if (!body) return;
+  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+
+  let posts: any[] = [];
+  try {
+    posts = ((await api('/workspace/blog')) as any[]) || [];
+  } catch (e: any) {
+    body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load blog posts: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+
+  const GROUPS: Array<{ key: string; label: string; color: string }> = [
+    { key: 'draft', label: 'DRAFTS', color: 'var(--muted)' },
+    { key: 'published', label: 'PUBLISHED', color: 'var(--accent)' },
+    { key: 'archived', label: 'ARCHIVED', color: 'var(--warning, #d29922)' },
+  ];
+
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <div style="font-size:11px;color:var(--text)"><b>${posts.length}</b> post${posts.length === 1 ? '' : 's'}</div>
+  </div>
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Author via the <code>save_blog_post</code> MCP tool; published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+
+  if (!posts.length) {
+    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one with <code>save_blog_post(title, body, status="published")</code>.</div>`;
+  } else {
+    for (const g of GROUPS) {
+      const inGroup = posts.filter(p => String(p.status || 'draft') === g.key);
+      if (!inGroup.length) continue;
+      html += `<div style="font-size:9px;color:${g.color};letter-spacing:.06em;margin:12px 0 6px">${g.label} · ${inGroup.length}</div>`;
+      for (const p of inGroup) {
+        const slug = String(p.slug || '');
+        const url = String(p.url || (slug ? `/blog/${slug}` : ''));
+        html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+          <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(p.title || 'Untitled'))}</div>
+          <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px">${escapeHtml(slug)}</div>
+          ${url ? `<div style="margin-top:4px"><a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="font-size:10px;color:var(--accent)">${escapeHtml(url)}</a></div>` : ''}
+        </div>`;
+      }
     }
   }
   body.innerHTML = html;

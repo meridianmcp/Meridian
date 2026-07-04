@@ -6648,10 +6648,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_insights_table",
         "_migrate_pg_sprint_item_slug",
         "_migrate_pg_capture_insight_notes_to_insights",
+        "_migrate_pg_blog_posts_tenant",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 81
+    assert len(allnames) == len(set(allnames)) == 82
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -13909,6 +13910,82 @@ async def test_blog_post_db_lifecycle(db):
     # Delete.
     assert await db_module.delete_blog_post(db, p1["id"]) is True
     assert await db_module.get_blog_post(db, p1["id"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Workspace-scoped blog (8843250f)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_blog_save_and_get(db):
+    """8843250f — save_blog_post / get_blog_posts: workspace-scoped, status
+    filter, computed /blog/<slug> url, tenant isolation, first-publish stamps."""
+    a1 = await db_module.save_blog_post(
+        db, "Tenant A Launch", "# Hi", status="published", tenant_id="tenant-a",
+    )
+    assert a1["status"] == "published"
+    assert a1["url"] == f"/blog/{a1['slug']}"
+    assert a1["published_at"] is not None
+    a2 = await db_module.save_blog_post(
+        db, "Tenant A Draft", "wip", tenant_id="tenant-a",
+    )
+    assert a2["status"] == "draft"
+    await db_module.save_blog_post(db, "Tenant B Post", "b", tenant_id="tenant-b")
+
+    # Tenant isolation.
+    a_titles = {p["title"] for p in await db_module.get_blog_posts(db, tenant_id="tenant-a")}
+    assert a_titles == {"Tenant A Launch", "Tenant A Draft"}
+    b_titles = {p["title"] for p in await db_module.get_blog_posts(db, tenant_id="tenant-b")}
+    assert b_titles == {"Tenant B Post"}
+
+    # Status filter.
+    pub = await db_module.get_blog_posts(db, tenant_id="tenant-a", status="published")
+    assert [p["title"] for p in pub] == ["Tenant A Launch"]
+
+    # Update: promote the draft to archived (keeps id, sets status).
+    a2b = await db_module.save_blog_post(
+        db, "Tenant A Draft", "wip", status="archived",
+        post_id=a2["id"], tenant_id="tenant-a",
+    )
+    assert a2b["id"] == a2["id"] and a2b["status"] == "archived"
+    arch = await db_module.get_blog_posts(db, tenant_id="tenant-a", status="archived")
+    assert [p["id"] for p in arch] == [a2["id"]]
+
+
+def test_mcp_workspace_blog_roundtrip(client):
+    """MCP: save_blog_post creates a post; get_blog_posts lists it with a url."""
+    import json as _json
+
+    def _result(resp):
+        assert resp.get("result") is not None, resp
+        return _json.loads(resp["result"]["content"][0]["text"])
+
+    saved = _result(_mcp_call(client, "save_blog_post", {
+        "title": "MCP Blog Post", "body": "# hi", "status": "published",
+    }))
+    assert saved["status"] == "published"
+    assert saved["url"] == f"/blog/{saved['slug']}"
+    posts = _result(_mcp_call(client, "get_blog_posts", {"status": "published"}))
+    assert any(p["id"] == saved["id"] and p["url"] == saved["url"] for p in posts)
+
+
+def test_workspace_blog_rest_endpoint(client):
+    """REST: POST /workspace/blog creates; GET /workspace/blog lists newest-first
+    with a computed url and honours the status filter."""
+    r = client.post("/workspace/blog", json={
+        "title": "REST Blog Post", "body": "body", "status": "published",
+    })
+    assert r.status_code == 201, r.text
+    post = r.json()
+    assert post["url"] == f"/blog/{post['slug']}"
+
+    listed = client.get("/workspace/blog").json()
+    assert any(p["id"] == post["id"] for p in listed)
+    pub = client.get("/workspace/blog?status=published").json()
+    assert any(p["id"] == post["id"] for p in pub)
+    # A missing title is rejected.
+    assert client.post("/workspace/blog", json={"title": ""}).status_code == 400
 
 
 def test_blog_admin_and_public_http(client):

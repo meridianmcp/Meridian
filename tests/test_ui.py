@@ -622,6 +622,31 @@ def test_max_turns_slider_supports_megasprints():
     assert "Math.min(200, Math.max(10, ctxRaw))" in settings_src, "checkpoint clamp must be raised to 200"
 
 
+def test_context_refresh_workspace_controls_present():
+    """1688710d — the Workspace settings pane exposes Context Refresh controls
+    (bf51b12e backend): a master #ws-auto-refresh checkbox, a #ws-refresh-interval
+    number input (1–50), and one checkbox per default trigger. Load reads
+    /workspace/settings; save PATCHes auto_refresh_enabled / refresh_interval_turns
+    / refresh_triggers."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    settings_src = (static / "dashboard-settings.ts").read_text(encoding="utf-8")
+    # Master toggle + interval input.
+    assert 'id="ws-auto-refresh"' in settings_src, "master auto-refresh checkbox missing"
+    assert 'id="ws-refresh-interval"' in settings_src, "refresh interval input missing"
+    assert 'min="1" max="50"' in settings_src, "refresh interval must clamp 1–50"
+    # One checkbox per trigger.
+    for trig in (
+        "add_insight", "pin_decision", "pin_workspace_decision",
+        "set_north_star", "set_goal", "generate_handoff",
+    ):
+        assert f'id="ws-trigger-{trig}"' in settings_src, f"trigger checkbox for {trig} missing"
+    # Save PATCH body carries all three fields.
+    assert "auto_refresh_enabled:" in settings_src, "auto_refresh_enabled not in PATCH body"
+    assert "refresh_interval_turns:" in settings_src, "refresh_interval_turns not in PATCH body"
+    assert "refresh_triggers:" in settings_src, "refresh_triggers not in PATCH body"
+
+
 def test_documents_tab_present():
     """3f596f81 — the dashboard exposes a Documents tab: a vtab button, a drawer
     panel, a loadDocumentsTab loader that reads project_notes (note_kind=document),
@@ -650,6 +675,22 @@ def test_insights_tab_present():
     assert "async function loadInsightsTab" in src, "loadInsightsTab loader missing"
     assert "if (vtab === 'insights') loadInsightsTab" in src, "Insights tab dispatch missing"
     assert "/projects/${projectId}/insights" in src, "insights fetch missing"
+
+
+def test_blog_tab_present():
+    """8843250f — the dashboard exposes a workspace-scoped Blog tab: a vtab
+    button, a drawer panel, a loadBlogTab loader that GETs the WORKSPACE
+    endpoint /workspace/blog (not a per-project one), and a dispatch."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    src = (static / "dashboard.ts").read_text(encoding="utf-8")
+    assert 'data-vtab="blog"' in src, "Blog vtab button missing"
+    assert "drawer-blog-${project.id}" in src, "Blog drawer panel missing"
+    assert "blog-body-${project.id}" in src, "Blog body container missing"
+    assert "async function loadBlogTab" in src, "loadBlogTab loader missing"
+    assert "if (vtab === 'blog') loadBlogTab" in src, "Blog tab dispatch missing"
+    # Blog is workspace-scoped — must fetch the workspace endpoint.
+    assert "/workspace/blog" in src, "workspace blog fetch missing"
 
 
 def test_execution_mode_toggle_present(js):

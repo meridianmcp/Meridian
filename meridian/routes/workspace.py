@@ -175,6 +175,37 @@ async def update_workspace_settings_endpoint(
     )
 
 
+# --- Workspace blog (workspace-scoped CMS) ---------------------------------
+
+@router.get("/workspace/blog")
+async def list_workspace_blog_endpoint(
+    request: Request, status: str | None = None
+) -> list[dict[str, Any]]:
+    """Workspace-scoped blog posts (newest first). ``?status=`` filters to
+    draft|published|archived. Each post carries a ``/blog/<slug>`` url (8843250f)."""
+    return await db_module.get_blog_posts(
+        await _db(request), tenant_id=await _tenant_id(request), status=status
+    )
+
+
+@router.post("/workspace/blog", status_code=201)
+async def create_workspace_blog_endpoint(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Create or update a workspace blog post. Body: {title, body?, status?,
+    slug?, id?}. Pass ``id`` to update an existing post."""
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title required")
+    return await db_module.save_blog_post(
+        await _db(request), title, body.get("body") or "",
+        status=body.get("status", "draft"),
+        slug=body.get("slug"),
+        post_id=body.get("id"),
+        tenant_id=await _tenant_id(request),
+    )
+
+
 # --- Workspace sprint board (cross-project personal backlog) ----------------
 
 @router.get("/workspace/sprint-items")

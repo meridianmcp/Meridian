@@ -715,17 +715,20 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
 );
 
 -- 6234f9b8 — blog_posts: admin-authored posts served at /blog/<slug>.
+-- 8843250f — workspace-scoped via tenant_id.
 CREATE TABLE IF NOT EXISTS blog_posts (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     slug TEXT NOT NULL UNIQUE,
     body_md TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'draft',
+    tenant_id TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     updated_at TEXT NOT NULL DEFAULT ({_TS}),
     published_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
+CREATE INDEX IF NOT EXISTS idx_blog_posts_tenant ON blog_posts(tenant_id);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -2364,6 +2367,17 @@ async def _migrate_pg_blog_posts(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_blog_posts_tenant(conn: PostgresConnection) -> None:
+    """8843250f — workspace-scope the blog: add a nullable ``tenant_id`` to
+    ``blog_posts`` + an index on it. Idempotent (ADD COLUMN IF NOT EXISTS).
+    Mirrors db._migrate_blog_posts_tenant. The 'archived' lifecycle status is
+    enforced at the app layer (the PG blog_posts table has no status CHECK)."""
+    await conn.executescript(
+        "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS tenant_id TEXT;"
+        "CREATE INDEX IF NOT EXISTS idx_blog_posts_tenant ON blog_posts(tenant_id)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2414,4 +2428,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_insights_table,
     _migrate_pg_sprint_item_slug,
     _migrate_pg_capture_insight_notes_to_insights,
+    _migrate_pg_blog_posts_tenant,
 )
