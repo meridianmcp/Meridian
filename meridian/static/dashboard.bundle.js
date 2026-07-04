@@ -1,18 +1,64 @@
 "use strict";
 (() => {
   // meridian/static/dashboard-core.ts
+  var _HEALTH_STALE_MS = 45e3;
+  var _lastApiOkAt = 0;
+  var _lastApiFailed = false;
+  function _setHealthDot(color, title) {
+    const dot = document.getElementById("connection-health-dot");
+    if (!dot) return;
+    dot.style.background = color;
+    dot.title = title;
+  }
+  function _refreshHealthDot() {
+    if (_lastApiFailed) {
+      _setHealthDot("#ef4444", "Disconnected \u2014 last request failed");
+      return;
+    }
+    if (_lastApiOkAt === 0) {
+      _setHealthDot("#6b7280", "Connecting\u2026");
+      return;
+    }
+    const age = Date.now() - _lastApiOkAt;
+    if (age > _HEALTH_STALE_MS) {
+      _setHealthDot("#f59e0b", "Idle / stale \u2014 no recent server response");
+    } else {
+      _setHealthDot("#22c55e", "Connected");
+    }
+  }
+  window._refreshHealthDot = _refreshHealthDot;
+  function _markApiOk() {
+    _lastApiOkAt = Date.now();
+    _lastApiFailed = false;
+    _refreshHealthDot();
+  }
+  function _markApiFail() {
+    _lastApiFailed = true;
+    _refreshHealthDot();
+  }
+  if (typeof window !== "undefined" && !window._healthDotTimer) {
+    window._healthDotTimer = setInterval(_refreshHealthDot, 5e3);
+  }
   async function api2(path, opts = {}) {
     const state2 = window.state || {};
     const headers = { "Content-Type": "application/json" };
     if (state2.activeWorkspaceTenantId) {
       headers["X-Workspace-Tenant-Id"] = state2.activeWorkspaceTenantId;
     }
-    const r3 = await fetch(path, { headers, ...opts });
+    let r3;
+    try {
+      r3 = await fetch(path, { headers, ...opts });
+    } catch (netErr) {
+      _markApiFail();
+      throw netErr;
+    }
     if (!r3.ok) {
       if (r3.status === 403 && (typeof isDemoMode === "function" ? isDemoMode() : false)) {
         if (typeof showDemoReadonlyToast === "function") showDemoReadonlyToast();
         throw new Error("demo_readonly");
       }
+      if (r3.status >= 500) _markApiFail();
+      else _markApiOk();
       const text = await r3.text();
       const err = new Error(`${r3.status}: ${text}`);
       err.status = r3.status;
@@ -20,6 +66,7 @@
       err.responseText = text;
       throw err;
     }
+    _markApiOk();
     return r3.status === 204 ? null : r3.json();
   }
   window.api = api2;
@@ -1916,6 +1963,8 @@
 
             ${version}
 
+            ${it.slug ? `<span style="font-size:9px;font-family:var(--font-mono);color:var(--muted);background:var(--surface-1);border:1px solid var(--border);border-radius:3px;padding:0 4px;white-space:nowrap" title="${escapeHtml(it.id || "")}">${escapeHtml(it.slug)}</span>` : ""}
+
             <span style="color:var(--text);font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(it.title || "")}</span>
 
             ${pushedTo}
@@ -3711,6 +3760,11 @@ project_id = "${displayPid}"`;
         const execModeIn = document.getElementById("ws-exec-mode-default");
         const codeIntelCb = document.getElementById("ws-code-intel-default");
         const loopCb = document.getElementById("ws-loop-default");
+        const REFRESH_TRIGGERS = ["add_insight", "pin_decision", "pin_workspace_decision", "set_north_star", "set_goal", "generate_handoff"];
+        const autoRefreshCb = document.getElementById("ws-auto-refresh");
+        const refreshIntervalIn = document.getElementById("ws-refresh-interval");
+        const triggerCbs = {};
+        for (const t3 of REFRESH_TRIGGERS) triggerCbs[t3] = document.getElementById(`ws-trigger-${t3}`);
         const saveBtn = document.getElementById("ws-settings-save");
         const saveStatus = document.getElementById("ws-settings-status");
         (async () => {
@@ -3724,6 +3778,12 @@ project_id = "${displayPid}"`;
             if (execModeIn) execModeIn.value = s3.execution_mode_default || "";
             if (codeIntelCb) codeIntelCb.checked = !!s3.code_intel_enabled_default;
             if (loopCb) loopCb.checked = s3.loop_enabled_default !== false;
+            if (autoRefreshCb) autoRefreshCb.checked = !!s3.auto_refresh_enabled;
+            if (refreshIntervalIn) refreshIntervalIn.value = s3.refresh_interval_turns != null ? s3.refresh_interval_turns : 10;
+            const activeTriggers = Array.isArray(s3.refresh_triggers) ? s3.refresh_triggers : null;
+            for (const t3 of REFRESH_TRIGGERS) {
+              if (triggerCbs[t3]) triggerCbs[t3].checked = activeTriggers ? activeTriggers.includes(t3) : true;
+            }
           } catch (e3) {
             if (saveStatus) saveStatus.textContent = "Could not load workspace defaults.";
           }
@@ -3744,7 +3804,14 @@ project_id = "${displayPid}"`;
                 execution_mode_default: execModeIn ? execModeIn.value : "",
                 code_intel_enabled_default: codeIntelCb && codeIntelCb.checked ? 1 : 0,
                 // 76cf8bda — workspace /loop auto-continue default.
-                loop_enabled_default: !!(loopCb && loopCb.checked)
+                loop_enabled_default: !!(loopCb && loopCb.checked),
+                // bf51b12e — planner context-refresh config.
+                auto_refresh_enabled: !!(autoRefreshCb && autoRefreshCb.checked),
+                refresh_interval_turns: (() => {
+                  const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 10;
+                  return isNaN(raw) ? 10 : Math.min(50, Math.max(1, raw));
+                })(),
+                refresh_triggers: REFRESH_TRIGGERS.filter((t3) => triggerCbs[t3] && triggerCbs[t3].checked)
               })
             });
             if (saveStatus) saveStatus.textContent = "Saved.";
@@ -4040,6 +4107,38 @@ project_id = "${displayPid}"`;
         <span>Auto-continue (<code>/loop</code>) by default<br>
           <span style="font-size:9px;color:var(--muted)">Sessions prepend <code>/loop</code> to the /goal so they auto-continue after each response. Projects set to "Use workspace default" inherit this. Recommended for sprint sessions.</span>
         </span>
+      </label>
+      <div style="font-size:10px;color:var(--text);margin:12px 0 4px">Context Refresh</div>
+      <div style="font-size:9px;color:var(--muted);margin-bottom:8px">Periodically re-inject fresh planning context into a session so it doesn't drift as its window fills. Fires on the trigger tools below and every N turns (bf51b12e).</div>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
+        <input type="checkbox" id="ws-auto-refresh" style="margin-top:2px">
+        <span>Auto-refresh context<br>
+          <span style="font-size:9px;color:var(--muted)">Master switch. When off, no automatic refresh happens regardless of the settings below.</span>
+        </span>
+      </label>
+      <label style="font-size:10px;color:var(--muted);display:block;margin-bottom:6px">Refresh every N turns<br>
+        <input id="ws-refresh-interval" type="number" min="1" max="50" placeholder="10" style="width:80px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
+        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Turns between interval-based refreshes (1\u201350). Default: 10.</span>
+      </label>
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Refresh triggers</div>
+      <div style="font-size:9px;color:var(--muted);margin-bottom:6px">Calling any checked tool also triggers a refresh.</div>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-add_insight"><span><code>add_insight</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-pin_decision"><span><code>pin_decision</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-pin_workspace_decision"><span><code>pin_workspace_decision</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-set_north_star"><span><code>set_north_star</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-set_goal"><span><code>set_goal</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
+        <input type="checkbox" id="ws-trigger-generate_handoff"><span><code>generate_handoff</code></span>
       </label>
       <div style="display:flex;gap:6px;align-items:flex-start;margin-bottom:8px">
         <span id="ws-stophook-badge" style="font-size:9px;padding:2px 6px;border-radius:3px;white-space:nowrap;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">Stop hook: sprint_guard</span>
@@ -9161,6 +9260,8 @@ Current: ${current || "(none)"}`,
 
       <button class="vtab-btn" data-vtab="insights" title="Insights \u2014 durable strategic understanding">\u{1F4A1}</button>
 
+      <button class="vtab-btn" data-vtab="blog" title="Blog \u2014 workspace posts (draft/published/archived)">\u270D\uFE0F</button>
+
     </div>
 
     <div class="vtab-drawer open" id="drawer-${project.id}">
@@ -9941,6 +10042,22 @@ Current: ${current || "(none)"}`,
 
       </div>
 
+      <div class="drawer-panel" id="drawer-blog-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>BLOG \xB7 workspace</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="blog-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading\u2026</div>
+
+        </div>
+
+      </div>
+
     </div>
 
     <section class="claude-handoff-panel">
@@ -10136,6 +10253,7 @@ Current: ${current || "(none)"}`,
           if (vtab === "codeintel") loadCodeIntelTab(project.id);
           if (vtab === "documents") loadDocumentsTab(project.id);
           if (vtab === "insights") loadInsightsTab(project.id);
+          if (vtab === "blog") loadBlogTab(project.id);
         };
       });
       try {
@@ -11782,6 +11900,46 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${ins.body ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;white-space:pre-wrap">${escapeHtml(String(ins.body))}</div>` : ""}
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t3) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(t3)}</span>`).join("")}</div>` : ""}
       </div>`;
+      }
+    }
+    body.innerHTML = html;
+  }
+  async function loadBlogTab(projectId) {
+    const body = document.getElementById(`blog-body-${projectId}`);
+    if (!body) return;
+    body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    let posts = [];
+    try {
+      posts = await api("/workspace/blog") || [];
+    } catch (e3) {
+      body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load blog posts: ${escapeHtml(String(e3))}</div>`;
+      return;
+    }
+    const GROUPS = [
+      { key: "draft", label: "DRAFTS", color: "var(--muted)" },
+      { key: "published", label: "PUBLISHED", color: "var(--accent)" },
+      { key: "archived", label: "ARCHIVED", color: "var(--warning, #d29922)" }
+    ];
+    let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <div style="font-size:11px;color:var(--text)"><b>${posts.length}</b> post${posts.length === 1 ? "" : "s"}</div>
+  </div>
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Author via the <code>save_blog_post</code> MCP tool; published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+    if (!posts.length) {
+      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one with <code>save_blog_post(title, body, status="published")</code>.</div>`;
+    } else {
+      for (const g2 of GROUPS) {
+        const inGroup = posts.filter((p3) => String(p3.status || "draft") === g2.key);
+        if (!inGroup.length) continue;
+        html += `<div style="font-size:9px;color:${g2.color};letter-spacing:.06em;margin:12px 0 6px">${g2.label} \xB7 ${inGroup.length}</div>`;
+        for (const p3 of inGroup) {
+          const slug = String(p3.slug || "");
+          const url = String(p3.url || (slug ? `/blog/${slug}` : ""));
+          html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+          <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(p3.title || "Untitled"))}</div>
+          <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px">${escapeHtml(slug)}</div>
+          ${url ? `<div style="margin-top:4px"><a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="font-size:10px;color:var(--accent)">${escapeHtml(url)}</a></div>` : ""}
+        </div>`;
+        }
       }
     }
     body.innerHTML = html;

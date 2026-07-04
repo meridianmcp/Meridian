@@ -39,6 +39,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_workspace_decisions": 'get_workspace_decisions()',
     "get_workspace_settings": 'get_workspace_settings()',
     "update_workspace_settings": 'update_workspace_settings(hitl_auto_answer_default=True, sprint_name_default="june-sprint")',
+    "save_blog_post": 'save_blog_post(title="Shipping the Blog tab", body="# What changed\\n...", status="published")',
+    "get_blog_posts": 'get_blog_posts(status="published")',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
     "fan_out_sprint_items": 'fan_out_sprint_items(project_id="abc-123", items=[{"title": "Design DB schema", "group": "backend"}, {"title": "Build API endpoints", "group": "backend"}, {"title": "Wire up frontend", "group": "frontend"}])',
     "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
@@ -320,27 +322,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "file_path": {"type": "string", "description": "Path to a server-accessible .docx file."}},
          "required": ["file_path"]}},
-    {"name": "capture_insight", "description":
-        "Save a key takeaway from a planning (claude.ai) conversation in one call — "
-        "persists a prominent kind='insight' note that's searchable, filterable, and "
-        "surfaced in generate_handoff(mode='planner'), WITHOUT the auto-capture "
-        "'Session summary' noise checkpoint() makes. Pass body (markdown) OR "
-        "bullet_points (a list, joined into a bullet list). Use mid-conversation "
-        "whenever you're afraid of losing context.",
-     "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "title": {"type": "string"},
-         "body": {"type": "string", "description": "Markdown body. Omit if using bullet_points."},
-         "bullet_points": {"type": "array", "items": {"type": "string"}, "description": "Key takeaways, joined into a markdown bullet list."},
-         "tags": {"type": "string", "description": "Optional comma-separated tags (an 'insight' tag is always added)."},
-         "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes appear first in planner context and generate_handoff."}},
-         "required": ["title"]}},
     {"name": "add_insight", "description":
         "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
         "decisions. A first-class knowledge type SEPARATE from decisions (choices with a "
         "lifecycle) and notes (reference). horizon sets its shelf-life: 'permanent' insights "
         "ALWAYS surface in get_planning_brief; 'year'/'quarter' are time-boxed. Returns the "
-        "stored insight. (Distinct from capture_insight, which saves a planner note.)",
+        "stored insight.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "title": {"type": "string"},
@@ -472,6 +459,26 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "execution_mode_default": {"type": "string", "description": "Seed new projects' execution mode: 'autonomous', 'interactive', or '' to clear."},
          "code_intel_enabled_default": {"type": "boolean", "description": "Seed new projects' code-intel toggle."},
          "loop_enabled_default": {"type": "boolean", "description": "Workspace default for /loop auto-continue; projects with loop_enabled='workspace' inherit it. True = sessions auto-continue."}},
+         "required": []}},
+    {"name": "save_blog_post", "description":
+        "Create or update a workspace-scoped blog post (draft|published|archived "
+        "lifecycle). Posts belong to the whole workspace, not a single project, and "
+        "are served publicly at /blog/<slug> once status='published'. Pass 'id' to "
+        "update an existing post; omit it to create a new draft. 'slug' is optional "
+        "(auto-derived from the title, de-duplicated). Returns the saved post with a "
+        "computed 'url'.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string"},
+         "body": {"type": "string", "description": "Post body (Markdown)."},
+         "status": {"type": "string", "enum": ["draft", "published", "archived"], "description": "Lifecycle status. Default 'draft'. 'published' makes it live at /blog/<slug>."},
+         "slug": {"type": "string", "description": "Optional URL slug; auto-derived from the title when omitted."},
+         "id": {"type": "string", "description": "Optional: id of an existing post to update instead of creating a new one."}},
+         "required": ["title"]}},
+    {"name": "get_blog_posts", "description":
+        "Read-only: List workspace-scoped blog posts, newest first. Optional 'status' "
+        "filter (draft|published|archived). Each post includes a 'url' (/blog/<slug>).",
+     "inputSchema": {"type": "object", "properties": {
+         "status": {"type": "string", "enum": ["draft", "published", "archived"]}},
          "required": []}},
     {"name": "add_workspace_sprint_item", "description":
         "Add an item to the workspace-level personal backlog — a cross-project board NOT "
@@ -1015,6 +1022,7 @@ _READ_ONLY_TOOLS = {
     "get_session_log", "idle_until_session_done", "generate_handoff", "load_handoff",
     "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
+    "get_blog_posts",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
     "list_plugins", "get_plugin_details",
@@ -1053,6 +1061,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "add_workspace_note": "Add Workspace Note",
     "get_workspace_settings": "Get Workspace Settings",
     "update_workspace_settings": "Update Workspace Settings",
+    "save_blog_post": "Save Blog Post",
+    "get_blog_posts": "Get Blog Posts",
     "set_executor_config": "Set Executor Config",
     "set_north_star": "Set North Star",
     "idle_until_session_done": "Wait for Session to Close",

@@ -354,6 +354,11 @@ async def lifespan(app: FastAPI):
         db = await db_module.init_db(db_path)
     app.state.db = db
 
+    # 1d69d5d9 — seed workspace_settings from meridian.toml on first boot so the
+    # 46c83e55 toml keys actually take effect (self-host). Guarded; no-op when a
+    # settings row already exists or no toml/env config is present.
+    await db_module.seed_workspace_settings_from_toml(db)
+
     # c00b1ccf — wire the offline codebase-graph-snapshot searcher into handoff
     # code-pointer enrichment. Fallback used when generate_handoff isn't handed a
     # live tunnel searcher; it reads the persisted snapshot so a fresh session
@@ -5784,6 +5789,64 @@ _SSE_CORS_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
+# bb16f9a7 — SSE keepalive heartbeat.
+# Idle SSE connections get dropped by intermediary proxies (Fly / Cloudflare
+# have ~60s idle-read timeouts). This wrapper races an interval timer against
+# the upstream generator: whenever the upstream produces no frame within
+# ``interval`` seconds, it emits a single SSE comment ping (``: ping\n\n``) to
+# keep the socket warm, then resumes waiting on the upstream. Real data always
+# passes through promptly — the ping only fires on genuine idle gaps, never
+# alongside flowing data. Kept as a standalone async-generator so it can be
+# unit-tested with a fake upstream and a short interval (no live connection).
+_SSE_HEARTBEAT_FRAME = ": ping\n\n"
+
+
+async def _with_sse_heartbeat(upstream, interval: float = 30.0):
+    """Yield frames from ``upstream``, injecting a ``: ping`` every ``interval``s of idle.
+
+    ``upstream`` is any async iterator of already-framed SSE strings/bytes. The
+    heartbeat is a bare SSE comment line, which every compliant client silently
+    ignores, so it never disturbs the MCP framing. When the upstream is
+    exhausted (client disconnect / normal completion) the wrapper stops too.
+    """
+    it = upstream.__aiter__()
+    nxt = asyncio.ensure_future(it.__anext__())
+    try:
+        while True:
+            try:
+                # shield() protects the in-flight read from wait_for's timeout
+                # cancellation, so we can keep awaiting the SAME read across
+                # successive heartbeat intervals on a fully idle upstream.
+                frame = await asyncio.wait_for(asyncio.shield(nxt), timeout=interval)
+            except asyncio.TimeoutError:
+                # wait_for timed out. But the read may have *just* completed in
+                # the same tick (its result/exception raced the timer) — if so,
+                # deliver that instead of a spurious ping.
+                if nxt.done():
+                    exc = nxt.exception()
+                    if isinstance(exc, StopAsyncIteration):
+                        return
+                    if exc is not None:
+                        raise exc
+                    frame = nxt.result()
+                    yield frame
+                    nxt = asyncio.ensure_future(it.__anext__())
+                    continue
+                # Genuinely idle — emit one keepalive and loop, re-waiting on the
+                # still-pending read. A perpetually idle upstream thus pings
+                # exactly once per interval, indefinitely.
+                yield _SSE_HEARTBEAT_FRAME
+                continue
+            except StopAsyncIteration:
+                return
+            yield frame
+            # Frame delivered — start the next read.
+            nxt = asyncio.ensure_future(it.__anext__())
+    finally:
+        # Don't leak the pending read if the consumer closes us mid-flight.
+        if not nxt.done():
+            nxt.cancel()
+
 
 @app.options("/mcp/sse")
 async def mcp_sse_options(request: Request) -> Response:
@@ -5795,9 +5858,11 @@ async def mcp_sse_options(request: Request) -> Response:
 async def mcp_sse_get(request: Request) -> StreamingResponse:
     """MCP SSE transport GET — opens event stream for dnakov/claude-mcp.
 
-    Sends ``event: endpoint`` with POST URL, then heartbeats every 15 s.
-    No strict auth required: uses the same _db() resolver (Bearer / cookie /
-    local fallback) so both local and hosted-tier clients work.
+    Sends ``event: endpoint`` with POST URL, then a keepalive ``: ping`` every
+    ~30 s while idle (bb16f9a7) so intermediary proxies (Fly / Cloudflare) don't
+    drop the idle connection. No strict auth required: uses the same _db()
+    resolver (Bearer / cookie / local fallback) so both local and hosted-tier
+    clients work.
     """
     import uuid as _uuid
     import anyio as _anyio
@@ -5816,20 +5881,24 @@ async def mcp_sse_get(request: Request) -> StreamingResponse:
 
     endpoint_path = f"/mcp/sse?session_id={session_id}"
 
-    async def _stream():
+    async def _source():
+        # Real SSE frames for this transport. Currently just the initial
+        # ``endpoint`` event; afterwards the stream idles (the client POSTs its
+        # JSON-RPC out-of-band and reads responses from the POST body), so this
+        # generator parks on a disconnect poll. bb16f9a7: the ~30s keepalive is
+        # supplied by _with_sse_heartbeat wrapping this source, so we no longer
+        # emit manual heartbeats here.
         try:
             yield f"event: endpoint\ndata: {endpoint_path}\n\n"
-            # Heartbeat loop — exit when client disconnects
             while True:
                 if await request.is_disconnected():
                     break
-                yield ": heartbeat\n\n"
-                await _anyio.sleep(15)
+                await _anyio.sleep(1)
         finally:
             _SSE_SESSIONS.pop(session_id, None)
 
     return StreamingResponse(
-        _stream(),
+        _with_sse_heartbeat(_source(), interval=30),
         media_type="text/event-stream",
         headers=_SSE_CORS_HEADERS,
     )

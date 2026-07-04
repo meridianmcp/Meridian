@@ -518,7 +518,8 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     notes TEXT,
     feedback_thumb SMALLINT,
     feedback_note TEXT,
-    milestone_type TEXT NOT NULL DEFAULT 'task'
+    milestone_type TEXT NOT NULL DEFAULT 'task',
+    slug TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -694,7 +695,10 @@ CREATE TABLE IF NOT EXISTS workspace_sprint_items (
     updated_at TEXT NOT NULL DEFAULT ({_TS}),
     completed_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant ON workspace_sprint_items(tenant_id, status);
+-- idx_workspace_sprint_items_tenant is created by _migrate_pg_workspace_sprint_board,
+-- NOT inline here: a pre-tenant_id copy of this table would make this unguarded
+-- executescript CREATE INDEX crash startup (see the init_pg_db note above about the
+-- 2026-06-13 outage). The migration runs in _run_pg_migrations, which survives it.
 
 -- v3.4 — workspace-level settings singleton (tenant-global defaults).
 CREATE TABLE IF NOT EXISTS workspace_settings (
@@ -707,21 +711,31 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
     loop_enabled_default INTEGER NOT NULL DEFAULT 1,
+    auto_refresh_enabled INTEGER NOT NULL DEFAULT 0,
+    refresh_interval_turns INTEGER NOT NULL DEFAULT 10,
+    refresh_triggers TEXT,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
 -- 6234f9b8 — blog_posts: admin-authored posts served at /blog/<slug>.
+-- 8843250f — workspace-scoped via tenant_id.
 CREATE TABLE IF NOT EXISTS blog_posts (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     slug TEXT NOT NULL UNIQUE,
     body_md TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'draft',
+    tenant_id TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     updated_at TEXT NOT NULL DEFAULT ({_TS}),
     published_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
+-- idx_blog_posts_tenant is created by _migrate_pg_blog_posts_tenant (which also
+-- ALTERs the column onto pre-8843250f blog_posts tables). It must NOT be inline
+-- here: blog_posts predates tenant_id, so on an existing DB this unguarded
+-- executescript CREATE INDEX hit a missing column and crash-looped startup
+-- (exit 3) on the 2026-07-04 promote. The guarded migration handles both paths.
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -987,16 +1001,38 @@ async def _run_pg_migrations(conn: PostgresConnection, migrations: tuple) -> Non
     A migration error must never abort startup — see init_pg_db for the
     outage that motivated this. Each migration is idempotent, so a failure
     here is retried on the next boot.
+
+    bb16f9a7/1280c66e — bound how long any single migration statement may wait
+    on a lock or run, so a canary deploy can't HANG the app past Fly's health
+    check when the still-live old machine holds a lock on a hot table (e.g. an
+    ``ALTER TABLE sprint_items ADD COLUMN`` behind active sprint-board queries).
+    A timed-out statement raises → caught below → logged → retried next boot once
+    contention clears. Reset afterward so app queries keep the pool's defaults.
     """
-    for migration in migrations:
-        try:
-            await migration(conn)
-        except Exception as exc:  # noqa: BLE001 — startup must survive any migration error
-            logger.warning(
-                "pg migration %s failed (continuing startup): %s",
-                getattr(migration, "__name__", repr(migration)),
-                exc,
-            )
+    _timeouts_set = False
+    try:
+        await conn.execute("SET lock_timeout = '5s'")
+        await conn.execute("SET statement_timeout = '120s'")
+        _timeouts_set = True
+    except Exception:  # noqa: BLE001 — best-effort guard; never block startup
+        pass
+    try:
+        for migration in migrations:
+            try:
+                await migration(conn)
+            except Exception as exc:  # noqa: BLE001 — startup must survive any migration error
+                logger.warning(
+                    "pg migration %s failed (continuing startup): %s",
+                    getattr(migration, "__name__", repr(migration)),
+                    exc,
+                )
+    finally:
+        if _timeouts_set:
+            try:
+                await conn.execute("SET lock_timeout = DEFAULT")
+                await conn.execute("SET statement_timeout = DEFAULT")
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def _migrate_pg_sprint_items_claimed_at(conn: PostgresConnection) -> None:
@@ -1085,6 +1121,35 @@ async def _migrate_pg_insights_table(conn: PostgresConnection) -> None:
         ");"
         "CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project_id, horizon);"
     )
+
+
+async def _migrate_pg_sprint_item_slug(conn: PostgresConnection) -> None:
+    """b944c905 — sprint_items.slug human-readable id (mirrors SQLite). Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS slug TEXT"
+    )
+
+
+async def _migrate_pg_capture_insight_notes_to_insights(conn: PostgresConnection) -> None:
+    """b5ed8a61 — retire the legacy ``capture_insight`` tool: MOVE every
+    ``project_notes`` row with ``note_kind = 'insight'`` into the dedicated
+    ``insights`` table (mirrors SQLite _migrate_capture_insight_notes_to_insights).
+
+    Per row: INSERT into ``insights`` (reusing the note's id, horizon='quarter',
+    status='active') THEN DELETE the note — insert-before-delete so a crash
+    mid-row can never lose data. Reusing the note id makes this a pure MOVE and
+    idempotent: after it runs there are no ``note_kind = 'insight'`` rows left,
+    so a re-run selects nothing and is a no-op. PG runs autocommit — no commit.
+    The adapter rewrites ``?`` → ``%s`` in the raw SQL below.
+    """
+    # bb16f9a7 — set-based (was per-row) so it can't slow-loop and delay startup
+    # on a large table. Pure idempotent MOVE (id reuse; re-run selects nothing).
+    await conn.execute(
+        "INSERT INTO insights (id, project_id, title, body, horizon, tags, status) "
+        "SELECT id, project_id, title, COALESCE(body, ''), 'quarter', tags, 'active' "
+        "FROM project_notes WHERE note_kind = 'insight'"
+    )
+    await conn.execute("DELETE FROM project_notes WHERE note_kind = 'insight'")
 
 
 async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
@@ -1925,7 +1990,13 @@ async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> No
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS execution_mode_default TEXT;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS code_intel_enabled_default INTEGER;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
-        "loop_enabled_default INTEGER NOT NULL DEFAULT 1"
+        "loop_enabled_default INTEGER NOT NULL DEFAULT 1;"
+        # bf51b12e — planner context-refresh config.
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "auto_refresh_enabled INTEGER NOT NULL DEFAULT 0;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "refresh_interval_turns INTEGER NOT NULL DEFAULT 10;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS refresh_triggers TEXT"
     )
 
 
@@ -2319,6 +2390,17 @@ async def _migrate_pg_blog_posts(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_blog_posts_tenant(conn: PostgresConnection) -> None:
+    """8843250f — workspace-scope the blog: add a nullable ``tenant_id`` to
+    ``blog_posts`` + an index on it. Idempotent (ADD COLUMN IF NOT EXISTS).
+    Mirrors db._migrate_blog_posts_tenant. The 'archived' lifecycle status is
+    enforced at the app layer (the PG blog_posts table has no status CHECK)."""
+    await conn.executescript(
+        "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS tenant_id TEXT;"
+        "CREATE INDEX IF NOT EXISTS idx_blog_posts_tenant ON blog_posts(tenant_id)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2367,4 +2449,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_codebase_graph_entities,
     _migrate_pg_pending_goal,
     _migrate_pg_insights_table,
+    _migrate_pg_sprint_item_slug,
+    _migrate_pg_capture_insight_notes_to_insights,
+    _migrate_pg_blog_posts_tenant,
 )

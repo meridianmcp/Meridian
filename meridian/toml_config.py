@@ -160,3 +160,159 @@ def _mask_url(url: str) -> str:
         return re.sub(r"(?<=://)[^:@]+:[^@]+@", "***:***@", url)
     except Exception:
         return "***"
+
+
+# ---------------------------------------------------------------------------
+# 46c83e55 — generic self-host config readers (env > toml > hardcoded default).
+#
+# These provide the SELF-HOST fallback values. For per-tenant behaviour the
+# authoritative override is the workspace_settings DB row (bf51b12e): the MCP
+# dispatch hook reads workspace_settings, and this toml is only the self-host
+# default seed. toml is intentionally NOT wired into the hook — a self-host
+# operator seeds workspace_settings (or relies on the built-in defaults); these
+# readers exist so a future seed/self-host path can consult meridian.toml.
+# ---------------------------------------------------------------------------
+
+# Mirror of handler._PLANNER_REFRESH_TRIGGERS, duplicated here to avoid importing
+# the heavy MCP handler module just to read config. Keep the two in sync.
+_DEFAULT_REFRESH_TRIGGERS: list[str] = [
+    "add_insight",
+    "pin_decision",
+    "pin_workspace_decision",
+    "set_north_star",
+    "set_goal",
+    "generate_handoff",
+]
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Interpret an env/toml scalar as a boolean.
+
+    Accepts real bools (toml) and the usual truthy/falsey strings (env).
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_table(table: str) -> dict[str, Any]:
+    """Return the named top-level toml table as a dict, or {} if absent."""
+    data = load_toml()
+    if not isinstance(data, dict):
+        return {}
+    section = data.get(table)
+    return section if isinstance(section, dict) else {}
+
+
+def get_context_refresh_config() -> dict[str, Any]:
+    """Return the self-host context-refresh defaults.
+
+    Precedence per key (matching ``get_active_db_url``'s env-first style):
+        env  >  [context_refresh] toml table  >  hardcoded default.
+
+    Keys / env vars:
+        auto_refresh_enabled     — MERIDIAN_AUTO_REFRESH            (default False)
+        refresh_interval_turns   — MERIDIAN_REFRESH_INTERVAL_TURNS  (default 10)
+        refresh_triggers         — MERIDIAN_REFRESH_TRIGGERS (csv)  (default set)
+
+    This is the self-host seed only; a per-tenant ``workspace_settings`` row is
+    the authoritative override when present (see module docstring above).
+    """
+    toml_tbl = _read_table("context_refresh")
+
+    # auto_refresh_enabled
+    env_enabled = os.environ.get("MERIDIAN_AUTO_REFRESH")
+    if env_enabled is not None:
+        auto_refresh_enabled = _coerce_bool(env_enabled)
+    elif "auto_refresh_enabled" in toml_tbl:
+        auto_refresh_enabled = _coerce_bool(toml_tbl["auto_refresh_enabled"])
+    else:
+        auto_refresh_enabled = False
+
+    # refresh_interval_turns
+    env_interval = os.environ.get("MERIDIAN_REFRESH_INTERVAL_TURNS")
+    interval_raw: Any = env_interval if env_interval is not None else toml_tbl.get(
+        "refresh_interval_turns", 10
+    )
+    try:
+        refresh_interval_turns = max(1, int(interval_raw))
+    except (TypeError, ValueError):
+        refresh_interval_turns = 10
+
+    # refresh_triggers
+    env_triggers = os.environ.get("MERIDIAN_REFRESH_TRIGGERS")
+    if env_triggers is not None:
+        refresh_triggers = [t.strip() for t in env_triggers.split(",") if t.strip()]
+    elif "refresh_triggers" in toml_tbl:
+        raw = toml_tbl["refresh_triggers"]
+        if isinstance(raw, list):
+            refresh_triggers = [str(t).strip() for t in raw if str(t).strip()]
+        elif isinstance(raw, str):
+            refresh_triggers = [t.strip() for t in raw.split(",") if t.strip()]
+        else:
+            refresh_triggers = list(_DEFAULT_REFRESH_TRIGGERS)
+    else:
+        refresh_triggers = list(_DEFAULT_REFRESH_TRIGGERS)
+
+    return {
+        "auto_refresh_enabled": auto_refresh_enabled,
+        "refresh_interval_turns": refresh_interval_turns,
+        "refresh_triggers": refresh_triggers,
+    }
+
+
+def get_self_host_defaults() -> dict[str, Any]:
+    """Return misc self-host default seeds (env > toml > hardcoded default).
+
+    Read from the ``[meridian]`` toml table. These are documented defaults; the
+    per-project / per-tenant DB values remain authoritative at runtime — wiring
+    these readers into their consumers is a follow-up (see the sprint report).
+
+    Keys / env vars:
+        loop_enabled_default  — MERIDIAN_LOOP_ENABLED     (default True)
+        max_turns_default     — MERIDIAN_MAX_TURNS        (default 0 = unlimited)
+        filesystem_roots      — MERIDIAN_FILESYSTEM_ROOTS (csv, default [])
+    """
+    toml_tbl = _read_table("meridian")
+
+    # loop_enabled_default
+    env_loop = os.environ.get("MERIDIAN_LOOP_ENABLED")
+    if env_loop is not None:
+        loop_enabled_default = _coerce_bool(env_loop)
+    elif "loop_enabled_default" in toml_tbl:
+        loop_enabled_default = _coerce_bool(toml_tbl["loop_enabled_default"])
+    else:
+        loop_enabled_default = True
+
+    # max_turns_default
+    env_turns = os.environ.get("MERIDIAN_MAX_TURNS")
+    turns_raw: Any = env_turns if env_turns is not None else toml_tbl.get(
+        "max_turns_default", 0
+    )
+    try:
+        max_turns_default = max(0, int(turns_raw))
+    except (TypeError, ValueError):
+        max_turns_default = 0
+
+    # filesystem_roots
+    env_roots = os.environ.get("MERIDIAN_FILESYSTEM_ROOTS")
+    if env_roots is not None:
+        filesystem_roots = [r.strip() for r in env_roots.split(",") if r.strip()]
+    elif "filesystem_roots" in toml_tbl:
+        raw = toml_tbl["filesystem_roots"]
+        if isinstance(raw, list):
+            filesystem_roots = [str(r).strip() for r in raw if str(r).strip()]
+        elif isinstance(raw, str):
+            filesystem_roots = [r.strip() for r in raw.split(",") if r.strip()]
+        else:
+            filesystem_roots = []
+    else:
+        filesystem_roots = []
+
+    return {
+        "loop_enabled_default": loop_enabled_default,
+        "max_turns_default": max_turns_default,
+        "filesystem_roots": filesystem_roots,
+    }

@@ -896,7 +896,7 @@ def test_add_sprint_item_proposes_insight_capture():
             "force": True,
         }, db, "/tmp"))
         assert "insight_hint" in hinted
-        assert "capture_insight" in hinted["insight_hint"]
+        assert "add_insight" in hinted["insight_hint"]
         plain = _run(mh._dispatch_mcp_tool("add_sprint_item", {
             "project_id": proj["id"], "version": "v1",
             "title": "Add a logout button to the header",
@@ -1369,13 +1369,17 @@ def test_generate_default_session_name_from_pending_item():
 
 
 def test_generate_default_session_name_empty_board():
-    """599d0097 — empty board falls back to session-<timestamp>."""
+    """2bce89ed — empty board falls back to a memorable adjective+noun+timestamp
+    (e.g. 'brisk-otter-0701-213045'), not the anonymous 'session-<ts>'."""
+    import re
     import meridian.db as db_module
     db = _make_db()
     try:
         proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "eb"}, db, "/tmp"))
         name = _run(db_module.generate_default_session_name(db, proj["id"]))
-        assert name.startswith("session-")
+        assert not name.startswith("session-")
+        # adjective-noun-mmdd-hhmmss
+        assert re.match(r"^[a-z]+-[a-z]+-\d{4}-\d{6}$", name), name
     finally:
         _run(db.close())
 
@@ -1502,32 +1506,6 @@ def test_dispatch_reconcile_sprint_drift_project_not_found_raises():
                 "reconcile_sprint_drift",
                 {"project_id": "ffffffff-ffff-ffff-ffff-ffffffffffff"}, db, "/tmp",
             ))
-    finally:
-        _run(db.close())
-
-
-def test_dispatch_capture_insight_requires_body():
-    db = _make_db()
-    try:
-        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ins"}, db, "/tmp"))
-        out = _run(mh._dispatch_mcp_tool(
-            "capture_insight", {"project_id": proj["id"], "title": "t"}, db, "/tmp",
-        ))
-        assert "requires body" in out["error"]
-    finally:
-        _run(db.close())
-
-
-def test_dispatch_capture_insight_from_bullets():
-    db = _make_db()
-    try:
-        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ins2"}, db, "/tmp"))
-        out = _run(mh._dispatch_mcp_tool(
-            "capture_insight",
-            {"project_id": proj["id"], "title": "t", "bullet_points": ["a", "b"]},
-            db, "/tmp",
-        ))
-        assert "error" not in out
     finally:
         _run(db.close())
 
@@ -1712,7 +1690,6 @@ def test_broad_tool_happy_paths():
         call("add_note", {"project_id": pid, "title": "wiki", "body": "note body"})
         call("add_note", {"project_id": pid, "title": "MANUAL: do thing", "body": "todo"})
         assert isinstance(call("get_notes", {"project_id": pid}), list)
-        call("capture_insight", {"project_id": pid, "title": "insight", "body": "learned X"})
 
         # Workspace layer
         call("add_workspace_note", {"title": "ws", "body": "b"})

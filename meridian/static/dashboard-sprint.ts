@@ -897,6 +897,8 @@ export function renderQueue(projectId: string, sprintItems: any = []) {
 
             ${version}
 
+            ${it.slug ? `<span style="font-size:9px;font-family:var(--font-mono);color:var(--muted);background:var(--surface-1);border:1px solid var(--border);border-radius:3px;padding:0 4px;white-space:nowrap" title="${escapeHtml(it.id || '')}">${escapeHtml(it.slug)}</span>` : ''}
+
             <span style="color:var(--text);font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(it.title || '')}</span>
 
             ${pushedTo}

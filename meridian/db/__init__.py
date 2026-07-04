@@ -265,7 +265,10 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- 4f02340e: mixed-ownership task chains. owner of a subtask: 'human' | 'ai'
     -- | NULL (unassigned). Drives the alternating claim/handoff state machine
     -- in _advance_task_chain. NULL on parents and on legacy single-owner items.
-    owner TEXT DEFAULT NULL
+    owner TEXT DEFAULT NULL,
+    -- b944c905: human-readable per-project id (title slug, deduped). UUID stays
+    -- the primary key; slug is the board-facing identifier.
+    slug TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -577,18 +580,26 @@ CREATE INDEX IF NOT EXISTS idx_file_symbol_claims_session
     ON file_symbol_claims(session_id);
 
 -- Blog CMS (6234f9b8): admin-authored posts; draft until published.
+-- 8843250f: workspace-scoped via tenant_id + archived lifecycle status.
 CREATE TABLE IF NOT EXISTS blog_posts (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     slug TEXT NOT NULL UNIQUE,
     body_md TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'draft'
-        CHECK (status IN ('draft','published')),
+        CHECK (status IN ('draft','published','archived')),
+    tenant_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     published_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
+-- idx_blog_posts_tenant is created by _migrate_blog_posts_tenant (which ALTERs
+-- tenant_id onto pre-8843250f tables first). It must NOT be inline here: this
+-- literal is run via an unguarded executescript, and on an existing DB
+-- CREATE TABLE IF NOT EXISTS keeps the old columnless blog_posts, so an inline
+-- CREATE INDEX ... (tenant_id) crashes startup ('no such column: tenant_id').
+-- Same missing-column class took prod down on the 2026-07-04 promote.
 
 CREATE TABLE IF NOT EXISTS active_worktrees (
     id TEXT PRIMARY KEY,
@@ -652,8 +663,10 @@ CREATE TABLE IF NOT EXISTS workspace_sprint_items (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     completed_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant
-    ON workspace_sprint_items(tenant_id, status);
+-- idx_workspace_sprint_items_tenant is created by _migrate_workspace_sprint_board.
+-- Not inline here for the same reason as idx_blog_posts_tenant above: an inline
+-- CREATE INDEX on tenant_id in this unguarded literal would crash startup on any
+-- pre-existing copy of this table that lacks the column.
 
 -- v3.4 — workspace-level settings: tenant-global defaults that every project
 -- session can read at startup (e.g. a default HITL auto-answer posture, a
@@ -669,6 +682,9 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
     loop_enabled_default INTEGER NOT NULL DEFAULT 1,
+    auto_refresh_enabled INTEGER NOT NULL DEFAULT 0,
+    refresh_interval_turns INTEGER NOT NULL DEFAULT 10,
+    refresh_triggers TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -862,6 +878,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_provision_queue(db)
     await _migrate_codebase_graph_entities(db)
     await _migrate_insights_table(db)
+    await _migrate_sprint_item_slug(db)
+    await _migrate_capture_insight_notes_to_insights(db)
+    await _migrate_blog_posts_tenant(db)
     return db
 
 
@@ -1805,13 +1824,16 @@ async def generate_default_session_name(
     """599d0097 — derive a meaningful session name when start_session gets none.
 
     Uses the first pending/todo sprint item's title (slugified to its first few
-    words) plus a UTC timestamp, so an unnamed session reads as e.g.
-    ``wire-billing-oauth-20260701-2130`` instead of forcing the caller to invent
-    a string. Falls back to ``session-<timestamp>`` when the board is empty. The
-    timestamp keeps the name unique (the board rejects duplicate active names).
+    words) plus a short UTC timestamp, so an unnamed session reads as e.g.
+    ``wire-billing-oauth-0701-2130`` instead of forcing the caller to invent a
+    string. 2bce89ed — when the board is empty, falls back to a memorable
+    adjective+noun+timestamp slug (e.g. ``brisk-otter-0701-213045``) instead of
+    the anonymous ``session-<ts>``. The timestamp keeps the name unique (the
+    board rejects duplicate active names); year is dropped for brevity but
+    seconds are kept so two sessions in the same minute don't collide.
     """
     from datetime import datetime, timezone  # local: db/__init__ has no top import
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%m%d-%H%M%S")
     try:
         items = await get_sprint_items(db, project_id, include_human=False)
     except Exception:  # noqa: BLE001 — naming must never block start_session
@@ -1826,7 +1848,14 @@ async def generate_default_session_name(
     if words:
         slug = "-".join(words[:5])[:48].strip("-") or "session"
         return f"{slug}-{ts}"
-    return f"session-{ts}"
+    # 2bce89ed — memorable adjective+noun for an empty board, chosen
+    # deterministically from the timestamp (readable + unique via the ts suffix).
+    _adj = ("brisk", "calm", "clever", "bold", "quiet", "swift", "warm", "keen",
+            "bright", "steady", "nimble", "lucid")
+    _noun = ("otter", "harbor", "cedar", "falcon", "meadow", "ember", "delta",
+             "willow", "quartz", "sparrow", "atlas", "cove")
+    _h = sum(ord(c) for c in ts)
+    return f"{_adj[_h % len(_adj)]}-{_noun[(_h // len(_adj)) % len(_noun)]}-{ts}"
 
 
 def build_worker_context_xml(
@@ -3165,6 +3194,35 @@ async def get_sprint_items_cached(
     return items
 
 
+def _sprint_item_slug_base(text: str) -> str:
+    """b944c905 — kebab-case a title into a short human-readable id base."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return "-".join(words[:6])[:60].strip("-") or "item"
+
+
+async def _unique_sprint_slug(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """b944c905 — ``base``, or base-2/base-3/… if the slug is taken in this
+    project (mirrors _unique_note_slug; slugs are unique per project)."""
+    slug = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM sprint_items WHERE project_id = ? AND slug = ?",
+            (project_id, slug),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
 async def add_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3177,6 +3235,7 @@ async def add_sprint_item(
     milestone_type: str = "task",
     touches_resources: Any = None,
     force: bool = False,
+    slug: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -3235,13 +3294,18 @@ async def add_sprint_item(
     # 501ec93f — normalize + validate typed resource identifiers (raises on bad input).
     resources_json = serialize_touches_resources(touches_resources)
     iid = _new_id()
+    # b944c905 — auto-populate a human-readable slug from the title (or a
+    # caller-supplied one), deduped per project.
+    _item_slug = await _unique_sprint_slug(
+        db, project_id, _sprint_item_slug_base(slug or title)
+    )
     await db.execute(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
-        "failure_mode, milestone_type, touches_resources) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "failure_mode, milestone_type, touches_resources, slug) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
-         depends_on, failure_mode or "continue", milestone_type, resources_json),
+         depends_on, failure_mode or "continue", milestone_type, resources_json, _item_slug),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -7437,6 +7501,105 @@ async def delete_blog_post(db: aiosqlite.Connection, post_id: str) -> bool:
     return cur.rowcount > 0
 
 
+_BLOG_STATUSES = ("draft", "published", "archived")
+
+
+def _blog_url(post: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Attach a computed ``url`` (``/blog/<slug>``) to a blog-post dict."""
+    if post is None:
+        return None
+    slug = post.get("slug")
+    post["url"] = f"/blog/{slug}" if slug else None
+    return post
+
+
+async def save_blog_post(
+    db: aiosqlite.Connection,
+    title: str,
+    body: str = "",
+    *,
+    status: str = "draft",
+    tenant_id: str | None = None,
+    slug: str | None = None,
+    post_id: str | None = None,
+) -> dict[str, Any]:
+    """8843250f — create (or update, when ``post_id`` is given) a
+    workspace-scoped blog post with a draft|published|archived lifecycle.
+
+    Workspace-scoped by ``tenant_id`` like ``add_workspace_note``. Reuses the
+    existing ``_slugify_title`` / ``_unique_blog_slug`` helpers. Sets
+    ``published_at`` the first time a post becomes 'published'. Returns the
+    stored row with a computed ``/blog/<slug>`` ``url`` field.
+    """
+    title = (title or "").strip() or "Untitled"
+    status = status if status in _BLOG_STATUSES else "draft"
+
+    if post_id:
+        existing = await get_blog_post(db, post_id)
+        if existing is None:
+            raise ValueError("blog post not found")
+        new_slug = await _unique_blog_slug(
+            db, _slugify_title(slug or existing.get("slug") or title), exclude_id=post_id
+        )
+        # First publish stamps published_at; keep it once set.
+        pub = existing.get("published_at")
+        pub_sql = ", published_at = COALESCE(published_at, datetime('now'))" if status == "published" else ""
+        await db.execute(
+            "UPDATE blog_posts SET title = ?, body_md = ?, slug = ?, status = ?, "
+            "tenant_id = ?, updated_at = datetime('now')" + pub_sql + " WHERE id = ?",
+            (title, body or "", new_slug, status, tenant_id, post_id),
+        )
+        await db.commit()
+        return _blog_url(await get_blog_post(db, post_id))
+
+    bid = _new_id()
+    new_slug = await _unique_blog_slug(db, _slugify_title(slug or title))
+    if status == "published":
+        await db.execute(
+            "INSERT INTO blog_posts (id, title, slug, body_md, status, tenant_id, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            (bid, title, new_slug, body or "", status, tenant_id),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO blog_posts (id, title, slug, body_md, status, tenant_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (bid, title, new_slug, body or "", status, tenant_id),
+        )
+    await db.commit()
+    return _blog_url(await get_blog_post(db, bid))
+
+
+async def get_blog_posts(
+    db: aiosqlite.Connection,
+    tenant_id: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """8843250f — list workspace-scoped blog posts, newest first.
+
+    Scoped to ``tenant_id`` (like ``get_workspace_notes``) and optionally
+    filtered by ``status`` (draft|published|archived). Each row carries a
+    computed ``url`` (``/blog/<slug>``) rather than a stored column.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status in _BLOG_STATUSES:
+        clauses.append("status = ?")
+        params.append(status)
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    if scope:
+        clauses.append(scope)
+        params.extend(scope_params)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db.execute(
+        "SELECT * FROM blog_posts" + where
+        + " ORDER BY COALESCE(published_at, updated_at) DESC, created_at DESC",
+        params or None,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_blog_url(r) for r in (_row_to_dict(row) for row in rows) if r]  # type: ignore[misc]
+
+
 # ---------------------------------------------------------------------------
 # Active worktrees — per-session git worktree tracking
 # ---------------------------------------------------------------------------
@@ -9262,7 +9425,8 @@ async def get_workspace_settings(
         "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
         "log_task_sprint_nudge_threshold, handoff_template, "
         "execution_mode_default, code_intel_enabled_default, "
-        "loop_enabled_default, updated_at "
+        "loop_enabled_default, auto_refresh_enabled, refresh_interval_turns, "
+        "refresh_triggers, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -9286,6 +9450,18 @@ async def get_workspace_settings(
     # 76cf8bda — /loop auto-continue workspace default. Missing column/row ⇒
     # True (Meridian sessions default to auto-continue); a stored 0 turns it off.
     _loop_default = data.get("loop_enabled_default")
+    # bf51b12e — planner context-refresh config. refresh_triggers is a JSON list
+    # (NULL ⇒ None ⇒ hook uses its built-in default trigger set).
+    _refresh_triggers_raw = data.get("refresh_triggers")
+    _refresh_triggers: list[str] | None = None
+    if _refresh_triggers_raw:
+        try:
+            _decoded = json.loads(_refresh_triggers_raw)
+            if isinstance(_decoded, list):
+                _refresh_triggers = [str(t) for t in _decoded]
+        except Exception:  # noqa: BLE001 — malformed row ⇒ fall back to default
+            _refresh_triggers = None
+    _interval = data.get("refresh_interval_turns")
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -9297,6 +9473,9 @@ async def get_workspace_settings(
         "execution_mode_default": _emode if _emode in ("autonomous", "interactive") else None,
         "code_intel_enabled_default": (None if _ci_default is None else bool(_ci_default)),
         "loop_enabled_default": (True if _loop_default is None else bool(_loop_default)),
+        "auto_refresh_enabled": bool(data.get("auto_refresh_enabled")),
+        "refresh_interval_turns": (int(_interval) if _interval is not None else 10) or 10,
+        "refresh_triggers": _refresh_triggers,
         "updated_at": data.get("updated_at"),
     }
 
@@ -9312,6 +9491,9 @@ async def update_workspace_settings(
     execution_mode_default: str | None = None,
     code_intel_enabled_default: "bool | int | str | None" = None,
     loop_enabled_default: "bool | int | str | None" = None,
+    auto_refresh_enabled: "bool | int | str | None" = None,
+    refresh_interval_turns: int | None = None,
+    refresh_triggers: "list[str] | str | None" = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -9362,6 +9544,24 @@ async def update_workspace_settings(
         # 76cf8bda — /loop auto-continue default. Truthy/1 → 1, falsey/0 → 0.
         updates.append("loop_enabled_default = ?")
         params.append(1 if loop_enabled_default and loop_enabled_default not in ("0", "false", "False") else 0)
+    if auto_refresh_enabled is not None:
+        # bf51b12e — planner context-refresh toggle. Truthy/1 → 1, falsey/0 → 0.
+        updates.append("auto_refresh_enabled = ?")
+        params.append(1 if auto_refresh_enabled and auto_refresh_enabled not in ("0", "false", "False") else 0)
+    if refresh_interval_turns is not None:
+        # At least 1 turn between interval-based refreshes.
+        updates.append("refresh_interval_turns = ?")
+        params.append(max(1, int(refresh_interval_turns)))
+    if refresh_triggers is not None:
+        # A list ⇒ JSON-encode; "" clears (revert to default trigger set);
+        # any other string is stored verbatim (already JSON).
+        updates.append("refresh_triggers = ?")
+        if isinstance(refresh_triggers, list):
+            params.append(json.dumps(refresh_triggers))
+        elif isinstance(refresh_triggers, str):
+            params.append(refresh_triggers.strip() or None)
+        else:
+            params.append(None)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -9374,6 +9574,43 @@ async def update_workspace_settings(
         )
     await db.commit()
     return await get_workspace_settings(db, tenant_id=tenant_id)
+
+
+async def seed_workspace_settings_from_toml(db: aiosqlite.Connection) -> None:
+    """1d69d5d9 — seed the self-host singleton workspace_settings row from
+    meridian.toml (env > toml > default, via toml_config) on first boot. This is
+    what makes the 46c83e55 toml readers actually take effect. No-op when the
+    singleton row already exists (the DB is authoritative once configured) or
+    when no self-host config (a meridian.toml file or MERIDIAN_* env var) is
+    present. Fully guarded — a seed failure must never block server startup."""
+    try:
+        from .. import toml_config  # local: avoid import cycle at module load
+        _has_cfg = toml_config.load_toml() is not None or any(
+            os.environ.get(k) for k in (
+                "MERIDIAN_AUTO_REFRESH", "MERIDIAN_REFRESH_INTERVAL_TURNS",
+                "MERIDIAN_REFRESH_TRIGGERS", "MERIDIAN_LOOP_ENABLED",
+                "MERIDIAN_MAX_TURNS", "MERIDIAN_FILESYSTEM_ROOTS",
+            )
+        )
+        if not _has_cfg:
+            return
+        async with db.execute(
+            "SELECT id FROM workspace_settings WHERE id = ?", ("singleton",)
+        ) as cur:
+            if await cur.fetchone() is not None:
+                return  # already configured — the DB row wins over toml
+        refresh = toml_config.get_context_refresh_config()
+        defaults = toml_config.get_self_host_defaults()
+        await update_workspace_settings(
+            db,
+            auto_refresh_enabled=bool(refresh.get("auto_refresh_enabled")),
+            refresh_interval_turns=int(refresh.get("refresh_interval_turns") or 10),
+            refresh_triggers=refresh.get("refresh_triggers"),
+            loop_enabled_default=bool(defaults.get("loop_enabled_default", True)),
+            tenant_id=None,
+        )
+    except Exception:  # noqa: BLE001 — seeding must never block startup
+        pass
 
 
 # ---------------------------------------------------------------------------

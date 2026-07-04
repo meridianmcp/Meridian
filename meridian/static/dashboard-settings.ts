@@ -2281,6 +2281,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
     const loopCb = document.getElementById('ws-loop-default');
 
+    // bf51b12e — planner context-refresh config.
+    const REFRESH_TRIGGERS = ['add_insight', 'pin_decision', 'pin_workspace_decision', 'set_north_star', 'set_goal', 'generate_handoff'];
+    const autoRefreshCb = document.getElementById('ws-auto-refresh');
+    const refreshIntervalIn = document.getElementById('ws-refresh-interval');
+    const triggerCbs: Record<string, any> = {};
+    for (const t of REFRESH_TRIGGERS) triggerCbs[t] = document.getElementById(`ws-trigger-${t}`);
+
     const saveBtn = document.getElementById('ws-settings-save');
 
     const saveStatus = document.getElementById('ws-settings-status');
@@ -2307,6 +2314,15 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         // 76cf8bda — loop default is True unless explicitly stored False.
         if (loopCb) loopCb.checked = s.loop_enabled_default !== false;
+
+        // bf51b12e — context-refresh config. refresh_triggers is a list, or
+        // null ⇒ the default set (all six triggers on).
+        if (autoRefreshCb) autoRefreshCb.checked = !!s.auto_refresh_enabled;
+        if (refreshIntervalIn) refreshIntervalIn.value = s.refresh_interval_turns != null ? s.refresh_interval_turns : 10;
+        const activeTriggers: string[] | null = Array.isArray(s.refresh_triggers) ? s.refresh_triggers : null;
+        for (const t of REFRESH_TRIGGERS) {
+          if (triggerCbs[t]) triggerCbs[t].checked = activeTriggers ? activeTriggers.includes(t) : true;
+        }
 
       } catch (e: any) {
         // A failed load must not masquerade as "saved defaults" — surface it so
@@ -2347,6 +2363,14 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
             // 76cf8bda — workspace /loop auto-continue default.
             loop_enabled_default: !!(loopCb && loopCb.checked),
+
+            // bf51b12e — planner context-refresh config.
+            auto_refresh_enabled: !!(autoRefreshCb && autoRefreshCb.checked),
+            refresh_interval_turns: (() => {
+              const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 10;
+              return isNaN(raw) ? 10 : Math.min(50, Math.max(1, raw));
+            })(),
+            refresh_triggers: REFRESH_TRIGGERS.filter(t => triggerCbs[t] && triggerCbs[t].checked),
 
           }),
 
@@ -2712,6 +2736,38 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         <span>Auto-continue (<code>/loop</code>) by default<br>
           <span style="font-size:9px;color:var(--muted)">Sessions prepend <code>/loop</code> to the /goal so they auto-continue after each response. Projects set to "Use workspace default" inherit this. Recommended for sprint sessions.</span>
         </span>
+      </label>
+      <div style="font-size:10px;color:var(--text);margin:12px 0 4px">Context Refresh</div>
+      <div style="font-size:9px;color:var(--muted);margin-bottom:8px">Periodically re-inject fresh planning context into a session so it doesn't drift as its window fills. Fires on the trigger tools below and every N turns (bf51b12e).</div>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
+        <input type="checkbox" id="ws-auto-refresh" style="margin-top:2px">
+        <span>Auto-refresh context<br>
+          <span style="font-size:9px;color:var(--muted)">Master switch. When off, no automatic refresh happens regardless of the settings below.</span>
+        </span>
+      </label>
+      <label style="font-size:10px;color:var(--muted);display:block;margin-bottom:6px">Refresh every N turns<br>
+        <input id="ws-refresh-interval" type="number" min="1" max="50" placeholder="10" style="width:80px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
+        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Turns between interval-based refreshes (1–50). Default: 10.</span>
+      </label>
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Refresh triggers</div>
+      <div style="font-size:9px;color:var(--muted);margin-bottom:6px">Calling any checked tool also triggers a refresh.</div>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-add_insight"><span><code>add_insight</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-pin_decision"><span><code>pin_decision</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-pin_workspace_decision"><span><code>pin_workspace_decision</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-set_north_star"><span><code>set_north_star</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:4px">
+        <input type="checkbox" id="ws-trigger-set_goal"><span><code>set_goal</code></span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
+        <input type="checkbox" id="ws-trigger-generate_handoff"><span><code>generate_handoff</code></span>
       </label>
       <div style="display:flex;gap:6px;align-items:flex-start;margin-bottom:8px">
         <span id="ws-stophook-badge" style="font-size:9px;padding:2px 6px;border-radius:3px;white-space:nowrap;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">Stop hook: sprint_guard</span>

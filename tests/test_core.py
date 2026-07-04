@@ -4633,6 +4633,45 @@ async def test_workspace_settings_db_defaults(db):
 
 
 # ---------------------------------------------------------------------------
+# bf51b12e — planner context-refresh config on workspace_settings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_refresh_config_defaults(db):
+    """New context-refresh columns default to off / interval 10 / no triggers."""
+    ws = await db_module.get_workspace_settings(db)
+    assert ws["auto_refresh_enabled"] is False
+    assert ws["refresh_interval_turns"] == 10
+    assert ws["refresh_triggers"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_refresh_config_roundtrip(db):
+    """auto_refresh_enabled / refresh_interval_turns / refresh_triggers roundtrip."""
+    ws = await db_module.update_workspace_settings(
+        db,
+        auto_refresh_enabled=True,
+        refresh_interval_turns=3,
+        refresh_triggers=["pin_decision", "set_goal"],
+    )
+    assert ws["auto_refresh_enabled"] is True
+    assert ws["refresh_interval_turns"] == 3
+    assert ws["refresh_triggers"] == ["pin_decision", "set_goal"]
+    # Persists on re-read.
+    ws2 = await db_module.get_workspace_settings(db)
+    assert ws2["auto_refresh_enabled"] is True
+    assert ws2["refresh_interval_turns"] == 3
+    assert ws2["refresh_triggers"] == ["pin_decision", "set_goal"]
+    # interval is clamped to a minimum of 1.
+    ws3 = await db_module.update_workspace_settings(db, refresh_interval_turns=0)
+    assert ws3["refresh_interval_turns"] == 1
+    # "" clears the trigger list (reverts to the default trigger set → None).
+    ws4 = await db_module.update_workspace_settings(db, refresh_triggers="")
+    assert ws4["refresh_triggers"] is None
+
+
+# ---------------------------------------------------------------------------
 # 637dd900 — workspace layer tenant isolation
 # ---------------------------------------------------------------------------
 
@@ -5309,6 +5348,35 @@ def test_workspace_settings_http_loop_default(client):
     assert client.get("/workspace/settings").json()["loop_enabled_default"] is False
     client.patch("/workspace/settings", json={"loop_enabled_default": True})
     assert client.get("/workspace/settings").json()["loop_enabled_default"] is True
+
+
+def test_seed_workspace_settings_from_toml(monkeypatch):
+    """1d69d5d9 — meridian.toml (via env) seeds the singleton workspace_settings on
+    first boot; once the row exists the DB is authoritative (idempotent)."""
+    import asyncio
+    from meridian import toml_config
+    db = asyncio.run(db_module.init_db(":memory:"))
+    try:
+        monkeypatch.setattr(toml_config, "load_toml", lambda: None)
+        for k in ("MERIDIAN_AUTO_REFRESH", "MERIDIAN_REFRESH_INTERVAL_TURNS",
+                  "MERIDIAN_REFRESH_TRIGGERS", "MERIDIAN_LOOP_ENABLED",
+                  "MERIDIAN_MAX_TURNS", "MERIDIAN_FILESYSTEM_ROOTS"):
+            monkeypatch.delenv(k, raising=False)
+        # No config present → no seed (nothing to consume).
+        asyncio.run(db_module.seed_workspace_settings_from_toml(db))
+        # Provide config via env → the singleton row is seeded from it.
+        monkeypatch.setenv("MERIDIAN_AUTO_REFRESH", "true")
+        monkeypatch.setenv("MERIDIAN_REFRESH_INTERVAL_TURNS", "7")
+        asyncio.run(db_module.seed_workspace_settings_from_toml(db))
+        ws = asyncio.run(db_module.get_workspace_settings(db))
+        assert ws["auto_refresh_enabled"] is True
+        assert ws["refresh_interval_turns"] == 7
+        # Idempotent: a second boot with different env does NOT overwrite the DB.
+        monkeypatch.setenv("MERIDIAN_REFRESH_INTERVAL_TURNS", "40")
+        asyncio.run(db_module.seed_workspace_settings_from_toml(db))
+        assert asyncio.run(db_module.get_workspace_settings(db))["refresh_interval_turns"] == 7
+    finally:
+        asyncio.run(db.close())
 
 
 def test_queue_session_http_roundtrip(client):
@@ -6607,10 +6675,95 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_codebase_graph_entities",
         "_migrate_pg_pending_goal",
         "_migrate_pg_insights_table",
+        "_migrate_pg_sprint_item_slug",
+        "_migrate_pg_capture_insight_notes_to_insights",
+        "_migrate_pg_blog_posts_tenant",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 79
+    assert len(allnames) == len(set(allnames)) == 82
+
+
+def test_core_schema_literals_have_no_inline_tenant_id_indexes():
+    """Regression guard for the 2026-07-04 prod outage.
+
+    Both base schema literals — Postgres ``CREATE_TABLES_CORE`` and SQLite
+    ``CREATE_TABLES`` — are applied via an *unguarded* ``executescript`` at
+    startup, so one failing statement aborts the whole boot (Postgres
+    crash-looped every prod machine, exit 3; SQLite raised 'no such column:
+    tenant_id'). ``tenant_id`` is added to ``blog_posts`` /
+    ``workspace_sprint_items`` by later ALTER migrations, so on an existing DB
+    ``CREATE TABLE IF NOT EXISTS`` keeps the old columnless table and an inline
+    ``CREATE INDEX ... (tenant_id)`` fails. Those indexes must live ONLY in the
+    guarded ``_migrate_*`` migrations. CI runs SQLite-only (PG fixtures skip
+    without TEST_DATABASE_URL), so this static check guards both literals.
+    """
+    from meridian.pg_adapter import CREATE_TABLES_CORE
+    from meridian.db import CREATE_TABLES
+
+    def _executable_sql(sql: str) -> str:
+        # Drop ``--`` comment lines so the assertions match executable SQL only,
+        # not the explanatory comments that (intentionally) name these indexes.
+        return "\n".join(
+            ln for ln in sql.splitlines() if not ln.lstrip().startswith("--")
+        )
+
+    for name, literal in (
+        ("CREATE_TABLES_CORE", CREATE_TABLES_CORE),
+        ("CREATE_TABLES", CREATE_TABLES),
+    ):
+        body = _executable_sql(literal)
+        assert "blog_posts(tenant_id)" not in body, name
+        assert "workspace_sprint_items(tenant_id" not in body, name
+        assert "idx_blog_posts_tenant" not in body, name
+        assert "idx_workspace_sprint_items_tenant" not in body, name
+
+
+@pytest.mark.asyncio
+async def test_create_tables_survives_pre_tenant_id_blog_posts():
+    """Behavioral regression for the 2026-07-04 outage.
+
+    Exercises the exact statement that crashed startup —
+    ``executescript(CREATE_TABLES)`` in ``init_db`` — against a connection that
+    already holds a ``blog_posts`` predating the ``tenant_id`` column. Before the
+    fix this raised 'no such column: tenant_id' from the inline
+    ``CREATE INDEX ... (tenant_id)`` (and, because ``init_db`` never closed the
+    half-open connection, left a non-daemon aiosqlite worker thread that hung
+    interpreter shutdown for hours). The connection is closed in ``finally`` so a
+    re-broken literal fails fast instead of zombie-hanging the suite.
+    """
+    import aiosqlite
+    from meridian.db import CREATE_TABLES
+    from meridian.db import migrations as _mig
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        conn.row_factory = aiosqlite.Row
+        # A blog_posts from before 8843250f added tenant_id.
+        await conn.executescript(
+            "CREATE TABLE blog_posts ("
+            " id TEXT PRIMARY KEY, title TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,"
+            " body_md TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft',"
+            " created_at TEXT, updated_at TEXT, published_at TEXT);"
+            "INSERT INTO blog_posts (id,title,slug) VALUES ('b1','Old Post','old-post');"
+        )
+        await conn.commit()
+        # The base schema literal must apply cleanly over the pre-existing table.
+        await conn.executescript(CREATE_TABLES)
+        await conn.commit()
+        # The guarded migration then ALTERs tenant_id + its index idempotently.
+        await _mig._migrate_blog_posts_tenant(conn)
+        async with conn.execute("PRAGMA table_info(blog_posts)") as cur:
+            cols = {r["name"] for r in await cur.fetchall()}
+        assert "tenant_id" in cols
+        # Pre-existing data survived the upgrade.
+        async with conn.execute(
+            "SELECT title FROM blog_posts WHERE id='b1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["title"] == "Old Post"
+    finally:
+        await conn.close()
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -11285,6 +11438,87 @@ def test_mcp_sse_cors_headers_on_post(client):
     assert r.headers.get("access-control-allow-origin") == "*"
 
 
+# ---------------------------------------------------------------------------
+# bb16f9a7 — SSE keepalive heartbeat wrapper (_with_sse_heartbeat)
+# ---------------------------------------------------------------------------
+
+
+async def _collect(agen, limit):
+    """Drain up to ``limit`` frames from an async generator, then stop it."""
+    out = []
+    async for frame in agen:
+        out.append(frame)
+        if len(out) >= limit:
+            break
+    await agen.aclose()
+    return out
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_passes_data_through_without_ping():
+    """Frames from a fast upstream pass through promptly — no spurious pings."""
+    async def upstream():
+        yield "event: endpoint\ndata: /x\n\n"
+        yield "data: real\n\n"
+
+    # Long interval so the timer never fires while real data is flowing.
+    frames = [f async for f in server_module._with_sse_heartbeat(upstream(), interval=30)]
+    assert frames == ["event: endpoint\ndata: /x\n\n", "data: real\n\n"]
+    assert server_module._SSE_HEARTBEAT_FRAME not in frames
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_emits_ping_after_idle_interval():
+    """A silent upstream triggers a ``: ping`` keepalive after the interval."""
+    started = asyncio.Event()
+
+    async def idle_upstream():
+        # Never yields until cancelled/closed — simulates an idle SSE connection.
+        started.set()
+        while True:
+            await asyncio.sleep(3600)
+        yield  # pragma: no cover - unreachable, marks this an async generator
+
+    # Tiny interval keeps the test fast; the wrapper must still emit exactly one
+    # ping per idle interval with no upstream data.
+    frames = await _collect(
+        server_module._with_sse_heartbeat(idle_upstream(), interval=0.02),
+        limit=3,
+    )
+    assert started.is_set()
+    assert frames == [server_module._SSE_HEARTBEAT_FRAME] * 3
+    assert server_module._SSE_HEARTBEAT_FRAME == ": ping\n\n"
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_interleaves_ping_then_delivers_data():
+    """After an idle ping, a subsequent real frame is still delivered (shielded read)."""
+    async def slow_then_data():
+        await asyncio.sleep(0.05)   # idle gap longer than the interval → ping
+        yield "data: after-idle\n\n"
+
+    frames = await _collect(
+        server_module._with_sse_heartbeat(slow_then_data(), interval=0.02),
+        limit=4,
+    )
+    # At least one ping fired during the idle gap, and the real frame arrived.
+    assert server_module._SSE_HEARTBEAT_FRAME in frames
+    assert "data: after-idle\n\n" in frames
+    # The real data frame comes after the ping(s).
+    assert frames.index("data: after-idle\n\n") == len(frames) - 1
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_stops_when_upstream_exhausts():
+    """An empty upstream ends the wrapper cleanly (no hang, no ping)."""
+    async def empty():
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    frames = [f async for f in server_module._with_sse_heartbeat(empty(), interval=0.01)]
+    assert frames == []
+
+
 def test_mcp_responses_carry_csp_header(client):
     """All /mcp route responses carry a strict Content-Security-Policy header.
 
@@ -11790,6 +12024,98 @@ async def test_dispatch_mcp_tool_set_sprint(db):
         "set_sprint", {"project_id": p["id"], "sprint": "week-1-auth"}, db, "/tmp"
     )
     assert result["sprint"] == "week-1-auth"
+
+
+# ---------------------------------------------------------------------------
+# bf51b12e — planner context-refresh dispatch hook
+# ---------------------------------------------------------------------------
+
+
+async def _new_project_and_session(db, name):
+    """Create a project + start a session, returning (project_id, session_id)."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, name)
+    sess = await srv._dispatch_mcp_tool(
+        "start_session", {"project_id": p["id"]}, db, "/tmp"
+    )
+    return p["id"], sess["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_fires_on_trigger_tool(db):
+    """auto_refresh_enabled + a trigger tool (add_insight) + a session_id ⇒ the
+    result carries '_context_refresh'."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-trigger")
+    await db_module.update_workspace_settings(db, auto_refresh_enabled=True)
+    result = await srv._dispatch_mcp_tool(
+        "add_insight",
+        {"project_id": pid, "session_id": sid, "title": "T", "body": "B"},
+        db, "/tmp",
+    )
+    assert "_context_refresh" in result
+    assert result["_context_refresh"]["project_id"] == pid
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_absent_when_disabled(db):
+    """auto_refresh disabled ⇒ no '_context_refresh' even on a trigger tool."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-disabled")
+    # auto_refresh_enabled defaults False — do not enable it.
+    result = await srv._dispatch_mcp_tool(
+        "add_insight",
+        {"project_id": pid, "session_id": sid, "title": "T", "body": "B"},
+        db, "/tmp",
+    )
+    assert "_context_refresh" not in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_skips_executor_session(db):
+    """A session registered as role=executor never gets '_context_refresh'."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    p = await db_module.create_project(db, "refresh-executor")
+    sess = await srv._dispatch_mcp_tool(
+        "start_session", {"project_id": p["id"], "role": "executor"}, db, "/tmp"
+    )
+    sid = sess["session_id"]
+    assert sid in mh._EXECUTOR_SESSIONS  # registered by the start_session hook
+    await db_module.update_workspace_settings(db, auto_refresh_enabled=True)
+    result = await srv._dispatch_mcp_tool(
+        "add_insight",
+        {"project_id": p["id"], "session_id": sid, "title": "T", "body": "B"},
+        db, "/tmp",
+    )
+    assert "_context_refresh" not in result
+
+
+@pytest.mark.asyncio
+async def test_build_context_refresh_returns_expected_keys(db):
+    """_build_context_refresh returns the compact orientation dict shape."""
+    from meridian.mcp import handler as mh
+    p = await db_module.create_project(db, "refresh-builder")
+    await db_module.set_goal(db, p["id"], "the goal")
+    ctx = await mh._build_context_refresh(db, p["id"])
+    assert ctx is not None
+    for key in (
+        "project_id", "project_name", "sprint", "north_star",
+        "sprint_progress", "next_pending_items", "recent_handoffs",
+        "high_priority_decisions", "unvalidated_assumptions", "key_note_slugs",
+    ):
+        assert key in ctx, f"missing key {key}"
+    assert ctx["project_id"] == p["id"]
+    # Unknown project ⇒ None (caller raises "project not found").
+    assert await mh._build_context_refresh(db, "no-such-project") is None
 
 
 @pytest.mark.asyncio
@@ -13257,6 +13583,23 @@ async def test_get_sprint_progress_version_filter(db):
     assert res["by_status"].get("pending") == 1
 
 
+@pytest.mark.asyncio
+async def test_sprint_item_slug_autopopulated(db):
+    """b944c905 — add_sprint_item auto-populates a human-readable slug from the
+    title (deduped per project). human_id (the assignee) is left untouched."""
+    p = await db_module.create_project(db, "slug-proj")
+    pid = p["id"]
+    a = await db_module.add_sprint_item(db, pid, "v1", "Wire the OAuth Login Flow")
+    assert a["slug"] == "wire-the-oauth-login-flow"
+    assert a.get("human_id") is None  # slug is NOT the assignee field
+    # Same title (forced past the dup guard) → -2 suffix.
+    b = await db_module.add_sprint_item(db, pid, "v1", "Wire the OAuth Login Flow", force=True)
+    assert b["slug"] == "wire-the-oauth-login-flow-2"
+    # A caller-supplied slug base is slugified too.
+    c = await db_module.add_sprint_item(db, pid, "v1", "Something else", slug="Custom Slug")
+    assert c["slug"] == "custom-slug"
+
+
 # ---------------------------------------------------------------------------
 # 2b93cb59 — live-queue hardening: provisional_complete, 10s cache, tier limits
 # ---------------------------------------------------------------------------
@@ -13627,50 +13970,53 @@ async def test_claim_sprint_item_soft_file_overlap_warning(db):
 
 
 # ---------------------------------------------------------------------------
-# Planning chat save mechanism (db9edba3)
+# capture_insight retirement — legacy note_kind='insight' → insights table (b5ed8a61)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_capture_insight_body(db):
-    import meridian.server as srv
+async def test_migrate_capture_insight_notes_to_insights(db):
+    """b5ed8a61 — the migration MOVES legacy kind='insight' project_notes into the
+    dedicated insights table: the note is gone afterward and the insight is present."""
+    from meridian.db.migrations import _migrate_capture_insight_notes_to_insights
 
-    p = await db_module.create_project(db, "ins-body")
-    res = await srv._dispatch_mcp_tool(
-        "capture_insight",
-        {"project_id": p["id"], "title": "Pricing", "body": "Workspace tiers, not per-seat."},
-        db, "/tmp",
+    p = await db_module.create_project(db, "insight-migrate")
+    note = await db_module.add_project_note(
+        db, p["id"], "Pricing takeaway", "Workspace tiers, not per-seat.",
+        "strategy", kind="insight",
     )
-    assert res["note_kind"] == "insight"
-    assert "Workspace tiers" in res["body"]
-    assert "insight" in (res.get("tags") or "")
+    # Precondition: the note exists as a kind='insight' project_note.
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM project_notes WHERE note_kind = 'insight'"
+    ) as cur:
+        pre = await cur.fetchone()
+    assert (pre["c"] if isinstance(pre, dict) else pre[0]) == 1
 
+    await _migrate_capture_insight_notes_to_insights(db)
 
-@pytest.mark.asyncio
-async def test_capture_insight_bullet_points(db):
-    import meridian.server as srv
+    # The note is gone from project_notes...
+    gone = await db_module.get_project_note(db, note["id"])
+    assert gone is None
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM project_notes WHERE note_kind = 'insight'"
+    ) as cur:
+        post = await cur.fetchone()
+    assert (post["c"] if isinstance(post, dict) else post[0]) == 0
 
-    p = await db_module.create_project(db, "ins-bullets")
-    res = await srv._dispatch_mcp_tool(
-        "capture_insight",
-        {"project_id": p["id"], "title": "Takeaways",
-         "bullet_points": ["Ship device flow", "Defer WS tunnel"]},
-        db, "/tmp",
-    )
-    assert res["note_kind"] == "insight"
-    assert "- Ship device flow" in res["body"]
-    assert "- Defer WS tunnel" in res["body"]
+    # ...and present in the insights table (id reused → pure MOVE).
+    insights = await db_module.get_insights(db, p["id"])
+    assert len(insights) == 1
+    moved = insights[0]
+    assert moved["id"] == note["id"]
+    assert moved["title"] == "Pricing takeaway"
+    assert moved["body"] == "Workspace tiers, not per-seat."
+    assert moved["horizon"] == "quarter"
+    assert moved["status"] == "active"
+    assert moved["tags"] == "strategy"
 
-
-@pytest.mark.asyncio
-async def test_capture_insight_requires_content(db):
-    import meridian.server as srv
-
-    p = await db_module.create_project(db, "ins-empty")
-    res = await srv._dispatch_mcp_tool(
-        "capture_insight", {"project_id": p["id"], "title": "Empty"}, db, "/tmp",
-    )
-    assert "error" in res
+    # Idempotent: a second run is a no-op (no rows to move, no duplicate insight).
+    await _migrate_capture_insight_notes_to_insights(db)
+    assert len(await db_module.get_insights(db, p["id"])) == 1
 
 
 def test_select_strategic_notes_includes_insights():
@@ -13756,6 +14102,82 @@ async def test_blog_post_db_lifecycle(db):
     # Delete.
     assert await db_module.delete_blog_post(db, p1["id"]) is True
     assert await db_module.get_blog_post(db, p1["id"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Workspace-scoped blog (8843250f)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_blog_save_and_get(db):
+    """8843250f — save_blog_post / get_blog_posts: workspace-scoped, status
+    filter, computed /blog/<slug> url, tenant isolation, first-publish stamps."""
+    a1 = await db_module.save_blog_post(
+        db, "Tenant A Launch", "# Hi", status="published", tenant_id="tenant-a",
+    )
+    assert a1["status"] == "published"
+    assert a1["url"] == f"/blog/{a1['slug']}"
+    assert a1["published_at"] is not None
+    a2 = await db_module.save_blog_post(
+        db, "Tenant A Draft", "wip", tenant_id="tenant-a",
+    )
+    assert a2["status"] == "draft"
+    await db_module.save_blog_post(db, "Tenant B Post", "b", tenant_id="tenant-b")
+
+    # Tenant isolation.
+    a_titles = {p["title"] for p in await db_module.get_blog_posts(db, tenant_id="tenant-a")}
+    assert a_titles == {"Tenant A Launch", "Tenant A Draft"}
+    b_titles = {p["title"] for p in await db_module.get_blog_posts(db, tenant_id="tenant-b")}
+    assert b_titles == {"Tenant B Post"}
+
+    # Status filter.
+    pub = await db_module.get_blog_posts(db, tenant_id="tenant-a", status="published")
+    assert [p["title"] for p in pub] == ["Tenant A Launch"]
+
+    # Update: promote the draft to archived (keeps id, sets status).
+    a2b = await db_module.save_blog_post(
+        db, "Tenant A Draft", "wip", status="archived",
+        post_id=a2["id"], tenant_id="tenant-a",
+    )
+    assert a2b["id"] == a2["id"] and a2b["status"] == "archived"
+    arch = await db_module.get_blog_posts(db, tenant_id="tenant-a", status="archived")
+    assert [p["id"] for p in arch] == [a2["id"]]
+
+
+def test_mcp_workspace_blog_roundtrip(client):
+    """MCP: save_blog_post creates a post; get_blog_posts lists it with a url."""
+    import json as _json
+
+    def _result(resp):
+        assert resp.get("result") is not None, resp
+        return _json.loads(resp["result"]["content"][0]["text"])
+
+    saved = _result(_mcp_call(client, "save_blog_post", {
+        "title": "MCP Blog Post", "body": "# hi", "status": "published",
+    }))
+    assert saved["status"] == "published"
+    assert saved["url"] == f"/blog/{saved['slug']}"
+    posts = _result(_mcp_call(client, "get_blog_posts", {"status": "published"}))
+    assert any(p["id"] == saved["id"] and p["url"] == saved["url"] for p in posts)
+
+
+def test_workspace_blog_rest_endpoint(client):
+    """REST: POST /workspace/blog creates; GET /workspace/blog lists newest-first
+    with a computed url and honours the status filter."""
+    r = client.post("/workspace/blog", json={
+        "title": "REST Blog Post", "body": "body", "status": "published",
+    })
+    assert r.status_code == 201, r.text
+    post = r.json()
+    assert post["url"] == f"/blog/{post['slug']}"
+
+    listed = client.get("/workspace/blog").json()
+    assert any(p["id"] == post["id"] for p in listed)
+    pub = client.get("/workspace/blog?status=published").json()
+    assert any(p["id"] == post["id"] for p in pub)
+    # A missing title is rejected.
+    assert client.post("/workspace/blog", json={"title": ""}).status_code == 400
 
 
 def test_blog_admin_and_public_http(client):
@@ -15275,3 +15697,107 @@ def test_patch_sprint_item_touches_resources(client):
     resources = json.loads(data["touches_resources"] or "[]")
     assert "note:my-note" in resources
     assert "decision:d1" in resources
+
+
+# ---------------------------------------------------------------------------
+# 46c83e55 — meridian.toml self-host config readers (env > toml > default)
+# ---------------------------------------------------------------------------
+
+
+def _point_toml_at(monkeypatch, tmp_path, text):
+    """Write ``text`` to a tmp meridian.toml and make toml_config read it."""
+    import meridian.toml_config as tc
+    p = tmp_path / "meridian.toml"
+    p.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(tc, "_toml_path", lambda: p)
+    return tc
+
+
+def _clear_refresh_env(monkeypatch):
+    for var in (
+        "MERIDIAN_AUTO_REFRESH",
+        "MERIDIAN_REFRESH_INTERVAL_TURNS",
+        "MERIDIAN_REFRESH_TRIGGERS",
+        "MERIDIAN_LOOP_ENABLED",
+        "MERIDIAN_MAX_TURNS",
+        "MERIDIAN_FILESYSTEM_ROOTS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_context_refresh_config_hardcoded_default(monkeypatch):
+    """No env, no toml ⇒ built-in defaults (disabled / 10 / default trigger set)."""
+    import meridian.toml_config as tc
+    _clear_refresh_env(monkeypatch)
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+    cfg = tc.get_context_refresh_config()
+    assert cfg["auto_refresh_enabled"] is False
+    assert cfg["refresh_interval_turns"] == 10
+    assert cfg["refresh_triggers"] == tc._DEFAULT_REFRESH_TRIGGERS
+    assert "pin_decision" in cfg["refresh_triggers"]
+
+
+def test_context_refresh_config_toml_over_default(monkeypatch, tmp_path):
+    """[context_refresh] toml table overrides the hardcoded default."""
+    _clear_refresh_env(monkeypatch)
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[context_refresh]\n"
+        "auto_refresh_enabled = true\n"
+        "refresh_interval_turns = 5\n"
+        'refresh_triggers = ["set_goal", "pin_decision"]\n',
+    )
+    cfg = tc.get_context_refresh_config()
+    assert cfg["auto_refresh_enabled"] is True
+    assert cfg["refresh_interval_turns"] == 5
+    assert cfg["refresh_triggers"] == ["set_goal", "pin_decision"]
+
+
+def test_context_refresh_config_env_over_toml(monkeypatch, tmp_path):
+    """Env vars win over the toml table (env-first precedence)."""
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[context_refresh]\n"
+        "auto_refresh_enabled = false\n"
+        "refresh_interval_turns = 5\n"
+        'refresh_triggers = ["set_goal"]\n',
+    )
+    monkeypatch.setenv("MERIDIAN_AUTO_REFRESH", "1")
+    monkeypatch.setenv("MERIDIAN_REFRESH_INTERVAL_TURNS", "20")
+    monkeypatch.setenv("MERIDIAN_REFRESH_TRIGGERS", "add_insight, generate_handoff")
+    cfg = tc.get_context_refresh_config()
+    assert cfg["auto_refresh_enabled"] is True
+    assert cfg["refresh_interval_turns"] == 20
+    assert cfg["refresh_triggers"] == ["add_insight", "generate_handoff"]
+
+
+def test_self_host_defaults_env_over_toml_over_default(monkeypatch, tmp_path):
+    """get_self_host_defaults resolves loop/max_turns/filesystem_roots env>toml>default."""
+    import meridian.toml_config as tc
+    _clear_refresh_env(monkeypatch)
+    # 1. hardcoded default (no toml, no env).
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+    d = tc.get_self_host_defaults()
+    assert d["loop_enabled_default"] is True
+    assert d["max_turns_default"] == 0
+    assert d["filesystem_roots"] == []
+    # 2. toml over default.
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[meridian]\n"
+        "loop_enabled_default = false\n"
+        "max_turns_default = 25\n"
+        'filesystem_roots = ["/repo", "/outputs"]\n',
+    )
+    d = tc.get_self_host_defaults()
+    assert d["loop_enabled_default"] is False
+    assert d["max_turns_default"] == 25
+    assert d["filesystem_roots"] == ["/repo", "/outputs"]
+    # 3. env over toml.
+    monkeypatch.setenv("MERIDIAN_LOOP_ENABLED", "true")
+    monkeypatch.setenv("MERIDIAN_MAX_TURNS", "7")
+    monkeypatch.setenv("MERIDIAN_FILESYSTEM_ROOTS", "/a,/b,/c")
+    d = tc.get_self_host_defaults()
+    assert d["loop_enabled_default"] is True
+    assert d["max_turns_default"] == 7
+    assert d["filesystem_roots"] == ["/a", "/b", "/c"]
