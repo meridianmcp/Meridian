@@ -3527,6 +3527,34 @@ project_id = "${displayPid}"`;
 
     </div>
 
+    <!-- b970fe07 \u2014 Serena default repo path (code-extractor slot). Single value;
+         used at tunnel start only when --repo is not passed on the CLI. -->
+    <div style="margin-bottom:10px">
+
+      <div style="font-size:10px;color:var(--muted);margin-bottom:4px">Serena Repo Path<br><span style="font-size:9px;color:var(--muted)">Default <code>--project</code> for the tunnel's code-extractor (Serena). Used only when <code>--repo</code> is not passed at tunnel start.</span></div>
+
+      <input id="exec-serena_repo_path-${projectId}" type="text" placeholder="e.g. C:\\Users\\you\\repo" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px" value="${escapeHtml(String(execCfg.serena_repo_path || ""))}">
+
+    </div>
+
+    <!-- b970fe07 \u2014 code-intel auto-index dirs (code slot). Add/remove list,
+         mirroring Filesystem Roots. Used only when --code-dir is not passed. -->
+    <div style="margin-bottom:10px">
+
+      <div style="font-size:10px;color:var(--muted);margin-bottom:4px">Code-Intel Index Dirs<br><span style="font-size:9px;color:var(--muted)">Directories codebase-memory-mcp auto-indexes at tunnel start. Used only when <code>--code-dir</code> is not passed.</span></div>
+
+      <div id="exec-code-dirs-tbl-${projectId}" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"></div>
+
+      <div style="display:flex;gap:6px">
+
+        <input id="exec-code-dirs-input-${projectId}" type="text" placeholder="e.g. C:\\Users\\you\\repo" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
+
+        <button id="exec-code-dirs-add-${projectId}" class="secondary" style="font-size:9px;padding:2px 10px">Add</button>
+
+      </div>
+
+    </div>
+
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
 
       <label style="font-size:10px;color:var(--muted)">env_file<br><input id="exec-env_file-${projectId}" type="text" placeholder=".env file path" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.env_file || ""))}"></label>
@@ -3718,12 +3746,51 @@ project_id = "${displayPid}"`;
             _addFsRoot();
           }
         });
+        let _execCodeDirs = Array.isArray(execCfg.codebase_code_dirs) ? execCfg.codebase_code_dirs.filter((r3) => typeof r3 === "string" && r3.trim()).map((r3) => r3.trim()) : [];
+        const _cdTblEl = document.getElementById(`exec-code-dirs-tbl-${projectId}`);
+        const _rerenderCdTbl = () => {
+          if (!_cdTblEl) return;
+          if (!_execCodeDirs.length) {
+            _cdTblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">None \u2014 no auto-index unless --code-dir is passed.</div>';
+            return;
+          }
+          _cdTblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' + _execCodeDirs.map((p3, i3) => `<tr>
+          <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p3)}</td>
+          <td style="padding:2px 0;text-align:right"><button class="exec-del-cd-row" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
+        </tr>`).join("") + "</table>";
+          _cdTblEl.querySelectorAll(".exec-del-cd-row").forEach((b2) => {
+            b2.onclick = () => {
+              _execCodeDirs.splice(parseInt(b2.dataset.idx, 10), 1);
+              _rerenderCdTbl();
+            };
+          });
+        };
+        _rerenderCdTbl();
+        const _cdInput = document.getElementById(`exec-code-dirs-input-${projectId}`);
+        const _cdAddBtn = document.getElementById(`exec-code-dirs-add-${projectId}`);
+        const _addCodeDir = () => {
+          const v3 = (_cdInput?.value || "").trim();
+          if (!v3) return;
+          if (!_execCodeDirs.includes(v3)) _execCodeDirs.push(v3);
+          if (_cdInput) _cdInput.value = "";
+          _rerenderCdTbl();
+        };
+        if (_cdAddBtn) _cdAddBtn.onclick = _addCodeDir;
+        if (_cdInput) _cdInput.addEventListener("keydown", (e3) => {
+          if (e3.key === "Enter") {
+            e3.preventDefault();
+            _addCodeDir();
+          }
+        });
         saveBtn.onclick = async () => {
           saveBtn.disabled = true;
           const fields = ["env_file", "test_cmd", "deploy_cmd", "branch"];
           const cfg = {};
           cfg.repo_paths = _execRepoPaths;
           cfg.filesystem_roots = _execFsRoots;
+          cfg.codebase_code_dirs = _execCodeDirs;
+          const _serenaVal = (document.getElementById(`exec-serena_repo_path-${projectId}`)?.value || "").trim();
+          if (_serenaVal) cfg.serena_repo_path = _serenaVal;
           if (Array.isArray(execCfg.hostnames)) cfg.hostnames = execCfg.hostnames;
           for (const f4 of fields) {
             const val = (document.getElementById(`exec-${f4}-${projectId}`)?.value || "").trim();

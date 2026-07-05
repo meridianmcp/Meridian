@@ -1420,6 +1420,54 @@ def _union_repo_paths(projects: list[dict]) -> list[str]:
     return paths
 
 
+def _first_serena_repo_path(projects: list[dict]) -> str:
+    """First non-empty ``executor_config.serena_repo_path`` across project rows.
+
+    b970fe07 — the tunnel is tenant-scoped but Serena's default ``--project`` is a
+    single path, so we take the first project that sets one (order-preserved by
+    ``list_projects``). executor_config may be a JSON string or dict. Returns ``""``
+    when no project configures it — the client then keeps today's cwd default.
+    """
+    for p in projects:
+        raw = p.get("executor_config")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+        if not isinstance(raw, dict):
+            continue
+        sp = raw.get("serena_repo_path")
+        if isinstance(sp, str) and sp.strip():
+            return sp.strip()
+    return ""
+
+
+def _union_codebase_code_dirs(projects: list[dict]) -> list[str]:
+    """Deduped, order-preserved union of ``executor_config.codebase_code_dirs``.
+
+    b970fe07 — dirs the code-intel slot (codebase-memory-mcp) auto-indexes at
+    tunnel start, unioned across the tenant's projects (mirrors
+    ``_union_filesystem_roots``). executor_config may be a JSON string or dict.
+    """
+    dirs: list[str] = []
+    seen: set[str] = set()
+    for p in projects:
+        raw = p.get("executor_config")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+        if not isinstance(raw, dict):
+            continue
+        for d in (raw.get("codebase_code_dirs") or []):
+            if isinstance(d, str) and d.strip() and d.strip() not in seen:
+                seen.add(d.strip())
+                dirs.append(d.strip())
+    return dirs
+
+
 @router.get("/tunnel/filesystem-roots")
 async def get_tunnel_filesystem_roots(request: Request) -> Response:
     """Return the directories the tunnel's filesystem connector may read.
@@ -1433,10 +1481,20 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
     Also returns ``known_repo_paths`` — the union of ``executor_config.repo_path``
     across all projects. The tunnel client uses these as implicitly-trusted roots
     for the silent path auto-add (item 3 of dynamic-fs-roots feature).
+
+    b970fe07 — additionally returns ``serena_repo_path`` (first non-empty
+    ``executor_config.serena_repo_path`` across projects — Serena's default
+    ``--project``) and ``codebase_code_dirs`` (deduped union of
+    ``executor_config.codebase_code_dirs`` — the code-intel slot's auto-index
+    dirs). Both are fall-back-safe: the client applies them only when the
+    corresponding CLI flag (``--repo`` / ``--code-dir``) is absent.
     """
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
-        return _json_response({"filesystem_roots": [], "known_repo_paths": []})
+        return _json_response({
+            "filesystem_roots": [], "known_repo_paths": [],
+            "serena_repo_path": "", "codebase_code_dirs": [],
+        })
     try:
         db = await _db(request)
         projects = await db_module.list_projects(db)
@@ -1445,6 +1503,9 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
     return _json_response({
         "filesystem_roots": _union_filesystem_roots(projects),
         "known_repo_paths": _union_repo_paths(projects),
+        # b970fe07 — Serena default repo + code-intel index dirs.
+        "serena_repo_path": _first_serena_repo_path(projects),
+        "codebase_code_dirs": _union_codebase_code_dirs(projects),
     })
 
 

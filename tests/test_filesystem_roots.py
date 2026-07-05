@@ -113,6 +113,84 @@ def test_union_repo_paths_empty():
 
 
 # ---------------------------------------------------------------------------
+# b970fe07 — serena_repo_path + codebase_code_dirs (executor_config extensions)
+# ---------------------------------------------------------------------------
+
+def test_normalize_executor_config_keeps_serena_repo_path_and_code_dirs():
+    """b970fe07 — the two new keys survive normalize; a non-empty code_dirs list
+    is preserved (and junk keys are still dropped)."""
+    out = normalize_executor_config({
+        "serena_repo_path": "  C:/repo  ",
+        "codebase_code_dirs": ["/a", "/b"],
+        "bogus": 1,
+    })
+    assert out["serena_repo_path"] == "C:/repo"          # str trimmed
+    assert out["codebase_code_dirs"] == ["/a", "/b"]     # non-empty list kept
+    assert "bogus" not in out
+
+
+def test_normalize_executor_config_drops_empty_serena_repo_path():
+    """An all-whitespace serena_repo_path is dropped (mirrors other str keys)."""
+    out = normalize_executor_config({"serena_repo_path": "   ", "codebase_code_dirs": []})
+    assert "serena_repo_path" not in out
+    # An empty list is retained as-is (same as filesystem_roots/repo_paths).
+    assert out["codebase_code_dirs"] == []
+
+
+def test_executor_config_serena_and_code_dirs_roundtrip():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        proj = await db_module.create_project(db, "serena-code-roundtrip")
+        await db_module.set_executor_config(
+            db, proj["id"],
+            {"serena_repo_path": "C:/Users/me/repo",
+             "codebase_code_dirs": ["C:/Users/me/repo", "D:/other"]},
+        )
+        return await db_module.get_executor_config(db, proj["id"])
+
+    cfg = asyncio.run(_run())
+    assert cfg["serena_repo_path"] == "C:/Users/me/repo"
+    assert cfg["codebase_code_dirs"] == ["C:/Users/me/repo", "D:/other"]
+
+
+def test_first_serena_repo_path_takes_first_non_empty():
+    projects = [
+        {"executor_config": json.dumps({"repo_path": "/x"})},          # no serena key
+        {"executor_config": json.dumps({"serena_repo_path": "  "})},   # blank → skip
+        {"executor_config": {"serena_repo_path": "/first/repo"}},      # dict, wins
+        {"executor_config": json.dumps({"serena_repo_path": "/second"})},
+    ]
+    assert tn._first_serena_repo_path(projects) == "/first/repo"
+
+
+def test_first_serena_repo_path_empty_when_unset():
+    assert tn._first_serena_repo_path([]) == ""
+    assert tn._first_serena_repo_path(
+        [{"executor_config": json.dumps({"filesystem_roots": ["/x"]})},
+         {"executor_config": None},
+         {"executor_config": "not json"}]
+    ) == ""
+
+
+def test_union_codebase_code_dirs_dedupes_and_parses():
+    projects = [
+        {"executor_config": json.dumps({"codebase_code_dirs": ["/a", "/b"]})},
+        {"executor_config": {"codebase_code_dirs": ["/b", "/c"]}},     # dict, dedupe /b
+        {"executor_config": None},                                     # no config
+        {"executor_config": "bad json"},                               # malformed
+        {"executor_config": json.dumps({"codebase_code_dirs": [" ", 5, "/d "]})},
+    ]
+    assert tn._union_codebase_code_dirs(projects) == ["/a", "/b", "/c", "/d"]
+
+
+def test_union_codebase_code_dirs_empty_when_unset():
+    assert tn._union_codebase_code_dirs([]) == []
+    assert tn._union_codebase_code_dirs(
+        [{"executor_config": json.dumps({"repo_path": "/x"})}]
+    ) == []
+
+
+# ---------------------------------------------------------------------------
 # _add_fs_roots_to_cmd helper
 # ---------------------------------------------------------------------------
 
@@ -273,3 +351,110 @@ class _FakeProc:
     returncode = None
     def kill(self): pass
     async def wait(self): return None
+
+
+# ---------------------------------------------------------------------------
+# b970fe07 — GET /tunnel/filesystem-roots route: new fields in the response
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock  # noqa: E402
+
+
+def _decode_route_body(resp):
+    """Decode a route's JSON Response body to a dict."""
+    body = resp.body
+    if isinstance(body, bytes):
+        body = body.decode("utf-8")
+    return json.loads(body)
+
+
+def test_get_tunnel_filesystem_roots_returns_serena_and_code_dirs(monkeypatch):
+    """b970fe07 — the route surfaces serena_repo_path (first non-empty) and
+    codebase_code_dirs (deduped union) alongside the existing fields."""
+    projects = [
+        {"executor_config": json.dumps({
+            "filesystem_roots": ["/root/a"],
+            "repo_path": "/repo/a",
+            "serena_repo_path": "/serena/a",
+            "codebase_code_dirs": ["/code/a", "/code/b"],
+        })},
+        {"executor_config": json.dumps({
+            "serena_repo_path": "/serena/b",       # second project — first wins
+            "codebase_code_dirs": ["/code/b", "/code/c"],  # /code/b dedupes
+        })},
+    ]
+    monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value={"id": "t1"}))
+    monkeypatch.setattr(tn, "_db", AsyncMock(return_value=object()))
+    monkeypatch.setattr(tn.db_module, "list_projects", AsyncMock(return_value=projects))
+
+    resp = asyncio.run(tn.get_tunnel_filesystem_roots(object()))
+    data = _decode_route_body(resp)
+    assert data["filesystem_roots"] == ["/root/a"]
+    assert data["known_repo_paths"] == ["/repo/a"]
+    assert data["serena_repo_path"] == "/serena/a"                      # first non-empty
+    assert data["codebase_code_dirs"] == ["/code/a", "/code/b", "/code/c"]  # deduped union
+
+
+def test_get_tunnel_filesystem_roots_defaults_when_unset(monkeypatch):
+    """No project configures the new keys → empty defaults (today's behaviour)."""
+    projects = [{"executor_config": json.dumps({"filesystem_roots": ["/x"]})}]
+    monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value={"id": "t1"}))
+    monkeypatch.setattr(tn, "_db", AsyncMock(return_value=object()))
+    monkeypatch.setattr(tn.db_module, "list_projects", AsyncMock(return_value=projects))
+
+    data = _decode_route_body(asyncio.run(tn.get_tunnel_filesystem_roots(object())))
+    assert data["serena_repo_path"] == ""
+    assert data["codebase_code_dirs"] == []
+
+
+def test_get_tunnel_filesystem_roots_no_tenant_returns_empty(monkeypatch):
+    """Unauthenticated → all four fields default (no DB access)."""
+    monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value=None))
+    data = _decode_route_body(asyncio.run(tn.get_tunnel_filesystem_roots(object())))
+    assert data == {
+        "filesystem_roots": [], "known_repo_paths": [],
+        "serena_repo_path": "", "codebase_code_dirs": [],
+    }
+
+
+def test_fetch_filesystem_roots_parses_new_fields(monkeypatch):
+    """b970fe07 — the client fetch returns the 4-tuple, parsing/sanitising the
+    two new fields from the route JSON."""
+    class _FakeResp:
+        status_code = 200
+        def json(self):
+            return {
+                "filesystem_roots": ["/a", " ", 5],
+                "known_repo_paths": ["/repo"],
+                "serena_repo_path": "  /serena  ",
+                "codebase_code_dirs": ["/c1", "", "/c2 "],
+            }
+
+    class _FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): return _FakeResp()
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", _FakeClient)
+    fs, known, serena, code = asyncio.run(
+        tc._fetch_filesystem_roots("https://x", "sk_tok")
+    )
+    assert fs == ["/a"]
+    assert known == ["/repo"]
+    assert serena == "/serena"
+    assert code == ["/c1", "/c2"]
+
+
+def test_fetch_filesystem_roots_defaults_on_error(monkeypatch):
+    """Network/parse failure → 4-tuple of empty defaults (today's fallback)."""
+    class _BoomClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): raise RuntimeError("network down")
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", _BoomClient)
+    assert asyncio.run(tc._fetch_filesystem_roots("https://x", "sk")) == ([], [], "", [])

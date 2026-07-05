@@ -2449,7 +2449,10 @@ async def _handle_session_tools(
         for k in ("repo_path", "env_file", "test_cmd", "test_min",
                   "deploy_cmd", "shell_type", "branch",
                   "filesystem_roots", "hostnames", "context_threshold",
-                  "isolation", "max_turns"):
+                  "isolation", "max_turns",
+                  # b970fe07 — dashboard-configurable Serena default repo + code-intel
+                  # index dirs (mirror filesystem_roots: scalar/list overwrite).
+                  "serena_repo_path", "codebase_code_dirs"):
             if k in args:
                 cfg[k] = args[k]
         if "repo_paths" in args:

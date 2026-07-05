@@ -1610,15 +1610,23 @@ def _extract_denied_path(resp: dict) -> "str | None":
 
 async def _fetch_filesystem_roots(
     base_url: str, token: str
-) -> "tuple[list[str], list[str]]":
+) -> "tuple[list[str], list[str], str, list[str]]":
     """GET /tunnel/filesystem-roots — the dirs the fs connector may serve.
 
-    Returns ``(filesystem_roots, known_repo_paths)``.  ``filesystem_roots`` are
-    the explicit allowed dirs (unioned ``executor_config.filesystem_roots`` across
-    projects); ``known_repo_paths`` are the implicit trust anchors
+    Returns ``(filesystem_roots, known_repo_paths, serena_repo_path,
+    codebase_code_dirs)``.  ``filesystem_roots`` are the explicit allowed dirs
+    (unioned ``executor_config.filesystem_roots`` across projects);
+    ``known_repo_paths`` are the implicit trust anchors
     (``executor_config.repo_path`` per project) used for silent auto-add.
-    Both lists are empty on any error so the caller falls back to the
-    home-directory default.
+
+    b970fe07 — ``serena_repo_path`` is the first non-empty
+    ``executor_config.serena_repo_path`` (Serena's default ``--project``) and
+    ``codebase_code_dirs`` the deduped union of ``executor_config.codebase_code_dirs``
+    (the code-intel slot's auto-index dirs). Fall-back-safe: the caller applies
+    each only when the matching CLI flag is absent.
+
+    All fields degrade to empty (``[]`` / ``""``) on any error so the caller
+    falls back to today's defaults (home dir / cwd / no auto-index).
     """
     import httpx
 
@@ -1632,13 +1640,17 @@ async def _fetch_filesystem_roots(
                 data = r.json() or {}
                 roots = data.get("filesystem_roots") or []
                 known = data.get("known_repo_paths") or []
+                serena_repo = data.get("serena_repo_path") or ""
+                code_dirs = data.get("codebase_code_dirs") or []
                 return (
                     [str(x).strip() for x in roots if isinstance(x, str) and x.strip()],
                     [str(x).strip() for x in known if isinstance(x, str) and x.strip()],
+                    str(serena_repo).strip() if isinstance(serena_repo, str) else "",
+                    [str(x).strip() for x in code_dirs if isinstance(x, str) and x.strip()],
                 )
     except Exception:  # noqa: BLE001 — network/parse error → defaults
         pass
-    return [], []
+    return [], [], "", []
 
 
 # ---------------------------------------------------------------------------
@@ -2133,6 +2145,13 @@ async def run_tunnel(
     _force_utf8_io()
     # Resolve base_url first — it's the cache key for the stored token.
     base_url = _resolve_base_url(base_url)
+    # b970fe07 — remember whether the caller explicitly set repo_path / code_dirs
+    # on the CLI *before* we default repo_path to cwd. When a flag is absent, a
+    # dashboard-configured value (serena_repo_path / codebase_code_dirs, fetched
+    # below) may fill it in; when a flag IS present, the CLI always wins and the
+    # config is ignored — so an unset config reproduces today's exact behaviour.
+    _repo_path_from_cli = bool(repo_path)
+    _code_dirs_from_cli = bool(code_dirs)
     repo_path = str(Path(repo_path or Path.cwd()).resolve())
 
     # Token priority: --token / env vars > cached token > browser auth flow.
@@ -2230,7 +2249,36 @@ async def run_tunnel(
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
     # known_repo_paths are trust anchors for silent auto-add (b9d1b606).
-    fs_roots, known_repo_paths = await _fetch_filesystem_roots(base_url, token)
+    # b970fe07 — also fetch the dashboard-configured Serena default repo path and
+    # code-intel index dirs (extract/code slots), consumed fall-back-safe below.
+    fs_roots, known_repo_paths, cfg_serena_repo_path, cfg_code_dirs = (
+        await _fetch_filesystem_roots(base_url, token)
+    )
+    # b970fe07 — Serena's default --project. The CLI --repo always wins; only when
+    # it was absent (repo_path defaulted to cwd) does a configured serena_repo_path
+    # take over. Unset config → serena_repo_path stays == repo_path (today's cwd
+    # default, unchanged behaviour).
+    serena_repo_path = repo_path
+    if not _repo_path_from_cli and cfg_serena_repo_path:
+        try:
+            serena_repo_path = str(Path(cfg_serena_repo_path).resolve())
+            print(
+                f"  code-extractor:    Serena default repo from dashboard config: "
+                f"{serena_repo_path}",
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 — bad config path → keep the cwd default
+            serena_repo_path = repo_path
+    # b970fe07 — code-intel auto-index dirs. --code-dir always wins; only when it
+    # was absent does the configured codebase_code_dirs fill in. Unset config →
+    # code_dirs stays as passed (today's behaviour: no auto-index unless flagged).
+    if not _code_dirs_from_cli and cfg_code_dirs:
+        code_dirs = list(cfg_code_dirs)
+        print(
+            f"  code-intel:        auto-index dirs from dashboard config: "
+            f"{', '.join(code_dirs)}",
+            flush=True,
+        )
     # cbbd0eb4 — extra --repo paths (after the first) become additional fs roots,
     # resolved + deduped onto the front so the connector serves exactly the dirs
     # the user named (and the active repo_path) — not a broad parent dir.
@@ -2330,7 +2378,9 @@ async def run_tunnel(
             # single fixed --project instance, so executor sessions touching other
             # repos no longer hit Serena's "outside configured workspaces" error.
             serena_pool = SerenaDaemonPool(
-                default_repo_path=repo_path,
+                # b970fe07 — dashboard serena_repo_path fills this in when --repo
+                # was not passed; otherwise it's the CLI repo_path (== cwd default).
+                default_repo_path=serena_repo_path,
                 spawn=lambda cmd: subprocess.Popen(cmd, **_spawn_kwargs()),
             )
             print(
@@ -2515,7 +2565,9 @@ async def run_tunnel(
         # single SlotProxy + idle-killer.
         tasks.append(asyncio.ensure_future(
             _reconnect_loop_extract_pool(
-                ws_extract, serena_pool, repo_path, "extract",
+                # b970fe07 — match the pool's default_repo_path (serena_repo_path,
+                # which is the CLI repo_path unless a dashboard config overrode it).
+                ws_extract, serena_pool, serena_repo_path, "extract",
                 tool_prefix=slot_prefixes.get("extract"),
             )
         ))
