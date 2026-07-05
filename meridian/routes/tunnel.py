@@ -1733,6 +1733,13 @@ SLOT_DISPLAY_NAMES = {
     "p3": "custom-p3",
 }
 
+
+def _display_pretty(display: str) -> str:
+    """Human label for a slot display name shown in tool titles:
+    ``desktop-commander`` → ``Desktop Commander``, ``filesystem`` → ``Filesystem``."""
+    return display.replace("-", " ").replace("_", " ").title()
+
+
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
 _tunnel_tool_routes: dict[str, dict[str, str]] = {}
 
@@ -1934,6 +1941,19 @@ async def list_tunnel_tools(
                 continue
             tool_copy = dict(tool)
             tool_copy["name"] = prefixed
+            # connector-source — claude.ai's tool-permission UI shows a tool's
+            # top-level ``title`` when present, else a humanized name. The prefixed
+            # NAME already carries the source (codebase__search_graph →
+            # "Codebase search graph"), but a slot whose inner server advertises a
+            # bare tool title (filesystem's "Read File", serena, desktop-commander)
+            # would display WITHOUT its plugin source. Namespace the title too so
+            # every slot indicates its connector consistently. Guarded against
+            # double-prefixing; nested inputSchema param titles are left alone.
+            _title = tool.get("title")
+            if isinstance(_title, str) and _title.strip():
+                _src = _display_pretty(display)
+                if not _title.startswith(_src):
+                    tool_copy["title"] = f"{_src}: {_title}"
             routes[prefixed] = label  # route back via the internal slot label
             aggregated.append(_rewrite_tool_description(tool_copy))
     if routes:
