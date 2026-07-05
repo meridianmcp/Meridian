@@ -34,7 +34,9 @@ from fastapi.responses import Response
 
 from .. import db as db_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
-from ..tunnel_plugins import normalize_plugins_config, resolve_plugins, resolve_custom_plugins
+from ..tunnel_plugins import (
+    normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
+)
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -1176,6 +1178,177 @@ def _json_response(payload: dict, status_code: int = 200) -> Response:
         status_code=status_code,
         media_type="application/json",
     )
+
+
+# ---------------------------------------------------------------------------
+# Custom-plugin add / remove — sprint item 9811d04c
+# Persists a tenant's *chosen* custom plugins (the "install this" path the browse
+# UI dead-ended on). Storage reuses the existing per-tenant ``tunnel_plugins``
+# JSON blob (or ``tunnel_plugins_by_host`` when ?hostname=X) — a custom plugin is
+# just an extra list entry whose name is not a built-in, so no new table/column
+# and no migration. resolve_custom_plugins already reads these entries.
+# ---------------------------------------------------------------------------
+
+def _config_as_entry_list(parsed: Any) -> list[dict]:
+    """Normalize a stored tunnel_plugins config into an ordered list of entries.
+
+    The store round-trips as either the dict-keyed form or the list form; the
+    add/remove handlers work on the list form (so we can append/filter and keep
+    custom entries' ``port``/``command`` intact) before re-normalizing to persist.
+    """
+    from ..tunnel_plugins import _iter_plugin_items
+    return _iter_plugin_items(parsed)
+
+
+async def _store_tunnel_config(request: Request, tenant: dict, hostname: str | None,
+                               entries: list[dict]) -> Any:
+    """Persist a full tunnel-plugins config (list of entries) for a tenant/machine.
+
+    Mirrors put_tunnel_plugins' storage: with ``hostname`` it writes that
+    machine's slice of ``tunnel_plugins_by_host``; otherwise the per-tenant
+    ``tunnel_plugins`` default. Returns the normalized config that was stored.
+    """
+    normalized = normalize_plugins_config(entries)
+    if hostname:
+        from ..tunnel_plugins import parse_plugins_by_host
+        by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+        if normalized:
+            by_host[hostname] = normalized
+        else:
+            by_host.pop(hostname, None)
+        stored_by_host = json.dumps(by_host) if by_host else None
+        await db_module.update_tenant(
+            request.app.state.db, tenant["id"], tunnel_plugins_by_host=stored_by_host)
+    else:
+        stored = json.dumps(normalized) if normalized else None
+        await db_module.update_tenant(
+            request.app.state.db, tenant["id"], tunnel_plugins=stored)
+    return normalized
+
+
+def _current_tunnel_config(tenant: dict, hostname: str | None) -> Any:
+    """The effective stored config (parsed) for a tenant/machine — no defaults."""
+    from ..tunnel_plugins import select_host_config
+    return select_host_config(
+        _parse_plugins_json(tenant.get("tunnel_plugins")),
+        tenant.get("tunnel_plugins_by_host"),
+        hostname,
+    )
+
+
+@router.post("/tunnel/plugins/custom")
+async def add_custom_plugin(request: Request) -> Response:
+    """9811d04c — persist a chosen custom plugin into the tenant's tunnel config.
+
+    Body: ``{"name": str, "command": str|list, "port"?: int, "env"?: {..}}``.
+    ``?hostname=X`` scopes it to that machine (else the per-tenant default). The
+    name is validated (safe charset, no built-in slot/plugin collision) and the
+    command must be non-empty; a missing/blank port is auto-assigned. Merges into
+    the existing config (reusing the ``tunnel_plugins`` JSON blob — no new table)
+    so ``resolve_custom_plugins`` picks it up on the next tunnel (re)start.
+    Returns the updated ``custom`` list.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"error": "authentication required"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_response({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return _json_response({"error": "expected a JSON object"}, status_code=400)
+
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    parsed = _current_tunnel_config(tenant, hostname)
+    entries = _config_as_entry_list(parsed)
+
+    from ..tunnel_plugins import validate_custom_plugin
+    name = str(body.get("name") or "").strip()
+    # Reject a duplicate custom name up front (case-insensitive) so add is
+    # idempotent-safe and doesn't silently replace an existing entry.
+    existing_custom = resolve_custom_plugins(parsed)
+    if name and any(c["name"].lower() == name.lower() for c in existing_custom):
+        return _json_response(
+            {"error": f"a custom plugin named '{name}' already exists"}, status_code=409)
+    existing_ports = [c["port"] for c in existing_custom]
+    entry, err = validate_custom_plugin(
+        name, body.get("command"), body.get("port"),
+        existing_ports=existing_ports, env=body.get("env"),
+    )
+    if err is not None:
+        return _json_response({"error": err}, status_code=400)
+
+    entries.append(entry)
+    await _store_tunnel_config(request, tenant, hostname, entries)
+    # Re-read the stored config so the returned custom list reflects exactly what
+    # persisted (and would resolve at tunnel spawn).
+    stored = _current_tunnel_config(
+        await _get_tenant_from_request(request) or tenant, hostname)
+    return _json_response({
+        "ok": True,
+        "hostname": hostname,
+        "added": entry,
+        "custom": resolve_custom_plugins(stored),
+    })
+
+
+@router.delete("/tunnel/plugins/custom")
+async def remove_custom_plugin(request: Request) -> Response:
+    """9811d04c — remove a persisted custom plugin by name.
+
+    Name comes from ``?name=`` or a ``{"name": ...}`` JSON body. ``?hostname=X``
+    scopes to that machine. Built-in slot overrides are left untouched (only a
+    non-built-in entry with a matching name is dropped). Returns the updated
+    ``custom`` list. Removing a name that isn't a custom plugin is a no-op 404.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"error": "authentication required"}, status_code=401)
+
+    name = (request.query_params.get("name") or "").strip()
+    if not name:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                name = str(body.get("name") or "").strip()
+        except Exception:  # noqa: BLE001 — no/invalid body; name may still be in query
+            pass
+    if not name:
+        return _json_response({"error": "name is required"}, status_code=400)
+
+    from ..tunnel_plugins import is_reserved_custom_name
+    if is_reserved_custom_name(name):
+        return _json_response(
+            {"error": "cannot remove a built-in slot via this route"}, status_code=400)
+
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    parsed = _current_tunnel_config(tenant, hostname)
+    entries = _config_as_entry_list(parsed)
+
+    builtin = set(builtin_names())
+    kept: list[dict] = []
+    removed = False
+    for it in entries:
+        it_name = str(it.get("name") or "").strip()
+        # Only drop a *custom* (non-built-in) entry matching the name — a built-in
+        # slot override that happens to be present is preserved.
+        if it_name.lower() == name.lower() and it_name not in builtin:
+            removed = True
+            continue
+        kept.append(it)
+    if not removed:
+        return _json_response(
+            {"error": f"no custom plugin named '{name}'"}, status_code=404)
+
+    await _store_tunnel_config(request, tenant, hostname, kept)
+    stored = _current_tunnel_config(
+        await _get_tenant_from_request(request) or tenant, hostname)
+    return _json_response({
+        "ok": True,
+        "hostname": hostname,
+        "removed": name,
+        "custom": resolve_custom_plugins(stored),
+    })
 
 
 # ---------------------------------------------------------------------------

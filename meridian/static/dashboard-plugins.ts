@@ -458,7 +458,7 @@ async function loadTunnelPluginsSection(projectId: string, hostname: any) {
 
     // Wire up live registry copy buttons and search/load-more (sprint item 9b288b91).
     _wireRegistryCopyButtons(section);
-    _wireRegistryBrowse(section, projectId);
+    _wireRegistryBrowse(section, projectId, _hq);
 
     // Wire up three-state lifecycle Install buttons (sprint item 56cb5d33).
     _wireLifecycleInstallButtons(section);
@@ -536,6 +536,26 @@ window.loadTunnelPluginsSection = loadTunnelPluginsSection;
 // the proxy is unavailable (self-hosted without internet, etc.).
 // ---------------------------------------------------------------------------
 
+// 9811d04c — derive a safe custom-plugin name from a registry entry's id/name.
+// The server's add route (validate_custom_plugin) requires letters/digits plus
+// ._- , ≤64 chars, starting alphanumeric. Registry ids look like
+// "io.github.owner/server-name" — take the last path segment, drop any scope,
+// slug-ify to the safe charset, and cap length. Returns '' if nothing usable.
+function _customNameFromRegistry(raw: any) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  // Last path segment (handles "io.github.owner/fetch" and "@scope/pkg").
+  if (s.includes('/')) s = s.split('/').filter(Boolean).pop() || s;
+  s = s.replace(/^@/, '');
+  // Replace runs of unsafe chars with a single dash; collapse repeats.
+  s = s.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/-{2,}/g, '-');
+  // Must start alphanumeric.
+  s = s.replace(/^[._-]+/, '');
+  s = s.slice(0, 64).replace(/[._-]+$/, '');
+  return s;
+}
+window._customNameFromRegistry = _customNameFromRegistry;
+
 async function _renderPluginBrowseSection(projectId: string) {
   let servers = null;
   let nextCursor = null;
@@ -581,6 +601,13 @@ async function _renderPluginBrowseSection(projectId: string) {
     const desc = escapeHtml(s.description || '');
     const installCmd = s.install_command || '';
     const homepage = escapeHtml(s.homepage || s.url || '');
+    // 9811d04c — a browsed result can be persisted directly as a custom plugin
+    // via the "Add" button (POST /tunnel/plugins/custom). Derive a safe, short
+    // plugin name from the registry id/name so the add route accepts it.
+    const addName = _customNameFromRegistry(s.name || s.id || '');
+    const addBtn = installCmd && addName
+      ? `<button class="primary rg-add" data-add-name="${escapeHtml(addName)}" data-add-cmd="${escapeHtml(installCmd)}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Add as a local custom plugin">Add</button>`
+      : '';
     return `
       <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)">
         <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;margin-bottom:4px">
@@ -590,6 +617,7 @@ async function _renderPluginBrowseSection(projectId: string) {
         ${desc ? `<div style="font-size:10px;color:var(--muted);margin-bottom:5px">${desc}</div>` : ''}
         ${installCmd ? `<div style="display:flex;gap:6px;align-items:center">
           <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(installCmd)}</code>
+          ${addBtn}
           <button class="secondary rg-copy" data-copy="${escapeHtml(installCmd)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy command</button>
         </div>` : ''}
       </div>`;
@@ -637,9 +665,49 @@ function _wireRegistryCopyButtons(container: any) {
 }
 window._wireRegistryCopyButtons = _wireRegistryCopyButtons;
 
+// 9811d04c — wire the browse "Add" buttons (.rg-add): POST the selected registry
+// server to /tunnel/plugins/custom so it persists as a local custom plugin, then
+// reflect an "Added" state on the button. ``hq`` is the ?hostname= query suffix
+// so per-machine browse Adds persist to the right machine's config.
+function _wireRegistryAddButtons(container: any, hq: any) {
+  if (!container) return;
+  container.querySelectorAll('.rg-add').forEach((btn: any) => {
+    if (btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', async () => {
+      const name = btn.dataset.addName || '';
+      const command = btn.dataset.addCmd || '';
+      if (!name || !command) return;
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Adding…';
+      try {
+        // Port omitted → the server auto-assigns a free one (>=8820).
+        const r = await api('/tunnel/plugins/custom' + (hq || ''), {
+          method: 'POST', body: JSON.stringify({ name, command }),
+        });
+        btn.textContent = 'Added';
+        btn.classList.remove('primary');
+        btn.classList.add('secondary');
+        const added = (r && r.added) || null;
+        toast(added && added.port
+          ? `Added "${name}" on port ${added.port} — restart the tunnel to launch it.`
+          : `Added "${name}" — restart the tunnel to launch it.`);
+      } catch (e: any) {
+        btn.disabled = false;
+        btn.textContent = prev;
+        toast('Add failed: ' + (e && e.message || e), true);
+      }
+    });
+  });
+}
+window._wireRegistryAddButtons = _wireRegistryAddButtons;
+
 // Wire up the live registry search filter and Load More button.
 // Called after section.innerHTML is set in loadTunnelPluginsSection.
-function _wireRegistryBrowse(section: any, projectId: string) {
+function _wireRegistryBrowse(section: any, projectId: string, hq?: any) {
+  // 9811d04c — wire the initial page's Add buttons (Load More wires its own).
+  _wireRegistryAddButtons(document.getElementById(`rg-list-${projectId}`), hq);
   const searchEl = document.getElementById(`rg-search-${projectId}`);
   if (searchEl) {
     searchEl.addEventListener('input', () => {
@@ -671,6 +739,7 @@ function _wireRegistryBrowse(section: any, projectId: string) {
               while (tmp.firstChild) listEl.appendChild(tmp.firstChild);
             });
             _wireRegistryCopyButtons(listEl);
+            _wireRegistryAddButtons(listEl, hq);  // 9811d04c
           }
           if (data.next_cursor) {
             loadMoreBtn.dataset.cursor = data.next_cursor;

@@ -290,6 +290,110 @@ _BUILTIN_DEFAULT_PORTS = frozenset({
     DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT,
 })
 
+# 9811d04c — first port a freshly-added custom plugin (from the browse "Add"
+# button) is auto-assigned when the caller supplies no port. Starts just above
+# the built-in default range (8808–8817, incl. the 4 pre-allocated custom
+# slots), so an auto-assigned port never collides with a built-in slot.
+_CUSTOM_PORT_START = 8820
+
+# 9811d04c — the built-in *slot* names (fs/code/extract/ppt/word/dc). A custom
+# plugin's name must not collide with a built-in slot name (task rule) nor with a
+# built-in plugin's display name (filesystem/code-intel/… — see builtin_names),
+# since either is a slot override rather than a genuine custom plugin.
+_RESERVED_CUSTOM_NAMES = frozenset(SLOTS)
+
+# Safe custom-plugin name charset: letters, digits, dash, underscore, dot. The
+# name becomes an ``.mcp.json`` key (``meridian-custom-<name>``) and part of a
+# local proxy identity, so we keep it to a conservative, shell/JSON-safe set.
+import re as _re
+_CUSTOM_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def is_reserved_custom_name(name: Any) -> bool:
+    """9811d04c — True if *name* collides with a built-in slot or plugin name.
+
+    A custom plugin may not be named like a built-in slot (fs/code/extract/ppt/
+    word/dc) or a built-in plugin (filesystem/code-intel/…): such a name is a slot
+    override, never a stand-alone custom plugin, and ``resolve_custom_plugins``
+    would silently drop it. Case-insensitive on the stripped value.
+    """
+    n = str(name or "").strip().lower()
+    if not n:
+        return False
+    return n in _RESERVED_CUSTOM_NAMES or n in {b.lower() for b in builtin_names()}
+
+
+def validate_custom_plugin(
+    name: Any, command: Any, port: Any = None,
+    *, existing_ports: Any = (), env: Any = None,
+) -> "tuple[dict | None, str | None]":
+    """9811d04c — validate one custom-plugin selection, returning ``(entry, error)``.
+
+    Exactly one of the pair is non-None. On success ``entry`` is a normalized
+    ``{"name", "command" (list[str]), "port" (int), "enabled": True}`` dict (plus
+    an ``"env"`` dict when supplied and non-empty), ready to merge into the stored
+    ``tunnel_plugins`` config; ``error`` is None. On failure ``entry`` is None and
+    ``error`` is a short human-readable reason.
+
+    Rules (mirror :func:`resolve_custom_plugins`, but *reject* instead of silently
+    dropping so the add API can report why):
+
+    - ``name``: stripped, matches :data:`_CUSTOM_NAME_RE` (letters/digits plus
+      ``._-``, ≤64 chars), and not a built-in slot/plugin name.
+    - ``command``: coerced via :func:`_coerce_command`; must be non-empty.
+    - ``port``: when given, a real ``int`` (``bool`` rejected) in 1024–65535, not a
+      built-in default port (8808–8813) and not already in ``existing_ports``. When
+      omitted/None, the first free port at/after :data:`_CUSTOM_PORT_START` that
+      avoids the built-in ports and ``existing_ports`` is auto-assigned.
+    - ``env`` (optional): a dict → coerced to ``{str: str}`` (blank keys dropped);
+      attached only when non-empty.
+    """
+    nm = str(name or "").strip()
+    if not nm:
+        return None, "name is required"
+    if not _CUSTOM_NAME_RE.match(nm):
+        return None, (
+            "name must be 1–64 chars of letters, digits, dot, dash or underscore "
+            "(and start alphanumeric)"
+        )
+    if is_reserved_custom_name(nm):
+        return None, f"'{nm}' collides with a built-in slot/plugin name"
+
+    cmd = _coerce_command(command)
+    if not cmd:
+        return None, "command is required"
+
+    used = {p for p in existing_ports if isinstance(p, int) and not isinstance(p, bool)}
+    if port is None or port == "":
+        assigned: int | None = None
+        for candidate in range(_CUSTOM_PORT_START, 65536):
+            if candidate in _BUILTIN_DEFAULT_PORTS or candidate in used:
+                continue
+            assigned = candidate
+            break
+        if assigned is None:  # pragma: no cover — 57k-port exhaustion is unreachable
+            return None, "no free port available"
+        port_int = assigned
+    else:
+        if not isinstance(port, int) or isinstance(port, bool):
+            return None, "port must be an integer"
+        if not (1024 <= port <= 65535):
+            return None, "port must be in 1024–65535"
+        if port in _BUILTIN_DEFAULT_PORTS:
+            return None, "port collides with a built-in slot (8808–8813)"
+        if port in used:
+            return None, f"port {port} is already used by another custom plugin"
+        port_int = port
+
+    entry: dict[str, Any] = {
+        "name": nm, "command": cmd, "port": port_int, "enabled": True,
+    }
+    if isinstance(env, dict):
+        coerced = {str(k): str(v) for k, v in env.items() if str(k)}
+        if coerced:
+            entry["env"] = coerced
+    return entry, None
+
 
 def resolve_custom_plugins(raw_config: Any) -> list[dict]:
     """Resolve user-defined (non-built-in) plugins from the stored config.

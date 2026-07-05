@@ -5936,7 +5936,7 @@ project_id = "${displayPid}"`;
         });
       });
       _wireRegistryCopyButtons(section);
-      _wireRegistryBrowse(section, projectId);
+      _wireRegistryBrowse(section, projectId, _hq);
       _wireLifecycleInstallButtons(section);
       let _tenantIdPromise = null;
       const _getTenantId = () => {
@@ -6000,6 +6000,17 @@ project_id = "${displayPid}"`;
     }
   }
   window.loadTunnelPluginsSection = loadTunnelPluginsSection2;
+  function _customNameFromRegistry(raw) {
+    let s3 = String(raw || "").trim();
+    if (!s3) return "";
+    if (s3.includes("/")) s3 = s3.split("/").filter(Boolean).pop() || s3;
+    s3 = s3.replace(/^@/, "");
+    s3 = s3.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/-{2,}/g, "-");
+    s3 = s3.replace(/^[._-]+/, "");
+    s3 = s3.slice(0, 64).replace(/[._-]+$/, "");
+    return s3;
+  }
+  window._customNameFromRegistry = _customNameFromRegistry;
   async function _renderPluginBrowseSection(projectId) {
     let servers = null;
     let nextCursor = null;
@@ -6040,6 +6051,8 @@ project_id = "${displayPid}"`;
       const desc = escapeHtml(s3.description || "");
       const installCmd = s3.install_command || "";
       const homepage = escapeHtml(s3.homepage || s3.url || "");
+      const addName = _customNameFromRegistry(s3.name || s3.id || "");
+      const addBtn = installCmd && addName ? `<button class="primary rg-add" data-add-name="${escapeHtml(addName)}" data-add-cmd="${escapeHtml(installCmd)}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Add as a local custom plugin">Add</button>` : "";
       return `
       <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)">
         <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;margin-bottom:4px">
@@ -6049,6 +6062,7 @@ project_id = "${displayPid}"`;
         ${desc ? `<div style="font-size:10px;color:var(--muted);margin-bottom:5px">${desc}</div>` : ""}
         ${installCmd ? `<div style="display:flex;gap:6px;align-items:center">
           <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(installCmd)}</code>
+          ${addBtn}
           <button class="secondary rg-copy" data-copy="${escapeHtml(installCmd)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy command</button>
         </div>` : ""}
       </div>`;
@@ -6091,7 +6105,39 @@ project_id = "${displayPid}"`;
     });
   }
   window._wireRegistryCopyButtons = _wireRegistryCopyButtons;
-  function _wireRegistryBrowse(section, projectId) {
+  function _wireRegistryAddButtons(container, hq) {
+    if (!container) return;
+    container.querySelectorAll(".rg-add").forEach((btn) => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = "1";
+      btn.addEventListener("click", async () => {
+        const name = btn.dataset.addName || "";
+        const command = btn.dataset.addCmd || "";
+        if (!name || !command) return;
+        const prev = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "Adding\u2026";
+        try {
+          const r3 = await api("/tunnel/plugins/custom" + (hq || ""), {
+            method: "POST",
+            body: JSON.stringify({ name, command })
+          });
+          btn.textContent = "Added";
+          btn.classList.remove("primary");
+          btn.classList.add("secondary");
+          const added = r3 && r3.added || null;
+          toast(added && added.port ? `Added "${name}" on port ${added.port} \u2014 restart the tunnel to launch it.` : `Added "${name}" \u2014 restart the tunnel to launch it.`);
+        } catch (e3) {
+          btn.disabled = false;
+          btn.textContent = prev;
+          toast("Add failed: " + (e3 && e3.message || e3), true);
+        }
+      });
+    });
+  }
+  window._wireRegistryAddButtons = _wireRegistryAddButtons;
+  function _wireRegistryBrowse(section, projectId, hq) {
+    _wireRegistryAddButtons(document.getElementById(`rg-list-${projectId}`), hq);
     const searchEl = document.getElementById(`rg-search-${projectId}`);
     if (searchEl) {
       searchEl.addEventListener("input", () => {
@@ -6122,6 +6168,7 @@ project_id = "${displayPid}"`;
                 while (tmp.firstChild) listEl.appendChild(tmp.firstChild);
               });
               _wireRegistryCopyButtons(listEl);
+              _wireRegistryAddButtons(listEl, hq);
             }
             if (data.next_cursor) {
               loadMoreBtn.dataset.cursor = data.next_cursor;
