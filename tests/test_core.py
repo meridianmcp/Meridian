@@ -199,7 +199,9 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     assert "sess-1" in content and "sess-2" in content
     assert "did A" in content and "did B" in content
     assert "## Quick Start" in content
-    assert "/goal Verify remaining work is complete." in content
+    # 5abf3e12 — empty-board /goal is XML-structured: the verify text is the
+    # <role> body now, not inline after "/goal ".
+    assert "<role>Verify remaining work is complete.</role>" in content
     assert "pixi run test passes 2150+" in content
     assert "## Resume Instructions" in content
     on_disk = tmp_path / "alpha_handoff.md"
@@ -275,7 +277,8 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "dependency order" in content
     assert f"{first['id']}, {second['id']}." in content
     # f628b880 — the /goal leads with the non-deferential executor directive.
-    assert "/goal You are an executor. Claim and execute" in content
+    # 5abf3e12 — now inside the <role> tag of the XML-structured /goal.
+    assert "<role>You are an executor. Claim and execute" in content
     assert "complete_sprint_item()" in content
 
 
@@ -5204,13 +5207,15 @@ def test_max_turns_from_settings_clamps_to_500():
 
 def test_build_quick_start_goal_loop_prefix():
     from meridian import handoff as h
+    # 5abf3e12 — the XML-structured /goal starts with "/goal\n" (newline before
+    # the first tag), and "/loop /goal\n" when auto-continue is enabled.
     # Empty-board path.
-    assert h._build_quick_start_goal([], loop_enabled=False).startswith("/goal ")
-    assert h._build_quick_start_goal([], loop_enabled=True).startswith("/loop /goal ")
+    assert h._build_quick_start_goal([], loop_enabled=False).startswith("/goal\n")
+    assert h._build_quick_start_goal([], loop_enabled=True).startswith("/loop /goal\n")
     # Items path.
     items = [{"id": "abc123", "version": None}]
-    assert h._build_quick_start_goal(items, loop_enabled=False).startswith("/goal ")
-    assert h._build_quick_start_goal(items, loop_enabled=True).startswith("/loop /goal ")
+    assert h._build_quick_start_goal(items, loop_enabled=False).startswith("/goal\n")
+    assert h._build_quick_start_goal(items, loop_enabled=True).startswith("/loop /goal\n")
 
 
 def test_build_quick_start_goal_parallel_batches():
@@ -5330,12 +5335,13 @@ async def test_generate_handoff_prepends_loop_when_workspace_default_on(db, tmp_
     await db_module.add_sprint_item(db, p["id"], "v1", "an item")
     await db_module.update_workspace_settings(db, loop_enabled_default=True)
     await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
-    assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal ")
+    # 5abf3e12 — XML-structured /goal starts with "/loop /goal\n" / "/goal\n".
+    assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal\n")
     # Workspace default OFF (and no project override) → no /loop.
     await db_module.update_workspace_settings(db, loop_enabled_default=False)
     await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
     stored2 = await db_module.get_pending_goal(db, p["id"])
-    assert stored2.startswith("/goal ") and not stored2.startswith("/loop")
+    assert stored2.startswith("/goal\n") and not stored2.startswith("/loop")
 
 
 def test_workspace_settings_http_loop_default(client):
@@ -6580,6 +6586,218 @@ async def test_run_pg_migrations_survives_a_failing_migration(caplog):
                for r in caplog.records), "failing migration should log a WARNING"
 
 
+# ---------------------------------------------------------------------------
+# 3b6ff466 — subprojects (parent_project_id) + north_star inheritance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_subproject_stores_parent_project_id(db):
+    """A child created with parent_project_id records it; the parent is None."""
+    parent = await db_module.create_project(db, "sub-parent")
+    child = await db_module.create_project(
+        db, "sub-child", parent_project_id=parent["id"]
+    )
+    assert child["parent_project_id"] == parent["id"]
+    # Round-trips through the DB, not just the return value.
+    fetched = await db_module.get_project(db, child["id"])
+    assert fetched["parent_project_id"] == parent["id"]
+    # The parent itself stays top-level.
+    assert parent["parent_project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_subproject_rejects_missing_parent(db):
+    """A parent_project_id that doesn't resolve is rejected."""
+    with pytest.raises(ValueError, match="does not exist"):
+        await db_module.create_project(
+            db, "sub-orphan", parent_project_id="nonexistent-id"
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_grandchild_rejected_one_level_deep(db):
+    """Subprojects are ONE level deep — a grandchild (child of a child) is
+    rejected so the hierarchy never nests."""
+    parent = await db_module.create_project(db, "gc-parent")
+    child = await db_module.create_project(
+        db, "gc-child", parent_project_id=parent["id"]
+    )
+    with pytest.raises(ValueError, match="one level deep"):
+        await db_module.create_project(
+            db, "gc-grandchild", parent_project_id=child["id"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_inherits_parent_north_star_via_get_goal(db):
+    """A child with no north_star of its own inherits the parent's, flagged
+    inherited, when the child has its own goal row (empty north_star)."""
+    parent = await db_module.create_project(db, "ns-parent")
+    await db_module.set_goal(
+        db, parent["id"], "parent version goal", north_star="Ship the platform"
+    )
+    child = await db_module.create_project(
+        db, "ns-child", parent_project_id=parent["id"]
+    )
+    # Child has its own goal but no north_star.
+    await db_module.set_goal(db, child["id"], "child version goal")
+    goal = await db_module.get_goal(db, child["id"])
+    assert goal is not None
+    assert goal["north_star"] == "Ship the platform"
+    assert goal["north_star_inherited"] is True
+    assert goal["north_star_source_project_id"] == parent["id"]
+    # The child's own content is preserved — only the north_star is borrowed.
+    assert goal["content"] == "child version goal"
+
+
+@pytest.mark.asyncio
+async def test_child_with_no_goal_row_still_inherits_north_star(db):
+    """A child that has never set a goal at all still surfaces the parent's
+    north_star (synthesised goal dict), rather than get_goal returning None."""
+    parent = await db_module.create_project(db, "ns2-parent")
+    await db_module.set_goal(
+        db, parent["id"], "pg", north_star="Inherited star"
+    )
+    child = await db_module.create_project(
+        db, "ns2-child", parent_project_id=parent["id"]
+    )
+    goal = await db_module.get_goal(db, child["id"])
+    assert goal is not None
+    assert goal["north_star"] == "Inherited star"
+    assert goal["north_star_inherited"] is True
+    assert goal["north_star_source_project_id"] == parent["id"]
+    assert goal["version"] == 0
+
+
+@pytest.mark.asyncio
+async def test_child_with_own_north_star_not_overridden(db):
+    """When the child sets its OWN north_star it wins — no inheritance."""
+    parent = await db_module.create_project(db, "ns3-parent")
+    await db_module.set_goal(db, parent["id"], "pg", north_star="Parent star")
+    child = await db_module.create_project(
+        db, "ns3-child", parent_project_id=parent["id"]
+    )
+    await db_module.set_goal(
+        db, child["id"], "cg", north_star="Child's own star"
+    )
+    goal = await db_module.get_goal(db, child["id"])
+    assert goal["north_star"] == "Child's own star"
+    assert goal["north_star_inherited"] is False
+    assert goal["north_star_source_project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_top_level_project_north_star_unchanged(db):
+    """A top-level project (no parent) is completely unaffected: no inheritance
+    keys leak a source, and an unset north_star stays unset."""
+    top = await db_module.create_project(db, "top-level")
+    # Own north_star set — plain passthrough, not flagged inherited.
+    await db_module.set_goal(db, top["id"], "tg", north_star="My star")
+    goal = await db_module.get_goal(db, top["id"])
+    assert goal["north_star"] == "My star"
+    assert goal["north_star_inherited"] is False
+    assert goal["north_star_source_project_id"] is None
+    # A different top-level project with no goal at all still returns None.
+    top2 = await db_module.create_project(db, "top-level-2")
+    assert await db_module.get_goal(db, top2["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_child_no_inheritance_when_parent_has_no_north_star(db):
+    """If the parent itself has no north_star there is nothing to inherit; the
+    child's own (empty) goal is returned unflagged."""
+    parent = await db_module.create_project(db, "ns4-parent")
+    await db_module.set_goal(db, parent["id"], "pg")  # no north_star
+    child = await db_module.create_project(
+        db, "ns4-child", parent_project_id=parent["id"]
+    )
+    await db_module.set_goal(db, child["id"], "cg")
+    goal = await db_module.get_goal(db, child["id"])
+    assert (goal["north_star"] or "") == ""
+    assert goal["north_star_inherited"] is False
+
+
+@pytest.mark.asyncio
+async def test_context_block_and_planning_brief_show_inherited_north_star(db):
+    """The two rendered read-paths (get_context_block / get_planning_brief)
+    both resolve the goal through get_goal, so a child with no north_star of
+    its own shows the parent's inherited north_star in each."""
+    from meridian._deps import _render_context_block
+
+    parent = await db_module.create_project(db, "brief-parent")
+    await db_module.set_goal(
+        db, parent["id"], "pg", north_star="Inherited brief star"
+    )
+    child = await db_module.create_project(
+        db, "brief-child", parent_project_id=parent["id"]
+    )
+    goal = await db_module.get_goal(db, child["id"])
+    # get_context_block renders via _render_context_block(project, goal, ...).
+    rendered = _render_context_block(
+        child, goal, [], [], [], [], mode="full",
+    )
+    assert "Inherited brief star" in rendered
+    # get_planning_brief embeds goal["north_star"] the same way — assert the
+    # shared source dict carries the inherited value.
+    assert goal["north_star"] == "Inherited brief star"
+    assert goal["north_star_inherited"] is True
+
+
+def test_migrate_project_parent_id_survives_pre_column_projects_table():
+    """3b6ff466 — existing-DB upgrade (spirit of the pre-tenant_id blog test).
+
+    A projects table that predates parent_project_id must get the column added
+    by init_db without crashing, existing rows preserved, and the guarded
+    index created — all idempotently on re-init."""
+    import sqlite3
+
+    def _run(db_path):
+        legacy = sqlite3.connect(db_path)
+        legacy.executescript(
+            """
+            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')));
+            INSERT INTO projects (id, name) VALUES ('p1', 'legacy-proj');
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+    import tempfile
+
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "legacy_parent.db")
+            _run(db_path)
+            # First init applies the migration (adds column + index).
+            conn = await db_module.init_db(db_path)
+            try:
+                assert await db_module._column_exists(
+                    conn, "projects", "parent_project_id"
+                )
+                proj = await db_module.get_project(conn, "p1")
+                assert proj is not None
+                assert proj["parent_project_id"] is None
+                # The guarded index exists.
+                async with conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND name='idx_projects_parent'"
+                ) as cur:
+                    assert await cur.fetchone() is not None
+            finally:
+                await conn.close()
+            # Second init is a no-op (idempotent) and preserves the row.
+            conn2 = await db_module.init_db(db_path)
+            try:
+                proj2 = await db_module.get_project(conn2, "p1")
+                assert proj2["name"] == "legacy-proj"
+            finally:
+                await conn2.close()
+
+    asyncio.run(run())
+
+
 def test_pg_migration_registry_matches_historical_order():
     """The migration registry tuples must concatenate to the exact historical
     call order (core → hosted → late) so refactoring the runner can't silently
@@ -6636,6 +6854,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_api_token_type",
         "_migrate_pg_api_token_expires_at",
         "_migrate_pg_oauth_codes",
+        "_migrate_pg_device_codes",
         "_migrate_pg_github_to_projects",
         "_migrate_pg_touches_resources",
         "_migrate_pg_resource_locks",
@@ -6678,10 +6897,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_slug",
         "_migrate_pg_capture_insight_notes_to_insights",
         "_migrate_pg_blog_posts_tenant",
+        "_migrate_pg_project_parent_id",
+        "_migrate_pg_session_goal_compliance",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 82
+    assert len(allnames) == len(set(allnames)) == 85
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -10972,6 +11193,113 @@ async def test_ingest_document_requires_content_or_file_path(db):
 
 
 @pytest.mark.asyncio
+async def test_ingest_document_upserts_by_source(db):
+    """e9addcb0 — re-ingesting the SAME source updates the existing document in
+    place: one row, refreshed body/title/tags/updated_at, same note id."""
+    p = await db_module.create_project(db, "e9addcb0-upsert")
+    pid = p["id"]
+    src = "onedrive://file/ABC123"
+
+    first = await db_module.ingest_document(
+        db, pid, content="v1 body", title="Spec v1", source=src, tags="draft",
+    )
+    # Re-ingest the same document (same source) with new content/title/tags.
+    second = await db_module.ingest_document(
+        db, pid, content="v2 body — revised", title="Spec v2", source=src, tags="final",
+    )
+
+    # Same underlying row was updated, not a new one created.
+    assert second["id"] == first["id"]
+    assert second["note_kind"] == "document"
+    assert second["source"] == src
+    assert second["body"] == "v2 body — revised"
+    assert second["title"] == "Spec v2"
+    assert second["tags"] == "final"
+
+    # Exactly ONE document note for this source in the project.
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document" and n.get("source") == src
+    ]
+    assert len(docs) == 1
+    assert docs[0]["body"] == "v2 body — revised"
+
+    # The stable-identity lookup returns that single row.
+    found = await db_module.get_project_document_by_source(db, pid, src)
+    assert found is not None and found["id"] == first["id"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_different_sources_are_distinct_rows(db):
+    """e9addcb0 — ingesting two DIFFERENT sources creates two document rows;
+    the upsert only collapses re-ingests of the same identity."""
+    p = await db_module.create_project(db, "e9addcb0-distinct")
+    pid = p["id"]
+
+    a = await db_module.ingest_document(
+        db, pid, content="alpha", title="A", source="path/a.md",
+    )
+    b = await db_module.ingest_document(
+        db, pid, content="beta", title="B", source="path/b.md",
+    )
+    assert a["id"] != b["id"]
+
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document"
+    ]
+    assert len(docs) == 2
+    assert {n["source"] for n in docs} == {"path/a.md", "path/b.md"}
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_without_source_never_merges(db):
+    """e9addcb0 — an anonymous ingest (content, no source/file_path) can't be
+    identified, so two such ingests stay two distinct rows — no silent merge."""
+    p = await db_module.create_project(db, "e9addcb0-anon")
+    pid = p["id"]
+
+    first = await db_module.ingest_document(db, pid, content="first anon", title="Doc")
+    second = await db_module.ingest_document(db, pid, content="second anon", title="Doc")
+    assert first["id"] != second["id"]
+    # Neither carries a source (nothing to key an upsert on).
+    assert not (first.get("source") or "")
+    assert not (second.get("source") or "")
+
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document"
+    ]
+    assert len(docs) == 2
+    # Lookup by empty source is a no-op, not a wildcard match.
+    assert await db_module.get_project_document_by_source(db, pid, "") is None
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_file_path_upserts_by_path(db, tmp_path):
+    """e9addcb0 — a file_path is the stable identity when no explicit source is
+    given: re-ingesting the same path (with changed contents) upserts one row."""
+    p = await db_module.create_project(db, "e9addcb0-file-upsert")
+    pid = p["id"]
+    doc = tmp_path / "spec.md"
+    doc.write_text("original text", encoding="utf-8")
+
+    first = await db_module.ingest_document(db, pid, file_path=str(doc))
+    doc.write_text("edited text — v2", encoding="utf-8")
+    second = await db_module.ingest_document(db, pid, file_path=str(doc))
+
+    assert second["id"] == first["id"]
+    assert second["source"] == str(doc)
+    assert second["body"] == "edited text — v2"
+
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document" and n.get("source") == str(doc)
+    ]
+    assert len(docs) == 1
+
+
+@pytest.mark.asyncio
 async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
     """e3f150d0 — the ingest_document MCP tool extracts a .docx server-side and
     stores a kind='document' note; the PDF path returns a clear error payload.
@@ -11010,6 +11338,99 @@ async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
     assert "project_name" in by_name["ingest_document"]["inputSchema"]["properties"]
     # It writes, so it must not be flagged read-only.
     assert by_name["ingest_document"]["annotations"]["readOnlyHint"] is False
+
+
+def test_upload_document_txt_ingests_and_lists(client):
+    """f1c7e7d1 — POST /documents/upload with a .txt reuses ingest_document's
+    content path: 201, a kind='document' note is stored and shows in the list,
+    and the uploaded content is body-searchable (i.e. it reached ingest)."""
+    project = client.post("/projects", json={"name": "f1c7e7d1-upload"}).json()
+    pid = project["id"]
+    r = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "design-notes.txt", "content": "The API must debounce writes by 300ms."},
+    )
+    assert r.status_code == 201, r.text
+    note = r.json()
+    assert note["note_kind"] == "document"
+    assert note["title"] == "design-notes.txt"
+    assert note["source"] == "design-notes.txt"
+    assert "debounce" in note["body"]
+    # It appears in the project's document list (what the panel renders).
+    listed = client.get(f"/projects/{pid}/notes").json()
+    docs = [n for n in listed if str(n.get("note_kind")) == "document"]
+    assert any(d["id"] == note["id"] for d in docs)
+    # And the content is full-text searchable (proves it reached ingest).
+    hits = client.get(f"/projects/{pid}/notes?query=debounce").json()
+    assert any(h["id"] == note["id"] for h in hits)
+
+
+def test_upload_document_md_ingested(client):
+    """f1c7e7d1 — a .md upload is accepted too."""
+    project = client.post("/projects", json={"name": "f1c7e7d1-md"}).json()
+    pid = project["id"]
+    r = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "README.md", "content": "# Title\n\nBody text."},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["note_kind"] == "document"
+
+
+def test_upload_document_rejects_bad_extension(client):
+    """f1c7e7d1 — non-.txt/.md uploads (.pdf, .exe, .docx) are 400-rejected."""
+    project = client.post("/projects", json={"name": "f1c7e7d1-badext"}).json()
+    pid = project["id"]
+    for bad in ("report.pdf", "malware.exe", "chapter.docx", "noext"):
+        r = client.post(
+            f"/projects/{pid}/documents/upload",
+            json={"filename": bad, "content": "x"},
+        )
+        assert r.status_code == 400, f"{bad} should be rejected: {r.text}"
+    # Nothing was ingested.
+    listed = client.get(f"/projects/{pid}/notes").json()
+    assert not [n for n in listed if str(n.get("note_kind")) == "document"]
+
+
+def test_upload_document_rejects_oversize_and_empty(client):
+    """f1c7e7d1 — an oversize body is rejected and an empty body is a 400.
+
+    Oversize: the global request-body guard (limits.BODY_BYTES, default 100KB)
+    fires first with a 429 when Content-Length is present; the handler's own
+    check is defense-in-depth. Either way the oversize upload is rejected and
+    no document is ingested — assert on that, not a single status code.
+    """
+    project = client.post("/projects", json={"name": "f1c7e7d1-size"}).json()
+    pid = project["id"]
+    from meridian import limits as _limits
+    big = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "huge.txt", "content": "x" * (_limits.BODY_BYTES + 5000)},
+    )
+    assert big.status_code in (400, 429), big.text
+    assert not [
+        n for n in client.get(f"/projects/{pid}/notes").json()
+        if str(n.get("note_kind")) == "document"
+    ]
+    empty = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "blank.txt", "content": "   "},
+    )
+    assert empty.status_code == 400, empty.text
+    missing_name = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"content": "hello"},
+    )
+    assert missing_name.status_code == 400, missing_name.text
+
+
+def test_upload_document_unknown_project_404(client):
+    """f1c7e7d1 — uploading to a non-existent project is a 404."""
+    r = client.post(
+        "/projects/does-not-exist/documents/upload",
+        json={"filename": "a.txt", "content": "hi"},
+    )
+    assert r.status_code == 404, r.text
 
 
 @pytest.mark.asyncio
@@ -12806,6 +13227,16 @@ def test_github_status_graceful_on_db_error(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _run_async(coro):
+    """Run a coroutine against the app DB on a fresh loop (aiosqlite is
+    thread-backed, so a private loop is safe here)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 def test_oauth_device_returns_required_fields(client):
     """POST /oauth/device returns all RFC 8628 required fields."""
     r = client.post("/oauth/device")
@@ -12875,7 +13306,7 @@ def test_oauth_device_expired_code(client):
 
 
 def test_oauth_device_deny_no_token(client):
-    """Deny action deletes the device code so subsequent poll returns expired_token."""
+    """Deny marks the code denied so the poll returns RFC 8628 access_denied."""
     resp = client.post("/oauth/device").json()
     device_code = resp["device_code"]
     user_code = resp["user_code"]
@@ -12883,13 +13314,22 @@ def test_oauth_device_deny_no_token(client):
     # User denies
     client.post("/activate", data={"user_code": user_code, "action": "deny"})
 
-    # Poll — code deleted on deny, so expired_token
+    # Poll — denial surfaces as access_denied (per RFC 8628), and the code is
+    # consumed so a second poll can't be redeemed.
     r = client.post("/oauth/token", json={
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
         "device_code": device_code,
     })
     assert r.status_code == 400
-    assert r.json()["error"] == "expired_token"
+    assert r.json()["error"] == "access_denied"
+
+    # Consumed on denial — subsequent poll is expired_token (row gone).
+    r2 = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "expired_token"
 
 
 def test_oauth_device_token_consumed_after_issue(client):
@@ -12940,6 +13380,111 @@ def test_oauth_device_table_in_create_tables():
     """CREATE_TABLES must define device_codes table for RFC 8628 persistence."""
     from meridian.db import CREATE_TABLES
     assert "device_codes" in CREATE_TABLES, "CREATE_TABLES missing 'device_codes'"
+
+
+def test_oauth_device_slow_down_on_fast_poll(client):
+    """Two rapid polls of the same pending code return slow_down on the second (e9f18530)."""
+    dc = client.post("/oauth/device").json()["device_code"]
+    body = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": dc,
+    }
+    r1 = client.post("/oauth/token", json=body)
+    assert r1.json()["error"] == "authorization_pending"
+    # Immediate second poll is faster than the 5s interval → slow_down.
+    r2 = client.post("/oauth/token", json=body)
+    assert r2.status_code == 200
+    assert r2.json()["error"] == "slow_down"
+
+
+def test_oauth_device_codes_stored_hashed_not_plaintext(client):
+    """device_code / user_code are persisted as SHA-256 hashes, never plaintext (e9f18530)."""
+    import hashlib
+
+    resp = client.post("/oauth/device").json()
+    device_code = resp["device_code"]
+    user_code = resp["user_code"]
+
+    async def _fetch():
+        db = client.app.state.db
+        async with db.execute(
+            "SELECT device_code, user_code FROM device_codes"
+        ) as cur:
+            return await cur.fetchall()
+
+    rows = _run_async(_fetch())
+    stored = [
+        (r["device_code"], r["user_code"]) if hasattr(r, "keys") else (r[0], r[1])
+        for r in rows
+    ]
+    stored_device = {s[0] for s in stored}
+    stored_user = {s[1] for s in stored}
+
+    # The raw codes must NOT appear anywhere in the table...
+    assert device_code not in stored_device
+    assert user_code not in stored_user
+    # ...but their SHA-256 hashes must.
+    assert hashlib.sha256(device_code.encode()).hexdigest() in stored_device
+    assert hashlib.sha256(user_code.encode()).hexdigest() in stored_user
+
+
+def test_oauth_device_tenant_token_authenticates(client):
+    """Hosted path: an approved code bound to a tenant mints a working API token
+    via create_api_token that authenticates via get_tenant_from_token_hash (e9f18530)."""
+    import hashlib
+    from meridian import db as db_module
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "device-flow@example.com")
+        # Insert an already-approved device code bound to this tenant.
+        resp = await _post_device(db)
+        return tenant["id"], resp
+
+    async def _post_device(db):
+        # Reuse the real endpoint logic by inserting a known pair directly.
+        import secrets as _s
+        from datetime import datetime, timezone, timedelta
+        from meridian.routes.oauth import _device_hash
+        device_code = _s.token_hex(32)
+        user_code = "TEST-CODE"
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?, ?, ?)",
+            (_device_hash(device_code), _device_hash(user_code), expires_at),
+        )
+        await db.commit()
+        return device_code
+
+    tenant_id, device_code = _run_async(_setup())
+
+    async def _approve():
+        db = client.app.state.db
+        from meridian.routes.oauth import _device_hash
+        await db.execute(
+            "UPDATE device_codes SET tenant_id = ?, approved = 1 WHERE device_code = ?",
+            (tenant_id, _device_hash(device_code)),
+        )
+        await db.commit()
+
+    _run_async(_approve())
+
+    r = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r.status_code == 200
+    tok = r.json()["access_token"]
+    assert tok.startswith("sk_meridian_")
+
+    async def _verify():
+        db = client.app.state.db
+        tok_hash = hashlib.sha256(tok.encode()).hexdigest()
+        return await db_module.get_tenant_from_token_hash(db, tok_hash)
+
+    tenant_row = _run_async(_verify())
+    assert tenant_row is not None
+    assert tenant_row["id"] == tenant_id
 
 
 # ---------------------------------------------------------------------------

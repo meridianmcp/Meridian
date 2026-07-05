@@ -115,6 +115,18 @@ async def get_install_windows_ps1() -> PlainTextResponse:
     return PlainTextResponse(script_path.read_text(encoding="utf-8"))
 
 
+@router.get("/hooks_install.ps1")
+async def get_hooks_install_ps1() -> PlainTextResponse:
+    # e9f18530 — hooks installer's keyless auth step. Runs the RFC 8628 device
+    # authorization grant (POST /oauth/device -> approve at /activate -> poll
+    # POST /oauth/token) so the installer never needs a pasted static API key.
+    # Distinct from hooks.ps1 (the token-rotating hooks installer).
+    script_path = _watcher_script_path("hooks_install.ps1")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="hooks_install.ps1 not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
 # ---------------------------------------------------------------------------
 # Connection management routes
 # ---------------------------------------------------------------------------

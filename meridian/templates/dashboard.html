@@ -2,9 +2,21 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- 3e3da82d — viewport meta so the dashboard renders at device width when
+     opened on a phone / Add-to-Home-Screen, instead of a zoomed-out desktop
+     shell. viewport-fit=cover pairs with the PWA safe-area on notched devices. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>{% if demo_mode %}Meridian Demo{% else %}Meridian Dashboard{% endif %}</title>
 <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
 <link rel="icon" href="/static/meridian_logo.png" type="image/png">
+<!-- b03be6a6 — Minimal installable PWA. Manifest + theme + apple-touch icon.
+     The service worker (registered below) is NETWORK-FIRST by hard requirement,
+     so dashboard edits appear on next open with no rebuild/republish. -->
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#4a9eff">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Meridian">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -25,6 +37,19 @@
 <script src="https://cdn.jsdelivr.net/npm/cose-base/cose-base.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose@2/cytoscape-fcose.js"></script>
 <link rel="stylesheet" href="/static/dashboard.css?v={{ asset_version or version }}">
+<!-- b03be6a6 — register the minimal PWA service worker. Lives in the HTML
+     template (not the TS bundle) so no `node build.mjs` rebuild is needed.
+     The SW at /sw.js has root scope ("/"), which covers /dashboard. It is
+     network-first, so it does NOT pin a stale app shell. -->
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(function (e) {
+      console.warn('SW registration failed', e);
+    });
+  });
+}
+</script>
 </head>
 <body>
 {% if demo_mode %}<div id="demo-banner" style="position:fixed;top:0;left:0;right:0;z-index:10000;background:#7c3aed;color:#fff;padding:8px 16px;font-size:12px;font-family:'IBM Plex Mono',monospace;display:flex;align-items:center;gap:12px">&#x1f9ed; <strong>Demo mode</strong> — read-only. Data resets periodically. &nbsp;<a href="https://usemeridian.us" style="color:#ddd6fe;text-decoration:underline">Get your own instance →</a><span style="margin-left:auto;color:rgba(255,255,255,.6)">usemeridian.us</span></div>{% endif %}

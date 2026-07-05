@@ -45,6 +45,26 @@ _SECTION_LEVELS: dict[str, int] = {
     "subparagraph": 6,
 }
 
+# In-text citation macros we recognise as citation markers (fefb596a). Each takes
+# a mandatory ``{key1,key2,...}`` argument (plus optional ``[..]`` pre/post note
+# args we ignore). The default pylatexenc context parses ``\cite*`` / ``\citep*``
+# etc. as the base macro (``cite`` / ``citep``) with a leading star flag, so the
+# base names below cover the starred variants too. We locate the key group
+# structurally (the last ``{..}``-delimited argument) rather than by arg index,
+# which is robust across the differing arg specs pylatexenc assigns each macro.
+_CITATION_MACROS: frozenset[str] = frozenset(
+    {
+        "cite",
+        "citep",
+        "citet",
+        "citeauthor",
+        "citeyear",
+        "citealt",
+        "citealp",
+        "citenum",
+    }
+)
+
 
 def _lazy_latexwalker():
     """Import pylatexenc lazily so a missing/optional dep degrades gracefully.
@@ -168,6 +188,119 @@ def _iter_headings(latexwalker: Any, node2text: Any, nodes: list[Any], out: list
                 if arg_nodes and macroname not in _SECTION_LEVELS:
                     # Don't re-descend a section's own title group (already read).
                     _iter_headings(latexwalker, node2text, arg_nodes, out)
+
+
+def _citation_keys(macro_node: Any) -> list[str]:
+    """Extract the individual citation keys from a ``\\cite``-family macro node.
+
+    The mandatory key group is the last ``{...}``-delimited argument in the
+    macro's parsed ``argnlist`` (optional ``[..]`` note args carry ``[`` / ``]``
+    delimiters and are ignored). The group's chars are the raw ``key1,key2``
+    string, which we split on commas and trim. A macro with no key group (a bare
+    ``\\cite``) or an empty group yields no keys.
+    """
+    nodeargd = getattr(macro_node, "nodeargd", None)
+    argnlist = (getattr(nodeargd, "argnlist", None) or []) if nodeargd else []
+    key_group = None
+    for arg in argnlist:
+        if arg is None:
+            continue
+        if getattr(arg, "delimiters", None) == ("{", "}"):
+            key_group = arg  # last brace group wins (mandatory key arg)
+    if key_group is None:
+        return []
+    inner = getattr(key_group, "nodelist", None) or []
+    raw = "".join(getattr(n, "chars", "") or "" for n in inner)
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def _iter_citations(
+    latexwalker: Any,
+    nodes: list[Any],
+    out: list[dict],
+    section_ordinal: int | None,
+    counter: dict[str, int],
+) -> None:
+    """Walk the node tree depth-first, appending in-text citation markers.
+
+    Tracks the *enclosing* section by mirroring the heading walk: whenever a
+    sectioning macro (``\\section`` etc.) is seen at this level it becomes the new
+    enclosing section for the citations that follow it, identified by its
+    document-order ordinal (``counter['heading']`` — the same ordinal the heading
+    receives in :func:`_iter_headings`, since both walks visit nodes in identical
+    order). Each recognised citation macro emits one entry per key:
+    ``{key, marker_text, section_ordinal}``.
+    """
+    current_section = section_ordinal
+    for node in nodes or []:
+        macroname = getattr(node, "macroname", None)
+        if macroname in _SECTION_LEVELS:
+            current_section = counter["heading"]
+            counter["heading"] += 1
+        elif macroname in _CITATION_MACROS:
+            try:
+                marker_text = node.latex_verbatim()
+            except Exception:  # noqa: BLE001 — verbatim is best-effort
+                marker_text = "\\" + str(macroname)
+            for key in _citation_keys(node):
+                out.append(
+                    {
+                        "key": key,
+                        "marker_text": marker_text,
+                        "section_ordinal": current_section,
+                    }
+                )
+        # Recurse into containers so citations nested inside environments (e.g.
+        # a ``figure`` caption or the ``document`` env) are still discovered. The
+        # enclosing section propagates into children.
+        child_nodes = getattr(node, "nodelist", None)
+        if child_nodes:
+            _iter_citations(
+                latexwalker, child_nodes, out, current_section, counter
+            )
+        nodeargd = getattr(node, "nodeargd", None)
+        if nodeargd is not None:
+            for arg in getattr(nodeargd, "argnlist", None) or []:
+                if arg is None:
+                    continue
+                arg_nodes = getattr(arg, "nodelist", None)
+                if arg_nodes and macroname not in _SECTION_LEVELS:
+                    # Skip a section's own title group (mirrors _iter_headings) so
+                    # the heading counter is not double-advanced.
+                    _iter_citations(
+                        latexwalker, arg_nodes, out, current_section, counter
+                    )
+
+
+def parse_latex_citations(source: str) -> list[dict[str, Any]]:
+    """Parse in-text citation markers from a LaTeX ``source`` string.
+
+    Returns a document-ordered list of ``{key, marker_text, section_ordinal}``
+    dicts — one per citation key (a ``\\cite{a,b}`` expands to two entries).
+    ``section_ordinal`` is the document-order ordinal of the enclosing sectioning
+    heading (``None`` if the citation precedes any heading), matching the ordinal
+    :func:`parse_latex_structure` assigns that heading, so a downstream consumer
+    can resolve each citation's parent section.
+
+    Never raises: any parse failure degrades to ``[]`` (honours the module
+    robustness contract).
+    """
+    if not source or not isinstance(source, str):
+        return []
+    latexwalker, _node2text = _lazy_latexwalker()
+    if latexwalker is None:
+        return []
+    try:
+        walker = latexwalker.LatexWalker(source, tolerant_parsing=True)
+        nodelist, _pos, _len = walker.get_latex_nodes()
+    except Exception:  # noqa: BLE001 — malformed LaTeX -> empty, never crash
+        return []
+    citations: list[dict[str, Any]] = []
+    try:
+        _iter_citations(latexwalker, nodelist, citations, None, {"heading": 0})
+    except Exception:  # noqa: BLE001 — partial list beats a crash
+        pass
+    return citations
 
 
 def _build_tree(headings: list[dict]) -> list[dict]:
@@ -435,7 +568,7 @@ def analyze_latex(path_or_source: str) -> dict[str, Any]:
     Mirrors docs_intel.document_outline's role as the one-call structural map.
 
     Returns ``{heading_count, headings, tree, unexpanded_inputs, bibliography,
-    bibliography_count}``. Never raises.
+    bibliography_count, citations}``. Never raises.
     """
     try:
         source, base_dir = _read_source(path_or_source)
@@ -444,8 +577,15 @@ def analyze_latex(path_or_source: str) -> dict[str, Any]:
 
     structure = parse_latex_structure(source)
     bibliography = get_bibliography(source, base_dir=base_dir)
+    # In-text citation markers (fefb596a). parse_latex_citations never raises, but
+    # guard defensively so a regression there can never break analyze_latex.
+    try:
+        citations = parse_latex_citations(source)
+    except Exception:  # noqa: BLE001 — citation parse must degrade to [], never crash
+        citations = []
     return {
         **structure,
         "bibliography": bibliography,
         "bibliography_count": len(bibliography),
+        "citations": citations,
     }

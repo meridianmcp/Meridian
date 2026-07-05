@@ -55,6 +55,21 @@ _IDLE_KILL_SECONDS = 30 * 60
 # the server to re-advertise the slot's tools.
 _SLOT_REPROBE_INTERVAL = 60.0
 
+# 089a936a — the DEFAULT first-spawn pre-flight probe budget (attempts, delay):
+# attempts=2 × delay=3s with a 10s per-attempt httpx timeout ≈ up to ~23s. Fine
+# for slots whose launcher is already on disk.
+_PREFLIGHT_BUDGET_DEFAULT: "tuple[int, float]" = (2, 3.0)
+# 089a936a — a LARGER first-spawn budget for "cold-fetch" slots whose very first
+# spawn triggers an npx cold download (e.g. Desktop Commander:
+# `npx -y @wonderwhy-er/desktop-commander@latest`) that can exceed the default
+# ~23s. attempts=4 × delay=5s with the 10s per-attempt timeout ≈ up to ~55s.
+# This applies ONLY to the first-spawn pre-flight, NOT the 60s background reprobe
+# (which stays attempts=1).
+_PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
+# 089a936a — slots that npx-download their inner server on first launch. These
+# get the larger cold-fetch pre-flight budget above. (dc = Desktop Commander.)
+_COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc"})
+
 
 # ---------------------------------------------------------------------------
 # Version check (4bde9437) — nudge an upgrade when the local tunnel binary is
@@ -316,6 +331,48 @@ def _classify_serena_failure(err: object) -> "tuple[str, str] | None":
     return None
 
 
+# 089a936a — human-readable hint per slot when its first-spawn pre-flight probe
+# fails (the proxy accepted the Popen but never answered a `tools/list`). The
+# dc/office hint is specific (cold npx download); everything else gets a generic
+# "proxy didn't respond" message. Keyed on the slot label used by the tunnel.
+_DC_PREFLIGHT_HINT = (
+    "Desktop Commander did not respond on port {port} — if it isn't installed, "
+    "add it via the dashboard (npx -y @wonderwhy-er/desktop-commander@latest); "
+    "the first launch can take ~a minute to download."
+)
+_OFFICE_PREFLIGHT_HINTS = {
+    "ppt": (
+        "The PowerPoint slot did not respond on port {port} — its launcher may "
+        "not be installed yet; the first launch can take a while to download."
+    ),
+    "word": (
+        "The Word slot did not respond on port {port} — its launcher may not be "
+        "installed yet; the first launch can take a while to download."
+    ),
+}
+
+
+def _preflight_failure_hint(label: str, port: int) -> "tuple[str, str]":
+    """Classify a first-spawn pre-flight probe failure into ``(reason, detail)``.
+
+    The proxy Popen-succeeded but never answered ``tools/list``. ``reason`` is a
+    short snake-case code consistent with :func:`_classify_serena_failure` /
+    ``_mark_unhealthy`` (which use e.g. ``access_denied``); here it is
+    ``unreachable``. ``detail`` is a human, slot-aware hint — specific for the
+    dc/office cold-fetch slots, generic otherwise. Pure + unit-tested. (089a936a)"""
+    reason = "unreachable"
+    if label == "dc":
+        return (reason, _DC_PREFLIGHT_HINT.format(port=port))
+    office = _OFFICE_PREFLIGHT_HINTS.get(label)
+    if office is not None:
+        return (reason, office.format(port=port))
+    return (
+        reason,
+        f"The {label} slot's proxy did not respond on port {port} — its tools "
+        "are suppressed until it comes up (auto-retried in the background).",
+    )
+
+
 async def _reprobe_once(proxy, probe) -> bool:
     """One slot-recovery attempt (a898710a). Ensure the proxy is running, probe
     its health, and — critically — if it is running but UNHEALTHY (a persistent
@@ -334,17 +391,49 @@ async def _reprobe_once(proxy, probe) -> bool:
     return healthy
 
 
-async def _preflight_slot(ws, port: int, label: str) -> bool:
+async def _preflight_slot(
+    ws,
+    port: int,
+    label: str,
+    *,
+    attempts: int | None = None,
+    delay: float | None = None,
+) -> bool:
     """Probe a slot after its first spawn; report unhealthy on failure. Returns
-    the health result so callers can log it. (d71ba2e7)"""
-    healthy = await _probe_slot_health(port)
+    the health result so callers can log it. (d71ba2e7)
+
+    089a936a — two robustness additions, both scoped to the failure path (the
+    HEALTHY path is unchanged):
+
+    * On failure, report a ``reason``/``detail`` (via :func:`_preflight_failure_hint`)
+      instead of a bare unhealthy dot, so the dashboard shows an actionable hint
+      — matching what the Serena slot already does with
+      :func:`_classify_serena_failure`.
+    * ``attempts``/``delay`` override the pre-flight probe budget so cold-fetch
+      slots (dc/office, which npx-download on first launch) can be given a longer
+      first-spawn budget. When omitted, the default budget is derived from the
+      slot label: cold-fetch slots use ``_PREFLIGHT_BUDGET_COLD_FETCH``, all
+      others ``_PREFLIGHT_BUDGET_DEFAULT``.
+    """
+    if attempts is None or delay is None:
+        _def_attempts, _def_delay = (
+            _PREFLIGHT_BUDGET_COLD_FETCH
+            if label in _COLD_FETCH_SLOTS
+            else _PREFLIGHT_BUDGET_DEFAULT
+        )
+        if attempts is None:
+            attempts = _def_attempts
+        if delay is None:
+            delay = _def_delay
+    healthy = await _probe_slot_health(port, attempts=attempts, delay=delay)
     if not healthy:
+        reason, detail = _preflight_failure_hint(label, port)
         print(
             f"tunnel:{label}: pre-flight health check FAILED on port {port} — "
-            "marking slot unhealthy (its tools will be suppressed)",
+            f"marking slot unhealthy (its tools will be suppressed): {detail}",
             file=sys.stderr, flush=True,
         )
-        await _report_slot_health(ws, label, False)
+        await _report_slot_health(ws, label, False, reason=reason, detail=detail)
     return healthy
 
 
@@ -1192,6 +1281,47 @@ def _managed_bin_dir() -> "Path":
     return Path.home() / ".meridian" / "bin"
 
 
+def _win_shell_safe_path(path: str) -> str:
+    """Make *path* safe to pass as a single token through mcp-proxy ``--shell``
+    on Windows (89bc72c4).
+
+    mcp-proxy's ``--shell`` hands the inner command to ``cmd.exe``, which splits
+    unquoted arguments on spaces. A binary path with a space — e.g. the
+    auto-downloaded ``C:\\Users\\John Smith\\.meridian\\bin\\codebase-memory-mcp.exe``
+    — is therefore truncated at the first space, so ``cmd.exe`` tries to run
+    ``C:\\Users\\John`` and fails with WinError 3, "The system cannot find the
+    path specified". This is why the code-intel slot failed to launch while the
+    filesystem / Office / extractor slots (whose inner token is a bare npm
+    package name or a space-free path) came up clean.
+
+    Fix: when the path contains a space, resolve it to its 8.3 short-name form
+    (``GetShortPathNameW``), which is space-free and understood by ``cmd.exe``.
+    This preserves the required ``--shell`` spawn for native ``.exe`` binaries
+    (mcp-proxy/Node can't always spawn them directly) *and* for ``.cmd`` shims.
+
+    Fail-soft: on any non-Windows platform, a space-free path, a nonexistent
+    path, or a volume with 8.3 name generation disabled (short-name lookup
+    returns empty / raises), the original *path* is returned unchanged — the
+    caller is no worse off than before this guard existed.
+    """
+    if sys.platform != "win32" or not path or " " not in path:
+        return path
+    try:
+        import ctypes  # Windows-only stdlib; imported lazily so non-win32 is untouched.
+
+        _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW  # type: ignore[attr-defined]
+        buf = ctypes.create_unicode_buffer(512)
+        n = _GetShortPathNameW(path, buf, len(buf))
+        # n == 0 → failure (path missing / 8.3 disabled); n > len → buffer too small.
+        if 0 < n < len(buf):
+            short = buf.value
+            if short and " " not in short:
+                return short
+    except Exception:  # noqa: BLE001 — any failure: fall back to the original path.
+        pass
+    return path
+
+
 def _find_codebase_memory_mcp() -> str | None:
     """Return path to codebase-memory-mcp, checking PATH, npm global, then managed dir.
 
@@ -1356,6 +1486,14 @@ def _build_code_proxy_command(
     shell (``--shell``) — mcp-proxy's direct spawn hits EINVAL under Node 24's
     CVE-2024-27980 mitigation. A real ``.exe`` spawns directly (and preserves
     support for paths with spaces), so ``--shell`` is added only for shims.
+
+    89bc72c4 — under ``--shell`` cmd.exe splits args on spaces, so a *binary*
+    path containing a space (e.g. a user whose home is ``C:\\Users\\John Smith``)
+    was truncated and spawned as ``C:\\Users\\John`` → WinError 3, "The system
+    cannot find the path specified". That was the isolated cause of the code-intel
+    slot failing to launch while the space-free / bare-package slots came up clean.
+    We now resolve the binary to its 8.3 short-name form when it contains a space
+    (:func:`_win_shell_safe_path`), which is space-safe for cmd.exe.
     """
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
            "--server", "stream", "--stateless"]
@@ -1363,10 +1501,11 @@ def _build_code_proxy_command(
         # Always add --shell on Windows: mcp-proxy (Node.js) cannot spawn .exe
         # binaries directly in some environments (missing DLL PATH, Node spawn
         # restrictions). cmd.exe handles resolution reliably. Mirrors the FS slot's
-        # unconditional --shell. Limitation: paths with spaces in them won't work
-        # via --shell (cmd.exe splits on spaces); .cmd shims need shell anyway per
-        # Node 24 CVE-2024-27980.
+        # unconditional --shell. A space in the binary path would be split by
+        # cmd.exe, so make it shell-safe (8.3 short path); .cmd shims need shell
+        # anyway per Node 24 CVE-2024-27980. (89bc72c4)
         cmd.append("--shell")
+        binary = _win_shell_safe_path(binary)
     cmd += ["--", binary]
     return cmd
 
@@ -1521,6 +1660,45 @@ def _find_npx() -> str:
     return shutil.which("npx") or "npx"
 
 
+def _normalize_path_arg(path: str) -> str:
+    """Strip surrounding whitespace and matched surrounding quotes from a user-
+    supplied path (e.g. a pasted '"C:\\Users\\me\\My Docs"'). Repeated/mixed
+    wrapping is unwound; interior characters (incl. spaces) are untouched.
+    Idempotent — a clean path is returned unchanged.
+
+    path-quote-strip: only MATCHED surrounding single/double quotes are removed
+    — never a lone quote, never an interior character."""
+    s = (path or "").strip()
+    while len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s
+
+
+def _unservable_roots(roots: "list[str] | None") -> "list[tuple[str, str]]":
+    """59c0e609 — configured filesystem_roots the connector will SILENTLY not
+    serve, each with a reason, so the caller can WARN instead of the user seeing
+    an unexplained "2 of 3 dirs" after a tunnel restart.
+
+    The Python pipeline passes every configured root through correctly (verified);
+    the drop happens at the inner ``@modelcontextprotocol/server-filesystem``
+    process, which two ways silently omits a dir: (1) the directory does not exist
+    at spawn time (e.g. a renamed folder, or a OneDrive/cloud dir that is
+    dehydrated/offline), and (2) on Windows, mcp-proxy runs with ``--shell`` and
+    concatenates args unescaped, so a path containing a SPACE is mis-parsed (see
+    :func:`_build_proxy_command`). Pure/deterministic for testing — it only reads
+    the filesystem via ``os.path.isdir``; the caller does the printing."""
+    out: list[tuple[str, str]] = []
+    for r in roots or []:
+        r = _normalize_path_arg(r)
+        if not r:
+            continue
+        if not os.path.isdir(r):
+            out.append((r, "does not exist / not a directory at tunnel start"))
+        elif sys.platform == "win32" and " " in r:
+            out.append((r, "contains a space — not served on Windows (mcp-proxy --shell limitation)"))
+    return out
+
+
 def _build_proxy_command(
     npx: str, repo_path: str, port: int = DEFAULT_PROXY_PORT,
     roots: "list[str] | None" = None,
@@ -1549,7 +1727,7 @@ def _build_proxy_command(
     Note: with ``--shell`` mcp-proxy concatenates args unescaped, so a
     directory containing spaces is not yet supported on Windows.
     """
-    dirs = [r for r in (roots or []) if r and r.strip()] or [repo_path]
+    dirs = [_normalize_path_arg(r) for r in (roots or []) if _normalize_path_arg(r)] or [repo_path]
     # --server stream: serve only Streamable HTTP (/mcp), no SSE.
     # --stateless: each POST is handled independently — required for the
     #   tunnel relay's one-shot request/response model (no persistent SSE pipe).
@@ -1583,7 +1761,10 @@ def _add_fs_roots_to_cmd(cmd: "list[str]", new_roots: "list[str]") -> "tuple[lis
     except ValueError:
         return cmd, False
     existing: set[str] = set(cmd[idx + 1:])
-    to_add = [r for r in new_roots if r and r.strip() and r.strip() not in existing]
+    to_add = [
+        nr for nr in (_normalize_path_arg(r) for r in new_roots)
+        if nr and nr not in existing
+    ]
     if not to_add:
         return cmd, False
     return cmd[:idx + 1] + list(cmd[idx + 1:]) + to_add, True
@@ -1643,10 +1824,10 @@ async def _fetch_filesystem_roots(
                 serena_repo = data.get("serena_repo_path") or ""
                 code_dirs = data.get("codebase_code_dirs") or []
                 return (
-                    [str(x).strip() for x in roots if isinstance(x, str) and x.strip()],
-                    [str(x).strip() for x in known if isinstance(x, str) and x.strip()],
-                    str(serena_repo).strip() if isinstance(serena_repo, str) else "",
-                    [str(x).strip() for x in code_dirs if isinstance(x, str) and x.strip()],
+                    [_normalize_path_arg(x) for x in roots if isinstance(x, str) and _normalize_path_arg(x)],
+                    [_normalize_path_arg(x) for x in known if isinstance(x, str) and _normalize_path_arg(x)],
+                    _normalize_path_arg(serena_repo) if isinstance(serena_repo, str) else "",
+                    [_normalize_path_arg(x) for x in code_dirs if isinstance(x, str) and _normalize_path_arg(x)],
                 )
     except Exception:  # noqa: BLE001 — network/parse error → defaults
         pass
@@ -2436,6 +2617,7 @@ async def run_tunnel(
     # default, unchanged behaviour).
     serena_repo_path = repo_path
     if not _repo_path_from_cli and cfg_serena_repo_path:
+        cfg_serena_repo_path = _normalize_path_arg(cfg_serena_repo_path)
         try:
             serena_repo_path = str(Path(cfg_serena_repo_path).resolve())
             print(
@@ -2511,6 +2693,13 @@ async def run_tunnel(
         )
         _served = ", ".join(fs_roots) if fs_roots else repo_path
         print(f"meridian tunnel: serving {_served}", flush=True)
+        # 59c0e609 — surface roots the inner filesystem server will silently drop
+        # (missing dir / Windows space-in-path) so a "served 2 of 3" is diagnosable.
+        for _r, _why in _unservable_roots(fs_roots if fs_override is None else None):
+            print(
+                f"  filesystem: WARNING configured root will NOT be served — {_r} ({_why})",
+                flush=True, file=sys.stderr,
+            )
         print(f"  filesystem:        lazy-spawn on port {fs_port}", flush=True)
         proxy_fs = SlotProxy(cmd_fs, fs_port, "fs")
         slot_proxies.append(proxy_fs)
@@ -2534,6 +2723,19 @@ async def run_tunnel(
             if managed_bin not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = managed_bin + os.pathsep + os.environ.get("PATH", "")
             cmd_code = _build_code_proxy_command(npx, code_binary, code_port)
+            # 89bc72c4 — the command builder makes a spaced binary path safe for
+            # cmd.exe via its 8.3 short name. If the resolved inner token STILL
+            # contains a space (8.3 generation disabled on the volume), the slot
+            # would hit WinError 3 on spawn — warn so it's diagnosable rather than
+            # a silent dead dot. Mirrors the FS slot's _unservable_roots warning.
+            if sys.platform == "win32" and " " in cmd_code[-1]:
+                print(
+                    "  code-intel: WARNING binary path contains a space and no 8.3 "
+                    f"short name was available — {cmd_code[-1]!r}. The slot may fail "
+                    "to launch (cmd.exe splits on spaces). Install codebase-memory-mcp "
+                    "under a space-free path, or enable 8.3 name generation.",
+                    flush=True, file=sys.stderr,
+                )
             print(f"  code-intel:        lazy-spawn on port {code_port}", flush=True)
             proxy_code = SlotProxy(cmd_code, code_port, "code")
             slot_proxies.append(proxy_code)
@@ -2702,9 +2904,12 @@ async def run_tunnel(
             await proxy.ensure_running()
             if proxy.is_running:
                 await _index_code_dir(proxy.port, code_dir)
-        for d in code_dirs:
+        for _d in (code_dirs or []):
+            _d = _normalize_path_arg(_d)
+            if not _d:
+                continue
             index_tasks.append(
-                asyncio.ensure_future(_lazy_index(proxy_code, str(Path(d).resolve())))
+                asyncio.ensure_future(_lazy_index(proxy_code, str(Path(_d).resolve())))
             )
 
     # 7. Run lazy reconnect loops — one per enabled slot. Each loop also gets an

@@ -45,6 +45,34 @@ function _detectClientOS() {
   return ua.includes('win') ? 'windows' : 'unix';
 }
 
+// 8201de19 — direct per-platform binary download links for the tunnel connector
+// ("meridian-connect"). Shown as a fallback inside the Meridian Connect panel so
+// there's always a way to grab the binary even if install.ps1 / install.sh 404s.
+// Asset names must match .github/workflows/release.yml exactly (else they 404).
+// 80f1d4bc — only the platforms the release actually builds. macOS Intel (dead
+// macos-13 runner) and Linux ARM64 (pixi lacks the linux-aarch64 platform) were
+// dropped from the release matrix, so those assets 404. Re-add here when their
+// build jobs are restored.
+const _MERIDIAN_CONNECT_ASSETS: Array<[string, string]> = [
+  ['Windows x86_64', 'meridian-connect-x86_64-windows.exe'],
+  ['macOS Apple Silicon', 'meridian-connect-aarch64-apple-darwin'],
+  ['Linux x86_64', 'meridian-connect-x86_64-unknown-linux'],
+];
+
+function _directBinaryDownloadsHtml(): string {
+  const base = 'https://github.com/meridianmcp/Meridian/releases/latest/download';
+  const rows = _MERIDIAN_CONNECT_ASSETS.map(([label, asset]) =>
+    `<li style="margin:0 0 3px 0"><span style="display:inline-block;min-width:120px;color:var(--muted)">${label}</span> <a href="${base}/${asset}" download style="color:var(--accent);text-decoration:none;word-break:break-all">${asset}</a></li>`
+  ).join('');
+  return `<details style="margin-top:10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+    <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text)">Direct binary download (if the install script fails)</summary>
+    <div style="padding:0 10px 10px">
+      <div style="font-size:10px;color:var(--muted);margin:6px 0 6px">Grab the <code>meridian-connect</code> tunnel binary for your platform straight from the latest GitHub release, then run it manually:</div>
+      <ul style="list-style:none;margin:0;padding:0;font-size:10px;font-family:var(--font-mono)">${rows}</ul>
+    </div>
+  </details>`;
+}
+
 function _collapseConnectPlatforms(projectId: any) {
   const body = document.getElementById(`settings-body-${projectId}`);
   if (!body) return;
@@ -641,6 +669,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       <div style="font-size:10px;color:var(--muted);margin-top:6px">Need manual config? See <a href="https://docs.usemeridian.us/configuration" target="_blank" style="color:var(--accent);text-decoration:none">docs.usemeridian.us/configuration</a></div>
 
+      ${_directBinaryDownloadsHtml()}
+
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;margin-top:10px">
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
@@ -1003,6 +1033,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       </div>
 
       <div style="font-size:10px;color:var(--muted);margin-top:6px">Need manual config? See <a href="https://docs.usemeridian.us/configuration" target="_blank" style="color:var(--accent);text-decoration:none">docs.usemeridian.us/configuration</a></div>
+
+      ${_directBinaryDownloadsHtml()}
 
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;margin-top:10px">
 

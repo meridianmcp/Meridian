@@ -163,10 +163,11 @@ def test_oauth_device_grant_expired_code(client):
 
     async def _expire():
         db = client.app.state.db
+        # device_codes stores the SHA-256 hash, so match on the hashed value.
         await db.execute(
             "UPDATE device_codes SET expires_at = '2000-01-01 00:00:00', approved = 1 "
             "WHERE device_code = ?",
-            (device_code,),
+            (oa_mod._device_hash(device_code),),
         )
         await db.commit()
 
@@ -350,12 +351,12 @@ def test_activate_hosted_authed_deny_deletes_code(tmp_path, monkeypatch):
             follow_redirects=False,
         )
         assert p.status_code == 303
-        # Denied → code deleted → grant reports expired_token.
+        # Denied → grant reports RFC 8628 access_denied and consumes the code.
         tok = client.post("/oauth/token", json={
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             "device_code": dc["device_code"],
         })
-        assert tok.json()["error"] == "expired_token"
+        assert tok.json()["error"] == "access_denied"
 
 
 def test_authorize_hosted_session_cookie_full_flow(tmp_path, monkeypatch):

@@ -172,6 +172,16 @@ def build_mcp_server():
                                 "dashboard Settings."
                             ),
                         },
+                        "parent_project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional parent project id — makes this a "
+                                "subproject that inherits the parent's north_star "
+                                "when it has none of its own. Subprojects are one "
+                                "level deep: the parent must exist and must not "
+                                "itself be a subproject."
+                            ),
+                        },
                     },
                     "required": ["name"],
                 },
@@ -1526,10 +1536,16 @@ def build_mcp_server():
                         "project": existing,
                     }
                 else:
-                    result = await db_module.create_project(
-                        db, arguments["name"],
-                        execution_mode=arguments.get("execution_mode"),
-                    )
+                    # 3b6ff466 — optional parent_project_id → one-level-deep
+                    # subproject; an invalid/nested parent raises ValueError.
+                    try:
+                        result = await db_module.create_project(
+                            db, arguments["name"],
+                            execution_mode=arguments.get("execution_mode"),
+                            parent_project_id=arguments.get("parent_project_id"),
+                        )
+                    except ValueError as exc:
+                        result = {"error": str(exc)}
             elif name == "register_session":
                 result = await db_module.register_session(
                     db,

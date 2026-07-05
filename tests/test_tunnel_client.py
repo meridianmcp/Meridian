@@ -178,6 +178,67 @@ def test_build_proxy_command_uses_shell_on_windows(monkeypatch):
     assert "--shell" not in tc._build_proxy_command("npx", "/repo")
 
 
+# ---------------------------------------------------------------------------
+# path-quote-strip — _normalize_path_arg de-quotes pasted path args so a
+# literal surrounding '"C:\\My Docs"' / "'C:/x'" is served correctly. Only
+# MATCHED surrounding quote pairs are removed; interior chars & lone quotes
+# are left untouched. Idempotent.
+# ---------------------------------------------------------------------------
+
+def test_normalize_path_arg_strips_matched_double_quotes():
+    assert tc._normalize_path_arg('"C:\\Users\\me\\My Docs"') == "C:\\Users\\me\\My Docs"
+
+
+def test_normalize_path_arg_strips_matched_single_quotes():
+    assert tc._normalize_path_arg("'C:/x'") == "C:/x"
+
+
+def test_normalize_path_arg_strips_surrounding_whitespace_then_quotes():
+    assert tc._normalize_path_arg('  "p"  ') == "p"
+
+
+def test_normalize_path_arg_clean_path_unchanged():
+    p = r"C:\Users\me\Documents"
+    assert tc._normalize_path_arg(p) == p
+
+
+def test_normalize_path_arg_preserves_interior_space():
+    # An interior space (unquoted) is a real path char — never stripped.
+    assert tc._normalize_path_arg("C:/Program Files/App") == "C:/Program Files/App"
+
+
+def test_normalize_path_arg_leaves_lone_leading_quote():
+    # A single unmatched quote is NOT a wrapping pair — keep it verbatim.
+    assert tc._normalize_path_arg('"C:/x') == '"C:/x'
+    assert tc._normalize_path_arg("C:/x'") == "C:/x'"
+
+
+def test_normalize_path_arg_unwinds_repeated_and_mixed_wrapping():
+    assert tc._normalize_path_arg('\'"C:/x"\'') == "C:/x"
+
+
+def test_normalize_path_arg_empty_and_whitespace():
+    assert tc._normalize_path_arg("") == ""
+    assert tc._normalize_path_arg("   ") == ""
+    assert tc._normalize_path_arg('""') == ""
+
+
+def test_build_proxy_command_strips_quotes_from_real_root(tmp_path):
+    # A quoted root pointing at a REAL dir must be served as that (de-quoted)
+    # dir — proving the quote-strip took effect end-to-end in the builder.
+    quoted = f'"{tmp_path}"'
+    cmd = tc._build_proxy_command("npx", str(tmp_path), roots=[quoted])
+    assert str(tmp_path) in cmd
+    assert quoted not in cmd
+
+
+def test_unservable_roots_ignores_quotes_for_real_dir(tmp_path):
+    # A quoted root that resolves to an existing dir is NOT flagged unservable
+    # (the quotes are stripped before the os.path.isdir check).
+    quoted = f'"{tmp_path}"'
+    assert tc._unservable_roots([quoted]) == []
+
+
 def test_build_code_proxy_command_structure(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "linux")  # test POSIX path — no --shell
     cmd = tc._build_code_proxy_command("npx", "/usr/local/bin/codebase-memory-mcp", port=9009)
@@ -334,6 +395,57 @@ def test_build_code_proxy_command_shell_for_native_exe_on_windows(monkeypatch):
     assert "--shell" in cmd
     sep = cmd.index("--")
     assert cmd[sep + 1] == exe
+
+
+# ---------------------------------------------------------------------------
+# 89bc72c4 — code-intel slot: a binary path with a SPACE was split by cmd.exe
+# under mcp-proxy --shell → WinError 3 "The system cannot find the path
+# specified". The command builder now resolves such a path to its 8.3 short
+# name (_win_shell_safe_path) so cmd.exe sees a single space-free token.
+# ---------------------------------------------------------------------------
+
+def test_win_shell_safe_path_noop_on_posix(monkeypatch):
+    # Non-Windows: never rewrite the path (no cmd.exe splitting to worry about).
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    p = "/home/john smith/.meridian/bin/codebase-memory-mcp"
+    assert tc._win_shell_safe_path(p) == p
+
+
+def test_win_shell_safe_path_noop_without_space(monkeypatch):
+    # Space-free path: nothing to fix, returned verbatim (no short-path lookup).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    p = r"C:\Users\13144\.meridian\bin\codebase-memory-mcp.exe"
+    assert tc._win_shell_safe_path(p) == p
+
+
+def test_win_shell_safe_path_uses_short_name_for_spaced_path(monkeypatch):
+    # When the path has a space, resolve it to the 8.3 short (space-free) form.
+    # GetShortPathNameW is Windows-only, so stub the ctypes call so this runs on
+    # the Linux CI runner too (no real Windows stdlib attr is touched).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    spaced = r"C:\Users\John Smith\.meridian\bin\codebase-memory-mcp.exe"
+    short = r"C:\Users\JOHNSM~1\.meridian\bin\CODEBA~1.EXE"
+
+    def fake_safe(path):
+        return short if path == spaced else path
+
+    monkeypatch.setattr(tc, "_win_shell_safe_path", fake_safe)
+    cmd = tc._build_code_proxy_command("npx.cmd", spaced, port=9009)
+    assert "--shell" in cmd
+    sep = cmd.index("--")
+    # The inner binary token is the space-free short path — cmd.exe won't split it.
+    assert cmd[sep + 1] == short
+    assert " " not in cmd[sep + 1]
+
+
+def test_win_shell_safe_path_falls_back_when_short_name_unavailable(monkeypatch):
+    # 8.3 generation disabled / lookup fails → return the original path unchanged
+    # (fail-soft: no worse than before; the startup warning surfaces the risk).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    spaced = r"C:\Users\John Smith\.meridian\bin\codebase-memory-mcp.exe"
+    # ctypes.windll doesn't exist on non-Windows → the lazy import raises inside
+    # _win_shell_safe_path, which swallows it and returns the input unchanged.
+    assert tc._win_shell_safe_path(spaced) == spaced
 
 
 # ---------------------------------------------------------------------------
@@ -1261,6 +1373,113 @@ def test_reprobe_once_no_kill_when_healthy_first_probe():
         loop.close()
     assert healthy is True
     assert proxy.killed == 0
+
+
+# ---------------------------------------------------------------------------
+# 089a936a — pre-flight diagnostics (reason/detail) + cold-fetch probe budget
+# ---------------------------------------------------------------------------
+
+def test_preflight_failure_hint_dc_is_specific():
+    """089a936a — the dc slot's pre-flight failure hint names Desktop Commander,
+    the port, and the npx install command."""
+    reason, detail = tc._preflight_failure_hint("dc", 8813)
+    assert reason == "unreachable"
+    assert "Desktop Commander" in detail
+    assert "8813" in detail
+    assert "desktop-commander" in detail
+
+
+def test_preflight_failure_hint_generic_slot():
+    """089a936a — a non-cold-fetch slot still gets a non-empty reason + detail
+    mentioning the slot label and port (generic, not the dc-specific text)."""
+    reason, detail = tc._preflight_failure_hint("fs", 8810)
+    assert reason == "unreachable"
+    assert "fs" in detail
+    assert "8810" in detail
+    assert "Desktop Commander" not in detail
+
+
+def test_preflight_slot_failure_reports_reason_and_detail(monkeypatch):
+    """089a936a — a FAILED pre-flight reports a non-empty reason AND detail to
+    _report_slot_health (not a bare healthy=False), so the dashboard can show an
+    actionable warning. Uses the dc slot (port 8813) as the example, matching the
+    _reprobe_once tests."""
+    # Force the probe to fail without spawning anything real.
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+    report = AsyncMock()
+    monkeypatch.setattr(tc, "_report_slot_health", report)
+
+    ws = object()  # never touched — _report_slot_health is mocked
+    loop = asyncio.new_event_loop()
+    try:
+        healthy = loop.run_until_complete(tc._preflight_slot(ws, 8813, "dc"))
+    finally:
+        loop.close()
+
+    assert healthy is False
+    report.assert_awaited_once()
+    args, kwargs = report.call_args
+    # positional: (ws, label, healthy)
+    assert args[1] == "dc"
+    assert args[2] is False
+    # 089a936a — reason + detail are populated (not a bare False report).
+    assert kwargs.get("reason") == "unreachable"
+    assert kwargs.get("detail")
+    assert "Desktop Commander" in kwargs["detail"]
+    assert "8813" in kwargs["detail"]
+
+
+def test_preflight_slot_dc_uses_larger_cold_fetch_budget(monkeypatch):
+    """089a936a — the dc (cold-fetch) slot's first pre-flight uses the LARGER
+    probe budget (attempts=4, delay=5.0) to tolerate the npx cold download, while
+    a normal slot uses the default (attempts=2, delay=3.0)."""
+    calls: list[dict] = []
+
+    async def fake_probe(port, *, attempts=2, delay=3.0):
+        calls.append({"port": port, "attempts": attempts, "delay": delay})
+        return True  # healthy → no unhealthy report path
+
+    monkeypatch.setattr(tc, "_probe_slot_health", fake_probe)
+    monkeypatch.setattr(tc, "_report_slot_health", AsyncMock())
+
+    ws = object()
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(tc._preflight_slot(ws, 8813, "dc"))
+        loop.run_until_complete(tc._preflight_slot(ws, 8810, "fs"))
+    finally:
+        loop.close()
+
+    assert calls[0] == {"port": 8813, "attempts": 4, "delay": 5.0}
+    assert calls[1] == {"port": 8810, "attempts": 2, "delay": 3.0}
+    # The larger budget must match the declared cold-fetch constant.
+    assert (calls[0]["attempts"], calls[0]["delay"]) == tc._PREFLIGHT_BUDGET_COLD_FETCH
+    assert (calls[1]["attempts"], calls[1]["delay"]) == tc._PREFLIGHT_BUDGET_DEFAULT
+
+
+def test_preflight_slot_explicit_budget_overrides_default(monkeypatch):
+    """089a936a — explicit attempts/delay override the label-derived default, so
+    callers keep full control and the background reprobe (attempts=1) is
+    unaffected by the cold-fetch defaults."""
+    calls: list[dict] = []
+
+    async def fake_probe(port, *, attempts=2, delay=3.0):
+        calls.append({"attempts": attempts, "delay": delay})
+        return True
+
+    monkeypatch.setattr(tc, "_probe_slot_health", fake_probe)
+    monkeypatch.setattr(tc, "_report_slot_health", AsyncMock())
+
+    loop = asyncio.new_event_loop()
+    try:
+        # dc slot but explicit budget → explicit wins over the cold-fetch default.
+        loop.run_until_complete(
+            tc._preflight_slot(object(), 8813, "dc", attempts=1, delay=0.0)
+        )
+    finally:
+        loop.close()
+
+    assert calls[0] == {"attempts": 1, "delay": 0.0}
 
 
 def test_builtin_plugins_session_mode():

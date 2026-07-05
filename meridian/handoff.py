@@ -25,6 +25,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from xml.sax.saxutils import escape as _xml_escape  # 5abf3e12 — XML-safe /goal
 
 import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -80,6 +81,39 @@ def _format_content(content) -> str:
     return json.dumps(content, indent=2)
 
 
+# 2d6d8677 — cap each embedded per-item body so a handoff can't balloon past the
+# MCP tool-result token cap. The renderer used to embed EVERY workspace/pinned
+# decision + note + task with FULL untruncated bodies (blog drafts, long
+# post-mortems, the whole append-only decisions log), producing 420K+ char blobs
+# that overflowed the cap — the handoff still persisted to state but the caller
+# got an error and couldn't read it (fired 3× live on 2026-07-04/05). The full
+# bodies still live in the DB; the handoff only needs a preview.
+_HANDOFF_BODY_CLIP = 300
+
+
+def _clip_body(text: Any, limit: int = _HANDOFF_BODY_CLIP) -> str:
+    """Return ``text`` clipped to ``limit`` chars with a truncation marker (2d6d8677).
+
+    When the body is longer than ``limit`` it is cut to ``limit`` chars and a
+    ``… (+N more chars)`` marker naming the omitted count is appended, so a
+    reader knows the full body lives in the DB. Short/empty bodies pass through
+    unchanged. Registered as the ``clip_body`` Jinja filter for the template.
+    """
+    if text is None:
+        return ""
+    s = text if isinstance(text, str) else str(text)
+    if len(s) <= limit:
+        return s
+    omitted = len(s) - limit
+    return f"{s[:limit].rstrip()}… (+{omitted} more chars)"
+
+
+# 2d6d8677 — expose _clip_body to the Jinja handoff template so long decision /
+# note / task bodies render clipped there too (the template is the biggest full-
+# body offender: {{ d.body }}, {{ note.body }}, {{ t.description }}, decisions_log).
+_env.filters["clip_body"] = _clip_body
+
+
 def _prepare_pending_sprint_items(
     items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -119,10 +153,12 @@ def _prepare_pending_sprint_items(
 # f628b880 — non-deferential executor framing prepended to the /goal string so an
 # executor session acts immediately instead of defaulting to assistant mode and
 # asking for direction. (ecf69de8 makes this conditional on execution_mode.)
+# 5abf3e12 — the /goal is now XML-structured; this text is the body of the
+# <role> tag (trailing space dropped — the tag provides the delimiter).
 _EXECUTOR_GOAL_DIRECTIVE = (
     "You are an executor. Claim and execute the following sprint items "
     "immediately in order without asking for direction or confirmation. "
-    "Start with the first item now. "
+    "Start with the first item now."
 )
 
 # ecf69de8 — deferential framing for execution_mode='interactive' projects. The
@@ -131,7 +167,7 @@ _EXECUTOR_GOAL_DIRECTIVE = (
 _INTERACTIVE_GOAL_DIRECTIVE = (
     "You are assisting interactively. Review the following sprint items and "
     "confirm with the human which to start before executing. Ask for direction "
-    "before claiming or changing anything. "
+    "before claiming or changing anything."
 )
 
 
@@ -297,7 +333,13 @@ def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
 def _build_manual_todo_note(manual_items: list[dict[str, Any]]) -> str:
     """3a02041a — render MANUAL/human items as a separate maintainer todo appended
     to the /goal, explicitly NOT for the AI executor to claim (no completion
-    pressure). Empty string when there are none."""
+    pressure). Empty string when there are none.
+
+    5abf3e12 — emitted as a self-contained ``<exclusions>`` XML tag (prepended
+    with a leading newline so it slots into the XML-structured /goal). The
+    semantic constraint is preserved verbatim: these items are the maintainer's
+    own todo and the executor must NOT claim, execute, or complete them.
+    Item snippets are XML-escaped (titles may carry untrusted content)."""
     parts: list[str] = []
     for it in manual_items:
         iid = it.get("id")
@@ -310,10 +352,11 @@ def _build_manual_todo_note(manual_items: list[dict[str, Any]]) -> str:
         parts.append(f"{iid} — {snippet}" if snippet else str(iid))
     if not parts:
         return ""
-    return (
-        " Separately, these MANUAL items are the maintainer's own todo — the "
-        "executor must NOT claim, execute, or complete them: " + "; ".join(parts) + "."
+    body = (
+        "These MANUAL items are the maintainer's own todo — the executor must "
+        "NOT claim, execute, or complete them: " + "; ".join(parts) + "."
     )
+    return f"\n<exclusions>{_xml_escape(body)}</exclusions>"
 
 
 def _build_quick_start_goal(
@@ -382,10 +425,18 @@ def _build_quick_start_goal(
     _manual_note = _build_manual_todo_note(_manual_items)
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     if not item_ids:
+        # 5abf3e12 — empty-board branch: same constraints as before (verify,
+        # test floor, generate_handoff, turn/HITL stop) re-expressed as XML tags.
+        # This branch has no items and therefore no anti-stop completion clause,
+        # exactly as the prior prose form did.
         return (
-            f"{_loop_prefix}/goal Verify remaining work is complete. Done when "
-            f"pixi run test passes {test_floor}+, and generate_handoff() is called "
-            f"at the end. Stop after {_turns} turns {_hitl_clause}"
+            f"{_loop_prefix}/goal\n"
+            "<role>Verify remaining work is complete.</role>\n"
+            "<completion_criteria>Done when pixi run test passes "
+            f"{test_floor}+, and generate_handoff() is called at the end."
+            "</completion_criteria>\n"
+            f"<stop_conditions>Stop after {_turns} turns "
+            f"{_xml_escape(_hitl_clause)}</stop_conditions>"
             f"{_manual_note}"
         )
     directive = (
@@ -452,31 +503,49 @@ def _build_quick_start_goal(
     else:
         items_clause = f"Complete sprint items: {', '.join(item_ids)}. "
     # f9fa00e4 — tag the /goal with an inferred sprint type + tailored guidance.
+    # 5abf3e12 — carried on a <sprint_type value="..."> tag (was a "[sprint:TYPE]"
+    # inline tag); the type value + note guidance are preserved verbatim.
     _stype = _infer_sprint_type(pending_sprint_items)
-    _type_clause = f" [sprint:{_stype}] {_SPRINT_TYPE_NOTES.get(_stype, '')}".rstrip()
-    # eeee02c6/9f57374b — anti-stop failure framing, unless completion_mode='lenient'.
-    _fail_clause = (
+    _stype_note = _SPRINT_TYPE_NOTES.get(_stype, "")
+    _type_clause = (
+        f'\n<sprint_type value="{_xml_escape(_stype, {chr(34): "&quot;"})}">'
+        f"{_xml_escape(_stype_note)}</sprint_type>"
+        if _stype_note
+        else f'\n<sprint_type value="{_xml_escape(_stype, {chr(34): "&quot;"})}" />'
+    )
+    # eeee02c6/9f57374b — the completion constraint that used to be prose-threat
+    # framing ("stopping early … is a FAILURE"). 5abf3e12 re-expresses the SAME
+    # semantics as a neutral, structured <not_done_until> tag: the session is not
+    # done while any listed item is still pending. No ALL-CAPS / threat language;
+    # the literal, checkable constraint is unchanged. Suppressed for
+    # completion_mode='lenient', exactly as the old _fail_clause was.
+    _not_done_until = (
         ""
         if completion_mode == "lenient"
         else (
-            " You are DONE only when complete_sprint_item() has been called for "
-            "every listed item — stopping early or handing off with items pending "
-            "is a FAILURE."
+            "\n<not_done_until>complete_sprint_item() has been called for every "
+            "listed item. The session is not done while any listed item is still "
+            "pending: do not stop early, and do not hand off with items pending."
+            "</not_done_until>"
         )
     )
     return (
-        f"{_loop_prefix}/goal {directive}"
+        f"{_loop_prefix}/goal\n"
+        f"<role>{_xml_escape(directive)}</role>\n"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
         # board query keeps a resumed session honest about mid-run injections
         # and already-claimed items instead of trusting a stale list.
-        'First call get_sprint_items(status="pending") to load the live board '
-        "(the ids below are a snapshot and may have shifted). "
-        f"{items_clause}"
-        "Done when all listed sprint items are marked complete via "
-        f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
-        f"generate_handoff() is called at the end. Stop after {_turns} turns "
-        f"{_hitl_clause}"
-        f"{_fail_clause}"
+        '<first_step>First call get_sprint_items(status="pending") to load the '
+        "live board (the ids below are a snapshot and may have shifted)."
+        "</first_step>\n"
+        f"<sprint_items>{_xml_escape(items_clause.strip())}</sprint_items>\n"
+        "<completion_criteria>Done when all listed sprint items are marked "
+        "complete via complete_sprint_item(), pixi run test passes "
+        f"{test_floor}+, and generate_handoff() is called at the end."
+        "</completion_criteria>"
+        f"{_not_done_until}\n"
+        f"<stop_conditions>Stop after {_turns} turns "
+        f"{_xml_escape(_hitl_clause)}</stop_conditions>"
         f"{_type_clause}"
         f"{_manual_note}"
     )
@@ -1503,7 +1572,8 @@ async def _generate_handoff_l0(
             # 366317e9 — urgent decisions are flagged so they stand out in the
             # priority-ordered list.
             mark = " ⚡" if d.get("priority") == "urgent" else ""
-            lines.append(f"- **{d.get('title', '?')}**{mark}: {d.get('body', '')}")
+            # 2d6d8677 — clip the body so even the emergency fallback stays bounded.
+            lines.append(f"- **{d.get('title', '?')}**{mark}: {_clip_body(d.get('body'))}")
         lines.append("")
     lines += [
         "---",
@@ -1557,14 +1627,16 @@ def _render_workspace_handoff_block(
         for d in decisions[:10]:
             cat = (d.get("category") or "").strip()
             prefix = f"**[{cat}]** " if cat else ""
-            lines.append(f"- {prefix}{d.get('title', '')} — {(d.get('body') or '')[:300]}")
+            # 2d6d8677 — clip the body with a truncation marker (was a raw [:300]).
+            lines.append(f"- {prefix}{d.get('title', '')} — {_clip_body(d.get('body'))}")
         lines.append("")
     if notes:
         lines.append("### Notes")
         for n in notes[:10]:
             tags = (n.get("tags") or "").strip()
             suffix = f" _({tags})_" if tags else ""
-            lines.append(f"- **{n.get('title', '')}** — {(n.get('body') or '')[:300]}{suffix}")
+            # 2d6d8677 — clip the body with a truncation marker (was a raw [:300]).
+            lines.append(f"- **{n.get('title', '')}** — {_clip_body(n.get('body'))}{suffix}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -1594,7 +1666,8 @@ def _render_custom_handoff(
         for t in recent_tasks[:10]:
             status = (t.get("status") or "?").upper()
             desc = (t.get("description") or "").strip().replace("\n", " ")
-            out.append(f"- [{status}] {desc[:160]}")
+            # 2d6d8677 — clip with a truncation marker (was a raw [:160]).
+            out.append(f"- [{status}] {_clip_body(desc, 160)}")
         return "\n".join(out)
 
     def _decisions_block() -> str:
@@ -1605,7 +1678,8 @@ def _render_custom_handoff(
         for d in active[:10]:
             cat = (d.get("category") or "").strip()
             prefix = f"[{cat}] " if cat else ""
-            out.append(f"- {prefix}{d.get('title', '')} — {(d.get('body') or '')[:300]}")
+            # 2d6d8677 — clip the body with a truncation marker (was a raw [:300]).
+            out.append(f"- {prefix}{d.get('title', '')} — {_clip_body(d.get('body'))}")
         return "\n".join(out)
 
     def _pending_block() -> str:
@@ -1623,7 +1697,8 @@ def _render_custom_handoff(
         for n in notes[:10]:
             tags = (n.get("tags") or "").strip()
             suffix = f" ({tags})" if tags else ""
-            out.append(f"- {n.get('title', '')} — {(n.get('body') or '')[:300]}{suffix}")
+            # 2d6d8677 — clip the body with a truncation marker (was a raw [:300]).
+            out.append(f"- {n.get('title', '')} — {_clip_body(n.get('body'))}{suffix}")
         return "\n".join(out)
 
     replacements = {
@@ -1946,6 +2021,18 @@ async def generate_handoff(
         await db_module.set_pending_goal(db, project_id, quick_start_goal)
     except Exception:  # noqa: BLE001
         pass
+    # 5abf3e12 — measure & persist this session's goal compliance (did its /goal
+    # item list get fully complete_sprint_item()'d?) at the canonical session-end
+    # point. N = items this session took on (actor = session id), M = of those,
+    # how many reached 'done'. Fully guarded: a pre-migration DB (no
+    # goal_compliance column) or a session-less handoff never breaks generation.
+    if session_id:
+        try:
+            await db_module.record_session_goal_compliance(
+                db, project_id, session_id
+            )
+        except Exception:  # noqa: BLE001
+            pass
     # aef94e4a — auto-save a strategic sprint retrospective (what shipped /
     # patterns / direction) as an insight note surfaced in the planner brief.
     # Skippable on hot paths / tests (skip_ai_summary) and fully guarded so it
@@ -2077,13 +2164,15 @@ async def _generate_planner_handoff(
             cat = d.get("category", "")
             # 366317e9 — pinned is ordered urgent → normal → low; tag urgent ones.
             prio = " ⚡urgent" if d.get("priority") == "urgent" else ""
-            lines.append(f"- **[{cat}]**{prio} {d.get('title', '')} — {(d.get('body') or '')[:200]}")
+            # 2d6d8677 — clip with a truncation marker (was a raw [:200]).
+            lines.append(f"- **[{cat}]**{prio} {d.get('title', '')} — {_clip_body(d.get('body'), 200)}")
         lines.append("")
 
     if strategic:
         lines += ["## Strategic Notes", ""]
         for n in strategic[:8]:
-            lines.append(f"- **{n.get('title', '')}** — {(n.get('body') or '')[:150]}")
+            # 2d6d8677 — clip with a truncation marker (was a raw [:150]).
+            lines.append(f"- **{n.get('title', '')}** — {_clip_body(n.get('body'), 150)}")
         lines.append("")
 
     # Sprint items to review — in-progress first (what's live), then pending.

@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS projects (
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
     icon TEXT,
     agent_instructions TEXT,
+    parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous'
         CHECK (execution_mode IN ('autonomous', 'interactive')),
     status TEXT NOT NULL DEFAULT 'active'
@@ -208,6 +209,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
     checkpoint_data TEXT,
     sprint_version TEXT,
+    goal_compliance TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -429,12 +431,17 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- RFC 8628 device authorization grant (e9f18530). device_code / user_code
+-- hold SHA-256 HASHES of the codes, never the raw values. last_polled_at
+-- backs the poll-rate limiter (RFC 8628 slow_down).
 CREATE TABLE IF NOT EXISTS device_codes (
     device_code TEXT PRIMARY KEY,
     user_code TEXT NOT NULL UNIQUE,
     tenant_id TEXT,
     expires_at TEXT NOT NULL,
     approved INTEGER NOT NULL DEFAULT 0,
+    denied INTEGER NOT NULL DEFAULT 0,
+    last_polled_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -833,6 +840,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_api_tokens_expires_at(db)
     await _migrate_oauth_codes_table(db)
     await _migrate_device_codes_table(db)
+    await _migrate_device_codes_denied_polled(db)
     await _migrate_github_to_projects(db)
     await _migrate_touches_files(db)
     await _migrate_touches_resources(db)
@@ -881,6 +889,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_slug(db)
     await _migrate_capture_insight_notes_to_insights(db)
     await _migrate_blog_posts_tenant(db)
+    await _migrate_project_parent_id(db)
+    await _migrate_session_goal_compliance(db)
     return db
 
 
@@ -892,6 +902,7 @@ async def create_project(
     human_id: str | None = None,
     execution_mode: str | None = None,
     tenant_id: str | None = None,
+    parent_project_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a project and return it as a dict. Raises if the name exists.
 
@@ -907,7 +918,27 @@ async def create_project(
     workspace's cascade defaults (execution_mode_default, hitl_auto_answer_default,
     code_intel_enabled_default) for any field the caller didn't set explicitly.
     Existing projects are never touched; this is a creation-time cascade only.
+
+    ``parent_project_id`` (3b6ff466) — when given, the new project is a
+    subproject of that parent. The hierarchy is ONE level deep: the parent
+    must exist AND must itself be top-level (its own parent_project_id is
+    NULL) — a grandchild is rejected with ValueError. A subproject with no
+    north_star of its own falls back to its parent's north_star (see
+    ``get_goal``). Top-level projects pass parent_project_id=None (default).
     """
+    # 3b6ff466 — validate the subproject parent before inserting anything.
+    if parent_project_id is not None:
+        parent = await get_project(db, parent_project_id)
+        if parent is None:
+            raise ValueError(
+                f"parent project '{parent_project_id}' does not exist"
+            )
+        if parent.get("parent_project_id"):
+            raise ValueError(
+                "subprojects are one level deep — cannot nest under a "
+                f"project that is itself a subproject "
+                f"('{parent_project_id}' has a parent)"
+            )
     # Resolve workspace defaults for seeding (best-effort; never block creation).
     _ws: dict[str, Any] = {}
     if tenant_id is not None:
@@ -920,9 +951,10 @@ async def create_project(
     pid = _new_id()
     mode = normalize_execution_mode(execution_mode)
     await db.execute(
-        "INSERT INTO projects (id, name, creator_human_id, execution_mode) "
-        "VALUES (?, ?, ?, ?)",
-        (pid, name, human_id, mode),
+        "INSERT INTO projects "
+        "(id, name, creator_human_id, execution_mode, parent_project_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (pid, name, human_id, mode, parent_project_id),
     )
     await db.commit()
     # Seed the remaining cascade defaults onto the fresh project row.
@@ -1557,6 +1589,16 @@ async def get_goal(
     Since v0.5.2 the returned dict also includes ``north_star`` and
     ``sprint`` pulled from the ``goal_north_star`` / ``goal_sprint``
     columns. Both are None when not yet set.
+
+    3b6ff466 — subproject north_star inheritance. When the project is a
+    subproject (``parent_project_id`` set) and has NO north_star of its own
+    (empty/NULL), the parent's north_star is inherited. The returned dict then
+    carries ``north_star_inherited=True`` and ``north_star_source_project_id``
+    (the parent's id) so callers can render "inherited" state. Top-level
+    projects and subprojects with their own north_star are unaffected. This is
+    the single fall-back point every read-path shares — ``get_goal``,
+    ``get_planning_brief`` and ``get_context_block`` all resolve the goal
+    through here, so the inheritance is wired into all three at once.
     """
     async with db.execute(
         "SELECT * FROM goal_states WHERE project_id = ? "
@@ -1565,12 +1607,70 @@ async def get_goal(
     ) as cur:
         row = await cur.fetchone()
     goal = _row_to_dict(row)
+    if goal is not None:
+        goal["content"] = _decode_content(goal["content"])
+        goal["north_star"] = goal.pop("goal_north_star", None)
+        goal["sprint"] = goal.pop("goal_sprint", None)
+        goal["north_star_inherited"] = False
+        goal["north_star_source_project_id"] = None
+        # Own north_star present → nothing to inherit; return as-is.
+        if (goal.get("north_star") or "").strip():
+            return goal
+    # No goal row, or a goal row with an empty north_star: try the parent.
+    inherited = await _inherited_north_star(db, project_id)
+    if inherited is None:
+        return goal
+    parent_ns, parent_id = inherited
     if goal is None:
-        return None
-    goal["content"] = _decode_content(goal["content"])
-    goal["north_star"] = goal.pop("goal_north_star", None)
-    goal["sprint"] = goal.pop("goal_sprint", None)
+        # Child has no goal state at all — synthesise a minimal one so the
+        # inherited north_star still surfaces (content/sprint stay empty).
+        return {
+            "project_id": project_id,
+            "content": "",
+            "version": 0,
+            "north_star": parent_ns,
+            "sprint": None,
+            "north_star_inherited": True,
+            "north_star_source_project_id": parent_id,
+        }
+    goal["north_star"] = parent_ns
+    goal["north_star_inherited"] = True
+    goal["north_star_source_project_id"] = parent_id
     return goal
+
+
+async def _inherited_north_star(
+    db: aiosqlite.Connection, project_id: str
+) -> tuple[str, str] | None:
+    """3b6ff466 — resolve a subproject's inherited north_star from its parent.
+
+    Returns ``(parent_north_star, parent_project_id)`` when ``project_id`` is a
+    subproject whose parent has a non-empty north_star, else None. One level
+    deep by construction (create_project rejects grandchildren), so no
+    recursion / cycle handling is needed. Best-effort: a missing
+    ``parent_project_id`` column (pre-migration DB) simply yields no inheritance.
+    """
+    try:
+        proj = await get_project(db, project_id)
+    except Exception:  # noqa: BLE001 — pre-migration schema → no inheritance
+        return None
+    if proj is None:
+        return None
+    parent_id = proj.get("parent_project_id")
+    if not parent_id:
+        return None
+    async with db.execute(
+        "SELECT goal_north_star FROM goal_states WHERE project_id = ? "
+        "ORDER BY version DESC LIMIT 1",
+        (parent_id,),
+    ) as cur:
+        prow = await cur.fetchone()
+    if prow is None:
+        return None
+    parent_ns = (prow["goal_north_star"] if isinstance(prow, dict) else prow[0]) or ""
+    if not parent_ns.strip():
+        return None
+    return parent_ns, parent_id
 
 
 async def set_goal(
@@ -1592,11 +1692,25 @@ async def set_goal(
     that should not pollute the goal history.
     """
     existing = await get_goal(db, project_id)
+    # 3b6ff466 — a subproject with no goal row of its own gets a *synthesised*
+    # goal dict back from get_goal (parent's inherited north_star, no real
+    # goal_states row → no "id"). That is NOT a row to update or version off
+    # of; treat it as "no existing goal" for all row surgery below, otherwise
+    # the in-place UPDATE (WHERE id = existing["id"]) would KeyError and the
+    # inherited north_star would be materialised into the child's first row.
+    if existing is not None and "id" not in existing:
+        existing = None
     encoded = _encode_content(content)
-    # Carry forward north_star / sprint from the previous row when not given.
-    final_north_star = north_star if north_star is not None else (
-        existing.get("north_star") if existing else None
+    # Never carry forward an INHERITED north_star as if it were the child's own.
+    # get_goal flags a borrowed parent north_star with north_star_inherited;
+    # treat that as "the child has no own north_star" for carry-forward.
+    _own_existing_ns = (
+        existing.get("north_star")
+        if (existing and not existing.get("north_star_inherited"))
+        else None
     )
+    # Carry forward north_star / sprint from the previous row when not given.
+    final_north_star = north_star if north_star is not None else _own_existing_ns
     final_sprint = sprint if sprint is not None else (
         existing.get("sprint") if existing else None
     )
@@ -2710,11 +2824,13 @@ async def search_tasks(
 ) -> list[dict[str, Any]]:
     """Full-text task search.
 
-    Postgres: uses pg_trgm similarity() — no ML model required, fast on the
-    GIN index added by _migrate_pg_v27_pg_trgm. Falls back to ILIKE when
-    the query is too short for trigrams (< 3 chars).
+    Postgres: uses pg_trgm similarity() for ranking — no ML model required,
+    fast on the GIN index added by _migrate_pg_v27_pg_trgm — OR'd with a
+    multiword ILIKE term-match and (82e0b887) an on-the-fly tsvector full-text
+    predicate so stemmed / non-substring queries also match. Ordering is
+    similarity DESC, ts_rank DESC, created_at DESC.
 
-    SQLite: simple LIKE wildcard match on description.
+    SQLite: keyword substring term-match on description (unchanged).
 
     Returns [{id, description, status, created_at, similarity, session_name}].
     """
@@ -2725,6 +2841,12 @@ async def search_tasks(
         # still orders results; the term-match just widens the candidate set.
         match_sql, match_params = _multiword_match_clause(
             ["t.description"], query, op="ILIKE")
+        # 82e0b887 — additively widen the candidate set with tsvector full-text
+        # match so stemmed / morphological queries ("authenticating users" vs a
+        # task "authentication for the user") also match. websearch_to_tsquery
+        # tolerates arbitrary user input without raising. similarity() still
+        # drives ordering (trigram score); ts_rank is a secondary tiebreak so
+        # rows matched purely by FTS (similarity 0) still order sensibly.
         sql = (
             "SELECT t.id, t.description, t.status, t.created_at, "
             "s.name AS session_name, "
@@ -2732,10 +2854,17 @@ async def search_tasks(
             "FROM task_log t "
             "LEFT JOIN sessions s ON s.id = t.session_id "
             "WHERE t.project_id = ? "
-            f"AND (similarity(t.description, ?) > 0.05 OR {match_sql}) "
-            "ORDER BY similarity DESC, t.created_at DESC LIMIT ?"
+            "AND (similarity(t.description, ?) > 0.05 "
+            "OR to_tsvector('english', coalesce(t.description,'')) "
+            "@@ websearch_to_tsquery('english', ?) "
+            f"OR {match_sql}) "
+            "ORDER BY similarity DESC, "
+            "ts_rank(to_tsvector('english', coalesce(t.description,'')), "
+            "websearch_to_tsquery('english', ?)) DESC, "
+            "t.created_at DESC LIMIT ?"
         )
-        params: tuple = (query, project_id, query, *match_params, limit)
+        params: tuple = (
+            query, project_id, query, query, *match_params, query, limit)
     else:
         match_sql, match_params = _multiword_match_clause(["t.description"], query)
         sql = (
@@ -2798,9 +2927,13 @@ async def search_all(
       - decisions_pinned.title + decisions_pinned.body
       - sprint_items.title + sprint_items.notes
 
-    SQLite: LIKE %query% on all relevant text fields.
-    Postgres: ILIKE on all relevant text fields (portable across both backends;
-    pg_trgm/tsvector are Postgres-only so we keep to ILIKE here for parity).
+    SQLite: keyword match — every whitespace-separated query term must appear
+    (as a substring) in one of the text fields (see _multiword_match_clause).
+    Postgres (82e0b887): on-the-fly tsvector full-text search via
+    websearch_to_tsquery, ordered by ts_rank. Stemming/word-form tolerance
+    means "authenticating users" matches "authentication for the user" — which
+    the SQLite substring path cannot. Zero schema / zero index (evaluated per
+    query).
 
     Returns grouped results: {tasks, notes, decisions, sprint_items}.
     Each item includes a ``match_type`` key for the source table and a
@@ -2816,44 +2949,102 @@ async def search_all(
             rows = await cur.fetchall()
         return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
-    # fcf90f3a — AND the query terms across each content type's text fields so a
-    # multi-word query matches rows containing every term (not only the exact
-    # contiguous phrase). op is ILIKE on PG / LIKE on SQLite, so the rest of the
-    # SQL is shared instead of duplicated per backend.
-    m_task, p_task = _multiword_match_clause(["description"], query, op=op)
-    m_note, p_note = _multiword_match_clause(["title", "body"], query, op=op)
-    m_dec, p_dec = _multiword_match_clause(["title", "body"], query, op=op)
-    m_sprint, p_sprint = _multiword_match_clause(["title", "notes"], query, op=op)
+    if is_pg:
+        # 82e0b887 — Postgres full-text search. The keyword AND-of-substrings
+        # path (below, SQLite) can't stem or cross word forms: querying
+        # "authenticating users" misses a note reading "authentication for the
+        # user". On PG we build an on-the-fly tsvector over each content type's
+        # text field(s) and match with websearch_to_tsquery (which tolerates
+        # arbitrary punctuation/user input without raising), then rank by
+        # ts_rank so the most relevant rows surface first. Zero schema / zero
+        # index — the expression is evaluated per query. 'english' regconfig
+        # matches the pg_trgm/English assumption already used by search_tasks.
+        #
+        # Param order per type is: <tsvector-query>, <existing filters incl.
+        # project_id>, <ts_rank-query>, <limit>. The predicate's ? comes first
+        # in the SQL, the ORDER BY ts_rank ? comes last before LIMIT — the
+        # params tuple below mirrors that exactly.
+        def _tsv(*cols: str) -> str:
+            expr = " || ' ' || ".join(f"coalesce({c},'')" for c in cols)
+            return f"to_tsvector('english', {expr})"
 
-    tasks_sql = (
-        "SELECT id, description, status, created_at, 'task' AS match_type "
-        "FROM task_log "
-        f"WHERE project_id = ? AND {m_task} "
-        "ORDER BY created_at DESC LIMIT ?"
-    )
-    notes_sql = (
-        "SELECT id, title, body, tags, created_at, 'note' AS match_type "
-        "FROM project_notes "
-        f"WHERE project_id = ? AND {m_note} "
-        "ORDER BY created_at DESC LIMIT ?"
-    )
-    decisions_sql = (
-        "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
-        "FROM decisions_pinned "
-        f"WHERE project_id = ? AND status = 'active' AND {m_dec} "
-        "ORDER BY created_at DESC LIMIT ?"
-    )
-    sprint_sql = (
-        "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
-        "FROM sprint_items "
-        f"WHERE project_id = ? AND {m_sprint} "
-        "ORDER BY added_at DESC LIMIT ?"
-    )
+        tv_task = _tsv("description")
+        tv_note = _tsv("title", "body")
+        tv_dec = _tsv("title", "body")
+        tv_sprint = _tsv("title", "notes")
 
-    tasks = await _search(tasks_sql, (project_id, *p_task, limit))
-    notes = await _search(notes_sql, (project_id, *p_note, limit))
-    decisions = await _search(decisions_sql, (project_id, *p_dec, limit))
-    sprint_items = await _search(sprint_sql, (project_id, *p_sprint, limit))
+        tasks_sql = (
+            "SELECT id, description, status, created_at, 'task' AS match_type "
+            "FROM task_log "
+            f"WHERE project_id = ? AND {tv_task} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_task}, websearch_to_tsquery('english', ?)) DESC, "
+            "created_at DESC LIMIT ?"
+        )
+        notes_sql = (
+            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+            "FROM project_notes "
+            f"WHERE project_id = ? AND {tv_note} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_note}, websearch_to_tsquery('english', ?)) DESC, "
+            "created_at DESC LIMIT ?"
+        )
+        decisions_sql = (
+            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+            "FROM decisions_pinned "
+            "WHERE project_id = ? AND status = 'active' "
+            f"AND {tv_dec} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_dec}, websearch_to_tsquery('english', ?)) DESC, "
+            "created_at DESC LIMIT ?"
+        )
+        sprint_sql = (
+            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "FROM sprint_items "
+            f"WHERE project_id = ? AND {tv_sprint} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_sprint}, websearch_to_tsquery('english', ?)) DESC, "
+            "added_at DESC LIMIT ?"
+        )
+
+        tasks = await _search(tasks_sql, (project_id, query, query, limit))
+        notes = await _search(notes_sql, (project_id, query, query, limit))
+        decisions = await _search(decisions_sql, (project_id, query, query, limit))
+        sprint_items = await _search(sprint_sql, (project_id, query, query, limit))
+    else:
+        # fcf90f3a — SQLite keyword path (unchanged). AND the query terms across
+        # each content type's text fields so a multi-word query matches rows
+        # containing every term (not only the exact contiguous phrase).
+        m_task, p_task = _multiword_match_clause(["description"], query, op=op)
+        m_note, p_note = _multiword_match_clause(["title", "body"], query, op=op)
+        m_dec, p_dec = _multiword_match_clause(["title", "body"], query, op=op)
+        m_sprint, p_sprint = _multiword_match_clause(["title", "notes"], query, op=op)
+
+        tasks_sql = (
+            "SELECT id, description, status, created_at, 'task' AS match_type "
+            "FROM task_log "
+            f"WHERE project_id = ? AND {m_task} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        notes_sql = (
+            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+            "FROM project_notes "
+            f"WHERE project_id = ? AND {m_note} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        decisions_sql = (
+            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+            "FROM decisions_pinned "
+            f"WHERE project_id = ? AND status = 'active' AND {m_dec} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        sprint_sql = (
+            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "FROM sprint_items "
+            f"WHERE project_id = ? AND {m_sprint} "
+            "ORDER BY added_at DESC LIMIT ?"
+        )
+
+        tasks = await _search(tasks_sql, (project_id, *p_task, limit))
+        notes = await _search(notes_sql, (project_id, *p_note, limit))
+        decisions = await _search(decisions_sql, (project_id, *p_dec, limit))
+        sprint_items = await _search(sprint_sql, (project_id, *p_sprint, limit))
 
     # Attach a body-text snippet for each result so the dashboard search bar can
     # surface matching context. The body field name differs per content type.
@@ -5468,14 +5659,27 @@ async def delete_api_tokens_by_label(
     db: aiosqlite.Connection,
     tenant_id: str,
     label: str,
+    exclude_id: str | None = None,
 ) -> int:
     """Delete all tokens with a given label for a tenant. Returns count deleted.
     Used so label acts as a unique slot -- regenerating hooks-installer token
-    doesn't leave stale tokens that cause 401 loops."""
-    cur = await db.execute(
-        "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ?",
-        (tenant_id, label),
-    )
+    doesn't leave stale tokens that cause 401 loops.
+
+    ``exclude_id`` (0e9bb6ef) — when set, the row with this id is preserved. This
+    lets a caller mint the replacement token FIRST and then prune the tenant's
+    older same-label tokens, so there is never an instant with zero valid keys
+    (create-new-then-revoke-old ordering). Placeholders are ``?`` (the psycopg3
+    adapter rewrites ``?`` -> ``%s``), so this stays SQLite+Postgres compatible."""
+    if exclude_id is not None:
+        cur = await db.execute(
+            "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ? AND id != ?",
+            (tenant_id, label, exclude_id),
+        )
+    else:
+        cur = await db.execute(
+            "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ?",
+            (tenant_id, label),
+        )
     await db.commit()
     return cur.rowcount
 
@@ -8722,6 +8926,32 @@ async def get_project_note(
     return _row_to_dict(row)
 
 
+async def get_project_document_by_source(
+    db: aiosqlite.Connection, project_id: str, source: str
+) -> dict[str, Any] | None:
+    """e9addcb0 — fetch a ``kind='document'`` note by its stable source identity.
+
+    ``source`` is the document's stable handle — a file path or a Drive file id —
+    set by :func:`ingest_document`. Re-ingesting the same document targets this
+    row so an upsert refreshes it in place instead of creating a duplicate.
+
+    Scoped to (``project_id``, ``source``, ``note_kind='document'``): a plain
+    note that happens to share a source string is never matched. Returns the
+    newest matching row (oldest are legacy pre-upsert duplicates) or None.
+    """
+    src = (source or "").strip()
+    if not src:
+        return None
+    async with db.execute(
+        "SELECT * FROM project_notes "
+        "WHERE project_id = ? AND note_kind = 'document' AND source = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (project_id, src),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
 async def ingest_document(
     db: aiosqlite.Connection,
     project_id: str,
@@ -8746,6 +8976,15 @@ async def ingest_document(
     ``doc_ingest.DOC_BODY_MAX_CHARS`` (truncated with a clear "…[truncated]"
     marker if longer; the kept prefix stays full-text searchable). The note is
     stored via :func:`add_project_note` with ``kind='document'`` and ``source``.
+
+    e9addcb0 — **upsert by stable identity.** When a ``source`` resolves (an
+    explicit ``source``, else ``file_path``), re-ingesting the same document
+    UPDATES the existing ``kind='document'`` note for this project in place
+    (refreshing body / title / tags / ``updated_at``) instead of creating a
+    duplicate — so re-touching a path or Drive file id yields one row, not N.
+    When no source can be resolved (``content`` with no ``source``/``file_path``)
+    the document is not identifiable, so it always inserts a fresh note — two
+    anonymous ingests never silently merge.
 
     Meridian is a coordination store, not an LLM: this never summarizes. Pass a
     summary as ``content`` if you want one stored instead of the raw text.
@@ -8775,6 +9014,26 @@ async def ingest_document(
             doc_title = "Untitled document"
 
     capped = cap_body(body or "")
+    stored_source = (ingest_source or "").strip() or None
+
+    # e9addcb0 — upsert by stable identity: if this project already has a
+    # kind='document' note for the same source, refresh it in place instead of
+    # creating a duplicate. Only when a source resolves — an anonymous ingest
+    # (content with no source/file_path) can't be identified, so it inserts.
+    if stored_source is not None:
+        existing = await get_project_document_by_source(db, project_id, stored_source)
+        if existing is not None:
+            # tags is passed through as-is: None (caller omitted it) leaves the
+            # prior ingest's tags untouched; a value replaces them.
+            updated = await update_project_note(
+                db,
+                existing["id"],
+                title=doc_title,
+                body=capped,
+                tags=tags,
+            )
+            return updated or existing
+
     return await add_project_note(
         db,
         project_id,
@@ -8782,7 +9041,7 @@ async def ingest_document(
         capped,
         tags,
         kind="document",
-        source=(ingest_source or None),
+        source=stored_source,
     )
 
 
@@ -9869,6 +10128,111 @@ async def get_session_checkpoint(
         return json.loads(raw)
     except (ValueError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# 5abf3e12 — per-session goal-compliance metric (sessions.goal_compliance)
+# ---------------------------------------------------------------------------
+
+
+async def compute_session_goal_compliance(
+    db: aiosqlite.Connection, project_id: str, session_id: str
+) -> dict[str, Any]:
+    """Measure whether a session's /goal item list was fully completed.
+
+    The /goal instructs an executor to "claim and execute the following sprint
+    items … you are DONE only when complete_sprint_item() has been called for
+    every listed item". This computes that compliance from the durable board
+    state, using ``sprint_items.actor`` as the link between a session and the
+    items it took on. ``actor`` is set by claim_sprint_item (COALESCE — the
+    first claimer wins) and OVERWRITTEN by complete_sprint_item to the completing
+    session (5823db0b). For the standard executor loop — where ONE session both
+    claims and completes each item — the claimer and completer are the same, so
+    this measures exactly that session's compliance. In a cross-session hand-off
+    (parallel / coordinator patterns) the item is reattributed to whichever
+    session called complete_sprint_item(): credit follows the completer, and a
+    claimer whose item is finalised by another session no longer counts it.
+    Attribution therefore reflects the FINAL owner of each item.
+
+    * ``listed`` (N): sprint items whose ``actor`` is this session at compute
+      time — the items it currently owns (claimed and/or completed). This
+      includes items left in any non-'done' terminal state (e.g. skipped /
+      failed / pushed), so an item this session owns but legitimately skipped
+      still counts toward N while never counting toward M.
+    * ``completed`` (M): of those, how many reached status 'done' (i.e. were
+      finished via complete_sprint_item()). Only 'done' counts as compliance.
+    * ``fully_completed``: True iff N > 0 and M == N (every taken-on item shipped).
+    * ``zero_listed``: True when N == 0 (the session claimed no items, so there is
+      nothing to have completed — ``fully_completed`` is False, not vacuously
+      True).
+    * ``compliance_pct``: round(100 * M / N) when N > 0 else 0.
+
+    Returns a plain dict (JSON-serialisable) so callers can store it verbatim on
+    ``sessions.goal_compliance`` and surface it in progress / handoff output.
+    """
+    async with db.execute(
+        "SELECT "
+        "  COUNT(*) AS listed, "
+        "  COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS completed "
+        "FROM sprint_items WHERE project_id = ? AND actor = ?",
+        (project_id, session_id),
+    ) as cur:
+        row = await cur.fetchone()
+    listed = int((row["listed"] if row else 0) or 0)
+    completed = int((row["completed"] if row else 0) or 0)
+    return {
+        "session_id": session_id,
+        "listed": listed,
+        "completed": completed,
+        "fully_completed": listed > 0 and completed == listed,
+        "zero_listed": listed == 0,
+        "compliance_pct": round(100 * completed / listed) if listed else 0,
+    }
+
+
+async def set_session_goal_compliance(
+    db: aiosqlite.Connection, session_id: str, metric: dict[str, Any]
+) -> None:
+    """Persist the computed goal-compliance metric on the session row (JSON text)."""
+    await db.execute(
+        "UPDATE sessions SET goal_compliance = ? WHERE id = ?",
+        (json.dumps(metric), session_id),
+    )
+    await db.commit()
+
+
+async def get_session_goal_compliance(
+    db: aiosqlite.Connection, session_id: str
+) -> dict[str, Any] | None:
+    """Return the stored goal-compliance metric for a session, or None."""
+    async with db.execute(
+        "SELECT goal_compliance FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    raw = row["goal_compliance"]
+    if not raw:
+        return None
+    if isinstance(raw, dict):  # Postgres may return parsed JSON
+        return raw
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+async def record_session_goal_compliance(
+    db: aiosqlite.Connection, project_id: str, session_id: str
+) -> dict[str, Any]:
+    """Compute the goal-compliance metric for a session and store it. Returns it.
+
+    Called at session end (generate_handoff) so every completed session leaves a
+    durable, queryable record of whether its /goal item list was fully done.
+    """
+    metric = await compute_session_goal_compliance(db, project_id, session_id)
+    await set_session_goal_compliance(db, session_id, metric)
+    return metric
 
 
 # ---------------------------------------------------------------------------

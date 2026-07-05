@@ -647,6 +647,7 @@ Create a new Meridian project.
 |-----------|------|----------|-------------|
 | `name` | string | required |  |
 | `execution_mode` | string | optional | Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings. |
+| `parent_project_id` | string | optional | Optional parent project id — makes this a subproject that inherits the parent's north_star when it has none of its own. Subprojects are one level deep: the parent must exist and must not itself be a subproject. |
 
 **Example:**
 ```

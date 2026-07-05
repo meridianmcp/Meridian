@@ -155,6 +155,45 @@ def test_list_tunnel_tools_aggregates_and_reserves(monkeypatch):
     }
 
 
+def test_list_tunnel_tools_namespaces_titles_for_source(monkeypatch):
+    """connector-source — a slot whose inner server advertises a bare tool
+    ``title`` (filesystem's "Read File") gets its title namespaced with the
+    source ("Filesystem: Read File") so claude.ai's tool-permission UI shows the
+    plugin; a tool with NO title is unchanged (its prefixed name carries the
+    source); nested inputSchema param titles are left alone; no double-prefixing."""
+    tn._tunnel_sockets["t1"] = object()
+    tn._tunnel_code_sockets["t1"] = object()
+
+    def responder(label, method, params):
+        if label == "fs":
+            return {"result": {"tools": [
+                {"name": "read_file", "title": "Read File",
+                 "inputSchema": {"properties": {"path": {"title": "File Path"}}}},
+                {"name": "already", "title": "Filesystem: Already"},  # pre-namespaced
+            ]}}
+        if label == "code":
+            return {"result": {"tools": [{"name": "trace_path"}]}}  # no tool title
+        return {"result": {"tools": []}}
+
+    _stub_proxy(monkeypatch, responder)
+    try:
+        tools = asyncio.run(tn.list_tunnel_tools("t1"))
+        by_name = {t["name"]: t for t in tools}
+        # fs tool title namespaced with the source connector.
+        assert by_name["filesystem__read_file"]["title"] == "Filesystem: Read File"
+        # nested inputSchema param title left untouched.
+        assert (by_name["filesystem__read_file"]["inputSchema"]["properties"]
+                ["path"]["title"] == "File Path")
+        # an already-namespaced title is NOT double-prefixed.
+        assert by_name["filesystem__already"]["title"] == "Filesystem: Already"
+        # a tool with no title gets none added (its prefixed name shows the source).
+        assert "title" not in by_name["codebase__trace_path"]
+    finally:
+        tn._tunnel_sockets.pop("t1", None)
+        tn._tunnel_code_sockets.pop("t1", None)
+        tn._tunnel_tool_routes.pop("t1", None)
+
+
 # ---------------------------------------------------------------------------
 # d71ba2e7 — core slot health registry + suppression
 # ---------------------------------------------------------------------------

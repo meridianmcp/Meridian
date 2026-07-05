@@ -295,6 +295,83 @@ def test_dashboard_js_has_github_connect_card(js):
     assert "Connect GitHub repo" in js
 
 
+# 8201de19 — the Meridian Connect panel must offer direct per-platform binary
+# downloads for the tunnel connector ("meridian-connect") as a fallback when the
+# install.ps1 / install.sh one-liner 404s. These asset names MUST match
+# .github/workflows/release.yml exactly or the download links 404.
+# 80f1d4bc — macOS Intel (dead macos-13 runner) + Linux ARM64 (pixi lacks the
+# linux-aarch64 platform) were dropped from the release matrix, so their assets
+# 404; removed from the panel. Only the 3 actually-built platforms remain.
+_MERIDIAN_CONNECT_ASSETS = [
+    "meridian-connect-x86_64-windows.exe",
+    "meridian-connect-aarch64-apple-darwin",
+    "meridian-connect-x86_64-unknown-linux",
+]
+_MERIDIAN_DROPPED_ASSETS = [
+    "meridian-connect-x86_64-apple-darwin",      # macOS Intel — dead macos-13
+    "meridian-connect-aarch64-unknown-linux",    # Linux ARM64 — no pixi linux-aarch64
+]
+_MERIDIAN_RELEASES_BASE = (
+    "https://github.com/meridianmcp/Meridian/releases/latest/download"
+)
+
+
+def test_connect_panel_has_direct_binary_download_links(js):
+    """The Connect panel exposes direct release-asset download URLs for all five
+    platforms, pointing at meridianmcp/Meridian's latest release (8201de19)."""
+    # The GitHub repo slug used by every download URL + install.ps1.
+    assert "meridianmcp/Meridian/releases/latest/download" in js, (
+        "Connect panel must link at the meridianmcp/Meridian latest-release asset path"
+    )
+    # The releases base path used to build every download href.
+    assert _MERIDIAN_RELEASES_BASE in js, (
+        "Connect panel must reference the latest-release download base URL"
+    )
+    # A labelled fallback section, shown alongside (not replacing) the one-liner.
+    assert "Direct binary download (if the install script fails)" in js
+    # Each of the five per-platform assets is present with its exact release name.
+    # (The href is built as `${base}/${asset}` so we assert the base + each asset
+    # rather than the pre-concatenated string, which the source never spells out.)
+    for asset in _MERIDIAN_CONNECT_ASSETS:
+        assert asset in js, f"Connect panel missing tunnel binary asset {asset!r}"
+    # 80f1d4bc — dropped (unbuilt) platforms must NOT be linked; they'd 404.
+    for asset in _MERIDIAN_DROPPED_ASSETS:
+        assert asset not in js, f"dropped platform {asset!r} should not be linked (404s)"
+    # The install-script one-liner must still be present (fallback is additive).
+    assert "install.ps1" in js and "install.sh" in js
+
+
+def test_connect_panel_asset_names_match_release_workflow():
+    """The download asset names in the dashboard must exactly match the artifact
+    names published by the release workflow — a mismatch silently 404s (8201de19)."""
+    from pathlib import Path
+
+    release_yml = (
+        Path(__file__).parent.parent / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    for asset in _MERIDIAN_CONNECT_ASSETS:
+        assert asset in release_yml, (
+            f"release.yml no longer publishes {asset!r} — dashboard download link "
+            "would 404; update both together."
+        )
+
+
+def test_connect_download_urls_in_built_bundle():
+    """The rebuilt esbuild bundle (what actually ships) contains the five download
+    URLs, so the fallback survives bundling (8201de19)."""
+    from pathlib import Path
+
+    bundle = (
+        Path(__file__).parent.parent
+        / "meridian"
+        / "static"
+        / "dashboard.bundle.js"
+    ).read_text(encoding="utf-8")
+    assert "meridianmcp/Meridian/releases/latest/download" in bundle
+    for asset in _MERIDIAN_CONNECT_ASSETS:
+        assert asset in bundle, f"built bundle missing download asset {asset!r}"
+
+
 def test_signout_link_created_unconditionally_for_hosted_users(js, client):
     """Item 42 — Free-tier sign-out regression.
 
@@ -875,3 +952,152 @@ def test_code_intel_architecture_charts(js):
 
     # Graceful fallback: a raw-JSON view is always available.
     assert "raw JSON" in js, "raw fallback view missing"
+
+
+# ---------------------------------------------------------------------------
+# 3e3da82d — viewport meta + bounded responsive pass (sprint board + nav).
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_has_viewport_meta(soup):
+    """3e3da82d — the dashboard <head> declares a device-width viewport meta.
+
+    Without it, a phone / Add-to-Home-Screen render lays the page out at a
+    zoomed-out desktop width. The PWA item (b03be6a6) added the manifest but
+    not the viewport tag.
+    """
+    vp = soup.find("meta", attrs={"name": "viewport"})
+    assert vp is not None, "dashboard <head> must include a viewport meta (3e3da82d)"
+    content = vp.get("content", "")
+    assert "width=device-width" in content, (
+        "viewport meta must set width=device-width so mobile renders at device width"
+    )
+    assert "initial-scale=1" in content, "viewport meta must set initial-scale=1"
+
+
+def test_dashboard_responsive_sprint_and_nav_media_block(css):
+    """3e3da82d — a bounded @media pass adjusts ONLY the sprint board + top nav
+    at phone widths, tagged with the sprint-item id.
+
+    Appearance can't be unit-tested, so we assert the structural pieces exist:
+    the media query, the tag comment, and rules for the sprint board rows and
+    the top nav tab strip inside a narrow breakpoint.
+    """
+    # The sprint-item tag marks the new block.
+    assert "3e3da82d" in css, "responsive pass must be tagged with the sprint-item id"
+    # A phone-width breakpoint (768px already present for the sidebar; 480px added).
+    assert "@media (max-width: 768px)" in css, "768px breakpoint missing"
+    assert "@media (max-width: 480px)" in css, "480px phone breakpoint missing"
+
+    # The block adjusts the sprint board rows/groups...
+    tail = css[css.index("3e3da82d"):]
+    assert ".sprint-item-row" in tail, "responsive pass must adjust .sprint-item-row"
+    assert ".sprint-item-title" in tail, "responsive pass must adjust .sprint-item-title"
+    # ...and the top nav tab strip.
+    assert ".tabs" in tail, "responsive pass must adjust the top nav (.tabs)"
+    assert ".tab {" in tail or ".tab{" in tail, "responsive pass must adjust nav tabs (.tab)"
+
+
+# ---------------------------------------------------------------------------
+# b03be6a6 — Minimal installable PWA: manifest + icons + network-first SW.
+# ---------------------------------------------------------------------------
+
+
+def test_pwa_service_worker_served_at_root(client):
+    """b03be6a6 — /sw.js is served at the site root with a JS content-type.
+
+    Root scope ("/") is required so the worker can control /dashboard; a SW
+    mounted under /static would only scope to /static/*.
+    """
+    r = client.get("/sw.js")
+    assert r.status_code == 200, f"expected 200 for /sw.js, got {r.status_code}"
+    ctype = r.headers.get("content-type", "")
+    assert "javascript" in ctype.lower(), f"sw.js must be JS, got {ctype!r}"
+    # Root-scope enablement header (belt-and-suspenders).
+    assert r.headers.get("service-worker-allowed") == "/", (
+        "sw.js must advertise Service-Worker-Allowed: / for root scope"
+    )
+
+
+def test_pwa_service_worker_is_network_first(client):
+    """b03be6a6 (HARD REQUIREMENT) — the SW must be network-first, not cache-first.
+
+    Dashboard edits must show up on next open with zero rebuild/republish, so
+    the fetch handler must call fetch(request) *before* any caches.match(), and
+    it must not precache the HTML/JS app shell.
+    """
+    body = client.get("/sw.js").text
+    assert "install" in body and "skipWaiting" in body, "install must skipWaiting"
+    assert "clients.claim" in body, "activate must clients.claim()"
+
+    # fetch() must appear before caches.match() — the defining ordering of a
+    # network-first worker.
+    fetch_idx = body.find("fetch(request)")
+    match_idx = body.find("caches.match")
+    assert fetch_idx != -1, "SW must call fetch(request)"
+    assert match_idx != -1, "SW must fall back to caches.match on failure"
+    assert fetch_idx < match_idx, (
+        "network-first violated: fetch(request) must come before caches.match "
+        "(b03be6a6)"
+    )
+
+    # The app shell must NOT be precached — no HTML/JS/CSS in the SW's cache list.
+    assert "/dashboard" not in body, "SW must not cache the dashboard HTML shell"
+    assert ".bundle.js" not in body and "dashboard.css" not in body, (
+        "SW must not precache the JS/CSS app shell (would break live-edit)"
+    )
+    assert "b03be6a6" in body, "SW must carry the sprint-item tag"
+
+
+def test_pwa_manifest_served_with_icons(client):
+    """b03be6a6 — /manifest.webmanifest returns 200 with the manifest media type
+    and declares both the 192 and 512 icons."""
+    r = client.get("/manifest.webmanifest")
+    assert r.status_code == 200, f"expected 200, got {r.status_code}"
+    ctype = r.headers.get("content-type", "")
+    assert "manifest" in ctype.lower(), f"unexpected manifest content-type {ctype!r}"
+
+    data = r.json()
+    assert data["name"] == "Meridian"
+    assert data["short_name"] == "Meridian"
+    assert data["display"] == "standalone"
+    assert data["start_url"] == "/dashboard", "start_url must open the dashboard"
+
+    sizes = {icon["sizes"] for icon in data["icons"]}
+    assert "192x192" in sizes and "512x512" in sizes, "both icon sizes required"
+    purposes = {icon.get("purpose", "") for icon in data["icons"]}
+    assert any("maskable" in p for p in purposes), "a maskable icon entry is required"
+
+
+def test_pwa_icons_are_pngs(client):
+    """b03be6a6 — both icons return 200 with image/png (no byte-content assertion)."""
+    for size in (192, 512):
+        r = client.get(f"/static/icon-{size}.png")
+        assert r.status_code == 200, f"icon-{size}.png missing"
+        assert r.headers.get("content-type", "").startswith("image/png"), (
+            f"icon-{size}.png must be served as image/png"
+        )
+        # Valid PNG magic bytes (not an exact-content assertion).
+        assert r.content[:8] == bytes((0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)), (
+            "not a valid PNG"
+        )
+
+
+def test_pwa_dashboard_head_wires_manifest_and_sw(soup, html):
+    """b03be6a6 — the dashboard <head> links the manifest, sets theme-color, and
+    registers the service worker inline (in the template, not the TS bundle)."""
+    manifest_link = soup.find("link", rel="manifest")
+    assert manifest_link is not None, "dashboard must <link rel=manifest>"
+    assert manifest_link.get("href") == "/manifest.webmanifest"
+
+    theme = soup.find("meta", attrs={"name": "theme-color"})
+    assert theme is not None and theme.get("content"), "theme-color meta required"
+
+    apple = soup.find("link", rel="apple-touch-icon")
+    assert apple is not None, "apple-touch-icon link required for iOS install"
+
+    # SW registration is inline in the HTML (no bundle rebuild needed).
+    assert "serviceWorker" in html, "SW registration guard missing"
+    assert "navigator.serviceWorker.register('/sw.js'" in html, (
+        "dashboard must register /sw.js"
+    )

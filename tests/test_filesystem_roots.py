@@ -60,6 +60,79 @@ def test_union_filesystem_roots_empty_when_none_set():
 
 
 # ---------------------------------------------------------------------------
+# 59c0e609 — regression: the union must serve EVERY distinct configured root,
+# order-preserved, deduped ONLY on exact match. The reported bug was "2 of 3
+# roots served on tunnel restart" (repository + OneDrive present, an underscore
+# 'Masters_Thesis/Outputs' path missing). Lock in that neither Windows path
+# shapes (underscore / space / mixed parents / trailing slash) nor a
+# single-project vs multi-project layout ever collapses a distinct root.
+# ---------------------------------------------------------------------------
+
+# The three real-world path shapes from the report: a repo dir, a OneDrive dir,
+# and an underscore-containing dir under a different parent.
+_R_REPO = r"C:\Users\13144\Documents\Meridian\repository"
+_R_ONEDRIVE = r"C:\Users\13144\OneDrive\Documents"
+_R_OUTPUTS = r"C:\Users\13144\Documents\Masters_Thesis\Outputs"
+
+
+def test_union_filesystem_roots_keeps_all_three_single_project():
+    """All 3 roots configured on ONE project → all 3 served, order-preserved."""
+    projects = [
+        {"executor_config": json.dumps(
+            {"filesystem_roots": [_R_REPO, _R_ONEDRIVE, _R_OUTPUTS]}
+        )},
+    ]
+    assert tn._union_filesystem_roots(projects) == [_R_REPO, _R_ONEDRIVE, _R_OUTPUTS]
+
+
+def test_union_filesystem_roots_keeps_all_three_across_projects():
+    """The same 3 roots spread across 3 projects → union preserves all 3.
+
+    Guards the tenant-scoped union path (``_union_filesystem_roots`` iterating
+    every project row from ``list_projects``): a per-project cap / early break /
+    'first project wins' bug would drop the 2nd or 3rd here.
+    """
+    projects = [
+        {"executor_config": json.dumps({"filesystem_roots": [_R_REPO]})},
+        {"executor_config": json.dumps({"filesystem_roots": [_R_ONEDRIVE]})},
+        {"executor_config": json.dumps({"filesystem_roots": [_R_OUTPUTS]})},
+    ]
+    assert tn._union_filesystem_roots(projects) == [_R_REPO, _R_ONEDRIVE, _R_OUTPUTS]
+
+
+def test_union_filesystem_roots_dedupe_is_exact_match_only():
+    """Dedup collapses ONLY byte-identical paths — a trailing slash, a differing
+    drive-letter case, or an extra space makes a DISTINCT root that must survive.
+
+    (Exact-match dedup is the correct behaviour: the union has no business
+    canonicalising client-local Windows paths the server can't see.)
+    """
+    projects = [
+        {"executor_config": json.dumps({"filesystem_roots": [
+            _R_OUTPUTS,            # canonical
+            _R_OUTPUTS,            # exact dup → collapses
+            _R_OUTPUTS + "\\",     # trailing sep → distinct, kept
+            _R_OUTPUTS.lower(),    # case variant → distinct, kept
+        ]})},
+    ]
+    assert tn._union_filesystem_roots(projects) == [
+        _R_OUTPUTS, _R_OUTPUTS + "\\", _R_OUTPUTS.lower(),
+    ]
+
+
+def test_union_filesystem_roots_keeps_path_with_space():
+    """A root containing a space (another shape the report warned about) survives;
+    only surrounding whitespace is trimmed, never internal."""
+    spaced = r"D:\Research Data\Thesis Outputs"
+    projects = [
+        {"executor_config": json.dumps({"filesystem_roots": [
+            _R_REPO, "  " + spaced + "  ", _R_OUTPUTS,
+        ]})},
+    ]
+    assert tn._union_filesystem_roots(projects) == [_R_REPO, spaced, _R_OUTPUTS]
+
+
+# ---------------------------------------------------------------------------
 # Filesystem-server command builder (multi-root vs home-dir fallback)
 # ---------------------------------------------------------------------------
 
@@ -81,6 +154,27 @@ def test_build_proxy_command_falls_back_to_repo_path():
 def test_build_proxy_command_ignores_blank_roots():
     cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["", "  "])
     assert cmd[-1] == "/home/me"
+
+
+def test_unservable_roots_flags_missing_and_space(tmp_path, monkeypatch):
+    """59c0e609 — configured roots the inner filesystem server would silently drop
+    are surfaced with a reason, so a "served 2 of 3" is diagnosable not silent."""
+    real = tmp_path / "exists"
+    real.mkdir()
+    missing = tmp_path / "gone"  # never created
+    flagged = dict(tc._unservable_roots([str(real), str(missing), "", "  "]))
+    assert str(missing) in flagged and "does not exist" in flagged[str(missing)]
+    assert str(real) not in flagged  # existing dir → served, not flagged
+
+    # On Windows an existing dir whose path contains a space is unservable
+    # (mcp-proxy --shell concatenates args unescaped). os.path.isdir/str ops only
+    # — no Windows-only stdlib touched, so this is safe on the Linux CI runner.
+    spaced = tmp_path / "has space"
+    spaced.mkdir()
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    flagged_win = dict(tc._unservable_roots([str(real), str(spaced)]))
+    assert str(spaced) in flagged_win and "space" in flagged_win[str(spaced)]
+    assert str(real) not in flagged_win  # exists + no space → served
 
 
 # ---------------------------------------------------------------------------

@@ -66,7 +66,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "create_project", "description": "Create a new Meridian project.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"},
-         "execution_mode": {"type": "string", "enum": ["autonomous", "interactive"], "description": "Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings."}},
+         "execution_mode": {"type": "string", "enum": ["autonomous", "interactive"], "description": "Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings."},
+         "parent_project_id": {"type": "string", "description": "Optional parent project id — makes this a subproject that inherits the parent's north_star when it has none of its own. Subprojects are one level deep: the parent must exist and must not itself be a subproject."}},
          "required": ["name"]}},
     {"name": "register_session", "description": "Low-level: register this session without loading goal context. Use start_session instead for executor/human sessions — it registers AND returns goal + tasks in one call. Use register_session when you only need a session ID and will fetch context separately.",
      "inputSchema": {"type": "object", "properties": {

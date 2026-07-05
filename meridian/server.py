@@ -444,6 +444,30 @@ async def lifespan(app: FastAPI):
                 "using in-memory SQLite demo DB. Set MERIDIAN_DEMO_DB_URL for persistence."
             )
 
+    # 9ee6d2ec — tiered document-structure store. Open a DEFAULT store on the
+    # self-hosted / solo path (local SQLite sidecar next to the main DB, or the
+    # MERIDIAN_DOC_STORE_URL override). Fully guarded: a failure here must NEVER
+    # block startup — the stateless get_document_structure / get_latex_structure
+    # parse tools keep working with app.state.doc_store = None. Per-tenant cloud
+    # stores (pro/admin) are opened lazily at ingest time via open_doc_store_for.
+    app.state.doc_store = None
+    try:
+        from .doc_store import open_doc_store_for  # noqa: PLC0415
+        app.state.doc_store = await open_doc_store_for(
+            plan=None,
+            hosted=_hosted_mode(),
+            data_dir=str(data_dir),
+            tenant_pg_url=None,
+            override_url=os.environ.get("MERIDIAN_DOC_STORE_URL"),
+        )
+    except Exception:  # noqa: BLE001 — structure persistence is best-effort
+        import logging as _ds_log  # noqa: PLC0415
+        _ds_log.getLogger(__name__).warning(
+            "document-structure store failed to open; continuing without it",
+            exc_info=True,
+        )
+        app.state.doc_store = None
+
     # v0.4.2 — periodic auto-summary task. Interval comes from env so
     # tests can run it on a sub-second cadence; default is ten minutes.
     interval_s = float(os.environ.get("MERIDIAN_AUTO_SUMMARY_INTERVAL", 600))
@@ -629,6 +653,23 @@ async def lifespan(app: FastAPI):
                 await _disp.stop()
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # 9ee6d2ec — close ALL document-structure stores alongside demo_db, before
+        # the main DB. Called UNCONDITIONALLY (not gated on app.state.doc_store):
+        # close_all_doc_stores() closes every cached store, including per-tenant
+        # cloud stores opened lazily at ingest time, so none leak even if the
+        # default store never opened. Guarded: a close error must not mask
+        # shutdown of the main connection.
+        try:
+            from .doc_store import close_all_doc_stores  # noqa: PLC0415
+            await close_all_doc_stores()
+        except Exception:  # noqa: BLE001 — shutdown best-effort
+            pass
+        _demo_db = getattr(app.state, "demo_db", None)
+        if _demo_db is not None and _demo_db is not db:
+            try:
+                await _demo_db.close()
+            except Exception:  # noqa: BLE001 — shutdown best-effort
+                pass
         await db.close()
 
 
@@ -758,7 +799,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/setup/health", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/setup/health", "/static", "/sw.js", "/manifest.webmanifest", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -1317,6 +1358,54 @@ async def favicon() -> Response:
     tags already point modern browsers at /static/logo.svg.)
     """
     return RedirectResponse(url="/static/logo.svg", status_code=301)
+
+
+# ---------------------------------------------------------------------------
+# b03be6a6 — Minimal installable PWA (manifest + service worker).
+#
+# The service worker's scope is limited to the directory it is served from, so
+# to control /dashboard it MUST be served at the ROOT (/sw.js → scope "/"). The
+# static mount lives at /static, whose scope would only cover /static/*, so we
+# expose sw.js and the manifest via explicit root routes here. The underlying
+# files live in meridian/static/ alongside the rest of the assets.
+#
+# The SW itself is deliberately NETWORK-FIRST (see sw.js) so dashboard edits show
+# up on next open with no rebuild/republish. These routes send no-cache headers
+# too, so a fresh sw.js is always fetched.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/sw.js")
+async def service_worker() -> Response:
+    """b03be6a6 — serve the PWA service worker at the site root.
+
+    Root scope ("/") is required so the worker can control /dashboard. The
+    ``Service-Worker-Allowed: /`` header is belt-and-suspenders; serving from /
+    already yields root scope. Sent no-cache so the network-first SW itself is
+    never pinned to a stale version.
+    """
+    from fastapi.responses import FileResponse  # noqa: PLC0415
+
+    return FileResponse(
+        _resource_path("meridian/static/sw.js"),
+        media_type="text/javascript",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Service-Worker-Allowed": "/",
+        },
+    )
+
+
+@app.get("/manifest.webmanifest")
+async def web_manifest() -> Response:
+    """b03be6a6 — serve the web app manifest at the site root (PWA installability)."""
+    from fastapi.responses import FileResponse  # noqa: PLC0415
+
+    return FileResponse(
+        _resource_path("meridian/static/manifest.webmanifest"),
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 @app.get("/sitemap.xml")
@@ -5265,8 +5354,21 @@ async def auth_install_page(request: Request) -> HTMLResponse:
     tenant = await _get_authenticated_tenant(request)
     db = request.app.state.db
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-    raw_token, _ = await db_module.create_api_token(
+    # 0e9bb6ef — rotate-and-dedup so repeated installer runs don't accumulate a
+    # pile of valid install keys. Install tokens are hash-only (raw not
+    # recoverable server-side), so we can't hand back a prior key's raw value;
+    # instead each install supersedes the previous. Mint the new token FIRST,
+    # then delete this tenant's OTHER label="install" tokens (exclude_id keeps
+    # the row we just created). This create-new-then-revoke-old ordering means
+    # there is never an instant with zero valid install keys even if the prune
+    # were to fail. Identity is tenant_id + label="install" (no hostname column
+    # exists on api_tokens). Same pattern already used by /auth/tokens and the
+    # tunnel-cli flow.
+    raw_token, install_row = await db_module.create_api_token(
         db, tenant["id"], label="install", expires_at=expires_at
+    )
+    await db_module.delete_api_tokens_by_label(
+        db, tenant["id"], "install", exclude_id=install_row["id"]
     )
     email = tenant.get("email", "")
     html = f"""<!DOCTYPE html>

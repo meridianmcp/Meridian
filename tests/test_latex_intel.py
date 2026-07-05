@@ -147,6 +147,75 @@ def test_analyze_latex_accepts_raw_source():
     assert res["unexpanded_inputs"] == ["extra_chapter"]
 
 
+# ---------------------------------------------------------------------------
+# In-text citation markers (fefb596a)
+# ---------------------------------------------------------------------------
+
+_CITE_TEX = r"""
+\section{Intro}
+We cite \cite{a,b} early.
+\subsection{Design}
+See \citep{c} and \citet[p.5]{d}.
+\section{Results}
+Author view: \citeauthor{e}, year \citeyear{f}, alt \citealt{g}, num \citenum{h}.
+"""
+
+
+def test_parse_latex_citations_extracts_keys_and_section_ordinals():
+    cites = latex_intel.parse_latex_citations(_CITE_TEX)
+    # \cite{a,b} expands to two entries, both under section 0 (Intro).
+    by_key = {c["key"]: c for c in cites}
+    assert set(by_key) == {"a", "b", "c", "d", "e", "f", "g", "h"}
+    assert by_key["a"]["section_ordinal"] == 0
+    assert by_key["b"]["section_ordinal"] == 0
+    # \citep{c} / \citet[p.5]{d} are under the subsection Design (heading index 1).
+    assert by_key["c"]["section_ordinal"] == 1
+    assert by_key["d"]["section_ordinal"] == 1
+    # The Results section is heading index 2; its citations track that.
+    assert by_key["e"]["section_ordinal"] == 2
+    assert by_key["h"]["section_ordinal"] == 2
+    # marker_text preserves the raw macro invocation (incl. optional note args).
+    assert by_key["a"]["marker_text"] == r"\cite{a,b}"
+    assert by_key["d"]["marker_text"] == r"\citet[p.5]{d}"
+
+
+def test_parse_latex_citations_before_any_heading_has_none_section():
+    cites = latex_intel.parse_latex_citations(r"Preamble text \cite{x} then \section{S}")
+    assert len(cites) == 1
+    assert cites[0]["key"] == "x"
+    assert cites[0]["section_ordinal"] is None
+
+
+def test_parse_latex_citations_starred_variants():
+    cites = latex_intel.parse_latex_citations(r"\cite*{a} \citep*{b} \citet*{c}")
+    assert [c["key"] for c in cites] == ["a", "b", "c"]
+
+
+def test_analyze_latex_exposes_citations():
+    res = latex_intel.analyze_latex(_CITE_TEX)
+    assert "citations" in res
+    keys = [c["key"] for c in res["citations"]]
+    assert keys == ["a", "b", "c", "d", "e", "f", "g", "h"]
+
+
+def test_parse_latex_citations_malformed_returns_empty_and_never_raises():
+    for bad in [
+        r"\cite",            # no key group at all
+        r"\cite{",           # unterminated
+        r"\section{Unclosed \begin{env",
+        "",
+        None,
+    ]:
+        out = latex_intel.parse_latex_citations(bad)
+        assert isinstance(out, list)
+    # An empty key group yields no keys (not a blank-keyed citation).
+    assert latex_intel.parse_latex_citations(r"\cite{}") == []
+    # analyze_latex still returns citations=[] on malformed input (never raises).
+    assert latex_intel.analyze_latex(r"\cite{")["citations"] == [] or isinstance(
+        latex_intel.analyze_latex(r"\cite{")["citations"], list
+    )
+
+
 def test_get_latex_structure_mcp_tool(tmp_path):
     # 106118cd — exposed as an MCP tool via the same dispatch docs_intel uses.
     import asyncio

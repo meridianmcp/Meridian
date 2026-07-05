@@ -183,6 +183,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.tunnel:
+        # path-quote-strip — de-quote pasted path args (e.g. '"C:\\My Docs"')
+        # so a user-supplied surrounding quote pair is not treated as part of
+        # the path. Idempotent; interior chars/spaces untouched.
+        from .tunnel_client import _normalize_path_arg
+        if args.repo:
+            args.repo = [_normalize_path_arg(p) for p in args.repo if _normalize_path_arg(p)]
+        if args.code_dirs:
+            args.code_dirs = [
+                _normalize_path_arg(p) for p in args.code_dirs if _normalize_path_arg(p)
+            ]
         if args.no_kill:
             print("[meridian] --tunnel: --no-kill set, skipping stale-port cleanup", flush=True)
         else:

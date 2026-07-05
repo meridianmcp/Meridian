@@ -2114,6 +2114,24 @@
     const ua = (navigator.userAgent || navigator.platform || "").toLowerCase();
     return ua.includes("win") ? "windows" : "unix";
   }
+  var _MERIDIAN_CONNECT_ASSETS = [
+    ["Windows x86_64", "meridian-connect-x86_64-windows.exe"],
+    ["macOS Apple Silicon", "meridian-connect-aarch64-apple-darwin"],
+    ["Linux x86_64", "meridian-connect-x86_64-unknown-linux"]
+  ];
+  function _directBinaryDownloadsHtml() {
+    const base = "https://github.com/meridianmcp/Meridian/releases/latest/download";
+    const rows = _MERIDIAN_CONNECT_ASSETS.map(
+      ([label, asset]) => `<li style="margin:0 0 3px 0"><span style="display:inline-block;min-width:120px;color:var(--muted)">${label}</span> <a href="${base}/${asset}" download style="color:var(--accent);text-decoration:none;word-break:break-all">${asset}</a></li>`
+    ).join("");
+    return `<details style="margin-top:10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+    <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text)">Direct binary download (if the install script fails)</summary>
+    <div style="padding:0 10px 10px">
+      <div style="font-size:10px;color:var(--muted);margin:6px 0 6px">Grab the <code>meridian-connect</code> tunnel binary for your platform straight from the latest GitHub release, then run it manually:</div>
+      <ul style="list-style:none;margin:0;padding:0;font-size:10px;font-family:var(--font-mono)">${rows}</ul>
+    </div>
+  </details>`;
+  }
   function _collapseConnectPlatforms(projectId) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
@@ -2467,6 +2485,8 @@ stop = ${JSON.stringify(stop)}`;
 
       <div style="font-size:10px;color:var(--muted);margin-top:6px">Need manual config? See <a href="https://docs.usemeridian.us/configuration" target="_blank" style="color:var(--accent);text-decoration:none">docs.usemeridian.us/configuration</a></div>
 
+      ${_directBinaryDownloadsHtml()}
+
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;margin-top:10px">
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ""}
@@ -2790,6 +2810,8 @@ stop = ${JSON.stringify(stop)}`;
       </div>
 
       <div style="font-size:10px;color:var(--muted);margin-top:6px">Need manual config? See <a href="https://docs.usemeridian.us/configuration" target="_blank" style="color:var(--accent);text-decoration:none">docs.usemeridian.us/configuration</a></div>
+
+      ${_directBinaryDownloadsHtml()}
 
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;margin-top:10px">
 
@@ -5914,7 +5936,7 @@ project_id = "${displayPid}"`;
         });
       });
       _wireRegistryCopyButtons(section);
-      _wireRegistryBrowse(section, projectId);
+      _wireRegistryBrowse(section, projectId, _hq);
       _wireLifecycleInstallButtons(section);
       let _tenantIdPromise = null;
       const _getTenantId = () => {
@@ -5978,6 +6000,17 @@ project_id = "${displayPid}"`;
     }
   }
   window.loadTunnelPluginsSection = loadTunnelPluginsSection2;
+  function _customNameFromRegistry(raw) {
+    let s3 = String(raw || "").trim();
+    if (!s3) return "";
+    if (s3.includes("/")) s3 = s3.split("/").filter(Boolean).pop() || s3;
+    s3 = s3.replace(/^@/, "");
+    s3 = s3.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/-{2,}/g, "-");
+    s3 = s3.replace(/^[._-]+/, "");
+    s3 = s3.slice(0, 64).replace(/[._-]+$/, "");
+    return s3;
+  }
+  window._customNameFromRegistry = _customNameFromRegistry;
   async function _renderPluginBrowseSection(projectId) {
     let servers = null;
     let nextCursor = null;
@@ -6018,6 +6051,8 @@ project_id = "${displayPid}"`;
       const desc = escapeHtml(s3.description || "");
       const installCmd = s3.install_command || "";
       const homepage = escapeHtml(s3.homepage || s3.url || "");
+      const addName = _customNameFromRegistry(s3.name || s3.id || "");
+      const addBtn = installCmd && addName ? `<button class="primary rg-add" data-add-name="${escapeHtml(addName)}" data-add-cmd="${escapeHtml(installCmd)}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Add as a local custom plugin">Add</button>` : "";
       return `
       <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)">
         <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;margin-bottom:4px">
@@ -6027,6 +6062,7 @@ project_id = "${displayPid}"`;
         ${desc ? `<div style="font-size:10px;color:var(--muted);margin-bottom:5px">${desc}</div>` : ""}
         ${installCmd ? `<div style="display:flex;gap:6px;align-items:center">
           <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(installCmd)}</code>
+          ${addBtn}
           <button class="secondary rg-copy" data-copy="${escapeHtml(installCmd)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy command</button>
         </div>` : ""}
       </div>`;
@@ -6069,7 +6105,39 @@ project_id = "${displayPid}"`;
     });
   }
   window._wireRegistryCopyButtons = _wireRegistryCopyButtons;
-  function _wireRegistryBrowse(section, projectId) {
+  function _wireRegistryAddButtons(container, hq) {
+    if (!container) return;
+    container.querySelectorAll(".rg-add").forEach((btn) => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = "1";
+      btn.addEventListener("click", async () => {
+        const name = btn.dataset.addName || "";
+        const command = btn.dataset.addCmd || "";
+        if (!name || !command) return;
+        const prev = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "Adding\u2026";
+        try {
+          const r3 = await api("/tunnel/plugins/custom" + (hq || ""), {
+            method: "POST",
+            body: JSON.stringify({ name, command })
+          });
+          btn.textContent = "Added";
+          btn.classList.remove("primary");
+          btn.classList.add("secondary");
+          const added = r3 && r3.added || null;
+          toast(added && added.port ? `Added "${name}" on port ${added.port} \u2014 restart the tunnel to launch it.` : `Added "${name}" \u2014 restart the tunnel to launch it.`);
+        } catch (e3) {
+          btn.disabled = false;
+          btn.textContent = prev;
+          toast("Add failed: " + (e3 && e3.message || e3), true);
+        }
+      });
+    });
+  }
+  window._wireRegistryAddButtons = _wireRegistryAddButtons;
+  function _wireRegistryBrowse(section, projectId, hq) {
+    _wireRegistryAddButtons(document.getElementById(`rg-list-${projectId}`), hq);
     const searchEl = document.getElementById(`rg-search-${projectId}`);
     if (searchEl) {
       searchEl.addEventListener("input", () => {
@@ -6100,6 +6168,7 @@ project_id = "${displayPid}"`;
                 while (tmp.firstChild) listEl.appendChild(tmp.firstChild);
               });
               _wireRegistryCopyButtons(listEl);
+              _wireRegistryAddButtons(listEl, hq);
             }
             if (data.next_cursor) {
               loadMoreBtn.dataset.cursor = data.next_cursor;
@@ -12031,8 +12100,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
     <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? "" : "s"} <span style="color:var(--muted)">(note_kind=document)</span></div>
   </div>`;
+    html += `<div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;padding:8px 10px;border:1px dashed var(--border);border-radius:4px;background:var(--surface-1)">
+    <input type="file" id="doc-upload-input-${escapeHtml(String(projectId))}" accept=".txt,.md" style="font-size:10px;flex:1;min-width:0" />
+    <button id="doc-upload-btn-${escapeHtml(String(projectId))}" class="secondary" style="font-size:10px;padding:3px 10px" disabled>Upload .txt/.md</button>
+  </div>
+  <div id="doc-upload-status-${escapeHtml(String(projectId))}" style="font-size:9px;color:var(--muted);margin-bottom:8px">Plain .txt / .md only \u2014 the file text is read in your browser and stored as a searchable document note.</div>`;
     if (!docs.length) {
-      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) \u2014 it is stored as a project note with kind=document and appears here. (Local/OneDrive/GDrive pickers are not yet wired; ingestion is via the MCP tool for now.)</div>`;
+      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Upload a .txt/.md above, or ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) \u2014 it is stored as a project note with kind=document and appears here.</div>`;
     } else {
       for (const d3 of docs) {
         const title = d3.title || d3.slug || d3.id;
@@ -12052,6 +12126,53 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
     }
     body.innerHTML = html;
+    const _fileInput = document.getElementById(`doc-upload-input-${projectId}`);
+    const _uploadBtn = document.getElementById(`doc-upload-btn-${projectId}`);
+    const _uploadStatus = document.getElementById(`doc-upload-status-${projectId}`);
+    const _setStatus = (msg, color) => {
+      if (_uploadStatus) {
+        _uploadStatus.textContent = msg;
+        _uploadStatus.style.color = color;
+      }
+    };
+    if (_fileInput && _uploadBtn) {
+      _fileInput.addEventListener("change", () => {
+        _uploadBtn.disabled = !(_fileInput.files && _fileInput.files.length > 0);
+      });
+      _uploadBtn.addEventListener("click", async () => {
+        const file = _fileInput.files && _fileInput.files[0];
+        if (!file) return;
+        const name = file.name || "";
+        if (!/\.(txt|md)$/i.test(name)) {
+          _setStatus("Only .txt and .md files are supported.", "var(--error)");
+          return;
+        }
+        _uploadBtn.disabled = true;
+        _setStatus(`Reading ${name}\u2026`, "var(--muted)");
+        try {
+          const text = await file.text();
+          const res = await api(`/projects/${projectId}/documents/upload`, {
+            method: "POST",
+            body: JSON.stringify({ filename: name, content: text })
+          });
+          if (res && res.error) throw new Error(String(res.error));
+          _setStatus(`Uploaded "${name}".`, "var(--accent)");
+          await loadDocumentsTab(projectId);
+        } catch (e3) {
+          let msg = String(e3 && e3.message ? e3.message : e3);
+          try {
+            const rt = e3 && e3.responseText;
+            if (rt) {
+              const j3 = JSON.parse(rt);
+              if (j3 && j3.detail) msg = String(j3.detail);
+            }
+          } catch (_2) {
+          }
+          _setStatus(`Upload failed: ${msg}`, "var(--error)");
+          _uploadBtn.disabled = false;
+        }
+      });
+    }
     body.querySelectorAll(".doc-struct-btn").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const fp = btn.dataset.fp || "";

@@ -411,3 +411,85 @@ def test_custom_plugin_command_and_port_round_trip_through_normalize():
     )
     assert norm["fetch"]["command"] == ["uvx", "mcp-server-fetch"]
     assert norm["fetch"]["port"] == 8901
+
+
+# ---------------------------------------------------------------------------
+# 9811d04c — validate_custom_plugin + is_reserved_custom_name (the ADD/persist half)
+# ---------------------------------------------------------------------------
+
+def test_validate_custom_plugin_valid_with_explicit_port():
+    entry, err = tp.validate_custom_plugin("fetch", "uvx mcp-server-fetch", 8901)
+    assert err is None
+    assert entry == {
+        "name": "fetch", "command": ["uvx", "mcp-server-fetch"],
+        "port": 8901, "enabled": True,
+    }
+
+
+def test_validate_custom_plugin_auto_assigns_port_when_omitted():
+    # No port → first free port at/after _CUSTOM_PORT_START (8820), avoiding the
+    # built-in default ports and any existing_ports.
+    entry, err = tp.validate_custom_plugin("fetch", "uvx x", None)
+    assert err is None and entry["port"] == tp._CUSTOM_PORT_START
+    # A used port at the start is skipped.
+    entry2, err2 = tp.validate_custom_plugin(
+        "git", "uvx y", None, existing_ports=[tp._CUSTOM_PORT_START])
+    assert err2 is None and entry2["port"] == tp._CUSTOM_PORT_START + 1
+
+
+def test_validate_custom_plugin_rejects_builtin_slot_and_plugin_names():
+    # The task's hard rule: a custom name may not collide with a built-in slot
+    # (fs/code/extract/ppt/word/dc) nor a built-in plugin display name.
+    for bad in ("fs", "code", "extract", "ppt", "word", "dc",
+                "filesystem", "code-intel", "code-extractor", "CODE", "Filesystem"):
+        entry, err = tp.validate_custom_plugin(bad, "uvx x", 8901)
+        assert entry is None and err and "collides" in err, bad
+
+
+def test_validate_custom_plugin_rejects_bad_name_charset():
+    for bad in ("", "  ", "has space", "bad/slash", "bad$char", "-leading", "."):
+        entry, err = tp.validate_custom_plugin(bad, "uvx x", 8901)
+        assert entry is None and err, bad
+
+
+def test_validate_custom_plugin_rejects_empty_command():
+    entry, err = tp.validate_custom_plugin("ok", "   ", 8901)
+    assert entry is None and "command" in err
+
+
+def test_validate_custom_plugin_rejects_bad_and_colliding_ports():
+    # bool / out-of-range / built-in default / already-used.
+    assert tp.validate_custom_plugin("a", "x", True)[0] is None
+    assert tp.validate_custom_plugin("a", "x", 80)[0] is None
+    assert tp.validate_custom_plugin("a", "x", 70000)[0] is None
+    assert tp.validate_custom_plugin("a", "x", 8808)[0] is None  # built-in slot port
+    entry, err = tp.validate_custom_plugin("a", "x", 9001, existing_ports=[9001])
+    assert entry is None and "already" in err
+
+
+def test_validate_custom_plugin_attaches_env_when_present():
+    entry, err = tp.validate_custom_plugin(
+        "zotero-mcp", "uvx zotero-mcp", 8901, env={"ZOTERO_LOCAL": "true", "": "drop"})
+    assert err is None and entry["env"] == {"ZOTERO_LOCAL": "true"}
+    # Envless entry keeps the historical shape (no "env" key).
+    entry2, _ = tp.validate_custom_plugin("p", "uvx p", 8902)
+    assert "env" not in entry2
+
+
+def test_validated_entry_round_trips_through_resolve_custom_plugins():
+    # A validated entry, once stored, must resolve back into the spawn list.
+    entry, _ = tp.validate_custom_plugin("fetch", "uvx mcp-server-fetch", 8901)
+    resolved = tp.resolve_custom_plugins([entry])
+    assert len(resolved) == 1
+    assert resolved[0]["name"] == "fetch"
+    assert resolved[0]["command"] == ["uvx", "mcp-server-fetch"]
+    assert resolved[0]["port"] == 8901
+    assert resolved[0]["custom"] is True
+
+
+def test_is_reserved_custom_name():
+    for n in ("fs", "code", "extract", "ppt", "word", "dc",
+              "filesystem", "code-intel", "CODE-EXTRACTOR"):
+        assert tp.is_reserved_custom_name(n) is True
+    for n in ("fetch", "git", "my-plugin", "", "   "):
+        assert tp.is_reserved_custom_name(n) is False
