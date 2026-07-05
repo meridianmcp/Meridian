@@ -55,6 +55,21 @@ _IDLE_KILL_SECONDS = 30 * 60
 # the server to re-advertise the slot's tools.
 _SLOT_REPROBE_INTERVAL = 60.0
 
+# 089a936a — the DEFAULT first-spawn pre-flight probe budget (attempts, delay):
+# attempts=2 × delay=3s with a 10s per-attempt httpx timeout ≈ up to ~23s. Fine
+# for slots whose launcher is already on disk.
+_PREFLIGHT_BUDGET_DEFAULT: "tuple[int, float]" = (2, 3.0)
+# 089a936a — a LARGER first-spawn budget for "cold-fetch" slots whose very first
+# spawn triggers an npx cold download (e.g. Desktop Commander:
+# `npx -y @wonderwhy-er/desktop-commander@latest`) that can exceed the default
+# ~23s. attempts=4 × delay=5s with the 10s per-attempt timeout ≈ up to ~55s.
+# This applies ONLY to the first-spawn pre-flight, NOT the 60s background reprobe
+# (which stays attempts=1).
+_PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
+# 089a936a — slots that npx-download their inner server on first launch. These
+# get the larger cold-fetch pre-flight budget above. (dc = Desktop Commander.)
+_COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc"})
+
 
 # ---------------------------------------------------------------------------
 # Version check (4bde9437) — nudge an upgrade when the local tunnel binary is
@@ -316,6 +331,48 @@ def _classify_serena_failure(err: object) -> "tuple[str, str] | None":
     return None
 
 
+# 089a936a — human-readable hint per slot when its first-spawn pre-flight probe
+# fails (the proxy accepted the Popen but never answered a `tools/list`). The
+# dc/office hint is specific (cold npx download); everything else gets a generic
+# "proxy didn't respond" message. Keyed on the slot label used by the tunnel.
+_DC_PREFLIGHT_HINT = (
+    "Desktop Commander did not respond on port {port} — if it isn't installed, "
+    "add it via the dashboard (npx -y @wonderwhy-er/desktop-commander@latest); "
+    "the first launch can take ~a minute to download."
+)
+_OFFICE_PREFLIGHT_HINTS = {
+    "ppt": (
+        "The PowerPoint slot did not respond on port {port} — its launcher may "
+        "not be installed yet; the first launch can take a while to download."
+    ),
+    "word": (
+        "The Word slot did not respond on port {port} — its launcher may not be "
+        "installed yet; the first launch can take a while to download."
+    ),
+}
+
+
+def _preflight_failure_hint(label: str, port: int) -> "tuple[str, str]":
+    """Classify a first-spawn pre-flight probe failure into ``(reason, detail)``.
+
+    The proxy Popen-succeeded but never answered ``tools/list``. ``reason`` is a
+    short snake-case code consistent with :func:`_classify_serena_failure` /
+    ``_mark_unhealthy`` (which use e.g. ``access_denied``); here it is
+    ``unreachable``. ``detail`` is a human, slot-aware hint — specific for the
+    dc/office cold-fetch slots, generic otherwise. Pure + unit-tested. (089a936a)"""
+    reason = "unreachable"
+    if label == "dc":
+        return (reason, _DC_PREFLIGHT_HINT.format(port=port))
+    office = _OFFICE_PREFLIGHT_HINTS.get(label)
+    if office is not None:
+        return (reason, office.format(port=port))
+    return (
+        reason,
+        f"The {label} slot's proxy did not respond on port {port} — its tools "
+        "are suppressed until it comes up (auto-retried in the background).",
+    )
+
+
 async def _reprobe_once(proxy, probe) -> bool:
     """One slot-recovery attempt (a898710a). Ensure the proxy is running, probe
     its health, and — critically — if it is running but UNHEALTHY (a persistent
@@ -334,17 +391,49 @@ async def _reprobe_once(proxy, probe) -> bool:
     return healthy
 
 
-async def _preflight_slot(ws, port: int, label: str) -> bool:
+async def _preflight_slot(
+    ws,
+    port: int,
+    label: str,
+    *,
+    attempts: int | None = None,
+    delay: float | None = None,
+) -> bool:
     """Probe a slot after its first spawn; report unhealthy on failure. Returns
-    the health result so callers can log it. (d71ba2e7)"""
-    healthy = await _probe_slot_health(port)
+    the health result so callers can log it. (d71ba2e7)
+
+    089a936a — two robustness additions, both scoped to the failure path (the
+    HEALTHY path is unchanged):
+
+    * On failure, report a ``reason``/``detail`` (via :func:`_preflight_failure_hint`)
+      instead of a bare unhealthy dot, so the dashboard shows an actionable hint
+      — matching what the Serena slot already does with
+      :func:`_classify_serena_failure`.
+    * ``attempts``/``delay`` override the pre-flight probe budget so cold-fetch
+      slots (dc/office, which npx-download on first launch) can be given a longer
+      first-spawn budget. When omitted, the default budget is derived from the
+      slot label: cold-fetch slots use ``_PREFLIGHT_BUDGET_COLD_FETCH``, all
+      others ``_PREFLIGHT_BUDGET_DEFAULT``.
+    """
+    if attempts is None or delay is None:
+        _def_attempts, _def_delay = (
+            _PREFLIGHT_BUDGET_COLD_FETCH
+            if label in _COLD_FETCH_SLOTS
+            else _PREFLIGHT_BUDGET_DEFAULT
+        )
+        if attempts is None:
+            attempts = _def_attempts
+        if delay is None:
+            delay = _def_delay
+    healthy = await _probe_slot_health(port, attempts=attempts, delay=delay)
     if not healthy:
+        reason, detail = _preflight_failure_hint(label, port)
         print(
             f"tunnel:{label}: pre-flight health check FAILED on port {port} — "
-            "marking slot unhealthy (its tools will be suppressed)",
+            f"marking slot unhealthy (its tools will be suppressed): {detail}",
             file=sys.stderr, flush=True,
         )
-        await _report_slot_health(ws, label, False)
+        await _report_slot_health(ws, label, False, reason=reason, detail=detail)
     return healthy
 
 

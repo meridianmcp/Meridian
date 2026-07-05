@@ -1314,6 +1314,113 @@ def test_reprobe_once_no_kill_when_healthy_first_probe():
     assert proxy.killed == 0
 
 
+# ---------------------------------------------------------------------------
+# 089a936a — pre-flight diagnostics (reason/detail) + cold-fetch probe budget
+# ---------------------------------------------------------------------------
+
+def test_preflight_failure_hint_dc_is_specific():
+    """089a936a — the dc slot's pre-flight failure hint names Desktop Commander,
+    the port, and the npx install command."""
+    reason, detail = tc._preflight_failure_hint("dc", 8813)
+    assert reason == "unreachable"
+    assert "Desktop Commander" in detail
+    assert "8813" in detail
+    assert "desktop-commander" in detail
+
+
+def test_preflight_failure_hint_generic_slot():
+    """089a936a — a non-cold-fetch slot still gets a non-empty reason + detail
+    mentioning the slot label and port (generic, not the dc-specific text)."""
+    reason, detail = tc._preflight_failure_hint("fs", 8810)
+    assert reason == "unreachable"
+    assert "fs" in detail
+    assert "8810" in detail
+    assert "Desktop Commander" not in detail
+
+
+def test_preflight_slot_failure_reports_reason_and_detail(monkeypatch):
+    """089a936a — a FAILED pre-flight reports a non-empty reason AND detail to
+    _report_slot_health (not a bare healthy=False), so the dashboard can show an
+    actionable warning. Uses the dc slot (port 8813) as the example, matching the
+    _reprobe_once tests."""
+    # Force the probe to fail without spawning anything real.
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+    report = AsyncMock()
+    monkeypatch.setattr(tc, "_report_slot_health", report)
+
+    ws = object()  # never touched — _report_slot_health is mocked
+    loop = asyncio.new_event_loop()
+    try:
+        healthy = loop.run_until_complete(tc._preflight_slot(ws, 8813, "dc"))
+    finally:
+        loop.close()
+
+    assert healthy is False
+    report.assert_awaited_once()
+    args, kwargs = report.call_args
+    # positional: (ws, label, healthy)
+    assert args[1] == "dc"
+    assert args[2] is False
+    # 089a936a — reason + detail are populated (not a bare False report).
+    assert kwargs.get("reason") == "unreachable"
+    assert kwargs.get("detail")
+    assert "Desktop Commander" in kwargs["detail"]
+    assert "8813" in kwargs["detail"]
+
+
+def test_preflight_slot_dc_uses_larger_cold_fetch_budget(monkeypatch):
+    """089a936a — the dc (cold-fetch) slot's first pre-flight uses the LARGER
+    probe budget (attempts=4, delay=5.0) to tolerate the npx cold download, while
+    a normal slot uses the default (attempts=2, delay=3.0)."""
+    calls: list[dict] = []
+
+    async def fake_probe(port, *, attempts=2, delay=3.0):
+        calls.append({"port": port, "attempts": attempts, "delay": delay})
+        return True  # healthy → no unhealthy report path
+
+    monkeypatch.setattr(tc, "_probe_slot_health", fake_probe)
+    monkeypatch.setattr(tc, "_report_slot_health", AsyncMock())
+
+    ws = object()
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(tc._preflight_slot(ws, 8813, "dc"))
+        loop.run_until_complete(tc._preflight_slot(ws, 8810, "fs"))
+    finally:
+        loop.close()
+
+    assert calls[0] == {"port": 8813, "attempts": 4, "delay": 5.0}
+    assert calls[1] == {"port": 8810, "attempts": 2, "delay": 3.0}
+    # The larger budget must match the declared cold-fetch constant.
+    assert (calls[0]["attempts"], calls[0]["delay"]) == tc._PREFLIGHT_BUDGET_COLD_FETCH
+    assert (calls[1]["attempts"], calls[1]["delay"]) == tc._PREFLIGHT_BUDGET_DEFAULT
+
+
+def test_preflight_slot_explicit_budget_overrides_default(monkeypatch):
+    """089a936a — explicit attempts/delay override the label-derived default, so
+    callers keep full control and the background reprobe (attempts=1) is
+    unaffected by the cold-fetch defaults."""
+    calls: list[dict] = []
+
+    async def fake_probe(port, *, attempts=2, delay=3.0):
+        calls.append({"attempts": attempts, "delay": delay})
+        return True
+
+    monkeypatch.setattr(tc, "_probe_slot_health", fake_probe)
+    monkeypatch.setattr(tc, "_report_slot_health", AsyncMock())
+
+    loop = asyncio.new_event_loop()
+    try:
+        # dc slot but explicit budget → explicit wins over the cold-fetch default.
+        loop.run_until_complete(
+            tc._preflight_slot(object(), 8813, "dc", attempts=1, delay=0.0)
+        )
+    finally:
+        loop.close()
+
+    assert calls[0] == {"attempts": 1, "delay": 0.0}
+
+
 def test_builtin_plugins_session_mode():
     from meridian.tunnel_plugins import BUILTIN_PLUGINS
     by_name = {p["name"]: p for p in BUILTIN_PLUGINS}

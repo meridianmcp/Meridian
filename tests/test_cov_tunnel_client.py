@@ -576,7 +576,15 @@ def test_preflight_slot_reports_unhealthy_on_failure(monkeypatch):
     monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
     healthy = asyncio.run(tc._preflight_slot(_WS(), 8808, "fs"))
     assert healthy is False
-    assert sent == [{"type": "plugin_status", "slot": "fs", "healthy": False}]
+    # 089a936a — the unhealthy report now also carries an actionable reason/detail
+    # (additive; the type/slot/healthy triple is unchanged).
+    assert len(sent) == 1
+    msg = sent[0]
+    assert msg["type"] == "plugin_status"
+    assert msg["slot"] == "fs"
+    assert msg["healthy"] is False
+    assert msg["reason"] == "unreachable"
+    assert msg["detail"]
 
 
 def test_preflight_slot_healthy_sends_nothing(monkeypatch):
@@ -631,7 +639,15 @@ def test_run_connection_lazy_preflight_reports_unhealthy(monkeypatch):
 
     asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
     # Both the plugin_status (unhealthy) and the relayed response were sent.
-    assert {"type": "plugin_status", "slot": "fs", "healthy": False} in sent
+    # 089a936a — the unhealthy report now also carries reason/detail (additive).
+    assert any(
+        m.get("type") == "plugin_status"
+        and m.get("slot") == "fs"
+        and m.get("healthy") is False
+        and m.get("reason") == "unreachable"
+        and m.get("detail")
+        for m in sent
+    )
     assert any(m.get("status") == 200 for m in sent)
 
 
