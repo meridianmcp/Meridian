@@ -1521,6 +1521,31 @@ def _find_npx() -> str:
     return shutil.which("npx") or "npx"
 
 
+def _unservable_roots(roots: "list[str] | None") -> "list[tuple[str, str]]":
+    """59c0e609 — configured filesystem_roots the connector will SILENTLY not
+    serve, each with a reason, so the caller can WARN instead of the user seeing
+    an unexplained "2 of 3 dirs" after a tunnel restart.
+
+    The Python pipeline passes every configured root through correctly (verified);
+    the drop happens at the inner ``@modelcontextprotocol/server-filesystem``
+    process, which two ways silently omits a dir: (1) the directory does not exist
+    at spawn time (e.g. a renamed folder, or a OneDrive/cloud dir that is
+    dehydrated/offline), and (2) on Windows, mcp-proxy runs with ``--shell`` and
+    concatenates args unescaped, so a path containing a SPACE is mis-parsed (see
+    :func:`_build_proxy_command`). Pure/deterministic for testing — it only reads
+    the filesystem via ``os.path.isdir``; the caller does the printing."""
+    out: list[tuple[str, str]] = []
+    for r in roots or []:
+        r = (r or "").strip()
+        if not r:
+            continue
+        if not os.path.isdir(r):
+            out.append((r, "does not exist / not a directory at tunnel start"))
+        elif sys.platform == "win32" and " " in r:
+            out.append((r, "contains a space — not served on Windows (mcp-proxy --shell limitation)"))
+    return out
+
+
 def _build_proxy_command(
     npx: str, repo_path: str, port: int = DEFAULT_PROXY_PORT,
     roots: "list[str] | None" = None,
@@ -2511,6 +2536,13 @@ async def run_tunnel(
         )
         _served = ", ".join(fs_roots) if fs_roots else repo_path
         print(f"meridian tunnel: serving {_served}", flush=True)
+        # 59c0e609 — surface roots the inner filesystem server will silently drop
+        # (missing dir / Windows space-in-path) so a "served 2 of 3" is diagnosable.
+        for _r, _why in _unservable_roots(fs_roots if fs_override is None else None):
+            print(
+                f"  filesystem: WARNING configured root will NOT be served — {_r} ({_why})",
+                flush=True, file=sys.stderr,
+            )
         print(f"  filesystem:        lazy-spawn on port {fs_port}", flush=True)
         proxy_fs = SlotProxy(cmd_fs, fs_port, "fs")
         slot_proxies.append(proxy_fs)
