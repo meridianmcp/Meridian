@@ -1727,6 +1727,114 @@ async def _handle_task_tools(
     return _MISS
 
 
+def _doc_type_for_path(file_path: str | None) -> str | None:
+    """Map a file path to a doc_store doc_type, or None if unsupported.
+
+    Only the formats whose *structure* the server can parse today qualify:
+    ``.docx`` (docs_intel) and ``.tex`` (latex_intel). Everything else (plain
+    text, PDF-as-content, …) has no structure to persist, so ingest just stores
+    the flat note and skips the structure store.
+    """
+    if not file_path:
+        return None
+    lowered = file_path.strip().lower()
+    if lowered.endswith(".docx"):
+        return "docx"
+    if lowered.endswith(".tex"):
+        return "latex"
+    return None
+
+
+async def _resolve_ingest_doc_store(
+    db: Any, data_dir: str, tenant: dict[str, Any] | None
+) -> Any:
+    """Resolve the document-structure store to persist an ingest into, or None.
+
+    Best-effort + fully guarded: any failure returns None so ingest itself never
+    breaks. Prefers the tier-resolved store (pro/admin tenants with a cloud PG
+    url get their tenant Postgres; everyone else the local sidecar). A tenant
+    ``neon_db_url`` is decrypted here exactly like ``_deps._open_tenant_db_by_id``
+    does. Falls back to the process-default ``app.state.doc_store``.
+    """
+    try:
+        from ..doc_store import open_doc_store_for  # noqa: PLC0415
+
+        plan: str | None = None
+        tenant_pg_url: str | None = None
+        if tenant:
+            plan = tenant.get("plan")
+            enc = tenant.get("neon_db_url")
+            tid = tenant.get("id")
+            if enc and tid:
+                try:
+                    from ..tenant_crypto import decrypt_tenant_db_url  # noqa: PLC0415
+                    tenant_pg_url = decrypt_tenant_db_url(tid, enc) or None
+                except Exception:  # noqa: BLE001 — degrade to local sidecar
+                    tenant_pg_url = None
+
+        return await open_doc_store_for(
+            plan=plan,
+            hosted=_hosted_mode(),
+            data_dir=data_dir,
+            tenant_pg_url=tenant_pg_url,
+            override_url=os.environ.get("MERIDIAN_DOC_STORE_URL"),
+        )
+    except Exception:  # noqa: BLE001 — never let store resolution break ingest
+        store = getattr(getattr(_server, "app", None), "state", None)
+        return getattr(store, "doc_store", None) if store is not None else None
+
+
+async def _persist_ingest_structure(
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    project_id: str,
+    file_path: str | None,
+    source: str | None,
+    title: str | None,
+) -> None:
+    """Best-effort: parse + persist a docx/latex structure into the doc store.
+
+    Called AFTER a successful ``ingest_document``. Wrapped so any failure
+    (unsupported type, parse error, store unavailable, backend error) is
+    swallowed — structure persistence is additive and must never regress ingest.
+    """
+    doc_type = _doc_type_for_path(file_path)
+    if doc_type is None:
+        return
+    try:
+        from ..doc_store import (  # noqa: PLC0415
+            elements_from_docx_outline,
+            elements_from_latex_analysis,
+        )
+
+        if doc_type == "docx":
+            from ..docs_intel import document_outline  # noqa: PLC0415
+            outline = document_outline(file_path)
+            elements = elements_from_docx_outline(outline)
+        else:  # latex
+            from ..latex_intel import analyze_latex  # noqa: PLC0415
+            analysis = analyze_latex(file_path)
+            elements = elements_from_latex_analysis(analysis)
+
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return
+        stored_source = (source or file_path or "").strip() or None
+        await store.put_document(
+            project_id,
+            doc_type,
+            elements,
+            source=stored_source,
+            title=title,
+        )
+    except Exception:  # noqa: BLE001 — persistence is best-effort, never break ingest
+        import logging as _ds_log  # noqa: PLC0415
+        _ds_log.getLogger(__name__).debug(
+            "doc-structure persistence skipped for %s", file_path, exc_info=True
+        )
+
+
 async def _handle_notes_decisions(
     name: str,
     args: dict[str, Any],
@@ -1887,7 +1995,7 @@ async def _handle_notes_decisions(
         validate_input_size(args.get("content"), "document content", 50_000_000)
         from ..doc_ingest import DocExtractionError  # local import: optional dep-free
         try:
-            return await db_module.ingest_document(
+            _ingest_result = await db_module.ingest_document(
                 db, args["project_id"],
                 file_path=args.get("file_path"),
                 content=args.get("content"),
@@ -1897,6 +2005,19 @@ async def _handle_notes_decisions(
             )
         except (ValueError, DocExtractionError, FileNotFoundError) as exc:
             return {"error": str(exc)}
+        # 9ee6d2ec — best-effort: persist the parsed docx/latex STRUCTURE into the
+        # tiered doc-structure store. Fully guarded inside — a persistence failure
+        # never touches _ingest_result (no regression to the flat-note ingest).
+        await _persist_ingest_structure(
+            db,
+            data_dir,
+            tenant,
+            args["project_id"],
+            args.get("file_path"),
+            args.get("source"),
+            args.get("title"),
+        )
+        return _ingest_result
     if name == "get_document_structure":
         # 13462df2 — stateless docs_intel: heading outline of a server-side .docx
         # (no sidecar index). Same server-side file access as ingest_document

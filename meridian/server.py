@@ -444,6 +444,30 @@ async def lifespan(app: FastAPI):
                 "using in-memory SQLite demo DB. Set MERIDIAN_DEMO_DB_URL for persistence."
             )
 
+    # 9ee6d2ec — tiered document-structure store. Open a DEFAULT store on the
+    # self-hosted / solo path (local SQLite sidecar next to the main DB, or the
+    # MERIDIAN_DOC_STORE_URL override). Fully guarded: a failure here must NEVER
+    # block startup — the stateless get_document_structure / get_latex_structure
+    # parse tools keep working with app.state.doc_store = None. Per-tenant cloud
+    # stores (pro/admin) are opened lazily at ingest time via open_doc_store_for.
+    app.state.doc_store = None
+    try:
+        from .doc_store import open_doc_store_for  # noqa: PLC0415
+        app.state.doc_store = await open_doc_store_for(
+            plan=None,
+            hosted=_hosted_mode(),
+            data_dir=str(data_dir),
+            tenant_pg_url=None,
+            override_url=os.environ.get("MERIDIAN_DOC_STORE_URL"),
+        )
+    except Exception:  # noqa: BLE001 — structure persistence is best-effort
+        import logging as _ds_log  # noqa: PLC0415
+        _ds_log.getLogger(__name__).warning(
+            "document-structure store failed to open; continuing without it",
+            exc_info=True,
+        )
+        app.state.doc_store = None
+
     # v0.4.2 — periodic auto-summary task. Interval comes from env so
     # tests can run it on a sub-second cadence; default is ten minutes.
     interval_s = float(os.environ.get("MERIDIAN_AUTO_SUMMARY_INTERVAL", 600))
@@ -628,6 +652,23 @@ async def lifespan(app: FastAPI):
             try:
                 await _disp.stop()
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        # 9ee6d2ec — close ALL document-structure stores alongside demo_db, before
+        # the main DB. Called UNCONDITIONALLY (not gated on app.state.doc_store):
+        # close_all_doc_stores() closes every cached store, including per-tenant
+        # cloud stores opened lazily at ingest time, so none leak even if the
+        # default store never opened. Guarded: a close error must not mask
+        # shutdown of the main connection.
+        try:
+            from .doc_store import close_all_doc_stores  # noqa: PLC0415
+            await close_all_doc_stores()
+        except Exception:  # noqa: BLE001 — shutdown best-effort
+            pass
+        _demo_db = getattr(app.state, "demo_db", None)
+        if _demo_db is not None and _demo_db is not db:
+            try:
+                await _demo_db.close()
+            except Exception:  # noqa: BLE001 — shutdown best-effort
                 pass
         await db.close()
 
