@@ -11012,6 +11012,99 @@ async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
     assert by_name["ingest_document"]["annotations"]["readOnlyHint"] is False
 
 
+def test_upload_document_txt_ingests_and_lists(client):
+    """f1c7e7d1 — POST /documents/upload with a .txt reuses ingest_document's
+    content path: 201, a kind='document' note is stored and shows in the list,
+    and the uploaded content is body-searchable (i.e. it reached ingest)."""
+    project = client.post("/projects", json={"name": "f1c7e7d1-upload"}).json()
+    pid = project["id"]
+    r = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "design-notes.txt", "content": "The API must debounce writes by 300ms."},
+    )
+    assert r.status_code == 201, r.text
+    note = r.json()
+    assert note["note_kind"] == "document"
+    assert note["title"] == "design-notes.txt"
+    assert note["source"] == "design-notes.txt"
+    assert "debounce" in note["body"]
+    # It appears in the project's document list (what the panel renders).
+    listed = client.get(f"/projects/{pid}/notes").json()
+    docs = [n for n in listed if str(n.get("note_kind")) == "document"]
+    assert any(d["id"] == note["id"] for d in docs)
+    # And the content is full-text searchable (proves it reached ingest).
+    hits = client.get(f"/projects/{pid}/notes?query=debounce").json()
+    assert any(h["id"] == note["id"] for h in hits)
+
+
+def test_upload_document_md_ingested(client):
+    """f1c7e7d1 — a .md upload is accepted too."""
+    project = client.post("/projects", json={"name": "f1c7e7d1-md"}).json()
+    pid = project["id"]
+    r = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "README.md", "content": "# Title\n\nBody text."},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["note_kind"] == "document"
+
+
+def test_upload_document_rejects_bad_extension(client):
+    """f1c7e7d1 — non-.txt/.md uploads (.pdf, .exe, .docx) are 400-rejected."""
+    project = client.post("/projects", json={"name": "f1c7e7d1-badext"}).json()
+    pid = project["id"]
+    for bad in ("report.pdf", "malware.exe", "chapter.docx", "noext"):
+        r = client.post(
+            f"/projects/{pid}/documents/upload",
+            json={"filename": bad, "content": "x"},
+        )
+        assert r.status_code == 400, f"{bad} should be rejected: {r.text}"
+    # Nothing was ingested.
+    listed = client.get(f"/projects/{pid}/notes").json()
+    assert not [n for n in listed if str(n.get("note_kind")) == "document"]
+
+
+def test_upload_document_rejects_oversize_and_empty(client):
+    """f1c7e7d1 — an oversize body is rejected and an empty body is a 400.
+
+    Oversize: the global request-body guard (limits.BODY_BYTES, default 100KB)
+    fires first with a 429 when Content-Length is present; the handler's own
+    check is defense-in-depth. Either way the oversize upload is rejected and
+    no document is ingested — assert on that, not a single status code.
+    """
+    project = client.post("/projects", json={"name": "f1c7e7d1-size"}).json()
+    pid = project["id"]
+    from meridian import limits as _limits
+    big = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "huge.txt", "content": "x" * (_limits.BODY_BYTES + 5000)},
+    )
+    assert big.status_code in (400, 429), big.text
+    assert not [
+        n for n in client.get(f"/projects/{pid}/notes").json()
+        if str(n.get("note_kind")) == "document"
+    ]
+    empty = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "blank.txt", "content": "   "},
+    )
+    assert empty.status_code == 400, empty.text
+    missing_name = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"content": "hello"},
+    )
+    assert missing_name.status_code == 400, missing_name.text
+
+
+def test_upload_document_unknown_project_404(client):
+    """f1c7e7d1 — uploading to a non-existent project is a 404."""
+    r = client.post(
+        "/projects/does-not-exist/documents/upload",
+        json={"filename": "a.txt", "content": "hi"},
+    )
+    assert r.status_code == 404, r.text
+
+
 @pytest.mark.asyncio
 async def test_add_note_mcp_tool_stores_source_and_document_kind(db):
     """e3f150d0 — the add_note MCP tool accepts source + kind='document' and the

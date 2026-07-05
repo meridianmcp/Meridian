@@ -12031,8 +12031,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
     <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? "" : "s"} <span style="color:var(--muted)">(note_kind=document)</span></div>
   </div>`;
+    html += `<div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;padding:8px 10px;border:1px dashed var(--border);border-radius:4px;background:var(--surface-1)">
+    <input type="file" id="doc-upload-input-${escapeHtml(String(projectId))}" accept=".txt,.md" style="font-size:10px;flex:1;min-width:0" />
+    <button id="doc-upload-btn-${escapeHtml(String(projectId))}" class="secondary" style="font-size:10px;padding:3px 10px" disabled>Upload .txt/.md</button>
+  </div>
+  <div id="doc-upload-status-${escapeHtml(String(projectId))}" style="font-size:9px;color:var(--muted);margin-bottom:8px">Plain .txt / .md only \u2014 the file text is read in your browser and stored as a searchable document note.</div>`;
     if (!docs.length) {
-      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) \u2014 it is stored as a project note with kind=document and appears here. (Local/OneDrive/GDrive pickers are not yet wired; ingestion is via the MCP tool for now.)</div>`;
+      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Upload a .txt/.md above, or ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) \u2014 it is stored as a project note with kind=document and appears here.</div>`;
     } else {
       for (const d3 of docs) {
         const title = d3.title || d3.slug || d3.id;
@@ -12052,6 +12057,53 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
     }
     body.innerHTML = html;
+    const _fileInput = document.getElementById(`doc-upload-input-${projectId}`);
+    const _uploadBtn = document.getElementById(`doc-upload-btn-${projectId}`);
+    const _uploadStatus = document.getElementById(`doc-upload-status-${projectId}`);
+    const _setStatus = (msg, color) => {
+      if (_uploadStatus) {
+        _uploadStatus.textContent = msg;
+        _uploadStatus.style.color = color;
+      }
+    };
+    if (_fileInput && _uploadBtn) {
+      _fileInput.addEventListener("change", () => {
+        _uploadBtn.disabled = !(_fileInput.files && _fileInput.files.length > 0);
+      });
+      _uploadBtn.addEventListener("click", async () => {
+        const file = _fileInput.files && _fileInput.files[0];
+        if (!file) return;
+        const name = file.name || "";
+        if (!/\.(txt|md)$/i.test(name)) {
+          _setStatus("Only .txt and .md files are supported.", "var(--error)");
+          return;
+        }
+        _uploadBtn.disabled = true;
+        _setStatus(`Reading ${name}\u2026`, "var(--muted)");
+        try {
+          const text = await file.text();
+          const res = await api(`/projects/${projectId}/documents/upload`, {
+            method: "POST",
+            body: JSON.stringify({ filename: name, content: text })
+          });
+          if (res && res.error) throw new Error(String(res.error));
+          _setStatus(`Uploaded "${name}".`, "var(--accent)");
+          await loadDocumentsTab(projectId);
+        } catch (e3) {
+          let msg = String(e3 && e3.message ? e3.message : e3);
+          try {
+            const rt = e3 && e3.responseText;
+            if (rt) {
+              const j3 = JSON.parse(rt);
+              if (j3 && j3.detail) msg = String(j3.detail);
+            }
+          } catch (_2) {
+          }
+          _setStatus(`Upload failed: ${msg}`, "var(--error)");
+          _uploadBtn.disabled = false;
+        }
+      });
+    }
     body.querySelectorAll(".doc-struct-btn").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const fp = btn.dataset.fp || "";

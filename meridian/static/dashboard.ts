@@ -7251,8 +7251,17 @@ async function loadDocumentsTab(projectId: any) {
     <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? '' : 's'} <span style="color:var(--muted)">(note_kind=document)</span></div>
   </div>`;
 
+  // f1c7e7d1 — tunnel-free upload: pick a local .txt/.md, read it client-side,
+  // POST {filename, content} to /documents/upload (reuses ingest_document's
+  // content path). No tunnel / server-side file access needed.
+  html += `<div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;padding:8px 10px;border:1px dashed var(--border);border-radius:4px;background:var(--surface-1)">
+    <input type="file" id="doc-upload-input-${escapeHtml(String(projectId))}" accept=".txt,.md" style="font-size:10px;flex:1;min-width:0" />
+    <button id="doc-upload-btn-${escapeHtml(String(projectId))}" class="secondary" style="font-size:10px;padding:3px 10px" disabled>Upload .txt/.md</button>
+  </div>
+  <div id="doc-upload-status-${escapeHtml(String(projectId))}" style="font-size:9px;color:var(--muted);margin-bottom:8px">Plain .txt / .md only — the file text is read in your browser and stored as a searchable document note.</div>`;
+
   if (!docs.length) {
-    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) — it is stored as a project note with kind=document and appears here. (Local/OneDrive/GDrive pickers are not yet wired; ingestion is via the MCP tool for now.)</div>`;
+    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Upload a .txt/.md above, or ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) — it is stored as a project note with kind=document and appears here.</div>`;
   } else {
     for (const d of docs) {
       const title = d.title || d.slug || d.id;
@@ -7274,6 +7283,50 @@ async function loadDocumentsTab(projectId: any) {
     html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
   }
   body.innerHTML = html;
+
+  // f1c7e7d1 — wire the upload picker: enable the button once a .txt/.md is
+  // chosen, then read text client-side and POST it to the upload route.
+  const _fileInput = document.getElementById(`doc-upload-input-${projectId}`) as HTMLInputElement | null;
+  const _uploadBtn = document.getElementById(`doc-upload-btn-${projectId}`) as HTMLButtonElement | null;
+  const _uploadStatus = document.getElementById(`doc-upload-status-${projectId}`);
+  const _setStatus = (msg: string, color: string) => {
+    if (_uploadStatus) { _uploadStatus.textContent = msg; (_uploadStatus as HTMLElement).style.color = color; }
+  };
+  if (_fileInput && _uploadBtn) {
+    _fileInput.addEventListener('change', () => {
+      _uploadBtn.disabled = !(_fileInput.files && _fileInput.files.length > 0);
+    });
+    _uploadBtn.addEventListener('click', async () => {
+      const file = _fileInput.files && _fileInput.files[0];
+      if (!file) return;
+      const name = file.name || '';
+      if (!/\.(txt|md)$/i.test(name)) {
+        _setStatus('Only .txt and .md files are supported.', 'var(--error)');
+        return;
+      }
+      _uploadBtn.disabled = true;
+      _setStatus(`Reading ${name}…`, 'var(--muted)');
+      try {
+        const text = await file.text();
+        const res = await api(`/projects/${projectId}/documents/upload`, {
+          method: 'POST',
+          body: JSON.stringify({ filename: name, content: text }),
+        });
+        if (res && res.error) throw new Error(String(res.error));
+        _setStatus(`Uploaded "${name}".`, 'var(--accent)');
+        await loadDocumentsTab(projectId);  // refresh the list
+      } catch (e: any) {
+        // api() throws on 4xx; try to surface the FastAPI `detail` message.
+        let msg = String(e && e.message ? e.message : e);
+        try {
+          const rt = e && e.responseText;
+          if (rt) { const j = JSON.parse(rt); if (j && j.detail) msg = String(j.detail); }
+        } catch (_) { /* keep raw message */ }
+        _setStatus(`Upload failed: ${msg}`, 'var(--error)');
+        _uploadBtn.disabled = false;
+      }
+    });
+  }
 
   body.querySelectorAll('.doc-struct-btn').forEach(btn => {
     (btn as HTMLElement).addEventListener('click', async () => {
