@@ -299,12 +299,17 @@ def test_dashboard_js_has_github_connect_card(js):
 # downloads for the tunnel connector ("meridian-connect") as a fallback when the
 # install.ps1 / install.sh one-liner 404s. These asset names MUST match
 # .github/workflows/release.yml exactly or the download links 404.
+# 80f1d4bc — macOS Intel (dead macos-13 runner) + Linux ARM64 (pixi lacks the
+# linux-aarch64 platform) were dropped from the release matrix, so their assets
+# 404; removed from the panel. Only the 3 actually-built platforms remain.
 _MERIDIAN_CONNECT_ASSETS = [
     "meridian-connect-x86_64-windows.exe",
     "meridian-connect-aarch64-apple-darwin",
-    "meridian-connect-x86_64-apple-darwin",
     "meridian-connect-x86_64-unknown-linux",
-    "meridian-connect-aarch64-unknown-linux",
+]
+_MERIDIAN_DROPPED_ASSETS = [
+    "meridian-connect-x86_64-apple-darwin",      # macOS Intel — dead macos-13
+    "meridian-connect-aarch64-unknown-linux",    # Linux ARM64 — no pixi linux-aarch64
 ]
 _MERIDIAN_RELEASES_BASE = (
     "https://github.com/meridianmcp/Meridian/releases/latest/download"
@@ -329,6 +334,9 @@ def test_connect_panel_has_direct_binary_download_links(js):
     # rather than the pre-concatenated string, which the source never spells out.)
     for asset in _MERIDIAN_CONNECT_ASSETS:
         assert asset in js, f"Connect panel missing tunnel binary asset {asset!r}"
+    # 80f1d4bc — dropped (unbuilt) platforms must NOT be linked; they'd 404.
+    for asset in _MERIDIAN_DROPPED_ASSETS:
+        assert asset not in js, f"dropped platform {asset!r} should not be linked (404s)"
     # The install-script one-liner must still be present (fallback is additive).
     assert "install.ps1" in js and "install.sh" in js
 

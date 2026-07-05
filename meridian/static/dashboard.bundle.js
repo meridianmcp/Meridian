@@ -2117,9 +2117,7 @@
   var _MERIDIAN_CONNECT_ASSETS = [
     ["Windows x86_64", "meridian-connect-x86_64-windows.exe"],
     ["macOS Apple Silicon", "meridian-connect-aarch64-apple-darwin"],
-    ["macOS Intel", "meridian-connect-x86_64-apple-darwin"],
-    ["Linux x86_64", "meridian-connect-x86_64-unknown-linux"],
-    ["Linux ARM64", "meridian-connect-aarch64-unknown-linux"]
+    ["Linux x86_64", "meridian-connect-x86_64-unknown-linux"]
   ];
   function _directBinaryDownloadsHtml() {
     const base = "https://github.com/meridianmcp/Meridian/releases/latest/download";

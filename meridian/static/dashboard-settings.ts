@@ -49,12 +49,14 @@ function _detectClientOS() {
 // ("meridian-connect"). Shown as a fallback inside the Meridian Connect panel so
 // there's always a way to grab the binary even if install.ps1 / install.sh 404s.
 // Asset names must match .github/workflows/release.yml exactly (else they 404).
+// 80f1d4bc — only the platforms the release actually builds. macOS Intel (dead
+// macos-13 runner) and Linux ARM64 (pixi lacks the linux-aarch64 platform) were
+// dropped from the release matrix, so those assets 404. Re-add here when their
+// build jobs are restored.
 const _MERIDIAN_CONNECT_ASSETS: Array<[string, string]> = [
   ['Windows x86_64', 'meridian-connect-x86_64-windows.exe'],
   ['macOS Apple Silicon', 'meridian-connect-aarch64-apple-darwin'],
-  ['macOS Intel', 'meridian-connect-x86_64-apple-darwin'],
   ['Linux x86_64', 'meridian-connect-x86_64-unknown-linux'],
-  ['Linux ARM64', 'meridian-connect-aarch64-unknown-linux'],
 ];
 
 function _directBinaryDownloadsHtml(): string {
