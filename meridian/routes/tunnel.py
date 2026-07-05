@@ -1700,6 +1700,182 @@ async def send_add_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[st
         return {"status": "error", "message": str(exc)}
 
 
+# live-fs-roots — full-list REPLACE control for the fs slot. add_fs_roots only
+# ADDS dirs to the running proxy, so a *removal* needs a way to shrink the served
+# set live. This sends the complete new root list; the client rebuilds the fs
+# proxy's allowed-dirs to EXACTLY these and respawns. Mirrors
+# :func:`send_add_fs_roots_control` (same socket, same best-effort contract).
+async def send_set_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[str, str]:
+    """Send set_fs_roots (full-list replace) over the fs WebSocket for a tenant.
+
+    Called after a root is removed from the persisted config so the change goes
+    live without a tunnel restart. Returns a status dict with ``status`` of
+    ``"ok"``, ``"not_connected"``, or ``"error"``. Best-effort — never let this
+    fail the calling request.
+    """
+    ws = _tunnel_sockets.get(tenant_id)
+    if ws is None:
+        return {"status": "not_connected", "message": "no active fs tunnel"}
+    try:
+        await ws.send_json({"type": "set_fs_roots", "roots": roots})
+        return {"status": "ok", "roots": roots}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "message": str(exc)}
+
+
+# live-fs-roots — POST/DELETE /tunnel/filesystem-roots: add or remove a single
+# served root LIVE from the dashboard. The tunnel is tenant-scoped and the served
+# set is the UNION of ``executor_config.filesystem_roots`` across the tenant's
+# projects (see :func:`_union_filesystem_roots`). So:
+#   * ADD persists the new path onto ONE project (the newest, matching how the
+#     GET/union path treats projects) then pushes it live with add_fs_roots.
+#   * DELETE strips the path from EVERY project that lists it (it could live on
+#     any of them) then pushes the full new union with set_fs_roots.
+# Normalization reuses the client's ``_normalize_path_arg`` so a pasted/quoted
+# path persists byte-identically to what the client will serve.
+
+def _normalize_root(path: Any) -> str:
+    """Normalize an incoming root path exactly like the tunnel client does.
+
+    Strips surrounding whitespace and matched surrounding quotes (a pasted
+    ``'"C:\\Users\\me\\My Docs"'`` becomes ``C:\\Users\\me\\My Docs``). Reuses
+    :func:`meridian.tunnel_client._normalize_path_arg` so the server-persisted
+    value matches the client-served dir exactly. Non-str input → ``""``.
+    """
+    if not isinstance(path, str):
+        return ""
+    from ..tunnel_client import _normalize_path_arg
+    return _normalize_path_arg(path)
+
+
+async def _persist_add_filesystem_root(
+    db: Any, projects: list[dict], path: str
+) -> list[str]:
+    """Append *path* to the newest project's ``executor_config.filesystem_roots``
+    (deduped, order preserved) and persist it. Returns the updated tenant-wide
+    UNION of filesystem roots. If the path is already served nothing is written.
+    """
+    if path in _union_filesystem_roots(projects):
+        return _union_filesystem_roots(projects)
+    if not projects:
+        # No project to attach the root to — nothing to persist. The union is
+        # necessarily empty; the caller still pushes the path live so the running
+        # tunnel serves it this session.
+        return []
+    target = projects[0]  # newest (list_projects orders created_at DESC)
+    cfg = target.get("executor_config")
+    if isinstance(cfg, str) and cfg.strip():
+        try:
+            cfg = json.loads(cfg)
+        except Exception:  # noqa: BLE001
+            cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    roots = [r for r in (cfg.get("filesystem_roots") or []) if isinstance(r, str)]
+    if path not in roots:
+        roots.append(path)
+    cfg["filesystem_roots"] = roots
+    await db_module.set_executor_config(db, target["id"], cfg)
+    # Reflect the write in our in-memory copy so the recomputed union is current.
+    target["executor_config"] = cfg
+    return _union_filesystem_roots(projects)
+
+
+async def _persist_remove_filesystem_root(
+    db: Any, projects: list[dict], path: str
+) -> list[str]:
+    """Remove *path* from EVERY project whose ``filesystem_roots`` lists it and
+    persist each changed project. Returns the updated tenant-wide UNION.
+    """
+    for p in projects:
+        cfg = p.get("executor_config")
+        if isinstance(cfg, str) and cfg.strip():
+            try:
+                cfg = json.loads(cfg)
+            except Exception:  # noqa: BLE001
+                continue
+        if not isinstance(cfg, dict):
+            continue
+        roots = [r for r in (cfg.get("filesystem_roots") or []) if isinstance(r, str)]
+        # Drop the target path (trim each stored value so a whitespace-padded
+        # entry still matches, mirroring the union's own trimming).
+        kept = [r for r in roots if r.strip() != path]
+        if len(kept) != len(roots):
+            cfg["filesystem_roots"] = kept
+            await db_module.set_executor_config(db, p["id"], cfg)
+            p["executor_config"] = cfg
+    return _union_filesystem_roots(projects)
+
+
+@router.post("/tunnel/filesystem-roots")
+async def add_tunnel_filesystem_root(request: Request) -> Response:
+    """live-fs-roots — add a served filesystem root and push it live.
+
+    Body: ``{"path": "..."}`` (``"root"`` is also accepted). The path is
+    normalized (surrounding quotes/whitespace stripped) and rejected if empty.
+    It is appended to the tenant's persisted ``executor_config.filesystem_roots``
+    (deduped, order preserved), then pushed to the running tunnel via
+    ``add_fs_roots`` so the connector serves it WITHOUT a restart. Returns the
+    updated union of ``roots`` plus ``live`` (the control-send status).
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"error": "authentication required"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_response({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return _json_response({"error": "expected a JSON object"}, status_code=400)
+    path = _normalize_root(body.get("path") if body.get("path") is not None else body.get("root"))
+    if not path:
+        return _json_response({"error": "path is required"}, status_code=400)
+    try:
+        db = await _db(request)
+        projects = await db_module.list_projects(db)
+        roots = await _persist_add_filesystem_root(db, projects, path)
+    except Exception as exc:  # noqa: BLE001
+        return _json_response({"error": f"could not persist root: {exc}"}, status_code=500)
+    live = await send_add_fs_roots_control(tenant["id"], [path])
+    return _json_response({"roots": roots, "live": live})
+
+
+@router.delete("/tunnel/filesystem-roots")
+async def remove_tunnel_filesystem_root(request: Request) -> Response:
+    """live-fs-roots — remove a served filesystem root and apply it live.
+
+    Path comes from a ``{"path": ...}`` JSON body (``"root"`` accepted too) or a
+    ``?path=`` query param. It is normalized then stripped from the tenant's
+    persisted ``executor_config.filesystem_roots`` across all projects. Because
+    ``add_fs_roots`` only ADDS, removal is pushed live with ``set_fs_roots`` (a
+    full-list replace) so the running connector stops serving it WITHOUT a
+    restart. Returns the updated union of ``roots`` plus ``live`` status.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"error": "authentication required"}, status_code=401)
+    path = _normalize_root(request.query_params.get("path"))
+    if not path:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                path = _normalize_root(
+                    body.get("path") if body.get("path") is not None else body.get("root")
+                )
+        except Exception:  # noqa: BLE001 — no/invalid body; path may be in query
+            pass
+    if not path:
+        return _json_response({"error": "path is required"}, status_code=400)
+    try:
+        db = await _db(request)
+        projects = await db_module.list_projects(db)
+        roots = await _persist_remove_filesystem_root(db, projects, path)
+    except Exception as exc:  # noqa: BLE001
+        return _json_response({"error": f"could not persist removal: {exc}"}, status_code=500)
+    live = await send_set_fs_roots_control(tenant["id"], roots)
+    return _json_response({"roots": roots, "live": live})
+
+
 # ---------------------------------------------------------------------------
 # Single-connector bridge — surface fs/code/extractor tools through /mcp
 # ---------------------------------------------------------------------------

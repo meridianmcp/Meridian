@@ -552,3 +552,397 @@ def test_fetch_filesystem_roots_defaults_on_error(monkeypatch):
     import httpx as _httpx
     monkeypatch.setattr(_httpx, "AsyncClient", _BoomClient)
     assert asyncio.run(tc._fetch_filesystem_roots("https://x", "sk")) == ([], [], "", [])
+
+
+# ---------------------------------------------------------------------------
+# live-fs-roots — client: _set_fs_roots_on_cmd (full-list REPLACE helper)
+# ---------------------------------------------------------------------------
+
+def test_set_fs_roots_on_cmd_replaces_dirs_exactly():
+    """The dirs after the fs-server token are REPLACED with exactly the new set
+    (normalized, deduped, order-preserved) — a removal shrinks the served list."""
+    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b", "/c"])
+    updated, changed = tc._set_fs_roots_on_cmd(cmd, ["/a", "/c"])
+    assert changed is True
+    idx = updated.index("@modelcontextprotocol/server-filesystem")
+    assert updated[idx + 1:] == ["/a", "/c"]  # /b removed, order kept
+
+
+def test_set_fs_roots_on_cmd_dequotes_and_dedupes():
+    """Quoted paths are de-quoted (via _normalize_path_arg) and exact dups collapse."""
+    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a"])
+    updated, changed = tc._set_fs_roots_on_cmd(cmd, ['"/x"', "/x", "  /y  "])
+    assert changed is True
+    idx = updated.index("@modelcontextprotocol/server-filesystem")
+    assert updated[idx + 1:] == ["/x", "/y"]
+
+
+def test_set_fs_roots_on_cmd_noop_when_unchanged():
+    """Requesting the current dir set changes nothing (changed False, cmd is-same)."""
+    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b"])
+    updated, changed = tc._set_fs_roots_on_cmd(cmd, ["/a", "/b"])
+    assert changed is False
+    assert updated is cmd
+
+
+def test_set_fs_roots_on_cmd_refuses_empty():
+    """An empty/all-blank list is a no-op — never strip the fs server to zero dirs."""
+    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a"])
+    for empty in ([], ["", "  "], ['""']):
+        updated, changed = tc._set_fs_roots_on_cmd(cmd, empty)
+        assert changed is False
+        assert updated is cmd
+
+
+def test_set_fs_roots_on_cmd_no_server_token():
+    """No fs-server token in the command → no change."""
+    cmd = ["npx", "-y", "mcp-proxy", "--port", "8808"]
+    _, changed = tc._set_fs_roots_on_cmd(cmd, ["/x"])
+    assert changed is False
+
+
+# ---------------------------------------------------------------------------
+# live-fs-roots — client: _run_connection_lazy handles set_fs_roots
+# ---------------------------------------------------------------------------
+
+def test_run_connection_lazy_handles_set_fs_roots(monkeypatch):
+    """A set_fs_roots control message REPLACES proxy.cmd's dirs with exactly the
+    given roots (normalized) and kills/restarts the proxy — mirrors the
+    add_fs_roots handler test but for the full-list-replace (removal) path."""
+    import websockets as _ws
+    import httpx as _httpx
+
+    # Start with 3 roots served; set_fs_roots down to 2 (a removal).
+    cmd_orig = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b", "/c"])
+
+    class FakeWS:
+        def __init__(self):
+            self._msgs = [
+                json.dumps({"type": "set_fs_roots", "roots": ['"/a"', "/c"]}),
+            ]
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def __aiter__(self): return self
+        async def __anext__(self):
+            if not self._msgs:
+                raise StopAsyncIteration
+            return self._msgs.pop(0)
+        async def send(self, data): pass
+
+    class FakeHttpClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+
+    class _AliveProc(_FakeProc):
+        def poll(self):
+            return None  # None → is_running True
+
+    proxy = tc.SlotProxy(list(cmd_orig), 8808, "fs")
+    # Mark the proxy "running" so the handler exercises kill + respawn.
+    proxy._proc = _AliveProc()
+    proxy.holder["proc"] = proxy._proc
+    kills = {"n": 0}
+
+    def fake_kill(self):
+        kills["n"] += 1
+        self._proc = None
+    monkeypatch.setattr(tc.SlotProxy, "kill", fake_kill)
+
+    respawns = {"n": 0}
+
+    async def fake_ensure(self):
+        respawns["n"] += 1
+        self._proc = _AliveProc()
+        self.holder["proc"] = self._proc
+    monkeypatch.setattr(tc.SlotProxy, "ensure_running", fake_ensure)
+
+    asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
+
+    idx = proxy.cmd.index("@modelcontextprotocol/server-filesystem")
+    assert proxy.cmd[idx + 1:] == ["/a", "/c"]  # exactly the new set, de-quoted
+    assert "/b" not in proxy.cmd                 # the removed root is gone
+    assert kills["n"] == 1 and respawns["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# live-fs-roots — backend: send_set_fs_roots_control
+# ---------------------------------------------------------------------------
+
+def test_send_set_fs_roots_control_not_connected():
+    result = asyncio.run(tn.send_set_fs_roots_control("no-tenant", ["/x"]))
+    assert result["status"] == "not_connected"
+
+
+def test_send_set_fs_roots_control_ok():
+    ws = _FakeFsWS()
+    tn._tunnel_sockets["t-set"] = ws
+    try:
+        result = asyncio.run(tn.send_set_fs_roots_control("t-set", ["/a", "/b"]))
+        assert result == {"status": "ok", "roots": ["/a", "/b"]}
+        assert ws.sent == [{"type": "set_fs_roots", "roots": ["/a", "/b"]}]
+    finally:
+        tn._tunnel_sockets.pop("t-set", None)
+
+
+def test_send_set_fs_roots_control_send_error():
+    ws = _FakeFsWS(raise_on_send=True)
+    tn._tunnel_sockets["t-set-err"] = ws
+    try:
+        result = asyncio.run(tn.send_set_fs_roots_control("t-set-err", ["/x"]))
+        assert result["status"] == "error"
+    finally:
+        tn._tunnel_sockets.pop("t-set-err", None)
+
+
+# ---------------------------------------------------------------------------
+# live-fs-roots — backend: persistence helpers (real in-memory DB round-trip)
+# ---------------------------------------------------------------------------
+
+def test_persist_add_filesystem_root_appends_and_returns_union():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p1 = await db_module.create_project(db, "fs-add-1")
+        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": ["/a"]})
+        projects = await db_module.list_projects(db)
+        union = await tn._persist_add_filesystem_root(db, projects, "/b")
+        # Re-read from DB to confirm it persisted (not just the in-memory copy).
+        cfg = await db_module.get_executor_config(db, p1["id"])
+        return union, cfg
+    union, cfg = asyncio.run(_run())
+    assert union == ["/a", "/b"]
+    assert cfg["filesystem_roots"] == ["/a", "/b"]
+
+
+def test_persist_add_filesystem_root_dedupes_existing():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p1 = await db_module.create_project(db, "fs-add-dup")
+        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": ["/a"]})
+        projects = await db_module.list_projects(db)
+        union = await tn._persist_add_filesystem_root(db, projects, "/a")
+        cfg = await db_module.get_executor_config(db, p1["id"])
+        return union, cfg
+    union, cfg = asyncio.run(_run())
+    assert union == ["/a"]
+    assert cfg["filesystem_roots"] == ["/a"]  # no duplicate written
+
+
+def test_persist_remove_filesystem_root_strips_from_all_projects():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p1 = await db_module.create_project(db, "fs-rm-1")
+        p2 = await db_module.create_project(db, "fs-rm-2")
+        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": ["/a", "/shared"]})
+        await db_module.set_executor_config(db, p2["id"], {"filesystem_roots": ["/shared", "/b"]})
+        projects = await db_module.list_projects(db)
+        union = await tn._persist_remove_filesystem_root(db, projects, "/shared")
+        c1 = await db_module.get_executor_config(db, p1["id"])
+        c2 = await db_module.get_executor_config(db, p2["id"])
+        return union, c1, c2
+    union, c1, c2 = asyncio.run(_run())
+    assert "/shared" not in union
+    assert c1["filesystem_roots"] == ["/a"]
+    assert c2["filesystem_roots"] == ["/b"]
+
+
+# ---------------------------------------------------------------------------
+# live-fs-roots — backend: POST /tunnel/filesystem-roots
+# ---------------------------------------------------------------------------
+
+class _FakeReq:
+    """Minimal Request stub: JSON body + query params for the fs-root routes."""
+    def __init__(self, body=None, query=None, bad_json=False):
+        self._body = body
+        self._bad_json = bad_json
+        self.query_params = query or {}
+
+    async def json(self):
+        if self._bad_json:
+            raise ValueError("no body")
+        return self._body
+
+
+def _patch_route_db(monkeypatch, projects):
+    """Wire _get_tenant_from_request/_db/list_projects for a route test."""
+    monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value={"id": "t1"}))
+    monkeypatch.setattr(tn, "_db", AsyncMock(return_value=object()))
+    monkeypatch.setattr(tn.db_module, "list_projects", AsyncMock(return_value=projects))
+
+
+def test_add_route_persists_and_pushes_add_control(monkeypatch):
+    """POST persists the root via _persist_add_filesystem_root AND pushes it live
+    via send_add_fs_roots_control (spied). Returns the union + live status."""
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/a"]})}]
+    _patch_route_db(monkeypatch, projects)
+    persisted = AsyncMock(return_value=["/a", "/b"])
+    monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
+    add_spy = AsyncMock(return_value={"status": "ok", "roots": ["/b"]})
+    monkeypatch.setattr(tn, "send_add_fs_roots_control", add_spy)
+
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/b"})))
+    data = _decode_route_body(resp)
+    assert data["roots"] == ["/a", "/b"]
+    assert data["live"] == {"status": "ok", "roots": ["/b"]}
+    # persisted with the normalized path; live pushed the same single path.
+    assert persisted.await_args.args[2] == "/b"
+    add_spy.assert_awaited_once_with("t1", ["/b"])
+
+
+def test_add_route_dequotes_path(monkeypatch):
+    """A quoted path is de-quoted before persist + live push."""
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": []})}]
+    _patch_route_db(monkeypatch, projects)
+    persisted = AsyncMock(return_value=["/quoted/dir"])
+    monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
+    add_spy = AsyncMock(return_value={"status": "not_connected"})
+    monkeypatch.setattr(tn, "send_add_fs_roots_control", add_spy)
+
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": '"/quoted/dir"'})))
+    assert _decode_route_body(resp)["roots"] == ["/quoted/dir"]
+    assert persisted.await_args.args[2] == "/quoted/dir"        # de-quoted for persist
+    add_spy.assert_awaited_once_with("t1", ["/quoted/dir"])     # de-quoted for live push
+
+
+def test_add_route_accepts_root_key(monkeypatch):
+    """The body may use "root" instead of "path"."""
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": []})}]
+    _patch_route_db(monkeypatch, projects)
+    monkeypatch.setattr(tn, "_persist_add_filesystem_root", AsyncMock(return_value=["/via-root"]))
+    monkeypatch.setattr(tn, "send_add_fs_roots_control", AsyncMock(return_value={"status": "ok"}))
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"root": "/via-root"})))
+    assert _decode_route_body(resp)["roots"] == ["/via-root"]
+
+
+def test_add_route_rejects_empty_path(monkeypatch):
+    """An empty/blank/quoted-empty path is a 400 and never touches the DB or WS."""
+    _patch_route_db(monkeypatch, [])
+    persisted = AsyncMock()
+    add_spy = AsyncMock()
+    monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
+    monkeypatch.setattr(tn, "send_add_fs_roots_control", add_spy)
+    for bad in ({"path": ""}, {"path": "   "}, {"path": '""'}, {}):
+        resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body=bad)))
+        assert resp.status_code == 400
+    persisted.assert_not_awaited()
+    add_spy.assert_not_awaited()
+
+
+def test_add_route_requires_auth(monkeypatch):
+    """No tenant → 401."""
+    monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value=None))
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/x"})))
+    assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# live-fs-roots — backend: DELETE /tunnel/filesystem-roots
+# ---------------------------------------------------------------------------
+
+def test_delete_route_persists_and_pushes_set_control(monkeypatch):
+    """DELETE persists the removal via _persist_remove_filesystem_root AND pushes
+    the FULL new list live via send_set_fs_roots_control (spied)."""
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/a", "/b"]})}]
+    _patch_route_db(monkeypatch, projects)
+    persisted = AsyncMock(return_value=["/a"])  # /b removed → union is ["/a"]
+    monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
+    set_spy = AsyncMock(return_value={"status": "ok", "roots": ["/a"]})
+    monkeypatch.setattr(tn, "send_set_fs_roots_control", set_spy)
+
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/b"})))
+    data = _decode_route_body(resp)
+    assert data["roots"] == ["/a"]
+    assert data["live"] == {"status": "ok", "roots": ["/a"]}
+    assert persisted.await_args.args[2] == "/b"
+    # set_fs_roots gets the FULL remaining list, not the removed path.
+    set_spy.assert_awaited_once_with("t1", ["/a"])
+
+
+def test_delete_route_reads_path_from_query(monkeypatch):
+    """The path may come from ?path= (no body)."""
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/a", "/b"]})}]
+    _patch_route_db(monkeypatch, projects)
+    persisted = AsyncMock(return_value=["/a"])
+    monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
+    monkeypatch.setattr(tn, "send_set_fs_roots_control", AsyncMock(return_value={"status": "ok"}))
+    resp = asyncio.run(
+        tn.remove_tunnel_filesystem_root(_FakeReq(query={"path": "/b"}, bad_json=True))
+    )
+    assert _decode_route_body(resp)["roots"] == ["/a"]
+    assert persisted.await_args.args[2] == "/b"
+
+
+def test_delete_route_dequotes_path(monkeypatch):
+    """A quoted path is de-quoted before the remove + live push."""
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/keep", "/drop"]})}]
+    _patch_route_db(monkeypatch, projects)
+    persisted = AsyncMock(return_value=["/keep"])
+    monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
+    set_spy = AsyncMock(return_value={"status": "ok"})
+    monkeypatch.setattr(tn, "send_set_fs_roots_control", set_spy)
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": '"/drop"'})))
+    assert _decode_route_body(resp)["roots"] == ["/keep"]
+    assert persisted.await_args.args[2] == "/drop"  # de-quoted
+    set_spy.assert_awaited_once_with("t1", ["/keep"])
+
+
+def test_delete_route_rejects_empty_path(monkeypatch):
+    """No path anywhere → 400, no DB write, no WS push."""
+    _patch_route_db(monkeypatch, [])
+    persisted = AsyncMock()
+    set_spy = AsyncMock()
+    monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
+    monkeypatch.setattr(tn, "send_set_fs_roots_control", set_spy)
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={}, query={})))
+    assert resp.status_code == 400
+    persisted.assert_not_awaited()
+    set_spy.assert_not_awaited()
+
+
+def test_delete_route_requires_auth(monkeypatch):
+    """No tenant → 401."""
+    monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value=None))
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/x"})))
+    assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# live-fs-roots — backend: end-to-end route → real DB persistence (no mocks on
+# the persist helpers), so the POST/DELETE actually round-trip through
+# set_executor_config. Only the tenant/db/list_projects + control-send are wired.
+# ---------------------------------------------------------------------------
+
+def test_add_then_delete_route_roundtrip_real_db(monkeypatch):
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p1 = await db_module.create_project(db, "fs-e2e")
+        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": ["/existing"]})
+
+        monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value={"id": "t1"}))
+        monkeypatch.setattr(tn, "_db", AsyncMock(return_value=db))
+        # list_projects hits the real DB (not mocked) so the route persists for real.
+        add_spy = AsyncMock(return_value={"status": "not_connected"})
+        set_spy = AsyncMock(return_value={"status": "not_connected"})
+        monkeypatch.setattr(tn, "send_add_fs_roots_control", add_spy)
+        monkeypatch.setattr(tn, "send_set_fs_roots_control", set_spy)
+
+        add_resp = await tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "  /new/dir  "}))
+        after_add = await db_module.get_executor_config(db, p1["id"])
+
+        del_resp = await tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/existing"}))
+        after_del = await db_module.get_executor_config(db, p1["id"])
+        return (_decode_route_body(add_resp), after_add,
+                _decode_route_body(del_resp), after_del, add_spy, set_spy)
+
+    add_data, after_add, del_data, after_del, add_spy, set_spy = asyncio.run(_run())
+    # ADD: normalized (trimmed) path appended + persisted; union returned.
+    assert add_data["roots"] == ["/existing", "/new/dir"]
+    assert after_add["filesystem_roots"] == ["/existing", "/new/dir"]
+    add_spy.assert_awaited_once_with("t1", ["/new/dir"])
+    # DELETE: /existing stripped from the persisted config; set_fs_roots gets the
+    # remaining full list.
+    assert del_data["roots"] == ["/new/dir"]
+    assert after_del["filesystem_roots"] == ["/new/dir"]
+    set_spy.assert_awaited_once_with("t1", ["/new/dir"])

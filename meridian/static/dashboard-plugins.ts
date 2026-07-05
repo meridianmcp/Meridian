@@ -127,6 +127,141 @@ function _renderStaleOverrideWarning(p: any) {
 }
 window._renderStaleOverrideWarning = _renderStaleOverrideWarning;
 
+// live-fs-roots — LIVE filesystem-roots management card. The filesystem slot
+// (/fs) serves the tenant-wide UNION of executor_config.filesystem_roots across
+// projects. This card lets the user add/remove a served dir and have the running
+// tunnel pick it up WITHOUT a restart: Add → POST /tunnel/filesystem-roots (which
+// persists + pushes add_fs_roots), Remove → DELETE (persists + pushes the new
+// full list via set_fs_roots). Rendered inside the fs slot row.
+
+// Escape a value for use inside a double-quoted HTML attribute (data-root=...).
+// escapeHtml already covers &<>"' so it is attribute-safe here.
+function _fsAttr(v: any) { return escapeHtml(String(v == null ? '' : v)); }
+
+// Render the static shell of the filesystem-roots card. The list body
+// (#fs-roots-list-<pid>) is filled in by _wireFsRootsCard after a GET. Kept
+// pure/exported so a UI test can assert the shell renders the input + list host.
+function _renderFsRootsCard(projectId: string) {
+  return `
+    <details class="meridian-disclosure" style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0" data-fs-roots-card="${_fsAttr(projectId)}">
+      <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Filesystem roots (live)</summary>
+      <div style="padding:0 8px 8px">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+          Directories the <code>/fs</code> connector may read, unioned across this account's projects.
+          Add or remove one and the running <code>meridian --tunnel</code> picks it up immediately &mdash; no restart.
+        </div>
+        <div id="fs-roots-list-${_fsAttr(projectId)}" style="margin-bottom:8px"><div style="color:var(--muted);font-size:10px">Loading&hellip;</div></div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input type="text" id="fs-roots-input-${_fsAttr(projectId)}" placeholder="add a directory (e.g. C:\\Users\\me\\Projects)"
+            style="flex:1;min-width:180px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+          <button class="secondary admin-only" id="fs-roots-add-${_fsAttr(projectId)}" style="padding:2px 10px;font-size:10px;flex-shrink:0">Add</button>
+        </div>
+        <div id="fs-roots-status-${_fsAttr(projectId)}" style="font-size:10px;color:var(--muted);margin-top:4px"></div>
+      </div>
+    </details>`;
+}
+window._renderFsRootsCard = _renderFsRootsCard;
+
+// Build the roots list markup (each row a path + a × remove button). Pure so the
+// UI test can assert the escaping + the empty state without a live DOM/fetch.
+function _renderFsRootsList(roots: any[]) {
+  const list = Array.isArray(roots)
+    ? roots.filter((r) => typeof r === 'string' && r.trim()).map((r) => r.trim())
+    : [];
+  if (!list.length) {
+    return '<div style="color:var(--muted);font-size:10px">No roots &mdash; the connector falls back to your home directory.</div>';
+  }
+  return list.map((p) => `
+    <div style="border:1px solid var(--border);border-radius:4px;padding:6px 8px;margin-bottom:6px;display:flex;gap:8px;align-items:center">
+      <div style="flex:1;min-width:0;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${_fsAttr(p)}">${escapeHtml(p)}</div>
+      <button class="fs-root-remove" data-root="${_fsAttr(p)}" title="Remove this root" style="font-size:11px;line-height:1;padding:1px 7px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer;flex-shrink:0">&#10005;</button>
+    </div>`).join('');
+}
+window._renderFsRootsList = _renderFsRootsList;
+
+// Fetch the current roots and wire the Add/Remove controls. Idempotent per
+// render (guards on data-wired). Add → POST, Remove → DELETE; both refresh the
+// list from the endpoint's returned `roots` so the UI reflects exactly what
+// persisted + went live.
+async function _wireFsRootsCard(section: any, projectId: string) {
+  if (!section) return;
+  const card = section.querySelector(`[data-fs-roots-card="${CSS.escape(projectId)}"]`);
+  if (!card || card.dataset.wired === '1') return;
+  card.dataset.wired = '1';
+
+  const listEl = document.getElementById(`fs-roots-list-${projectId}`);
+  const inputEl = document.getElementById(`fs-roots-input-${projectId}`);
+  const addBtn = document.getElementById(`fs-roots-add-${projectId}`);
+  const statusEl = document.getElementById(`fs-roots-status-${projectId}`);
+  const setStatus = (m: any) => {
+    if (!statusEl) return;
+    statusEl.textContent = m || '';
+    if (m) setTimeout(() => { if (statusEl.textContent === m) statusEl.textContent = ''; }, 3000);
+  };
+  // Describe the live-push outcome from a POST/DELETE `live` status field.
+  const liveNote = (live: any) => {
+    const s = live && live.status;
+    if (s === 'ok') return ' (applied to the running tunnel)';
+    if (s === 'not_connected') return ' (saved — tunnel offline, applies on next start)';
+    if (s === 'error') return ' (saved — could not reach the tunnel)';
+    return '';
+  };
+
+  const renderList = (roots: any[]) => {
+    if (!listEl) return;
+    listEl.innerHTML = _renderFsRootsList(roots);
+    listEl.querySelectorAll('.fs-root-remove').forEach((btn: any) => {
+      btn.addEventListener('click', async () => {
+        const root = btn.dataset.root || '';
+        if (!root) return;
+        btn.disabled = true;
+        try {
+          const r = await api('/tunnel/filesystem-roots', {
+            method: 'DELETE', body: JSON.stringify({ path: root }),
+          });
+          renderList((r && r.roots) || []);
+          setStatus('Removed' + liveNote(r && r.live));
+        } catch (e: any) {
+          btn.disabled = false;
+          toast('Remove failed: ' + (e && e.message || e), true);
+        }
+      });
+    });
+  };
+
+  const addRoot = async () => {
+    const v = (inputEl && inputEl.value || '').trim();
+    if (!v) { toast('Enter a directory path', true); return; }
+    if (addBtn) addBtn.disabled = true;
+    try {
+      const r = await api('/tunnel/filesystem-roots', {
+        method: 'POST', body: JSON.stringify({ path: v }),
+      });
+      if (inputEl) inputEl.value = '';
+      renderList((r && r.roots) || []);
+      setStatus('Added' + liveNote(r && r.live));
+    } catch (e: any) {
+      toast('Add failed: ' + (e && e.message || e), true);
+    } finally {
+      if (addBtn) addBtn.disabled = false;
+    }
+  };
+
+  if (addBtn) addBtn.addEventListener('click', addRoot);
+  if (inputEl) inputEl.addEventListener('keydown', (e: any) => {
+    if (e.key === 'Enter') { e.preventDefault(); addRoot(); }
+  });
+
+  // Initial load — reuse the same endpoint the tunnel client fetches at startup.
+  try {
+    const data = await api('/tunnel/filesystem-roots');
+    renderList((data && data.filesystem_roots) || []);
+  } catch (e: any) {
+    if (listEl) listEl.innerHTML = `<div style="color:var(--error);font-size:10px">Failed to load roots: ${escapeHtml(e && e.message || String(e))}</div>`;
+  }
+}
+window._wireFsRootsCard = _wireFsRootsCard;
+
 async function loadTunnelPluginsSection(projectId: string, hostname: any) {
   const host = document.getElementById(`settings-body-${projectId}`);
   if (!host) return;
@@ -344,6 +479,7 @@ async function loadTunnelPluginsSection(projectId: string, hostname: any) {
       </div>
       ${_hostPicker}
       ${rows || '<div style="color:var(--muted);font-size:10px">No plugins.</div>'}
+      ${_renderFsRootsCard(projectId)}
       <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px">
         <button class="secondary admin-only" id="tp-reset-${projectId}" style="padding:2px 10px;font-size:10px" title="Clear all overrides (back to built-in defaults)">Reset to defaults</button>
         <button class="primary admin-only" id="tp-save-${projectId}" style="padding:2px 10px;font-size:10px">Save</button>
@@ -462,6 +598,10 @@ async function loadTunnelPluginsSection(projectId: string, hostname: any) {
 
     // Wire up three-state lifecycle Install buttons (sprint item 56cb5d33).
     _wireLifecycleInstallButtons(section);
+
+    // live-fs-roots — wire the LIVE filesystem-roots add/remove card (fetches
+    // the current roots + POST/DELETE to apply changes without a tunnel restart).
+    _wireFsRootsCard(section, projectId);
 
     // Per-plugin live tools dropdown. Lazy-load the slot's tool manifest the
     // first time its <details> is expanded; reuse one /me lookup across slots.
