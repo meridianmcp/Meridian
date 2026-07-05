@@ -32,6 +32,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "ingest_document": 'ingest_document(project_id="abc-123", file_path="docs/spec.docx", tags="spec")  # or, for a PDF: ingest_document(project_id="abc-123", content="<text you extracted>", title="Q3 report", source="https://example.com/q3.pdf")',
     "get_document_structure": 'get_document_structure(file_path="thesis/chapter1.docx")',
     "get_latex_structure": 'get_latex_structure(file_path="thesis/chapter1.tex")',
+    "get_citation_edges": 'get_citation_edges(project_id="abc-123", source="thesis/chapter1.tex")',
+    "resolve_citations": 'resolve_citations(project_id="abc-123")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -339,6 +341,49 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "file_path": {"type": "string", "description": "Path to a server-accessible .tex file. A sibling .bib referenced by \\bibliography is resolved relative to it."},
          "source": {"type": "string", "description": "Raw LaTeX source, as an alternative to file_path. Ignored when file_path is given."}},
+         "required": []}},
+    {"name": "get_citation_edges", "description":
+        "fefb596a — read the CITATION GRAPH of a project's ingested documents. "
+        "Returns every in-text citation marker (a kind='citation' element parsed "
+        "from an ingested .tex/.docx) together with its resolved edges:\n"
+        "• bibentry edges — the intra-document link from a \\cite{key} marker to a "
+        "matching \\bibitem/bibliography entry in the SAME document (materialised "
+        "automatically on ingest).\n"
+        "• zotero_item edges — the cross-document link from a marker to a canonical "
+        "Zotero library item, keyed on DOI (materialised by the opt-in "
+        "resolve_citations pass); target_document_id is set when the cited paper "
+        "is itself ingested in this project.\n"
+        "Each marker carries {element_id, document_id, ordinal, ref, text, edges:"
+        "[{edge_kind, target_kind, target_ref, target_element_id, "
+        "target_document_id, resolved_at}]}. Scope to one document with source (a "
+        "stored source path/URL) or document_id; omit both for the whole project. "
+        "Returns an empty markers list (never an error) when no document structure "
+        "has been persisted yet.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally."},
+         "source": {"type": "string", "description": "Restrict to the document stored under this source (path/URL). Empty graph if the source is unknown."},
+         "document_id": {"type": "string", "description": "Restrict to one stored document by its doc_store id."}},
+         "required": []}},
+    {"name": "resolve_citations", "description":
+        "fefb596a — resolve this project's in-text citation markers to canonical "
+        "Zotero items via Zotero's LOCAL API and materialise the cross-document "
+        "'cites' -> zotero_item edges (keyed on DOI). An OPT-IN, network-making "
+        "pass — deliberately separate from ingest, which stays offline. For each "
+        "kind='citation' marker without a zotero_item edge, the marker's ref is "
+        "resolved: a DOI (doi:.. / a bare 10.x/y / a doi.org URL) matches the "
+        "library item with that DOI; a zotero:<key> ref is a direct item lookup; a "
+        "bare BibTeX citekey is a best-effort text search (fuzzy without Better "
+        "BibTeX). When the resolved DOI matches a paper ALSO ingested in this "
+        "project, the edge's target_document_id is linked too. IDEMPOTENT — re-runs "
+        "only fill gaps, never duplicate. If Zotero is closed or its local API is "
+        "disabled, markers simply stay unresolved (no error). Returns {resolved, "
+        "unresolved, cross_doc_linked} counts. Requires Zotero running locally with "
+        "the local API enabled (endpoint configurable via MERIDIAN_ZOTERO_API_URL).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally."},
+         "max_items": {"type": "integer", "description": "Cap how many unresolved markers to attempt this pass. Omit to attempt all."}},
          "required": []}},
     {"name": "add_insight", "description":
         "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
@@ -1049,6 +1094,7 @@ _READ_ONLY_TOOLS = {
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
     "list_plugins", "get_plugin_details",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
+    "get_citation_edges",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 

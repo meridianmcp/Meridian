@@ -2054,6 +2054,52 @@ async def _handle_notes_decisions(
             return analyze_latex(src)
         except Exception as exc:  # noqa: BLE001 — defense in depth; analyze_latex is already safe
             return {"error": f"could not parse latex: {exc}"}
+    if name == "get_citation_edges":
+        # fefb596a — read the citation graph: every kind='citation' marker in a
+        # project (optionally scoped to one document via source/document_id) with
+        # its intra-doc bibentry edges AND cross-doc zotero_item edges. Reads the
+        # tier-resolved doc-structure store; returns an empty graph (never an
+        # error) when no structure has been persisted yet.
+        validate_input_size(args.get("source"), "citation source", 2_000)
+        validate_input_size(args.get("document_id"), "citation document_id", 200)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"project_id": args["project_id"], "markers": []}
+        try:
+            graph = await store.get_citation_graph(
+                args["project_id"],
+                source=args.get("source"),
+                document_id=args.get("document_id"),
+            )
+        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+            return {"error": f"could not read citation graph: {exc}"}
+        return {"project_id": args["project_id"], **graph}
+    if name == "resolve_citations":
+        # fefb596a — opt-in cross-document resolve pass: walk unresolved citation
+        # markers and link each to a canonical Zotero item via Zotero's LOCAL API
+        # (zotero_client.resolve_citation_ref). NETWORK — deliberately a separate
+        # tool, never in ingest/put_document. Idempotent: only fills gaps. When
+        # Zotero is closed / its local API is disabled every marker just stays
+        # unresolved (the resolver returns None, never raises).
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        _max = args.get("max_items")
+        try:
+            _max = int(_max) if _max is not None else None
+        except (TypeError, ValueError):
+            _max = None
+        try:
+            summary = await store.resolve_zotero_edges(
+                args["project_id"], max_items=_max,
+            )
+        except Exception as exc:  # noqa: BLE001 — the pass is best-effort
+            return {"error": f"could not resolve citations: {exc}"}
+        return {"project_id": args["project_id"], **summary}
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)

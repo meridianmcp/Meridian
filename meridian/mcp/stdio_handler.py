@@ -1758,6 +1758,7 @@ def build_mcp_server():
                 "update_md_section",
                 "list_sessions",
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
+                "get_citation_edges", "resolve_citations",
                 "add_workspace_note", "get_workspace_notes",
                 "pin_workspace_decision", "get_workspace_decisions",
             ):
