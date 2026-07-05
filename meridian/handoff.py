@@ -1373,6 +1373,9 @@ _SPRINT_GUARD_SH = """#!/usr/bin/env bash
 # c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
 # session from stopping while this project has pending sprint items. Fails OPEN.
 # This is NOT hooks.sh (the token-rotation installer).
+# b4ce3274 — bounded retry ceiling: the server stops reporting pending>0 for a
+# session after MERIDIAN_STOP_OVERRIDE_CEILING forced continuations, so this
+# guard then lets the stop through (exit 0) instead of blocking forever.
 set -uo pipefail
 PROJECT_ID="__PROJECT_ID__"
 MERIDIAN_URL="${MERIDIAN_URL:-__URL__}"
@@ -1380,7 +1383,12 @@ payload="$(cat 2>/dev/null || true)"
 if printf '%s' "$payload" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then
   exit 0
 fi
-resp="$(curl -sf --max-time 5 "$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count" 2>/dev/null || true)"
+# b4ce3274 — forward the session id (if the hook payload carries one) so the
+# override budget is counted per session, not per project.
+sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"session_id"[[:space:]]*:[[:space:]]*"([^"]*)".*/\\1/' || true)"
+url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count"
+[ -n "$sid" ] && url="$url?session_id=$sid"
+resp="$(curl -sf --max-time 5 "$url" 2>/dev/null || true)"
 [ -z "$resp" ] && exit 0
 pending="$(printf '%s' "$resp" | grep -oE '"pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
 [ -z "$pending" ] && exit 0
@@ -1388,26 +1396,43 @@ if [ "$pending" -gt 0 ] 2>/dev/null; then
   echo "Meridian: $pending sprint item(s) still pending — complete or skip them (complete_sprint_item) before stopping." >&2
   exit 2
 fi
+# pending==0: either genuinely done, or the stop-override ceiling was reached —
+# surface the ceiling case so the human/agent knows to generate a delta handoff.
+if printf '%s' "$resp" | grep -Eq '"stopped_at_ceiling"[[:space:]]*:[[:space:]]*true'; then
+  echo "Meridian: stop-override ceiling reached — allowing stop despite pending items; generate a delta handoff." >&2
+fi
 exit 0
 """
 
 _SPRINT_GUARD_PS1 = """# c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
 # session from stopping while this project has pending sprint items. Fails OPEN.
 # This is NOT hooks.ps1 (the token-rotation installer).
+# b4ce3274 — bounded retry ceiling: after MERIDIAN_STOP_OVERRIDE_CEILING forced
+# continuations the server reports pending 0 + stopped_at_ceiling, so this guard
+# lets the stop through instead of blocking forever.
 $ErrorActionPreference = 'SilentlyContinue'
 $ProjectId = '__PROJECT_ID__'
 $Url = if ($env:MERIDIAN_URL) { $env:MERIDIAN_URL } else { '__URL__' }
 $raw = [Console]::In.ReadToEnd()
 try { $payload = $raw | ConvertFrom-Json } catch { $payload = $null }
 if ($payload -and $payload.stop_hook_active -eq $true) { exit 0 }
+# b4ce3274 — forward the session id (when present) so the override budget is
+# counted per session, not per project.
+$reqUrl = "$Url/projects/$ProjectId/sprint/pending_count"
+if ($payload -and $payload.session_id) {
+    $reqUrl = "$reqUrl?session_id=$([uri]::EscapeDataString([string]$payload.session_id))"
+}
 try {
-    $r = Invoke-RestMethod -Method GET -Uri "$Url/projects/$ProjectId/sprint/pending_count" -TimeoutSec 5
+    $r = Invoke-RestMethod -Method GET -Uri $reqUrl -TimeoutSec 5
 } catch { exit 0 }
 if ($null -eq $r -or $null -eq $r.pending_count) { exit 0 }
 $pending = [int]$r.pending_count
 if ($pending -gt 0) {
     [Console]::Error.WriteLine("Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping.")
     exit 2
+}
+if ($r.stopped_at_ceiling -eq $true) {
+    [Console]::Error.WriteLine("Meridian: stop-override ceiling reached - allowing stop despite pending items; generate a delta handoff.")
 }
 exit 0
 """
