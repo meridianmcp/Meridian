@@ -1192,6 +1192,47 @@ def _managed_bin_dir() -> "Path":
     return Path.home() / ".meridian" / "bin"
 
 
+def _win_shell_safe_path(path: str) -> str:
+    """Make *path* safe to pass as a single token through mcp-proxy ``--shell``
+    on Windows (89bc72c4).
+
+    mcp-proxy's ``--shell`` hands the inner command to ``cmd.exe``, which splits
+    unquoted arguments on spaces. A binary path with a space — e.g. the
+    auto-downloaded ``C:\\Users\\John Smith\\.meridian\\bin\\codebase-memory-mcp.exe``
+    — is therefore truncated at the first space, so ``cmd.exe`` tries to run
+    ``C:\\Users\\John`` and fails with WinError 3, "The system cannot find the
+    path specified". This is why the code-intel slot failed to launch while the
+    filesystem / Office / extractor slots (whose inner token is a bare npm
+    package name or a space-free path) came up clean.
+
+    Fix: when the path contains a space, resolve it to its 8.3 short-name form
+    (``GetShortPathNameW``), which is space-free and understood by ``cmd.exe``.
+    This preserves the required ``--shell`` spawn for native ``.exe`` binaries
+    (mcp-proxy/Node can't always spawn them directly) *and* for ``.cmd`` shims.
+
+    Fail-soft: on any non-Windows platform, a space-free path, a nonexistent
+    path, or a volume with 8.3 name generation disabled (short-name lookup
+    returns empty / raises), the original *path* is returned unchanged — the
+    caller is no worse off than before this guard existed.
+    """
+    if sys.platform != "win32" or not path or " " not in path:
+        return path
+    try:
+        import ctypes  # Windows-only stdlib; imported lazily so non-win32 is untouched.
+
+        _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW  # type: ignore[attr-defined]
+        buf = ctypes.create_unicode_buffer(512)
+        n = _GetShortPathNameW(path, buf, len(buf))
+        # n == 0 → failure (path missing / 8.3 disabled); n > len → buffer too small.
+        if 0 < n < len(buf):
+            short = buf.value
+            if short and " " not in short:
+                return short
+    except Exception:  # noqa: BLE001 — any failure: fall back to the original path.
+        pass
+    return path
+
+
 def _find_codebase_memory_mcp() -> str | None:
     """Return path to codebase-memory-mcp, checking PATH, npm global, then managed dir.
 
@@ -1356,6 +1397,14 @@ def _build_code_proxy_command(
     shell (``--shell``) — mcp-proxy's direct spawn hits EINVAL under Node 24's
     CVE-2024-27980 mitigation. A real ``.exe`` spawns directly (and preserves
     support for paths with spaces), so ``--shell`` is added only for shims.
+
+    89bc72c4 — under ``--shell`` cmd.exe splits args on spaces, so a *binary*
+    path containing a space (e.g. a user whose home is ``C:\\Users\\John Smith``)
+    was truncated and spawned as ``C:\\Users\\John`` → WinError 3, "The system
+    cannot find the path specified". That was the isolated cause of the code-intel
+    slot failing to launch while the space-free / bare-package slots came up clean.
+    We now resolve the binary to its 8.3 short-name form when it contains a space
+    (:func:`_win_shell_safe_path`), which is space-safe for cmd.exe.
     """
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
            "--server", "stream", "--stateless"]
@@ -1363,10 +1412,11 @@ def _build_code_proxy_command(
         # Always add --shell on Windows: mcp-proxy (Node.js) cannot spawn .exe
         # binaries directly in some environments (missing DLL PATH, Node spawn
         # restrictions). cmd.exe handles resolution reliably. Mirrors the FS slot's
-        # unconditional --shell. Limitation: paths with spaces in them won't work
-        # via --shell (cmd.exe splits on spaces); .cmd shims need shell anyway per
-        # Node 24 CVE-2024-27980.
+        # unconditional --shell. A space in the binary path would be split by
+        # cmd.exe, so make it shell-safe (8.3 short path); .cmd shims need shell
+        # anyway per Node 24 CVE-2024-27980. (89bc72c4)
         cmd.append("--shell")
+        binary = _win_shell_safe_path(binary)
     cmd += ["--", binary]
     return cmd
 
@@ -2566,6 +2616,19 @@ async def run_tunnel(
             if managed_bin not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = managed_bin + os.pathsep + os.environ.get("PATH", "")
             cmd_code = _build_code_proxy_command(npx, code_binary, code_port)
+            # 89bc72c4 — the command builder makes a spaced binary path safe for
+            # cmd.exe via its 8.3 short name. If the resolved inner token STILL
+            # contains a space (8.3 generation disabled on the volume), the slot
+            # would hit WinError 3 on spawn — warn so it's diagnosable rather than
+            # a silent dead dot. Mirrors the FS slot's _unservable_roots warning.
+            if sys.platform == "win32" and " " in cmd_code[-1]:
+                print(
+                    "  code-intel: WARNING binary path contains a space and no 8.3 "
+                    f"short name was available — {cmd_code[-1]!r}. The slot may fail "
+                    "to launch (cmd.exe splits on spaces). Install codebase-memory-mcp "
+                    "under a space-free path, or enable 8.3 name generation.",
+                    flush=True, file=sys.stderr,
+                )
             print(f"  code-intel:        lazy-spawn on port {code_port}", flush=True)
             proxy_code = SlotProxy(cmd_code, code_port, "code")
             slot_proxies.append(proxy_code)

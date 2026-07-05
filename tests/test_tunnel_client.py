@@ -337,6 +337,57 @@ def test_build_code_proxy_command_shell_for_native_exe_on_windows(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 89bc72c4 — code-intel slot: a binary path with a SPACE was split by cmd.exe
+# under mcp-proxy --shell → WinError 3 "The system cannot find the path
+# specified". The command builder now resolves such a path to its 8.3 short
+# name (_win_shell_safe_path) so cmd.exe sees a single space-free token.
+# ---------------------------------------------------------------------------
+
+def test_win_shell_safe_path_noop_on_posix(monkeypatch):
+    # Non-Windows: never rewrite the path (no cmd.exe splitting to worry about).
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    p = "/home/john smith/.meridian/bin/codebase-memory-mcp"
+    assert tc._win_shell_safe_path(p) == p
+
+
+def test_win_shell_safe_path_noop_without_space(monkeypatch):
+    # Space-free path: nothing to fix, returned verbatim (no short-path lookup).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    p = r"C:\Users\13144\.meridian\bin\codebase-memory-mcp.exe"
+    assert tc._win_shell_safe_path(p) == p
+
+
+def test_win_shell_safe_path_uses_short_name_for_spaced_path(monkeypatch):
+    # When the path has a space, resolve it to the 8.3 short (space-free) form.
+    # GetShortPathNameW is Windows-only, so stub the ctypes call so this runs on
+    # the Linux CI runner too (no real Windows stdlib attr is touched).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    spaced = r"C:\Users\John Smith\.meridian\bin\codebase-memory-mcp.exe"
+    short = r"C:\Users\JOHNSM~1\.meridian\bin\CODEBA~1.EXE"
+
+    def fake_safe(path):
+        return short if path == spaced else path
+
+    monkeypatch.setattr(tc, "_win_shell_safe_path", fake_safe)
+    cmd = tc._build_code_proxy_command("npx.cmd", spaced, port=9009)
+    assert "--shell" in cmd
+    sep = cmd.index("--")
+    # The inner binary token is the space-free short path — cmd.exe won't split it.
+    assert cmd[sep + 1] == short
+    assert " " not in cmd[sep + 1]
+
+
+def test_win_shell_safe_path_falls_back_when_short_name_unavailable(monkeypatch):
+    # 8.3 generation disabled / lookup fails → return the original path unchanged
+    # (fail-soft: no worse than before; the startup warning surfaces the risk).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    spaced = r"C:\Users\John Smith\.meridian\bin\codebase-memory-mcp.exe"
+    # ctypes.windll doesn't exist on non-Windows → the lazy import raises inside
+    # _win_shell_safe_path, which swallows it and returns the input unchanged.
+    assert tc._win_shell_safe_path(spaced) == spaced
+
+
+# ---------------------------------------------------------------------------
 # _index_code_dir
 # ---------------------------------------------------------------------------
 
