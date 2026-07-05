@@ -1,0 +1,43 @@
+{
+  "packageId": "us.usemeridian.twa",
+  "host": "usemeridian.us",
+  "name": "Meridian",
+  "launcherName": "Meridian",
+  "display": "standalone",
+  "themeColor": "#4a9eff",
+  "themeColorDark": "#0d0f12",
+  "navigationColor": "#0d0f12",
+  "navigationColorDark": "#0d0f12",
+  "navigationDividerColor": "#0d0f12",
+  "navigationDividerColorDark": "#0d0f12",
+  "backgroundColor": "#0d0f12",
+  "enableNotifications": false,
+  "startUrl": "https://usemeridian.us/dashboard",
+  "iconUrl": "https://usemeridian.us/static/icon-512.png",
+  "maskableIconUrl": "https://usemeridian.us/static/icon-512.png",
+  "splashScreenFadeOutDuration": 300,
+  "signingKey": {
+    "path": "./android.keystore",
+    "alias": "meridian"
+  },
+  "appVersionName": "1",
+  "appVersionCode": 1,
+  "shortcuts": [],
+  "generatorApp": "bubblewrap-cli",
+  "webManifestUrl": "https://usemeridian.us/manifest.webmanifest",
+  "fallbackType": "customtabs",
+  "features": {},
+  "alphaDependencies": {
+    "enabled": false
+  },
+  "enableSiteSettingsShortcut": true,
+  "isChromeOSOnly": false,
+  "isMetaQuest": false,
+  "fullScopeUrl": "https://usemeridian.us/",
+  "minSdkVersion": 21,
+  "orientation": "default",
+  "fingerprints": [],
+  "additionalTrustedOrigins": [],
+  "retainedBundles": [],
+  "appVersion": "1"
+}
