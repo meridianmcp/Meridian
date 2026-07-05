@@ -2018,6 +2018,77 @@ async def test_search_all_multiword_terms_across_fields(db):
     assert any(i["title"] == "RAG evaluation harness" for i in result2["sprint_items"])
 
 
+# ---------------------------------------------------------------------------
+# 82e0b887 — Postgres tsvector full-text search (search_all / search_tasks).
+#   On PG, search matches stemmed / morphological word forms via
+#   websearch_to_tsquery + ts_rank. The SQLite path stays pure substring
+#   keyword matching (no stemming). These tests prove both:
+#     * SQLite: a stemmed non-substring query does NOT match (behavior
+#       unchanged — keyword semantics only).
+#     * Postgres (gated on TEST_DATABASE_URL, skips cleanly otherwise): the
+#       same stemmed query DOES match where the old substring-AND missed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_all_sqlite_no_stemming_still_keyword(db):
+    """82e0b887 — the SQLite path is unchanged: it matches substrings only, no
+    stemming. A morphological query ("authenticating user") must NOT match a
+    note body reading "authentication for the users" (neither "authenticating"
+    nor "user" is a substring of the stored text) — that stemmed match is a
+    Postgres-only capability. Guards that the tsvector branch didn't leak into
+    the SQLite keyword path."""
+    p = await db_module.create_project(db, "sa-sqlite-nostem")
+    await db_module.add_project_note(
+        db, p["id"], "Auth design", "authentication for the users")
+    # Substring keyword query DOES match (path works as before).
+    hit = await db_module.search_all(db, p["id"], "authentication users")
+    assert any(n["title"] == "Auth design" for n in hit["notes"])
+    # Stemmed / non-substring query does NOT match on SQLite (no FTS).
+    miss = await db_module.search_all(db, p["id"], "authenticating user")
+    assert not any(n["title"] == "Auth design" for n in miss["notes"])
+
+
+@pytest.mark.asyncio
+async def test_search_all_pg_tsvector_stemmed_match(db_pg):
+    """82e0b887 — on Postgres, search_all matches a STEMMED / non-substring
+    query via websearch_to_tsquery. A note body "authentication for the users"
+    is found by the query "authenticating user" — the exact substrings
+    "authenticating"/"user" never appear, so the old substring-AND (and the
+    SQLite path) return zero. SKIPS cleanly when TEST_DATABASE_URL is unset."""
+    db = db_pg
+    p = await db_module.create_project(db, "sa-pg-tsvector")
+    await db_module.add_project_note(
+        db, p["id"], "Auth design", "authentication for the users")
+    result = await db_module.search_all(db, p["id"], "authenticating user")
+    assert any(n["title"] == "Auth design" for n in result["notes"]), (
+        "tsvector should stem 'authenticating'->'authentication' and match")
+    # Also confirm the other content types stem: a decision body.
+    await db_module.pin_decision(
+        db, p["id"], "Retry policy",
+        "the workers retry failed jobs with backoff", "TECHNICAL")
+    dres = await db_module.search_all(db, p["id"], "retrying worker")
+    assert any(d["title"] == "Retry policy" for d in dres["decisions"]), (
+        "tsvector should stem 'retrying'->'retry', 'worker'->'workers'")
+
+
+@pytest.mark.asyncio
+async def test_search_tasks_pg_tsvector_stemmed_match(db_pg):
+    """82e0b887 — search_tasks on Postgres additively matches stemmed queries
+    via the tsvector predicate OR'd alongside pg_trgm similarity(). A task
+    "authentication for the users" is returned for query "authenticating user"
+    even though similarity() alone would likely fall below the 0.05 trigram
+    threshold for a non-substring form. SKIPS when TEST_DATABASE_URL is unset."""
+    db = db_pg
+    p = await db_module.create_project(db, "st-pg-tsvector")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db_module.log_task(
+        db, s["id"], p["id"], "authentication for the users", "done")
+    results = await db_module.search_tasks(db, p["id"], "authenticating user")
+    assert any("authentication" in r["description"].lower() for r in results), (
+        "tsvector predicate should widen search_tasks to stemmed matches")
+
+
 @pytest.mark.asyncio
 async def test_get_project_notes_query_searches_body(db):
     """get_project_notes query= searches body text, not just tags."""

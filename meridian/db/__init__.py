@@ -2824,11 +2824,13 @@ async def search_tasks(
 ) -> list[dict[str, Any]]:
     """Full-text task search.
 
-    Postgres: uses pg_trgm similarity() — no ML model required, fast on the
-    GIN index added by _migrate_pg_v27_pg_trgm. Falls back to ILIKE when
-    the query is too short for trigrams (< 3 chars).
+    Postgres: uses pg_trgm similarity() for ranking — no ML model required,
+    fast on the GIN index added by _migrate_pg_v27_pg_trgm — OR'd with a
+    multiword ILIKE term-match and (82e0b887) an on-the-fly tsvector full-text
+    predicate so stemmed / non-substring queries also match. Ordering is
+    similarity DESC, ts_rank DESC, created_at DESC.
 
-    SQLite: simple LIKE wildcard match on description.
+    SQLite: keyword substring term-match on description (unchanged).
 
     Returns [{id, description, status, created_at, similarity, session_name}].
     """
@@ -2839,6 +2841,12 @@ async def search_tasks(
         # still orders results; the term-match just widens the candidate set.
         match_sql, match_params = _multiword_match_clause(
             ["t.description"], query, op="ILIKE")
+        # 82e0b887 — additively widen the candidate set with tsvector full-text
+        # match so stemmed / morphological queries ("authenticating users" vs a
+        # task "authentication for the user") also match. websearch_to_tsquery
+        # tolerates arbitrary user input without raising. similarity() still
+        # drives ordering (trigram score); ts_rank is a secondary tiebreak so
+        # rows matched purely by FTS (similarity 0) still order sensibly.
         sql = (
             "SELECT t.id, t.description, t.status, t.created_at, "
             "s.name AS session_name, "
@@ -2846,10 +2854,17 @@ async def search_tasks(
             "FROM task_log t "
             "LEFT JOIN sessions s ON s.id = t.session_id "
             "WHERE t.project_id = ? "
-            f"AND (similarity(t.description, ?) > 0.05 OR {match_sql}) "
-            "ORDER BY similarity DESC, t.created_at DESC LIMIT ?"
+            "AND (similarity(t.description, ?) > 0.05 "
+            "OR to_tsvector('english', coalesce(t.description,'')) "
+            "@@ websearch_to_tsquery('english', ?) "
+            f"OR {match_sql}) "
+            "ORDER BY similarity DESC, "
+            "ts_rank(to_tsvector('english', coalesce(t.description,'')), "
+            "websearch_to_tsquery('english', ?)) DESC, "
+            "t.created_at DESC LIMIT ?"
         )
-        params: tuple = (query, project_id, query, *match_params, limit)
+        params: tuple = (
+            query, project_id, query, query, *match_params, query, limit)
     else:
         match_sql, match_params = _multiword_match_clause(["t.description"], query)
         sql = (
@@ -2912,9 +2927,13 @@ async def search_all(
       - decisions_pinned.title + decisions_pinned.body
       - sprint_items.title + sprint_items.notes
 
-    SQLite: LIKE %query% on all relevant text fields.
-    Postgres: ILIKE on all relevant text fields (portable across both backends;
-    pg_trgm/tsvector are Postgres-only so we keep to ILIKE here for parity).
+    SQLite: keyword match — every whitespace-separated query term must appear
+    (as a substring) in one of the text fields (see _multiword_match_clause).
+    Postgres (82e0b887): on-the-fly tsvector full-text search via
+    websearch_to_tsquery, ordered by ts_rank. Stemming/word-form tolerance
+    means "authenticating users" matches "authentication for the user" — which
+    the SQLite substring path cannot. Zero schema / zero index (evaluated per
+    query).
 
     Returns grouped results: {tasks, notes, decisions, sprint_items}.
     Each item includes a ``match_type`` key for the source table and a
@@ -2930,44 +2949,102 @@ async def search_all(
             rows = await cur.fetchall()
         return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
-    # fcf90f3a — AND the query terms across each content type's text fields so a
-    # multi-word query matches rows containing every term (not only the exact
-    # contiguous phrase). op is ILIKE on PG / LIKE on SQLite, so the rest of the
-    # SQL is shared instead of duplicated per backend.
-    m_task, p_task = _multiword_match_clause(["description"], query, op=op)
-    m_note, p_note = _multiword_match_clause(["title", "body"], query, op=op)
-    m_dec, p_dec = _multiword_match_clause(["title", "body"], query, op=op)
-    m_sprint, p_sprint = _multiword_match_clause(["title", "notes"], query, op=op)
+    if is_pg:
+        # 82e0b887 — Postgres full-text search. The keyword AND-of-substrings
+        # path (below, SQLite) can't stem or cross word forms: querying
+        # "authenticating users" misses a note reading "authentication for the
+        # user". On PG we build an on-the-fly tsvector over each content type's
+        # text field(s) and match with websearch_to_tsquery (which tolerates
+        # arbitrary punctuation/user input without raising), then rank by
+        # ts_rank so the most relevant rows surface first. Zero schema / zero
+        # index — the expression is evaluated per query. 'english' regconfig
+        # matches the pg_trgm/English assumption already used by search_tasks.
+        #
+        # Param order per type is: <tsvector-query>, <existing filters incl.
+        # project_id>, <ts_rank-query>, <limit>. The predicate's ? comes first
+        # in the SQL, the ORDER BY ts_rank ? comes last before LIMIT — the
+        # params tuple below mirrors that exactly.
+        def _tsv(*cols: str) -> str:
+            expr = " || ' ' || ".join(f"coalesce({c},'')" for c in cols)
+            return f"to_tsvector('english', {expr})"
 
-    tasks_sql = (
-        "SELECT id, description, status, created_at, 'task' AS match_type "
-        "FROM task_log "
-        f"WHERE project_id = ? AND {m_task} "
-        "ORDER BY created_at DESC LIMIT ?"
-    )
-    notes_sql = (
-        "SELECT id, title, body, tags, created_at, 'note' AS match_type "
-        "FROM project_notes "
-        f"WHERE project_id = ? AND {m_note} "
-        "ORDER BY created_at DESC LIMIT ?"
-    )
-    decisions_sql = (
-        "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
-        "FROM decisions_pinned "
-        f"WHERE project_id = ? AND status = 'active' AND {m_dec} "
-        "ORDER BY created_at DESC LIMIT ?"
-    )
-    sprint_sql = (
-        "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
-        "FROM sprint_items "
-        f"WHERE project_id = ? AND {m_sprint} "
-        "ORDER BY added_at DESC LIMIT ?"
-    )
+        tv_task = _tsv("description")
+        tv_note = _tsv("title", "body")
+        tv_dec = _tsv("title", "body")
+        tv_sprint = _tsv("title", "notes")
 
-    tasks = await _search(tasks_sql, (project_id, *p_task, limit))
-    notes = await _search(notes_sql, (project_id, *p_note, limit))
-    decisions = await _search(decisions_sql, (project_id, *p_dec, limit))
-    sprint_items = await _search(sprint_sql, (project_id, *p_sprint, limit))
+        tasks_sql = (
+            "SELECT id, description, status, created_at, 'task' AS match_type "
+            "FROM task_log "
+            f"WHERE project_id = ? AND {tv_task} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_task}, websearch_to_tsquery('english', ?)) DESC, "
+            "created_at DESC LIMIT ?"
+        )
+        notes_sql = (
+            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+            "FROM project_notes "
+            f"WHERE project_id = ? AND {tv_note} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_note}, websearch_to_tsquery('english', ?)) DESC, "
+            "created_at DESC LIMIT ?"
+        )
+        decisions_sql = (
+            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+            "FROM decisions_pinned "
+            "WHERE project_id = ? AND status = 'active' "
+            f"AND {tv_dec} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_dec}, websearch_to_tsquery('english', ?)) DESC, "
+            "created_at DESC LIMIT ?"
+        )
+        sprint_sql = (
+            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "FROM sprint_items "
+            f"WHERE project_id = ? AND {tv_sprint} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_sprint}, websearch_to_tsquery('english', ?)) DESC, "
+            "added_at DESC LIMIT ?"
+        )
+
+        tasks = await _search(tasks_sql, (project_id, query, query, limit))
+        notes = await _search(notes_sql, (project_id, query, query, limit))
+        decisions = await _search(decisions_sql, (project_id, query, query, limit))
+        sprint_items = await _search(sprint_sql, (project_id, query, query, limit))
+    else:
+        # fcf90f3a — SQLite keyword path (unchanged). AND the query terms across
+        # each content type's text fields so a multi-word query matches rows
+        # containing every term (not only the exact contiguous phrase).
+        m_task, p_task = _multiword_match_clause(["description"], query, op=op)
+        m_note, p_note = _multiword_match_clause(["title", "body"], query, op=op)
+        m_dec, p_dec = _multiword_match_clause(["title", "body"], query, op=op)
+        m_sprint, p_sprint = _multiword_match_clause(["title", "notes"], query, op=op)
+
+        tasks_sql = (
+            "SELECT id, description, status, created_at, 'task' AS match_type "
+            "FROM task_log "
+            f"WHERE project_id = ? AND {m_task} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        notes_sql = (
+            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+            "FROM project_notes "
+            f"WHERE project_id = ? AND {m_note} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        decisions_sql = (
+            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+            "FROM decisions_pinned "
+            f"WHERE project_id = ? AND status = 'active' AND {m_dec} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        sprint_sql = (
+            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "FROM sprint_items "
+            f"WHERE project_id = ? AND {m_sprint} "
+            "ORDER BY added_at DESC LIMIT ?"
+        )
+
+        tasks = await _search(tasks_sql, (project_id, *p_task, limit))
+        notes = await _search(notes_sql, (project_id, *p_note, limit))
+        decisions = await _search(decisions_sql, (project_id, *p_dec, limit))
+        sprint_items = await _search(sprint_sql, (project_id, *p_sprint, limit))
 
     # Attach a body-text snippet for each result so the dashboard search bar can
     # surface matching context. The body field name differs per content type.
