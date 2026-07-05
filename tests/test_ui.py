@@ -875,3 +875,108 @@ def test_code_intel_architecture_charts(js):
 
     # Graceful fallback: a raw-JSON view is always available.
     assert "raw JSON" in js, "raw fallback view missing"
+
+
+# ---------------------------------------------------------------------------
+# b03be6a6 — Minimal installable PWA: manifest + icons + network-first SW.
+# ---------------------------------------------------------------------------
+
+
+def test_pwa_service_worker_served_at_root(client):
+    """b03be6a6 — /sw.js is served at the site root with a JS content-type.
+
+    Root scope ("/") is required so the worker can control /dashboard; a SW
+    mounted under /static would only scope to /static/*.
+    """
+    r = client.get("/sw.js")
+    assert r.status_code == 200, f"expected 200 for /sw.js, got {r.status_code}"
+    ctype = r.headers.get("content-type", "")
+    assert "javascript" in ctype.lower(), f"sw.js must be JS, got {ctype!r}"
+    # Root-scope enablement header (belt-and-suspenders).
+    assert r.headers.get("service-worker-allowed") == "/", (
+        "sw.js must advertise Service-Worker-Allowed: / for root scope"
+    )
+
+
+def test_pwa_service_worker_is_network_first(client):
+    """b03be6a6 (HARD REQUIREMENT) — the SW must be network-first, not cache-first.
+
+    Dashboard edits must show up on next open with zero rebuild/republish, so
+    the fetch handler must call fetch(request) *before* any caches.match(), and
+    it must not precache the HTML/JS app shell.
+    """
+    body = client.get("/sw.js").text
+    assert "install" in body and "skipWaiting" in body, "install must skipWaiting"
+    assert "clients.claim" in body, "activate must clients.claim()"
+
+    # fetch() must appear before caches.match() — the defining ordering of a
+    # network-first worker.
+    fetch_idx = body.find("fetch(request)")
+    match_idx = body.find("caches.match")
+    assert fetch_idx != -1, "SW must call fetch(request)"
+    assert match_idx != -1, "SW must fall back to caches.match on failure"
+    assert fetch_idx < match_idx, (
+        "network-first violated: fetch(request) must come before caches.match "
+        "(b03be6a6)"
+    )
+
+    # The app shell must NOT be precached — no HTML/JS/CSS in the SW's cache list.
+    assert "/dashboard" not in body, "SW must not cache the dashboard HTML shell"
+    assert ".bundle.js" not in body and "dashboard.css" not in body, (
+        "SW must not precache the JS/CSS app shell (would break live-edit)"
+    )
+    assert "b03be6a6" in body, "SW must carry the sprint-item tag"
+
+
+def test_pwa_manifest_served_with_icons(client):
+    """b03be6a6 — /manifest.webmanifest returns 200 with the manifest media type
+    and declares both the 192 and 512 icons."""
+    r = client.get("/manifest.webmanifest")
+    assert r.status_code == 200, f"expected 200, got {r.status_code}"
+    ctype = r.headers.get("content-type", "")
+    assert "manifest" in ctype.lower(), f"unexpected manifest content-type {ctype!r}"
+
+    data = r.json()
+    assert data["name"] == "Meridian"
+    assert data["short_name"] == "Meridian"
+    assert data["display"] == "standalone"
+    assert data["start_url"] == "/dashboard", "start_url must open the dashboard"
+
+    sizes = {icon["sizes"] for icon in data["icons"]}
+    assert "192x192" in sizes and "512x512" in sizes, "both icon sizes required"
+    purposes = {icon.get("purpose", "") for icon in data["icons"]}
+    assert any("maskable" in p for p in purposes), "a maskable icon entry is required"
+
+
+def test_pwa_icons_are_pngs(client):
+    """b03be6a6 — both icons return 200 with image/png (no byte-content assertion)."""
+    for size in (192, 512):
+        r = client.get(f"/static/icon-{size}.png")
+        assert r.status_code == 200, f"icon-{size}.png missing"
+        assert r.headers.get("content-type", "").startswith("image/png"), (
+            f"icon-{size}.png must be served as image/png"
+        )
+        # Valid PNG magic bytes (not an exact-content assertion).
+        assert r.content[:8] == bytes((0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)), (
+            "not a valid PNG"
+        )
+
+
+def test_pwa_dashboard_head_wires_manifest_and_sw(soup, html):
+    """b03be6a6 — the dashboard <head> links the manifest, sets theme-color, and
+    registers the service worker inline (in the template, not the TS bundle)."""
+    manifest_link = soup.find("link", rel="manifest")
+    assert manifest_link is not None, "dashboard must <link rel=manifest>"
+    assert manifest_link.get("href") == "/manifest.webmanifest"
+
+    theme = soup.find("meta", attrs={"name": "theme-color"})
+    assert theme is not None and theme.get("content"), "theme-color meta required"
+
+    apple = soup.find("link", rel="apple-touch-icon")
+    assert apple is not None, "apple-touch-icon link required for iOS install"
+
+    # SW registration is inline in the HTML (no bundle rebuild needed).
+    assert "serviceWorker" in html, "SW registration guard missing"
+    assert "navigator.serviceWorker.register('/sw.js'" in html, (
+        "dashboard must register /sw.js"
+    )

@@ -758,7 +758,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/setup/health", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/setup/health", "/static", "/sw.js", "/manifest.webmanifest", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -1317,6 +1317,54 @@ async def favicon() -> Response:
     tags already point modern browsers at /static/logo.svg.)
     """
     return RedirectResponse(url="/static/logo.svg", status_code=301)
+
+
+# ---------------------------------------------------------------------------
+# b03be6a6 — Minimal installable PWA (manifest + service worker).
+#
+# The service worker's scope is limited to the directory it is served from, so
+# to control /dashboard it MUST be served at the ROOT (/sw.js → scope "/"). The
+# static mount lives at /static, whose scope would only cover /static/*, so we
+# expose sw.js and the manifest via explicit root routes here. The underlying
+# files live in meridian/static/ alongside the rest of the assets.
+#
+# The SW itself is deliberately NETWORK-FIRST (see sw.js) so dashboard edits show
+# up on next open with no rebuild/republish. These routes send no-cache headers
+# too, so a fresh sw.js is always fetched.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/sw.js")
+async def service_worker() -> Response:
+    """b03be6a6 — serve the PWA service worker at the site root.
+
+    Root scope ("/") is required so the worker can control /dashboard. The
+    ``Service-Worker-Allowed: /`` header is belt-and-suspenders; serving from /
+    already yields root scope. Sent no-cache so the network-first SW itself is
+    never pinned to a stale version.
+    """
+    from fastapi.responses import FileResponse  # noqa: PLC0415
+
+    return FileResponse(
+        _resource_path("meridian/static/sw.js"),
+        media_type="text/javascript",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Service-Worker-Allowed": "/",
+        },
+    )
+
+
+@app.get("/manifest.webmanifest")
+async def web_manifest() -> Response:
+    """b03be6a6 — serve the web app manifest at the site root (PWA installability)."""
+    from fastapi.responses import FileResponse  # noqa: PLC0415
+
+    return FileResponse(
+        _resource_path("meridian/static/manifest.webmanifest"),
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 @app.get("/sitemap.xml")
