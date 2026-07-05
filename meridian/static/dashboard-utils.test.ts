@@ -65,6 +65,39 @@ describe("sessionAgeMs / isLiveSession", () => {
   });
 });
 
+// 59ab2f9f — Recent Runs "live" fallback consistency. loadRecentRuns' dur
+// fallback previously showed "live" forever on any run with duration_s === null
+// and raw status === 'running', ignoring the session's status and any recency
+// window. The fix reuses isLiveSession on the run's SessionLike projection
+// ({ status: run.session_status, last_seen: run.started_at }) so it matches the
+// displayRunStatus cross-check. These tests pin that projection's behaviour.
+describe("Recent Runs live fallback (59ab2f9f)", () => {
+  // Mirror the exact mapping the dur fallback applies to a run row.
+  const runIsLive = (run: { session_status?: string | null; started_at?: string | null }) =>
+    isLiveSession({ status: run.session_status, last_seen: run.started_at });
+
+  it("is NOT live for a stale run (duration null, started long ago) even when raw status is running", () => {
+    // Session went inactive and the run started well outside the live window.
+    const stale = { status: "running", session_status: "idle", started_at: "2000-01-01 00:00:00", duration_s: null };
+    expect(runIsLive(stale)).toBe(false);
+  });
+
+  it("is NOT live when the session is still active but the run is outside the recency window", () => {
+    const old = new Date(Date.now() - (SESSION_LIVE_WINDOW_MS + 60_000)).toISOString();
+    expect(runIsLive({ session_status: "active", started_at: old })).toBe(false);
+  });
+
+  it("is live for a fresh run whose session is still active", () => {
+    const recent = new Date(Date.now() - 1_000).toISOString();
+    expect(runIsLive({ session_status: "active", started_at: recent })).toBe(true);
+  });
+
+  it("is NOT live when the session status is missing", () => {
+    const recent = new Date(Date.now() - 1_000).toISOString();
+    expect(runIsLive({ session_status: null, started_at: recent })).toBe(false);
+  });
+});
+
 describe("_colorForHuman", () => {
   it("returns a palette color, stable per id", () => {
     const c = _colorForHuman("alice");

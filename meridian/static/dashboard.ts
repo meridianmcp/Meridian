@@ -8775,11 +8775,18 @@ async function loadRecentRuns(projectId: any) {
 
       const ts = (run.started_at || '').slice(0, 16).replace('T', ' ');
 
+      // 59ab2f9f — the "live" fallback must match displayRunStatus's liveness
+      // logic: cross-check the session's status AND a recency window (via
+      // isLiveSession), not just the raw run.status. Otherwise a run whose
+      // duration_s is null (never finalized) shows "live" forever even after
+      // its session went inactive / the run went stale. Map the run onto the
+      // SessionLike shape isLiveSession expects: session_status (same field
+      // displayRunStatus checks) + started_at as the recency timestamp.
       const dur = run.duration_s != null
 
         ? (run.duration_s < 60 ? `${run.duration_s}s` : `${Math.round(run.duration_s / 60)}m`)
 
-        : (run.status === 'running' ? 'live' : '—');
+        : (isLiveSession({ status: run.session_status, last_seen: run.started_at }) ? 'live' : '—');
 
       const cnt = run.task_count || 0;
 

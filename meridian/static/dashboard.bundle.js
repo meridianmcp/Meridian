@@ -13218,7 +13218,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const sid = (run.session_id || "").slice(0, 8);
         const runLabel = run.session_name || sid;
         const ts = (run.started_at || "").slice(0, 16).replace("T", " ");
-        const dur = run.duration_s != null ? run.duration_s < 60 ? `${run.duration_s}s` : `${Math.round(run.duration_s / 60)}m` : run.status === "running" ? "live" : "\u2014";
+        const dur = run.duration_s != null ? run.duration_s < 60 ? `${run.duration_s}s` : `${Math.round(run.duration_s / 60)}m` : isLiveSession({ status: run.session_status, last_seen: run.started_at }) ? "live" : "\u2014";
         const cnt = run.task_count || 0;
         const displayRunStatus = run.status === "running" && run.session_status && run.session_status !== "active" ? "done" : run.status;
         const statusColor = displayRunStatus === "running" ? "var(--accent)" : displayRunStatus === "failed" ? "var(--danger,#e05)" : "var(--muted)";
