@@ -22,7 +22,7 @@ jobs:
       - name: Install UPX (binary compression)
         run: choco install upx -y --no-progress
       - name: Build Windows executable
-        run: pixi run build-exe
+        run: pixi run -e dev build-exe
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
@@ -40,7 +40,7 @@ jobs:
       - name: Install UPX (binary compression)
         run: sudo apt-get update && sudo apt-get install -y upx-ucl
       - name: Build Linux executable
-        run: pixi run build-exe
+        run: pixi run -e dev build-exe
       - name: Stage artifact
         run: cp dist/meridian dist/meridian-linux
       - name: Upload Linux artifact
@@ -58,7 +58,7 @@ jobs:
           pixi-version: latest
           cache: true
       - name: Build macOS arm64 executable
-        run: pixi run build-exe
+        run: pixi run -e dev build-exe
       - name: Stage artifact
         run: cp dist/meridian dist/meridian-mac-arm64
       - name: Upload macOS arm64 artifact
@@ -76,7 +76,7 @@ jobs:
           pixi-version: latest
           cache: true
       - name: Build macOS x86_64 executable
-        run: pixi run build-exe
+        run: pixi run -e dev build-exe
       - name: Stage artifact
         run: cp dist/meridian dist/meridian-mac-x86_64
       - name: Upload macOS x86_64 artifact
@@ -107,7 +107,7 @@ jobs:
           pixi-version: latest
           cache: true
       - name: Build meridian-connect
-        run: pixi run build-connect
+        run: pixi run -e dev build-connect
       - name: Stage artifact (Unix)
         if: runner.os != 'Windows'
         run: mv dist/meridian-connect ${{ matrix.artifact }}
