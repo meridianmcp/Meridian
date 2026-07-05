@@ -295,6 +295,75 @@ def test_dashboard_js_has_github_connect_card(js):
     assert "Connect GitHub repo" in js
 
 
+# 8201de19 — the Meridian Connect panel must offer direct per-platform binary
+# downloads for the tunnel connector ("meridian-connect") as a fallback when the
+# install.ps1 / install.sh one-liner 404s. These asset names MUST match
+# .github/workflows/release.yml exactly or the download links 404.
+_MERIDIAN_CONNECT_ASSETS = [
+    "meridian-connect-x86_64-windows.exe",
+    "meridian-connect-aarch64-apple-darwin",
+    "meridian-connect-x86_64-apple-darwin",
+    "meridian-connect-x86_64-unknown-linux",
+    "meridian-connect-aarch64-unknown-linux",
+]
+_MERIDIAN_RELEASES_BASE = (
+    "https://github.com/meridianmcp/Meridian/releases/latest/download"
+)
+
+
+def test_connect_panel_has_direct_binary_download_links(js):
+    """The Connect panel exposes direct release-asset download URLs for all five
+    platforms, pointing at meridianmcp/Meridian's latest release (8201de19)."""
+    # The GitHub repo slug used by every download URL + install.ps1.
+    assert "meridianmcp/Meridian/releases/latest/download" in js, (
+        "Connect panel must link at the meridianmcp/Meridian latest-release asset path"
+    )
+    # The releases base path used to build every download href.
+    assert _MERIDIAN_RELEASES_BASE in js, (
+        "Connect panel must reference the latest-release download base URL"
+    )
+    # A labelled fallback section, shown alongside (not replacing) the one-liner.
+    assert "Direct binary download (if the install script fails)" in js
+    # Each of the five per-platform assets is present with its exact release name.
+    # (The href is built as `${base}/${asset}` so we assert the base + each asset
+    # rather than the pre-concatenated string, which the source never spells out.)
+    for asset in _MERIDIAN_CONNECT_ASSETS:
+        assert asset in js, f"Connect panel missing tunnel binary asset {asset!r}"
+    # The install-script one-liner must still be present (fallback is additive).
+    assert "install.ps1" in js and "install.sh" in js
+
+
+def test_connect_panel_asset_names_match_release_workflow():
+    """The download asset names in the dashboard must exactly match the artifact
+    names published by the release workflow — a mismatch silently 404s (8201de19)."""
+    from pathlib import Path
+
+    release_yml = (
+        Path(__file__).parent.parent / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    for asset in _MERIDIAN_CONNECT_ASSETS:
+        assert asset in release_yml, (
+            f"release.yml no longer publishes {asset!r} — dashboard download link "
+            "would 404; update both together."
+        )
+
+
+def test_connect_download_urls_in_built_bundle():
+    """The rebuilt esbuild bundle (what actually ships) contains the five download
+    URLs, so the fallback survives bundling (8201de19)."""
+    from pathlib import Path
+
+    bundle = (
+        Path(__file__).parent.parent
+        / "meridian"
+        / "static"
+        / "dashboard.bundle.js"
+    ).read_text(encoding="utf-8")
+    assert "meridianmcp/Meridian/releases/latest/download" in bundle
+    for asset in _MERIDIAN_CONNECT_ASSETS:
+        assert asset in bundle, f"built bundle missing download asset {asset!r}"
+
+
 def test_signout_link_created_unconditionally_for_hosted_users(js, client):
     """Item 42 — Free-tier sign-out regression.
 
