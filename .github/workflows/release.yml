@@ -89,9 +89,13 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-20.04
+          # ef162c28-adjacent fix: ubuntu-20.04 runners were retired by GitHub
+          # (jobs queued forever, blocking the release job); ubuntu-22.04-arm64 is
+          # a non-standard label — GitHub's public ARM Linux runner is
+          # `ubuntu-22.04-arm`. Corrected so the build-connect matrix can complete.
+          - os: ubuntu-22.04
             artifact: meridian-connect-x86_64-unknown-linux
-          - os: ubuntu-22.04-arm64
+          - os: ubuntu-22.04-arm
             artifact: meridian-connect-aarch64-unknown-linux
           - os: macos-14
             artifact: meridian-connect-aarch64-apple-darwin
