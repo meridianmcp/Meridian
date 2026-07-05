@@ -57,6 +57,23 @@ _SAMPLE_TEX = r"""
 """
 
 
+# A .tex with in-text citations (fefb596a): one resolvable (knuth1984 -> a real
+# \bibitem) and one dangling (missing_key -> no matching bib entry).
+_CITE_TEX = r"""
+\documentclass{article}
+\begin{document}
+\section{Introduction}
+As shown \cite{knuth1984} and also \citep{missing_key}.
+\section{Results}
+Confirmed by \citet{lamport1994}.
+\begin{thebibliography}{9}
+\bibitem{knuth1984} Donald Knuth. The TeXbook. 1984.
+\bibitem{lamport1994} Leslie Lamport. LaTeX. 1994.
+\end{thebibliography}
+\end{document}
+"""
+
+
 def _synthetic_docx() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -184,6 +201,40 @@ def test_elements_from_latex_analysis_headings_and_bibliography():
     assert len(biblio) == 1
     assert biblio[0]["ref"] == "knuth1984"
     assert biblio[0]["parent_ordinal"] is None
+
+
+def test_elements_from_latex_analysis_emits_citation_elements(tmp_path):
+    """fefb596a: citation markers become kind='citation' elements whose
+    parent_ordinal points at the enclosing section's heading element."""
+    from meridian.latex_intel import analyze_latex
+    analysis = analyze_latex(_CITE_TEX)
+    elements = doc_store.elements_from_latex_analysis(analysis)
+    by_kind: dict[str, list] = {}
+    for e in elements:
+        by_kind.setdefault(e["kind"], []).append(e)
+
+    headings = by_kind["section"]
+    citations = by_kind["citation"]
+    biblio = by_kind["bibliography"]
+
+    # Two sections: Introduction (ordinal 0), Results (ordinal 1).
+    assert [h["text"] for h in headings] == ["Introduction", "Results"]
+    intro_ord = headings[0]["ordinal"]
+    results_ord = headings[1]["ordinal"]
+
+    # Three citation elements: text = raw marker, ref = key, level None.
+    assert {c["ref"] for c in citations} == {"knuth1984", "missing_key", "lamport1994"}
+    assert all(c["level"] is None for c in citations)
+    assert all(c["text"].startswith("\\cite") for c in citations)
+    by_ref = {c["ref"]: c for c in citations}
+    # knuth1984 + missing_key are in the Introduction section.
+    assert by_ref["knuth1984"]["parent_ordinal"] == intro_ord
+    assert by_ref["missing_key"]["parent_ordinal"] == intro_ord
+    # lamport1994 is in the Results section.
+    assert by_ref["lamport1994"]["parent_ordinal"] == results_ord
+
+    # Bibliography still emitted (flat roots), keyed by citation key.
+    assert {b["ref"] for b in biblio} == {"knuth1984", "lamport1994"}
 
 
 def test_elements_from_empty_outline_is_empty():
@@ -339,6 +390,154 @@ def test_store_persists_real_docx_outline_end_to_end(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# doc_edges — intra-document citation graph (fefb596a)
+# ---------------------------------------------------------------------------
+
+def test_put_document_materializes_resolved_and_dangling_citation_edges(tmp_path):
+    """A citation whose key matches a local bib entry yields a resolved 'cites'
+    edge; a citation with no matching bib entry stays a dangling element (no
+    edge)."""
+    async def _run():
+        from meridian.latex_intel import analyze_latex
+        store = await _open_store(tmp_path)
+        try:
+            analysis = analyze_latex(_CITE_TEX)
+            elements = doc_store.elements_from_latex_analysis(analysis)
+            doc = await store.put_document(
+                "proj-1", "latex", elements, source="paper.tex",
+            )
+
+            edges = await store.get_edges("proj-1", document_id=doc["id"])
+            # Two resolvable citations (knuth1984, lamport1994) -> two edges.
+            # missing_key is dangling -> no edge.
+            assert len(edges) == 2
+            by_ref = {e["target_ref"]: e for e in edges}
+            assert set(by_ref) == {"knuth1984", "lamport1994"}
+            for edge in edges:
+                assert edge["edge_kind"] == "cites"
+                assert edge["target_kind"] == "bibentry"
+                assert edge["target_element_id"] is not None
+                assert edge["resolved_at"] is not None
+                assert edge["target_document_id"] is None
+                assert edge["project_id"] == "proj-1"
+
+            # The dangling citation element is still stored (honest), just edge-less.
+            struct = await store.get_structure("proj-1", "paper.tex")
+            cite_refs = {
+                e["ref"] for e in struct["elements"] if e["kind"] == "citation"
+            }
+            assert cite_refs == {"knuth1984", "missing_key", "lamport1994"}
+
+            # Each edge's source element is the matching citation element; the
+            # target element is the bibliography element with the same key.
+            els_by_id = {e["id"]: e for e in struct["elements"]}
+            for ref, edge in by_ref.items():
+                src_el = els_by_id[edge["source_element_id"]]
+                tgt_el = els_by_id[edge["target_element_id"]]
+                assert src_el["kind"] == "citation" and src_el["ref"] == ref
+                assert tgt_el["kind"] == "bibliography" and tgt_el["ref"] == ref
+
+            # get_edges source_element_id filter narrows to one edge.
+            knuth_src = next(
+                e["id"] for e in struct["elements"]
+                if e["kind"] == "citation" and e["ref"] == "knuth1984"
+            )
+            one = await store.get_edges("proj-1", source_element_id=knuth_src)
+            assert len(one) == 1 and one[0]["target_ref"] == "knuth1984"
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_put_document_case_insensitive_key_match(tmp_path):
+    """Citation key matching a bib entry is case-insensitive exact."""
+    async def _run():
+        store = await _open_store(tmp_path)
+        try:
+            elements = [
+                {"ordinal": 0, "level": 2, "kind": "section", "text": "S",
+                 "ref": None, "parent_ordinal": None},
+                {"ordinal": 1, "level": None, "kind": "citation",
+                 "text": r"\cite{Knuth1984}", "ref": "Knuth1984",
+                 "parent_ordinal": 0},
+                {"ordinal": 2, "level": None, "kind": "bibliography",
+                 "text": "Knuth", "ref": "knuth1984", "parent_ordinal": None},
+            ]
+            doc = await store.put_document(
+                "proj-1", "latex", elements, source="c.tex",
+            )
+            edges = await store.get_edges("proj-1", document_id=doc["id"])
+            assert len(edges) == 1
+            assert edges[0]["target_ref"] == "Knuth1984"
+            assert edges[0]["resolved_at"] is not None
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_put_document_upsert_replaces_edges_no_orphans(tmp_path):
+    """Re-storing the same source replaces edges — no duplicate/orphan rows."""
+    async def _run():
+        from meridian.latex_intel import analyze_latex
+        store = await _open_store(tmp_path)
+        try:
+            elements = doc_store.elements_from_latex_analysis(
+                analyze_latex(_CITE_TEX)
+            )
+            doc1 = await store.put_document(
+                "proj-1", "latex", elements, source="paper.tex",
+            )
+            edges1 = await store.get_edges("proj-1", document_id=doc1["id"])
+            assert len(edges1) == 2
+
+            # Re-store the SAME source (upsert). Edges must be replaced, not
+            # accumulated, and no orphan rows pointing at deleted elements remain.
+            doc2 = await store.put_document(
+                "proj-1", "latex", elements, source="paper.tex",
+            )
+            assert doc2["id"] == doc1["id"]
+
+            # Exactly one document; exactly two edges (no duplicates).
+            assert len(await store.list_documents("proj-1")) == 1
+            edges2 = await store.get_edges("proj-1", document_id=doc2["id"])
+            assert len(edges2) == 2
+
+            # Every remaining edge's source element still exists (no orphans).
+            struct = await store.get_structure("proj-1", "paper.tex")
+            live_ids = {e["id"] for e in struct["elements"]}
+            all_edges = await store.get_edges("proj-1")
+            assert len(all_edges) == 2
+            assert all(e["source_element_id"] in live_ids for e in all_edges)
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_delete_document_removes_edges(tmp_path):
+    """Deleting a document leaves no orphan edges."""
+    async def _run():
+        from meridian.latex_intel import analyze_latex
+        store = await _open_store(tmp_path)
+        try:
+            elements = doc_store.elements_from_latex_analysis(
+                analyze_latex(_CITE_TEX)
+            )
+            await store.put_document(
+                "proj-1", "latex", elements, source="paper.tex",
+            )
+            assert len(await store.get_edges("proj-1")) == 2
+            assert await store.delete_document("proj-1", "paper.tex") is True
+            assert await store.get_edges("proj-1") == []
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # open_doc_store_for — factory + cache
 # ---------------------------------------------------------------------------
 
@@ -439,6 +638,95 @@ def test_ingest_persists_structure_into_default_store(tmp_path, monkeypatch):
             assert [e["text"] for e in struct["elements"]] == [
                 "Introduction", "Design", "Results",
             ]
+        finally:
+            await db.close()
+            await ds_mod.close_all_doc_stores()
+
+    asyncio.run(_run())
+
+
+def test_ingest_tex_persists_citations_and_edges_end_to_end(tmp_path, monkeypatch):
+    """fefb596a end-to-end: ingesting a .tex with in-text citations persists the
+    citation elements AND materializes the resolved citation->bibentry edges via
+    the default (tier-resolved) store, with no MCP/handler change required."""
+    async def _run():
+        from meridian import server as mh
+        from meridian import doc_store as ds_mod
+
+        ds_mod._reset_doc_store_cache()
+        monkeypatch.delenv("MERIDIAN_DOC_STORE_URL", raising=False)
+        db = await db_module.init_db(":memory:")
+        try:
+            proj = await db_module.create_project(db, "ingest-cites")
+            tex_path = tmp_path / "paper.tex"
+            tex_path.write_text(_CITE_TEX, encoding="utf-8")
+
+            # .tex is not server-side EXTRACTED (only .txt/.md/.docx are), so the
+            # supported ingest path passes the raw source as `content` alongside a
+            # `.tex` file_path — the flat note is stored from content, and the
+            # structure/citation persistence re-parses the .tex on disk.
+            res = await mh._dispatch_mcp_tool(
+                "ingest_document",
+                {"project_id": proj["id"], "file_path": str(tex_path),
+                 "content": _CITE_TEX, "title": "Paper"},
+                db, str(tmp_path),
+            )
+            assert "error" not in res
+
+            store = await ds_mod.open_doc_store_for(
+                plan=None, hosted=False, data_dir=str(tmp_path),
+                tenant_pg_url=None, override_url=None,
+            )
+            struct = await store.get_structure(proj["id"], str(tex_path))
+            assert struct is not None
+            cite_refs = {
+                e["ref"] for e in struct["elements"] if e["kind"] == "citation"
+            }
+            assert cite_refs == {"knuth1984", "missing_key", "lamport1994"}
+
+            edges = await store.get_edges(
+                proj["id"], document_id=struct["document"]["id"]
+            )
+            assert {e["target_ref"] for e in edges} == {"knuth1984", "lamport1994"}
+            assert all(e["edge_kind"] == "cites" for e in edges)
+            assert all(e["resolved_at"] is not None for e in edges)
+        finally:
+            await db.close()
+            await ds_mod.close_all_doc_stores()
+
+    asyncio.run(_run())
+
+
+def test_ingest_tex_survives_citation_path_failure(tmp_path, monkeypatch):
+    """Best-effort: if the citation-emission path raises, ingest still succeeds
+    (the flat kind='document' note is produced, no error surfaced)."""
+    async def _run():
+        from meridian import server as mh
+        from meridian import doc_store as ds_mod
+
+        ds_mod._reset_doc_store_cache()
+        monkeypatch.delenv("MERIDIAN_DOC_STORE_URL", raising=False)
+
+        # Force the latex element mapper to explode mid-ingest.
+        def _boom(_analysis):
+            raise RuntimeError("citation path down")
+
+        monkeypatch.setattr(ds_mod, "elements_from_latex_analysis", _boom)
+        db = await db_module.init_db(":memory:")
+        try:
+            proj = await db_module.create_project(db, "ingest-cite-guard")
+            tex_path = tmp_path / "paper.tex"
+            tex_path.write_text(_CITE_TEX, encoding="utf-8")
+
+            res = await mh._dispatch_mcp_tool(
+                "ingest_document",
+                {"project_id": proj["id"], "file_path": str(tex_path),
+                 "content": _CITE_TEX, "title": "Paper"},
+                db, str(tmp_path),
+            )
+            # Ingest still produced the note — the citation-path failure is swallowed.
+            assert "error" not in res
+            assert res.get("id")
         finally:
             await db.close()
             await ds_mod.close_all_doc_stores()

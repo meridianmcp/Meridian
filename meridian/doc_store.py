@@ -89,10 +89,35 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         ref TEXT
     )
     """,
+    # Third self-contained table (fefb596a): a citation/reference *graph* over the
+    # stored elements. Today it holds intra-document ``cites`` edges from a
+    # ``kind='citation'`` element to a matching local ``kind='bibliography'``
+    # entry; the ``target_kind`` / ``target_document_id`` columns leave room for
+    # the future cross-document (Zotero / document / element) resolver without a
+    # schema change. Same self-contained pattern as the two tables above — created
+    # here by ``ensure_schema``, deliberately OUTSIDE the main migration machinery.
+    """
+    CREATE TABLE IF NOT EXISTS doc_edges (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        source_element_id TEXT NOT NULL,
+        edge_kind TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        target_ref TEXT,
+        target_element_id TEXT,
+        target_document_id TEXT,
+        resolved_at TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_doc_documents_project_source "
     "ON doc_documents (project_id, source)",
     "CREATE INDEX IF NOT EXISTS idx_doc_elements_document_ordinal "
     "ON doc_elements (document_id, ordinal)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_edges_project_kind "
+    "ON doc_edges (project_id, edge_kind)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_edges_source_element "
+    "ON doc_edges (source_element_id)",
 )
 
 
@@ -124,6 +149,11 @@ _DOC_COLUMNS = (
 )
 _ELEMENT_COLUMNS = (
     "id", "document_id", "parent_id", "ordinal", "level", "kind", "text", "ref",
+)
+_EDGE_COLUMNS = (
+    "id", "project_id", "source_element_id", "edge_kind", "target_kind",
+    "target_ref", "target_element_id", "target_document_id", "resolved_at",
+    "created_at",
 )
 
 # Sentinel level for a heading dict that carries no usable level. Deliberately
@@ -175,18 +205,33 @@ def elements_from_latex_analysis(analysis: dict[str, Any]) -> list[dict[str, Any
     """Map :func:`latex_intel.analyze_latex` output to store elements.
 
     ``analysis`` is ``{heading_count, headings:[{level, kind, text}], tree,
-    bibliography:[{key, ...}], ...}``. Headings become elements keyed by
-    heading-level nesting (like the docx path); the ``kind`` preserves the LaTeX
-    sectioning command (``section`` / ``subsection`` / …) and ``ref`` is left
-    ``None`` (LaTeX headings carry no stable id). Bibliography entries are
-    appended as flat ``kind='bibliography'`` root elements (``ref`` = citation
-    key), after the heading tree, so the whole parsed structure is persisted.
+    bibliography:[{key, ...}], citations:[{key, marker_text, section_ordinal}],
+    ...}``. Emission order (so parent/citation edges resolve on store):
+
+    1. **Headings** — nested by heading-level (like the docx path); ``kind``
+       preserves the LaTeX sectioning command (``section`` / ``subsection`` / …)
+       and ``ref`` is ``None`` (LaTeX headings carry no stable id).
+    2. **Citations** (fefb596a) — one ``kind='citation'`` element per in-text
+       citation key, ``text`` = the raw marker (``\\cite{..}``), ``ref`` = the
+       citation key, ``level=None``, ``parent_ordinal`` = the ordinal of the
+       enclosing section's heading element (mapped from ``section_ordinal``;
+       ``None`` if the citation precedes any heading). Interleaving them by their
+       enclosing section keeps parent edges consistent with the heading tree.
+    3. **Bibliography** — flat ``kind='bibliography'`` root elements (``ref`` =
+       citation key) after the heading/citation elements, so the whole parsed
+       structure — and the citation→bibentry edges materialised on store — is
+       persisted.
     """
     headings = (analysis or {}).get("headings") or []
     elements: list[dict[str, Any]] = []
     stack: list[tuple[int, int]] = []
     ordinal = 0
-    for h in headings:
+    # Map a heading's document-order index (the ``section_ordinal`` the citation
+    # parser reports) to the ordinal we assign that heading element here. They are
+    # identical today (headings are appended first, in order), but the explicit map
+    # keeps citation parent resolution correct even if that ever changes.
+    section_ordinal_to_element_ordinal: dict[int, int] = {}
+    for heading_index, h in enumerate(headings):
         level = h.get("level")
         # NB: LaTeX \part is a legitimate level 0, so a missing level must NOT
         # fall back to 0 (that would masquerade as a top-level part) — use the
@@ -195,6 +240,7 @@ def elements_from_latex_analysis(analysis: dict[str, Any]) -> list[dict[str, Any
         while stack and stack[-1][1] >= lvl:
             stack.pop()
         parent_ordinal = stack[-1][0] if stack else None
+        section_ordinal_to_element_ordinal[heading_index] = ordinal
         elements.append(
             {
                 "ordinal": ordinal,
@@ -206,6 +252,26 @@ def elements_from_latex_analysis(analysis: dict[str, Any]) -> list[dict[str, Any
             }
         )
         stack.append((ordinal, lvl))
+        ordinal += 1
+
+    citations = (analysis or {}).get("citations") or []
+    for cite in citations:
+        section_ordinal = cite.get("section_ordinal")
+        parent_ordinal = (
+            section_ordinal_to_element_ordinal.get(section_ordinal)
+            if isinstance(section_ordinal, int)
+            else None
+        )
+        elements.append(
+            {
+                "ordinal": ordinal,
+                "level": None,
+                "kind": "citation",
+                "text": cite.get("marker_text", ""),
+                "ref": cite.get("key"),
+                "parent_ordinal": parent_ordinal,
+            }
+        )
         ordinal += 1
 
     bibliography = (analysis or {}).get("bibliography") or []
@@ -301,6 +367,73 @@ class DocStructureStore:
             "DELETE FROM doc_elements WHERE document_id = ?", (document_id,)
         )
 
+    async def _delete_edges_for_document(self, document_id: str) -> None:
+        """Delete every edge whose source element belongs to ``document_id``.
+
+        Edges reference their source only by ``source_element_id`` (there is no
+        ``document_id`` column on ``doc_edges``), so a document's edges are the
+        ones whose source element is (or was) one of its elements. We delete via a
+        subquery over ``doc_elements`` *before* the elements themselves are
+        removed on an upsert, so no stale/orphan edges survive a re-store.
+        """
+        await self._db.execute(
+            "DELETE FROM doc_edges WHERE source_element_id IN "
+            "(SELECT id FROM doc_elements WHERE document_id = ?)",
+            (document_id,),
+        )
+
+    async def _materialize_citation_edges(
+        self, project_id: str, prepared: list[dict[str, Any]], now: str
+    ) -> None:
+        """Derive intra-document ``cites`` edges from an element list (in-process).
+
+        For each ``kind='citation'`` element, look for a ``kind='bibliography'``
+        element in the SAME element set whose ``ref`` matches the citation's
+        ``ref`` (case-insensitive exact citation-key match). On a match, insert a
+        resolved ``doc_edges`` row (``edge_kind='cites'``, ``target_kind='bibentry'``,
+        ``target_element_id`` = the bib element's id, ``resolved_at`` = ``now``).
+        A citation with NO matching bib entry is a DANGLING marker: the citation
+        element is kept by the caller, but NO edge is written (honest — we never
+        fabricate a target). ``prepared`` elements already carry assigned ``id``s.
+        """
+        # Index bibliography elements by normalised ref (lowercased, trimmed key).
+        bib_by_ref: dict[str, str] = {}
+        for el in prepared:
+            if el.get("kind") == "bibliography":
+                ref = el.get("ref")
+                if isinstance(ref, str) and ref.strip():
+                    # First writer wins on a duplicate key (stable, deterministic).
+                    bib_by_ref.setdefault(ref.strip().lower(), el["id"])
+
+        for el in prepared:
+            if el.get("kind") != "citation":
+                continue
+            ref = el.get("ref")
+            key = ref.strip().lower() if isinstance(ref, str) and ref.strip() else None
+            target_element_id = bib_by_ref.get(key) if key else None
+            if target_element_id is None:
+                # Dangling citation — keep the element, write no edge.
+                continue
+            await self._db.execute(
+                "INSERT INTO doc_edges "
+                "(id, project_id, source_element_id, edge_kind, target_kind, "
+                "target_ref, target_element_id, target_document_id, resolved_at, "
+                "created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    uuid.uuid4().hex,
+                    project_id,
+                    el["id"],
+                    "cites",
+                    "bibentry",
+                    ref,
+                    target_element_id,
+                    None,
+                    now,
+                    now,
+                ),
+            )
+
     # -- write ---------------------------------------------------------------
 
     async def put_document(
@@ -344,6 +477,9 @@ class DocStructureStore:
         if existing is not None:
             doc_id = existing["id"]
             created_at = existing.get("created_at") or now
+            # Drop old edges FIRST (subquery over the still-present elements), then
+            # the elements + doc row, so an upsert leaves no stale/orphan edges.
+            await self._delete_edges_for_document(doc_id)
             await self._delete_elements(doc_id)
             await self._db.execute(
                 "DELETE FROM doc_documents WHERE id = ?", (doc_id,)
@@ -394,6 +530,12 @@ class DocStructureStore:
                 ),
             )
 
+        # Materialise intra-document citation edges as a side-effect of storing the
+        # elements (self-healing, same best-effort contract). On a resolvable
+        # (source) upsert the old edges were already dropped above; on an anonymous
+        # store the fresh doc_id guarantees no pre-existing edges to collide with.
+        await self._materialize_citation_edges(project_id, prepared, now)
+
         await self._db.commit()
         stored = await self._fetch_document_row(project_id, src) if src else None
         if stored is not None:
@@ -440,6 +582,45 @@ class DocStructureStore:
         elements = [_row_to_dict(r, _ELEMENT_COLUMNS) for r in rows]
         return {"document": doc, "elements": elements}
 
+    async def get_edges(
+        self,
+        project_id: str,
+        *,
+        source_element_id: str | None = None,
+        document_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return citation/reference edges for a project (fefb596a).
+
+        Filters (all optional, ANDed):
+
+        * ``source_element_id`` — only edges originating from that element.
+        * ``document_id`` — only edges whose source element belongs to that
+          document (joined via ``doc_elements`` since ``doc_edges`` stores the
+          source only by element id).
+
+        Rows are ordered by ``created_at`` then ``id`` for a stable result and
+        materialised into plain dicts over :data:`_EDGE_COLUMNS`.
+        """
+        clauses = ["project_id = ?"]
+        params: list[Any] = [project_id]
+        if source_element_id is not None:
+            clauses.append("source_element_id = ?")
+            params.append(source_element_id)
+        if document_id is not None:
+            clauses.append(
+                "source_element_id IN "
+                "(SELECT id FROM doc_elements WHERE document_id = ?)"
+            )
+            params.append(document_id)
+        sql = (
+            "SELECT * FROM doc_edges WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at ASC, id ASC"
+        )
+        async with self._db.execute(sql, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_dict(r, _EDGE_COLUMNS) for r in rows]
+
     async def list_documents(self, project_id: str) -> list[dict[str, Any]]:
         """Return all stored document headers for a project (newest first)."""
         async with self._db.execute(
@@ -451,10 +632,13 @@ class DocStructureStore:
         return [_row_to_dict(r, _DOC_COLUMNS) for r in rows]
 
     async def delete_document(self, project_id: str, source: str) -> bool:
-        """Delete a document (and its elements) by source. Return True if removed."""
+        """Delete a document (its elements + edges) by source. Return True if removed."""
         doc = await self.get_document(project_id, source)
         if doc is None:
             return False
+        # Drop edges FIRST (subquery over the still-present elements) so deleting a
+        # document leaves no orphan edges behind.
+        await self._delete_edges_for_document(doc["id"])
         await self._delete_elements(doc["id"])
         await self._db.execute(
             "DELETE FROM doc_documents WHERE id = ?", (doc["id"],)
