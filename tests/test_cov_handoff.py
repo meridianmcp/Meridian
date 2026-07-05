@@ -1045,6 +1045,96 @@ async def test_generate_handoff_no_completed_items_no_retrospective(db, tmp_path
     assert notes == []
 
 
+# ---------------------------------------------------------------------------
+# 78ebc812 — _annotate_touches_files persists to touches_resources (the column
+# that actually exists), not the phantom touches_files column.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_annotate_touches_files_writes_touches_resources(db, tmp_path, monkeypatch):
+    """The auto-inferred file match round-trips: _annotate_touches_files must
+    persist typed touches_resources ids that get_sprint_items reads back — the
+    old touches_files UPDATE targeted a non-existent column and failed silently."""
+    import subprocess as _subprocess
+
+    class _R:
+        stdout = "meridian/pg_adapter.py\n"
+
+    monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _R())
+
+    p = await db_module.create_project(db, "touches-proj")
+    it = await db_module.add_sprint_item(
+        db, p["id"], "v1", "rewrite pg_adapter cursor handling"
+    )
+
+    pending = [{"id": it["id"], "title": "rewrite pg_adapter cursor handling",
+                "status": "pending"}]
+    out = await handoff_module._annotate_touches_files(db, p["id"], pending)
+
+    # In-memory annotation set the typed, provenance-marked resource id.
+    assert out[0]["touches_resources"]
+    assert "inferred:file:meridian/pg_adapter.py" in out[0]["touches_resources"]
+
+    # And it actually persisted — get_sprint_items reads it back (previously the
+    # write hit a phantom touches_files column and silently no-op'd).
+    items = await db_module.get_sprint_items(db, p["id"])
+    stored = next(i for i in items if i["id"] == it["id"])
+    resources = db_module.parse_touches_resources(stored.get("touches_resources"))
+    assert "file:meridian/pg_adapter.py" in resources
+
+
+# ---------------------------------------------------------------------------
+# 093d55e0 — retrospective idempotency keys on the sprint VERSION, not the
+# verbose (drift-prone) sprint description embedded in the note title.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retrospective_idempotent_across_sprint_text_drift(db, tmp_path):
+    """Two retro persists for the SAME sprint version but DIFFERENT sprint text
+    (which drifts the rendered title) must update ONE note in place, not insert a
+    duplicate. Previously the title-embedded verbose description broke the match."""
+    p = await db_module.create_project(db, "retro-drift")
+
+    # First persist: verbose sprint description A.
+    await handoff_module._persist_sprint_retrospective(
+        db, p["id"], "v0.2.x — wire tunnel, add graph searcher, ship docs",
+        "RETRO BODY A", version=7,
+    )
+    # Second persist: SAME version, reworded/expanded description (title drifts).
+    await handoff_module._persist_sprint_retrospective(
+        db, p["id"],
+        "v0.2.x — wire tunnel; add graph searcher; ship docs; fix flaky test",
+        "RETRO BODY B", version=7,
+    )
+
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 1  # updated in place, not duplicated
+    assert notes[0]["body"] == "RETRO BODY B"
+    # The stable per-version tag is present so future runs match regardless of drift.
+    assert "retro:v7" in (notes[0].get("tags") or "")
+
+
+@pytest.mark.asyncio
+async def test_retrospective_distinct_versions_are_separate_notes(db, tmp_path):
+    """Different sprint versions get their own retro notes (the stable key is
+    per-version, so it must not collapse distinct sprints into one)."""
+    p = await db_module.create_project(db, "retro-versions")
+    await handoff_module._persist_sprint_retrospective(
+        db, p["id"], "v1 sprint", "BODY V1", version=1,
+    )
+    await handoff_module._persist_sprint_retrospective(
+        db, p["id"], "v2 sprint", "BODY V2", version=2,
+    )
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 2
+
+
 @pytest.mark.asyncio
 async def test_generate_handoff_planner_mode_full_content(db, tmp_path):
     """Planner mode emits a directive planning prompt: tool-order protocol,

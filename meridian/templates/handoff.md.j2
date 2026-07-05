@@ -65,6 +65,10 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 {% if pending_sprint_items -%}
 **Pending Sprint Items:**
 
+{% if code_pointer_skip_reason -%}
+_⚠ {{ code_pointer_skip_reason }}._
+
+{% endif -%}
 {% for it in pending_sprint_items -%}
 {{ loop.index }}. [{{ it.status }}] {{ it.title }}{% if it.item_group %} _({{ it.item_group }})_{% endif %}{% if it.version %} — version {{ it.version }}{% endif %}{% if it.possibly_done %} ⚠ _possibly done — verify before executing_{% endif %}
 {% if it.depends_on %}   Depends on item {{ it.dependency_position or "?" }} (`{{ it.depends_on }}`){% if it.dependency_title %}: {{ it.dependency_title }}{% endif %}{% if it.dependency_status %} — currently {{ it.dependency_status }}{% endif %}

@@ -833,9 +833,17 @@ async def _annotate_touches_files(
     project_id: str,
     pending_items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Auto-set touches_files on pending items whose title keywords match recently
-    changed files (git diff --name-only HEAD~3). Persists the match to the DB so
-    start_session file_warnings can reference it. Safe to skip on error."""
+    """Auto-set touches_resources on pending items whose title keywords match
+    recently changed files (git diff --name-only HEAD~3). Persists the match to
+    the DB so start_session file_warnings can reference it. Safe to skip on error.
+
+    78ebc812 — the write previously targeted a ``touches_files`` column that does
+    NOT exist on this schema (only the SQLite legacy migration ever added it; the
+    Postgres side has ``touches_resources`` only, so the UPDATE failed silently on
+    prod under the guarded except). Matched paths are now stored as typed
+    ``touches_resources`` identifiers (``inferred:file:<path>``) — the canonical,
+    conflict-aware format read by get_sprint_items / get_parallelizable_groups —
+    reusing the existing column (no new column / migration)."""
     import subprocess  # noqa: PLC0415
     try:
         result = subprocess.run(
@@ -849,7 +857,7 @@ async def _annotate_touches_files(
         return pending_items
 
     for item in pending_items:
-        if item.get("touches_files"):
+        if item.get("touches_resources"):
             continue
         title_kws = _extract_keywords(item.get("title") or "")
         if len(title_kws) < 2:
@@ -865,11 +873,18 @@ async def _annotate_touches_files(
             elif len(title_kws & path_kws) >= 2:
                 matched.append(fpath)
         if matched:
-            touches = json.dumps(matched[:10])
-            item["touches_files"] = touches
+            # Store as typed, provenance-marked resource ids so the value round-
+            # trips through parse/serialize_touches_resources and participates in
+            # conflict detection. serialize_touches_resources normalizes + dedupes.
+            inferred = [f"inferred:file:{fpath}" for fpath in matched[:10]]
+            touches = db_module.serialize_touches_resources(inferred)
+            if not touches:
+                continue
+            item["touches_resources"] = touches
             try:
                 async with db.execute(
-                    "UPDATE sprint_items SET touches_files = ? WHERE id = ? AND project_id = ?",
+                    "UPDATE sprint_items SET touches_resources = ? "
+                    "WHERE id = ? AND project_id = ?",
                     (touches, item["id"], project_id),
                 ) as _:
                     pass
@@ -1299,6 +1314,20 @@ def _retro_note_title(sprint: str | None) -> str:
     return f"Sprint Retrospective — {label}"
 
 
+def _retro_stable_tag(version: Any) -> str:
+    """093d55e0 — stable idempotency key for a sprint's retrospective note.
+
+    The retro note is keyed on the sprint *version* (a monotonic goal_states
+    version, not the free-form sprint description). This tag is stored alongside
+    RETRO_NOTE_TAGS so the SAME version's retro is UPDATED in place regardless of
+    how the sprint text / rendered title drifts between handoffs. Matching on the
+    verbose title (the old behaviour) broke on any wording/whitespace change and
+    inserted duplicates.
+    """
+    label = str(version if version is not None else "unversioned").strip() or "unversioned"
+    return f"retro:v{label}"
+
+
 def _retro_shipped_lines(completed_items: list[dict[str, Any]]) -> list[str]:
     lines: list[str] = []
     for it in completed_items[:20]:
@@ -1413,22 +1442,38 @@ async def _persist_sprint_retrospective(
     project_id: str,
     sprint: str | None,
     body: str,
+    version: Any = None,
 ) -> dict[str, Any] | None:
     """Idempotently store the retrospective as a strategic insight note (one per
-    sprint title): update the existing note in place, else insert. Guarded by the
-    caller; returns the note row or None."""
+    sprint *version*): update the existing note in place, else insert. Guarded by
+    the caller; returns the note row or None.
+
+    093d55e0 — the update-lookup matches on the stable per-version tag
+    (:func:`_retro_stable_tag`), NOT the rendered title. ``goal.sprint`` is a
+    free-form description that drifts as items are added / reworded / respaced;
+    matching on the title-embedded description missed the existing note on any
+    drift and inserted a duplicate (observed: 5 near-duplicate v0.2.x retros).
+    The version is stable across text edits, so the same version's retro is now
+    updated in place. The human-readable title still embeds the sprint text for
+    display — only the match key changed.
+    """
     title = _retro_note_title(sprint)
+    stable_tag = _retro_stable_tag(version)
     existing = await db_module.get_project_notes(
         db, project_id, tag="retrospective", bodies=False
     )
-    match = next((n for n in existing if (n.get("title") or "") == title), None)
+    match = next(
+        (n for n in existing if stable_tag in (n.get("tags") or "")), None
+    )
     if match is not None:
+        # Refresh the title too so a renamed sprint's retro shows the new label,
+        # while the stable tag keeps the note singular per version.
         return await db_module.update_project_note(
-            db, match["id"], body=body, priority="high"
+            db, match["id"], title=title, body=body, priority="high"
         )
     return await db_module.add_project_note(
         db, project_id, title, body,
-        tags=RETRO_NOTE_TAGS, kind="insight", priority="high",
+        tags=f"{RETRO_NOTE_TAGS},{stable_tag}", kind="insight", priority="high",
     )
 
 
@@ -1839,6 +1884,11 @@ async def generate_handoff(
         proj_settings = await db_module.get_project_settings(db, project_id)
     except Exception:  # noqa: BLE001 — settings fetch must never break handoff
         proj_settings = None
+    # c96577b3 — when enrichment is enabled but can't run (no live tunnel / graph
+    # searcher, or the annotation blows up), surface a visible skip reason in the
+    # handoff instead of silently omitting pointers — a zero-pointer handoff was
+    # otherwise indistinguishable from "enrichment never attempted". Fully guarded.
+    code_pointer_skip_reason: str | None = None
     if _code_pointers_enabled(proj_settings):
         searcher = graph_searcher or _resolve_graph_searcher(project_id)
         if searcher is not None:
@@ -1847,7 +1897,13 @@ async def generate_handoff(
                     pending_sprint_items, searcher
                 )
             except Exception:  # noqa: BLE001 — enrichment is best-effort
-                pass
+                code_pointer_skip_reason = (
+                    "code-pointer enrichment skipped — graph searcher errored"
+                )
+        else:
+            code_pointer_skip_reason = (
+                "code-pointer enrichment skipped — no live tunnel/graph searcher"
+            )
     decisions_log = (project.get("decisions") or "").strip()
     now_utc = datetime.now(timezone.utc)
     generated_at = now_utc.isoformat(timespec="seconds")
@@ -1956,6 +2012,7 @@ async def generate_handoff(
                 pinned_decisions=pinned_decisions,
                 strategic_notes=strategic_notes,
                 pending_sprint_items=pending_sprint_items,
+                code_pointer_skip_reason=code_pointer_skip_reason,
                 decisions_log=decisions_log,
                 ai_summary=ai_summary,
                 quick_start_goal=quick_start_goal,
@@ -2049,7 +2106,8 @@ async def generate_handoff(
                     summarizer=summarizer,
                 )
                 await _persist_sprint_retrospective(
-                    db, project_id, goal.get("sprint"), retro_text
+                    db, project_id, goal.get("sprint"), retro_text,
+                    version=goal.get("version"),
                 )
         except Exception:  # noqa: BLE001 — retrospective is best-effort
             pass

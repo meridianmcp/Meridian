@@ -249,3 +249,68 @@ async def test_generate_handoff_survives_searcher_blowup(db, tmp_path):
     # Handoff still produced; just no pointers.
     assert "MERIDIAN_CONTEXT" in content
     assert "Code pointers:" not in content
+
+
+# ---------------------------------------------------------------------------
+# c96577b3 — a skipped enrichment is SURFACED, not silently omitted. A
+# zero-pointer handoff must be distinguishable from "enrichment not attempted".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_surfaces_skip_note_when_no_searcher(db, tmp_path):
+    """Enrichment enabled (default) but no live tunnel/graph searcher ⇒ the
+    handoff surfaces a visible skip reason where the pointers would otherwise be,
+    instead of silently omitting them."""
+    p = await db_module.create_project(db, "enrich-skip-note")
+    await db_module.set_goal(db, p["id"], "ship enrichment")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Fix OAuth redirect bug")
+
+    # No graph_searcher injected, and no resolver registered ⇒ searcher is None.
+    # Explicitly clear any resolver leaked from another test on this worker so the
+    # searcher deterministically resolves to None.
+    handoff_module.set_graph_searcher_resolver(None)
+    try:
+        _, content = await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True
+        )
+    finally:
+        handoff_module.set_graph_searcher_resolver(None)
+    assert "enrichment skipped" in content
+    assert "no live tunnel/graph searcher" in content
+    # No actual pointers were produced.
+    assert "Code pointers:" not in content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_surfaces_skip_note_when_searcher_errors(db, tmp_path):
+    """When the searcher blows up, the skip note is surfaced too (not silent)."""
+    p = await db_module.create_project(db, "enrich-skip-err")
+    await db_module.set_goal(db, p["id"], "ship enrichment")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Fix OAuth redirect bug")
+
+    # A searcher that raises for EVERY query drives the annotate helper to raise
+    # out (it swallows per-item errors, so force a top-level failure by making the
+    # helper itself unusable via a non-callable object the branch will try to use).
+    class _Boom:
+        def __call__(self, query):
+            raise RuntimeError("graph backend unreachable")
+
+    # Monkeypatch _annotate_code_pointers to raise so the outer guard trips.
+    import meridian.handoff as _h
+
+    async def _raise(*a, **k):
+        raise RuntimeError("enrichment pass exploded")
+
+    orig = _h._annotate_code_pointers
+    _h._annotate_code_pointers = _raise
+    try:
+        _, content = await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True, graph_searcher=_Boom()
+        )
+    finally:
+        _h._annotate_code_pointers = orig
+
+    assert "enrichment skipped" in content
+    assert "graph searcher errored" in content
+    assert "MERIDIAN_CONTEXT" in content
