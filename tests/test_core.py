@@ -199,7 +199,9 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     assert "sess-1" in content and "sess-2" in content
     assert "did A" in content and "did B" in content
     assert "## Quick Start" in content
-    assert "/goal Verify remaining work is complete." in content
+    # 5abf3e12 — empty-board /goal is XML-structured: the verify text is the
+    # <role> body now, not inline after "/goal ".
+    assert "<role>Verify remaining work is complete.</role>" in content
     assert "pixi run test passes 2150+" in content
     assert "## Resume Instructions" in content
     on_disk = tmp_path / "alpha_handoff.md"
@@ -275,7 +277,8 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "dependency order" in content
     assert f"{first['id']}, {second['id']}." in content
     # f628b880 — the /goal leads with the non-deferential executor directive.
-    assert "/goal You are an executor. Claim and execute" in content
+    # 5abf3e12 — now inside the <role> tag of the XML-structured /goal.
+    assert "<role>You are an executor. Claim and execute" in content
     assert "complete_sprint_item()" in content
 
 
@@ -5204,13 +5207,15 @@ def test_max_turns_from_settings_clamps_to_500():
 
 def test_build_quick_start_goal_loop_prefix():
     from meridian import handoff as h
+    # 5abf3e12 — the XML-structured /goal starts with "/goal\n" (newline before
+    # the first tag), and "/loop /goal\n" when auto-continue is enabled.
     # Empty-board path.
-    assert h._build_quick_start_goal([], loop_enabled=False).startswith("/goal ")
-    assert h._build_quick_start_goal([], loop_enabled=True).startswith("/loop /goal ")
+    assert h._build_quick_start_goal([], loop_enabled=False).startswith("/goal\n")
+    assert h._build_quick_start_goal([], loop_enabled=True).startswith("/loop /goal\n")
     # Items path.
     items = [{"id": "abc123", "version": None}]
-    assert h._build_quick_start_goal(items, loop_enabled=False).startswith("/goal ")
-    assert h._build_quick_start_goal(items, loop_enabled=True).startswith("/loop /goal ")
+    assert h._build_quick_start_goal(items, loop_enabled=False).startswith("/goal\n")
+    assert h._build_quick_start_goal(items, loop_enabled=True).startswith("/loop /goal\n")
 
 
 def test_build_quick_start_goal_parallel_batches():
@@ -5330,12 +5335,13 @@ async def test_generate_handoff_prepends_loop_when_workspace_default_on(db, tmp_
     await db_module.add_sprint_item(db, p["id"], "v1", "an item")
     await db_module.update_workspace_settings(db, loop_enabled_default=True)
     await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
-    assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal ")
+    # 5abf3e12 — XML-structured /goal starts with "/loop /goal\n" / "/goal\n".
+    assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal\n")
     # Workspace default OFF (and no project override) → no /loop.
     await db_module.update_workspace_settings(db, loop_enabled_default=False)
     await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
     stored2 = await db_module.get_pending_goal(db, p["id"])
-    assert stored2.startswith("/goal ") and not stored2.startswith("/loop")
+    assert stored2.startswith("/goal\n") and not stored2.startswith("/loop")
 
 
 def test_workspace_settings_http_loop_default(client):
@@ -6892,10 +6898,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_capture_insight_notes_to_insights",
         "_migrate_pg_blog_posts_tenant",
         "_migrate_pg_project_parent_id",
+        "_migrate_pg_session_goal_compliance",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 84
+    assert len(allnames) == len(set(allnames)) == 85
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

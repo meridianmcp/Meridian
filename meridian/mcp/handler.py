@@ -1673,6 +1673,17 @@ async def _handle_task_tools(
         # dashboard textarea without breaking the surrounding fence).
         import re as _re_fence  # noqa: PLC0415
         _plain_content = _re_fence.sub(r"```[A-Za-z0-9_+.-]*", "", content)
+        # 5abf3e12 — surface the stored per-session goal-compliance metric
+        # (generate_handoff computed & persisted it) so the caller / dashboard
+        # sees whether this session's /goal item list was fully completed.
+        _goal_compliance = None
+        if session_id:
+            try:
+                _goal_compliance = await db_module.get_session_goal_compliance(
+                    db, session_id
+                )
+            except Exception:  # noqa: BLE001
+                _goal_compliance = None
         return {
             "file_path": path,
             "content": _plain_content,
@@ -1680,6 +1691,7 @@ async def _handle_task_tools(
             "template_stale": _tpl_stale,
             "insight_hints": _insight_hints[:5],
             "goal_length_warning": _goal_warn,
+            "goal_compliance": _goal_compliance,
         }
     if name == "load_handoff":
         # 5efe254b — trusted retrieval of the latest stored handoff for a project
@@ -2964,6 +2976,20 @@ async def _handle_sprint_tools(
         _bc = await _board_change_for_session(db, args["project_id"], args.get("session_id"))
         if _bc:
             _resp_progress["board_change"] = _bc
+        # 5abf3e12 — when scoped to a session, report that session's live goal
+        # compliance (N items it took on via actor= vs M complete_sprint_item()'d)
+        # so an executor can see mid-run whether it's on track to fully complete
+        # its /goal list. Guarded: never break the progress poll.
+        _sess_id = args.get("session_id")
+        if _sess_id:
+            try:
+                _resp_progress["goal_compliance"] = (
+                    await db_module.compute_session_goal_compliance(
+                        db, args["project_id"], _sess_id
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return _resp_progress
     if name == "get_sprint_items":
         include_human = args.get("human", True)

@@ -487,7 +487,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     session_summary TEXT,
     checkpoint_data TEXT,
-    sprint_version TEXT
+    sprint_version TEXT,
+    goal_compliance TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_log (
@@ -2444,6 +2445,19 @@ async def _migrate_pg_project_parent_id(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_session_goal_compliance(conn: PostgresConnection) -> None:
+    """5abf3e12 — sessions.goal_compliance: stored per-session goal-compliance
+    metric (JSON: listed N vs completed M vs fully_completed).
+
+    Written at generate_handoff by db.compute_session_goal_compliance. Nullable;
+    no index (read only by the session's primary key). Idempotent
+    (ADD COLUMN IF NOT EXISTS). Mirrors db._migrate_session_goal_compliance.
+    """
+    await conn.executescript(
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS goal_compliance TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2497,4 +2511,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_capture_insight_notes_to_insights,
     _migrate_pg_blog_posts_tenant,
     _migrate_pg_project_parent_id,
+    _migrate_pg_session_goal_compliance,
 )

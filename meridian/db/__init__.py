@@ -209,6 +209,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
     checkpoint_data TEXT,
     sprint_version TEXT,
+    goal_compliance TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -889,6 +890,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_capture_insight_notes_to_insights(db)
     await _migrate_blog_posts_tenant(db)
     await _migrate_project_parent_id(db)
+    await _migrate_session_goal_compliance(db)
     return db
 
 
@@ -10049,6 +10051,111 @@ async def get_session_checkpoint(
         return json.loads(raw)
     except (ValueError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# 5abf3e12 — per-session goal-compliance metric (sessions.goal_compliance)
+# ---------------------------------------------------------------------------
+
+
+async def compute_session_goal_compliance(
+    db: aiosqlite.Connection, project_id: str, session_id: str
+) -> dict[str, Any]:
+    """Measure whether a session's /goal item list was fully completed.
+
+    The /goal instructs an executor to "claim and execute the following sprint
+    items … you are DONE only when complete_sprint_item() has been called for
+    every listed item". This computes that compliance from the durable board
+    state, using ``sprint_items.actor`` as the link between a session and the
+    items it took on. ``actor`` is set by claim_sprint_item (COALESCE — the
+    first claimer wins) and OVERWRITTEN by complete_sprint_item to the completing
+    session (5823db0b). For the standard executor loop — where ONE session both
+    claims and completes each item — the claimer and completer are the same, so
+    this measures exactly that session's compliance. In a cross-session hand-off
+    (parallel / coordinator patterns) the item is reattributed to whichever
+    session called complete_sprint_item(): credit follows the completer, and a
+    claimer whose item is finalised by another session no longer counts it.
+    Attribution therefore reflects the FINAL owner of each item.
+
+    * ``listed`` (N): sprint items whose ``actor`` is this session at compute
+      time — the items it currently owns (claimed and/or completed). This
+      includes items left in any non-'done' terminal state (e.g. skipped /
+      failed / pushed), so an item this session owns but legitimately skipped
+      still counts toward N while never counting toward M.
+    * ``completed`` (M): of those, how many reached status 'done' (i.e. were
+      finished via complete_sprint_item()). Only 'done' counts as compliance.
+    * ``fully_completed``: True iff N > 0 and M == N (every taken-on item shipped).
+    * ``zero_listed``: True when N == 0 (the session claimed no items, so there is
+      nothing to have completed — ``fully_completed`` is False, not vacuously
+      True).
+    * ``compliance_pct``: round(100 * M / N) when N > 0 else 0.
+
+    Returns a plain dict (JSON-serialisable) so callers can store it verbatim on
+    ``sessions.goal_compliance`` and surface it in progress / handoff output.
+    """
+    async with db.execute(
+        "SELECT "
+        "  COUNT(*) AS listed, "
+        "  COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS completed "
+        "FROM sprint_items WHERE project_id = ? AND actor = ?",
+        (project_id, session_id),
+    ) as cur:
+        row = await cur.fetchone()
+    listed = int((row["listed"] if row else 0) or 0)
+    completed = int((row["completed"] if row else 0) or 0)
+    return {
+        "session_id": session_id,
+        "listed": listed,
+        "completed": completed,
+        "fully_completed": listed > 0 and completed == listed,
+        "zero_listed": listed == 0,
+        "compliance_pct": round(100 * completed / listed) if listed else 0,
+    }
+
+
+async def set_session_goal_compliance(
+    db: aiosqlite.Connection, session_id: str, metric: dict[str, Any]
+) -> None:
+    """Persist the computed goal-compliance metric on the session row (JSON text)."""
+    await db.execute(
+        "UPDATE sessions SET goal_compliance = ? WHERE id = ?",
+        (json.dumps(metric), session_id),
+    )
+    await db.commit()
+
+
+async def get_session_goal_compliance(
+    db: aiosqlite.Connection, session_id: str
+) -> dict[str, Any] | None:
+    """Return the stored goal-compliance metric for a session, or None."""
+    async with db.execute(
+        "SELECT goal_compliance FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    raw = row["goal_compliance"]
+    if not raw:
+        return None
+    if isinstance(raw, dict):  # Postgres may return parsed JSON
+        return raw
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+async def record_session_goal_compliance(
+    db: aiosqlite.Connection, project_id: str, session_id: str
+) -> dict[str, Any]:
+    """Compute the goal-compliance metric for a session and store it. Returns it.
+
+    Called at session end (generate_handoff) so every completed session leaves a
+    durable, queryable record of whether its /goal item list was fully done.
+    """
+    metric = await compute_session_goal_compliance(db, project_id, session_id)
+    await set_session_goal_compliance(db, session_id, metric)
+    return metric
 
 
 # ---------------------------------------------------------------------------

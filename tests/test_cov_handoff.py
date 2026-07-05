@@ -86,7 +86,10 @@ def test_build_quick_start_goal_with_and_without_items():
     assert "abc123" in full and "def456" in full
     assert "complete_sprint_item()" in full
     # f628b880 — non-deferential executor directive leads the items /goal.
-    assert full.startswith("/goal You are an executor. Claim and execute")
+    # 5abf3e12 — the /goal is now XML-structured: /goal, then a <role> tag whose
+    # body is the executor directive.
+    assert full.startswith("/goal\n<role>You are an executor. Claim and execute")
+    assert "<role>You are an executor. Claim and execute" in full
     # 4cfaecc2 — the items /goal instructs a live board query up front, and the
     # test floor tracks the real suite size (524 -> 2150).
     assert 'get_sprint_items(status="pending")' in full
@@ -124,16 +127,21 @@ def test_build_quick_start_goal_excludes_manual_items():
 
     # The executable item leads the claim-and-execute directive.
     assert "code01" in goal
-    assert goal.startswith("/goal You are an executor. Claim and execute")
-    # MANUAL ids appear ONLY in the separate note, never in the pressure list.
-    exec_clause, _, manual_clause = goal.partition("Separately, these MANUAL items")
-    assert manual_clause, "expected a separate MANUAL todo section"
+    # 5abf3e12 — XML-structured /goal: /goal then <role>…executor directive…
+    assert goal.startswith("/goal\n<role>You are an executor. Claim and execute")
+    # MANUAL ids appear ONLY in the separate <exclusions> tag, never in the
+    # pressure list. (5abf3e12 — the maintainer todo is now an <exclusions> tag.)
+    exec_clause, _, manual_clause = goal.partition("<exclusions>")
+    assert manual_clause, "expected a separate <exclusions> MANUAL todo section"
+    assert "maintainer's own todo" in manual_clause
     for mid in ("man-title", "man-human", "man-mile"):
         assert mid not in exec_clause, f"{mid} leaked into the executor list"
         assert mid in manual_clause
     assert "code01" not in manual_clause
-    # The maintainer note carries no completion-pressure language.
+    # The maintainer note carries no completion-pressure / anti-stop language
+    # (no <not_done_until> and no legacy "is a FAILURE" phrasing).
     assert "is a FAILURE" not in manual_clause
+    assert "not done while any listed item" not in manual_clause
     assert "must NOT claim, execute, or complete" in manual_clause
 
     # Helper classifies each MANUAL signal, and leaves real work alone.
@@ -151,7 +159,8 @@ def test_build_quick_start_goal_all_manual_still_surfaces_todo():
     )
     assert "Verify remaining work is complete" in goal   # empty executable path
     assert "maintainer's own todo" in goal
-    before_note = goal.split("Separately, these MANUAL items")[0]
+    # 5abf3e12 — the maintainer todo is the <exclusions> tag.
+    before_note = goal.split("<exclusions>")[0]
     assert "m1" not in before_note   # never in a claim-and-execute clause
     assert "m1" in goal              # present only in the note
 
@@ -175,11 +184,12 @@ def test_infer_sprint_type_heuristics():
 
 
 def test_build_quick_start_goal_tags_sprint_type():
-    """f9fa00e4 — the /goal carries an inferred [sprint:TYPE] tag + guidance,
-    without disturbing the existing structure."""
+    """f9fa00e4 — the /goal carries an inferred sprint type + guidance, without
+    disturbing the existing structure. 5abf3e12 — the type now rides a
+    <sprint_type value="..."> XML tag instead of a "[sprint:TYPE]" inline tag."""
     from meridian.handoff import _build_quick_start_goal
     goal = _build_quick_start_goal([{"id": "a1", "title": "hotfix: crash on start"}])
-    assert "[sprint:hotfix]" in goal
+    assert '<sprint_type value="hotfix">' in goal
     assert "HOTFIX sprint" in goal
     assert "a1" in goal
     assert 'get_sprint_items(status="pending")' in goal
@@ -187,17 +197,24 @@ def test_build_quick_start_goal_tags_sprint_type():
 
 
 def test_build_quick_start_goal_completion_mode_and_group_style():
-    """9f57374b — completion_mode='lenient' drops the anti-stop failure framing;
-    goal_group_style='waves' restores Wave headers for a dependency graph; the
-    executor_config extractors default to strict/flat."""
+    """9f57374b — completion_mode='lenient' drops the anti-stop completion
+    constraint; goal_group_style='waves' restores Wave headers for a dependency
+    graph; the executor_config extractors default to strict/flat.
+
+    5abf3e12 — the anti-stop framing is now the <not_done_until> XML tag (the old
+    prose-threat "is a FAILURE" wording is gone) but the constraint is unchanged:
+    strict mode carries it, lenient mode drops it."""
     from meridian.handoff import (
         _build_quick_start_goal,
         _completion_mode_from_settings,
         _goal_group_style_from_settings,
     )
-    assert "is a FAILURE" in _build_quick_start_goal([{"id": "a1"}])
-    assert "is a FAILURE" not in _build_quick_start_goal(
-        [{"id": "a1"}], completion_mode="lenient")
+    strict = _build_quick_start_goal([{"id": "a1"}])
+    assert "<not_done_until>" in strict
+    assert "not done while any listed item is still" in strict
+    assert "is a FAILURE" not in strict  # threat wording removed by 5abf3e12
+    lenient = _build_quick_start_goal([{"id": "a1"}], completion_mode="lenient")
+    assert "<not_done_until>" not in lenient
 
     deps = [{"id": "a1"}, {"id": "a2", "depends_on": "a1"}]
     assert "Wave" not in _build_quick_start_goal(deps)  # default flat
@@ -210,6 +227,100 @@ def test_build_quick_start_goal_completion_mode_and_group_style():
     assert _goal_group_style_from_settings(
         {"executor_config": {"goal_group_style": "waves"}}) == "waves"
     assert _goal_group_style_from_settings(None) == "flat"
+
+
+def _parse_goal_xml(goal):
+    """Wrap the /goal body (everything after the '/goal' + newline prefix) in a
+    root element and parse it — asserts the /goal is well-formed XML."""
+    import xml.etree.ElementTree as ET
+    body = goal.split("/goal", 1)[1].lstrip("\n")
+    root = ET.fromstring(f"<goal_root>{body}</goal_root>")
+    return {child.tag: (child.text or "") for child in root}, root
+
+
+def test_build_quick_start_goal_xml_structure_preserves_constraints():
+    """5abf3e12 — the /goal is XML-structured (no ALL-CAPS threat prose) yet every
+    semantic constraint from the old prose form is preserved, and the XML parses.
+
+    Constraints checked: executor role/immediacy, live-board first step, the item
+    list, the completion criteria (complete_sprint_item + test floor +
+    generate_handoff), the anti-stop 'not done until every item complete', the
+    turn + HITL stop conditions, the sprint-type tag, and the MANUAL exclusion —
+    all as clean XML tags."""
+    from meridian.handoff import _build_quick_start_goal
+
+    goal = _build_quick_start_goal(
+        [
+            {"id": "code1", "title": "FEAT: real work"},
+            {"id": "code2", "title": "FEAT: more work"},
+            {"id": "m1", "title": "MANUAL (Adam): publish the blog post", "human_id": "adam"},
+        ],
+        test_floor=350,
+    )
+    # No prose-threat / ALL-CAPS framing survives.
+    assert "is a FAILURE" not in goal
+    assert "FAILURE" not in goal
+
+    tags, root = _parse_goal_xml(goal)  # asserts well-formed XML
+    # Every constraint is present as a distinct XML tag.
+    assert set(tags) >= {
+        "role", "first_step", "sprint_items", "completion_criteria",
+        "not_done_until", "stop_conditions", "sprint_type", "exclusions",
+    }
+    # <role> — executor, act immediately, don't ask.
+    assert "You are an executor" in tags["role"]
+    assert "without asking for direction" in tags["role"]
+    # <first_step> — live board query before trusting the snapshot.
+    assert 'get_sprint_items(status="pending")' in tags["first_step"]
+    # <sprint_items> — the executable ids, MANUAL item excluded.
+    assert "code1" in tags["sprint_items"] and "code2" in tags["sprint_items"]
+    assert "m1" not in tags["sprint_items"]
+    # <completion_criteria> — the three done-conditions, verbatim semantics.
+    assert "complete_sprint_item()" in tags["completion_criteria"]
+    assert "pixi run test passes 350+" in tags["completion_criteria"]
+    assert "generate_handoff()" in tags["completion_criteria"]
+    # <not_done_until> — the anti-stop constraint (re-expressed from the threat).
+    assert "every listed item" in tags["not_done_until"]
+    assert "not done while any listed item is still pending" in tags["not_done_until"]
+    assert "do not hand off with items pending" in tags["not_done_until"]
+    # <stop_conditions> — turn ceiling + HITL.
+    assert "Stop after 200 turns" in tags["stop_conditions"]
+    assert "or if HITL triggered." in tags["stop_conditions"]
+    # <sprint_type> — inferred type on the attribute.
+    assert root.find("sprint_type").attrib["value"] == "feature"
+    # <exclusions> — the MANUAL carve-out, still saying the executor must NOT do them.
+    assert "m1" in tags["exclusions"]
+    assert "must NOT claim, execute, or complete" in tags["exclusions"]
+    assert "maintainer's own todo" in tags["exclusions"]
+
+
+def test_build_quick_start_goal_xml_hitl_mode1_no_hitl_rule():
+    """5abf3e12 — the no-HITL rule (auto-answer mode) rides <stop_conditions>, and
+    the goal stays well-formed XML."""
+    from meridian.handoff import _build_quick_start_goal
+    goal = _build_quick_start_goal([{"id": "a1"}], hitl_auto_answer_mode=1)
+    tags, _ = _parse_goal_xml(goal)
+    assert "Do NOT file HITLs" in tags["stop_conditions"]
+    assert "or if HITL triggered." not in goal
+
+
+def test_build_quick_start_goal_xml_escapes_untrusted_manual_title():
+    """5abf3e12 — a MANUAL item title carrying raw XML metacharacters is escaped
+    inside <exclusions>, so it cannot inject tags into the /goal (build_goal_xml
+    escaping discipline). The /goal remains parseable."""
+    from meridian.handoff import _build_quick_start_goal
+    goal = _build_quick_start_goal(
+        [
+            {"id": "c1", "title": "FEAT real"},
+            {"id": "m1", "title": "MANUAL: publish <script>alert(1)</script> & more",
+             "human_id": "adam"},
+        ]
+    )
+    # Raw injected tag must NOT appear; escaped form must.
+    assert "<script>" not in goal
+    assert "&lt;script&gt;" in goal
+    tags, _ = _parse_goal_xml(goal)  # still well-formed
+    assert "alert(1)" in tags["exclusions"]
 
 
 def test_resolve_graph_searcher_uses_registered_resolver():
@@ -261,18 +372,19 @@ def test_partition_into_waves_topological_layers():
 def test_build_quick_start_goal_flattens_deps_no_wave_headers():
     """eeee02c6 — a dependency graph flattens into one ordered id list (no 'Wave'
     headers, which invite stopping between waves); a flat list keeps the legacy
-    phrasing. Both carry the anti-stop failure framing."""
+    phrasing. Both carry the anti-stop completion constraint (5abf3e12: now the
+    <not_done_until> XML tag, not the old "is a FAILURE" prose)."""
     flat = handoff_module._build_quick_start_goal([{"id": "a1"}, {"id": "a2"}])
     assert "Complete sprint items: a1, a2." in flat
     assert "Wave" not in flat
-    assert "is a FAILURE" in flat
+    assert "<not_done_until>" in flat
     waved = handoff_module._build_quick_start_goal([
         {"id": "a1"}, {"id": "a2", "depends_on": "a1"},
     ])
     assert "dependency order" in waved
     assert "a1, a2" in waved
     assert "Wave" not in waved
-    assert "is a FAILURE" in waved
+    assert "<not_done_until>" in waved
 
 
 def test_agent_instructions_stale_detection():
@@ -1306,3 +1418,146 @@ def test_start_session_includes_current_timestamp(client):
     data = _json.loads(r.json()["result"]["content"][0]["text"])
     assert "current_timestamp" in data
     assert re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", data["current_timestamp"])
+
+
+# ---------------------------------------------------------------------------
+# 5abf3e12 — per-session goal-compliance metric
+# ---------------------------------------------------------------------------
+
+
+async def _seed_session_with_items(db, project_name, n_listed, n_done):
+    """Create a project + session, claim ``n_listed`` items for the session
+    (actor = session id) and complete the first ``n_done`` of them."""
+    p = await db_module.create_project(db, project_name)
+    sess = await db_module.register_session(db, p["id"], "exec-sess")
+    sid = sess["id"]
+    items = []
+    for i in range(n_listed):
+        it = await db_module.add_sprint_item(db, p["id"], "v1", f"item {i}")
+        await db_module.claim_sprint_item(db, p["id"], it["id"], actor=sid)
+        items.append(it)
+    for it in items[:n_done]:
+        await db_module.complete_sprint_item(db, p["id"], it["id"], actor=sid)
+    return p, sid, items
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_full(db):
+    """Full compliance: every item the session took on (N) was completed (M==N)."""
+    p, sid, _ = await _seed_session_with_items(db, "gc-full", 3, 3)
+    metric = await db_module.compute_session_goal_compliance(db, p["id"], sid)
+    assert metric["listed"] == 3
+    assert metric["completed"] == 3
+    assert metric["fully_completed"] is True
+    assert metric["zero_listed"] is False
+    assert metric["compliance_pct"] == 100
+    assert metric["session_id"] == sid
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_partial(db):
+    """Partial compliance: M < N → not fully completed, pct reflects the ratio."""
+    p, sid, _ = await _seed_session_with_items(db, "gc-partial", 4, 1)
+    metric = await db_module.compute_session_goal_compliance(db, p["id"], sid)
+    assert metric["listed"] == 4
+    assert metric["completed"] == 1
+    assert metric["fully_completed"] is False
+    assert metric["zero_listed"] is False
+    assert metric["compliance_pct"] == 25
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_zero_listed(db):
+    """Zero-listed edge case: a session that claimed no items is NOT vacuously
+    'fully_completed' — nothing was listed, so the flag is False and zero_listed
+    is True."""
+    p = await db_module.create_project(db, "gc-zero")
+    sess = await db_module.register_session(db, p["id"], "idle-sess")
+    metric = await db_module.compute_session_goal_compliance(db, p["id"], sess["id"])
+    assert metric["listed"] == 0
+    assert metric["completed"] == 0
+    assert metric["fully_completed"] is False
+    assert metric["zero_listed"] is True
+    assert metric["compliance_pct"] == 0
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_scoped_to_session(db):
+    """The metric only counts items attributed to THIS session (actor), not the
+    project-wide board — a second session's items are excluded."""
+    p = await db_module.create_project(db, "gc-scope")
+    s1 = (await db_module.register_session(db, p["id"], "s1"))["id"]
+    s2 = (await db_module.register_session(db, p["id"], "s2"))["id"]
+    a = await db_module.add_sprint_item(db, p["id"], "v1", "a")
+    b = await db_module.add_sprint_item(db, p["id"], "v1", "b")
+    await db_module.claim_sprint_item(db, p["id"], a["id"], actor=s1)
+    await db_module.complete_sprint_item(db, p["id"], a["id"], actor=s1)
+    await db_module.claim_sprint_item(db, p["id"], b["id"], actor=s2)  # other session, still pending
+    m1 = await db_module.compute_session_goal_compliance(db, p["id"], s1)
+    m2 = await db_module.compute_session_goal_compliance(db, p["id"], s2)
+    assert m1 == {**m1, "listed": 1, "completed": 1, "fully_completed": True}
+    assert m2["listed"] == 1 and m2["completed"] == 0 and m2["fully_completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_cross_session_completion_reattributes(db):
+    """5abf3e12 — cross-session hand-off: session A claims an item but session B
+    *completes* it (actor=B, as complete_sprint_item does). The item is
+    reattributed to the completer, so credit follows B — A no longer counts it,
+    B counts it as completed. Pins the documented attribution (complete overwrites
+    actor, unlike claim which COALESCEs); this is correct for the common
+    single-session loop and defined behaviour for parallel/coordinator patterns."""
+    p = await db_module.create_project(db, "gc-xsession")
+    a = (await db_module.register_session(db, p["id"], "claimer"))["id"]
+    b = (await db_module.register_session(db, p["id"], "completer"))["id"]
+    it = await db_module.add_sprint_item(db, p["id"], "v1", "handed-off item")
+    await db_module.claim_sprint_item(db, p["id"], it["id"], actor=a)
+    await db_module.complete_sprint_item(db, p["id"], it["id"], actor=b)
+    ma = await db_module.compute_session_goal_compliance(db, p["id"], a)
+    mb = await db_module.compute_session_goal_compliance(db, p["id"], b)
+    # A claimed it but B finalised it → the item is now attributed to B.
+    assert ma["listed"] == 0 and ma["zero_listed"] is True
+    assert mb["listed"] == 1 and mb["completed"] == 1 and mb["fully_completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_record_session_goal_compliance_persists(db):
+    """record_session_goal_compliance stores the metric on sessions.goal_compliance
+    and get_session_goal_compliance reads it back verbatim."""
+    p, sid, _ = await _seed_session_with_items(db, "gc-store", 2, 1)
+    assert await db_module.get_session_goal_compliance(db, sid) is None  # nothing yet
+    returned = await db_module.record_session_goal_compliance(db, p["id"], sid)
+    stored = await db_module.get_session_goal_compliance(db, sid)
+    assert stored == returned
+    assert stored["listed"] == 2 and stored["completed"] == 1
+    assert stored["fully_completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_stores_goal_compliance(db, tmp_path):
+    """5abf3e12 — the metric is computed & persisted at the canonical session-end
+    point (generate_handoff), so every completed session leaves a durable record
+    of whether its /goal item list was fully done."""
+    p, sid, _ = await _seed_session_with_items(db, "gc-handoff", 2, 2)
+    # No metric until the session ends.
+    assert await db_module.get_session_goal_compliance(db, sid) is None
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=sid
+    )
+    stored = await db_module.get_session_goal_compliance(db, sid)
+    assert stored is not None
+    assert stored["listed"] == 2 and stored["completed"] == 2
+    assert stored["fully_completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_no_session_id_skips_compliance(db, tmp_path):
+    """A session-less handoff must not attempt to store a metric (nothing to key
+    it on) and must not raise."""
+    p = await db_module.create_project(db, "gc-nosess")
+    await db_module.add_sprint_item(db, p["id"], "v1", "an item")
+    # No session_id → no compliance write, no error.
+    path, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert path
