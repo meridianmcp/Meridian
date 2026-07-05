@@ -2675,6 +2675,33 @@ async def get_tasks(
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+def _multiword_match_clause(
+    columns: "list[str]", query: str, *, op: str = "LIKE"
+) -> "tuple[str, list[str]]":
+    """fcf90f3a — WHERE fragment matching rows where EVERY whitespace-separated
+    term in ``query`` appears in at least one of ``columns`` (AND across terms,
+    OR across columns).
+
+    A single ``%query%`` LIKE matched only the contiguous phrase, so multi-word
+    queries whose words weren't adjacent ("RAG problem definition") — or that
+    crossed punctuation ("retrieval-augmented generation") — silently returned
+    zero. ANDing the terms fixes that while staying more precise than OR-ing:
+    these searches have no relevance ranking (just created_at DESC), so OR would
+    flood the top with rows matching one common word. Terms shorter than 2 chars
+    are dropped and the list is capped; a single-token query falls back to the
+    whole string. Returns ``(sql_fragment, params)`` — a parenthesized boolean
+    safe to AND into an existing WHERE. Placeholders are ``?`` (the pg adapter
+    rewrites to %s); ``op`` is LIKE (SQLite, case-insensitive) or ILIKE (PG)."""
+    terms = [t for t in query.split() if len(t) >= 2][:8] or [query]
+    per_term: list[str] = []
+    params: list[str] = []
+    for term in terms:
+        ors = " OR ".join(f"{c} {op} ?" for c in columns)
+        per_term.append(f"({ors})")
+        params.extend([f"%{term}%"] * len(columns))
+    return "(" + " AND ".join(per_term) + ")", params
+
+
 async def search_tasks(
     db: Any,
     project_id: str,
@@ -2691,9 +2718,13 @@ async def search_tasks(
 
     Returns [{id, description, status, created_at, similarity, session_name}].
     """
-    like_pat = f"%{query}%"
     is_pg = hasattr(db, "_pool")
     if is_pg:
+        # fcf90f3a — AND the query terms so a multi-word query isn't a single
+        # %...% ILIKE that only matches the contiguous phrase. Similarity ranking
+        # still orders results; the term-match just widens the candidate set.
+        match_sql, match_params = _multiword_match_clause(
+            ["t.description"], query, op="ILIKE")
         sql = (
             "SELECT t.id, t.description, t.status, t.created_at, "
             "s.name AS session_name, "
@@ -2701,20 +2732,21 @@ async def search_tasks(
             "FROM task_log t "
             "LEFT JOIN sessions s ON s.id = t.session_id "
             "WHERE t.project_id = ? "
-            "AND (similarity(t.description, ?) > 0.05 OR t.description ILIKE ?) "
+            f"AND (similarity(t.description, ?) > 0.05 OR {match_sql}) "
             "ORDER BY similarity DESC, t.created_at DESC LIMIT ?"
         )
-        params: tuple = (query, project_id, query, like_pat, limit)
+        params: tuple = (query, project_id, query, *match_params, limit)
     else:
+        match_sql, match_params = _multiword_match_clause(["t.description"], query)
         sql = (
             "SELECT t.id, t.description, t.status, t.created_at, "
             "s.name AS session_name, 1.0 AS similarity "
             "FROM task_log t "
             "LEFT JOIN sessions s ON s.id = t.session_id "
-            "WHERE t.project_id = ? AND t.description LIKE ? "
+            f"WHERE t.project_id = ? AND {match_sql} "
             "ORDER BY t.created_at DESC LIMIT ?"
         )
-        params = (project_id, like_pat, limit)
+        params = (project_id, *match_params, limit)
     async with db.execute(sql, params) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
@@ -2730,11 +2762,20 @@ def _search_snippet(text: str | None, query: str, window: int = 60) -> str:
     """
     if not text or not query:
         return ""
-    idx = text.lower().find(query.lower())
+    low = text.lower()
+    anchor = query.lower()
+    idx = low.find(anchor)
+    if idx == -1:
+        # fcf90f3a — multi-word query whose exact phrase isn't contiguous: anchor
+        # the preview on the first query term that IS present.
+        for term in query.split():
+            if len(term) >= 2 and (i := low.find(term.lower())) != -1:
+                anchor, idx = term.lower(), i
+                break
     if idx == -1:
         return ""
     start = max(0, idx - window)
-    end = min(len(text), idx + len(query) + window)
+    end = min(len(text), idx + len(anchor) + window)
     snippet = text[start:end].strip()
     if start > 0:
         snippet = "…" + snippet
@@ -2767,69 +2808,52 @@ async def search_all(
     query term (empty string when no body field matched, e.g. a title-only
     match).
     """
-    like_pat = f"%{query}%"
     is_pg = hasattr(db, "_pool")
+    op = "ILIKE" if is_pg else "LIKE"
 
     async def _search(sql: str, params: tuple) -> list[dict[str, Any]]:
         async with db.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
-    if is_pg:
-        tasks_sql = (
-            "SELECT id, description, status, created_at, 'task' AS match_type "
-            "FROM task_log "
-            "WHERE project_id = ? AND description ILIKE ? "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        notes_sql = (
-            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
-            "FROM project_notes "
-            "WHERE project_id = ? AND (title ILIKE ? OR body ILIKE ?) "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        decisions_sql = (
-            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
-            "FROM decisions_pinned "
-            "WHERE project_id = ? AND status = 'active' AND (title ILIKE ? OR body ILIKE ?) "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        sprint_sql = (
-            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
-            "FROM sprint_items "
-            "WHERE project_id = ? AND (title ILIKE ? OR notes ILIKE ?) "
-            "ORDER BY added_at DESC LIMIT ?"
-        )
-    else:
-        tasks_sql = (
-            "SELECT id, description, status, created_at, 'task' AS match_type "
-            "FROM task_log "
-            "WHERE project_id = ? AND description LIKE ? "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        notes_sql = (
-            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
-            "FROM project_notes "
-            "WHERE project_id = ? AND (title LIKE ? OR body LIKE ?) "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        decisions_sql = (
-            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
-            "FROM decisions_pinned "
-            "WHERE project_id = ? AND status = 'active' AND (title LIKE ? OR body LIKE ?) "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        sprint_sql = (
-            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
-            "FROM sprint_items "
-            "WHERE project_id = ? AND (title LIKE ? OR notes LIKE ?) "
-            "ORDER BY added_at DESC LIMIT ?"
-        )
+    # fcf90f3a — AND the query terms across each content type's text fields so a
+    # multi-word query matches rows containing every term (not only the exact
+    # contiguous phrase). op is ILIKE on PG / LIKE on SQLite, so the rest of the
+    # SQL is shared instead of duplicated per backend.
+    m_task, p_task = _multiword_match_clause(["description"], query, op=op)
+    m_note, p_note = _multiword_match_clause(["title", "body"], query, op=op)
+    m_dec, p_dec = _multiword_match_clause(["title", "body"], query, op=op)
+    m_sprint, p_sprint = _multiword_match_clause(["title", "notes"], query, op=op)
 
-    tasks = await _search(tasks_sql, (project_id, like_pat, limit))
-    notes = await _search(notes_sql, (project_id, like_pat, like_pat, limit))
-    decisions = await _search(decisions_sql, (project_id, like_pat, like_pat, limit))
-    sprint_items = await _search(sprint_sql, (project_id, like_pat, like_pat, limit))
+    tasks_sql = (
+        "SELECT id, description, status, created_at, 'task' AS match_type "
+        "FROM task_log "
+        f"WHERE project_id = ? AND {m_task} "
+        "ORDER BY created_at DESC LIMIT ?"
+    )
+    notes_sql = (
+        "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+        "FROM project_notes "
+        f"WHERE project_id = ? AND {m_note} "
+        "ORDER BY created_at DESC LIMIT ?"
+    )
+    decisions_sql = (
+        "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+        "FROM decisions_pinned "
+        f"WHERE project_id = ? AND status = 'active' AND {m_dec} "
+        "ORDER BY created_at DESC LIMIT ?"
+    )
+    sprint_sql = (
+        "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+        "FROM sprint_items "
+        f"WHERE project_id = ? AND {m_sprint} "
+        "ORDER BY added_at DESC LIMIT ?"
+    )
+
+    tasks = await _search(tasks_sql, (project_id, *p_task, limit))
+    notes = await _search(notes_sql, (project_id, *p_note, limit))
+    decisions = await _search(decisions_sql, (project_id, *p_dec, limit))
+    sprint_items = await _search(sprint_sql, (project_id, *p_sprint, limit))
 
     # Attach a body-text snippet for each result so the dashboard search bar can
     # surface matching context. The body field name differs per content type.

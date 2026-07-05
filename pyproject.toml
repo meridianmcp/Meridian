@@ -34,6 +34,10 @@ dependencies = [
     "tree-sitter-rust>=0.21",
     "tree-sitter-java>=0.21",
     "tree-sitter-c-sharp>=0.21",
+    # Native LaTeX source parsing — docs_intel Phase 3 (106118cd). Pure-Python
+    # latexwalker parser (no PDF intermediary); ships in the Fly image so the
+    # get_latex_structure MCP tool works server-side.
+    "pylatexenc>=2.10,<3",
 ]
 
 [project.scripts]

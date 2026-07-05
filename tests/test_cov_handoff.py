@@ -108,6 +108,54 @@ def test_build_quick_start_goal_max_turns():
     assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}], max_turns="bad")
 
 
+def test_build_quick_start_goal_excludes_manual_items():
+    """3a02041a — MANUAL/human items must be kept OUT of the 'claim and execute'
+    batch list (an AI executor can't do them and may fake-complete under pressure)
+    and surfaced separately as the maintainer's own todo."""
+    from meridian.handoff import _is_manual_sprint_item
+
+    items = [
+        {"id": "code01", "title": "FEAT: real code work"},
+        {"id": "man-title", "title": "MANUAL (Adam): publish the blog post"},
+        {"id": "man-human", "title": "Configure PyPI publisher", "human_id": "adam"},
+        {"id": "man-mile", "title": "Install binary", "milestone_type": "human"},
+    ]
+    goal = handoff_module._build_quick_start_goal(items)
+
+    # The executable item leads the claim-and-execute directive.
+    assert "code01" in goal
+    assert goal.startswith("/goal You are an executor. Claim and execute")
+    # MANUAL ids appear ONLY in the separate note, never in the pressure list.
+    exec_clause, _, manual_clause = goal.partition("Separately, these MANUAL items")
+    assert manual_clause, "expected a separate MANUAL todo section"
+    for mid in ("man-title", "man-human", "man-mile"):
+        assert mid not in exec_clause, f"{mid} leaked into the executor list"
+        assert mid in manual_clause
+    assert "code01" not in manual_clause
+    # The maintainer note carries no completion-pressure language.
+    assert "is a FAILURE" not in manual_clause
+    assert "must NOT claim, execute, or complete" in manual_clause
+
+    # Helper classifies each MANUAL signal, and leaves real work alone.
+    assert _is_manual_sprint_item({"title": "MANUAL (Adam): x"})
+    assert _is_manual_sprint_item({"title": "x", "human_id": "adam"})
+    assert _is_manual_sprint_item({"title": "x", "milestone_type": "human"})
+    assert not _is_manual_sprint_item({"id": "y", "title": "FEAT: y"})
+
+
+def test_build_quick_start_goal_all_manual_still_surfaces_todo():
+    """3a02041a — when every pending item is MANUAL the executor path has nothing
+    to claim (falls back to the verify goal), but the MANUAL todo is still shown."""
+    goal = handoff_module._build_quick_start_goal(
+        [{"id": "m1", "title": "MANUAL (Adam): screenshots", "human_id": "adam"}]
+    )
+    assert "Verify remaining work is complete" in goal   # empty executable path
+    assert "maintainer's own todo" in goal
+    before_note = goal.split("Separately, these MANUAL items")[0]
+    assert "m1" not in before_note   # never in a claim-and-execute clause
+    assert "m1" in goal              # present only in the note
+
+
 def test_infer_sprint_type_heuristics():
     """f9fa00e4 — sprint-type inference by count / item_group / title keyword."""
     from meridian.handoff import _infer_sprint_type

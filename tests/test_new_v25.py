@@ -1918,6 +1918,37 @@ async def test_search_tasks_respects_limit(db):
     assert len(results) <= 3
 
 
+@pytest.mark.asyncio
+async def test_search_tasks_multiword_non_contiguous(db):
+    """fcf90f3a — a multi-word query matches when its terms appear in the
+    description but NOT as a contiguous phrase (the old single %query% LIKE
+    returned zero here). AND semantics: a term absent everywhere still misses."""
+    p = await db_module.create_project(db, "search-multiword")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db_module.log_task(
+        db, s["id"], p["id"],
+        "Fix the authentication bug in the login flow", "done")
+    # Terms present but reordered / non-adjacent → previously 0 results.
+    results = await db_module.search_tasks(db, p["id"], "authentication login")
+    assert len(results) == 1
+    assert await db_module.search_tasks(db, p["id"], "authentication payments") == []
+
+
+def test_multiword_match_clause_helper():
+    """fcf90f3a — the term-AND builder: one clause per term (>=2 chars, capped),
+    OR-ed across columns, AND-ed across terms; single token falls back to whole."""
+    from meridian.db import _multiword_match_clause
+    sql, params = _multiword_match_clause(["title", "body"], "RAG problem", op="LIKE")
+    assert sql == "((title LIKE ? OR body LIKE ?) AND (title LIKE ? OR body LIKE ?))"
+    assert params == ["%RAG%", "%RAG%", "%problem%", "%problem%"]
+    sql1, params1 = _multiword_match_clause(["description"], "auth", op="ILIKE")
+    assert sql1 == "((description ILIKE ?))"
+    assert params1 == ["%auth%"]
+    # All-short tokens → fall back to the whole query as one term.
+    _, params2 = _multiword_match_clause(["c"], "a b", op="LIKE")
+    assert params2 == ["%a b%"]
+
+
 def test_search_tasks_http_endpoint(client):
     """GET /projects/{id}/tasks/search?q=... returns matching tasks."""
     pid = client.post("/projects", json={"name": "search-http"}).json()["id"]
@@ -1966,6 +1997,25 @@ async def test_search_all_sprint_title_still_matches(db):
     await db_module.add_sprint_item(db, p["id"], "v1", "Implement rate limiting")
     result = await db_module.search_all(db, p["id"], "rate limiting")
     assert any(i["title"] == "Implement rate limiting" for i in result["sprint_items"])
+
+
+@pytest.mark.asyncio
+async def test_search_all_multiword_terms_across_fields(db):
+    """fcf90f3a — search_all matches when each query term appears in SOME text
+    field of a row (AND across terms, OR across the row's fields), even when the
+    exact phrase never appears contiguously."""
+    p = await db_module.create_project(db, "sa-multiword")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "RAG evaluation harness")
+    await db_module.patch_sprint_item(
+        db, p["id"], item["id"],
+        notes="covers the problem definition and retrieval augmented generation")
+    # "RAG" is in the title, "problem"/"definition" in the notes — the exact
+    # phrase never appears, so the old single-LIKE returned nothing.
+    result = await db_module.search_all(db, p["id"], "RAG problem definition")
+    assert any(i["title"] == "RAG evaluation harness" for i in result["sprint_items"])
+    # Space-separated query terms still match hyphen-joined / interspersed content.
+    result2 = await db_module.search_all(db, p["id"], "retrieval generation")
+    assert any(i["title"] == "RAG evaluation harness" for i in result2["sprint_items"])
 
 
 @pytest.mark.asyncio

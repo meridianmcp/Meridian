@@ -279,6 +279,43 @@ def _infer_sprint_type(items: list[dict[str, Any]]) -> str:
     return "feature"
 
 
+def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
+    """3a02041a — True for items only a human can carry out: publishing a blog
+    post, capturing screenshots, configuring a PyPI trusted publisher, installing
+    a local binary, etc. These must be kept OUT of the executor /goal's "claim and
+    execute … stopping early is a FAILURE" list — an AI executor cannot do them the
+    way intended and, under completion pressure, may fake-complete them. Signals
+    (any one): an explicit human assignee (``human_id``), ``milestone_type ==
+    'human'``, or a ``MANUAL``-tagged title."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("milestone_type") == "human" or item.get("human_id"):
+        return True
+    return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
+
+
+def _build_manual_todo_note(manual_items: list[dict[str, Any]]) -> str:
+    """3a02041a — render MANUAL/human items as a separate maintainer todo appended
+    to the /goal, explicitly NOT for the AI executor to claim (no completion
+    pressure). Empty string when there are none."""
+    parts: list[str] = []
+    for it in manual_items:
+        iid = it.get("id")
+        if not iid:
+            continue
+        title = (it.get("title") or "").strip()
+        # Drop the "MANUAL (Adam): " tag and keep a short snippet.
+        snippet = re.sub(r"^MANUAL\s*(\([^)]*\))?\s*:?\s*", "", title, flags=re.I)
+        snippet = snippet.split(". ")[0][:80].strip()
+        parts.append(f"{iid} — {snippet}" if snippet else str(iid))
+    if not parts:
+        return ""
+    return (
+        " Separately, these MANUAL items are the maintainer's own todo — the "
+        "executor must NOT claim, execute, or complete them: " + "; ".join(parts) + "."
+    )
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -335,12 +372,21 @@ def _build_quick_start_goal(
             item for item in pending_sprint_items
             if item.get("version") == version
         ]
+    # 3a02041a — split MANUAL/human items out of the executable list so they are
+    # never named under the "claim and execute" directive; they're surfaced
+    # separately as the maintainer's own todo (no completion-pressure language).
+    _manual_items = [it for it in pending_sprint_items if _is_manual_sprint_item(it)]
+    pending_sprint_items = [
+        it for it in pending_sprint_items if not _is_manual_sprint_item(it)
+    ]
+    _manual_note = _build_manual_todo_note(_manual_items)
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     if not item_ids:
         return (
             f"{_loop_prefix}/goal Verify remaining work is complete. Done when "
             f"pixi run test passes {test_floor}+, and generate_handoff() is called "
             f"at the end. Stop after {_turns} turns {_hitl_clause}"
+            f"{_manual_note}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -432,6 +478,7 @@ def _build_quick_start_goal(
         f"{_hitl_clause}"
         f"{_fail_clause}"
         f"{_type_clause}"
+        f"{_manual_note}"
     )
 
 
@@ -1326,6 +1373,9 @@ _SPRINT_GUARD_SH = """#!/usr/bin/env bash
 # c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
 # session from stopping while this project has pending sprint items. Fails OPEN.
 # This is NOT hooks.sh (the token-rotation installer).
+# b4ce3274 — bounded retry ceiling: the server stops reporting pending>0 for a
+# session after MERIDIAN_STOP_OVERRIDE_CEILING forced continuations, so this
+# guard then lets the stop through (exit 0) instead of blocking forever.
 set -uo pipefail
 PROJECT_ID="__PROJECT_ID__"
 MERIDIAN_URL="${MERIDIAN_URL:-__URL__}"
@@ -1333,7 +1383,12 @@ payload="$(cat 2>/dev/null || true)"
 if printf '%s' "$payload" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then
   exit 0
 fi
-resp="$(curl -sf --max-time 5 "$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count" 2>/dev/null || true)"
+# b4ce3274 — forward the session id (if the hook payload carries one) so the
+# override budget is counted per session, not per project.
+sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"session_id"[[:space:]]*:[[:space:]]*"([^"]*)".*/\\1/' || true)"
+url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count"
+[ -n "$sid" ] && url="$url?session_id=$sid"
+resp="$(curl -sf --max-time 5 "$url" 2>/dev/null || true)"
 [ -z "$resp" ] && exit 0
 pending="$(printf '%s' "$resp" | grep -oE '"pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
 [ -z "$pending" ] && exit 0
@@ -1341,26 +1396,43 @@ if [ "$pending" -gt 0 ] 2>/dev/null; then
   echo "Meridian: $pending sprint item(s) still pending — complete or skip them (complete_sprint_item) before stopping." >&2
   exit 2
 fi
+# pending==0: either genuinely done, or the stop-override ceiling was reached —
+# surface the ceiling case so the human/agent knows to generate a delta handoff.
+if printf '%s' "$resp" | grep -Eq '"stopped_at_ceiling"[[:space:]]*:[[:space:]]*true'; then
+  echo "Meridian: stop-override ceiling reached — allowing stop despite pending items; generate a delta handoff." >&2
+fi
 exit 0
 """
 
 _SPRINT_GUARD_PS1 = """# c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
 # session from stopping while this project has pending sprint items. Fails OPEN.
 # This is NOT hooks.ps1 (the token-rotation installer).
+# b4ce3274 — bounded retry ceiling: after MERIDIAN_STOP_OVERRIDE_CEILING forced
+# continuations the server reports pending 0 + stopped_at_ceiling, so this guard
+# lets the stop through instead of blocking forever.
 $ErrorActionPreference = 'SilentlyContinue'
 $ProjectId = '__PROJECT_ID__'
 $Url = if ($env:MERIDIAN_URL) { $env:MERIDIAN_URL } else { '__URL__' }
 $raw = [Console]::In.ReadToEnd()
 try { $payload = $raw | ConvertFrom-Json } catch { $payload = $null }
 if ($payload -and $payload.stop_hook_active -eq $true) { exit 0 }
+# b4ce3274 — forward the session id (when present) so the override budget is
+# counted per session, not per project.
+$reqUrl = "$Url/projects/$ProjectId/sprint/pending_count"
+if ($payload -and $payload.session_id) {
+    $reqUrl = "$reqUrl?session_id=$([uri]::EscapeDataString([string]$payload.session_id))"
+}
 try {
-    $r = Invoke-RestMethod -Method GET -Uri "$Url/projects/$ProjectId/sprint/pending_count" -TimeoutSec 5
+    $r = Invoke-RestMethod -Method GET -Uri $reqUrl -TimeoutSec 5
 } catch { exit 0 }
 if ($null -eq $r -or $null -eq $r.pending_count) { exit 0 }
 $pending = [int]$r.pending_count
 if ($pending -gt 0) {
     [Console]::Error.WriteLine("Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping.")
     exit 2
+}
+if ($r.stopped_at_ceiling -eq $true) {
+    [Console]::Error.WriteLine("Meridian: stop-override ceiling reached - allowing stop despite pending items; generate a delta handoff.")
 }
 exit 0
 """

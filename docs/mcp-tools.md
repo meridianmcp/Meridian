@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **89 tools** over MCP.
+Meridian exposes **90 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -197,6 +197,8 @@ Store project-level executor defaults so worker sessions start with repo path, e
 | `shell_type` | string | optional |  |
 | `branch` | string | optional |  |
 | `filesystem_roots` | array | optional | Directories the tunnel's filesystem connector may serve (unioned across the tenant's projects). Overwrites the existing list. |
+| `serena_repo_path` | string | optional | b970fe07 — default repo path for Serena (the tunnel's code-extractor slot). Auto-fetched at tunnel start; used only when --repo is not passed on the CLI. |
+| `codebase_code_dirs` | array | optional | b970fe07 — directories codebase-memory-mcp (the tunnel's code-intel slot) auto-indexes. Deduped-union across the tenant's projects; used only when --code-dir is not passed on the CLI. Overwrites the existing list. |
 | `context_threshold` | integer | optional | Turns before a context-budget warning is surfaced to the session. |
 | `max_turns` | integer | optional | Turn ceiling injected into the /goal string ('Stop after N turns'). Default 200. |
 

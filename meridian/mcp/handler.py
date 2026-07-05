@@ -1894,6 +1894,27 @@ async def _handle_notes_decisions(
             return {"error": f"file not found: {fp}"}
         except Exception as exc:  # noqa: BLE001
             return {"error": f"could not parse document: {exc}"}
+    if name == "get_latex_structure":
+        # 106118cd — docs_intel Phase 3: native LaTeX (.tex) structure + biblio,
+        # no PDF intermediary. Accepts a server-side file_path (like
+        # get_document_structure) OR raw `source` inline. latex_intel never
+        # raises — malformed LaTeX yields a partial/empty tree, not a crash.
+        validate_input_size(args.get("file_path"), "latex file_path", 2_000)
+        validate_input_size(args.get("source"), "latex source", 5_000_000)
+        fp = args.get("file_path")
+        src = args.get("source")
+        if not fp and not src:
+            return {"error": "file_path or source is required"}
+        from ..latex_intel import analyze_latex  # noqa: PLC0415
+        try:
+            if fp:
+                import os  # noqa: PLC0415
+                if not os.path.isfile(fp):
+                    return {"error": f"file not found: {fp}"}
+                return analyze_latex(fp)
+            return analyze_latex(src)
+        except Exception as exc:  # noqa: BLE001 — defense in depth; analyze_latex is already safe
+            return {"error": f"could not parse latex: {exc}"}
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)
@@ -2449,7 +2470,10 @@ async def _handle_session_tools(
         for k in ("repo_path", "env_file", "test_cmd", "test_min",
                   "deploy_cmd", "shell_type", "branch",
                   "filesystem_roots", "hostnames", "context_threshold",
-                  "isolation", "max_turns"):
+                  "isolation", "max_turns",
+                  # b970fe07 — dashboard-configurable Serena default repo + code-intel
+                  # index dirs (mirror filesystem_roots: scalar/list overwrite).
+                  "serena_repo_path", "codebase_code_dirs"):
             if k in args:
                 cfg[k] = args[k]
         if "repo_paths" in args:
@@ -3250,6 +3274,41 @@ async def _handle_sprint_tools(
         if _bc_complete:
             item = dict(item)
             item["board_change"] = _bc_complete
+        # bb29a06f — ADVISORY completion sanity-check. Extends the required_notes
+        # gate (evidence EXISTS) with a check that evidence is PLAUSIBLE: when the
+        # completion looks weakly-supported (no linked task, no notes anywhere) and
+        # no recent commit/migration shares keywords with the title, add a soft
+        # nudge. NEVER blocks, never raises — the completion already succeeded. The
+        # drift heuristic is noisy, so this is a hint, not a gate.
+        try:
+            _weakly_supported = not (
+                args.get("task_id")
+                or (args.get("notes") or "").strip()
+                or (item.get("notes") or "").strip()
+                or item.get("task_id")
+            )
+            if _weakly_supported:
+                from .. import handoff as _handoff_advisory
+                try:
+                    _adv_project = await db_module.get_project(db, args["project_id"])
+                    _adv_commits = (
+                        await _fetch_recent_commits(_adv_project, tenant)
+                        if _adv_project else []
+                    )
+                except Exception:  # noqa: BLE001 — never let commit-fetch break completion
+                    _adv_commits = []
+                _adv_matches = _handoff_advisory.detect_sprint_item_drift(
+                    item.get("title") or "", _adv_commits,
+                )
+                if not _adv_matches:
+                    item = dict(item)
+                    item["completion_advisory"] = (
+                        "No recent commit or linked evidence appears to reference "
+                        "this item — double-check it actually shipped (this is a "
+                        "heuristic; ignore if you completed it via docs/config/decision)."
+                    )
+        except Exception:  # noqa: BLE001 — advisory must never affect completion
+            pass
         # Notify only when the sprint is fully complete.
         active_statuses = {"pending", "todo", "in_progress"}
         remaining_items = await db_module.get_sprint_items(db, args["project_id"])

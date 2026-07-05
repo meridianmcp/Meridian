@@ -767,18 +767,18 @@ def test_run_connection_lazy_reprobe_recovers(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_inject_mcp_entries_replaces_non_dict_top_level():
-    out = tc._inject_mcp_entries("[1, 2, 3]", {"meridian-fs": {"type": "http", "url": "u"}})
+    out = tc._inject_mcp_entries("[1, 2, 3]", {"filesystem": {"type": "http", "url": "u"}})
     data = json.loads(out)
-    assert data["mcpServers"]["meridian-fs"]["url"] == "u"
+    assert data["mcpServers"]["filesystem"]["url"] == "u"
 
 
 def test_inject_mcp_entries_replaces_non_dict_mcpservers():
     out = tc._inject_mcp_entries(
         json.dumps({"mcpServers": "oops-a-string"}),
-        {"meridian-fs": {"type": "http", "url": "u"}},
+        {"filesystem": {"type": "http", "url": "u"}},
     )
     data = json.loads(out)
-    assert data["mcpServers"]["meridian-fs"]["url"] == "u"
+    assert data["mcpServers"]["filesystem"]["url"] == "u"
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1030,9 @@ def test_run_tunnel_node_missing_returns_1(monkeypatch):
         AsyncMock(return_value={"tenant_id": "t1", "plan": "pro"}),
     )
     monkeypatch.setattr(tc, "_write_cached_token", lambda *a, **k: None)
-    monkeypatch.setattr(tc, "_fetch_filesystem_roots", AsyncMock(return_value=([], [])))
+    # b970fe07 — _fetch_filesystem_roots now returns a 4-tuple
+    # (fs_roots, known_repo_paths, serena_repo_path, codebase_code_dirs).
+    monkeypatch.setattr(tc, "_fetch_filesystem_roots", AsyncMock(return_value=([], [], "", [])))
     monkeypatch.setattr(tc, "_ensure_node", lambda auto: False)
     rc = _run_tunnel(token="sk_tok", base_url="https://x")
     assert rc == 1
@@ -1122,7 +1124,8 @@ def test_run_tunnel_extra_fs_roots_union(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         tc, "_fetch_filesystem_roots",
-        AsyncMock(return_value=(["/server/root"], [])),
+        # b970fe07 — 4-tuple (fs_roots, known_repo_paths, serena_repo_path, code_dirs).
+        AsyncMock(return_value=(["/server/root"], [], "", [])),
     )
     captured = {}
     real_build = tc._build_proxy_command
@@ -1143,6 +1146,108 @@ def test_run_tunnel_extra_fs_roots_union(monkeypatch, tmp_path):
     assert roots is not None
     assert "/server/root" in roots                       # server roots preserved
     assert any("Outputs" in r for r in roots)            # extra root unioned in
+
+
+def _capture_serena_and_index(monkeypatch):
+    """Capture SerenaDaemonPool default_repo_path + _index_code_dir(dir) calls.
+
+    Returns a dict populated during a run_tunnel call: ``serena`` (the pool's
+    default_repo_path) and ``indexed`` (list of dirs handed to _index_code_dir).
+    """
+    captured: dict = {"serena": None, "indexed": []}
+    real_pool = tc.SerenaDaemonPool
+
+    def cap_pool(*a, **k):
+        captured["serena"] = k.get("default_repo_path")
+        return real_pool(*a, **k)
+
+    monkeypatch.setattr(tc, "SerenaDaemonPool", cap_pool)
+
+    async def fake_index(port, code_dir):
+        captured["indexed"].append(code_dir)
+
+    monkeypatch.setattr(tc, "_index_code_dir", fake_index)
+    return captured
+
+
+def test_run_tunnel_config_serena_and_code_dirs_applied(monkeypatch, tmp_path):
+    """b970fe07 fall-back-safe: with no --repo and no --code-dir, the dashboard
+    serena_repo_path drives the Serena pool default and codebase_code_dirs get
+    auto-indexed."""
+    _stub_run_tunnel_spawn(monkeypatch)
+    captured = _capture_serena_and_index(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "tid-cfg", "plan": "pro"}),
+    )
+    serena_dir = tmp_path / "serena_repo"
+    code_dir = tmp_path / "code_repo"
+    serena_dir.mkdir()
+    code_dir.mkdir()
+    monkeypatch.setattr(
+        tc, "_fetch_filesystem_roots",
+        AsyncMock(return_value=([], [], str(serena_dir), [str(code_dir)])),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    # repo_path=None / code_dirs=None → CLI flags absent → config wins.
+    rc = _run_tunnel(token="sk", base_url="https://x", repo_path=None, code_dirs=None)
+    assert rc == 0
+    assert captured["serena"] == str(serena_dir.resolve())
+    assert captured["indexed"] == [str(code_dir.resolve())]
+
+
+def test_run_tunnel_cli_flags_override_config(monkeypatch, tmp_path):
+    """b970fe07 fall-back-safe: when --repo and --code-dir ARE passed, the CLI
+    wins and the dashboard config is ignored."""
+    _stub_run_tunnel_spawn(monkeypatch)
+    captured = _capture_serena_and_index(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "tid-cli", "plan": "pro"}),
+    )
+    cli_repo = tmp_path / "cli_repo"
+    cli_code = tmp_path / "cli_code"
+    cfg_serena = tmp_path / "cfg_serena"
+    cfg_code = tmp_path / "cfg_code"
+    for d in (cli_repo, cli_code, cfg_serena, cfg_code):
+        d.mkdir()
+    monkeypatch.setattr(
+        tc, "_fetch_filesystem_roots",
+        AsyncMock(return_value=([], [], str(cfg_serena), [str(cfg_code)])),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(
+        token="sk", base_url="https://x",
+        repo_path=str(cli_repo), code_dirs=[str(cli_code)],
+    )
+    assert rc == 0
+    # CLI repo wins for Serena default; config serena_repo_path ignored.
+    assert captured["serena"] == str(cli_repo.resolve())
+    # CLI --code-dir wins; config codebase_code_dirs ignored.
+    assert captured["indexed"] == [str(cli_code.resolve())]
+
+
+def test_run_tunnel_no_config_reproduces_cwd_default(monkeypatch, tmp_path):
+    """b970fe07 fall-back-safe: absent config + no flags → Serena default is the
+    cwd (today's exact behaviour) and nothing is auto-indexed."""
+    _stub_run_tunnel_spawn(monkeypatch)
+    captured = _capture_serena_and_index(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "tid-def", "plan": "pro"}),
+    )
+    monkeypatch.setattr(
+        tc, "_fetch_filesystem_roots",
+        AsyncMock(return_value=([], [], "", [])),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk", base_url="https://x", repo_path=None, code_dirs=None)
+    assert rc == 0
+    assert captured["serena"] == str(tmp_path.resolve())   # cwd default, unchanged
+    assert captured["indexed"] == []                        # no auto-index
 
 
 def test_run_tunnel_full_path_all_slots(monkeypatch, tmp_path):
@@ -1449,8 +1554,8 @@ def test_tunnel_mcp_entries_includes_custom_local_proxies():
         "https://usemeridian.us", "tid-x",
         custom=[{"name": "fetch", "port": 8901}, {"name": "git", "port": 8902}],
     )
-    # Built-ins still point at the hosted relay.
-    assert entries["meridian-fs"]["url"].startswith("https://usemeridian.us/fs/mcp/")
+    # Built-ins still point at the hosted relay (ef162c28 — new plugin-derived key).
+    assert entries["filesystem"]["url"].startswith("https://usemeridian.us/fs/mcp/")
     # Custom ones point at the local proxy, NOT the hosted server.
     assert entries["meridian-custom-fetch"] == {"type": "http", "url": "http://127.0.0.1:8901/mcp"}
     assert entries["meridian-custom-git"] == {"type": "http", "url": "http://127.0.0.1:8902/mcp"}
@@ -1470,7 +1575,7 @@ def test_run_tunnel_spawns_custom_plugin_locally_and_writes_mcp_json(monkeypatch
 
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
     # Don't restore (delete) the .mcp.json on shutdown so we can inspect it.
-    monkeypatch.setattr(tc, "_restore_mcp_json", lambda snaps: None)
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
 
     monkeypatch.setattr(
         tc, "_fetch_me",
@@ -1501,7 +1606,7 @@ def test_run_tunnel_custom_plugin_repo_path_expanded_at_spawn(monkeypatch, tmp_p
     """{repo_path} in a custom plugin command is expanded to the served repo at
     spawn time (resolve_custom_plugins leaves it intact; the client expands it)."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
-    monkeypatch.setattr(tc, "_restore_mcp_json", lambda snaps: None)
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
     monkeypatch.setattr(
         tc, "_fetch_me",
         AsyncMock(return_value={
@@ -1527,7 +1632,7 @@ def test_run_tunnel_custom_only_keeps_tunnel_alive(monkeypatch, tmp_path):
     """With every built-in slot disabled but one custom plugin enabled, the tunnel
     still serves (the local proxy + mcp.json) — exit 0, not 'nothing to serve'."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
-    monkeypatch.setattr(tc, "_restore_mcp_json", lambda snaps: None)
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
     monkeypatch.setattr(
         tc, "_fetch_me",
         AsyncMock(return_value={

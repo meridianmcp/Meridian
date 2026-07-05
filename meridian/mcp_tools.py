@@ -31,6 +31,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
     "ingest_document": 'ingest_document(project_id="abc-123", file_path="docs/spec.docx", tags="spec")  # or, for a PDF: ingest_document(project_id="abc-123", content="<text you extracted>", title="Q3 report", source="https://example.com/q3.pdf")',
     "get_document_structure": 'get_document_structure(file_path="thesis/chapter1.docx")',
+    "get_latex_structure": 'get_latex_structure(file_path="thesis/chapter1.tex")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -322,6 +323,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "file_path": {"type": "string", "description": "Path to a server-accessible .docx file."}},
          "required": ["file_path"]}},
+    {"name": "get_latex_structure", "description":
+        "106118cd — parse a LaTeX (.tex) source's structure WITHOUT a PDF "
+        "intermediary. Meridian parses the .tex server-side with pylatexenc "
+        "(pure-Python, no LaTeX install) and returns heading_count, an ordered "
+        "headings outline and a nested tree of "
+        "\\part/\\chapter/\\section/\\subsection/\\subsubsection/\\paragraph "
+        "(level, kind, text, children), plus unexpanded_inputs (\\input/\\include "
+        "filenames, not expanded) and a bibliography list (thebibliography "
+        "\\bibitem entries, and \\bibliography{...} + a sibling .bib when a path "
+        "is given). Pass file_path to a server-accessible .tex, OR pass source "
+        "with the raw LaTeX inline. Malformed LaTeX returns a partial/empty "
+        "result, never an error crash.",
+     "inputSchema": {"type": "object", "properties": {
+         "file_path": {"type": "string", "description": "Path to a server-accessible .tex file. A sibling .bib referenced by \\bibliography is resolved relative to it."},
+         "source": {"type": "string", "description": "Raw LaTeX source, as an alternative to file_path. Ignored when file_path is given."}},
+         "required": []}},
     {"name": "add_insight", "description":
         "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
         "decisions. A first-class knowledge type SEPARATE from decisions (choices with a "
@@ -819,6 +836,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "branch": {"type": "string"},
          "filesystem_roots": {"type": "array", "items": {"type": "string"},
              "description": "Directories the tunnel's filesystem connector may serve (unioned across the tenant's projects). Overwrites the existing list."},
+         "serena_repo_path": {"type": "string",
+             "description": "b970fe07 — default repo path for Serena (the tunnel's code-extractor slot). Auto-fetched at tunnel start; used only when --repo is not passed on the CLI."},
+         "codebase_code_dirs": {"type": "array", "items": {"type": "string"},
+             "description": "b970fe07 — directories codebase-memory-mcp (the tunnel's code-intel slot) auto-indexes. Deduped-union across the tenant's projects; used only when --code-dir is not passed on the CLI. Overwrites the existing list."},
          "context_threshold": {"type": "integer", "description": "Turns before a context-budget warning is surfaced to the session."},
          "max_turns": {"type": "integer", "description": "Turn ceiling injected into the /goal string ('Stop after N turns'). Default 200."}},
          "required": []}},
