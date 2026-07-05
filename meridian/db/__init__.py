@@ -8735,6 +8735,32 @@ async def get_project_note(
     return _row_to_dict(row)
 
 
+async def get_project_document_by_source(
+    db: aiosqlite.Connection, project_id: str, source: str
+) -> dict[str, Any] | None:
+    """e9addcb0 — fetch a ``kind='document'`` note by its stable source identity.
+
+    ``source`` is the document's stable handle — a file path or a Drive file id —
+    set by :func:`ingest_document`. Re-ingesting the same document targets this
+    row so an upsert refreshes it in place instead of creating a duplicate.
+
+    Scoped to (``project_id``, ``source``, ``note_kind='document'``): a plain
+    note that happens to share a source string is never matched. Returns the
+    newest matching row (oldest are legacy pre-upsert duplicates) or None.
+    """
+    src = (source or "").strip()
+    if not src:
+        return None
+    async with db.execute(
+        "SELECT * FROM project_notes "
+        "WHERE project_id = ? AND note_kind = 'document' AND source = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (project_id, src),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
 async def ingest_document(
     db: aiosqlite.Connection,
     project_id: str,
@@ -8759,6 +8785,15 @@ async def ingest_document(
     ``doc_ingest.DOC_BODY_MAX_CHARS`` (truncated with a clear "…[truncated]"
     marker if longer; the kept prefix stays full-text searchable). The note is
     stored via :func:`add_project_note` with ``kind='document'`` and ``source``.
+
+    e9addcb0 — **upsert by stable identity.** When a ``source`` resolves (an
+    explicit ``source``, else ``file_path``), re-ingesting the same document
+    UPDATES the existing ``kind='document'`` note for this project in place
+    (refreshing body / title / tags / ``updated_at``) instead of creating a
+    duplicate — so re-touching a path or Drive file id yields one row, not N.
+    When no source can be resolved (``content`` with no ``source``/``file_path``)
+    the document is not identifiable, so it always inserts a fresh note — two
+    anonymous ingests never silently merge.
 
     Meridian is a coordination store, not an LLM: this never summarizes. Pass a
     summary as ``content`` if you want one stored instead of the raw text.
@@ -8788,6 +8823,26 @@ async def ingest_document(
             doc_title = "Untitled document"
 
     capped = cap_body(body or "")
+    stored_source = (ingest_source or "").strip() or None
+
+    # e9addcb0 — upsert by stable identity: if this project already has a
+    # kind='document' note for the same source, refresh it in place instead of
+    # creating a duplicate. Only when a source resolves — an anonymous ingest
+    # (content with no source/file_path) can't be identified, so it inserts.
+    if stored_source is not None:
+        existing = await get_project_document_by_source(db, project_id, stored_source)
+        if existing is not None:
+            # tags is passed through as-is: None (caller omitted it) leaves the
+            # prior ingest's tags untouched; a value replaces them.
+            updated = await update_project_note(
+                db,
+                existing["id"],
+                title=doc_title,
+                body=capped,
+                tags=tags,
+            )
+            return updated or existing
+
     return await add_project_note(
         db,
         project_id,
@@ -8795,7 +8850,7 @@ async def ingest_document(
         capped,
         tags,
         kind="document",
-        source=(ingest_source or None),
+        source=stored_source,
     )
 
 

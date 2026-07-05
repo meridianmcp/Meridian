@@ -10972,6 +10972,113 @@ async def test_ingest_document_requires_content_or_file_path(db):
 
 
 @pytest.mark.asyncio
+async def test_ingest_document_upserts_by_source(db):
+    """e9addcb0 — re-ingesting the SAME source updates the existing document in
+    place: one row, refreshed body/title/tags/updated_at, same note id."""
+    p = await db_module.create_project(db, "e9addcb0-upsert")
+    pid = p["id"]
+    src = "onedrive://file/ABC123"
+
+    first = await db_module.ingest_document(
+        db, pid, content="v1 body", title="Spec v1", source=src, tags="draft",
+    )
+    # Re-ingest the same document (same source) with new content/title/tags.
+    second = await db_module.ingest_document(
+        db, pid, content="v2 body — revised", title="Spec v2", source=src, tags="final",
+    )
+
+    # Same underlying row was updated, not a new one created.
+    assert second["id"] == first["id"]
+    assert second["note_kind"] == "document"
+    assert second["source"] == src
+    assert second["body"] == "v2 body — revised"
+    assert second["title"] == "Spec v2"
+    assert second["tags"] == "final"
+
+    # Exactly ONE document note for this source in the project.
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document" and n.get("source") == src
+    ]
+    assert len(docs) == 1
+    assert docs[0]["body"] == "v2 body — revised"
+
+    # The stable-identity lookup returns that single row.
+    found = await db_module.get_project_document_by_source(db, pid, src)
+    assert found is not None and found["id"] == first["id"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_different_sources_are_distinct_rows(db):
+    """e9addcb0 — ingesting two DIFFERENT sources creates two document rows;
+    the upsert only collapses re-ingests of the same identity."""
+    p = await db_module.create_project(db, "e9addcb0-distinct")
+    pid = p["id"]
+
+    a = await db_module.ingest_document(
+        db, pid, content="alpha", title="A", source="path/a.md",
+    )
+    b = await db_module.ingest_document(
+        db, pid, content="beta", title="B", source="path/b.md",
+    )
+    assert a["id"] != b["id"]
+
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document"
+    ]
+    assert len(docs) == 2
+    assert {n["source"] for n in docs} == {"path/a.md", "path/b.md"}
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_without_source_never_merges(db):
+    """e9addcb0 — an anonymous ingest (content, no source/file_path) can't be
+    identified, so two such ingests stay two distinct rows — no silent merge."""
+    p = await db_module.create_project(db, "e9addcb0-anon")
+    pid = p["id"]
+
+    first = await db_module.ingest_document(db, pid, content="first anon", title="Doc")
+    second = await db_module.ingest_document(db, pid, content="second anon", title="Doc")
+    assert first["id"] != second["id"]
+    # Neither carries a source (nothing to key an upsert on).
+    assert not (first.get("source") or "")
+    assert not (second.get("source") or "")
+
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document"
+    ]
+    assert len(docs) == 2
+    # Lookup by empty source is a no-op, not a wildcard match.
+    assert await db_module.get_project_document_by_source(db, pid, "") is None
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_file_path_upserts_by_path(db, tmp_path):
+    """e9addcb0 — a file_path is the stable identity when no explicit source is
+    given: re-ingesting the same path (with changed contents) upserts one row."""
+    p = await db_module.create_project(db, "e9addcb0-file-upsert")
+    pid = p["id"]
+    doc = tmp_path / "spec.md"
+    doc.write_text("original text", encoding="utf-8")
+
+    first = await db_module.ingest_document(db, pid, file_path=str(doc))
+    doc.write_text("edited text — v2", encoding="utf-8")
+    second = await db_module.ingest_document(db, pid, file_path=str(doc))
+
+    assert second["id"] == first["id"]
+    assert second["source"] == str(doc)
+    assert second["body"] == "edited text — v2"
+
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document" and n.get("source") == str(doc)
+    ]
+    assert len(docs) == 1
+
+
+@pytest.mark.asyncio
 async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
     """e3f150d0 — the ingest_document MCP tool extracts a .docx server-side and
     stores a kind='document' note; the PDF path returns a clear error payload.
