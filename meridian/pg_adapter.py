@@ -1082,6 +1082,31 @@ async def _migrate_pg_oauth_codes(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_device_codes(conn: PostgresConnection) -> None:
+    """e9f18530 — RFC 8628 device authorization grant table (Postgres).
+
+    device_code / user_code hold SHA-256 HASHES of the codes, never the raw
+    values. last_polled_at backs the slow_down poll-rate limiter. CREATE … IF
+    NOT EXISTS + ADD COLUMN IF NOT EXISTS so re-running is a no-op and older PG
+    DBs that never had the table get the full hardened schema. Mirrors
+    db._migrate_device_codes_table + db._migrate_device_codes_denied_polled.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS device_codes ("
+        "    device_code TEXT PRIMARY KEY,"
+        "    user_code TEXT NOT NULL UNIQUE,"
+        "    tenant_id TEXT,"
+        "    expires_at TEXT NOT NULL,"
+        "    approved INTEGER NOT NULL DEFAULT 0,"
+        "    denied INTEGER NOT NULL DEFAULT 0,"
+        "    last_polled_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "ALTER TABLE device_codes ADD COLUMN IF NOT EXISTS denied INTEGER NOT NULL DEFAULT 0;"
+        "ALTER TABLE device_codes ADD COLUMN IF NOT EXISTS last_polled_at TEXT"
+    )
+
+
 async def _migrate_pg_github_to_projects(conn: PostgresConnection) -> None:
     """Move github_repo + github_branch from tenants to projects (Task 1)."""
     await conn.executescript(
@@ -2428,6 +2453,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_api_token_type,
     _migrate_pg_api_token_expires_at,
     _migrate_pg_oauth_codes,
+    _migrate_pg_device_codes,
     _migrate_pg_github_to_projects,
     _migrate_pg_touches_resources,
     _migrate_pg_resource_locks,

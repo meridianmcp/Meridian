@@ -372,24 +372,39 @@ async def _oauth_reg(request: Request):
 # Device flow (RFC 8628)
 # ---------------------------------------------------------------------------
 
+# RFC 8628 device-flow tuning (e9f18530).
+_DEVICE_CODE_TTL = 300  # expires_in — 5 minutes
+_DEVICE_POLL_INTERVAL = 5  # interval — min seconds between /oauth/token polls
+
+
+def _device_hash(code: str) -> str:
+    """SHA-256 of a device_code / user_code. Only hashes are persisted."""
+    return _hs.sha256(code.encode()).hexdigest()
+
+
 @router.post("/oauth/device")
 async def _oauth_device(request: Request):
-    """RFC 8628 device authorization endpoint."""
-    import string as _str  # noqa: PLC0415
+    """RFC 8628 device authorization endpoint.
+
+    Mints a high-entropy opaque ``device_code`` and a short human-typable
+    ``user_code`` (base32, e.g. ``WDJB-MJHT``). Only SHA-256 HASHES of both are
+    persisted — the raw values are returned once and never stored or logged.
+    """
     auth_db = request.app.state.db
     b = str(request.base_url).rstrip("/")
-    device_code = _sec.token_hex(32)
-    _chars = _str.ascii_uppercase
+    device_code = _sec.token_hex(32)  # 256 bits of entropy
+    # Crockford-ish base32 alphabet (no I/L/O/U/0/1) — unambiguous when typed.
+    _chars = "ABCDEFGHJKMNPQRSTVWXYZ23456789"
     user_code = (
         "".join(_sec.choice(_chars) for _ in range(4))
         + "-"
         + "".join(_sec.choice(_chars) for _ in range(4))
     )
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td_cls  # noqa: PLC0415
-    expires_at = (_dt.now(tz=_tz.utc) + _td_cls(seconds=300)).strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (_dt.now(tz=_tz.utc) + _td_cls(seconds=_DEVICE_CODE_TTL)).strftime("%Y-%m-%d %H:%M:%S")
     await auth_db.execute(
         "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?, ?, ?)",
-        (device_code, user_code, expires_at),
+        (_device_hash(device_code), _device_hash(user_code), expires_at),
     )
     await auth_db.commit()
     return JSONResponse({
@@ -397,8 +412,8 @@ async def _oauth_device(request: Request):
         "user_code": user_code,
         "verification_uri": f"{b}/activate",
         "verification_uri_complete": f"{b}/activate?code={user_code}",
-        "expires_in": 300,
-        "interval": 5,
+        "expires_in": _DEVICE_CODE_TTL,
+        "interval": _DEVICE_POLL_INTERVAL,
     })
 
 
@@ -433,18 +448,25 @@ async def _activate_get(request: Request):
     if code_param:
         from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
         async with auth_db.execute(
-            "SELECT device_code, user_code, expires_at, approved FROM device_codes WHERE user_code = ?",
-            (code_param,),
+            "SELECT device_code, user_code, expires_at, approved, denied FROM device_codes WHERE user_code = ?",
+            (_device_hash(code_param),),
         ) as _cur:
             _row = await _cur.fetchone()
         if _row:
-            _row_d = dict(zip(["device_code", "user_code", "expires_at", "approved"], _row)) if not hasattr(_row, "keys") else dict(_row)
+            _row_d = dict(zip(["device_code", "user_code", "expires_at", "approved", "denied"], _row)) if not hasattr(_row, "keys") else dict(_row)
             _exp_str = _row_d.get("expires_at", "")
             try:
                 _exp_dt = _dt.fromisoformat(str(_exp_str).replace("Z", "+00:00"))
                 if _exp_dt.tzinfo is None:
                     _exp_dt = _exp_dt.replace(tzinfo=_tz.utc)
-                if _dt.now(tz=_tz.utc) <= _exp_dt and not _row_d.get("approved"):
+                if (
+                    _dt.now(tz=_tz.utc) <= _exp_dt
+                    and not _row_d.get("approved")
+                    and not _row_d.get("denied")
+                ):
+                    # Carry the raw (typed) code through to the approve form —
+                    # the DB only holds its hash.
+                    _row_d["user_code"] = code_param
                     row_data = _row_d
             except Exception:
                 pass
@@ -542,9 +564,11 @@ async def _activate_post(request: Request):
     if not user_code:
         return _RR("/activate", status_code=303)
 
+    # device_codes stores the hash — look up by hashing the typed code.
+    user_code_hash = _device_hash(user_code)
     async with auth_db.execute(
         "SELECT device_code, user_code, expires_at, approved FROM device_codes WHERE user_code = ?",
-        (user_code,),
+        (user_code_hash,),
     ) as _cur:
         _row = await _cur.fetchone()
 
@@ -552,13 +576,20 @@ async def _activate_post(request: Request):
         return _RR("/activate", status_code=303)
 
     if action == "approve":
+        # Approval binds the device code to THIS authenticated tenant (hosted
+        # mode); tenant_id is None in self-hosted single-user mode.
         await auth_db.execute(
             "UPDATE device_codes SET tenant_id = ?, approved = 1 WHERE user_code = ?",
-            (tenant_id, user_code),
+            (tenant_id, user_code_hash),
         )
         await auth_db.commit()
     else:
-        await auth_db.execute("DELETE FROM device_codes WHERE user_code = ?", (user_code,))
+        # Mark denied (RFC 8628 access_denied) rather than delete, so the poll
+        # endpoint can report access_denied instead of a bare expired_token.
+        await auth_db.execute(
+            "UPDATE device_codes SET denied = 1 WHERE user_code = ?",
+            (user_code_hash,),
+        )
         await auth_db.commit()
 
     return _RR("/dashboard", status_code=303)
@@ -705,46 +736,84 @@ async def _oauth_token(request: Request):
             return JSONResponse({"error": "invalid_request", "error_description": "device_code required"}, status_code=400)
         auth_db = request.app.state.db
         from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
+        # device_codes stores the hash — look up by hashing the presented code.
+        device_code_hash = _device_hash(device_code)
         async with auth_db.execute(
-            "SELECT device_code, user_code, tenant_id, expires_at, approved FROM device_codes WHERE device_code = ?",
-            (device_code,),
+            "SELECT device_code, user_code, tenant_id, expires_at, approved, denied, last_polled_at "
+            "FROM device_codes WHERE device_code = ?",
+            (device_code_hash,),
         ) as _cur:
             _row = await _cur.fetchone()
         if _row is None:
             return JSONResponse({"error": "expired_token", "error_description": "device code expired or not found"}, status_code=400)
-        _row_d = dict(zip(["device_code", "user_code", "tenant_id", "expires_at", "approved"], _row)) if not hasattr(_row, "keys") else dict(_row)
+        _cols = ["device_code", "user_code", "tenant_id", "expires_at", "approved", "denied", "last_polled_at"]
+        _row_d = dict(zip(_cols, _row)) if not hasattr(_row, "keys") else dict(_row)
+        _now = _dt.now(tz=_tz.utc)
         try:
             _exp_dt = _dt.fromisoformat(str(_row_d["expires_at"]).replace("Z", "+00:00"))
             if _exp_dt.tzinfo is None:
                 _exp_dt = _exp_dt.replace(tzinfo=_tz.utc)
-            if _dt.now(tz=_tz.utc) > _exp_dt:
-                await auth_db.execute("DELETE FROM device_codes WHERE device_code = ?", (device_code,))
+            if _now > _exp_dt:
+                await auth_db.execute("DELETE FROM device_codes WHERE device_code = ?", (device_code_hash,))
                 await auth_db.commit()
                 return JSONResponse({"error": "expired_token", "error_description": "device code expired"}, status_code=400)
         except Exception:
             return JSONResponse({"error": "expired_token"}, status_code=400)
-        if not _row_d.get("approved"):
-            return JSONResponse({"error": "authorization_pending"}, status_code=200)
-        await auth_db.execute("DELETE FROM device_codes WHERE device_code = ?", (device_code,))
-        await auth_db.commit()
-        tok = f"sk_meridian_{_sec.token_urlsafe(32)}"
-        tok_hash = _oauth_token_hash(tok)
-        _oa_tenant_id = _row_d.get("tenant_id")
-        tok_data = {"client_id": d.get("client_id", "meridian"), "exp": int(_tm.time() + 86400 * 90), "tenant_id": _oa_tenant_id}
-        _oa_tokens[tok_hash] = tok_data
-        if _oa_tenant_id:
-            import uuid as _uuid  # noqa: PLC0415
-            _api_tid = str(_uuid.uuid4())
+        # Explicit denial (RFC 8628 access_denied). Consume so it can't be reused.
+        if _row_d.get("denied"):
+            await auth_db.execute("DELETE FROM device_codes WHERE device_code = ?", (device_code_hash,))
+            await auth_db.commit()
+            return JSONResponse({"error": "access_denied", "error_description": "user denied the request"}, status_code=400)
+        # Poll-rate limiting (RFC 8628 slow_down): reject polls faster than the
+        # advertised interval. Checked before the pending check so an aggressive
+        # client is throttled while still waiting for approval.
+        _last = _row_d.get("last_polled_at")
+        if _last:
             try:
-                await auth_db.execute(
-                    "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type) VALUES (?, ?, ?, ?, ?)",
-                    (_api_tid, _oa_tenant_id, tok_hash, "claude-code-oauth", "readwrite"),
-                )
-                await auth_db.commit()
+                _last_dt = _dt.fromisoformat(str(_last).replace("Z", "+00:00"))
+                if _last_dt.tzinfo is None:
+                    _last_dt = _last_dt.replace(tzinfo=_tz.utc)
+                if (_now - _last_dt).total_seconds() < _DEVICE_POLL_INTERVAL:
+                    return JSONResponse({"error": "slow_down", "error_description": "polling too frequently"}, status_code=200)
             except Exception:
                 pass
+        await auth_db.execute(
+            "UPDATE device_codes SET last_polled_at = ? WHERE device_code = ?",
+            (_now.strftime("%Y-%m-%d %H:%M:%S"), device_code_hash),
+        )
+        await auth_db.commit()
+        if not _row_d.get("approved"):
+            return JSONResponse({"error": "authorization_pending"}, status_code=200)
+        # Approved — consume the code (single-use) and mint the token exactly once.
+        await auth_db.execute("DELETE FROM device_codes WHERE device_code = ?", (device_code_hash,))
+        await auth_db.commit()
+        _oa_tenant_id = _row_d.get("tenant_id")
+        if _oa_tenant_id:
+            # Hosted mode: mint a real tenant-scoped API token via the shared
+            # helper so the returned key authenticates like any other API key.
+            tok, _ = await db_module.create_api_token(
+                auth_db, _oa_tenant_id, label="device-code", token_type="readwrite"
+            )
+            tok_hash = _oauth_token_hash(tok)
+            _oa_tokens[tok_hash] = {
+                "client_id": d.get("client_id", "meridian"),
+                "exp": int(_tm.time() + 86400 * 90),
+                "tenant_id": _oa_tenant_id,
+            }
         else:
-            await _upsert_oauth_token(auth_db, tok_hash, tenant_id=None, client_id=tok_data["client_id"], exp=tok_data["exp"])
+            # Self-hosted single-user mode: no tenant FK to hang an api_token on,
+            # so persist to oauth_tokens (the OAuth middleware honours these too).
+            tok = f"sk_meridian_{_sec.token_urlsafe(32)}"
+            tok_hash = _oauth_token_hash(tok)
+            _oa_tokens[tok_hash] = {
+                "client_id": d.get("client_id", "meridian"),
+                "exp": int(_tm.time() + 86400 * 90),
+                "tenant_id": None,
+            }
+            await _upsert_oauth_token(
+                auth_db, tok_hash, tenant_id=None,
+                client_id=_oa_tokens[tok_hash]["client_id"], exp=_oa_tokens[tok_hash]["exp"],
+            )
         _save_oa_tokens(_oa_tokens)
         return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
 

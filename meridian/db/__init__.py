@@ -430,12 +430,17 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- RFC 8628 device authorization grant (e9f18530). device_code / user_code
+-- hold SHA-256 HASHES of the codes, never the raw values. last_polled_at
+-- backs the poll-rate limiter (RFC 8628 slow_down).
 CREATE TABLE IF NOT EXISTS device_codes (
     device_code TEXT PRIMARY KEY,
     user_code TEXT NOT NULL UNIQUE,
     tenant_id TEXT,
     expires_at TEXT NOT NULL,
     approved INTEGER NOT NULL DEFAULT 0,
+    denied INTEGER NOT NULL DEFAULT 0,
+    last_polled_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -834,6 +839,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_api_tokens_expires_at(db)
     await _migrate_oauth_codes_table(db)
     await _migrate_device_codes_table(db)
+    await _migrate_device_codes_denied_polled(db)
     await _migrate_github_to_projects(db)
     await _migrate_touches_files(db)
     await _migrate_touches_resources(db)

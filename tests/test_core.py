@@ -6848,6 +6848,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_api_token_type",
         "_migrate_pg_api_token_expires_at",
         "_migrate_pg_oauth_codes",
+        "_migrate_pg_device_codes",
         "_migrate_pg_github_to_projects",
         "_migrate_pg_touches_resources",
         "_migrate_pg_resource_locks",
@@ -6894,7 +6895,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 83
+    assert len(allnames) == len(set(allnames)) == 84
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -13219,6 +13220,16 @@ def test_github_status_graceful_on_db_error(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _run_async(coro):
+    """Run a coroutine against the app DB on a fresh loop (aiosqlite is
+    thread-backed, so a private loop is safe here)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 def test_oauth_device_returns_required_fields(client):
     """POST /oauth/device returns all RFC 8628 required fields."""
     r = client.post("/oauth/device")
@@ -13288,7 +13299,7 @@ def test_oauth_device_expired_code(client):
 
 
 def test_oauth_device_deny_no_token(client):
-    """Deny action deletes the device code so subsequent poll returns expired_token."""
+    """Deny marks the code denied so the poll returns RFC 8628 access_denied."""
     resp = client.post("/oauth/device").json()
     device_code = resp["device_code"]
     user_code = resp["user_code"]
@@ -13296,13 +13307,22 @@ def test_oauth_device_deny_no_token(client):
     # User denies
     client.post("/activate", data={"user_code": user_code, "action": "deny"})
 
-    # Poll — code deleted on deny, so expired_token
+    # Poll — denial surfaces as access_denied (per RFC 8628), and the code is
+    # consumed so a second poll can't be redeemed.
     r = client.post("/oauth/token", json={
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
         "device_code": device_code,
     })
     assert r.status_code == 400
-    assert r.json()["error"] == "expired_token"
+    assert r.json()["error"] == "access_denied"
+
+    # Consumed on denial — subsequent poll is expired_token (row gone).
+    r2 = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "expired_token"
 
 
 def test_oauth_device_token_consumed_after_issue(client):
@@ -13353,6 +13373,111 @@ def test_oauth_device_table_in_create_tables():
     """CREATE_TABLES must define device_codes table for RFC 8628 persistence."""
     from meridian.db import CREATE_TABLES
     assert "device_codes" in CREATE_TABLES, "CREATE_TABLES missing 'device_codes'"
+
+
+def test_oauth_device_slow_down_on_fast_poll(client):
+    """Two rapid polls of the same pending code return slow_down on the second (e9f18530)."""
+    dc = client.post("/oauth/device").json()["device_code"]
+    body = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": dc,
+    }
+    r1 = client.post("/oauth/token", json=body)
+    assert r1.json()["error"] == "authorization_pending"
+    # Immediate second poll is faster than the 5s interval → slow_down.
+    r2 = client.post("/oauth/token", json=body)
+    assert r2.status_code == 200
+    assert r2.json()["error"] == "slow_down"
+
+
+def test_oauth_device_codes_stored_hashed_not_plaintext(client):
+    """device_code / user_code are persisted as SHA-256 hashes, never plaintext (e9f18530)."""
+    import hashlib
+
+    resp = client.post("/oauth/device").json()
+    device_code = resp["device_code"]
+    user_code = resp["user_code"]
+
+    async def _fetch():
+        db = client.app.state.db
+        async with db.execute(
+            "SELECT device_code, user_code FROM device_codes"
+        ) as cur:
+            return await cur.fetchall()
+
+    rows = _run_async(_fetch())
+    stored = [
+        (r["device_code"], r["user_code"]) if hasattr(r, "keys") else (r[0], r[1])
+        for r in rows
+    ]
+    stored_device = {s[0] for s in stored}
+    stored_user = {s[1] for s in stored}
+
+    # The raw codes must NOT appear anywhere in the table...
+    assert device_code not in stored_device
+    assert user_code not in stored_user
+    # ...but their SHA-256 hashes must.
+    assert hashlib.sha256(device_code.encode()).hexdigest() in stored_device
+    assert hashlib.sha256(user_code.encode()).hexdigest() in stored_user
+
+
+def test_oauth_device_tenant_token_authenticates(client):
+    """Hosted path: an approved code bound to a tenant mints a working API token
+    via create_api_token that authenticates via get_tenant_from_token_hash (e9f18530)."""
+    import hashlib
+    from meridian import db as db_module
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "device-flow@example.com")
+        # Insert an already-approved device code bound to this tenant.
+        resp = await _post_device(db)
+        return tenant["id"], resp
+
+    async def _post_device(db):
+        # Reuse the real endpoint logic by inserting a known pair directly.
+        import secrets as _s
+        from datetime import datetime, timezone, timedelta
+        from meridian.routes.oauth import _device_hash
+        device_code = _s.token_hex(32)
+        user_code = "TEST-CODE"
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?, ?, ?)",
+            (_device_hash(device_code), _device_hash(user_code), expires_at),
+        )
+        await db.commit()
+        return device_code
+
+    tenant_id, device_code = _run_async(_setup())
+
+    async def _approve():
+        db = client.app.state.db
+        from meridian.routes.oauth import _device_hash
+        await db.execute(
+            "UPDATE device_codes SET tenant_id = ?, approved = 1 WHERE device_code = ?",
+            (tenant_id, _device_hash(device_code)),
+        )
+        await db.commit()
+
+    _run_async(_approve())
+
+    r = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r.status_code == 200
+    tok = r.json()["access_token"]
+    assert tok.startswith("sk_meridian_")
+
+    async def _verify():
+        db = client.app.state.db
+        tok_hash = hashlib.sha256(tok.encode()).hexdigest()
+        return await db_module.get_tenant_from_token_hash(db, tok_hash)
+
+    tenant_row = _run_async(_verify())
+    assert tenant_row is not None
+    assert tenant_row["id"] == tenant_id
 
 
 # ---------------------------------------------------------------------------
