@@ -145,10 +145,16 @@ async def create_project(
     db = await _db(request)
     # 0bf67524 — pass tenant_id so the new project is seeded from the workspace's
     # cascade defaults (execution mode / HITL / code intel).
-    project = await db_module.create_project(
-        db, body.name, human_id=body.human_id,
-        tenant_id=(tenant.get("id") if tenant else None),
-    )
+    # 3b6ff466 — optional parent_project_id makes this a one-level-deep subproject;
+    # an invalid/nested parent raises ValueError → 400.
+    try:
+        project = await db_module.create_project(
+            db, body.name, human_id=body.human_id,
+            tenant_id=(tenant.get("id") if tenant else None),
+            parent_project_id=body.parent_project_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     from ..agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # noqa: PLC0415
     await db_module.set_agent_instructions(db, project["id"], DEFAULT_AGENT_INSTRUCTIONS)
     # c3e91df4 — start the free-tier trial clock on first own project creation,

@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS projects (
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
     icon TEXT,
     agent_instructions TEXT,
+    parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous'
         CHECK (execution_mode IN ('autonomous', 'interactive')),
     status TEXT NOT NULL DEFAULT 'active'
@@ -881,6 +882,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_slug(db)
     await _migrate_capture_insight_notes_to_insights(db)
     await _migrate_blog_posts_tenant(db)
+    await _migrate_project_parent_id(db)
     return db
 
 
@@ -892,6 +894,7 @@ async def create_project(
     human_id: str | None = None,
     execution_mode: str | None = None,
     tenant_id: str | None = None,
+    parent_project_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a project and return it as a dict. Raises if the name exists.
 
@@ -907,7 +910,27 @@ async def create_project(
     workspace's cascade defaults (execution_mode_default, hitl_auto_answer_default,
     code_intel_enabled_default) for any field the caller didn't set explicitly.
     Existing projects are never touched; this is a creation-time cascade only.
+
+    ``parent_project_id`` (3b6ff466) — when given, the new project is a
+    subproject of that parent. The hierarchy is ONE level deep: the parent
+    must exist AND must itself be top-level (its own parent_project_id is
+    NULL) — a grandchild is rejected with ValueError. A subproject with no
+    north_star of its own falls back to its parent's north_star (see
+    ``get_goal``). Top-level projects pass parent_project_id=None (default).
     """
+    # 3b6ff466 — validate the subproject parent before inserting anything.
+    if parent_project_id is not None:
+        parent = await get_project(db, parent_project_id)
+        if parent is None:
+            raise ValueError(
+                f"parent project '{parent_project_id}' does not exist"
+            )
+        if parent.get("parent_project_id"):
+            raise ValueError(
+                "subprojects are one level deep — cannot nest under a "
+                f"project that is itself a subproject "
+                f"('{parent_project_id}' has a parent)"
+            )
     # Resolve workspace defaults for seeding (best-effort; never block creation).
     _ws: dict[str, Any] = {}
     if tenant_id is not None:
@@ -920,9 +943,10 @@ async def create_project(
     pid = _new_id()
     mode = normalize_execution_mode(execution_mode)
     await db.execute(
-        "INSERT INTO projects (id, name, creator_human_id, execution_mode) "
-        "VALUES (?, ?, ?, ?)",
-        (pid, name, human_id, mode),
+        "INSERT INTO projects "
+        "(id, name, creator_human_id, execution_mode, parent_project_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (pid, name, human_id, mode, parent_project_id),
     )
     await db.commit()
     # Seed the remaining cascade defaults onto the fresh project row.
@@ -1557,6 +1581,16 @@ async def get_goal(
     Since v0.5.2 the returned dict also includes ``north_star`` and
     ``sprint`` pulled from the ``goal_north_star`` / ``goal_sprint``
     columns. Both are None when not yet set.
+
+    3b6ff466 — subproject north_star inheritance. When the project is a
+    subproject (``parent_project_id`` set) and has NO north_star of its own
+    (empty/NULL), the parent's north_star is inherited. The returned dict then
+    carries ``north_star_inherited=True`` and ``north_star_source_project_id``
+    (the parent's id) so callers can render "inherited" state. Top-level
+    projects and subprojects with their own north_star are unaffected. This is
+    the single fall-back point every read-path shares — ``get_goal``,
+    ``get_planning_brief`` and ``get_context_block`` all resolve the goal
+    through here, so the inheritance is wired into all three at once.
     """
     async with db.execute(
         "SELECT * FROM goal_states WHERE project_id = ? "
@@ -1565,12 +1599,70 @@ async def get_goal(
     ) as cur:
         row = await cur.fetchone()
     goal = _row_to_dict(row)
+    if goal is not None:
+        goal["content"] = _decode_content(goal["content"])
+        goal["north_star"] = goal.pop("goal_north_star", None)
+        goal["sprint"] = goal.pop("goal_sprint", None)
+        goal["north_star_inherited"] = False
+        goal["north_star_source_project_id"] = None
+        # Own north_star present → nothing to inherit; return as-is.
+        if (goal.get("north_star") or "").strip():
+            return goal
+    # No goal row, or a goal row with an empty north_star: try the parent.
+    inherited = await _inherited_north_star(db, project_id)
+    if inherited is None:
+        return goal
+    parent_ns, parent_id = inherited
     if goal is None:
-        return None
-    goal["content"] = _decode_content(goal["content"])
-    goal["north_star"] = goal.pop("goal_north_star", None)
-    goal["sprint"] = goal.pop("goal_sprint", None)
+        # Child has no goal state at all — synthesise a minimal one so the
+        # inherited north_star still surfaces (content/sprint stay empty).
+        return {
+            "project_id": project_id,
+            "content": "",
+            "version": 0,
+            "north_star": parent_ns,
+            "sprint": None,
+            "north_star_inherited": True,
+            "north_star_source_project_id": parent_id,
+        }
+    goal["north_star"] = parent_ns
+    goal["north_star_inherited"] = True
+    goal["north_star_source_project_id"] = parent_id
     return goal
+
+
+async def _inherited_north_star(
+    db: aiosqlite.Connection, project_id: str
+) -> tuple[str, str] | None:
+    """3b6ff466 — resolve a subproject's inherited north_star from its parent.
+
+    Returns ``(parent_north_star, parent_project_id)`` when ``project_id`` is a
+    subproject whose parent has a non-empty north_star, else None. One level
+    deep by construction (create_project rejects grandchildren), so no
+    recursion / cycle handling is needed. Best-effort: a missing
+    ``parent_project_id`` column (pre-migration DB) simply yields no inheritance.
+    """
+    try:
+        proj = await get_project(db, project_id)
+    except Exception:  # noqa: BLE001 — pre-migration schema → no inheritance
+        return None
+    if proj is None:
+        return None
+    parent_id = proj.get("parent_project_id")
+    if not parent_id:
+        return None
+    async with db.execute(
+        "SELECT goal_north_star FROM goal_states WHERE project_id = ? "
+        "ORDER BY version DESC LIMIT 1",
+        (parent_id,),
+    ) as cur:
+        prow = await cur.fetchone()
+    if prow is None:
+        return None
+    parent_ns = (prow["goal_north_star"] if isinstance(prow, dict) else prow[0]) or ""
+    if not parent_ns.strip():
+        return None
+    return parent_ns, parent_id
 
 
 async def set_goal(
@@ -1592,11 +1684,25 @@ async def set_goal(
     that should not pollute the goal history.
     """
     existing = await get_goal(db, project_id)
+    # 3b6ff466 — a subproject with no goal row of its own gets a *synthesised*
+    # goal dict back from get_goal (parent's inherited north_star, no real
+    # goal_states row → no "id"). That is NOT a row to update or version off
+    # of; treat it as "no existing goal" for all row surgery below, otherwise
+    # the in-place UPDATE (WHERE id = existing["id"]) would KeyError and the
+    # inherited north_star would be materialised into the child's first row.
+    if existing is not None and "id" not in existing:
+        existing = None
     encoded = _encode_content(content)
-    # Carry forward north_star / sprint from the previous row when not given.
-    final_north_star = north_star if north_star is not None else (
-        existing.get("north_star") if existing else None
+    # Never carry forward an INHERITED north_star as if it were the child's own.
+    # get_goal flags a borrowed parent north_star with north_star_inherited;
+    # treat that as "the child has no own north_star" for carry-forward.
+    _own_existing_ns = (
+        existing.get("north_star")
+        if (existing and not existing.get("north_star_inherited"))
+        else None
     )
+    # Carry forward north_star / sprint from the previous row when not given.
+    final_north_star = north_star if north_star is not None else _own_existing_ns
     final_sprint = sprint if sprint is not None else (
         existing.get("sprint") if existing else None
     )

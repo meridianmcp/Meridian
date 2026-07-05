@@ -1400,11 +1400,17 @@ async def _handle_project_tools(
         existing = await db_module.get_project_by_name(db, args["name"])
         if existing is not None:
             return {"error": f"project '{args['name']}' already exists", "project": existing}
-        return await db_module.create_project(
-            db, args["name"], execution_mode=args.get("execution_mode"),
-            # 0bf67524 — seed from workspace cascade defaults when authenticated.
-            tenant_id=(tenant.get("id") if tenant else None),
-        )
+        # 3b6ff466 — optional parent_project_id makes this a one-level-deep
+        # subproject; an invalid/nested parent raises ValueError → error dict.
+        try:
+            return await db_module.create_project(
+                db, args["name"], execution_mode=args.get("execution_mode"),
+                # 0bf67524 — seed from workspace cascade defaults when authenticated.
+                tenant_id=(tenant.get("id") if tenant else None),
+                parent_project_id=args.get("parent_project_id"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
     if name == "register_session":
         hid = args.get("human_id")
         if not hid and not _hosted_mode():

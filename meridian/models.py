@@ -20,6 +20,15 @@ class ProjectCreate(BaseModel):
         default=None,
         description="Optional creator identifier. Becomes the project's owner.",
     )
+    parent_project_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional parent project id (3b6ff466). When set, this project is a "
+            "subproject that inherits the parent's north_star when it has none of "
+            "its own. Subprojects are one level deep: the parent must exist and "
+            "must not itself be a subproject."
+        ),
+    )
 
 
 class GoalSet(BaseModel):

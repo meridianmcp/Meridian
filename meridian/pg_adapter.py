@@ -457,6 +457,7 @@ CREATE TABLE IF NOT EXISTS projects (
     github_branch TEXT,
     queued_session TEXT,
     pending_goal TEXT,
+    parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'parked', 'archived')),
     priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN ('P0', 'P1', 'P2')),
@@ -2401,6 +2402,23 @@ async def _migrate_pg_blog_posts_tenant(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_project_parent_id(conn: PostgresConnection) -> None:
+    """3b6ff466 — projects.parent_project_id: one-level-deep subprojects.
+
+    Nullable self-reference; NULL means a top-level project. The one-level
+    depth rule and parent-exists check are enforced at the app layer
+    (db.create_project). The north_star fall-back to the parent lives in
+    db.get_goal so every read-path (get_goal / get_planning_brief /
+    get_context_block) inherits it. Idempotent (ADD COLUMN IF NOT EXISTS).
+    The index lives here, never inline in CREATE_TABLES_CORE, to avoid the
+    unguarded-index boot crash on a projects table predating the column.
+    Mirrors db._migrate_project_parent_id."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS parent_project_id TEXT;"
+        "CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_project_id)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2452,4 +2470,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_slug,
     _migrate_pg_capture_insight_notes_to_insights,
     _migrate_pg_blog_posts_tenant,
+    _migrate_pg_project_parent_id,
 )

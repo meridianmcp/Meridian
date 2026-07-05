@@ -6580,6 +6580,218 @@ async def test_run_pg_migrations_survives_a_failing_migration(caplog):
                for r in caplog.records), "failing migration should log a WARNING"
 
 
+# ---------------------------------------------------------------------------
+# 3b6ff466 — subprojects (parent_project_id) + north_star inheritance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_subproject_stores_parent_project_id(db):
+    """A child created with parent_project_id records it; the parent is None."""
+    parent = await db_module.create_project(db, "sub-parent")
+    child = await db_module.create_project(
+        db, "sub-child", parent_project_id=parent["id"]
+    )
+    assert child["parent_project_id"] == parent["id"]
+    # Round-trips through the DB, not just the return value.
+    fetched = await db_module.get_project(db, child["id"])
+    assert fetched["parent_project_id"] == parent["id"]
+    # The parent itself stays top-level.
+    assert parent["parent_project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_subproject_rejects_missing_parent(db):
+    """A parent_project_id that doesn't resolve is rejected."""
+    with pytest.raises(ValueError, match="does not exist"):
+        await db_module.create_project(
+            db, "sub-orphan", parent_project_id="nonexistent-id"
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_grandchild_rejected_one_level_deep(db):
+    """Subprojects are ONE level deep — a grandchild (child of a child) is
+    rejected so the hierarchy never nests."""
+    parent = await db_module.create_project(db, "gc-parent")
+    child = await db_module.create_project(
+        db, "gc-child", parent_project_id=parent["id"]
+    )
+    with pytest.raises(ValueError, match="one level deep"):
+        await db_module.create_project(
+            db, "gc-grandchild", parent_project_id=child["id"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_inherits_parent_north_star_via_get_goal(db):
+    """A child with no north_star of its own inherits the parent's, flagged
+    inherited, when the child has its own goal row (empty north_star)."""
+    parent = await db_module.create_project(db, "ns-parent")
+    await db_module.set_goal(
+        db, parent["id"], "parent version goal", north_star="Ship the platform"
+    )
+    child = await db_module.create_project(
+        db, "ns-child", parent_project_id=parent["id"]
+    )
+    # Child has its own goal but no north_star.
+    await db_module.set_goal(db, child["id"], "child version goal")
+    goal = await db_module.get_goal(db, child["id"])
+    assert goal is not None
+    assert goal["north_star"] == "Ship the platform"
+    assert goal["north_star_inherited"] is True
+    assert goal["north_star_source_project_id"] == parent["id"]
+    # The child's own content is preserved — only the north_star is borrowed.
+    assert goal["content"] == "child version goal"
+
+
+@pytest.mark.asyncio
+async def test_child_with_no_goal_row_still_inherits_north_star(db):
+    """A child that has never set a goal at all still surfaces the parent's
+    north_star (synthesised goal dict), rather than get_goal returning None."""
+    parent = await db_module.create_project(db, "ns2-parent")
+    await db_module.set_goal(
+        db, parent["id"], "pg", north_star="Inherited star"
+    )
+    child = await db_module.create_project(
+        db, "ns2-child", parent_project_id=parent["id"]
+    )
+    goal = await db_module.get_goal(db, child["id"])
+    assert goal is not None
+    assert goal["north_star"] == "Inherited star"
+    assert goal["north_star_inherited"] is True
+    assert goal["north_star_source_project_id"] == parent["id"]
+    assert goal["version"] == 0
+
+
+@pytest.mark.asyncio
+async def test_child_with_own_north_star_not_overridden(db):
+    """When the child sets its OWN north_star it wins — no inheritance."""
+    parent = await db_module.create_project(db, "ns3-parent")
+    await db_module.set_goal(db, parent["id"], "pg", north_star="Parent star")
+    child = await db_module.create_project(
+        db, "ns3-child", parent_project_id=parent["id"]
+    )
+    await db_module.set_goal(
+        db, child["id"], "cg", north_star="Child's own star"
+    )
+    goal = await db_module.get_goal(db, child["id"])
+    assert goal["north_star"] == "Child's own star"
+    assert goal["north_star_inherited"] is False
+    assert goal["north_star_source_project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_top_level_project_north_star_unchanged(db):
+    """A top-level project (no parent) is completely unaffected: no inheritance
+    keys leak a source, and an unset north_star stays unset."""
+    top = await db_module.create_project(db, "top-level")
+    # Own north_star set — plain passthrough, not flagged inherited.
+    await db_module.set_goal(db, top["id"], "tg", north_star="My star")
+    goal = await db_module.get_goal(db, top["id"])
+    assert goal["north_star"] == "My star"
+    assert goal["north_star_inherited"] is False
+    assert goal["north_star_source_project_id"] is None
+    # A different top-level project with no goal at all still returns None.
+    top2 = await db_module.create_project(db, "top-level-2")
+    assert await db_module.get_goal(db, top2["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_child_no_inheritance_when_parent_has_no_north_star(db):
+    """If the parent itself has no north_star there is nothing to inherit; the
+    child's own (empty) goal is returned unflagged."""
+    parent = await db_module.create_project(db, "ns4-parent")
+    await db_module.set_goal(db, parent["id"], "pg")  # no north_star
+    child = await db_module.create_project(
+        db, "ns4-child", parent_project_id=parent["id"]
+    )
+    await db_module.set_goal(db, child["id"], "cg")
+    goal = await db_module.get_goal(db, child["id"])
+    assert (goal["north_star"] or "") == ""
+    assert goal["north_star_inherited"] is False
+
+
+@pytest.mark.asyncio
+async def test_context_block_and_planning_brief_show_inherited_north_star(db):
+    """The two rendered read-paths (get_context_block / get_planning_brief)
+    both resolve the goal through get_goal, so a child with no north_star of
+    its own shows the parent's inherited north_star in each."""
+    from meridian._deps import _render_context_block
+
+    parent = await db_module.create_project(db, "brief-parent")
+    await db_module.set_goal(
+        db, parent["id"], "pg", north_star="Inherited brief star"
+    )
+    child = await db_module.create_project(
+        db, "brief-child", parent_project_id=parent["id"]
+    )
+    goal = await db_module.get_goal(db, child["id"])
+    # get_context_block renders via _render_context_block(project, goal, ...).
+    rendered = _render_context_block(
+        child, goal, [], [], [], [], mode="full",
+    )
+    assert "Inherited brief star" in rendered
+    # get_planning_brief embeds goal["north_star"] the same way — assert the
+    # shared source dict carries the inherited value.
+    assert goal["north_star"] == "Inherited brief star"
+    assert goal["north_star_inherited"] is True
+
+
+def test_migrate_project_parent_id_survives_pre_column_projects_table():
+    """3b6ff466 — existing-DB upgrade (spirit of the pre-tenant_id blog test).
+
+    A projects table that predates parent_project_id must get the column added
+    by init_db without crashing, existing rows preserved, and the guarded
+    index created — all idempotently on re-init."""
+    import sqlite3
+
+    def _run(db_path):
+        legacy = sqlite3.connect(db_path)
+        legacy.executescript(
+            """
+            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')));
+            INSERT INTO projects (id, name) VALUES ('p1', 'legacy-proj');
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+    import tempfile
+
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "legacy_parent.db")
+            _run(db_path)
+            # First init applies the migration (adds column + index).
+            conn = await db_module.init_db(db_path)
+            try:
+                assert await db_module._column_exists(
+                    conn, "projects", "parent_project_id"
+                )
+                proj = await db_module.get_project(conn, "p1")
+                assert proj is not None
+                assert proj["parent_project_id"] is None
+                # The guarded index exists.
+                async with conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND name='idx_projects_parent'"
+                ) as cur:
+                    assert await cur.fetchone() is not None
+            finally:
+                await conn.close()
+            # Second init is a no-op (idempotent) and preserves the row.
+            conn2 = await db_module.init_db(db_path)
+            try:
+                proj2 = await db_module.get_project(conn2, "p1")
+                assert proj2["name"] == "legacy-proj"
+            finally:
+                await conn2.close()
+
+    asyncio.run(run())
+
+
 def test_pg_migration_registry_matches_historical_order():
     """The migration registry tuples must concatenate to the exact historical
     call order (core → hosted → late) so refactoring the runner can't silently
@@ -6678,10 +6890,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_slug",
         "_migrate_pg_capture_insight_notes_to_insights",
         "_migrate_pg_blog_posts_tenant",
+        "_migrate_pg_project_parent_id",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 82
+    assert len(allnames) == len(set(allnames)) == 83
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
