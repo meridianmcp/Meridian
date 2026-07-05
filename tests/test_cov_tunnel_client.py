@@ -767,18 +767,18 @@ def test_run_connection_lazy_reprobe_recovers(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_inject_mcp_entries_replaces_non_dict_top_level():
-    out = tc._inject_mcp_entries("[1, 2, 3]", {"meridian-fs": {"type": "http", "url": "u"}})
+    out = tc._inject_mcp_entries("[1, 2, 3]", {"filesystem": {"type": "http", "url": "u"}})
     data = json.loads(out)
-    assert data["mcpServers"]["meridian-fs"]["url"] == "u"
+    assert data["mcpServers"]["filesystem"]["url"] == "u"
 
 
 def test_inject_mcp_entries_replaces_non_dict_mcpservers():
     out = tc._inject_mcp_entries(
         json.dumps({"mcpServers": "oops-a-string"}),
-        {"meridian-fs": {"type": "http", "url": "u"}},
+        {"filesystem": {"type": "http", "url": "u"}},
     )
     data = json.loads(out)
-    assert data["mcpServers"]["meridian-fs"]["url"] == "u"
+    assert data["mcpServers"]["filesystem"]["url"] == "u"
 
 
 # ---------------------------------------------------------------------------
@@ -1554,8 +1554,8 @@ def test_tunnel_mcp_entries_includes_custom_local_proxies():
         "https://usemeridian.us", "tid-x",
         custom=[{"name": "fetch", "port": 8901}, {"name": "git", "port": 8902}],
     )
-    # Built-ins still point at the hosted relay.
-    assert entries["meridian-fs"]["url"].startswith("https://usemeridian.us/fs/mcp/")
+    # Built-ins still point at the hosted relay (ef162c28 — new plugin-derived key).
+    assert entries["filesystem"]["url"].startswith("https://usemeridian.us/fs/mcp/")
     # Custom ones point at the local proxy, NOT the hosted server.
     assert entries["meridian-custom-fetch"] == {"type": "http", "url": "http://127.0.0.1:8901/mcp"}
     assert entries["meridian-custom-git"] == {"type": "http", "url": "http://127.0.0.1:8902/mcp"}
@@ -1575,7 +1575,7 @@ def test_run_tunnel_spawns_custom_plugin_locally_and_writes_mcp_json(monkeypatch
 
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
     # Don't restore (delete) the .mcp.json on shutdown so we can inspect it.
-    monkeypatch.setattr(tc, "_restore_mcp_json", lambda snaps: None)
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
 
     monkeypatch.setattr(
         tc, "_fetch_me",
@@ -1606,7 +1606,7 @@ def test_run_tunnel_custom_plugin_repo_path_expanded_at_spawn(monkeypatch, tmp_p
     """{repo_path} in a custom plugin command is expanded to the served repo at
     spawn time (resolve_custom_plugins leaves it intact; the client expands it)."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
-    monkeypatch.setattr(tc, "_restore_mcp_json", lambda snaps: None)
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
     monkeypatch.setattr(
         tc, "_fetch_me",
         AsyncMock(return_value={
@@ -1632,7 +1632,7 @@ def test_run_tunnel_custom_only_keeps_tunnel_alive(monkeypatch, tmp_path):
     """With every built-in slot disabled but one custom plugin enabled, the tunnel
     still serves (the local proxy + mcp.json) — exit 0, not 'nothing to serve'."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
-    monkeypatch.setattr(tc, "_restore_mcp_json", lambda snaps: None)
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
     monkeypatch.setattr(
         tc, "_fetch_me",
         AsyncMock(return_value={

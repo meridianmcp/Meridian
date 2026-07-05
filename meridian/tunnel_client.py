@@ -2009,8 +2009,68 @@ async def _proc_watchdog(
 # Local MCP config auto-update (.mcp.json / .cursor/mcp.json) — pure, unit tested
 # ---------------------------------------------------------------------------
 
-# Connector keys we inject; used for restore so we only touch our own entries.
-TUNNEL_MCP_KEYS = ("meridian-fs", "meridian-code", "meridian-extractor")
+# ef162c28 — Connector keys were historically named by transport SLOT
+# (meridian-fs / meridian-code / meridian-extractor). They now derive from the
+# PLUGIN behind each slot so the .mcp.json names read as what the connector
+# actually is: filesystem / codebase-memory / serena. The static slot→name map
+# below is the canonical source. We deliberately do NOT derive these from the
+# resolved plugin's ``name`` field: the plugin names are "filesystem" /
+# "code-intel" / "code-extractor", which would give the wrong labels for the
+# code and extract slots (codebase-memory-mcp rides "code"; Serena rides
+# "extract"). A hardcoded slot→name map is therefore the cleanest option and
+# avoids threading the plugin registry through these pure helpers. Known
+# limitation: a tenant who overrides the extract slot's command (e.g. back to
+# mcp-server-code-extractor) still gets the connector name "serena" — the name
+# tracks the slot's default implementation, not the live override.
+_TUNNEL_MCP_SLOT_NAMES = {
+    "fs": "filesystem",
+    "code": "codebase-memory",
+    "extract": "serena",
+}
+
+# The connector keys the CURRENT code injects (new, plugin-derived names).
+TUNNEL_MCP_KEYS = tuple(_TUNNEL_MCP_SLOT_NAMES.values())
+
+# ef162c28 — the legacy slot-named keys older tunnel builds wrote. Kept so the
+# migration on inject (drop stale duplicates) and the restore/cleanup path
+# (remove our entries on tunnel stop) both cover the old names as well as the
+# new ones. Existing users must not accumulate both meridian-fs AND filesystem
+# pointing at the same relay URL.
+_LEGACY_TUNNEL_MCP_KEYS = ("meridian-fs", "meridian-code", "meridian-extractor")
+
+# Keys that are unambiguously ours by NAME alone: the legacy slot names and the
+# custom-plugin prefix. No user names a server ``meridian-fs`` /
+# ``meridian-custom-*``, so seeing one is proof we wrote it.
+#
+# The NEW built-in names (``filesystem`` / ``codebase-memory`` / ``serena``) are
+# deliberately NOT in this set: a user may legitimately run their own server
+# called ``filesystem``. Such a key counts as ours ONLY when its URL also points
+# at our relay (see :func:`_is_our_mcp_entry`); otherwise it's the user's and we
+# suffix ours around it.
+_OWN_TUNNEL_MCP_KEYS_BY_NAME = frozenset(_LEGACY_TUNNEL_MCP_KEYS)
+
+
+def _is_our_mcp_entry(key: str, value: object, base_url: str, tenant_id: str) -> bool:
+    """Whether an existing ``mcpServers`` entry was written by this tunnel.
+
+    ef162c28 — ours if the key is a legacy slot name or a ``meridian-custom-*``
+    key (unambiguous by name), OR the entry's ``url`` points at this tenant's
+    relay/permanent tunnel URL (a connector a prior run wrote — even under a
+    new-name key like ``filesystem`` or a collision-suffixed key). A key that is
+    merely NAMED like one of our new built-ins but whose URL is NOT ours is the
+    USER's own server and must never be clobbered.
+    """
+    if key in _OWN_TUNNEL_MCP_KEYS_BY_NAME or key.startswith("meridian-custom-"):
+        return True
+    url = value.get("url") if isinstance(value, dict) else None
+    if not isinstance(url, str):
+        return False
+    ours = {
+        _permanent_url(base_url, tenant_id),
+        _permanent_code_url(base_url, tenant_id),
+        _permanent_extract_url(base_url, tenant_id),
+    }
+    return url in ours
 
 
 def _tunnel_mcp_entries(
@@ -2018,16 +2078,23 @@ def _tunnel_mcp_entries(
 ) -> dict[str, dict]:
     """The HTTP MCP connector entries pointing at this tenant's tunnel.
 
-    The three built-in slots point at the hosted relay URLs (claude.ai-reachable).
-    *custom* is the list of running user-defined plugins (``{"name", "port"}``);
-    each gets an entry keyed ``meridian-custom-<name>`` pointing at its LOCAL
-    mcp-proxy (``http://127.0.0.1:<port>/mcp``) — they are LOCAL-ONLY and have no
-    server route, so a co-located client reaches them directly, not via the relay.
+    ef162c28 — the three built-in slots are keyed by the plugin behind each slot
+    (``filesystem`` / ``codebase-memory`` / ``serena``, see
+    :data:`_TUNNEL_MCP_SLOT_NAMES`), pointing at the hosted relay URLs
+    (claude.ai-reachable). *custom* is the list of running user-defined plugins
+    (``{"name", "port"}``); each gets an entry keyed ``meridian-custom-<name>``
+    pointing at its LOCAL mcp-proxy (``http://127.0.0.1:<port>/mcp``) — they are
+    LOCAL-ONLY and have no server route, so a co-located client reaches them
+    directly, not via the relay.
+
+    Collision handling and legacy-key migration happen in
+    :func:`_inject_mcp_entries`, which sees the existing config; this function is
+    a pure name→url map and stays trivially unit-testable.
     """
     entries = {
-        "meridian-fs": {"type": "http", "url": _permanent_url(base_url, tenant_id)},
-        "meridian-code": {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
-        "meridian-extractor": {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
+        _TUNNEL_MCP_SLOT_NAMES["fs"]: {"type": "http", "url": _permanent_url(base_url, tenant_id)},
+        _TUNNEL_MCP_SLOT_NAMES["code"]: {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
+        _TUNNEL_MCP_SLOT_NAMES["extract"]: {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
     }
     for cp in custom or []:
         name = cp.get("name")
@@ -2055,11 +2122,49 @@ def _mcp_json_paths(cwd: "str | Path") -> list["Path"]:
     return paths
 
 
-def _inject_mcp_entries(text: "str | None", entries: dict[str, dict]) -> str:
+def _unique_mcp_key(desired: str, taken: "set[str]") -> str:
+    """A connector key not already in *taken*, derived from *desired*.
+
+    ef162c28 — on collision with a user's own server we append ``-meridian``,
+    then ``-meridian-2``, ``-meridian-3`` … so we never clobber their entry.
+    """
+    if desired not in taken:
+        return desired
+    candidate = f"{desired}-meridian"
+    n = 2
+    while candidate in taken:
+        candidate = f"{desired}-meridian-{n}"
+        n += 1
+    return candidate
+
+
+def _inject_mcp_entries(
+    text: "str | None",
+    entries: dict[str, dict],
+    base_url: str = "",
+    tenant_id: str = "",
+) -> str:
     """Merge *entries* under ``mcpServers`` in an existing `.mcp.json` body.
 
     *text* is the current file content (``None``/empty for a new file). Existing
     servers and other top-level keys are preserved. Returns the new file text.
+
+    ef162c28 — three behaviours layered on the plain merge:
+
+    * **Legacy migration:** any of our *legacy* slot-named keys
+      (``meridian-fs`` / ``meridian-code`` / ``meridian-extractor``) already in
+      the file are removed before we write the new plugin-named entries, so
+      resuming users don't accumulate stale duplicates pointing at the same URL.
+      Our *new* keys are simply overwritten with the current URL.
+    * **Collision handling:** if the file has a key matching one of our incoming
+      built-in names (e.g. the user runs their OWN ``filesystem`` server) that
+      is NOT ours, we write under a suffixed key (``filesystem-meridian``, …)
+      and leave the user's entry untouched.
+    * Custom (``meridian-custom-*``) keys are always ours — overwritten in place.
+
+    *base_url*/*tenant_id* enable ours-vs-theirs detection by URL (a connector a
+    prior run wrote under a suffixed key). Both default to "" for callers that
+    only merge already-unique entries (e.g. simple unit tests).
     """
     data = {}
     if text:
@@ -2072,7 +2177,20 @@ def _inject_mcp_entries(text: "str | None", entries: dict[str, dict]) -> str:
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
         servers = {}
-    servers.update(entries)
+
+    # 1. Migration + de-dup: drop every entry that is OURS (legacy slot names,
+    #    prior new-name writes, custom keys, or any URL pointing at our relay).
+    #    We rebuild them fresh below, so this prevents stale duplicates and lets
+    #    collision detection see only the USER's remaining servers.
+    for key in list(servers):
+        if _is_our_mcp_entry(key, servers.get(key), base_url, tenant_id):
+            del servers[key]
+
+    # 2. Merge our entries, suffixing on collision with a user-owned key.
+    for desired, entry in entries.items():
+        key = _unique_mcp_key(desired, set(servers))
+        servers[key] = entry
+
     data["mcpServers"] = servers
     return json.dumps(data, indent=2) + "\n"
 
@@ -2098,21 +2216,79 @@ def _install_mcp_json(
         original = path.read_text(encoding="utf-8") if existed else None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(_inject_mcp_entries(original, entries), encoding="utf-8")
+            path.write_text(
+                _inject_mcp_entries(original, entries, base_url, tenant_id),
+                encoding="utf-8",
+            )
             snapshots.append((path, original))
         except Exception as exc:  # noqa: BLE001
             print(f"  warning: could not update {path}: {exc}", file=sys.stderr, flush=True)
     return snapshots
 
 
-def _restore_mcp_json(snapshots: list[tuple["Path", "str | None"]]) -> None:
-    """Undo :func:`_install_mcp_json`: restore originals, delete files we created."""
+def _strip_our_mcp_entries(
+    text: "str | None", base_url: str = "", tenant_id: str = "",
+) -> "str | None":
+    """Remove every connector entry that is OURS from a `.mcp.json` body.
+
+    ef162c28 — used on restore to guarantee neither the LEGACY slot names
+    (``meridian-fs`` / ``meridian-code`` / ``meridian-extractor``) nor the NEW
+    plugin names (``filesystem`` / ``codebase-memory`` / ``serena``), nor any
+    ``meridian-custom-*`` key, nor a suffixed key whose URL points at our relay,
+    survives after the tunnel stops.
+
+    Returns the re-serialized cleaned text WHEN something of ours was removed, or
+    ``None`` when there was nothing of ours to strip (``None``/unparseable input,
+    or a body that already contained none of our keys). ``None`` tells the caller
+    to keep the original text byte-for-byte — so a user's file we never touched
+    is restored exactly, not reformatted by ``json.dumps``.
+    """
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:  # noqa: BLE001 — malformed → keep original verbatim
+        return None
+    if not isinstance(data, dict):
+        return None
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return None
+    removed = False
+    for key in list(servers):
+        if _is_our_mcp_entry(key, servers.get(key), base_url, tenant_id):
+            del servers[key]
+            removed = True
+    if not removed:
+        return None
+    data["mcpServers"] = servers
+    return json.dumps(data, indent=2) + "\n"
+
+
+def _restore_mcp_json(
+    snapshots: list[tuple["Path", "str | None"]],
+    base_url: str = "",
+    tenant_id: str = "",
+) -> None:
+    """Undo :func:`_install_mcp_json`: restore originals, delete files we created.
+
+    ef162c28 — before restoring an original that we merged into, strip any of
+    OUR connector entries (legacy + new + custom) from it. Normally the original
+    had none of ours, so :func:`_strip_our_mcp_entries` returns ``None`` and we
+    write the original text BYTE-FOR-BYTE (no json.dumps reformatting). But if a
+    prior tunnel crashed and left stale ``meridian-fs``/etc. entries in the file
+    we snapshotted, those are stripped so we never resurrect them. Files we
+    CREATED (original is ``None``) are deleted outright.
+    """
     for path, original in snapshots:
         try:
             if original is None:
                 path.unlink(missing_ok=True)
             else:
-                path.write_text(original, encoding="utf-8")
+                cleaned = _strip_our_mcp_entries(original, base_url, tenant_id)
+                path.write_text(
+                    cleaned if cleaned is not None else original, encoding="utf-8"
+                )
         except Exception:  # noqa: BLE001 — best-effort cleanup
             pass
 
@@ -2504,8 +2680,11 @@ async def run_tunnel(
         _custom_conns = "".join(
             f", meridian-custom-{cp['name']}" for cp in running_custom
         )
+        # ef162c28 — connectors are now named by the plugin behind each slot
+        # (filesystem / codebase-memory / serena) rather than by transport slot.
+        _builtin_conns = ", ".join(TUNNEL_MCP_KEYS)
         print(
-            "    added connectors: meridian-fs, meridian-code, meridian-extractor"
+            f"    added connectors: {_builtin_conns}"
             f"{_custom_conns} (removed on Ctrl+C)",
             flush=True,
         )
@@ -2620,7 +2799,7 @@ async def run_tunnel(
                 pass
         # Restore local MCP config before killing processes.
         if mcp_snapshots:
-            _restore_mcp_json(mcp_snapshots)
+            _restore_mcp_json(mcp_snapshots, base_url, tenant_id)
             print("  Restored local MCP config (removed tunnel connectors).", flush=True)
         for t in tasks + index_tasks:
             t.cancel()
