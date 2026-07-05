@@ -279,6 +279,43 @@ def _infer_sprint_type(items: list[dict[str, Any]]) -> str:
     return "feature"
 
 
+def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
+    """3a02041a — True for items only a human can carry out: publishing a blog
+    post, capturing screenshots, configuring a PyPI trusted publisher, installing
+    a local binary, etc. These must be kept OUT of the executor /goal's "claim and
+    execute … stopping early is a FAILURE" list — an AI executor cannot do them the
+    way intended and, under completion pressure, may fake-complete them. Signals
+    (any one): an explicit human assignee (``human_id``), ``milestone_type ==
+    'human'``, or a ``MANUAL``-tagged title."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("milestone_type") == "human" or item.get("human_id"):
+        return True
+    return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
+
+
+def _build_manual_todo_note(manual_items: list[dict[str, Any]]) -> str:
+    """3a02041a — render MANUAL/human items as a separate maintainer todo appended
+    to the /goal, explicitly NOT for the AI executor to claim (no completion
+    pressure). Empty string when there are none."""
+    parts: list[str] = []
+    for it in manual_items:
+        iid = it.get("id")
+        if not iid:
+            continue
+        title = (it.get("title") or "").strip()
+        # Drop the "MANUAL (Adam): " tag and keep a short snippet.
+        snippet = re.sub(r"^MANUAL\s*(\([^)]*\))?\s*:?\s*", "", title, flags=re.I)
+        snippet = snippet.split(". ")[0][:80].strip()
+        parts.append(f"{iid} — {snippet}" if snippet else str(iid))
+    if not parts:
+        return ""
+    return (
+        " Separately, these MANUAL items are the maintainer's own todo — the "
+        "executor must NOT claim, execute, or complete them: " + "; ".join(parts) + "."
+    )
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -335,12 +372,21 @@ def _build_quick_start_goal(
             item for item in pending_sprint_items
             if item.get("version") == version
         ]
+    # 3a02041a — split MANUAL/human items out of the executable list so they are
+    # never named under the "claim and execute" directive; they're surfaced
+    # separately as the maintainer's own todo (no completion-pressure language).
+    _manual_items = [it for it in pending_sprint_items if _is_manual_sprint_item(it)]
+    pending_sprint_items = [
+        it for it in pending_sprint_items if not _is_manual_sprint_item(it)
+    ]
+    _manual_note = _build_manual_todo_note(_manual_items)
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     if not item_ids:
         return (
             f"{_loop_prefix}/goal Verify remaining work is complete. Done when "
             f"pixi run test passes {test_floor}+, and generate_handoff() is called "
             f"at the end. Stop after {_turns} turns {_hitl_clause}"
+            f"{_manual_note}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -432,6 +478,7 @@ def _build_quick_start_goal(
         f"{_hitl_clause}"
         f"{_fail_clause}"
         f"{_type_clause}"
+        f"{_manual_note}"
     )
 
 
