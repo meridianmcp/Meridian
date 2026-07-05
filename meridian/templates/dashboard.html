@@ -2,6 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- 3e3da82d — viewport meta so the dashboard renders at device width when
+     opened on a phone / Add-to-Home-Screen, instead of a zoomed-out desktop
+     shell. viewport-fit=cover pairs with the PWA safe-area on notched devices. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>{% if demo_mode %}Meridian Demo{% else %}Meridian Dashboard{% endif %}</title>
 <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
 <link rel="icon" href="/static/meridian_logo.png" type="image/png">

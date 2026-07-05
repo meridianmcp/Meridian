@@ -855,6 +855,48 @@ select option {
     align-items: center; justify-content: center; cursor: pointer;
     color: var(--text); font-size: 18px; font-family: monospace;
   }
+
+  /* 3e3da82d — bounded phone/PWA pass: sprint board + top nav only.
+     Desktop rules above are untouched; everything here is inside @media. */
+
+  /* Top nav (project tab strip): keep it swipeable and stop it pushing the
+     page wider than the viewport. It already has overflow-x:auto on desktop;
+     here we harden that + trim padding so tabs aren't cramped off-screen. */
+  .tabs {
+    max-width: 100%;
+    -webkit-overflow-scrolling: touch;
+  }
+  .tab {
+    padding: 9px 11px;
+    font-size: 11px;
+  }
+  /* Leave room for the fixed hamburger so the first tab isn't hidden under it. */
+  .tabs { padding-left: 44px; }
+
+  /* Sprint board: it's a single-column flex list, so the real phone breakage is
+     horizontal overflow from the meta column + action buttons crowding the
+     title. Let rows wrap, keep the title from forcing overflow, and give the
+     meta room to sit under the title instead of pushing off-screen. */
+  .sprint-item-row {
+    flex-wrap: wrap;
+    gap: 4px 6px;
+  }
+  .sprint-item-title {
+    min-width: 0;
+    flex-basis: 100%;
+    white-space: normal;
+  }
+  .sprint-item-meta { max-width: 60%; }
+  .sprint-add-row { flex-wrap: wrap; }
+}
+
+/* 3e3da82d — narrow-phone tightening (sprint board + nav only). */
+@media (max-width: 480px) {
+  .tab { padding: 8px 9px; font-size: 10px; }
+  .sprint-group-header { font-size: 9px; }
+  .sprint-item-row { font-size: 11px; }
+  /* Actions can wrap to their own line rather than squeezing the title. */
+  .sprint-item-actions { flex-wrap: wrap; }
 }
 
 .tab-context-menu div:hover { background: var(--hover); cursor: pointer; }

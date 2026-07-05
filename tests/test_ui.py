@@ -878,6 +878,50 @@ def test_code_intel_architecture_charts(js):
 
 
 # ---------------------------------------------------------------------------
+# 3e3da82d — viewport meta + bounded responsive pass (sprint board + nav).
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_has_viewport_meta(soup):
+    """3e3da82d — the dashboard <head> declares a device-width viewport meta.
+
+    Without it, a phone / Add-to-Home-Screen render lays the page out at a
+    zoomed-out desktop width. The PWA item (b03be6a6) added the manifest but
+    not the viewport tag.
+    """
+    vp = soup.find("meta", attrs={"name": "viewport"})
+    assert vp is not None, "dashboard <head> must include a viewport meta (3e3da82d)"
+    content = vp.get("content", "")
+    assert "width=device-width" in content, (
+        "viewport meta must set width=device-width so mobile renders at device width"
+    )
+    assert "initial-scale=1" in content, "viewport meta must set initial-scale=1"
+
+
+def test_dashboard_responsive_sprint_and_nav_media_block(css):
+    """3e3da82d — a bounded @media pass adjusts ONLY the sprint board + top nav
+    at phone widths, tagged with the sprint-item id.
+
+    Appearance can't be unit-tested, so we assert the structural pieces exist:
+    the media query, the tag comment, and rules for the sprint board rows and
+    the top nav tab strip inside a narrow breakpoint.
+    """
+    # The sprint-item tag marks the new block.
+    assert "3e3da82d" in css, "responsive pass must be tagged with the sprint-item id"
+    # A phone-width breakpoint (768px already present for the sidebar; 480px added).
+    assert "@media (max-width: 768px)" in css, "768px breakpoint missing"
+    assert "@media (max-width: 480px)" in css, "480px phone breakpoint missing"
+
+    # The block adjusts the sprint board rows/groups...
+    tail = css[css.index("3e3da82d"):]
+    assert ".sprint-item-row" in tail, "responsive pass must adjust .sprint-item-row"
+    assert ".sprint-item-title" in tail, "responsive pass must adjust .sprint-item-title"
+    # ...and the top nav tab strip.
+    assert ".tabs" in tail, "responsive pass must adjust the top nav (.tabs)"
+    assert ".tab {" in tail or ".tab{" in tail, "responsive pass must adjust nav tabs (.tab)"
+
+
+# ---------------------------------------------------------------------------
 # b03be6a6 — Minimal installable PWA: manifest + icons + network-first SW.
 # ---------------------------------------------------------------------------
 
