@@ -1660,6 +1660,20 @@ def _find_npx() -> str:
     return shutil.which("npx") or "npx"
 
 
+def _normalize_path_arg(path: str) -> str:
+    """Strip surrounding whitespace and matched surrounding quotes from a user-
+    supplied path (e.g. a pasted '"C:\\Users\\me\\My Docs"'). Repeated/mixed
+    wrapping is unwound; interior characters (incl. spaces) are untouched.
+    Idempotent — a clean path is returned unchanged.
+
+    path-quote-strip: only MATCHED surrounding single/double quotes are removed
+    — never a lone quote, never an interior character."""
+    s = (path or "").strip()
+    while len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s
+
+
 def _unservable_roots(roots: "list[str] | None") -> "list[tuple[str, str]]":
     """59c0e609 — configured filesystem_roots the connector will SILENTLY not
     serve, each with a reason, so the caller can WARN instead of the user seeing
@@ -1675,7 +1689,7 @@ def _unservable_roots(roots: "list[str] | None") -> "list[tuple[str, str]]":
     the filesystem via ``os.path.isdir``; the caller does the printing."""
     out: list[tuple[str, str]] = []
     for r in roots or []:
-        r = (r or "").strip()
+        r = _normalize_path_arg(r)
         if not r:
             continue
         if not os.path.isdir(r):
@@ -1713,7 +1727,7 @@ def _build_proxy_command(
     Note: with ``--shell`` mcp-proxy concatenates args unescaped, so a
     directory containing spaces is not yet supported on Windows.
     """
-    dirs = [r for r in (roots or []) if r and r.strip()] or [repo_path]
+    dirs = [_normalize_path_arg(r) for r in (roots or []) if _normalize_path_arg(r)] or [repo_path]
     # --server stream: serve only Streamable HTTP (/mcp), no SSE.
     # --stateless: each POST is handled independently — required for the
     #   tunnel relay's one-shot request/response model (no persistent SSE pipe).
@@ -1747,7 +1761,10 @@ def _add_fs_roots_to_cmd(cmd: "list[str]", new_roots: "list[str]") -> "tuple[lis
     except ValueError:
         return cmd, False
     existing: set[str] = set(cmd[idx + 1:])
-    to_add = [r for r in new_roots if r and r.strip() and r.strip() not in existing]
+    to_add = [
+        nr for nr in (_normalize_path_arg(r) for r in new_roots)
+        if nr and nr not in existing
+    ]
     if not to_add:
         return cmd, False
     return cmd[:idx + 1] + list(cmd[idx + 1:]) + to_add, True
@@ -1807,10 +1824,10 @@ async def _fetch_filesystem_roots(
                 serena_repo = data.get("serena_repo_path") or ""
                 code_dirs = data.get("codebase_code_dirs") or []
                 return (
-                    [str(x).strip() for x in roots if isinstance(x, str) and x.strip()],
-                    [str(x).strip() for x in known if isinstance(x, str) and x.strip()],
-                    str(serena_repo).strip() if isinstance(serena_repo, str) else "",
-                    [str(x).strip() for x in code_dirs if isinstance(x, str) and x.strip()],
+                    [_normalize_path_arg(x) for x in roots if isinstance(x, str) and _normalize_path_arg(x)],
+                    [_normalize_path_arg(x) for x in known if isinstance(x, str) and _normalize_path_arg(x)],
+                    _normalize_path_arg(serena_repo) if isinstance(serena_repo, str) else "",
+                    [_normalize_path_arg(x) for x in code_dirs if isinstance(x, str) and _normalize_path_arg(x)],
                 )
     except Exception:  # noqa: BLE001 — network/parse error → defaults
         pass
@@ -2600,6 +2617,7 @@ async def run_tunnel(
     # default, unchanged behaviour).
     serena_repo_path = repo_path
     if not _repo_path_from_cli and cfg_serena_repo_path:
+        cfg_serena_repo_path = _normalize_path_arg(cfg_serena_repo_path)
         try:
             serena_repo_path = str(Path(cfg_serena_repo_path).resolve())
             print(
@@ -2886,9 +2904,12 @@ async def run_tunnel(
             await proxy.ensure_running()
             if proxy.is_running:
                 await _index_code_dir(proxy.port, code_dir)
-        for d in code_dirs:
+        for _d in (code_dirs or []):
+            _d = _normalize_path_arg(_d)
+            if not _d:
+                continue
             index_tasks.append(
-                asyncio.ensure_future(_lazy_index(proxy_code, str(Path(d).resolve())))
+                asyncio.ensure_future(_lazy_index(proxy_code, str(Path(_d).resolve())))
             )
 
     # 7. Run lazy reconnect loops — one per enabled slot. Each loop also gets an

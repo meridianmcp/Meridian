@@ -178,6 +178,67 @@ def test_build_proxy_command_uses_shell_on_windows(monkeypatch):
     assert "--shell" not in tc._build_proxy_command("npx", "/repo")
 
 
+# ---------------------------------------------------------------------------
+# path-quote-strip — _normalize_path_arg de-quotes pasted path args so a
+# literal surrounding '"C:\\My Docs"' / "'C:/x'" is served correctly. Only
+# MATCHED surrounding quote pairs are removed; interior chars & lone quotes
+# are left untouched. Idempotent.
+# ---------------------------------------------------------------------------
+
+def test_normalize_path_arg_strips_matched_double_quotes():
+    assert tc._normalize_path_arg('"C:\\Users\\me\\My Docs"') == "C:\\Users\\me\\My Docs"
+
+
+def test_normalize_path_arg_strips_matched_single_quotes():
+    assert tc._normalize_path_arg("'C:/x'") == "C:/x"
+
+
+def test_normalize_path_arg_strips_surrounding_whitespace_then_quotes():
+    assert tc._normalize_path_arg('  "p"  ') == "p"
+
+
+def test_normalize_path_arg_clean_path_unchanged():
+    p = r"C:\Users\me\Documents"
+    assert tc._normalize_path_arg(p) == p
+
+
+def test_normalize_path_arg_preserves_interior_space():
+    # An interior space (unquoted) is a real path char — never stripped.
+    assert tc._normalize_path_arg("C:/Program Files/App") == "C:/Program Files/App"
+
+
+def test_normalize_path_arg_leaves_lone_leading_quote():
+    # A single unmatched quote is NOT a wrapping pair — keep it verbatim.
+    assert tc._normalize_path_arg('"C:/x') == '"C:/x'
+    assert tc._normalize_path_arg("C:/x'") == "C:/x'"
+
+
+def test_normalize_path_arg_unwinds_repeated_and_mixed_wrapping():
+    assert tc._normalize_path_arg('\'"C:/x"\'') == "C:/x"
+
+
+def test_normalize_path_arg_empty_and_whitespace():
+    assert tc._normalize_path_arg("") == ""
+    assert tc._normalize_path_arg("   ") == ""
+    assert tc._normalize_path_arg('""') == ""
+
+
+def test_build_proxy_command_strips_quotes_from_real_root(tmp_path):
+    # A quoted root pointing at a REAL dir must be served as that (de-quoted)
+    # dir — proving the quote-strip took effect end-to-end in the builder.
+    quoted = f'"{tmp_path}"'
+    cmd = tc._build_proxy_command("npx", str(tmp_path), roots=[quoted])
+    assert str(tmp_path) in cmd
+    assert quoted not in cmd
+
+
+def test_unservable_roots_ignores_quotes_for_real_dir(tmp_path):
+    # A quoted root that resolves to an existing dir is NOT flagged unservable
+    # (the quotes are stripped before the os.path.isdir check).
+    quoted = f'"{tmp_path}"'
+    assert tc._unservable_roots([quoted]) == []
+
+
 def test_build_code_proxy_command_structure(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "linux")  # test POSIX path — no --shell
     cmd = tc._build_code_proxy_command("npx", "/usr/local/bin/codebase-memory-mcp", port=9009)
