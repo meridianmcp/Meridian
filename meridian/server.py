@@ -285,15 +285,43 @@ async def _keepalive_connected_sessions(db, now=None, ttl_s=SESSION_KEEPALIVE_TT
     return fresh
 
 
-async def _run_session_keepalive_loop(db) -> None:
+async def _keepalive_tunnel_sessions(app) -> list:
+    """4b698ea5 — passive, tool-independent liveness pass.
+
+    For every tenant that currently holds a live tunnel WebSocket, refresh the
+    ``last_seen`` of that tenant's most-recently-active session. The liveness
+    proof is the open socket (the local ``meridian --tunnel`` binary is running),
+    so this keeps a busy executor's session fresh even across long stretches of
+    NON-Meridian work (reading files, thinking, running tests) that touch no
+    Meridian tool. Not circular: it renews off socket-liveness, not off
+    ``last_seen``.
+
+    Split out from the loop so a single tick can be driven from tests. No-op
+    (returns []) when ``app`` is None (self-host stdio, which has no tunnels)."""
+    if app is None:
+        return []
+    try:
+        from .routes import tunnel as _tunnel_mod  # noqa: PLC0415
+        return await _tunnel_mod.keepalive_tunnel_sessions(app)
+    except Exception:  # noqa: BLE001 — a failed sweep must not kill the loop
+        return []
+
+
+async def _run_session_keepalive_loop(db, app=None) -> None:
     """Periodically refresh connected sessions. Started by both the FastAPI
     lifespan (hosted/HTTP clients) and the stdio entrypoint (local clients) so
     a busy session never looks dead to a coordinating one regardless of how it
-    connected."""
+    connected.
+
+    ``app`` (4b698ea5) — the FastAPI app, passed on the hosted path so each tick
+    can also run the tunnel-liveness pass (touch the live session of every tenant
+    holding an open tunnel socket). None on the self-host stdio path, where there
+    are no tunnels."""
     while True:
         try:
             await asyncio.sleep(SESSION_KEEPALIVE_INTERVAL_S)
             await _keepalive_connected_sessions(db)
+            await _keepalive_tunnel_sessions(app)
         except asyncio.CancelledError:
             break
         except Exception:  # noqa: BLE001 — never let the loop die
@@ -606,7 +634,7 @@ async def lifespan(app: FastAPI):
     version_task = asyncio.create_task(_version_check_loop())
     app.state.version_task = version_task
 
-    keepalive_task = asyncio.create_task(_run_session_keepalive_loop(db))
+    keepalive_task = asyncio.create_task(_run_session_keepalive_loop(db, app))
     app.state.keepalive_task = keepalive_task
 
     # 57f7f7ba — autonomous dispatcher daemon.

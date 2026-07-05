@@ -1991,6 +1991,56 @@ def has_active_tunnel(tenant_id: str) -> bool:
     )
 
 
+def active_tunnel_tenant_ids() -> "set[str]":
+    """4b698ea5 — every tenant_id that currently holds ≥1 live tunnel socket.
+
+    A live tunnel is proof the tenant's local ``meridian --tunnel`` binary is
+    running — a liveness signal that is independent of whether any Meridian tool
+    was called. The keepalive loop iterates these each tick to hold the tenant's
+    live session fresh through long stretches of non-Meridian work.
+    """
+    ids: set[str] = set()
+    ids.update(_tunnel_sockets)
+    ids.update(_tunnel_code_sockets)
+    ids.update(_tunnel_extract_sockets)
+    ids.update(_tunnel_ppt_sockets)
+    ids.update(_tunnel_word_sockets)
+    ids.update(_tunnel_dc_sockets)
+    for s in _tunnel_custom_sockets.values():
+        ids.update(s)
+    return ids
+
+
+async def keepalive_tunnel_sessions(app: Any) -> "list[str]":
+    """4b698ea5 — passive liveness pass: for each tenant with a live tunnel,
+    refresh ``last_seen`` on that tenant's most-recently-active session.
+
+    Returns the list of session ids refreshed (for tests / observability).
+
+    Safety / cost:
+      * Only tenants whose project DB is ALREADY cached are touched — we never
+        provision or open a fresh DB connection from this background loop.
+      * A tenant with no cached DB has made no MCP call, so it has no session to
+        keep alive yet; it is simply skipped until it does.
+      * Every tenant is isolated in its own try/except so one bad DB can't stall
+        the sweep for the others.
+    """
+    from .._deps import _tenant_db_cache  # noqa: PLC0415
+
+    refreshed: list[str] = []
+    for tenant_id in active_tunnel_tenant_ids():
+        conn = _tenant_db_cache.get(tenant_id)
+        if conn is None:
+            continue  # no MCP activity yet → nothing to keep alive
+        try:
+            sid = await db_module.touch_latest_active_session(conn)
+            if sid:
+                refreshed.append(sid)
+        except Exception:  # noqa: BLE001 — a failed bump must not kill the loop
+            _log.debug("tunnel keepalive: touch failed for tenant %s", tenant_id[:8])
+    return refreshed
+
+
 def _parse_mcp_payload(raw: bytes | None) -> dict | None:
     """Parse an MCP JSON-RPC response body that may be plain JSON or SSE-framed.
 

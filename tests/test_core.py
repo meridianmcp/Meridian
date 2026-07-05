@@ -159,6 +159,107 @@ async def test_keepalive_keeps_busy_session_alive_but_expires_dead_ones(db):
 
 
 @pytest.mark.asyncio
+async def test_touch_latest_active_session_bumps_most_recent(db):
+    """4b698ea5 — touch_latest_active_session refreshes the ONE most-recently-active
+    live session and returns its id; picks the latest by last_seen; skips closed."""
+    from datetime import datetime, timezone
+
+    p = await db_module.create_project(db, "alpha")
+    older = await db_module.register_session(db, p["id"], "older")
+    newer = await db_module.register_session(db, p["id"], "newer")
+    closed = await db_module.register_session(db, p["id"], "closed")
+    # older last_seen 9 min ago; newer 5 min ago; closed most recent but not live.
+    await db.execute("UPDATE sessions SET last_seen = datetime('now','-9 minutes') WHERE id = ?", (older["id"],))
+    await db.execute("UPDATE sessions SET last_seen = datetime('now','-5 minutes') WHERE id = ?", (newer["id"],))
+    await db.execute("UPDATE sessions SET last_seen = datetime('now'), status='closed' WHERE id = ?", (closed["id"],))
+    await db.commit()
+
+    touched = await db_module.touch_latest_active_session(db, p["id"])
+    assert touched == newer["id"]  # the most-recently-active LIVE session
+
+    rows = {r["id"]: r for r in await db_module.get_sessions(db, p["id"], active_only=False)}
+
+    def _age_of(sid) -> float:
+        ls = datetime.fromisoformat(rows[sid]["last_seen"].replace(" ", "T")).replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ls).total_seconds()
+
+    assert _age_of(newer["id"]) < 60       # bumped to now
+    assert _age_of(older["id"]) > 8 * 60   # untouched
+
+
+@pytest.mark.asyncio
+async def test_touch_latest_active_session_no_live_returns_none(db):
+    """4b698ea5 — no live session ⇒ returns None (nothing to keep alive)."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db.execute("UPDATE sessions SET status='closed' WHERE id = ?", (s["id"],))
+    await db.commit()
+    assert await db_module.touch_latest_active_session(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_tunnel_keepalive_refreshes_live_session_without_meridian_tool(db):
+    """4b698ea5 (core regression) — an executor with a LIVE tunnel doing minutes of
+    non-Meridian work calls no Meridian tool, so its last_seen goes stale. The
+    server keepalive loop's tunnel pass must refresh it purely from the open
+    socket — a passive signal, no tool call involved."""
+    from meridian import _deps as deps_module
+    from meridian.routes import tunnel as tunnel_module
+
+    # A tenant + its cached project DB (the seam _open_tenant_db_by_id populates).
+    tenant_id = "tenant-4b698ea5"
+    p = await db_module.create_project(db, "alpha")
+    sess = await db_module.register_session(db, p["id"], "busy-executor")
+    # Session pinged Meridian 9 minutes ago — how a long non-Meridian run looks.
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now','-9 minutes') WHERE id = ?",
+        (sess["id"],),
+    )
+    await db.commit()
+
+    # Register the live tunnel socket + cache the tenant DB.
+    tunnel_module._tunnel_sockets[tenant_id] = object()  # sentinel "live socket"
+    deps_module._tenant_db_cache[tenant_id] = db
+    try:
+        # Drive one keepalive tick via the server-loop seam (app is truthy).
+        refreshed = await server_module._keepalive_tunnel_sessions(app=object())
+    finally:
+        tunnel_module._tunnel_sockets.pop(tenant_id, None)
+        deps_module._tenant_db_cache.pop(tenant_id, None)
+
+    assert sess["id"] in refreshed  # the passive path touched it — NO tool call
+
+    from datetime import datetime, timezone
+    rows = {r["id"]: r for r in await db_module.get_sessions(db, p["id"], active_only=False)}
+    ls = datetime.fromisoformat(rows[sess["id"]]["last_seen"].replace(" ", "T")).replace(tzinfo=timezone.utc)
+    assert (datetime.now(timezone.utc) - ls).total_seconds() < 60  # live again
+
+
+@pytest.mark.asyncio
+async def test_tunnel_keepalive_skips_tenant_without_cached_db(db):
+    """4b698ea5 — a tenant with a live socket but no cached DB (no MCP call yet)
+    is skipped: nothing to keep alive, and we never open a fresh DB from the loop."""
+    from meridian import _deps as deps_module
+    from meridian.routes import tunnel as tunnel_module
+
+    tenant_id = "tenant-nodb-4b698ea5"
+    tunnel_module._tunnel_sockets[tenant_id] = object()
+    deps_module._tenant_db_cache.pop(tenant_id, None)
+    try:
+        refreshed = await server_module._keepalive_tunnel_sessions(app=object())
+    finally:
+        tunnel_module._tunnel_sockets.pop(tenant_id, None)
+    assert tenant_id not in {s for s in refreshed}
+
+
+@pytest.mark.asyncio
+async def test_tunnel_keepalive_noop_when_no_app(db):
+    """4b698ea5 — self-host stdio has no tunnels; the pass is a no-op (app=None)."""
+    refreshed = await server_module._keepalive_tunnel_sessions(app=None)
+    assert refreshed == []
+
+
+@pytest.mark.asyncio
 async def test_log_task_and_get_tasks_newest_first(db):
     p = await db_module.create_project(db, "alpha")
     s = await db_module.register_session(db, p["id"], "sess-1")

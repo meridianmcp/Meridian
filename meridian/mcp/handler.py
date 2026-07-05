@@ -897,6 +897,23 @@ async def _handle_mcp_request(
                 result = await _dispatch_github_tool(name, args, tenant, db)
             else:
                 result = await _dispatch_mcp_tool(name, args, db, data_dir, tenant=tenant)
+                # 4b698ea5 — implicit last_seen bump on the HOSTED path, mirroring
+                # the stdio handler. Previously ONLY stdio tool calls refreshed a
+                # session's last_seen; a hosted/tunnel executor's session went
+                # stale between the sparse tools that happen to write it. Any
+                # native Meridian tool carrying a session_id now keeps the session
+                # alive, and marks it "connected" so the keepalive loop holds it
+                # fresh through quiet, non-MCP work. Best-effort: never fail the call.
+                _session_id = args.get("session_id")
+                if _session_id and name != "heartbeat":
+                    try:
+                        await db_module.update_session_seen(db, _session_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        _server._mark_session_connected(_session_id)
+                    except Exception:  # noqa: BLE001
+                        pass
             return _server._jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
         except Exception as exc:
             return _server._jsonrpc_err(req_id, -32603, str(exc))

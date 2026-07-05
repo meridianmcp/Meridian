@@ -1727,6 +1727,48 @@ def test_handle_request_tools_call_success_envelope():
         _run(db.close())
 
 
+def test_hosted_tools_call_bumps_session_last_seen():
+    """4b698ea5 — on the HOSTED path, any native Meridian tool carrying a
+    session_id refreshes that session's last_seen (mirrors the stdio handler).
+    Previously the hosted /mcp path never did this, so hosted/tunnel sessions
+    went stale between the sparse tools that happen to write last_seen."""
+    import meridian.db as db_module
+    import meridian.server as srv
+    from datetime import datetime, timezone
+
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "hb"))
+        sess = _run(db_module.register_session(db, proj["id"], "s1"))
+        # Age last_seen to 9 minutes ago.
+        _run(db.execute(
+            "UPDATE sessions SET last_seen = datetime('now','-9 minutes') WHERE id = ?",
+            (sess["id"],),
+        ))
+        _run(db.commit())
+        srv._CONNECTED_SESSIONS.pop(sess["id"], None)
+
+        # A read-only native tool that carries session_id (no last_seen write of
+        # its own) must still refresh last_seen via the handler's implicit bump.
+        resp = _run(mh._handle_mcp_request(
+            _req("tools/call", {
+                "name": "get_session_brief",
+                "arguments": {"session_id": sess["id"], "project_id": proj["id"]},
+            }),
+            db=db, data_dir="/tmp",
+        ))
+        assert "result" in resp
+
+        rows = {r["id"]: r for r in _run(db_module.get_sessions(db, proj["id"], active_only=False))}
+        ls = datetime.fromisoformat(rows[sess["id"]]["last_seen"].replace(" ", "T")).replace(tzinfo=timezone.utc)
+        assert (datetime.now(timezone.utc) - ls).total_seconds() < 60  # refreshed
+        # And it was marked "connected" so the keepalive loop holds it fresh.
+        assert sess["id"] in srv._CONNECTED_SESSIONS
+    finally:
+        srv._CONNECTED_SESSIONS.pop(sess["id"], None)
+        _run(db.close())
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------

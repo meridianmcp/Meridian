@@ -2348,6 +2348,52 @@ async def keepalive_sessions(
     return cursor.rowcount
 
 
+async def touch_latest_active_session(
+    db: aiosqlite.Connection, project_id: str | None = None
+) -> str | None:
+    """4b698ea5 — bump ``last_seen`` on the most-recently-active live session and
+    return its id (or None when there is no live session to touch).
+
+    This is the DB side of the *passive* tunnel-liveness signal: the server's
+    keepalive loop calls it once per tick for every tenant that holds a live
+    tunnel WebSocket, so an executor doing minutes of NON-Meridian work (reading
+    files, thinking, running tests) — and therefore touching no Meridian tool —
+    still keeps a fresh ``last_seen`` and isn't mistaken for dead.
+
+    The signal is genuinely passive because the liveness *proof* is the open
+    tunnel socket (the tenant's local ``meridian --tunnel`` binary is running),
+    NOT ``last_seen`` itself — so it is not circular the way a loop that renews
+    based on ``last_seen`` would be.
+
+    Association: a tunnel is per-TENANT and a tenant's project DB typically has a
+    single active executor. We resolve the ambiguity by touching the ONE
+    most-recently-active ('active'/'idle') session — the one a planner would most
+    plausibly read as "the live executor". ``project_id`` narrows the scope when a
+    tenant DB holds more than one project; None (the common single-project tenant
+    DB) considers all of them.
+    """
+    where = "status IN ('active', 'idle')"
+    params: tuple[Any, ...] = ()
+    if project_id is not None:
+        where += " AND project_id = ?"
+        params = (project_id,)
+    async with db.execute(
+        f"SELECT id FROM sessions WHERE {where} "
+        f"ORDER BY last_seen DESC LIMIT 1",
+        params,
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    sid = row["id"] if isinstance(row, dict) else row[0]
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now') WHERE id = ?",
+        (sid,),
+    )
+    await db.commit()
+    return sid
+
+
 # bc9259b8 — worker stall auto-retry budget. A sprint item left in_progress by a
 # closing/stale worker is re-queued to pending while its stall_count is within
 # this budget; once it would exceed the budget it is marked failed silently (no
