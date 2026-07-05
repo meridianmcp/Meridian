@@ -841,6 +841,33 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="get_latex_structure",
+                description=(
+                    "106118cd — parse a LaTeX (.tex) source's structure WITHOUT a "
+                    "PDF intermediary (pylatexenc, pure-Python). Returns "
+                    "heading_count, an ordered headings outline and a nested tree "
+                    "of \\part/\\chapter/\\section/\\subsection/\\subsubsection/"
+                    "\\paragraph (level, kind, text, children), unexpanded_inputs "
+                    "(\\input/\\include, not expanded) and a bibliography list "
+                    "(thebibliography \\bibitem, and \\bibliography{...} + a "
+                    "sibling .bib). Malformed LaTeX returns a partial/empty result."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to a server-accessible .tex file. A sibling .bib referenced by \\bibliography is resolved relative to it.",
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Raw LaTeX source, as an alternative to file_path. Ignored when file_path is given.",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1714,7 +1741,7 @@ def build_mcp_server():
                 "list_hitl_requests", "answer_hitl", "dismiss_hitl",
                 "update_md_section",
                 "list_sessions",
-                "add_note", "ingest_document", "get_document_structure", "get_notes", "read_note", "delete_note",
+                "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
                 "add_workspace_note", "get_workspace_notes",
                 "pin_workspace_decision", "get_workspace_decisions",
             ):

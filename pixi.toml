@@ -50,6 +50,7 @@ tree-sitter-go = ">=0.21"
 tree-sitter-rust = ">=0.21"
 tree-sitter-java = ">=0.21"
 tree-sitter-c-sharp = ">=0.21"
+pylatexenc = ">=2.10, <3"
 
 # Dev/build-only deps — not installed on Fly (Dockerfile uses pyproject.toml via uv).
 # Use `pixi run -e dev <task>` for docs, exe builds, and media scripts.

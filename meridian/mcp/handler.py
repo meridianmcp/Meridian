@@ -1894,6 +1894,27 @@ async def _handle_notes_decisions(
             return {"error": f"file not found: {fp}"}
         except Exception as exc:  # noqa: BLE001
             return {"error": f"could not parse document: {exc}"}
+    if name == "get_latex_structure":
+        # 106118cd — docs_intel Phase 3: native LaTeX (.tex) structure + biblio,
+        # no PDF intermediary. Accepts a server-side file_path (like
+        # get_document_structure) OR raw `source` inline. latex_intel never
+        # raises — malformed LaTeX yields a partial/empty tree, not a crash.
+        validate_input_size(args.get("file_path"), "latex file_path", 2_000)
+        validate_input_size(args.get("source"), "latex source", 5_000_000)
+        fp = args.get("file_path")
+        src = args.get("source")
+        if not fp and not src:
+            return {"error": "file_path or source is required"}
+        from ..latex_intel import analyze_latex  # noqa: PLC0415
+        try:
+            if fp:
+                import os  # noqa: PLC0415
+                if not os.path.isfile(fp):
+                    return {"error": f"file not found: {fp}"}
+                return analyze_latex(fp)
+            return analyze_latex(src)
+        except Exception as exc:  # noqa: BLE001 — defense in depth; analyze_latex is already safe
+            return {"error": f"could not parse latex: {exc}"}
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)
