@@ -40,6 +40,18 @@ dependencies = [
     "pylatexenc>=2.10,<3",
 ]
 
+[project.optional-dependencies]
+# 56cd8712 — Model2Vec semantic-search escalation. OPTIONAL extra, NOT a base dep:
+# it pulls numpy and a ~30MB static model (~90MB WARM RSS), which we keep off the
+# 512MB prod box and out of base/CI installs. Opt in with:
+#   uv pip install '.[semantic]'   (and set MERIDIAN_SEMANTIC_ENABLED=1)
+# model2vec is numpy-only static embeddings (NO torch). psutil is used by the
+# runtime RSS circuit breaker (semantic_search.rss_mb falls back to /proc if absent).
+semantic = [
+    "model2vec>=0.3",
+    "psutil>=5.9",
+]
+
 [project.scripts]
 # Console entry so `uv tool install meridian-server` / `pipx install` provide a
 # `meridian` command (CLI dispatcher: `meridian --tunnel`, `meridian --mcp`, …).

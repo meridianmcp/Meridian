@@ -322,6 +322,14 @@ async def _run_session_keepalive_loop(db, app=None) -> None:
             await asyncio.sleep(SESSION_KEEPALIVE_INTERVAL_S)
             await _keepalive_connected_sessions(db)
             await _keepalive_tunnel_sessions(app)
+            # 56cd8712 — release the semantic model if it has gone idle, so the
+            # ~90MB isn't pinned on a quiet box after a single escalation. No-op
+            # when semantic is off / no model loaded; import is lazy + guarded.
+            try:
+                from . import semantic_search as _sem  # noqa: PLC0415
+                _sem.maybe_idle_unload()
+            except Exception:  # noqa: BLE001 — best-effort; never break the loop
+                pass
         except asyncio.CancelledError:
             break
         except Exception:  # noqa: BLE001 — never let the loop die

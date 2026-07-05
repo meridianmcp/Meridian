@@ -2959,6 +2959,227 @@ def _search_snippet(text: str | None, query: str, window: int = 60) -> str:
     return snippet
 
 
+# ---------------------------------------------------------------------------
+# 56cd8712 — Model2Vec semantic escalation for search_all (Postgres only).
+# SAFE-BY-DEFAULT: OFF unless MERIDIAN_SEMANTIC_ENABLED is truthy, model2vec is
+# importable, and the runtime RSS circuit breaker is not tripped. All of that is
+# folded into semantic_search.is_available(); when it's False this is a NO-OP and
+# the plain keyword/tsvector results are returned UNCHANGED.
+# ---------------------------------------------------------------------------
+
+# Cap on how many corpus rows we embed per escalation. The static model is fast but
+# we still bound the work (and memory) on a 512MB box.
+_SEMANTIC_CORPUS_CAP = 200
+
+
+async def _pure_fts_count_and_trigram_top(
+    db: Any, project_id: str, query: str
+) -> "tuple[int, float]":
+    """Return (pure_fts_count, trigram_top) over the project's searchable text — PG.
+
+    ``pure_fts_count`` — number of rows across task_log / project_notes /
+    decisions_pinned / sprint_items whose text matches PURE
+    ``websearch_to_tsquery`` FTS (no OR with trigram/ILIKE). ``trigram_top`` — the
+    single best pg_trgm ``similarity`` of the query against any of those text
+    fields. Together they answer "did keyword search genuinely find nothing good?"
+    for :func:`meridian.semantic_search.should_escalate`.
+
+    psycopg3: ``?`` placeholders (adapter rewrites to %s), autocommit. On any error
+    returns ``(1, 1.0)`` — a "found something" signal that suppresses escalation, so
+    a metadata hiccup never spuriously spins up the model.
+    """
+    sql = (
+        "WITH corpus AS ("
+        "  SELECT coalesce(description,'') AS txt FROM task_log WHERE project_id = ? "
+        "  UNION ALL "
+        "  SELECT coalesce(title,'') || ' ' || coalesce(body,'') FROM project_notes WHERE project_id = ? "
+        "  UNION ALL "
+        "  SELECT coalesce(title,'') || ' ' || coalesce(body,'') FROM decisions_pinned "
+        "    WHERE project_id = ? AND status = 'active' "
+        "  UNION ALL "
+        "  SELECT coalesce(title,'') || ' ' || coalesce(notes,'') FROM sprint_items WHERE project_id = ? "
+        ") "
+        "SELECT "
+        "  count(*) FILTER ("
+        "    WHERE to_tsvector('english', txt) @@ websearch_to_tsquery('english', ?)"
+        "  ) AS fts_count, "
+        "  coalesce(max(similarity(txt, ?)), 0.0) AS trigram_top "
+        "FROM corpus"
+    )
+    params: tuple = (project_id, project_id, project_id, project_id, query, query)
+    try:
+        async with db.execute(sql, params) as cur:
+            row = await cur.fetchone()
+    except Exception:  # noqa: BLE001 - never let metadata query break search
+        _log.warning("semantic gate: pre-count failed — suppressing escalation", exc_info=True)
+        return 1, 1.0
+    if row is None:
+        # 56cd8712 — fail-safe consistent with the exception path: a missing row
+        # SUPPRESSES escalation (1,1.0) rather than firing it (0,0.0). Unreachable
+        # for a single-row count/max aggregate, but defensive.
+        return 1, 1.0
+    d = _row_to_dict(row)  # type: ignore[misc]
+    try:
+        return int(d.get("fts_count") or 0), float(d.get("trigram_top") or 0.0)
+    except (TypeError, ValueError):
+        return 1, 1.0
+
+
+async def _semantic_candidate_corpus(
+    db: Any, project_id: str, cap: int
+) -> "list[tuple[str, str, str]]":
+    """Fetch the project's candidate corpus for semantic ranking — PG.
+
+    Returns ``[(match_type, id, text)]`` across the four content types (title+body
+    concatenated). Bounded by ``cap`` rows total. On error returns ``[]``.
+    """
+    sql = (
+        "SELECT 'task' AS match_type, id, coalesce(description,'') AS txt "
+        "  FROM task_log WHERE project_id = ? "
+        "UNION ALL "
+        "SELECT 'note', id, coalesce(title,'') || ' ' || coalesce(body,'') "
+        "  FROM project_notes WHERE project_id = ? "
+        "UNION ALL "
+        "SELECT 'decision', id, coalesce(title,'') || ' ' || coalesce(body,'') "
+        "  FROM decisions_pinned WHERE project_id = ? AND status = 'active' "
+        "UNION ALL "
+        "SELECT 'sprint_item', id, coalesce(title,'') || ' ' || coalesce(notes,'') "
+        "  FROM sprint_items WHERE project_id = ? "
+        "LIMIT ?"
+    )
+    params: tuple = (project_id, project_id, project_id, project_id, cap)
+    try:
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+    except Exception:  # noqa: BLE001
+        _log.warning("semantic escalation: corpus fetch failed", exc_info=True)
+        return []
+    out: list[tuple[str, str, str]] = []
+    for r in rows:  # type: ignore[assignment]
+        d = _row_to_dict(r)  # type: ignore[misc]
+        out.append((d.get("match_type", ""), d.get("id", ""), d.get("txt", "") or ""))
+    return out
+
+
+async def _hydrate_semantic_rows(
+    db: Any, project_id: str, by_type: "dict[str, list[str]]"
+) -> "dict[str, list[dict[str, Any]]]":
+    """Load full result rows for the semantically-matched ids, grouped by type.
+
+    Mirrors the column shape of the keyword-path SELECTs so merged results are
+    homogeneous. Ordering within each group follows the id order passed in (which is
+    the semantic rank order). On error a type yields no rows.
+    """
+    result: dict[str, list[dict[str, Any]]] = {
+        "task": [], "note": [], "decision": [], "sprint_item": []
+    }
+    selects = {
+        "task": (
+            "SELECT id, description, status, created_at, 'task' AS match_type "
+            "FROM task_log WHERE project_id = ? AND id = ?"
+        ),
+        "note": (
+            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+            "FROM project_notes WHERE project_id = ? AND id = ?"
+        ),
+        "decision": (
+            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+            "FROM decisions_pinned WHERE project_id = ? AND status = 'active' AND id = ?"
+        ),
+        "sprint_item": (
+            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "FROM sprint_items WHERE project_id = ? AND id = ?"
+        ),
+    }
+    for mtype, ids in by_type.items():
+        sql = selects.get(mtype)
+        if not sql:
+            continue
+        for rid in ids:
+            try:
+                async with db.execute(sql, (project_id, rid)) as cur:
+                    row = await cur.fetchone()
+            except Exception:  # noqa: BLE001
+                continue
+            if row is not None:
+                result[mtype].append(_row_to_dict(row))  # type: ignore[misc]
+    return result
+
+
+async def _maybe_semantic_escalate(
+    db: Any,
+    project_id: str,
+    query: str,
+    limit: int,
+    tasks: "list[dict[str, Any]]",
+    notes: "list[dict[str, Any]]",
+    decisions: "list[dict[str, Any]]",
+    sprint_items: "list[dict[str, Any]]",
+) -> "tuple[list[dict], list[dict], list[dict], list[dict]]":
+    """Optionally augment the keyword results with semantic hits (PG-only).
+
+    Returns the (possibly augmented) ``(tasks, notes, decisions, sprint_items)``.
+    A NO-OP — returns the inputs unchanged — unless ALL hold:
+
+    * ``semantic_search.is_available()`` (enabled + importable + not tripped), AND
+    * the CORRECTED gate fires: pure-FTS count == 0 AND pg_trgm top < ~0.1.
+
+    Semantic hits are ranked by cosine (floor-filtered) and appended AFTER the
+    keyword rows, deduped by id, keyword-first — so existing behavior is a strict
+    prefix of the augmented result and the return shape is identical.
+    """
+    from meridian import semantic_search
+
+    if not semantic_search.is_available():
+        return tasks, notes, decisions, sprint_items
+
+    pure_fts, trigram_top = await _pure_fts_count_and_trigram_top(db, project_id, query)
+    if not semantic_search.should_escalate(pure_fts, trigram_top):
+        return tasks, notes, decisions, sprint_items
+
+    corpus = await _semantic_candidate_corpus(db, project_id, _SEMANTIC_CORPUS_CAP)
+    if not corpus:
+        return tasks, notes, decisions, sprint_items
+
+    # rank() takes [(id, text)]; keep a side map id -> match_type to regroup.
+    type_by_id: dict[str, str] = {cid: mtype for mtype, cid, _ in corpus}
+    ranked = semantic_search.rank(query, [(cid, txt) for _, cid, txt in corpus])
+    if not ranked:  # unavailable mid-flight (breaker tripped) or all sub-floor
+        return tasks, notes, decisions, sprint_items
+
+    # Exclude ids already present in the keyword results (keyword-first dedupe).
+    existing: dict[str, set[str]] = {
+        "task": {t.get("id") for t in tasks},
+        "note": {n.get("id") for n in notes},
+        "decision": {d.get("id") for d in decisions},
+        "sprint_item": {s.get("id") for s in sprint_items},
+    }
+    new_by_type: dict[str, list[str]] = {
+        "task": [], "note": [], "decision": [], "sprint_item": []
+    }
+    for cid, _score in ranked:
+        mtype = type_by_id.get(cid)
+        if not mtype or mtype not in new_by_type:
+            continue
+        if cid in existing.get(mtype, set()):
+            continue
+        if len(new_by_type[mtype]) >= limit:
+            continue
+        new_by_type[mtype].append(cid)
+
+    hydrated = await _hydrate_semantic_rows(db, project_id, new_by_type)
+    # Mark provenance so callers/UI can distinguish semantic-augmented rows.
+    for mtype, rows in hydrated.items():
+        for r in rows:
+            r["semantic"] = True
+    return (
+        tasks + hydrated["task"],
+        notes + hydrated["note"],
+        decisions + hydrated["decision"],
+        sprint_items + hydrated["sprint_item"],
+    )
+
+
 async def search_all(
     db: Any,
     project_id: str,
@@ -3053,6 +3274,17 @@ async def search_all(
         notes = await _search(notes_sql, (project_id, query, query, limit))
         decisions = await _search(decisions_sql, (project_id, query, query, limit))
         sprint_items = await _search(sprint_sql, (project_id, query, query, limit))
+
+        # 56cd8712 — SAFE-BY-DEFAULT, OPT-IN semantic escalation. When keyword /
+        # tsvector search genuinely found nothing good, and semantic search is
+        # enabled+importable+not-tripped, embed the query and rank the project's
+        # candidate corpus, merging any above-cosine-floor hits (keyword first,
+        # deduped). This is a NO-OP unless MERIDIAN_SEMANTIC_ENABLED is truthy —
+        # is_available() is False by default so the gate never fires on prod.
+        tasks, notes, decisions, sprint_items = await _maybe_semantic_escalate(
+            db, project_id, query, limit,
+            tasks, notes, decisions, sprint_items,
+        )
     else:
         # fcf90f3a — SQLite keyword path (unchanged). AND the query terms across
         # each content type's text fields so a multi-word query matches rows
