@@ -719,6 +719,120 @@ def test_auth_install_hosted_happy(monkeypatch, tmp_path):
         assert "Meridian Connect" in r.text
 
 
+# --- 0e9bb6ef: install token rotate-and-dedup --------------------------------
+
+def _install_token_from_html(html: str) -> str:
+    """Pull the raw ``sk_meridian_...`` install token out of the install page.
+
+    The token is rendered inside the ``token-box`` div (and repeated in the
+    copyToken() JS). Grabbing the first ``sk_meridian_`` run is sufficient.
+    """
+    import re
+    m = re.search(r"sk_meridian_[A-Za-z0-9_\-]+", html)
+    assert m, "no install token found in /auth/install HTML"
+    return m.group(0)
+
+
+def _count_install_tokens(db, tenant_id: str) -> int:
+    from meridian import db as db_module
+    rows = _run(db_module.list_api_tokens(db, tenant_id))
+    return sum(1 for r in rows if r.get("label") == "install")
+
+
+def test_auth_install_dedups_repeated_installs(monkeypatch, tmp_path):
+    """0e9bb6ef — hitting /auth/install repeatedly must NOT accumulate a pile of
+    valid install keys; each install supersedes the prior one (rotate-and-dedup).
+    The token returned by the latest install must still authenticate."""
+    import hashlib as _hashlib
+    from meridian import db as db_module
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        db = client.app.state.db
+        tenant, raw = _run(_new_tenant_token(db, "dedup-install@example.com"))
+        tid = tenant["id"]
+
+        # Simulate several repeated installer runs.
+        last_token = None
+        for _ in range(4):
+            r = client.get("/auth/install", headers=_hdr(raw))
+            assert r.status_code == 200
+            last_token = _install_token_from_html(r.text)
+
+        # Exactly ONE install-labelled key survives (not 4).
+        assert _count_install_tokens(db, tid) == 1
+
+        # ...and the most-recently-returned token still authenticates.
+        h = _hashlib.sha256(last_token.encode()).hexdigest()
+        resolved = _run(db_module.get_tenant_from_token_hash(db, h))
+        assert resolved is not None
+        assert resolved["id"] == tid
+
+
+def test_auth_install_does_not_touch_other_tenants(monkeypatch, tmp_path):
+    """0e9bb6ef — dedup is scoped to the installing tenant; another tenant's
+    install key must be left completely untouched."""
+    from meridian import db as db_module
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        db = client.app.state.db
+
+        # Tenant A gets an install token via a direct mint (stands in for a
+        # prior install on a different account).
+        other = _run(db_module.upsert_tenant(db, "other-install@example.com"))
+        raw_other, _row = _run(
+            db_module.create_api_token(db, other["id"], label="install")
+        )
+        import hashlib as _hashlib
+        h_other = _hashlib.sha256(raw_other.encode()).hexdigest()
+
+        # Tenant B runs the installer twice.
+        tenant_b, raw_b = _run(_new_tenant_token(db, "installer-b@example.com"))
+        for _ in range(2):
+            r = client.get("/auth/install", headers=_hdr(raw_b))
+            assert r.status_code == 200
+
+        # B is deduped to a single install key...
+        assert _count_install_tokens(db, tenant_b["id"]) == 1
+        # ...and A's install key is untouched (still exactly one, still valid).
+        assert _count_install_tokens(db, other["id"]) == 1
+        resolved = _run(db_module.get_tenant_from_token_hash(db, h_other))
+        assert resolved is not None
+        assert resolved["id"] == other["id"]
+
+
+def test_delete_api_tokens_by_label_exclude_id(monkeypatch, tmp_path):
+    """0e9bb6ef — the exclude_id path preserves exactly the named row and prunes
+    the rest of the same-label tokens for that tenant, and never reuses a revoked
+    (deleted) key."""
+    from meridian import db as db_module
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        db = client.app.state.db
+        tenant = _run(db_module.upsert_tenant(db, "exclude-id@example.com"))
+        tid = tenant["id"]
+
+        raw_old, row_old = _run(
+            db_module.create_api_token(db, tid, label="install")
+        )
+        _raw_new, row_new = _run(
+            db_module.create_api_token(db, tid, label="install")
+        )
+        assert _count_install_tokens(db, tid) == 2
+
+        deleted = _run(
+            db_module.delete_api_tokens_by_label(
+                db, tid, "install", exclude_id=row_new["id"]
+            )
+        )
+        assert deleted == 1
+        assert _count_install_tokens(db, tid) == 1
+
+        # The excluded (kept) row is the survivor; the old one is gone and does
+        # not resolve any tenant (not reused).
+        import hashlib as _hashlib
+        h_old = _hashlib.sha256(raw_old.encode()).hexdigest()
+        assert _run(db_module.get_tenant_from_token_hash(db, h_old)) is None
+        rows = _run(db_module.list_api_tokens(db, tid))
+        assert [r["id"] for r in rows if r.get("label") == "install"] == [row_new["id"]]
+
+
 # ===========================================================================
 # tunnel device-code flow (hosted only)
 # ===========================================================================

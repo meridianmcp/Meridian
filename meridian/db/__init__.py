@@ -5468,14 +5468,27 @@ async def delete_api_tokens_by_label(
     db: aiosqlite.Connection,
     tenant_id: str,
     label: str,
+    exclude_id: str | None = None,
 ) -> int:
     """Delete all tokens with a given label for a tenant. Returns count deleted.
     Used so label acts as a unique slot -- regenerating hooks-installer token
-    doesn't leave stale tokens that cause 401 loops."""
-    cur = await db.execute(
-        "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ?",
-        (tenant_id, label),
-    )
+    doesn't leave stale tokens that cause 401 loops.
+
+    ``exclude_id`` (0e9bb6ef) — when set, the row with this id is preserved. This
+    lets a caller mint the replacement token FIRST and then prune the tenant's
+    older same-label tokens, so there is never an instant with zero valid keys
+    (create-new-then-revoke-old ordering). Placeholders are ``?`` (the psycopg3
+    adapter rewrites ``?`` -> ``%s``), so this stays SQLite+Postgres compatible."""
+    if exclude_id is not None:
+        cur = await db.execute(
+            "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ? AND id != ?",
+            (tenant_id, label, exclude_id),
+        )
+    else:
+        cur = await db.execute(
+            "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ?",
+            (tenant_id, label),
+        )
     await db.commit()
     return cur.rowcount
 

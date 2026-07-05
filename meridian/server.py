@@ -5313,8 +5313,21 @@ async def auth_install_page(request: Request) -> HTMLResponse:
     tenant = await _get_authenticated_tenant(request)
     db = request.app.state.db
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-    raw_token, _ = await db_module.create_api_token(
+    # 0e9bb6ef — rotate-and-dedup so repeated installer runs don't accumulate a
+    # pile of valid install keys. Install tokens are hash-only (raw not
+    # recoverable server-side), so we can't hand back a prior key's raw value;
+    # instead each install supersedes the previous. Mint the new token FIRST,
+    # then delete this tenant's OTHER label="install" tokens (exclude_id keeps
+    # the row we just created). This create-new-then-revoke-old ordering means
+    # there is never an instant with zero valid install keys even if the prune
+    # were to fail. Identity is tenant_id + label="install" (no hostname column
+    # exists on api_tokens). Same pattern already used by /auth/tokens and the
+    # tunnel-cli flow.
+    raw_token, install_row = await db_module.create_api_token(
         db, tenant["id"], label="install", expires_at=expires_at
+    )
+    await db_module.delete_api_tokens_by_label(
+        db, tenant["id"], "install", exclude_id=install_row["id"]
     )
     email = tenant.get("email", "")
     html = f"""<!DOCTYPE html>
