@@ -5654,6 +5654,122 @@ project_id = "${displayPid}"`;
         </div>`;
   }
   window._renderStaleOverrideWarning = _renderStaleOverrideWarning;
+  function _fsAttr(v3) {
+    return escapeHtml(String(v3 == null ? "" : v3));
+  }
+  function _renderFsRootsCard(projectId) {
+    return `
+    <details class="meridian-disclosure" style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0" data-fs-roots-card="${_fsAttr(projectId)}">
+      <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Filesystem roots (live)</summary>
+      <div style="padding:0 8px 8px">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+          Directories the <code>/fs</code> connector may read, unioned across this account's projects.
+          Add or remove one and the running <code>meridian --tunnel</code> picks it up immediately &mdash; no restart.
+        </div>
+        <div id="fs-roots-list-${_fsAttr(projectId)}" style="margin-bottom:8px"><div style="color:var(--muted);font-size:10px">Loading&hellip;</div></div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input type="text" id="fs-roots-input-${_fsAttr(projectId)}" placeholder="add a directory (e.g. C:\\Users\\me\\Projects)"
+            style="flex:1;min-width:180px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+          <button class="secondary admin-only" id="fs-roots-add-${_fsAttr(projectId)}" style="padding:2px 10px;font-size:10px;flex-shrink:0">Add</button>
+        </div>
+        <div id="fs-roots-status-${_fsAttr(projectId)}" style="font-size:10px;color:var(--muted);margin-top:4px"></div>
+      </div>
+    </details>`;
+  }
+  window._renderFsRootsCard = _renderFsRootsCard;
+  function _renderFsRootsList(roots) {
+    const list = Array.isArray(roots) ? roots.filter((r3) => typeof r3 === "string" && r3.trim()).map((r3) => r3.trim()) : [];
+    if (!list.length) {
+      return '<div style="color:var(--muted);font-size:10px">No roots &mdash; the connector falls back to your home directory.</div>';
+    }
+    return list.map((p3) => `
+    <div style="border:1px solid var(--border);border-radius:4px;padding:6px 8px;margin-bottom:6px;display:flex;gap:8px;align-items:center">
+      <div style="flex:1;min-width:0;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${_fsAttr(p3)}">${escapeHtml(p3)}</div>
+      <button class="fs-root-remove" data-root="${_fsAttr(p3)}" title="Remove this root" style="font-size:11px;line-height:1;padding:1px 7px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer;flex-shrink:0">&#10005;</button>
+    </div>`).join("");
+  }
+  window._renderFsRootsList = _renderFsRootsList;
+  async function _wireFsRootsCard(section, projectId) {
+    if (!section) return;
+    const card = section.querySelector(`[data-fs-roots-card="${CSS.escape(projectId)}"]`);
+    if (!card || card.dataset.wired === "1") return;
+    card.dataset.wired = "1";
+    const listEl = document.getElementById(`fs-roots-list-${projectId}`);
+    const inputEl = document.getElementById(`fs-roots-input-${projectId}`);
+    const addBtn = document.getElementById(`fs-roots-add-${projectId}`);
+    const statusEl = document.getElementById(`fs-roots-status-${projectId}`);
+    const setStatus = (m3) => {
+      if (!statusEl) return;
+      statusEl.textContent = m3 || "";
+      if (m3) setTimeout(() => {
+        if (statusEl.textContent === m3) statusEl.textContent = "";
+      }, 3e3);
+    };
+    const liveNote = (live) => {
+      const s3 = live && live.status;
+      if (s3 === "ok") return " (applied to the running tunnel)";
+      if (s3 === "not_connected") return " (saved \u2014 tunnel offline, applies on next start)";
+      if (s3 === "error") return " (saved \u2014 could not reach the tunnel)";
+      return "";
+    };
+    const renderList = (roots) => {
+      if (!listEl) return;
+      listEl.innerHTML = _renderFsRootsList(roots);
+      listEl.querySelectorAll(".fs-root-remove").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const root = btn.dataset.root || "";
+          if (!root) return;
+          btn.disabled = true;
+          try {
+            const r3 = await api("/tunnel/filesystem-roots", {
+              method: "DELETE",
+              body: JSON.stringify({ path: root })
+            });
+            renderList(r3 && r3.roots || []);
+            setStatus("Removed" + liveNote(r3 && r3.live));
+          } catch (e3) {
+            btn.disabled = false;
+            toast("Remove failed: " + (e3 && e3.message || e3), true);
+          }
+        });
+      });
+    };
+    const addRoot = async () => {
+      const v3 = (inputEl && inputEl.value || "").trim();
+      if (!v3) {
+        toast("Enter a directory path", true);
+        return;
+      }
+      if (addBtn) addBtn.disabled = true;
+      try {
+        const r3 = await api("/tunnel/filesystem-roots", {
+          method: "POST",
+          body: JSON.stringify({ path: v3 })
+        });
+        if (inputEl) inputEl.value = "";
+        renderList(r3 && r3.roots || []);
+        setStatus("Added" + liveNote(r3 && r3.live));
+      } catch (e3) {
+        toast("Add failed: " + (e3 && e3.message || e3), true);
+      } finally {
+        if (addBtn) addBtn.disabled = false;
+      }
+    };
+    if (addBtn) addBtn.addEventListener("click", addRoot);
+    if (inputEl) inputEl.addEventListener("keydown", (e3) => {
+      if (e3.key === "Enter") {
+        e3.preventDefault();
+        addRoot();
+      }
+    });
+    try {
+      const data = await api("/tunnel/filesystem-roots");
+      renderList(data && data.filesystem_roots || []);
+    } catch (e3) {
+      if (listEl) listEl.innerHTML = `<div style="color:var(--error);font-size:10px">Failed to load roots: ${escapeHtml(e3 && e3.message || String(e3))}</div>`;
+    }
+  }
+  window._wireFsRootsCard = _wireFsRootsCard;
   async function loadTunnelPluginsSection2(projectId, hostname) {
     const host = document.getElementById(`settings-body-${projectId}`);
     if (!host) return;
@@ -5827,6 +5943,7 @@ project_id = "${displayPid}"`;
       </div>
       ${_hostPicker}
       ${rows || '<div style="color:var(--muted);font-size:10px">No plugins.</div>'}
+      ${_renderFsRootsCard(projectId)}
       <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px">
         <button class="secondary admin-only" id="tp-reset-${projectId}" style="padding:2px 10px;font-size:10px" title="Clear all overrides (back to built-in defaults)">Reset to defaults</button>
         <button class="primary admin-only" id="tp-save-${projectId}" style="padding:2px 10px;font-size:10px">Save</button>
@@ -5938,6 +6055,7 @@ project_id = "${displayPid}"`;
       _wireRegistryCopyButtons(section);
       _wireRegistryBrowse(section, projectId, _hq);
       _wireLifecycleInstallButtons(section);
+      _wireFsRootsCard(section, projectId);
       let _tenantIdPromise = null;
       const _getTenantId = () => {
         if (!_tenantIdPromise) {

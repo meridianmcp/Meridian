@@ -535,6 +535,25 @@ async def _run_connection_lazy(
                                 flush=True,
                             )
                         continue
+                    if msg.get("type") == "set_fs_roots":
+                        # live-fs-roots — full-list REPLACE: rebuild the fs proxy's
+                        # allowed dirs to EXACTLY these roots (a removal shrinks the
+                        # served set, which add_fs_roots cannot do), then respawn.
+                        want_roots: list[str] = msg.get("roots") or []
+                        updated_cmd, changed = _set_fs_roots_on_cmd(proxy.cmd, want_roots)
+                        if changed:
+                            proxy.cmd = updated_cmd
+                            if proxy.is_running:
+                                proxy.kill()
+                                await proxy.ensure_running()
+                            served = [
+                                d for d in (_normalize_path_arg(r) for r in want_roots) if d
+                            ]
+                            print(
+                                f"tunnel:{label}: set allowed dirs → {served}",
+                                flush=True,
+                            )
+                        continue
                     if msg.get("type") == "request":
                         # Lazy spawn: bring the proxy up if it died or was idle-killed.
                         _was_running = proxy.is_running
@@ -1768,6 +1787,35 @@ def _add_fs_roots_to_cmd(cmd: "list[str]", new_roots: "list[str]") -> "tuple[lis
     if not to_add:
         return cmd, False
     return cmd[:idx + 1] + list(cmd[idx + 1:]) + to_add, True
+
+
+def _set_fs_roots_on_cmd(cmd: "list[str]", roots: "list[str]") -> "tuple[list[str], bool]":
+    """live-fs-roots — REPLACE the served dirs in a ``_build_proxy_command`` result
+    with EXACTLY *roots* (normalized, deduped, order preserved).
+
+    Unlike :func:`_add_fs_roots_to_cmd` (which only appends), this rebuilds the
+    trailing dir list after the ``@modelcontextprotocol/server-filesystem`` token
+    so a removal shrinks the served set. Returns ``(updated_cmd, changed)`` —
+    *changed* is ``False`` (and *cmd* returned unchanged) when the token is absent
+    or the requested dirs already match the current ones. An empty/all-blank
+    *roots* list is a no-op (``changed=False``): the inner filesystem server needs
+    at least one dir, so we never strip it down to zero.
+    """
+    try:
+        idx = cmd.index("@modelcontextprotocol/server-filesystem")
+    except ValueError:
+        return cmd, False
+    new_dirs: list[str] = []
+    for r in roots:
+        nr = _normalize_path_arg(r)
+        if nr and nr not in new_dirs:
+            new_dirs.append(nr)
+    if not new_dirs:
+        # Refuse to leave the filesystem server with zero dirs.
+        return cmd, False
+    if list(cmd[idx + 1:]) == new_dirs:
+        return cmd, False
+    return cmd[:idx + 1] + new_dirs, True
 
 
 def _extract_denied_path(resp: dict) -> "str | None":
