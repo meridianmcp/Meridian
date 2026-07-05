@@ -1401,6 +1401,143 @@ def test_dispatch_complete_sprint_item_no_gate_when_not_flagged():
         _run(db.close())
 
 
+# ---------------------------------------------------------------------------
+# bb29a06f — ADVISORY completion sanity-check (plausibility of evidence).
+# Extends the required_notes gate: a weakly-supported completion whose title
+# shares no keywords with a recent commit gets a soft advisory. Never blocks.
+# ---------------------------------------------------------------------------
+
+def _no_commits(monkeypatch):
+    """Force _fetch_recent_commits to return no commits (advisory should fire
+    for a weakly-supported completion)."""
+    async def _fake(_project, _tenant):
+        return []
+    monkeypatch.setattr(mh, "_fetch_recent_commits", _fake)
+
+
+def _commits(monkeypatch, commits):
+    """Force _fetch_recent_commits to return a fixed commit list."""
+    async def _fake(_project, _tenant):
+        return list(commits)
+    monkeypatch.setattr(mh, "_fetch_recent_commits", _fake)
+
+
+def test_sprint_item_advisory_weak_completion_no_commit(monkeypatch):
+    """(a) Weak completion (no task/notes) + no matching commit → advisory present,
+    and the completion still succeeds."""
+    _no_commits(monkeypatch)
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-a"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done["status"] == "done"  # completion never blocked
+        assert "completion_advisory" in done
+        assert "double-check it actually shipped" in done["completion_advisory"]
+    finally:
+        _run(db.close())
+
+
+def test_sprint_item_advisory_absent_when_commit_matches(monkeypatch):
+    """(b) Weak completion but a recent commit shares >=3 keywords with the
+    title → plausibly supported → NO advisory."""
+    _commits(monkeypatch, [
+        {"sha": "abc123def456",
+         "message": "Add rate limiter middleware bucket for API"},
+    ])
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-b"}, db, "/tmp"))
+        pid = proj["id"]
+        # force=True so add_sprint_item's own drift guard (which fires when the
+        # mocked commit matches the title) doesn't refuse to create the item.
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1", "force": True}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done["status"] == "done"
+        assert "completion_advisory" not in done
+    finally:
+        _run(db.close())
+
+
+def test_sprint_item_advisory_absent_with_notes_evidence(monkeypatch):
+    """(c) Completion carrying evidence (notes= arg) → evidence exists → NO
+    advisory even when no commit matches."""
+    _no_commits(monkeypatch)
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-c"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"],
+             "notes": "shipped the limiter; tests green"}, db, "/tmp"))
+        assert done["status"] == "done"
+        assert "completion_advisory" not in done
+    finally:
+        _run(db.close())
+
+
+def test_sprint_item_advisory_absent_with_task_id_evidence(monkeypatch):
+    """(c') Completion linking a task_id → evidence exists → NO advisory."""
+    _no_commits(monkeypatch)
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-c2"}, db, "/tmp"))
+        pid = proj["id"]
+        sess = _run(db_module.register_session(db, pid, "adv-sess"))
+        task = _run(db_module.log_task(db, sess["id"], pid, "did the work"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "task_id": task["id"]},
+            db, "/tmp"))
+        assert done["status"] == "done"
+        assert "completion_advisory" not in done
+    finally:
+        _run(db.close())
+
+
+def test_sprint_item_advisory_never_blocks_on_commit_fetch_error(monkeypatch):
+    """(d) A failing commit-fetch must never break completion — the advisory is
+    silently skipped and the item still completes."""
+    async def _boom(_project, _tenant):
+        raise RuntimeError("git unavailable")
+    monkeypatch.setattr(mh, "_fetch_recent_commits", _boom)
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-d"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done["status"] == "done"  # completion succeeded despite git error
+    finally:
+        _run(db.close())
+
+
 def test_read_write_claim_distinction():
     """ffa03655 — shared read claims coexist; write is exclusive and waits for readers."""
     import meridian.db as db_module

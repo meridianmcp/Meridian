@@ -3253,6 +3253,41 @@ async def _handle_sprint_tools(
         if _bc_complete:
             item = dict(item)
             item["board_change"] = _bc_complete
+        # bb29a06f — ADVISORY completion sanity-check. Extends the required_notes
+        # gate (evidence EXISTS) with a check that evidence is PLAUSIBLE: when the
+        # completion looks weakly-supported (no linked task, no notes anywhere) and
+        # no recent commit/migration shares keywords with the title, add a soft
+        # nudge. NEVER blocks, never raises — the completion already succeeded. The
+        # drift heuristic is noisy, so this is a hint, not a gate.
+        try:
+            _weakly_supported = not (
+                args.get("task_id")
+                or (args.get("notes") or "").strip()
+                or (item.get("notes") or "").strip()
+                or item.get("task_id")
+            )
+            if _weakly_supported:
+                from .. import handoff as _handoff_advisory
+                try:
+                    _adv_project = await db_module.get_project(db, args["project_id"])
+                    _adv_commits = (
+                        await _fetch_recent_commits(_adv_project, tenant)
+                        if _adv_project else []
+                    )
+                except Exception:  # noqa: BLE001 — never let commit-fetch break completion
+                    _adv_commits = []
+                _adv_matches = _handoff_advisory.detect_sprint_item_drift(
+                    item.get("title") or "", _adv_commits,
+                )
+                if not _adv_matches:
+                    item = dict(item)
+                    item["completion_advisory"] = (
+                        "No recent commit or linked evidence appears to reference "
+                        "this item — double-check it actually shipped (this is a "
+                        "heuristic; ignore if you completed it via docs/config/decision)."
+                    )
+        except Exception:  # noqa: BLE001 — advisory must never affect completion
+            pass
         # Notify only when the sprint is fully complete.
         active_statuses = {"pending", "todo", "in_progress"}
         remaining_items = await db_module.get_sprint_items(db, args["project_id"])
