@@ -30,7 +30,7 @@ start_session(project_id="{{ project.id }}", session_name="describe-what-youre-d
 **Pinned Decisions ({{ pinned_decisions | length }}):**
 
 {% for d in pinned_decisions -%}
-- **[{{ d.category }}]** {{ d.title }} — {{ d.body }}
+- **[{{ d.category }}]** {{ d.title }} — {{ d.body | clip_body }}
 {% endfor %}
 {% else -%}
 _No pinned decisions yet — use `pin_decision` MCP tool to establish the constitution._
@@ -41,7 +41,7 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 **Strategic Notes ({{ strategic_notes | length }}):**
 
 {% for note in strategic_notes -%}
-- **{{ note.title }}**{% if note.tags %} _[{{ note.tags }}]_{% endif %} — {{ note.body }}
+- **{{ note.title }}**{% if note.tags %} _[{{ note.tags }}]_{% endif %} — {{ note.body | clip_body }}
 {% endfor %}
 
 {% endif %}
@@ -82,7 +82,7 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 **Recent Tasks (last {{ l1_tasks | length }}):**
 
 {% for t in l1_tasks -%}
-[{{ t.created_at }}] [{{ t.status | upper }}] {{ session_names[t.session_id] }}: {{ t.description }}
+[{{ t.created_at }}] [{{ t.status | upper }}] {{ session_names[t.session_id] }}: {{ t.description | clip_body }}
 {% endfor %}
 
 ## L2 — History (~5000 tokens, skim if space)
@@ -91,7 +91,7 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 **Older Task Log ({{ l2_tasks | length }} entries):**
 
 {% for t in l2_tasks -%}
-[{{ t.created_at }}] [{{ t.status | upper }}] {{ session_names[t.session_id] }}: {{ t.description }}
+[{{ t.created_at }}] [{{ t.status | upper }}] {{ session_names[t.session_id] }}: {{ t.description | clip_body }}
 {% endfor %}
 {% endif %}
 
@@ -106,7 +106,7 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 {% if decisions_log -%}
 **Append-Only Decisions Log:**
 
-{{ decisions_log }}
+{{ decisions_log | clip_body(4000) }}
 {% endif %}
 
 ## Quick Start

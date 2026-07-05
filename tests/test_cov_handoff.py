@@ -374,6 +374,39 @@ def test_render_workspace_handoff_block_empty_and_full():
     assert "WS note" in block
 
 
+# ---------------------------------------------------------------------------
+# 2d6d8677 — per-item body clipping so a handoff can't overflow the MCP result cap
+# ---------------------------------------------------------------------------
+
+
+def test_clip_body_short_body_unchanged():
+    """A body at or under the limit passes through verbatim (no marker)."""
+    assert handoff_module._clip_body("short body") == "short body"
+    assert handoff_module._clip_body("") == ""
+    assert handoff_module._clip_body(None) == ""
+    exact = "x" * 300
+    assert handoff_module._clip_body(exact) == exact  # ==limit, untouched
+
+
+def test_clip_body_long_body_truncated_with_marker():
+    """A body over the limit is cut to the limit and marked with the omitted count."""
+    body = "a" * 5000
+    clipped = handoff_module._clip_body(body)  # default 300
+    # The rendered preview is far shorter than the original 5000 chars.
+    assert len(clipped) < 400
+    assert clipped.startswith("a" * 200)  # keeps the head
+    assert "5000" not in clipped[:300]  # not the whole body
+    assert "(+4700 more chars)" in clipped  # 5000 - 300 omitted
+    assert body not in clipped  # NOT the full body
+
+
+def test_clip_body_custom_limit():
+    body = "b" * 1000
+    clipped = handoff_module._clip_body(body, 100)
+    assert "(+900 more chars)" in clipped
+    assert len(clipped) < 150
+
+
 def test_render_custom_handoff_empty_sources_render_none():
     out = handoff_module._render_custom_handoff(
         "T:{{recent_tasks}}|D:{{decisions}}|P:{{pending_items}}|N:{{notes}}|S:{{sprint}}",
@@ -680,6 +713,63 @@ async def test_generate_handoff_full_with_decisions_and_workspace(db, tmp_path):
     assert "Workspace rule" in content
     assert "Sprint: sprint-rich" in content
     assert "1 pinned decision" in content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_clips_long_bodies(db, tmp_path):
+    """2d6d8677 — long decision / workspace-note / task bodies are clipped to a
+    ~300-char preview with a truncation marker, NOT dumped at full length (the
+    420K-blob-over-MCP-cap bug). Short bodies stay intact."""
+    long_dec = "D" * 5000
+    long_note = "N" * 5000
+    long_task = "T" * 5000
+    p = await db_module.create_project(db, "alpha-longbody")
+    await db_module.set_goal(db, p["id"], "clip long bodies", sprint="s-clip")
+    await db_module.pin_decision(db, p["id"], "Long decision", long_dec, "TECHNICAL")
+    await db_module.pin_decision(db, p["id"], "Short decision", "brief body", "TECHNICAL")
+    await db_module.add_workspace_note(db, "Long WS note", long_note, "x")
+    s = await db_module.register_session(db, p["id"], "sess-clip")
+    await db_module.log_task(db, s["id"], p["id"], long_task, "done")
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    # None of the full 5000-char bodies survive verbatim.
+    assert long_dec not in content
+    assert long_note not in content
+    assert long_task not in content
+    # But a bounded preview + truncation marker does.
+    assert "D" * 200 in content
+    assert "N" * 200 in content
+    assert "(+4700 more chars)" in content  # 5000 - 300 clip
+    # Titles and short bodies stay intact.
+    assert "Long decision" in content
+    assert "Short decision" in content
+    assert "brief body" in content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_total_size_bounded_with_many_long_items(db, tmp_path):
+    """2d6d8677 — a realistic board of dozens of long-bodied decisions + notes
+    keeps the whole rendered handoff comfortably under the MCP result cap. Without
+    the per-body clip this fixture alone would be ~300K+ chars; with it, well under."""
+    p = await db_module.create_project(db, "alpha-bulk")
+    await db_module.set_goal(db, p["id"], "bulk clip", sprint="s-bulk")
+    s = await db_module.register_session(db, p["id"], "sess-bulk")
+    huge = "Z" * 8000
+    for i in range(30):
+        await db_module.pin_decision(db, p["id"], f"Decision {i}", huge, "TECHNICAL")
+        await db_module.add_project_note(
+            db, p["id"], f"Insight {i}", huge, tags="strategy", kind="insight",
+            priority="high",
+        )
+        await db_module.log_task(db, s["id"], p["id"], huge, "done")
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    # 30 decisions + 30 insight notes + 30 tasks × 8000 chars would be >700K raw;
+    # clipped, the whole handoff stays well under a conservative bound.
+    assert len(content) < 60_000, f"handoff too large: {len(content)} chars"
+    assert huge not in content  # no full 8000-char body leaked through
 
 
 @pytest.mark.asyncio

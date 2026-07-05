@@ -80,6 +80,39 @@ def _format_content(content) -> str:
     return json.dumps(content, indent=2)
 
 
+# 2d6d8677 — cap each embedded per-item body so a handoff can't balloon past the
+# MCP tool-result token cap. The renderer used to embed EVERY workspace/pinned
+# decision + note + task with FULL untruncated bodies (blog drafts, long
+# post-mortems, the whole append-only decisions log), producing 420K+ char blobs
+# that overflowed the cap — the handoff still persisted to state but the caller
+# got an error and couldn't read it (fired 3× live on 2026-07-04/05). The full
+# bodies still live in the DB; the handoff only needs a preview.
+_HANDOFF_BODY_CLIP = 300
+
+
+def _clip_body(text: Any, limit: int = _HANDOFF_BODY_CLIP) -> str:
+    """Return ``text`` clipped to ``limit`` chars with a truncation marker (2d6d8677).
+
+    When the body is longer than ``limit`` it is cut to ``limit`` chars and a
+    ``… (+N more chars)`` marker naming the omitted count is appended, so a
+    reader knows the full body lives in the DB. Short/empty bodies pass through
+    unchanged. Registered as the ``clip_body`` Jinja filter for the template.
+    """
+    if text is None:
+        return ""
+    s = text if isinstance(text, str) else str(text)
+    if len(s) <= limit:
+        return s
+    omitted = len(s) - limit
+    return f"{s[:limit].rstrip()}… (+{omitted} more chars)"
+
+
+# 2d6d8677 — expose _clip_body to the Jinja handoff template so long decision /
+# note / task bodies render clipped there too (the template is the biggest full-
+# body offender: {{ d.body }}, {{ note.body }}, {{ t.description }}, decisions_log).
+_env.filters["clip_body"] = _clip_body
+
+
 def _prepare_pending_sprint_items(
     items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1503,7 +1536,8 @@ async def _generate_handoff_l0(
             # 366317e9 — urgent decisions are flagged so they stand out in the
             # priority-ordered list.
             mark = " ⚡" if d.get("priority") == "urgent" else ""
-            lines.append(f"- **{d.get('title', '?')}**{mark}: {d.get('body', '')}")
+            # 2d6d8677 — clip the body so even the emergency fallback stays bounded.
+            lines.append(f"- **{d.get('title', '?')}**{mark}: {_clip_body(d.get('body'))}")
         lines.append("")
     lines += [
         "---",
@@ -1557,14 +1591,16 @@ def _render_workspace_handoff_block(
         for d in decisions[:10]:
             cat = (d.get("category") or "").strip()
             prefix = f"**[{cat}]** " if cat else ""
-            lines.append(f"- {prefix}{d.get('title', '')} — {(d.get('body') or '')[:300]}")
+            # 2d6d8677 — clip the body with a truncation marker (was a raw [:300]).
+            lines.append(f"- {prefix}{d.get('title', '')} — {_clip_body(d.get('body'))}")
         lines.append("")
     if notes:
         lines.append("### Notes")
         for n in notes[:10]:
             tags = (n.get("tags") or "").strip()
             suffix = f" _({tags})_" if tags else ""
-            lines.append(f"- **{n.get('title', '')}** — {(n.get('body') or '')[:300]}{suffix}")
+            # 2d6d8677 — clip the body with a truncation marker (was a raw [:300]).
+            lines.append(f"- **{n.get('title', '')}** — {_clip_body(n.get('body'))}{suffix}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -1594,7 +1630,8 @@ def _render_custom_handoff(
         for t in recent_tasks[:10]:
             status = (t.get("status") or "?").upper()
             desc = (t.get("description") or "").strip().replace("\n", " ")
-            out.append(f"- [{status}] {desc[:160]}")
+            # 2d6d8677 — clip with a truncation marker (was a raw [:160]).
+            out.append(f"- [{status}] {_clip_body(desc, 160)}")
         return "\n".join(out)
 
     def _decisions_block() -> str:
@@ -1605,7 +1642,8 @@ def _render_custom_handoff(
         for d in active[:10]:
             cat = (d.get("category") or "").strip()
             prefix = f"[{cat}] " if cat else ""
-            out.append(f"- {prefix}{d.get('title', '')} — {(d.get('body') or '')[:300]}")
+            # 2d6d8677 — clip the body with a truncation marker (was a raw [:300]).
+            out.append(f"- {prefix}{d.get('title', '')} — {_clip_body(d.get('body'))}")
         return "\n".join(out)
 
     def _pending_block() -> str:
@@ -1623,7 +1661,8 @@ def _render_custom_handoff(
         for n in notes[:10]:
             tags = (n.get("tags") or "").strip()
             suffix = f" ({tags})" if tags else ""
-            out.append(f"- {n.get('title', '')} — {(n.get('body') or '')[:300]}{suffix}")
+            # 2d6d8677 — clip the body with a truncation marker (was a raw [:300]).
+            out.append(f"- {n.get('title', '')} — {_clip_body(n.get('body'))}{suffix}")
         return "\n".join(out)
 
     replacements = {
@@ -2077,13 +2116,15 @@ async def _generate_planner_handoff(
             cat = d.get("category", "")
             # 366317e9 — pinned is ordered urgent → normal → low; tag urgent ones.
             prio = " ⚡urgent" if d.get("priority") == "urgent" else ""
-            lines.append(f"- **[{cat}]**{prio} {d.get('title', '')} — {(d.get('body') or '')[:200]}")
+            # 2d6d8677 — clip with a truncation marker (was a raw [:200]).
+            lines.append(f"- **[{cat}]**{prio} {d.get('title', '')} — {_clip_body(d.get('body'), 200)}")
         lines.append("")
 
     if strategic:
         lines += ["## Strategic Notes", ""]
         for n in strategic[:8]:
-            lines.append(f"- **{n.get('title', '')}** — {(n.get('body') or '')[:150]}")
+            # 2d6d8677 — clip with a truncation marker (was a raw [:150]).
+            lines.append(f"- **{n.get('title', '')}** — {_clip_body(n.get('body'), 150)}")
         lines.append("")
 
     # Sprint items to review — in-progress first (what's live), then pending.
