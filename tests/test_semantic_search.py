@@ -85,7 +85,7 @@ def _stub_embed_from_map(mapping):
 
 
 def test_rank_drops_subfloor_and_sorts_desc(monkeypatch):
-    import numpy as np
+    np = pytest.importorskip("numpy")  # CI has no model2vec/numpy; skip the vector math there
 
     s = SemanticSearcher()
     # Query points along +x. Candidates at varying cosine to it.
@@ -108,7 +108,7 @@ def test_rank_drops_subfloor_and_sorts_desc(monkeypatch):
 
 
 def test_rank_respects_env_floor(monkeypatch):
-    import numpy as np
+    np = pytest.importorskip("numpy")
 
     s = SemanticSearcher()
     vecs = {
@@ -124,8 +124,30 @@ def test_rank_respects_env_floor(monkeypatch):
 
 
 def test_rank_empty_candidates_returns_empty():
+    # b3537a8d — empty candidates early-return BEFORE the numpy import, so no numpy needed.
     s = SemanticSearcher()
     assert s.rank("q", []) == []
+
+
+def test_rank_and_embed_safe_without_numpy(monkeypatch):
+    """b3537a8d — the degenerate/unavailable paths of rank()/embed() must NOT crash
+    when numpy is absent (the module's safe-by-default promise). Simulate numpy
+    missing: any attempt to import it raises, so this fails if a numpy import creeps
+    back before the early-returns."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _no_numpy(name, *a, **k):
+        if name == "numpy" or name.startswith("numpy."):
+            raise ModuleNotFoundError("No module named 'numpy'")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_numpy)
+    s = SemanticSearcher()
+    assert s.rank("q", []) == []               # empty candidates
+    assert s.embed([]) is None                 # empty texts
+    monkeypatch.setattr(s, "embed", lambda texts: None)
+    assert s.rank("q", [("a", "text")]) == []  # semantic unavailable
 
 
 def test_rank_returns_empty_when_embed_unavailable(monkeypatch):
@@ -415,7 +437,7 @@ def test_preload_refuses_when_headroom_insufficient(monkeypatch):
 def test_embed_chunks_and_truncates_large_corpus(monkeypatch):
     """56cd8712 — embed truncates each text to _MAX_TEXT_CHARS and encodes in
     RSS-checked sub-batches of _ENCODE_BATCH, bounding the encode-time RSS peak."""
-    import numpy as np
+    np = pytest.importorskip("numpy")
     monkeypatch.setenv("MERIDIAN_SEMANTIC_ENABLED", "1")
     monkeypatch.setenv("MERIDIAN_SEMANTIC_RSS_LIMIT_MB", "100000")  # never trips
     calls: "list[list[str]]" = []
