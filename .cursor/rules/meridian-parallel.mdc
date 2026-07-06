@@ -1,0 +1,31 @@
+---
+description: Meridian parallel-session file-claim protocol — run before editing any shared file
+globs:
+alwaysApply: true
+---
+
+# Meridian file-claim protocol (cross-tool parallelization)
+
+Meridian's file/symbol claims are the cross-tool parallelization primitive — the one
+mechanism that reaches Cursor, Claude Code, and Codex identically. No native
+cross-platform primitive exists (vendor concurrency features are siloed), so this claim
+mechanism is the actual coordination layer between agents working the same repo.
+
+**Run this exact sequence before editing any shared file:**
+
+1. `get_file_claims(file_path)` — check first. If another live session holds a write claim
+   (or any claim on a file you intend to write), coordinate before proceeding.
+2. `claim_file(session_id, file_path, mode="write")` — `write` is exclusive (blocks other
+   writers and readers); use `mode="read"` for shared read-only exploration (many readers,
+   blocked only by a writer). For symbol-level work in a large file, also pass `symbol=` +
+   `content=` so two sessions can own different symbols in the same file — line ranges
+   resolve via real AST/tree-sitter parsing (Python `ast` + TypeScript tree-sitter).
+3. Edit the file (or symbol) you now own.
+4. `release_file(file_path, session_id)` — release as soon as you're done. Claims also
+   auto-expire after a 2h TTL; don't lean on it, release explicitly.
+
+**High-contention files — always sequential, never parallel:**
+`meridian/static/dashboard.ts`, `meridian/server.py`, `meridian/db/__init__.py`.
+
+Never `git add -A` / `git add .` / `git commit -a` — stage only your own files, by path,
+so a repo-wide add can't sweep up another session's uncommitted work.
