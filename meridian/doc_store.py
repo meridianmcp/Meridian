@@ -958,6 +958,37 @@ class DocStructureStore:
 
         return {"markers": markers}
 
+    async def get_element_by_id(
+        self, element_id: str
+    ) -> dict[str, Any] | None:
+        """Return a single stored element (with its parent doc) by its id, or None.
+
+        2976e168 — the read primitive the GENERIC POINTER resolver needs for a
+        ``selector.type='node_id'`` pointer: a doc_store element id (9ee6d2ec)
+        resolves to ``{element:{...}, document:{...}}`` (the element row plus its
+        owning document header) so the pointer can surface a source/title. Returns
+        None for an unknown id. Never raises upward (the resolver guards, but this
+        stays a plain best-effort lookup).
+        """
+        if not isinstance(element_id, str) or not element_id.strip():
+            return None
+        async with self._db.execute(
+            "SELECT * FROM doc_elements WHERE id = ?", (element_id.strip(),)
+        ) as cur:
+            row = await cur.fetchone()
+        element = _row_to_dict(row, _ELEMENT_COLUMNS)
+        if element is None:
+            return None
+        document: dict[str, Any] | None = None
+        doc_id = element.get("document_id")
+        if isinstance(doc_id, str) and doc_id:
+            async with self._db.execute(
+                "SELECT * FROM doc_documents WHERE id = ?", (doc_id,)
+            ) as cur:
+                drow = await cur.fetchone()
+            document = _row_to_dict(drow, _DOC_COLUMNS)
+        return {"element": element, "document": document}
+
     async def list_documents(self, project_id: str) -> list[dict[str, Any]]:
         """Return all stored document headers for a project (newest first)."""
         async with self._db.execute(

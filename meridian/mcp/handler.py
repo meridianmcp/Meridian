@@ -3538,6 +3538,71 @@ async def _handle_sprint_tools(
                 pref_key="sprint",
             )
         return item
+    if name == "add_sprint_item_pointer":
+        # 2976e168 — attach a GENERIC POINTER to a sprint item. Validation lives in
+        # db.add_sprint_item_pointer (via meridian.pointers.validate_pointer); a
+        # malformed pointer raises ValueError, surfaced here as a clean {error}.
+        if not args.get("project_id"):
+            return {"error": "project_id is required (or pass project_name)"}
+        if not args.get("sprint_item_id"):
+            return {"error": "sprint_item_id is required"}
+        validate_input_size(args.get("label"), "pointer label", 500)
+        try:
+            return await db_module.add_sprint_item_pointer(
+                db,
+                args["project_id"],
+                args["sprint_item_id"],
+                args.get("source_type") or "",
+                args.get("targets") or [],
+                label=args.get("label"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+    if name == "get_sprint_item_pointers":
+        if not args.get("sprint_item_id"):
+            return {"error": "sprint_item_id is required"}
+        pointers = await db_module.get_sprint_item_pointers(
+            db, args["sprint_item_id"]
+        )
+        return {"sprint_item_id": args["sprint_item_id"], "pointers": pointers}
+    if name == "resolve_sprint_item_pointers":
+        # 2976e168 — resolve EVERY pointer on an item, dispatching by selector.type.
+        # Best-effort + guarded: unresolvable targets become {resolved:false}; the
+        # pass NEVER raises. node_id targets need the doc-structure store, resolved
+        # via the same tier-aware helper the citation tools use; symbol/zotero use
+        # the pointers module's default seams (db.search_graph_entities /
+        # zotero_client). project_id scopes the code-graph search.
+        if not args.get("project_id"):
+            return {"error": "project_id is required (or pass project_name)"}
+        if not args.get("sprint_item_id"):
+            return {"error": "sprint_item_id is required"}
+        from ..pointers import resolve_pointer  # noqa: PLC0415
+
+        # Resolve the doc-structure store once for node_id lookups (best-effort;
+        # None → node_id targets degrade to {resolved:false}).
+        _ptr_store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+
+        async def _node_resolver(element_id: str) -> Any:
+            if _ptr_store is None:
+                return None
+            try:
+                return await _ptr_store.get_element_by_id(element_id)
+            except Exception:  # noqa: BLE001 — resolver seam must never raise
+                return None
+
+        pointers = await db_module.get_sprint_item_pointers(
+            db, args["sprint_item_id"]
+        )
+        resolved: list[dict[str, Any]] = []
+        for ptr in pointers:
+            resolved.append(
+                await resolve_pointer(
+                    db, ptr,
+                    project_id=args["project_id"],
+                    node_resolver=_node_resolver,
+                )
+            )
+        return {"sprint_item_id": args["sprint_item_id"], "pointers": resolved}
     return _MISS
 
 

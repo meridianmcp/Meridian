@@ -34,6 +34,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_latex_structure": 'get_latex_structure(file_path="thesis/chapter1.tex")',
     "get_citation_edges": 'get_citation_edges(project_id="abc-123", source="thesis/chapter1.tex")',
     "resolve_citations": 'resolve_citations(project_id="abc-123")',
+    "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
+    "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
+    "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -385,6 +388,59 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally."},
          "max_items": {"type": "integer", "description": "Cap how many unresolved markers to attempt this pass. Omit to attempt all."}},
          "required": []}},
+    {"name": "add_sprint_item_pointer", "description":
+        "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
+        "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
+        "Selector composition. targets is an ARRAY of {uri, selector, subSelector?} "
+        "objects (native multi-file, the LSP WorkspaceEdit pattern); the whole composite "
+        "shape is stored as JSON, not per-domain columns. Each selector.type is one of:\n"
+        "• range — a line span {start_line, start_char?, end_line, end_char?} (an LSP "
+        "Range); the pointer IS the location.\n"
+        "• symbol — {qualified_name} resolved against the cached code graph to a file+line.\n"
+        "• node_id — {id} of a doc_store element (an ingested-document structure node).\n"
+        "• zotero_key — {key} of a Zotero library item.\n"
+        "An optional selector.subSelector nests finer granularity (W3C hasSubSelector) — "
+        "e.g. a symbol selector + a range subSelector = 'these lines, within this "
+        "function'. source_type names the domain (code | docs | citation | …). Malformed "
+        "pointers (bad selector.type, missing required selector fields) are rejected. "
+        "Returns the stored pointer.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
+         "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | … (free text)."},
+         "targets": {"type": "array", "description":
+             "Non-empty array of {uri, selector, subSelector?} targets. selector.type ∈ "
+             "range|symbol|node_id|zotero_key with its type-specific fields.",
+             "items": {"type": "object"}},
+         "label": {"type": "string", "description": "Optional human-readable label for the pointer."}},
+         "required": ["sprint_item_id", "source_type", "targets"]}},
+    {"name": "get_sprint_item_pointers", "description":
+        "2976e168 — list the GENERIC POINTERS attached to a sprint item (oldest first). "
+        "Each pointer is {id, source_type, targets:[{uri, selector, subSelector?}], label, "
+        "created_at} — the stored shape with its JSON targets deserialized. Read-only; "
+        "does NOT resolve the targets (use resolve_sprint_item_pointers for that).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to list."}},
+         "required": ["sprint_item_id"]}},
+    {"name": "resolve_sprint_item_pointers", "description":
+        "2976e168 — resolve EVERY generic pointer on a sprint item to its concrete "
+        "location, dispatching by selector.type. A range target returns its location "
+        "as-is; symbol resolves the qualified_name in the cached code graph to a "
+        "file+line; node_id looks the element up in the doc-structure store; zotero_key "
+        "resolves via Zotero's local API. A subSelector narrows the outer resolution "
+        "('these lines, within this function'). Every dispatch is best-effort: an "
+        "unresolvable target yields {resolved:false, reason} instead of an error, and "
+        "the pass NEVER fails. Returns {pointers:[{id, source_type, label, "
+        "targets:[<resolved-target>]}]}. Requires no network for range/symbol/node_id; "
+        "zotero_key needs Zotero running locally (else that target is just unresolved).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to resolve."}},
+         "required": ["sprint_item_id"]}},
     {"name": "add_insight", "description":
         "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
         "decisions. A first-class knowledge type SEPARATE from decisions (choices with a "
@@ -1095,6 +1151,7 @@ _READ_ONLY_TOOLS = {
     "list_plugins", "get_plugin_details",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
+    "get_sprint_item_pointers", "resolve_sprint_item_pointers",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 

@@ -7000,10 +7000,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_blog_posts_tenant",
         "_migrate_pg_project_parent_id",
         "_migrate_pg_session_goal_compliance",
+        "_migrate_pg_sprint_item_pointers",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 85
+    assert len(allnames) == len(set(allnames)) == 86
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -7039,6 +7040,62 @@ def test_core_schema_literals_have_no_inline_tenant_id_indexes():
         assert "workspace_sprint_items(tenant_id" not in body, name
         assert "idx_blog_posts_tenant" not in body, name
         assert "idx_workspace_sprint_items_tenant" not in body, name
+
+
+def test_sprint_item_pointers_index_not_inline_in_base_literals():
+    """2976e168 — the sprint_item_pointers index must live ONLY in the guarded
+    migration, never inline in either base schema literal (the 2026-07-04
+    inline-index-on-a-migration-added-table outage trap)."""
+    from meridian.pg_adapter import CREATE_TABLES_CORE
+    from meridian.db import CREATE_TABLES
+
+    for name, literal in (
+        ("CREATE_TABLES_CORE", CREATE_TABLES_CORE),
+        ("CREATE_TABLES", CREATE_TABLES),
+    ):
+        body = "\n".join(
+            ln for ln in literal.splitlines() if not ln.lstrip().startswith("--")
+        )
+        # The table itself IS in the base literal (fresh DBs), but its index is not.
+        assert "CREATE TABLE IF NOT EXISTS sprint_item_pointers" in body, name
+        assert "idx_sprint_item_pointers_item" not in body, name
+
+
+@pytest.mark.asyncio
+async def test_sprint_item_pointers_migration_creates_table_and_index_idempotently():
+    """2976e168 — the guarded SQLite migration creates the table + index, and is
+    idempotent (safe to re-run). Exercised against a bare connection that has
+    NEITHER, so both the CREATE TABLE and the CREATE INDEX paths run."""
+    import aiosqlite
+    from meridian.db import migrations as _mig
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        conn.row_factory = aiosqlite.Row
+        # Table + index absent to start.
+        await _mig._migrate_sprint_item_pointers(conn)
+        # Re-run must be a no-op (idempotent) and not raise.
+        await _mig._migrate_sprint_item_pointers(conn)
+
+        async with conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='sprint_item_pointers'"
+        ) as cur:
+            assert await cur.fetchone() is not None
+        async with conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_sprint_item_pointers_item'"
+        ) as cur:
+            assert await cur.fetchone() is not None
+        # Column parity with both base literals.
+        async with conn.execute("PRAGMA table_info(sprint_item_pointers)") as cur:
+            cols = {r["name"] for r in await cur.fetchall()}
+        assert cols == {
+            "id", "project_id", "sprint_item_id", "source_type",
+            "targets", "label", "created_at",
+        }
+    finally:
+        await conn.close()
 
 
 @pytest.mark.asyncio

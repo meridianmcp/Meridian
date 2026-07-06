@@ -738,6 +738,21 @@ CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
 -- here: blog_posts predates tenant_id, so on an existing DB this unguarded
 -- executescript CREATE INDEX hit a missing column and crash-looped startup
 -- (exit 3) on the 2026-07-04 promote. The guarded migration handles both paths.
+
+-- 2976e168 — sprint_item_pointers: the GENERIC POINTER PRIMITIVE (mirrors SQLite).
+-- ONE table, a JSON ``targets`` array of composite target objects — NOT
+-- per-domain columns. idx_sprint_item_pointers_item is created ONLY by the
+-- guarded _migrate_pg_sprint_item_pointers migration, never inline here.
+-- (NB: this literal is an f-string; keep curly braces out of these comments.)
+CREATE TABLE IF NOT EXISTS sprint_item_pointers (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    sprint_item_id TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    targets TEXT NOT NULL,
+    label TEXT,
+    created_at TEXT NOT NULL DEFAULT ({_TS})
+);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -2458,6 +2473,31 @@ async def _migrate_pg_session_goal_compliance(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_pointers(conn: PostgresConnection) -> None:
+    """2976e168 — sprint_item_pointers: the GENERIC POINTER PRIMITIVE (mirrors SQLite).
+
+    ONE table for pointers of ANY source_type, keyed to a sprint item; ``targets``
+    is a JSON array of {uri, selector, subSelector?} (composite shape stored as
+    JSON, NOT per-domain columns). CREATE_TABLES_CORE covers fresh DBs; this is
+    the upgrade path. The index lives here, never inline in CREATE_TABLES_CORE, to
+    avoid the unguarded-index boot crash. Idempotent. Mirrors
+    db._migrate_sprint_item_pointers.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sprint_item_pointers ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    sprint_item_id TEXT NOT NULL,"
+        "    source_type TEXT NOT NULL,"
+        "    targets TEXT NOT NULL,"
+        "    label TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_sprint_item_pointers_item "
+        "ON sprint_item_pointers(sprint_item_id);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2512,4 +2552,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_blog_posts_tenant,
     _migrate_pg_project_parent_id,
     _migrate_pg_session_goal_compliance,
+    _migrate_pg_sprint_item_pointers,
 )

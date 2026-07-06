@@ -706,6 +706,27 @@ CREATE INDEX IF NOT EXISTS idx_feedback_tenant
     ON feedback(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_created
     ON feedback(created_at);
+
+-- 2976e168 — sprint_item_pointers: the GENERIC POINTER PRIMITIVE. ONE table for
+-- pointers of ANY source_type (code/docs/citation/…), keyed to a sprint item.
+-- ``targets`` is a JSON array of {uri, selector, subSelector?} objects (native
+-- multi-file, LSP WorkspaceEdit pattern); the per-target selector.type
+-- (range|symbol|node_id|zotero_key) is what the resolver dispatches on. Storing
+-- the composite shape as JSON — NOT per-domain columns — is the core design
+-- requirement (W3C Web Annotation Selector composition, LSP Location). The
+-- idx_sprint_item_pointers_item index is created ONLY inside the guarded
+-- _migrate_sprint_item_pointers migration, never inline here — an unguarded
+-- CREATE INDEX in this base literal would crash startup on a DB whose table
+-- predates it (the 2026-07-04 inline-index outage trap).
+CREATE TABLE IF NOT EXISTS sprint_item_pointers (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    sprint_item_id TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    targets TEXT NOT NULL,
+    label TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -891,6 +912,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_blog_posts_tenant(db)
     await _migrate_project_parent_id(db)
     await _migrate_session_goal_compliance(db)
+    await _migrate_sprint_item_pointers(db)
     return db
 
 
@@ -5931,6 +5953,93 @@ async def search_graph_entities(
     async with db.execute(sql, params) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# 2976e168 — GENERIC POINTER PRIMITIVE persistence (sprint_item_pointers)
+# ---------------------------------------------------------------------------
+
+async def add_sprint_item_pointer(
+    db: aiosqlite.Connection,
+    project_id: str,
+    sprint_item_id: str,
+    source_type: str,
+    targets: list[dict[str, Any]],
+    label: str | None = None,
+) -> dict[str, Any]:
+    """2976e168 — persist a GENERIC POINTER on a sprint item; return the stored row.
+
+    Validates the ``{source_type, targets:[{uri, selector, subSelector?}], label?}``
+    shape via :mod:`meridian.pointers` (raising ``ValueError`` on a malformed
+    pointer BEFORE any write), serializes ``targets`` to the JSON column, and
+    inserts one ``sprint_item_pointers`` row. ``targets`` is an ARRAY (native
+    multi-file); the composite shape is stored as JSON, NOT per-domain columns.
+    The returned dict is the deserialized pointer (targets back as a list).
+
+    psycopg3: ``?`` placeholders are converted to ``%s`` by the adapter; the
+    shared connection is autocommit on Postgres, and ``commit()`` is a real
+    flush on aiosqlite.
+    """
+    from ..pointers import (  # noqa: PLC0415 — avoid an import cycle at module load
+        validate_pointer,
+        serialize_targets,
+        row_to_pointer,
+    )
+
+    normalized = validate_pointer(
+        {"source_type": source_type, "targets": targets, "label": label}
+    )
+    pid = _new_id()
+    targets_json = serialize_targets(normalized["targets"])
+    await db.execute(
+        "INSERT INTO sprint_item_pointers "
+        "(id, project_id, sprint_item_id, source_type, targets, label) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            pid, project_id, sprint_item_id,
+            normalized["source_type"], targets_json, label,
+        ),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM sprint_item_pointers WHERE id = ?", (pid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row_to_pointer(_row_to_dict(row) or {})
+
+
+async def get_sprint_item_pointers(
+    db: aiosqlite.Connection, sprint_item_id: str
+) -> list[dict[str, Any]]:
+    """2976e168 — return all pointers on a sprint item (oldest first).
+
+    Each row's JSON ``targets`` column is deserialized back into a list, so the
+    caller gets the full pointer shape plus its id / source_type / label /
+    created_at.
+    """
+    from ..pointers import row_to_pointer  # noqa: PLC0415
+    async with db.execute(
+        "SELECT * FROM sprint_item_pointers WHERE sprint_item_id = ? "
+        "ORDER BY created_at ASC, id ASC",
+        (sprint_item_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [row_to_pointer(_row_to_dict(r) or {}) for r in rows if r is not None]
+
+
+async def delete_sprint_item_pointer(
+    db: aiosqlite.Connection, pointer_id: str
+) -> bool:
+    """2976e168 — delete one pointer by id. Return True if a row was removed."""
+    async with db.execute(
+        "SELECT 1 FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+    ) as cur:
+        existed = await cur.fetchone() is not None
+    await db.execute(
+        "DELETE FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+    )
+    await db.commit()
+    return existed
 
 
 async def delete_api_tokens_by_label(

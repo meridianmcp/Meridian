@@ -1420,6 +1420,75 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="add_sprint_item_pointer",
+                description=(
+                    "2976e168 — attach a GENERIC POINTER to a sprint item: a "
+                    "composable reference to a thing-in-a-source (LSP Location + "
+                    "W3C Web Annotation Selector). targets is an ARRAY of {uri, "
+                    "selector, subSelector?} (native multi-file); selector.type is "
+                    "range (line span) | symbol (qualified_name) | node_id "
+                    "(doc_store element) | zotero_key. An optional subSelector "
+                    "nests finer granularity. Stored as JSON, not per-domain "
+                    "columns. Malformed pointers are rejected. Returns the stored "
+                    "pointer."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
+                        "source_type": {"type": "string", "description": "Domain: code | docs | citation | … (free text)."},
+                        "targets": {
+                            "type": "array",
+                            "description": "Non-empty array of {uri, selector, subSelector?} targets.",
+                            "items": {"type": "object"},
+                        },
+                        "label": {"type": "string", "description": "Optional human-readable label."},
+                    },
+                    "required": ["sprint_item_id", "source_type", "targets"],
+                },
+            ),
+            Tool(
+                name="get_sprint_item_pointers",
+                description=(
+                    "2976e168 — list the generic pointers on a sprint item "
+                    "(oldest first). Each is {id, source_type, targets, label, "
+                    "created_at}. Read-only; does NOT resolve targets (use "
+                    "resolve_sprint_item_pointers for that)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to list."},
+                    },
+                    "required": ["sprint_item_id"],
+                },
+            ),
+            Tool(
+                name="resolve_sprint_item_pointers",
+                description=(
+                    "2976e168 — resolve every generic pointer on a sprint item to "
+                    "its concrete location, dispatching by selector.type: range "
+                    "as-is; symbol → file+line via the cached code graph; node_id "
+                    "→ doc_store element; zotero_key → Zotero local API. A "
+                    "subSelector narrows the outer resolution. Best-effort — an "
+                    "unresolvable target yields {resolved:false, reason}; the pass "
+                    "NEVER fails."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to resolve."},
+                    },
+                    "required": ["sprint_item_id"],
+                },
+            ),
+            Tool(
                 name="start_session",
                 description=(
                     "Single call to start a coordinated session. Registers "
@@ -1759,6 +1828,8 @@ def build_mcp_server():
                 "list_sessions",
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
                 "get_citation_edges", "resolve_citations",
+                "add_sprint_item_pointer", "get_sprint_item_pointers",
+                "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",
                 "pin_workspace_decision", "get_workspace_decisions",
             ):
