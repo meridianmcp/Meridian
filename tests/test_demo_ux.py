@@ -578,6 +578,35 @@ def test_settings_tab_classifier(client):
 
 
 @pytestmark_playwright
+def test_settings_disconnects_observer_before_innerhtml_wipe():
+    """Regression guard (4bde9437 settings black-screen). The blank-on-second-open
+    bug was a leaked MutationObserver reparenting freshly-rendered children into
+    orphaned panes. The fix requires loadSettingsTab to disconnect
+    body._settingsObs AND clear dataset.tabbed BEFORE it wipes innerHTML — this
+    test pins that ordering so a future refactor can't silently reintroduce the
+    black screen.
+    """
+    from pathlib import Path
+    src = (
+        Path(__file__).resolve().parent.parent
+        / "meridian" / "static" / "dashboard-settings.ts"
+    )
+    text = src.read_text(encoding="utf-8")
+    disconnect_idx = text.find("_settingsObs.disconnect()")
+    # First innerHTML assignment in loadSettingsTab is the 'loading…' wipe.
+    wipe_idx = text.find("body.innerHTML =")
+    assert disconnect_idx != -1, "observer disconnect removed — black-screen guard gone"
+    assert wipe_idx != -1, "settings innerHTML wipe not found"
+    assert disconnect_idx < wipe_idx, (
+        "MutationObserver must be disconnected BEFORE the innerHTML wipe or the "
+        "settings panel blanks on the second open (black-screen regression)"
+    )
+    assert "delete body.dataset.tabbed" in text, (
+        "dataset.tabbed must be cleared before the wipe so the 30s TTL early-return "
+        "cannot serve a blanked panel as fresh"
+    )
+
+
 def test_settings_tabs_organize_and_switch(client):
     """0bf67524 — _organizeSettingsIntoTabs builds the Project/Workspace/Account
     tab bar, distributes sections, extracts the nested workspace-section, routes

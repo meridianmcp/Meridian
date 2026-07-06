@@ -154,6 +154,7 @@ async def update_workspace_settings_endpoint(
 ) -> dict[str, Any]:
     """Patch workspace-global defaults. Only the fields passed are changed."""
     nudge_thresh = body.get("log_task_sprint_nudge_threshold")
+    interval = body.get("refresh_interval_turns")
     return await db_module.update_workspace_settings(
         await _db(request),
         hitl_auto_answer_default=body.get("hitl_auto_answer_default"),
@@ -164,6 +165,43 @@ async def update_workspace_settings_endpoint(
         # 0bf67524 — cascade defaults seeded onto new projects.
         execution_mode_default=body.get("execution_mode_default"),
         code_intel_enabled_default=body.get("code_intel_enabled_default"),
+        # 76cf8bda — /loop auto-continue workspace default.
+        loop_enabled_default=body.get("loop_enabled_default"),
+        # bf51b12e — planner context-refresh config.
+        auto_refresh_enabled=body.get("auto_refresh_enabled"),
+        refresh_interval_turns=int(interval) if interval is not None else None,
+        refresh_triggers=body.get("refresh_triggers"),
+        tenant_id=await _tenant_id(request),
+    )
+
+
+# --- Workspace blog (workspace-scoped CMS) ---------------------------------
+
+@router.get("/workspace/blog")
+async def list_workspace_blog_endpoint(
+    request: Request, status: str | None = None
+) -> list[dict[str, Any]]:
+    """Workspace-scoped blog posts (newest first). ``?status=`` filters to
+    draft|published|archived. Each post carries a ``/blog/<slug>`` url (8843250f)."""
+    return await db_module.get_blog_posts(
+        await _db(request), tenant_id=await _tenant_id(request), status=status
+    )
+
+
+@router.post("/workspace/blog", status_code=201)
+async def create_workspace_blog_endpoint(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Create or update a workspace blog post. Body: {title, body?, status?,
+    slug?, id?}. Pass ``id`` to update an existing post."""
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title required")
+    return await db_module.save_blog_post(
+        await _db(request), title, body.get("body") or "",
+        status=body.get("status", "draft"),
+        slug=body.get("slug"),
+        post_id=body.get("id"),
         tenant_id=await _tenant_id(request),
     )
 

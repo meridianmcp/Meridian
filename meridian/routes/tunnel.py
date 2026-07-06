@@ -25,6 +25,7 @@ import base64
 import hashlib
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -33,7 +34,9 @@ from fastapi.responses import Response
 
 from .. import db as db_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
-from ..tunnel_plugins import normalize_plugins_config, resolve_plugins, resolve_custom_plugins
+from ..tunnel_plugins import (
+    normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
+)
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -61,6 +64,13 @@ _pending_extract_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_ppt_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_word_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
+
+# 8fb69d54 — 4 pre-allocated custom tunnel slots (p0-p3, ports 8814-8817) so
+# custom plugins get real server routes and appear in the claude.ai connector
+# (closes ecf5b8c6). Registries are keyed by slot label, mirroring word/dc.
+_CUSTOM_SLOTS = ("p0", "p1", "p2", "p3")
+_tunnel_custom_sockets: dict[str, dict[str, WebSocket]] = {s: {} for s in _CUSTOM_SLOTS}
+_pending_custom_reqs: dict[str, dict[str, "asyncio.Future[dict]"]] = {s: {} for s in _CUSTOM_SLOTS}
 
 # d71ba2e7 — per-tenant core-slot health: tenant_id → {slot_label: healthy}.
 # Absent ⇒ assumed healthy. The client sends a
@@ -181,6 +191,7 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
             pass
 
     _tunnel_sockets[tenant_id] = ws
+    _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd — reconnect: rebuild tool routes
     try:
         await db_module.update_tenant(auth_db, tenant_id, tunnel_active=1)
     except Exception:
@@ -228,6 +239,8 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     finally:
         _tunnel_sockets.pop(tenant_id, None)
         _clear_slot_health(tenant_id, "fs")
+        if not has_active_tunnel(tenant_id):
+            _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd
         # Cancel any in-flight proxy requests for this tenant
         for fut in list(_pending_reqs.values()):
             if not fut.done():
@@ -449,6 +462,9 @@ async def _serve_tunnel_ws(
             pass
 
     sockets[tenant_id] = ws
+    # 4331f9cd — a (re)connect may change the slot's tool set; drop the cached
+    # routes so the next tools/list rebuilds them for this tenant.
+    _tunnel_tool_routes.pop(tenant_id, None)
     _log.info("tunnel-%s: tenant %s connected", label, tenant_id[:8])
 
     try:
@@ -467,6 +483,15 @@ async def _serve_tunnel_ws(
             msg_type = msg.get("type")
             if msg_type == "ping":
                 continue
+            if msg_type == "plugin_status":
+                # a898710a — dc/ppt/word slots report health too; record it so a
+                # failed pre-flight surfaces as "unhealthy" (not "inactive"), and
+                # a later healthy report clears the diagnostic.
+                _record_slot_health(
+                    tenant_id, msg.get("slot") or label, msg.get("healthy", True),
+                    reason=msg.get("reason"), detail=msg.get("detail"),
+                )
+                continue
             if msg_type == "response":
                 req_id = msg.get("id")
                 fut = pending.get(req_id)
@@ -479,6 +504,11 @@ async def _serve_tunnel_ws(
         _log.debug("tunnel-%s: tenant %s disconnected: %s", label, tenant_id[:8], exc)
     finally:
         sockets.pop(tenant_id, None)
+        _clear_slot_health(tenant_id, label)
+        # 4331f9cd — slot dropped; if no tunnel remains, drop cached routes so the
+        # next tools/list rebuilds cleanly.
+        if not has_active_tunnel(tenant_id):
+            _tunnel_tool_routes.pop(tenant_id, None)
         for fut in list(pending.values()):
             if not fut.done():
                 fut.cancel()
@@ -493,7 +523,7 @@ async def tunnel_ppt_ws(ws: WebSocket, tenant_id: str) -> None:
 
 @router.websocket("/tunnel-word/{tenant_id}")
 async def tunnel_word_ws(ws: WebSocket, tenant_id: str) -> None:
-    """Hold open a WebSocket for one tenant's word-mcp-live proxy."""
+    """Hold open a WebSocket for one tenant's docx-mcp-server proxy."""
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_word_sockets, _pending_word_reqs, "word")
 
 
@@ -501,6 +531,21 @@ async def tunnel_word_ws(ws: WebSocket, tenant_id: str) -> None:
 async def tunnel_dc_ws(ws: WebSocket, tenant_id: str) -> None:
     """Hold open a WebSocket for one tenant's desktop-commander proxy."""
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
+# 8fb69d54 — register the 4 custom-slot WebSocket routes (/tunnel-p0 … /tunnel-p3)
+# so a custom plugin bound to a slot gets a real server route.
+def _make_custom_slot_ws(_slot: str):
+    async def _ws(ws: WebSocket, tenant_id: str) -> None:
+        await _serve_tunnel_ws(
+            ws, tenant_id,
+            _tunnel_custom_sockets[_slot], _pending_custom_reqs[_slot], _slot,
+        )
+    return _ws
+
+
+for _cs in _CUSTOM_SLOTS:
+    router.websocket(f"/tunnel-{_cs}/{{tenant_id}}")(_make_custom_slot_ws(_cs))
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +974,7 @@ async def ppt_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> 
 @router.post("/word/mcp/{tenant_id}")
 @router.options("/word/mcp/{tenant_id}")
 async def word_mcp_proxy(tenant_id: str, request: Request) -> Response:
-    """Proxy requests to the tenant's word-mcp-live over the word tunnel."""
+    """Proxy requests to the tenant's docx-mcp-server over the word tunnel."""
     prefix = f"/word/mcp/{tenant_id}"
     local_path = request.url.path[len(prefix):] or "/"
     return await _office_proxy(tenant_id, local_path, request,
@@ -1020,24 +1065,53 @@ async def get_tunnel_plugins(request: Request) -> Response:
     if tenant is None:
         return _json_response({
             "plugins": resolve_plugins(None), "custom": [], "config": {},
-            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False},
+            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False, **{s: False for s in _CUSTOM_SLOTS}},
             "plan": "free",
         })
-    parsed = _parse_plugins_json(tenant.get("tunnel_plugins"))
+    # 8660d701 — per-machine config. ?hostname=X scopes to that machine's config
+    # (from tunnel_plugins_by_host), falling back to the per-tenant default. No
+    # hostname → the default config (back-compat with the single-machine dashboard).
+    from ..tunnel_plugins import select_host_config, parse_plugins_by_host
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+    parsed = select_host_config(
+        _parse_plugins_json(tenant.get("tunnel_plugins")),
+        tenant.get("tunnel_plugins_by_host"),
+        hostname,
+    )
     tid = tenant.get("id")
+    # Machines the dashboard can offer per-machine config for: those with a saved
+    # per-host config + machines that registered hook tokens (registered_hostnames).
+    _hosts = set(by_host.keys())
+    try:
+        for _m in await db_module.list_registered_hostnames(request.app.state.db, tid):
+            if _m.get("hostname"):
+                _hosts.add(str(_m["hostname"]))
+    except Exception:  # noqa: BLE001 — host listing is best-effort
+        pass
     return _json_response({
         "plugins": resolve_plugins(parsed),
         # User-defined (non-built-in) plugins, so the dashboard can render and
         # edit existing custom entries. LOCAL-ONLY — no server route involved.
         "custom": resolve_custom_plugins(parsed),
         "config": parsed if isinstance(parsed, (dict, list)) else {},
+        # 8660d701 — per-machine config UI: the selected machine + the machines the
+        # dashboard can pick from (configured + registered), and which already have
+        # an explicit per-host config saved.
+        "hostname": hostname,
+        "hosts": sorted(_hosts),
+        "configured_hosts": sorted(by_host.keys()),
         "active": {
-            "fs": tid in _tunnel_sockets,
+            # On Fly.io multi-instance, the WebSocket may be held by a different
+            # instance (in-memory miss). Fall back to tenant.tunnel_active (DB flag
+            # set on connect, cleared on disconnect) so status stays correct.
+            "fs": (tid in _tunnel_sockets) or bool(tenant.get("tunnel_active")),
             "code": tid in _tunnel_code_sockets,
             "extract": tid in _tunnel_extract_sockets,
             "ppt": tid in _tunnel_ppt_sockets,
             "word": tid in _tunnel_word_sockets,
             "dc": tid in _tunnel_dc_sockets,
+            **{s: tid in _tunnel_custom_sockets[s] for s in _CUSTOM_SLOTS},
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
         # uses this to gate the Tunnel Plugins card.
@@ -1069,12 +1143,29 @@ async def put_tunnel_plugins(request: Request) -> Response:
         return _json_response({"error": "invalid JSON body"}, status_code=400)
     raw = body.get("config") if isinstance(body, dict) and "config" in body else body
     normalized = normalize_plugins_config(raw)
-    stored = json.dumps(normalized) if normalized else None
+    # 8660d701 — ?hostname=X persists this config for that machine only
+    # (tunnel_plugins_by_host); without a hostname it writes the per-tenant default
+    # (tunnel_plugins), preserving the legacy single-machine behaviour.
+    hostname = (request.query_params.get("hostname") or "").strip() or None
     # tenants lives in the control-plane DB (app.state.db), not the tenant's
     # data-plane DB — mirror the WS handler's update_tenant(tunnel_active=...).
-    await db_module.update_tenant(request.app.state.db, tenant["id"], tunnel_plugins=stored)
+    if hostname:
+        from ..tunnel_plugins import parse_plugins_by_host
+        by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+        if normalized:
+            by_host[hostname] = normalized
+        else:
+            by_host.pop(hostname, None)  # empty → clear this machine's override
+        stored_by_host = json.dumps(by_host) if by_host else None
+        await db_module.update_tenant(
+            request.app.state.db, tenant["id"], tunnel_plugins_by_host=stored_by_host)
+    else:
+        stored = json.dumps(normalized) if normalized else None
+        await db_module.update_tenant(
+            request.app.state.db, tenant["id"], tunnel_plugins=stored)
     return _json_response({
         "ok": True,
+        "hostname": hostname,
         "plugins": resolve_plugins(normalized),
         "config": normalized,
     })
@@ -1087,6 +1178,177 @@ def _json_response(payload: dict, status_code: int = 200) -> Response:
         status_code=status_code,
         media_type="application/json",
     )
+
+
+# ---------------------------------------------------------------------------
+# Custom-plugin add / remove — sprint item 9811d04c
+# Persists a tenant's *chosen* custom plugins (the "install this" path the browse
+# UI dead-ended on). Storage reuses the existing per-tenant ``tunnel_plugins``
+# JSON blob (or ``tunnel_plugins_by_host`` when ?hostname=X) — a custom plugin is
+# just an extra list entry whose name is not a built-in, so no new table/column
+# and no migration. resolve_custom_plugins already reads these entries.
+# ---------------------------------------------------------------------------
+
+def _config_as_entry_list(parsed: Any) -> list[dict]:
+    """Normalize a stored tunnel_plugins config into an ordered list of entries.
+
+    The store round-trips as either the dict-keyed form or the list form; the
+    add/remove handlers work on the list form (so we can append/filter and keep
+    custom entries' ``port``/``command`` intact) before re-normalizing to persist.
+    """
+    from ..tunnel_plugins import _iter_plugin_items
+    return _iter_plugin_items(parsed)
+
+
+async def _store_tunnel_config(request: Request, tenant: dict, hostname: str | None,
+                               entries: list[dict]) -> Any:
+    """Persist a full tunnel-plugins config (list of entries) for a tenant/machine.
+
+    Mirrors put_tunnel_plugins' storage: with ``hostname`` it writes that
+    machine's slice of ``tunnel_plugins_by_host``; otherwise the per-tenant
+    ``tunnel_plugins`` default. Returns the normalized config that was stored.
+    """
+    normalized = normalize_plugins_config(entries)
+    if hostname:
+        from ..tunnel_plugins import parse_plugins_by_host
+        by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+        if normalized:
+            by_host[hostname] = normalized
+        else:
+            by_host.pop(hostname, None)
+        stored_by_host = json.dumps(by_host) if by_host else None
+        await db_module.update_tenant(
+            request.app.state.db, tenant["id"], tunnel_plugins_by_host=stored_by_host)
+    else:
+        stored = json.dumps(normalized) if normalized else None
+        await db_module.update_tenant(
+            request.app.state.db, tenant["id"], tunnel_plugins=stored)
+    return normalized
+
+
+def _current_tunnel_config(tenant: dict, hostname: str | None) -> Any:
+    """The effective stored config (parsed) for a tenant/machine — no defaults."""
+    from ..tunnel_plugins import select_host_config
+    return select_host_config(
+        _parse_plugins_json(tenant.get("tunnel_plugins")),
+        tenant.get("tunnel_plugins_by_host"),
+        hostname,
+    )
+
+
+@router.post("/tunnel/plugins/custom")
+async def add_custom_plugin(request: Request) -> Response:
+    """9811d04c — persist a chosen custom plugin into the tenant's tunnel config.
+
+    Body: ``{"name": str, "command": str|list, "port"?: int, "env"?: {..}}``.
+    ``?hostname=X`` scopes it to that machine (else the per-tenant default). The
+    name is validated (safe charset, no built-in slot/plugin collision) and the
+    command must be non-empty; a missing/blank port is auto-assigned. Merges into
+    the existing config (reusing the ``tunnel_plugins`` JSON blob — no new table)
+    so ``resolve_custom_plugins`` picks it up on the next tunnel (re)start.
+    Returns the updated ``custom`` list.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"error": "authentication required"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_response({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return _json_response({"error": "expected a JSON object"}, status_code=400)
+
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    parsed = _current_tunnel_config(tenant, hostname)
+    entries = _config_as_entry_list(parsed)
+
+    from ..tunnel_plugins import validate_custom_plugin
+    name = str(body.get("name") or "").strip()
+    # Reject a duplicate custom name up front (case-insensitive) so add is
+    # idempotent-safe and doesn't silently replace an existing entry.
+    existing_custom = resolve_custom_plugins(parsed)
+    if name and any(c["name"].lower() == name.lower() for c in existing_custom):
+        return _json_response(
+            {"error": f"a custom plugin named '{name}' already exists"}, status_code=409)
+    existing_ports = [c["port"] for c in existing_custom]
+    entry, err = validate_custom_plugin(
+        name, body.get("command"), body.get("port"),
+        existing_ports=existing_ports, env=body.get("env"),
+    )
+    if err is not None:
+        return _json_response({"error": err}, status_code=400)
+
+    entries.append(entry)
+    await _store_tunnel_config(request, tenant, hostname, entries)
+    # Re-read the stored config so the returned custom list reflects exactly what
+    # persisted (and would resolve at tunnel spawn).
+    stored = _current_tunnel_config(
+        await _get_tenant_from_request(request) or tenant, hostname)
+    return _json_response({
+        "ok": True,
+        "hostname": hostname,
+        "added": entry,
+        "custom": resolve_custom_plugins(stored),
+    })
+
+
+@router.delete("/tunnel/plugins/custom")
+async def remove_custom_plugin(request: Request) -> Response:
+    """9811d04c — remove a persisted custom plugin by name.
+
+    Name comes from ``?name=`` or a ``{"name": ...}`` JSON body. ``?hostname=X``
+    scopes to that machine. Built-in slot overrides are left untouched (only a
+    non-built-in entry with a matching name is dropped). Returns the updated
+    ``custom`` list. Removing a name that isn't a custom plugin is a no-op 404.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"error": "authentication required"}, status_code=401)
+
+    name = (request.query_params.get("name") or "").strip()
+    if not name:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                name = str(body.get("name") or "").strip()
+        except Exception:  # noqa: BLE001 — no/invalid body; name may still be in query
+            pass
+    if not name:
+        return _json_response({"error": "name is required"}, status_code=400)
+
+    from ..tunnel_plugins import is_reserved_custom_name
+    if is_reserved_custom_name(name):
+        return _json_response(
+            {"error": "cannot remove a built-in slot via this route"}, status_code=400)
+
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    parsed = _current_tunnel_config(tenant, hostname)
+    entries = _config_as_entry_list(parsed)
+
+    builtin = set(builtin_names())
+    kept: list[dict] = []
+    removed = False
+    for it in entries:
+        it_name = str(it.get("name") or "").strip()
+        # Only drop a *custom* (non-built-in) entry matching the name — a built-in
+        # slot override that happens to be present is preserved.
+        if it_name.lower() == name.lower() and it_name not in builtin:
+            removed = True
+            continue
+        kept.append(it)
+    if not removed:
+        return _json_response(
+            {"error": f"no custom plugin named '{name}'"}, status_code=404)
+
+    await _store_tunnel_config(request, tenant, hostname, kept)
+    stored = _current_tunnel_config(
+        await _get_tenant_from_request(request) or tenant, hostname)
+    return _json_response({
+        "ok": True,
+        "hostname": hostname,
+        "removed": name,
+        "custom": resolve_custom_plugins(stored),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1180,6 +1442,11 @@ async def install_plugin(request: Request) -> Response:
 
 _REGISTRY_BASE = "https://registry.modelcontextprotocol.io/v0/servers"
 _REGISTRY_TIMEOUT = 8  # seconds
+# Per-process response cache: "{limit}:{cursor}" → (response_dict, monotonic_ts)
+# Serves stale data on upstream failure so the registry never appears empty just
+# because Fly.io egress is briefly unreachable.
+_registry_cache: dict[str, tuple[dict, float]] = {}
+_REGISTRY_CACHE_TTL = 3600  # seconds
 
 
 def _extract_install_command(server: dict) -> str:
@@ -1233,18 +1500,29 @@ async def get_mcp_registry(request: Request) -> Response:
         params["cursor"] = cursor
     url = _REGISTRY_BASE + "?" + urllib.parse.urlencode(params)
 
+    cache_key = f"{limit}:{cursor}"
+
     try:
         req = urllib.request.Request(
             url,
             headers={"Accept": "application/json", "User-Agent": "Meridian/1.0"},
         )
-        import socket as _socket
         with urllib.request.urlopen(req, timeout=_REGISTRY_TIMEOUT) as resp:  # noqa: S310
             raw = resp.read()
         data = json.loads(raw)
     except Exception as exc:  # noqa: BLE001
         _log.warning("MCP registry fetch failed: %s", exc)
-        return _json_response({"error": "registry unavailable", "servers": [], "next_cursor": None}, status_code=200)
+        # Return cached data if available — prevents the browse section from
+        # appearing empty just because Fly.io egress is temporarily unreachable.
+        cached = _registry_cache.get(cache_key)
+        if cached and (time.monotonic() - cached[1]) < _REGISTRY_CACHE_TTL:
+            _log.info("MCP registry: serving cached response (age=%.0fs)", time.monotonic() - cached[1])
+            return _json_response({**cached[0], "cached": True})
+        # No cache — 503 so api() throws and the client falls back to curated list.
+        return _json_response(
+            {"error": f"registry unavailable: {exc}", "servers": [], "next_cursor": None},
+            status_code=503,
+        )
 
     servers_raw = data.get("servers") or []
     servers_out = []
@@ -1263,10 +1541,12 @@ async def get_mcp_registry(request: Request) -> Response:
             "homepage": homepage,
         })
 
-    return _json_response({
+    result = {
         "servers": servers_out,
         "next_cursor": data.get("nextCursor") or data.get("next_cursor") or None,
-    })
+    }
+    _registry_cache[cache_key] = (result, time.monotonic())
+    return _json_response(result)
 
 
 def _union_filesystem_roots(projects: list[dict]) -> list[str]:
@@ -1313,6 +1593,54 @@ def _union_repo_paths(projects: list[dict]) -> list[str]:
     return paths
 
 
+def _first_serena_repo_path(projects: list[dict]) -> str:
+    """First non-empty ``executor_config.serena_repo_path`` across project rows.
+
+    b970fe07 — the tunnel is tenant-scoped but Serena's default ``--project`` is a
+    single path, so we take the first project that sets one (order-preserved by
+    ``list_projects``). executor_config may be a JSON string or dict. Returns ``""``
+    when no project configures it — the client then keeps today's cwd default.
+    """
+    for p in projects:
+        raw = p.get("executor_config")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+        if not isinstance(raw, dict):
+            continue
+        sp = raw.get("serena_repo_path")
+        if isinstance(sp, str) and sp.strip():
+            return sp.strip()
+    return ""
+
+
+def _union_codebase_code_dirs(projects: list[dict]) -> list[str]:
+    """Deduped, order-preserved union of ``executor_config.codebase_code_dirs``.
+
+    b970fe07 — dirs the code-intel slot (codebase-memory-mcp) auto-indexes at
+    tunnel start, unioned across the tenant's projects (mirrors
+    ``_union_filesystem_roots``). executor_config may be a JSON string or dict.
+    """
+    dirs: list[str] = []
+    seen: set[str] = set()
+    for p in projects:
+        raw = p.get("executor_config")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+        if not isinstance(raw, dict):
+            continue
+        for d in (raw.get("codebase_code_dirs") or []):
+            if isinstance(d, str) and d.strip() and d.strip() not in seen:
+                seen.add(d.strip())
+                dirs.append(d.strip())
+    return dirs
+
+
 @router.get("/tunnel/filesystem-roots")
 async def get_tunnel_filesystem_roots(request: Request) -> Response:
     """Return the directories the tunnel's filesystem connector may read.
@@ -1326,10 +1654,20 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
     Also returns ``known_repo_paths`` — the union of ``executor_config.repo_path``
     across all projects. The tunnel client uses these as implicitly-trusted roots
     for the silent path auto-add (item 3 of dynamic-fs-roots feature).
+
+    b970fe07 — additionally returns ``serena_repo_path`` (first non-empty
+    ``executor_config.serena_repo_path`` across projects — Serena's default
+    ``--project``) and ``codebase_code_dirs`` (deduped union of
+    ``executor_config.codebase_code_dirs`` — the code-intel slot's auto-index
+    dirs). Both are fall-back-safe: the client applies them only when the
+    corresponding CLI flag (``--repo`` / ``--code-dir``) is absent.
     """
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
-        return _json_response({"filesystem_roots": [], "known_repo_paths": []})
+        return _json_response({
+            "filesystem_roots": [], "known_repo_paths": [],
+            "serena_repo_path": "", "codebase_code_dirs": [],
+        })
     try:
         db = await _db(request)
         projects = await db_module.list_projects(db)
@@ -1338,6 +1676,9 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
     return _json_response({
         "filesystem_roots": _union_filesystem_roots(projects),
         "known_repo_paths": _union_repo_paths(projects),
+        # b970fe07 — Serena default repo + code-intel index dirs.
+        "serena_repo_path": _first_serena_repo_path(projects),
+        "codebase_code_dirs": _union_codebase_code_dirs(projects),
     })
 
 
@@ -1359,6 +1700,182 @@ async def send_add_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[st
         return {"status": "error", "message": str(exc)}
 
 
+# live-fs-roots — full-list REPLACE control for the fs slot. add_fs_roots only
+# ADDS dirs to the running proxy, so a *removal* needs a way to shrink the served
+# set live. This sends the complete new root list; the client rebuilds the fs
+# proxy's allowed-dirs to EXACTLY these and respawns. Mirrors
+# :func:`send_add_fs_roots_control` (same socket, same best-effort contract).
+async def send_set_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[str, str]:
+    """Send set_fs_roots (full-list replace) over the fs WebSocket for a tenant.
+
+    Called after a root is removed from the persisted config so the change goes
+    live without a tunnel restart. Returns a status dict with ``status`` of
+    ``"ok"``, ``"not_connected"``, or ``"error"``. Best-effort — never let this
+    fail the calling request.
+    """
+    ws = _tunnel_sockets.get(tenant_id)
+    if ws is None:
+        return {"status": "not_connected", "message": "no active fs tunnel"}
+    try:
+        await ws.send_json({"type": "set_fs_roots", "roots": roots})
+        return {"status": "ok", "roots": roots}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "message": str(exc)}
+
+
+# live-fs-roots — POST/DELETE /tunnel/filesystem-roots: add or remove a single
+# served root LIVE from the dashboard. The tunnel is tenant-scoped and the served
+# set is the UNION of ``executor_config.filesystem_roots`` across the tenant's
+# projects (see :func:`_union_filesystem_roots`). So:
+#   * ADD persists the new path onto ONE project (the newest, matching how the
+#     GET/union path treats projects) then pushes it live with add_fs_roots.
+#   * DELETE strips the path from EVERY project that lists it (it could live on
+#     any of them) then pushes the full new union with set_fs_roots.
+# Normalization reuses the client's ``_normalize_path_arg`` so a pasted/quoted
+# path persists byte-identically to what the client will serve.
+
+def _normalize_root(path: Any) -> str:
+    """Normalize an incoming root path exactly like the tunnel client does.
+
+    Strips surrounding whitespace and matched surrounding quotes (a pasted
+    ``'"C:\\Users\\me\\My Docs"'`` becomes ``C:\\Users\\me\\My Docs``). Reuses
+    :func:`meridian.tunnel_client._normalize_path_arg` so the server-persisted
+    value matches the client-served dir exactly. Non-str input → ``""``.
+    """
+    if not isinstance(path, str):
+        return ""
+    from ..tunnel_client import _normalize_path_arg
+    return _normalize_path_arg(path)
+
+
+async def _persist_add_filesystem_root(
+    db: Any, projects: list[dict], path: str
+) -> list[str]:
+    """Append *path* to the newest project's ``executor_config.filesystem_roots``
+    (deduped, order preserved) and persist it. Returns the updated tenant-wide
+    UNION of filesystem roots. If the path is already served nothing is written.
+    """
+    if path in _union_filesystem_roots(projects):
+        return _union_filesystem_roots(projects)
+    if not projects:
+        # No project to attach the root to — nothing to persist. The union is
+        # necessarily empty; the caller still pushes the path live so the running
+        # tunnel serves it this session.
+        return []
+    target = projects[0]  # newest (list_projects orders created_at DESC)
+    cfg = target.get("executor_config")
+    if isinstance(cfg, str) and cfg.strip():
+        try:
+            cfg = json.loads(cfg)
+        except Exception:  # noqa: BLE001
+            cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    roots = [r for r in (cfg.get("filesystem_roots") or []) if isinstance(r, str)]
+    if path not in roots:
+        roots.append(path)
+    cfg["filesystem_roots"] = roots
+    await db_module.set_executor_config(db, target["id"], cfg)
+    # Reflect the write in our in-memory copy so the recomputed union is current.
+    target["executor_config"] = cfg
+    return _union_filesystem_roots(projects)
+
+
+async def _persist_remove_filesystem_root(
+    db: Any, projects: list[dict], path: str
+) -> list[str]:
+    """Remove *path* from EVERY project whose ``filesystem_roots`` lists it and
+    persist each changed project. Returns the updated tenant-wide UNION.
+    """
+    for p in projects:
+        cfg = p.get("executor_config")
+        if isinstance(cfg, str) and cfg.strip():
+            try:
+                cfg = json.loads(cfg)
+            except Exception:  # noqa: BLE001
+                continue
+        if not isinstance(cfg, dict):
+            continue
+        roots = [r for r in (cfg.get("filesystem_roots") or []) if isinstance(r, str)]
+        # Drop the target path (trim each stored value so a whitespace-padded
+        # entry still matches, mirroring the union's own trimming).
+        kept = [r for r in roots if r.strip() != path]
+        if len(kept) != len(roots):
+            cfg["filesystem_roots"] = kept
+            await db_module.set_executor_config(db, p["id"], cfg)
+            p["executor_config"] = cfg
+    return _union_filesystem_roots(projects)
+
+
+@router.post("/tunnel/filesystem-roots")
+async def add_tunnel_filesystem_root(request: Request) -> Response:
+    """live-fs-roots — add a served filesystem root and push it live.
+
+    Body: ``{"path": "..."}`` (``"root"`` is also accepted). The path is
+    normalized (surrounding quotes/whitespace stripped) and rejected if empty.
+    It is appended to the tenant's persisted ``executor_config.filesystem_roots``
+    (deduped, order preserved), then pushed to the running tunnel via
+    ``add_fs_roots`` so the connector serves it WITHOUT a restart. Returns the
+    updated union of ``roots`` plus ``live`` (the control-send status).
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"error": "authentication required"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_response({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return _json_response({"error": "expected a JSON object"}, status_code=400)
+    path = _normalize_root(body.get("path") if body.get("path") is not None else body.get("root"))
+    if not path:
+        return _json_response({"error": "path is required"}, status_code=400)
+    try:
+        db = await _db(request)
+        projects = await db_module.list_projects(db)
+        roots = await _persist_add_filesystem_root(db, projects, path)
+    except Exception as exc:  # noqa: BLE001
+        return _json_response({"error": f"could not persist root: {exc}"}, status_code=500)
+    live = await send_add_fs_roots_control(tenant["id"], [path])
+    return _json_response({"roots": roots, "live": live})
+
+
+@router.delete("/tunnel/filesystem-roots")
+async def remove_tunnel_filesystem_root(request: Request) -> Response:
+    """live-fs-roots — remove a served filesystem root and apply it live.
+
+    Path comes from a ``{"path": ...}`` JSON body (``"root"`` accepted too) or a
+    ``?path=`` query param. It is normalized then stripped from the tenant's
+    persisted ``executor_config.filesystem_roots`` across all projects. Because
+    ``add_fs_roots`` only ADDS, removal is pushed live with ``set_fs_roots`` (a
+    full-list replace) so the running connector stops serving it WITHOUT a
+    restart. Returns the updated union of ``roots`` plus ``live`` status.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"error": "authentication required"}, status_code=401)
+    path = _normalize_root(request.query_params.get("path"))
+    if not path:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                path = _normalize_root(
+                    body.get("path") if body.get("path") is not None else body.get("root")
+                )
+        except Exception:  # noqa: BLE001 — no/invalid body; path may be in query
+            pass
+    if not path:
+        return _json_response({"error": "path is required"}, status_code=400)
+    try:
+        db = await _db(request)
+        projects = await db_module.list_projects(db)
+        roots = await _persist_remove_filesystem_root(db, projects, path)
+    except Exception as exc:  # noqa: BLE001
+        return _json_response({"error": f"could not persist removal: {exc}"}, status_code=500)
+    live = await send_set_fs_roots_control(tenant["id"], roots)
+    return _json_response({"roots": roots, "live": live})
+
+
 # ---------------------------------------------------------------------------
 # Single-connector bridge — surface fs/code/extractor tools through /mcp
 # ---------------------------------------------------------------------------
@@ -1373,7 +1890,7 @@ async def send_add_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[st
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc")
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc") + _CUSTOM_SLOTS
 
 # Human-readable connector prefix shown to Claude in tool names (e.g.
 # "filesystem:read_file" instead of "fs:read_file"). The routing cache still
@@ -1386,7 +1903,18 @@ SLOT_DISPLAY_NAMES = {
     "ppt": "powerpoint",
     "word": "word",
     "dc": "desktop-commander",
+    "p0": "custom-p0",
+    "p1": "custom-p1",
+    "p2": "custom-p2",
+    "p3": "custom-p3",
 }
+
+
+def _display_pretty(display: str) -> str:
+    """Human label for a slot display name shown in tool titles:
+    ``desktop-commander`` → ``Desktop Commander``, ``filesystem`` → ``Filesystem``."""
+    return display.replace("-", " ").replace("_", " ").title()
+
 
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
 _tunnel_tool_routes: dict[str, dict[str, str]] = {}
@@ -1445,6 +1973,8 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_word_sockets, _pending_word_reqs
     if label == "dc":
         return _tunnel_dc_sockets, _pending_dc_reqs
+    if label in _tunnel_custom_sockets:  # 8fb69d54 — custom slots p0-p3
+        return _tunnel_custom_sockets[label], _pending_custom_reqs[label]
     return _tunnel_extract_sockets, _pending_extract_reqs
 
 
@@ -1457,7 +1987,58 @@ def has_active_tunnel(tenant_id: str) -> bool:
         or tenant_id in _tunnel_ppt_sockets
         or tenant_id in _tunnel_word_sockets
         or tenant_id in _tunnel_dc_sockets
+        or any(tenant_id in s for s in _tunnel_custom_sockets.values())
     )
+
+
+def active_tunnel_tenant_ids() -> "set[str]":
+    """4b698ea5 — every tenant_id that currently holds ≥1 live tunnel socket.
+
+    A live tunnel is proof the tenant's local ``meridian --tunnel`` binary is
+    running — a liveness signal that is independent of whether any Meridian tool
+    was called. The keepalive loop iterates these each tick to hold the tenant's
+    live session fresh through long stretches of non-Meridian work.
+    """
+    ids: set[str] = set()
+    ids.update(_tunnel_sockets)
+    ids.update(_tunnel_code_sockets)
+    ids.update(_tunnel_extract_sockets)
+    ids.update(_tunnel_ppt_sockets)
+    ids.update(_tunnel_word_sockets)
+    ids.update(_tunnel_dc_sockets)
+    for s in _tunnel_custom_sockets.values():
+        ids.update(s)
+    return ids
+
+
+async def keepalive_tunnel_sessions(app: Any) -> "list[str]":
+    """4b698ea5 — passive liveness pass: for each tenant with a live tunnel,
+    refresh ``last_seen`` on that tenant's most-recently-active session.
+
+    Returns the list of session ids refreshed (for tests / observability).
+
+    Safety / cost:
+      * Only tenants whose project DB is ALREADY cached are touched — we never
+        provision or open a fresh DB connection from this background loop.
+      * A tenant with no cached DB has made no MCP call, so it has no session to
+        keep alive yet; it is simply skipped until it does.
+      * Every tenant is isolated in its own try/except so one bad DB can't stall
+        the sweep for the others.
+    """
+    from .._deps import _tenant_db_cache  # noqa: PLC0415
+
+    refreshed: list[str] = []
+    for tenant_id in active_tunnel_tenant_ids():
+        conn = _tenant_db_cache.get(tenant_id)
+        if conn is None:
+            continue  # no MCP activity yet → nothing to keep alive
+        try:
+            sid = await db_module.touch_latest_active_session(conn)
+            if sid:
+                refreshed.append(sid)
+        except Exception:  # noqa: BLE001 — a failed bump must not kill the loop
+            _log.debug("tunnel keepalive: touch failed for tenant %s", tenant_id[:8])
+    return refreshed
 
 
 def _parse_mcp_payload(raw: bytes | None) -> dict | None:
@@ -1586,6 +2167,19 @@ async def list_tunnel_tools(
                 continue
             tool_copy = dict(tool)
             tool_copy["name"] = prefixed
+            # connector-source — claude.ai's tool-permission UI shows a tool's
+            # top-level ``title`` when present, else a humanized name. The prefixed
+            # NAME already carries the source (codebase__search_graph →
+            # "Codebase search graph"), but a slot whose inner server advertises a
+            # bare tool title (filesystem's "Read File", serena, desktop-commander)
+            # would display WITHOUT its plugin source. Namespace the title too so
+            # every slot indicates its connector consistently. Guarded against
+            # double-prefixing; nested inputSchema param titles are left alone.
+            _title = tool.get("title")
+            if isinstance(_title, str) and _title.strip():
+                _src = _display_pretty(display)
+                if not _title.startswith(_src):
+                    tool_copy["title"] = f"{_src}: {_title}"
             routes[prefixed] = label  # route back via the internal slot label
             aggregated.append(_rewrite_tool_description(tool_copy))
     if routes:
@@ -1656,3 +2250,51 @@ async def call_tunnel_tool(
     if err:
         raise RuntimeError(str(err.get("message") if isinstance(err, dict) else err))
     return resp.get("result")
+
+
+def _extract_graph_matches(result: Any) -> Any:
+    """Unwrap an MCP ``tools/call`` result into a plain match payload.
+
+    Code-intel ``search_graph`` returns its JSON payload inside the MCP
+    ``content[].text`` envelope. Pull the first text block and json-decode it so
+    the handoff enrichment layer (``_coerce_match_list``) sees the raw
+    ``{"results": [...]}`` dict it already understands. Anything unexpected is
+    returned untouched — the caller degrades to no pointers.
+    """
+    if not isinstance(result, dict):
+        return result
+    content = result.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text") or ""
+                try:
+                    return json.loads(text)
+                except Exception:  # noqa: BLE001 — non-JSON text is not a match set
+                    return text
+    return result
+
+
+def build_graph_searcher(tenant_id: str | None):
+    """Return an async code-graph searcher bound to a tenant's tunnel, or None.
+
+    4cfaecc2 — this is the concrete wiring behind handoff.py's
+    ``_resolve_graph_searcher`` seam. When the tenant has an active tunnel
+    exposing the code-intel ``search_graph`` tool, the returned coroutine issues
+    a ``tools/call`` over the tunnel and normalises the result. When no tunnel is
+    active, returns None so enrichment stays a no-op. The searcher itself never
+    raises — any tunnel/parse failure yields ``None`` for that query.
+    """
+    if not tenant_id or not has_active_tunnel(tenant_id):
+        return None
+
+    async def _search(query: str) -> Any:
+        try:
+            result = await call_tunnel_tool(
+                tenant_id, "search_graph", {"query": query, "limit": 3},
+            )
+        except Exception:  # noqa: BLE001 — best-effort enrichment, never fatal
+            return None
+        return _extract_graph_matches(result)
+
+    return _search

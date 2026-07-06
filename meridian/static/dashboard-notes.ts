@@ -1,7 +1,7 @@
 // dashboard-notes.js — per-project notes wiki tab extracted from dashboard.js
 // Re-exposes its symbols on window so inline handlers + cross-file references resolve after esbuild IIFE bundling.
 
-export async function loadNotesTab(projectId) {
+export async function loadNotesTab(projectId: string) {
   /** v0.9 / e5592013 — load + render the per-project notes wiki.
    *
    * Plain list (no thread / no goal hierarchy). Title, body, tag pills,
@@ -15,15 +15,15 @@ export async function loadNotesTab(projectId) {
   const searchInput = document.getElementById(`notes-search-${projectId}`);
   const tagSelect = document.getElementById(`notes-tagsel-${projectId}`);
   const kindSelect = document.getElementById(`notes-kindsel-${projectId}`);
-  const showAuto = document.getElementById(`notes-show-auto-${projectId}`);
+  // 42e9f7b5 — summaries toggle removed; notes are partitioned by the tab bar.
 
   // 9d44998b — note_kind taxonomy. NULL/unknown renders as the compact "wiki".
-  const KIND_STYLE = {
+  const KIND_STYLE: Record<string, { label: string; color: string; border: string }> = {
     wiki: { label: 'wiki', color: 'var(--muted)', border: 'var(--border)' },
     insight: { label: 'insight', color: 'var(--accent)', border: 'var(--accent)' },
     reference: { label: 'reference', color: '#c9a227', border: '#c9a227' },
   };
-  const noteKind = (n) => {
+  const noteKind = (n: any) => {
     const k = String(n.note_kind || '').toLowerCase();
     return KIND_STYLE[k] ? k : 'wiki';
   };
@@ -37,7 +37,7 @@ export async function loadNotesTab(projectId) {
   // Auto-captured session summaries: auto_capture_session() writes notes titled
   // "Session summary (date)" tagged "auto-capture"; the legacy path wrote
   // "checkpoint: …" / tag "checkpoint". Hidden unless the toggle is on.
-  const isAutoCapture = (n) => {
+  const isAutoCapture = (n: any) => {
     const title = String(n.title || '').trim().toLowerCase();
     const tags = String(n.tags || '').split(',').map(t => t.trim().toLowerCase());
     return title.startsWith('checkpoint:')
@@ -46,10 +46,20 @@ export async function loadNotesTab(projectId) {
       || tags.includes('auto-capture');
   };
 
-  const noteTags = (n) =>
+  const noteTags = (n: any) =>
     String(n.tags || '').split(',').map(t => t.trim()).filter(Boolean);
 
-  let allNotes = [];
+  // 42e9f7b5 — Notes/Log/Archive tabs replace the "summaries" toggle. Log =
+  // auto-captured session summaries; Archive = notes tagged 'archived';
+  // Notes = everything else.
+  const isArchived = (n: any) =>
+    String(n.tags || '').split(',').map((t: string) => t.trim().toLowerCase()).includes('archived');
+  const activeTabEl = document.getElementById(`notes-active-tab-${projectId}`);
+  const tabButtons = ['notes', 'log', 'archive'].map(
+    t => document.getElementById(`notes-tab-${t}-${projectId}`) as HTMLButtonElement | null);
+  const getActiveTab = () => ((activeTabEl?.textContent || 'notes').trim() || 'notes');
+
+  let allNotes: any[] = [];
   // 9fa119dd — cursor pagination: the notes list caps at NOTES_PAGE per fetch
   // and a "Load More" button pulls the next cursor and appends, mirroring the
   // devlog/tasks Load-More wiring. allNotes accumulates every loaded page so the
@@ -78,9 +88,8 @@ export async function loadNotesTab(projectId) {
   const refreshTagOptions = () => {
     if (!tagSelect) return;
     const prev = tagSelect.value;
-    const seen = new Set();
+    const seen = new Set<string>();
     for (const n of allNotes) {
-      if (!showAuto?.checked && isAutoCapture(n)) continue;
       for (const t of noteTags(n)) seen.add(t);
     }
     const tags = [...seen].sort((a, b) => a.localeCompare(b));
@@ -94,10 +103,13 @@ export async function loadNotesTab(projectId) {
     const q = (searchInput?.value || '').trim().toLowerCase();
     const selectedTag = (tagSelect?.value || '').trim().toLowerCase();
     const selectedKind = (kindSelect?.value || '').trim().toLowerCase();
-    const includeAuto = !!showAuto?.checked;
+    const tab = getActiveTab();
 
     const visible = allNotes.filter(n => {
-      if (!includeAuto && isAutoCapture(n)) return false;
+      // 42e9f7b5 — partition by tab: Log=summaries, Archive=archived, Notes=rest.
+      if (tab === 'log') { if (!isAutoCapture(n)) return false; }
+      else if (tab === 'archive') { if (!isArchived(n)) return false; }
+      else if (isAutoCapture(n) || isArchived(n)) return false;
       if (selectedKind && noteKind(n) !== selectedKind) return false;
       if (selectedTag && !noteTags(n).map(t => t.toLowerCase()).includes(selectedTag)) return false;
       if (q) {
@@ -108,11 +120,11 @@ export async function loadNotesTab(projectId) {
     });
 
     setVtabCountBadge(`.notes-vtab-badge[data-pid="${projectId}"]`,
-      allNotes.filter(n => !isAutoCapture(n)).length);
+      allNotes.filter(n => !isAutoCapture(n) && !isArchived(n)).length);
 
     if (!visible.length) {
       const reason = allNotes.length
-        ? `(no notes match — clear the search/tag filter${!includeAuto ? ' or tick “summaries”' : ''})`
+        ? `(no notes in this tab match — clear the search/tag filter or switch tabs)`
         : `(no notes yet — use the form below or <code>add_note</code> MCP tool)`;
       body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
       renderLoadMore();
@@ -153,7 +165,7 @@ export async function loadNotesTab(projectId) {
           if (!r.ok) throw new Error(`${r.status}`);
           toast('note deleted');
           await load();
-        } catch (e) { toast('delete failed: ' + e.message, true); }
+        } catch (e: any) { toast('delete failed: ' + e.message, true); }
       };
     });
 
@@ -162,7 +174,7 @@ export async function loadNotesTab(projectId) {
 
   // Fetch the next cursor page and append it to allNotes, then re-render. The
   // server returns {notes, has_more, next_cursor}; cursor is the next offset.
-  const loadMore = async (btn) => {
+  const loadMore = async (btn: any) => {
     if (btn) { btn.disabled = true; btn.textContent = 'loading…'; }
     try {
       const page = await projectApi(
@@ -174,7 +186,7 @@ export async function loadNotesTab(projectId) {
       nextCursor = page.next_cursor != null ? page.next_cursor : nextCursor;
       refreshTagOptions();
       applyFilters();
-    } catch (e) {
+    } catch (e: any) {
       if (btn) { btn.disabled = false; btn.textContent = `Load ${NOTES_PAGE} more ↓ (retry)`; }
       toast('load more failed: ' + e.message, true);
     }
@@ -201,12 +213,26 @@ export async function loadNotesTab(projectId) {
   };
 
   if (searchInput) {
-    let t = null;
+    let t: any = null;
     searchInput.oninput = () => { clearTimeout(t); t = setTimeout(applyFilters, 150); };
   }
   if (tagSelect) tagSelect.onchange = applyFilters;
   if (kindSelect) kindSelect.onchange = applyFilters;
-  if (showAuto) showAuto.onchange = () => { refreshTagOptions(); applyFilters(); };
+  // 42e9f7b5 — tab switching drives the note partition + re-renders the list.
+  tabButtons.forEach(btn => {
+    if (!btn) return;
+    btn.onclick = () => {
+      const tab = btn.getAttribute('data-notes-tab') || 'notes';
+      if (activeTabEl) activeTabEl.textContent = tab;
+      tabButtons.forEach(b => {
+        if (!b) return;
+        const on = b === btn;
+        b.style.borderBottom = on ? '2px solid var(--accent)' : '2px solid transparent';
+        b.style.color = on ? 'var(--text)' : 'var(--muted)';
+      });
+      applyFilters();
+    };
+  });
 
   if (addBtn) addBtn.onclick = async () => {
     const title = (addTitle && addTitle.value || '').trim();
@@ -227,7 +253,7 @@ export async function loadNotesTab(projectId) {
       if (res && res.lint) toast(res.lint, false);
       else toast('note added');
       await load();
-    } catch (e) { toast('add failed: ' + e.message, true); }
+    } catch (e: any) { toast('add failed: ' + e.message, true); }
   };
 
   await load();

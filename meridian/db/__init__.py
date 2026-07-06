@@ -176,8 +176,13 @@ CREATE TABLE IF NOT EXISTS projects (
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
     icon TEXT,
     agent_instructions TEXT,
+    parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous'
         CHECK (execution_mode IN ('autonomous', 'interactive')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'parked', 'archived')),
+    priority TEXT NOT NULL DEFAULT 'P2'
+        CHECK (priority IN ('P0', 'P1', 'P2')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -204,6 +209,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
     checkpoint_data TEXT,
     sprint_version TEXT,
+    goal_compliance TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -261,7 +267,10 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- 4f02340e: mixed-ownership task chains. owner of a subtask: 'human' | 'ai'
     -- | NULL (unassigned). Drives the alternating claim/handoff state machine
     -- in _advance_task_chain. NULL on parents and on legacy single-owner items.
-    owner TEXT DEFAULT NULL
+    owner TEXT DEFAULT NULL,
+    -- b944c905: human-readable per-project id (title slug, deduped). UUID stays
+    -- the primary key; slug is the board-facing identifier.
+    slug TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -281,6 +290,23 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','superseded')),
     superseded_by TEXT REFERENCES decisions_pinned(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 0b711a9d — insights: durable strategic understanding, a first-class knowledge
+-- type distinct from decisions (choices w/ lifecycle) and notes (reference).
+-- horizon ∈ permanent|year|quarter (validated in Python, no DB CHECK so the
+-- vocabulary can grow without a table rebuild). permanent insights always
+-- surface in get_planning_brief.
+CREATE TABLE IF NOT EXISTS insights (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    horizon TEXT NOT NULL DEFAULT 'quarter',
+    tags TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -405,12 +431,17 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- RFC 8628 device authorization grant (e9f18530). device_code / user_code
+-- hold SHA-256 HASHES of the codes, never the raw values. last_polled_at
+-- backs the poll-rate limiter (RFC 8628 slow_down).
 CREATE TABLE IF NOT EXISTS device_codes (
     device_code TEXT PRIMARY KEY,
     user_code TEXT NOT NULL UNIQUE,
     tenant_id TEXT,
     expires_at TEXT NOT NULL,
     approved INTEGER NOT NULL DEFAULT 0,
+    denied INTEGER NOT NULL DEFAULT 0,
+    last_polled_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -556,18 +587,26 @@ CREATE INDEX IF NOT EXISTS idx_file_symbol_claims_session
     ON file_symbol_claims(session_id);
 
 -- Blog CMS (6234f9b8): admin-authored posts; draft until published.
+-- 8843250f: workspace-scoped via tenant_id + archived lifecycle status.
 CREATE TABLE IF NOT EXISTS blog_posts (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     slug TEXT NOT NULL UNIQUE,
     body_md TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'draft'
-        CHECK (status IN ('draft','published')),
+        CHECK (status IN ('draft','published','archived')),
+    tenant_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     published_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
+-- idx_blog_posts_tenant is created by _migrate_blog_posts_tenant (which ALTERs
+-- tenant_id onto pre-8843250f tables first). It must NOT be inline here: this
+-- literal is run via an unguarded executescript, and on an existing DB
+-- CREATE TABLE IF NOT EXISTS keeps the old columnless blog_posts, so an inline
+-- CREATE INDEX ... (tenant_id) crashes startup ('no such column: tenant_id').
+-- Same missing-column class took prod down on the 2026-07-04 promote.
 
 CREATE TABLE IF NOT EXISTS active_worktrees (
     id TEXT PRIMARY KEY,
@@ -631,8 +670,10 @@ CREATE TABLE IF NOT EXISTS workspace_sprint_items (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     completed_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant
-    ON workspace_sprint_items(tenant_id, status);
+-- idx_workspace_sprint_items_tenant is created by _migrate_workspace_sprint_board.
+-- Not inline here for the same reason as idx_blog_posts_tenant above: an inline
+-- CREATE INDEX on tenant_id in this unguarded literal would crash startup on any
+-- pre-existing copy of this table that lacks the column.
 
 -- v3.4 — workspace-level settings: tenant-global defaults that every project
 -- session can read at startup (e.g. a default HITL auto-answer posture, a
@@ -647,6 +688,10 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     handoff_template TEXT,
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
+    loop_enabled_default INTEGER NOT NULL DEFAULT 1,
+    auto_refresh_enabled INTEGER NOT NULL DEFAULT 0,
+    refresh_interval_turns INTEGER NOT NULL DEFAULT 10,
+    refresh_triggers TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -661,6 +706,27 @@ CREATE INDEX IF NOT EXISTS idx_feedback_tenant
     ON feedback(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_created
     ON feedback(created_at);
+
+-- 2976e168 — sprint_item_pointers: the GENERIC POINTER PRIMITIVE. ONE table for
+-- pointers of ANY source_type (code/docs/citation/…), keyed to a sprint item.
+-- ``targets`` is a JSON array of {uri, selector, subSelector?} objects (native
+-- multi-file, LSP WorkspaceEdit pattern); the per-target selector.type
+-- (range|symbol|node_id|zotero_key) is what the resolver dispatches on. Storing
+-- the composite shape as JSON — NOT per-domain columns — is the core design
+-- requirement (W3C Web Annotation Selector composition, LSP Location). The
+-- idx_sprint_item_pointers_item index is created ONLY inside the guarded
+-- _migrate_sprint_item_pointers migration, never inline here — an unguarded
+-- CREATE INDEX in this base literal would crash startup on a DB whose table
+-- predates it (the 2026-07-04 inline-index outage trap).
+CREATE TABLE IF NOT EXISTS sprint_item_pointers (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    sprint_item_id TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    targets TEXT NOT NULL,
+    label TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -795,6 +861,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_api_tokens_expires_at(db)
     await _migrate_oauth_codes_table(db)
     await _migrate_device_codes_table(db)
+    await _migrate_device_codes_denied_polled(db)
     await _migrate_github_to_projects(db)
     await _migrate_touches_files(db)
     await _migrate_touches_resources(db)
@@ -805,6 +872,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_sprint_board(db)
     await _migrate_registered_hostnames(db)
     await _migrate_queued_session(db)
+    await _migrate_pending_goal(db)
     await _migrate_parallel_safety(db)
     await _migrate_changelog_entries(db)
     await _migrate_agent_instructions(db)
@@ -813,6 +881,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_tunnel_active(db)
     await _migrate_code_intel(db)
     await _migrate_tunnel_plugins(db)
+    await _migrate_tunnel_plugins_by_host(db)
     await _migrate_notes_priority(db)
     await _migrate_task_log_kind(db)
     await _migrate_note_slug(db)
@@ -830,6 +899,20 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoffs_table(db)
     await _migrate_decision_assumption(db)
     await _migrate_github_connections(db)
+    await _migrate_sprint_item_quality_gates(db)
+    await _migrate_parallel_primitives(db)
+    await _migrate_project_status_priority(db)
+    await _migrate_signup_attempts(db)
+    await _migrate_user_session_metadata(db)
+    await _migrate_provision_queue(db)
+    await _migrate_codebase_graph_entities(db)
+    await _migrate_insights_table(db)
+    await _migrate_sprint_item_slug(db)
+    await _migrate_capture_insight_notes_to_insights(db)
+    await _migrate_blog_posts_tenant(db)
+    await _migrate_project_parent_id(db)
+    await _migrate_session_goal_compliance(db)
+    await _migrate_sprint_item_pointers(db)
     return db
 
 
@@ -841,6 +924,7 @@ async def create_project(
     human_id: str | None = None,
     execution_mode: str | None = None,
     tenant_id: str | None = None,
+    parent_project_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a project and return it as a dict. Raises if the name exists.
 
@@ -856,7 +940,27 @@ async def create_project(
     workspace's cascade defaults (execution_mode_default, hitl_auto_answer_default,
     code_intel_enabled_default) for any field the caller didn't set explicitly.
     Existing projects are never touched; this is a creation-time cascade only.
+
+    ``parent_project_id`` (3b6ff466) — when given, the new project is a
+    subproject of that parent. The hierarchy is ONE level deep: the parent
+    must exist AND must itself be top-level (its own parent_project_id is
+    NULL) — a grandchild is rejected with ValueError. A subproject with no
+    north_star of its own falls back to its parent's north_star (see
+    ``get_goal``). Top-level projects pass parent_project_id=None (default).
     """
+    # 3b6ff466 — validate the subproject parent before inserting anything.
+    if parent_project_id is not None:
+        parent = await get_project(db, parent_project_id)
+        if parent is None:
+            raise ValueError(
+                f"parent project '{parent_project_id}' does not exist"
+            )
+        if parent.get("parent_project_id"):
+            raise ValueError(
+                "subprojects are one level deep — cannot nest under a "
+                f"project that is itself a subproject "
+                f"('{parent_project_id}' has a parent)"
+            )
     # Resolve workspace defaults for seeding (best-effort; never block creation).
     _ws: dict[str, Any] = {}
     if tenant_id is not None:
@@ -869,9 +973,10 @@ async def create_project(
     pid = _new_id()
     mode = normalize_execution_mode(execution_mode)
     await db.execute(
-        "INSERT INTO projects (id, name, creator_human_id, execution_mode) "
-        "VALUES (?, ?, ?, ?)",
-        (pid, name, human_id, mode),
+        "INSERT INTO projects "
+        "(id, name, creator_human_id, execution_mode, parent_project_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (pid, name, human_id, mode, parent_project_id),
     )
     await db.commit()
     # Seed the remaining cascade defaults onto the fresh project row.
@@ -910,6 +1015,43 @@ async def get_project(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+_PROJECT_STATUSES = ("active", "parked", "archived")
+_PROJECT_PRIORITIES = ("P0", "P1", "P2")
+
+
+async def set_project_status(
+    db: aiosqlite.Connection,
+    project_id: str,
+    status: str | None = None,
+    priority: str | None = None,
+) -> dict[str, Any] | None:
+    """8db00fcb — update a project's organization fields (status/priority).
+    Validates the enums; only the provided fields change."""
+    sets: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        if status not in _PROJECT_STATUSES:
+            raise ValueError(
+                f"invalid status {status!r}; expected one of {_PROJECT_STATUSES}"
+            )
+        sets.append("status = ?")
+        params.append(status)
+    if priority is not None:
+        if priority not in _PROJECT_PRIORITIES:
+            raise ValueError(
+                f"invalid priority {priority!r}; expected one of {_PROJECT_PRIORITIES}"
+            )
+        sets.append("priority = ?")
+        params.append(priority)
+    if sets:
+        params.append(project_id)
+        await db.execute(
+            f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
+        )
+        await db.commit()
+    return await get_project(db, project_id)
 
 
 async def get_agent_instructions(
@@ -1469,6 +1611,16 @@ async def get_goal(
     Since v0.5.2 the returned dict also includes ``north_star`` and
     ``sprint`` pulled from the ``goal_north_star`` / ``goal_sprint``
     columns. Both are None when not yet set.
+
+    3b6ff466 — subproject north_star inheritance. When the project is a
+    subproject (``parent_project_id`` set) and has NO north_star of its own
+    (empty/NULL), the parent's north_star is inherited. The returned dict then
+    carries ``north_star_inherited=True`` and ``north_star_source_project_id``
+    (the parent's id) so callers can render "inherited" state. Top-level
+    projects and subprojects with their own north_star are unaffected. This is
+    the single fall-back point every read-path shares — ``get_goal``,
+    ``get_planning_brief`` and ``get_context_block`` all resolve the goal
+    through here, so the inheritance is wired into all three at once.
     """
     async with db.execute(
         "SELECT * FROM goal_states WHERE project_id = ? "
@@ -1477,12 +1629,70 @@ async def get_goal(
     ) as cur:
         row = await cur.fetchone()
     goal = _row_to_dict(row)
+    if goal is not None:
+        goal["content"] = _decode_content(goal["content"])
+        goal["north_star"] = goal.pop("goal_north_star", None)
+        goal["sprint"] = goal.pop("goal_sprint", None)
+        goal["north_star_inherited"] = False
+        goal["north_star_source_project_id"] = None
+        # Own north_star present → nothing to inherit; return as-is.
+        if (goal.get("north_star") or "").strip():
+            return goal
+    # No goal row, or a goal row with an empty north_star: try the parent.
+    inherited = await _inherited_north_star(db, project_id)
+    if inherited is None:
+        return goal
+    parent_ns, parent_id = inherited
     if goal is None:
-        return None
-    goal["content"] = _decode_content(goal["content"])
-    goal["north_star"] = goal.pop("goal_north_star", None)
-    goal["sprint"] = goal.pop("goal_sprint", None)
+        # Child has no goal state at all — synthesise a minimal one so the
+        # inherited north_star still surfaces (content/sprint stay empty).
+        return {
+            "project_id": project_id,
+            "content": "",
+            "version": 0,
+            "north_star": parent_ns,
+            "sprint": None,
+            "north_star_inherited": True,
+            "north_star_source_project_id": parent_id,
+        }
+    goal["north_star"] = parent_ns
+    goal["north_star_inherited"] = True
+    goal["north_star_source_project_id"] = parent_id
     return goal
+
+
+async def _inherited_north_star(
+    db: aiosqlite.Connection, project_id: str
+) -> tuple[str, str] | None:
+    """3b6ff466 — resolve a subproject's inherited north_star from its parent.
+
+    Returns ``(parent_north_star, parent_project_id)`` when ``project_id`` is a
+    subproject whose parent has a non-empty north_star, else None. One level
+    deep by construction (create_project rejects grandchildren), so no
+    recursion / cycle handling is needed. Best-effort: a missing
+    ``parent_project_id`` column (pre-migration DB) simply yields no inheritance.
+    """
+    try:
+        proj = await get_project(db, project_id)
+    except Exception:  # noqa: BLE001 — pre-migration schema → no inheritance
+        return None
+    if proj is None:
+        return None
+    parent_id = proj.get("parent_project_id")
+    if not parent_id:
+        return None
+    async with db.execute(
+        "SELECT goal_north_star FROM goal_states WHERE project_id = ? "
+        "ORDER BY version DESC LIMIT 1",
+        (parent_id,),
+    ) as cur:
+        prow = await cur.fetchone()
+    if prow is None:
+        return None
+    parent_ns = (prow["goal_north_star"] if isinstance(prow, dict) else prow[0]) or ""
+    if not parent_ns.strip():
+        return None
+    return parent_ns, parent_id
 
 
 async def set_goal(
@@ -1504,11 +1714,25 @@ async def set_goal(
     that should not pollute the goal history.
     """
     existing = await get_goal(db, project_id)
+    # 3b6ff466 — a subproject with no goal row of its own gets a *synthesised*
+    # goal dict back from get_goal (parent's inherited north_star, no real
+    # goal_states row → no "id"). That is NOT a row to update or version off
+    # of; treat it as "no existing goal" for all row surgery below, otherwise
+    # the in-place UPDATE (WHERE id = existing["id"]) would KeyError and the
+    # inherited north_star would be materialised into the child's first row.
+    if existing is not None and "id" not in existing:
+        existing = None
     encoded = _encode_content(content)
-    # Carry forward north_star / sprint from the previous row when not given.
-    final_north_star = north_star if north_star is not None else (
-        existing.get("north_star") if existing else None
+    # Never carry forward an INHERITED north_star as if it were the child's own.
+    # get_goal flags a borrowed parent north_star with north_star_inherited;
+    # treat that as "the child has no own north_star" for carry-forward.
+    _own_existing_ns = (
+        existing.get("north_star")
+        if (existing and not existing.get("north_star_inherited"))
+        else None
     )
+    # Carry forward north_star / sprint from the previous row when not given.
+    final_north_star = north_star if north_star is not None else _own_existing_ns
     final_sprint = sprint if sprint is not None else (
         existing.get("sprint") if existing else None
     )
@@ -1727,6 +1951,47 @@ async def register_session(
         "session_id": sid, "session_name": name, "human_id": human_id,
     })
     return session
+
+
+async def generate_default_session_name(
+    db: aiosqlite.Connection,
+    project_id: str,
+) -> str:
+    """599d0097 — derive a meaningful session name when start_session gets none.
+
+    Uses the first pending/todo sprint item's title (slugified to its first few
+    words) plus a short UTC timestamp, so an unnamed session reads as e.g.
+    ``wire-billing-oauth-0701-2130`` instead of forcing the caller to invent a
+    string. 2bce89ed — when the board is empty, falls back to a memorable
+    adjective+noun+timestamp slug (e.g. ``brisk-otter-0701-213045``) instead of
+    the anonymous ``session-<ts>``. The timestamp keeps the name unique (the
+    board rejects duplicate active names); year is dropped for brevity but
+    seconds are kept so two sessions in the same minute don't collide.
+    """
+    from datetime import datetime, timezone  # local: db/__init__ has no top import
+    ts = datetime.now(timezone.utc).strftime("%m%d-%H%M%S")
+    try:
+        items = await get_sprint_items(db, project_id, include_human=False)
+    except Exception:  # noqa: BLE001 — naming must never block start_session
+        items = []
+    first = next(
+        (it for it in items
+         if (it.get("status") or "pending") in {"pending", "todo"}),
+        None,
+    )
+    title = (first or {}).get("title") or ""
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    if words:
+        slug = "-".join(words[:5])[:48].strip("-") or "session"
+        return f"{slug}-{ts}"
+    # 2bce89ed — memorable adjective+noun for an empty board, chosen
+    # deterministically from the timestamp (readable + unique via the ts suffix).
+    _adj = ("brisk", "calm", "clever", "bold", "quiet", "swift", "warm", "keen",
+            "bright", "steady", "nimble", "lucid")
+    _noun = ("otter", "harbor", "cedar", "falcon", "meadow", "ember", "delta",
+             "willow", "quartz", "sparrow", "atlas", "cove")
+    _h = sum(ord(c) for c in ts)
+    return f"{_adj[_h % len(_adj)]}-{_noun[(_h // len(_adj)) % len(_noun)]}-{ts}"
 
 
 def build_worker_context_xml(
@@ -2103,6 +2368,52 @@ async def keepalive_sessions(
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def touch_latest_active_session(
+    db: aiosqlite.Connection, project_id: str | None = None
+) -> str | None:
+    """4b698ea5 — bump ``last_seen`` on the most-recently-active live session and
+    return its id (or None when there is no live session to touch).
+
+    This is the DB side of the *passive* tunnel-liveness signal: the server's
+    keepalive loop calls it once per tick for every tenant that holds a live
+    tunnel WebSocket, so an executor doing minutes of NON-Meridian work (reading
+    files, thinking, running tests) — and therefore touching no Meridian tool —
+    still keeps a fresh ``last_seen`` and isn't mistaken for dead.
+
+    The signal is genuinely passive because the liveness *proof* is the open
+    tunnel socket (the tenant's local ``meridian --tunnel`` binary is running),
+    NOT ``last_seen`` itself — so it is not circular the way a loop that renews
+    based on ``last_seen`` would be.
+
+    Association: a tunnel is per-TENANT and a tenant's project DB typically has a
+    single active executor. We resolve the ambiguity by touching the ONE
+    most-recently-active ('active'/'idle') session — the one a planner would most
+    plausibly read as "the live executor". ``project_id`` narrows the scope when a
+    tenant DB holds more than one project; None (the common single-project tenant
+    DB) considers all of them.
+    """
+    where = "status IN ('active', 'idle')"
+    params: tuple[Any, ...] = ()
+    if project_id is not None:
+        where += " AND project_id = ?"
+        params = (project_id,)
+    async with db.execute(
+        f"SELECT id FROM sessions WHERE {where} "
+        f"ORDER BY last_seen DESC LIMIT 1",
+        params,
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    sid = row["id"] if isinstance(row, dict) else row[0]
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now') WHERE id = ?",
+        (sid,),
+    )
+    await db.commit()
+    return sid
 
 
 # bc9259b8 — worker stall auto-retry budget. A sprint item left in_progress by a
@@ -2546,6 +2857,33 @@ async def get_tasks(
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+def _multiword_match_clause(
+    columns: "list[str]", query: str, *, op: str = "LIKE"
+) -> "tuple[str, list[str]]":
+    """fcf90f3a — WHERE fragment matching rows where EVERY whitespace-separated
+    term in ``query`` appears in at least one of ``columns`` (AND across terms,
+    OR across columns).
+
+    A single ``%query%`` LIKE matched only the contiguous phrase, so multi-word
+    queries whose words weren't adjacent ("RAG problem definition") — or that
+    crossed punctuation ("retrieval-augmented generation") — silently returned
+    zero. ANDing the terms fixes that while staying more precise than OR-ing:
+    these searches have no relevance ranking (just created_at DESC), so OR would
+    flood the top with rows matching one common word. Terms shorter than 2 chars
+    are dropped and the list is capped; a single-token query falls back to the
+    whole string. Returns ``(sql_fragment, params)`` — a parenthesized boolean
+    safe to AND into an existing WHERE. Placeholders are ``?`` (the pg adapter
+    rewrites to %s); ``op`` is LIKE (SQLite, case-insensitive) or ILIKE (PG)."""
+    terms = [t for t in query.split() if len(t) >= 2][:8] or [query]
+    per_term: list[str] = []
+    params: list[str] = []
+    for term in terms:
+        ors = " OR ".join(f"{c} {op} ?" for c in columns)
+        per_term.append(f"({ors})")
+        params.extend([f"%{term}%"] * len(columns))
+    return "(" + " AND ".join(per_term) + ")", params
+
+
 async def search_tasks(
     db: Any,
     project_id: str,
@@ -2554,17 +2892,29 @@ async def search_tasks(
 ) -> list[dict[str, Any]]:
     """Full-text task search.
 
-    Postgres: uses pg_trgm similarity() — no ML model required, fast on the
-    GIN index added by _migrate_pg_v27_pg_trgm. Falls back to ILIKE when
-    the query is too short for trigrams (< 3 chars).
+    Postgres: uses pg_trgm similarity() for ranking — no ML model required,
+    fast on the GIN index added by _migrate_pg_v27_pg_trgm — OR'd with a
+    multiword ILIKE term-match and (82e0b887) an on-the-fly tsvector full-text
+    predicate so stemmed / non-substring queries also match. Ordering is
+    similarity DESC, ts_rank DESC, created_at DESC.
 
-    SQLite: simple LIKE wildcard match on description.
+    SQLite: keyword substring term-match on description (unchanged).
 
     Returns [{id, description, status, created_at, similarity, session_name}].
     """
-    like_pat = f"%{query}%"
     is_pg = hasattr(db, "_pool")
     if is_pg:
+        # fcf90f3a — AND the query terms so a multi-word query isn't a single
+        # %...% ILIKE that only matches the contiguous phrase. Similarity ranking
+        # still orders results; the term-match just widens the candidate set.
+        match_sql, match_params = _multiword_match_clause(
+            ["t.description"], query, op="ILIKE")
+        # 82e0b887 — additively widen the candidate set with tsvector full-text
+        # match so stemmed / morphological queries ("authenticating users" vs a
+        # task "authentication for the user") also match. websearch_to_tsquery
+        # tolerates arbitrary user input without raising. similarity() still
+        # drives ordering (trigram score); ts_rank is a secondary tiebreak so
+        # rows matched purely by FTS (similarity 0) still order sensibly.
         sql = (
             "SELECT t.id, t.description, t.status, t.created_at, "
             "s.name AS session_name, "
@@ -2572,20 +2922,28 @@ async def search_tasks(
             "FROM task_log t "
             "LEFT JOIN sessions s ON s.id = t.session_id "
             "WHERE t.project_id = ? "
-            "AND (similarity(t.description, ?) > 0.05 OR t.description ILIKE ?) "
-            "ORDER BY similarity DESC, t.created_at DESC LIMIT ?"
+            "AND (similarity(t.description, ?) > 0.05 "
+            "OR to_tsvector('english', coalesce(t.description,'')) "
+            "@@ websearch_to_tsquery('english', ?) "
+            f"OR {match_sql}) "
+            "ORDER BY similarity DESC, "
+            "ts_rank(to_tsvector('english', coalesce(t.description,'')), "
+            "websearch_to_tsquery('english', ?)) DESC, "
+            "t.created_at DESC LIMIT ?"
         )
-        params: tuple = (query, project_id, query, like_pat, limit)
+        params: tuple = (
+            query, project_id, query, query, *match_params, query, limit)
     else:
+        match_sql, match_params = _multiword_match_clause(["t.description"], query)
         sql = (
             "SELECT t.id, t.description, t.status, t.created_at, "
             "s.name AS session_name, 1.0 AS similarity "
             "FROM task_log t "
             "LEFT JOIN sessions s ON s.id = t.session_id "
-            "WHERE t.project_id = ? AND t.description LIKE ? "
+            f"WHERE t.project_id = ? AND {match_sql} "
             "ORDER BY t.created_at DESC LIMIT ?"
         )
-        params = (project_id, like_pat, limit)
+        params = (project_id, *match_params, limit)
     async with db.execute(sql, params) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
@@ -2601,17 +2959,247 @@ def _search_snippet(text: str | None, query: str, window: int = 60) -> str:
     """
     if not text or not query:
         return ""
-    idx = text.lower().find(query.lower())
+    low = text.lower()
+    anchor = query.lower()
+    idx = low.find(anchor)
+    if idx == -1:
+        # fcf90f3a — multi-word query whose exact phrase isn't contiguous: anchor
+        # the preview on the first query term that IS present.
+        for term in query.split():
+            if len(term) >= 2 and (i := low.find(term.lower())) != -1:
+                anchor, idx = term.lower(), i
+                break
     if idx == -1:
         return ""
     start = max(0, idx - window)
-    end = min(len(text), idx + len(query) + window)
+    end = min(len(text), idx + len(anchor) + window)
     snippet = text[start:end].strip()
     if start > 0:
         snippet = "…" + snippet
     if end < len(text):
         snippet = snippet + "…"
     return snippet
+
+
+# ---------------------------------------------------------------------------
+# 56cd8712 — Model2Vec semantic escalation for search_all (Postgres only).
+# SAFE-BY-DEFAULT: OFF unless MERIDIAN_SEMANTIC_ENABLED is truthy, model2vec is
+# importable, and the runtime RSS circuit breaker is not tripped. All of that is
+# folded into semantic_search.is_available(); when it's False this is a NO-OP and
+# the plain keyword/tsvector results are returned UNCHANGED.
+# ---------------------------------------------------------------------------
+
+# Cap on how many corpus rows we embed per escalation. The static model is fast but
+# we still bound the work (and memory) on a 512MB box.
+_SEMANTIC_CORPUS_CAP = 200
+
+
+async def _pure_fts_count_and_trigram_top(
+    db: Any, project_id: str, query: str
+) -> "tuple[int, float]":
+    """Return (pure_fts_count, trigram_top) over the project's searchable text — PG.
+
+    ``pure_fts_count`` — number of rows across task_log / project_notes /
+    decisions_pinned / sprint_items whose text matches PURE
+    ``websearch_to_tsquery`` FTS (no OR with trigram/ILIKE). ``trigram_top`` — the
+    single best pg_trgm ``similarity`` of the query against any of those text
+    fields. Together they answer "did keyword search genuinely find nothing good?"
+    for :func:`meridian.semantic_search.should_escalate`.
+
+    psycopg3: ``?`` placeholders (adapter rewrites to %s), autocommit. On any error
+    returns ``(1, 1.0)`` — a "found something" signal that suppresses escalation, so
+    a metadata hiccup never spuriously spins up the model.
+    """
+    sql = (
+        "WITH corpus AS ("
+        "  SELECT coalesce(description,'') AS txt FROM task_log WHERE project_id = ? "
+        "  UNION ALL "
+        "  SELECT coalesce(title,'') || ' ' || coalesce(body,'') FROM project_notes WHERE project_id = ? "
+        "  UNION ALL "
+        "  SELECT coalesce(title,'') || ' ' || coalesce(body,'') FROM decisions_pinned "
+        "    WHERE project_id = ? AND status = 'active' "
+        "  UNION ALL "
+        "  SELECT coalesce(title,'') || ' ' || coalesce(notes,'') FROM sprint_items WHERE project_id = ? "
+        ") "
+        "SELECT "
+        "  count(*) FILTER ("
+        "    WHERE to_tsvector('english', txt) @@ websearch_to_tsquery('english', ?)"
+        "  ) AS fts_count, "
+        "  coalesce(max(similarity(txt, ?)), 0.0) AS trigram_top "
+        "FROM corpus"
+    )
+    params: tuple = (project_id, project_id, project_id, project_id, query, query)
+    try:
+        async with db.execute(sql, params) as cur:
+            row = await cur.fetchone()
+    except Exception:  # noqa: BLE001 - never let metadata query break search
+        _log.warning("semantic gate: pre-count failed — suppressing escalation", exc_info=True)
+        return 1, 1.0
+    if row is None:
+        # 56cd8712 — fail-safe consistent with the exception path: a missing row
+        # SUPPRESSES escalation (1,1.0) rather than firing it (0,0.0). Unreachable
+        # for a single-row count/max aggregate, but defensive.
+        return 1, 1.0
+    d = _row_to_dict(row)  # type: ignore[misc]
+    try:
+        return int(d.get("fts_count") or 0), float(d.get("trigram_top") or 0.0)
+    except (TypeError, ValueError):
+        return 1, 1.0
+
+
+async def _semantic_candidate_corpus(
+    db: Any, project_id: str, cap: int
+) -> "list[tuple[str, str, str]]":
+    """Fetch the project's candidate corpus for semantic ranking — PG.
+
+    Returns ``[(match_type, id, text)]`` across the four content types (title+body
+    concatenated). Bounded by ``cap`` rows total. On error returns ``[]``.
+    """
+    sql = (
+        "SELECT 'task' AS match_type, id, coalesce(description,'') AS txt "
+        "  FROM task_log WHERE project_id = ? "
+        "UNION ALL "
+        "SELECT 'note', id, coalesce(title,'') || ' ' || coalesce(body,'') "
+        "  FROM project_notes WHERE project_id = ? "
+        "UNION ALL "
+        "SELECT 'decision', id, coalesce(title,'') || ' ' || coalesce(body,'') "
+        "  FROM decisions_pinned WHERE project_id = ? AND status = 'active' "
+        "UNION ALL "
+        "SELECT 'sprint_item', id, coalesce(title,'') || ' ' || coalesce(notes,'') "
+        "  FROM sprint_items WHERE project_id = ? "
+        "LIMIT ?"
+    )
+    params: tuple = (project_id, project_id, project_id, project_id, cap)
+    try:
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+    except Exception:  # noqa: BLE001
+        _log.warning("semantic escalation: corpus fetch failed", exc_info=True)
+        return []
+    out: list[tuple[str, str, str]] = []
+    for r in rows:  # type: ignore[assignment]
+        d = _row_to_dict(r)  # type: ignore[misc]
+        out.append((d.get("match_type", ""), d.get("id", ""), d.get("txt", "") or ""))
+    return out
+
+
+async def _hydrate_semantic_rows(
+    db: Any, project_id: str, by_type: "dict[str, list[str]]"
+) -> "dict[str, list[dict[str, Any]]]":
+    """Load full result rows for the semantically-matched ids, grouped by type.
+
+    Mirrors the column shape of the keyword-path SELECTs so merged results are
+    homogeneous. Ordering within each group follows the id order passed in (which is
+    the semantic rank order). On error a type yields no rows.
+    """
+    result: dict[str, list[dict[str, Any]]] = {
+        "task": [], "note": [], "decision": [], "sprint_item": []
+    }
+    selects = {
+        "task": (
+            "SELECT id, description, status, created_at, 'task' AS match_type "
+            "FROM task_log WHERE project_id = ? AND id = ?"
+        ),
+        "note": (
+            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+            "FROM project_notes WHERE project_id = ? AND id = ?"
+        ),
+        "decision": (
+            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+            "FROM decisions_pinned WHERE project_id = ? AND status = 'active' AND id = ?"
+        ),
+        "sprint_item": (
+            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "FROM sprint_items WHERE project_id = ? AND id = ?"
+        ),
+    }
+    for mtype, ids in by_type.items():
+        sql = selects.get(mtype)
+        if not sql:
+            continue
+        for rid in ids:
+            try:
+                async with db.execute(sql, (project_id, rid)) as cur:
+                    row = await cur.fetchone()
+            except Exception:  # noqa: BLE001
+                continue
+            if row is not None:
+                result[mtype].append(_row_to_dict(row))  # type: ignore[misc]
+    return result
+
+
+async def _maybe_semantic_escalate(
+    db: Any,
+    project_id: str,
+    query: str,
+    limit: int,
+    tasks: "list[dict[str, Any]]",
+    notes: "list[dict[str, Any]]",
+    decisions: "list[dict[str, Any]]",
+    sprint_items: "list[dict[str, Any]]",
+) -> "tuple[list[dict], list[dict], list[dict], list[dict]]":
+    """Optionally augment the keyword results with semantic hits (PG-only).
+
+    Returns the (possibly augmented) ``(tasks, notes, decisions, sprint_items)``.
+    A NO-OP — returns the inputs unchanged — unless ALL hold:
+
+    * ``semantic_search.is_available()`` (enabled + importable + not tripped), AND
+    * the CORRECTED gate fires: pure-FTS count == 0 AND pg_trgm top < ~0.1.
+
+    Semantic hits are ranked by cosine (floor-filtered) and appended AFTER the
+    keyword rows, deduped by id, keyword-first — so existing behavior is a strict
+    prefix of the augmented result and the return shape is identical.
+    """
+    from meridian import semantic_search
+
+    if not semantic_search.is_available():
+        return tasks, notes, decisions, sprint_items
+
+    pure_fts, trigram_top = await _pure_fts_count_and_trigram_top(db, project_id, query)
+    if not semantic_search.should_escalate(pure_fts, trigram_top):
+        return tasks, notes, decisions, sprint_items
+
+    corpus = await _semantic_candidate_corpus(db, project_id, _SEMANTIC_CORPUS_CAP)
+    if not corpus:
+        return tasks, notes, decisions, sprint_items
+
+    # rank() takes [(id, text)]; keep a side map id -> match_type to regroup.
+    type_by_id: dict[str, str] = {cid: mtype for mtype, cid, _ in corpus}
+    ranked = semantic_search.rank(query, [(cid, txt) for _, cid, txt in corpus])
+    if not ranked:  # unavailable mid-flight (breaker tripped) or all sub-floor
+        return tasks, notes, decisions, sprint_items
+
+    # Exclude ids already present in the keyword results (keyword-first dedupe).
+    existing: dict[str, set[str]] = {
+        "task": {t.get("id") for t in tasks},
+        "note": {n.get("id") for n in notes},
+        "decision": {d.get("id") for d in decisions},
+        "sprint_item": {s.get("id") for s in sprint_items},
+    }
+    new_by_type: dict[str, list[str]] = {
+        "task": [], "note": [], "decision": [], "sprint_item": []
+    }
+    for cid, _score in ranked:
+        mtype = type_by_id.get(cid)
+        if not mtype or mtype not in new_by_type:
+            continue
+        if cid in existing.get(mtype, set()):
+            continue
+        if len(new_by_type[mtype]) >= limit:
+            continue
+        new_by_type[mtype].append(cid)
+
+    hydrated = await _hydrate_semantic_rows(db, project_id, new_by_type)
+    # Mark provenance so callers/UI can distinguish semantic-augmented rows.
+    for mtype, rows in hydrated.items():
+        for r in rows:
+            r["semantic"] = True
+    return (
+        tasks + hydrated["task"],
+        notes + hydrated["note"],
+        decisions + hydrated["decision"],
+        sprint_items + hydrated["sprint_item"],
+    )
 
 
 async def search_all(
@@ -2628,9 +3216,13 @@ async def search_all(
       - decisions_pinned.title + decisions_pinned.body
       - sprint_items.title + sprint_items.notes
 
-    SQLite: LIKE %query% on all relevant text fields.
-    Postgres: ILIKE on all relevant text fields (portable across both backends;
-    pg_trgm/tsvector are Postgres-only so we keep to ILIKE here for parity).
+    SQLite: keyword match — every whitespace-separated query term must appear
+    (as a substring) in one of the text fields (see _multiword_match_clause).
+    Postgres (82e0b887): on-the-fly tsvector full-text search via
+    websearch_to_tsquery, ordered by ts_rank. Stemming/word-form tolerance
+    means "authenticating users" matches "authentication for the user" — which
+    the SQLite substring path cannot. Zero schema / zero index (evaluated per
+    query).
 
     Returns grouped results: {tasks, notes, decisions, sprint_items}.
     Each item includes a ``match_type`` key for the source table and a
@@ -2638,8 +3230,8 @@ async def search_all(
     query term (empty string when no body field matched, e.g. a title-only
     match).
     """
-    like_pat = f"%{query}%"
     is_pg = hasattr(db, "_pool")
+    op = "ILIKE" if is_pg else "LIKE"
 
     async def _search(sql: str, params: tuple) -> list[dict[str, Any]]:
         async with db.execute(sql, params) as cur:
@@ -2647,60 +3239,112 @@ async def search_all(
         return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
     if is_pg:
+        # 82e0b887 — Postgres full-text search. The keyword AND-of-substrings
+        # path (below, SQLite) can't stem or cross word forms: querying
+        # "authenticating users" misses a note reading "authentication for the
+        # user". On PG we build an on-the-fly tsvector over each content type's
+        # text field(s) and match with websearch_to_tsquery (which tolerates
+        # arbitrary punctuation/user input without raising), then rank by
+        # ts_rank so the most relevant rows surface first. Zero schema / zero
+        # index — the expression is evaluated per query. 'english' regconfig
+        # matches the pg_trgm/English assumption already used by search_tasks.
+        #
+        # Param order per type is: <tsvector-query>, <existing filters incl.
+        # project_id>, <ts_rank-query>, <limit>. The predicate's ? comes first
+        # in the SQL, the ORDER BY ts_rank ? comes last before LIMIT — the
+        # params tuple below mirrors that exactly.
+        def _tsv(*cols: str) -> str:
+            expr = " || ' ' || ".join(f"coalesce({c},'')" for c in cols)
+            return f"to_tsvector('english', {expr})"
+
+        tv_task = _tsv("description")
+        tv_note = _tsv("title", "body")
+        tv_dec = _tsv("title", "body")
+        tv_sprint = _tsv("title", "notes")
+
         tasks_sql = (
             "SELECT id, description, status, created_at, 'task' AS match_type "
             "FROM task_log "
-            "WHERE project_id = ? AND description ILIKE ? "
-            "ORDER BY created_at DESC LIMIT ?"
+            f"WHERE project_id = ? AND {tv_task} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_task}, websearch_to_tsquery('english', ?)) DESC, "
+            "created_at DESC LIMIT ?"
         )
         notes_sql = (
             "SELECT id, title, body, tags, created_at, 'note' AS match_type "
             "FROM project_notes "
-            "WHERE project_id = ? AND (title ILIKE ? OR body ILIKE ?) "
-            "ORDER BY created_at DESC LIMIT ?"
+            f"WHERE project_id = ? AND {tv_note} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_note}, websearch_to_tsquery('english', ?)) DESC, "
+            "created_at DESC LIMIT ?"
         )
         decisions_sql = (
             "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
             "FROM decisions_pinned "
-            "WHERE project_id = ? AND status = 'active' AND (title ILIKE ? OR body ILIKE ?) "
-            "ORDER BY created_at DESC LIMIT ?"
+            "WHERE project_id = ? AND status = 'active' "
+            f"AND {tv_dec} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_dec}, websearch_to_tsquery('english', ?)) DESC, "
+            "created_at DESC LIMIT ?"
         )
         sprint_sql = (
             "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
             "FROM sprint_items "
-            "WHERE project_id = ? AND (title ILIKE ? OR notes ILIKE ?) "
-            "ORDER BY added_at DESC LIMIT ?"
+            f"WHERE project_id = ? AND {tv_sprint} @@ websearch_to_tsquery('english', ?) "
+            f"ORDER BY ts_rank({tv_sprint}, websearch_to_tsquery('english', ?)) DESC, "
+            "added_at DESC LIMIT ?"
+        )
+
+        tasks = await _search(tasks_sql, (project_id, query, query, limit))
+        notes = await _search(notes_sql, (project_id, query, query, limit))
+        decisions = await _search(decisions_sql, (project_id, query, query, limit))
+        sprint_items = await _search(sprint_sql, (project_id, query, query, limit))
+
+        # 56cd8712 — SAFE-BY-DEFAULT, OPT-IN semantic escalation. When keyword /
+        # tsvector search genuinely found nothing good, and semantic search is
+        # enabled+importable+not-tripped, embed the query and rank the project's
+        # candidate corpus, merging any above-cosine-floor hits (keyword first,
+        # deduped). This is a NO-OP unless MERIDIAN_SEMANTIC_ENABLED is truthy —
+        # is_available() is False by default so the gate never fires on prod.
+        tasks, notes, decisions, sprint_items = await _maybe_semantic_escalate(
+            db, project_id, query, limit,
+            tasks, notes, decisions, sprint_items,
         )
     else:
+        # fcf90f3a — SQLite keyword path (unchanged). AND the query terms across
+        # each content type's text fields so a multi-word query matches rows
+        # containing every term (not only the exact contiguous phrase).
+        m_task, p_task = _multiword_match_clause(["description"], query, op=op)
+        m_note, p_note = _multiword_match_clause(["title", "body"], query, op=op)
+        m_dec, p_dec = _multiword_match_clause(["title", "body"], query, op=op)
+        m_sprint, p_sprint = _multiword_match_clause(["title", "notes"], query, op=op)
+
         tasks_sql = (
             "SELECT id, description, status, created_at, 'task' AS match_type "
             "FROM task_log "
-            "WHERE project_id = ? AND description LIKE ? "
+            f"WHERE project_id = ? AND {m_task} "
             "ORDER BY created_at DESC LIMIT ?"
         )
         notes_sql = (
             "SELECT id, title, body, tags, created_at, 'note' AS match_type "
             "FROM project_notes "
-            "WHERE project_id = ? AND (title LIKE ? OR body LIKE ?) "
+            f"WHERE project_id = ? AND {m_note} "
             "ORDER BY created_at DESC LIMIT ?"
         )
         decisions_sql = (
             "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
             "FROM decisions_pinned "
-            "WHERE project_id = ? AND status = 'active' AND (title LIKE ? OR body LIKE ?) "
+            f"WHERE project_id = ? AND status = 'active' AND {m_dec} "
             "ORDER BY created_at DESC LIMIT ?"
         )
         sprint_sql = (
             "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
             "FROM sprint_items "
-            "WHERE project_id = ? AND (title LIKE ? OR notes LIKE ?) "
+            f"WHERE project_id = ? AND {m_sprint} "
             "ORDER BY added_at DESC LIMIT ?"
         )
 
-    tasks = await _search(tasks_sql, (project_id, like_pat, limit))
-    notes = await _search(notes_sql, (project_id, like_pat, like_pat, limit))
-    decisions = await _search(decisions_sql, (project_id, like_pat, like_pat, limit))
-    sprint_items = await _search(sprint_sql, (project_id, like_pat, like_pat, limit))
+        tasks = await _search(tasks_sql, (project_id, *p_task, limit))
+        notes = await _search(notes_sql, (project_id, *p_note, limit))
+        decisions = await _search(decisions_sql, (project_id, *p_dec, limit))
+        sprint_items = await _search(sprint_sql, (project_id, *p_sprint, limit))
 
     # Attach a body-text snippet for each result so the dashboard search bar can
     # surface matching context. The body field name differs per content type.
@@ -3065,6 +3709,35 @@ async def get_sprint_items_cached(
     return items
 
 
+def _sprint_item_slug_base(text: str) -> str:
+    """b944c905 — kebab-case a title into a short human-readable id base."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return "-".join(words[:6])[:60].strip("-") or "item"
+
+
+async def _unique_sprint_slug(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """b944c905 — ``base``, or base-2/base-3/… if the slug is taken in this
+    project (mirrors _unique_note_slug; slugs are unique per project)."""
+    slug = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM sprint_items WHERE project_id = ? AND slug = ?",
+            (project_id, slug),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
 async def add_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3077,6 +3750,7 @@ async def add_sprint_item(
     milestone_type: str = "task",
     touches_resources: Any = None,
     force: bool = False,
+    slug: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -3135,13 +3809,18 @@ async def add_sprint_item(
     # 501ec93f — normalize + validate typed resource identifiers (raises on bad input).
     resources_json = serialize_touches_resources(touches_resources)
     iid = _new_id()
+    # b944c905 — auto-populate a human-readable slug from the title (or a
+    # caller-supplied one), deduped per project.
+    _item_slug = await _unique_sprint_slug(
+        db, project_id, _sprint_item_slug_base(slug or title)
+    )
     await db.execute(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
-        "failure_mode, milestone_type, touches_resources) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "failure_mode, milestone_type, touches_resources, slug) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
-         depends_on, failure_mode or "continue", milestone_type, resources_json),
+         depends_on, failure_mode or "continue", milestone_type, resources_json, _item_slug),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -3213,12 +3892,14 @@ async def _update_sprint_item_status(
     task_id: str | None = None,
     notes: str | None = None,
     pushed_to: str | None = None,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Internal: flip a sprint item's status and optionally link a task.
 
     Terminal statuses (done / skipped / failed / pushed) stamp
     ``completed_at``; non-terminal statuses clear it. ``pushed_to``
-    records the target version when status == 'pushed'.
+    records the target version when status == 'pushed'. ``actor`` (5823db0b)
+    records the executor id/name that made this transition.
     """
     if status not in _VALID_SPRINT_STATUSES:
         raise ValueError(f"invalid sprint-item status: {status!r}")
@@ -3239,6 +3920,9 @@ async def _update_sprint_item_status(
     if pushed_to is not None:
         fields.append("pushed_to = ?")
         values.append(pushed_to)
+    if actor is not None:
+        fields.append("actor = ?")
+        values.append(actor)
     values.append(item_id)
     values.append(project_id)
     cursor = await db.execute(
@@ -3283,11 +3967,18 @@ async def _maybe_rollup_parent(db: aiosqlite.Connection, project_id: str, item_i
         await _update_sprint_item_status(db, project_id, parent_id, "indeterminate")
 
 
+class SprintItemEvidenceRequired(ValueError):
+    """Raised when complete_sprint_item is blocked by the required_notes gate
+    (5823db0b) — the item is flagged required_notes but has no evidence."""
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
     item_id: str,
     task_id: str | None = None,
+    notes: str | None = None,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
 
@@ -3295,9 +3986,29 @@ async def complete_sprint_item(
     chain, advance the chain: an AI→human transition auto-files a HITL handoff,
     a human→AI transition un-blocks the next AI subtask (see
     :func:`_advance_task_chain`).
+
+    5823db0b — quality gate: when the item is flagged ``required_notes``, refuse
+    to complete unless evidence exists — an existing ``notes`` value, a linked
+    ``task_id``, or a ``notes`` argument on this call (which is persisted).
+    ``actor`` records which executor completed the item.
     """
+    item = await get_sprint_item(db, item_id)
+    if item is not None and item.get("project_id") == project_id:
+        if item.get("required_notes"):
+            has_evidence = bool(
+                (notes or "").strip()
+                or task_id
+                or (item.get("notes") or "").strip()
+                or (item.get("task_id"))
+            )
+            if not has_evidence:
+                raise SprintItemEvidenceRequired(
+                    f"item {item_id} requires evidence before completion — pass "
+                    "notes=... (what shipped / how it was verified) or link a "
+                    "task_id. This item was flagged required_notes."
+                )
     result = await _update_sprint_item_status(
-        db, project_id, item_id, "done", task_id=task_id
+        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
@@ -3354,11 +4065,13 @@ async def claim_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
     item_id: str,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Claim a sprint item: set status='in_progress' and claimed_at=now().
 
     Rejects (raises ValueError) if already in_progress, done, failed, or skipped.
-    Returns None if the item doesn't exist.
+    Returns None if the item doesn't exist. ``actor`` (5823db0b) records which
+    executor claimed the item.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
@@ -3371,9 +4084,10 @@ async def claim_sprint_item(
             f"cannot claim item with status '{item.get('status')}'"
         )
     cursor = await db.execute(
-        "UPDATE sprint_items SET status = 'in_progress', claimed_at = datetime('now') "
+        "UPDATE sprint_items SET status = 'in_progress', "
+        "claimed_at = datetime('now'), actor = COALESCE(?, actor) "
         "WHERE id = ? AND project_id = ?",
-        (item_id, project_id),
+        (actor, item_id, project_id),
     )
     await db.commit()
     if cursor.rowcount == 0:
@@ -3429,11 +4143,13 @@ async def patch_sprint_item(
     human_id: str | None = None,
     item_group: str | None = None,
     touches_resources: Any = _UNSET,
+    required_notes: bool | int | None = None,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
-    item_group, touches_resources. Only fields passed as non-None are changed;
+    item_group, touches_resources, required_notes. Only fields passed as
+    non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
     so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
@@ -3470,6 +4186,9 @@ async def patch_sprint_item(
     if touches_resources is not _UNSET:
         fields.append("touches_resources = ?")
         values.append(serialize_touches_resources(touches_resources))
+    if required_notes is not None:
+        fields.append("required_notes = ?")
+        values.append(1 if required_notes else 0)
     if not fields:
         return await get_sprint_item(db, item_id)
     values.extend([item_id, project_id])
@@ -3810,6 +4529,22 @@ def _NEG_TS(ts: str) -> tuple[int, str]:
     # earlier ts compare greater than a later one under default tuple ordering.
     inverted = "".join(chr(255 - min(ord(c), 255)) for c in ts)
     return (1, inverted)
+
+
+async def count_pending_sprint_items(
+    db: aiosqlite.Connection, project_id: str
+) -> int:
+    """c0d2356d — count of not-yet-done sprint items (status pending/todo) for a
+    project. Backs the Stop-hook sprint guard's /sprint/pending_count endpoint."""
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM sprint_items "
+        "WHERE project_id = ? AND status IN ('pending', 'todo')",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0
+    return int(row["c"] if isinstance(row, dict) else row[0])
 
 
 async def get_sprint_items(
@@ -4980,7 +5715,7 @@ async def update_tenant(
         "compute_cu_hours_used", "storage_gb_used",
         "overage_reset_at", "compute_throttled_at",
         "trial_started_at", "inactivity_expires_at",
-        "github_pat", "tunnel_active", "tunnel_plugins",
+        "github_pat", "tunnel_active", "tunnel_plugins", "tunnel_plugins_by_host",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -4998,12 +5733,22 @@ async def create_user_session(
     db: aiosqlite.Connection,
     tenant_id: str,
     expires_at: str,
+    user_agent: str | None = None,
+    ip: str | None = None,
 ) -> dict[str, Any]:
-    """Create a web session for a tenant. Returns the session dict."""
+    """Create a web session for a tenant. Returns the session dict.
+
+    3c28450d — optional device metadata (``user_agent``/``ip``) is stored for
+    the active-sessions view; ``last_seen_at`` is seeded to now."""
     sid = _new_id()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
-        "INSERT INTO user_sessions (id, tenant_id, expires_at) VALUES (?, ?, ?)",
-        (sid, tenant_id, expires_at),
+        "INSERT INTO user_sessions "
+        "(id, tenant_id, expires_at, user_agent, ip, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (sid, tenant_id, expires_at,
+         (user_agent or None), (ip or None), now),
     )
     await db.commit()
     async with db.execute("SELECT * FROM user_sessions WHERE id = ?", (sid,)) as cur:
@@ -5040,18 +5785,288 @@ async def delete_user_session(
     await db.commit()
 
 
+async def get_user_sessions_for_tenant(
+    db: aiosqlite.Connection, tenant_id: str
+) -> list[dict[str, Any]]:
+    """3c28450d — all non-expired web sessions for a tenant, most-recently-seen
+    first, for the active-sessions view."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    async with db.execute(
+        "SELECT * FROM user_sessions WHERE tenant_id = ? AND expires_at > ? "
+        "ORDER BY COALESCE(last_seen_at, created_at) DESC",
+        (tenant_id, now),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def touch_user_session(
+    db: aiosqlite.Connection, session_id: str
+) -> None:
+    """3c28450d — bump last_seen_at so the active-sessions view shows recency."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE user_sessions SET last_seen_at = ? WHERE id = ?", (now, session_id)
+    )
+    await db.commit()
+
+
+async def revoke_user_session(
+    db: aiosqlite.Connection, session_id: str, tenant_id: str
+) -> bool:
+    """3c28450d — delete a session only if it belongs to ``tenant_id`` (so a user
+    can never revoke another tenant's session). Returns True if a row was
+    removed."""
+    cur = await db.execute(
+        "DELETE FROM user_sessions WHERE id = ? AND tenant_id = ?",
+        (session_id, tenant_id),
+    )
+    await db.commit()
+    return (cur.rowcount or 0) > 0
+
+
+async def enqueue_provision(
+    db: aiosqlite.Connection, tenant_id: str, last_error: str | None = None
+) -> None:
+    """4c559d4e — record a tenant needing (re)provisioning. Bumps attempts and
+    resets status to 'pending' so a background drain can retry it later."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async with db.execute(
+        "SELECT attempts FROM provision_queue WHERE tenant_id = ?", (tenant_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        await db.execute(
+            "INSERT INTO provision_queue "
+            "(tenant_id, status, attempts, last_error, updated_at) "
+            "VALUES (?, 'pending', 1, ?, ?)",
+            (tenant_id, last_error, now),
+        )
+    else:
+        await db.execute(
+            "UPDATE provision_queue SET status = 'pending', attempts = attempts + 1, "
+            "last_error = ?, updated_at = ? WHERE tenant_id = ?",
+            (last_error, now, tenant_id),
+        )
+    await db.commit()
+
+
+async def mark_provision_done(db: aiosqlite.Connection, tenant_id: str) -> None:
+    """4c559d4e — mark a tenant's provisioning complete (clears it from pending)."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE provision_queue SET status = 'done', updated_at = ? WHERE tenant_id = ?",
+        (now, tenant_id),
+    )
+    await db.commit()
+
+
+async def get_pending_provisions(
+    db: aiosqlite.Connection, limit: int = 50
+) -> list[dict[str, Any]]:
+    """4c559d4e — tenants still awaiting provisioning, oldest first."""
+    async with db.execute(
+        "SELECT * FROM provision_queue WHERE status = 'pending' "
+        "ORDER BY created_at ASC LIMIT ?",
+        (int(limit),),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def count_pending_provisions(db: aiosqlite.Connection) -> int:
+    """4c559d4e — number of tenants awaiting (re)provisioning."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM provision_queue WHERE status = 'pending'"
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def upsert_graph_entities(
+    db: aiosqlite.Connection,
+    project_id: str,
+    entities: list[dict[str, Any]],
+    cap: int = 500,
+) -> int:
+    """c00b1ccf — replace a project's cached graph snapshot with up to ``cap``
+    entities (each: qualified_name + optional file/kind/signature). Returns the
+    number stored. Entities beyond the cap are dropped."""
+    cap = max(0, int(cap))
+    await db.execute(
+        "DELETE FROM codebase_graph_entities WHERE project_id = ?", (project_id,)
+    )
+    stored = 0
+    for ent in (entities or [])[:cap]:
+        qn = str(ent.get("qualified_name") or ent.get("name") or "").strip()
+        if not qn:
+            continue
+        await db.execute(
+            "INSERT INTO codebase_graph_entities "
+            "(id, project_id, qualified_name, file, kind, signature) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (_new_id(), project_id, qn,
+             (ent.get("file") or None), (ent.get("kind") or None),
+             (ent.get("signature") or None)),
+        )
+        stored += 1
+    await db.commit()
+    return stored
+
+
+async def count_graph_entities(db: aiosqlite.Connection, project_id: str) -> int:
+    """c00b1ccf — number of cached graph entities for a project."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM codebase_graph_entities WHERE project_id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def search_graph_entities(
+    db: aiosqlite.Connection, project_id: str, query: str, limit: int = 10
+) -> list[dict[str, Any]]:
+    """c00b1ccf — keyword search over a project's cached graph snapshot. Matches
+    tokens (>=3 chars) of ``query`` against qualified_name/file. Returns entity
+    rows (each carrying ``file``) for handoff code-pointer enrichment."""
+    import re as _re
+    tokens = [t for t in _re.split(r"[^A-Za-z0-9_]+", (query or "")) if len(t) >= 3]
+    if not tokens:
+        return []
+    clauses: list[str] = []
+    params: list[Any] = [project_id]
+    for tok in tokens[:6]:
+        clauses.append("(qualified_name LIKE ? OR file LIKE ?)")
+        like = f"%{tok}%"
+        params.extend([like, like])
+    sql = (
+        "SELECT * FROM codebase_graph_entities WHERE project_id = ? AND ("
+        + " OR ".join(clauses)
+        + ") LIMIT ?"
+    )
+    params.append(int(limit))
+    async with db.execute(sql, params) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# 2976e168 — GENERIC POINTER PRIMITIVE persistence (sprint_item_pointers)
+# ---------------------------------------------------------------------------
+
+async def add_sprint_item_pointer(
+    db: aiosqlite.Connection,
+    project_id: str,
+    sprint_item_id: str,
+    source_type: str,
+    targets: list[dict[str, Any]],
+    label: str | None = None,
+) -> dict[str, Any]:
+    """2976e168 — persist a GENERIC POINTER on a sprint item; return the stored row.
+
+    Validates the ``{source_type, targets:[{uri, selector, subSelector?}], label?}``
+    shape via :mod:`meridian.pointers` (raising ``ValueError`` on a malformed
+    pointer BEFORE any write), serializes ``targets`` to the JSON column, and
+    inserts one ``sprint_item_pointers`` row. ``targets`` is an ARRAY (native
+    multi-file); the composite shape is stored as JSON, NOT per-domain columns.
+    The returned dict is the deserialized pointer (targets back as a list).
+
+    psycopg3: ``?`` placeholders are converted to ``%s`` by the adapter; the
+    shared connection is autocommit on Postgres, and ``commit()`` is a real
+    flush on aiosqlite.
+    """
+    from ..pointers import (  # noqa: PLC0415 — avoid an import cycle at module load
+        validate_pointer,
+        serialize_targets,
+        row_to_pointer,
+    )
+
+    normalized = validate_pointer(
+        {"source_type": source_type, "targets": targets, "label": label}
+    )
+    pid = _new_id()
+    targets_json = serialize_targets(normalized["targets"])
+    await db.execute(
+        "INSERT INTO sprint_item_pointers "
+        "(id, project_id, sprint_item_id, source_type, targets, label) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            pid, project_id, sprint_item_id,
+            normalized["source_type"], targets_json, label,
+        ),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM sprint_item_pointers WHERE id = ?", (pid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row_to_pointer(_row_to_dict(row) or {})
+
+
+async def get_sprint_item_pointers(
+    db: aiosqlite.Connection, sprint_item_id: str
+) -> list[dict[str, Any]]:
+    """2976e168 — return all pointers on a sprint item (oldest first).
+
+    Each row's JSON ``targets`` column is deserialized back into a list, so the
+    caller gets the full pointer shape plus its id / source_type / label /
+    created_at.
+    """
+    from ..pointers import row_to_pointer  # noqa: PLC0415
+    async with db.execute(
+        "SELECT * FROM sprint_item_pointers WHERE sprint_item_id = ? "
+        "ORDER BY created_at ASC, id ASC",
+        (sprint_item_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [row_to_pointer(_row_to_dict(r) or {}) for r in rows if r is not None]
+
+
+async def delete_sprint_item_pointer(
+    db: aiosqlite.Connection, pointer_id: str
+) -> bool:
+    """2976e168 — delete one pointer by id. Return True if a row was removed."""
+    async with db.execute(
+        "SELECT 1 FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+    ) as cur:
+        existed = await cur.fetchone() is not None
+    await db.execute(
+        "DELETE FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+    )
+    await db.commit()
+    return existed
+
+
 async def delete_api_tokens_by_label(
     db: aiosqlite.Connection,
     tenant_id: str,
     label: str,
+    exclude_id: str | None = None,
 ) -> int:
     """Delete all tokens with a given label for a tenant. Returns count deleted.
     Used so label acts as a unique slot -- regenerating hooks-installer token
-    doesn't leave stale tokens that cause 401 loops."""
-    cur = await db.execute(
-        "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ?",
-        (tenant_id, label),
-    )
+    doesn't leave stale tokens that cause 401 loops.
+
+    ``exclude_id`` (0e9bb6ef) — when set, the row with this id is preserved. This
+    lets a caller mint the replacement token FIRST and then prune the tenant's
+    older same-label tokens, so there is never an instant with zero valid keys
+    (create-new-then-revoke-old ordering). Placeholders are ``?`` (the psycopg3
+    adapter rewrites ``?`` -> ``%s``), so this stays SQLite+Postgres compatible."""
+    if exclude_id is not None:
+        cur = await db.execute(
+            "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ? AND id != ?",
+            (tenant_id, label, exclude_id),
+        )
+    else:
+        cur = await db.execute(
+            "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ?",
+            (tenant_id, label),
+        )
     await db.commit()
     return cur.rowcount
 
@@ -5513,6 +6528,7 @@ async def claim_file(
     *,
     symbol: str | None = None,
     ttl_hours: int = _FILE_LOCK_TTL_HOURS,
+    mode: str = "write",
 ) -> dict[str, Any]:
     """Claim a file path for a session, auto-releasing expired locks first.
 
@@ -5522,11 +6538,38 @@ async def claim_file(
     anchors for that symbol are preferred but file-level anchors (no symbol)
     are always included. Empty when none. Additive — existing callers are
     unaffected.
+
+    ffa03655 — ``mode`` selects the claim grain. ``write`` (default, legacy) is
+    an EXCLUSIVE lock: it blocks other writers and is itself blocked by any other
+    session's live read claim ("no lock on an open door" for reads, exclusion for
+    writes). ``read`` is a SHARED claim: many sessions can hold a read claim on
+    the same file concurrently (zero false contention for parallel reader agents),
+    blocked only by another session's exclusive write lock.
     """
     normalized = _normalize_file_path(file_path)
     if not normalized:
         raise ValueError("file_path is required")
     await expire_file_locks(db)
+    await expire_file_read_claims(db)
+    _mode = "read" if str(mode or "write").lower() == "read" else "write"
+    if _mode == "read":
+        return await _claim_file_read(db, normalized, session_id, ttl_hours, symbol)
+    # ffa03655 — exclusive write waits for readers: another session's live read
+    # claim blocks a write claim.
+    _readers = await _other_read_claims(db, normalized, session_id)
+    if _readers:
+        return {
+            "claimed": False,
+            "reason": "read_locked",
+            "claim_mode": "write",
+            "file_path": normalized,
+            "session_id": session_id,
+            "read_claims": [r.get("session_id") for r in _readers],
+            "message": (
+                f"Cannot write-claim {normalized}: {len(_readers)} reader(s) hold a "
+                "shared read claim. Wait for readers to release, or read-claim instead."
+            ),
+        }
     # 63b030a6 — file ⊃ symbol hierarchy: a whole-file lock conflicts with any
     # live symbol claim on the file held by another session. Block here so the
     # coarser grain can't silently stomp a finer one.
@@ -5612,6 +6655,7 @@ async def claim_file(
         }
     return {
         "claimed": True,
+        "claim_mode": "write",
         "file_path": normalized,
         "session_id": lock.get("session_id"),
         "claimed_at": lock.get("claimed_at"),
@@ -5622,6 +6666,95 @@ async def claim_file(
         # 777f26b0 — decisions with code_anchor matching this file path.
         "decision_notes": await _decision_notes_for_session_file(
             db, session_id, normalized
+        ),
+    }
+
+
+async def expire_file_read_claims(db: aiosqlite.Connection) -> None:
+    """ffa03655 — drop read claims whose TTL has lapsed (mirrors expire_file_locks)."""
+    await db.execute(
+        "DELETE FROM file_read_claims WHERE expires_at < datetime('now')"
+    )
+    await db.commit()
+
+
+async def _other_read_claims(
+    db: aiosqlite.Connection, file_path: str, session_id: str
+) -> list[dict[str, Any]]:
+    """Live read claims on ``file_path`` held by sessions other than this one."""
+    async with db.execute(
+        "SELECT * FROM file_read_claims WHERE file_path = ? AND session_id != ?",
+        (file_path, session_id),
+    ) as cur:
+        return [_row_to_dict(r) for r in await cur.fetchall()]
+
+
+async def _all_read_claims(
+    db: aiosqlite.Connection, file_path: str
+) -> list[dict[str, Any]]:
+    async with db.execute(
+        "SELECT * FROM file_read_claims WHERE file_path = ?", (file_path,)
+    ) as cur:
+        return [_row_to_dict(r) for r in await cur.fetchall()]
+
+
+async def _claim_file_read(
+    db: aiosqlite.Connection,
+    normalized: str,
+    session_id: str,
+    ttl_hours: int,
+    symbol: str | None,
+) -> dict[str, Any]:
+    """ffa03655 — acquire (or refresh) a SHARED read claim on ``normalized``.
+
+    Blocked only by another session's exclusive write lock; multiple sessions may
+    hold a read claim on the same file at once.
+    """
+    async with db.execute(
+        "SELECT * FROM file_locks WHERE file_path = ?", (normalized,)
+    ) as cur:
+        wrow = _row_to_dict(await cur.fetchone())
+    if wrow and wrow.get("session_id") != session_id:
+        return {
+            "claimed": False,
+            "reason": "write_locked",
+            "claim_mode": "read",
+            "file_path": normalized,
+            "session_id": session_id,
+            "holder_session_id": wrow.get("session_id"),
+            "message": (
+                f"Cannot read-claim {normalized}: it is write-locked by another "
+                "live session. Wait for the writer to release."
+            ),
+        }
+    async with db.execute(
+        "SELECT id FROM file_read_claims WHERE file_path = ? AND session_id = ?",
+        (normalized, session_id),
+    ) as cur:
+        existing = _row_to_dict(await cur.fetchone())
+    if existing:
+        await db.execute(
+            "UPDATE file_read_claims SET claimed_at = datetime('now'), "
+            "expires_at = datetime('now', ? || ' hours') WHERE id = ?",
+            (str(ttl_hours), existing["id"]),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO file_read_claims (id, file_path, session_id, claimed_at, expires_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now', ? || ' hours'))",
+            (_new_id(), normalized, session_id, str(ttl_hours)),
+        )
+    await db.commit()
+    readers = await _all_read_claims(db, normalized)
+    return {
+        "claimed": True,
+        "claim_mode": "read",
+        "file_path": normalized,
+        "session_id": session_id,
+        "readers": [r.get("session_id") for r in readers],
+        "reader_count": len(readers),
+        "code_notes": await _code_notes_for_session_file(
+            db, session_id, normalized, symbol
         ),
     }
 
@@ -5646,17 +6779,27 @@ async def release_file(
         "WHERE file_path = ? AND session_id = ? AND released_at IS NULL",
         (normalized, session_id),
     )
+    # ffa03655 — also drop any shared read claim this session holds on the file.
+    read_cursor = await db.execute(
+        "DELETE FROM file_read_claims WHERE file_path = ? AND session_id = ?",
+        (normalized, session_id),
+    )
     await db.commit()
-    return cursor.rowcount > 0 or sym_cursor.rowcount > 0
+    return cursor.rowcount > 0 or sym_cursor.rowcount > 0 or read_cursor.rowcount > 0
 
 
 async def release_file_locks_for_session(
     db: aiosqlite.Connection,
     session_id: str,
 ) -> int:
-    """Release every file lock held by a session."""
+    """Release every file lock held by a session (write locks + read claims)."""
     cursor = await db.execute(
         "DELETE FROM file_locks WHERE session_id = ?",
+        (session_id,),
+    )
+    # ffa03655 — also drop the session's shared read claims on cleanup.
+    await db.execute(
+        "DELETE FROM file_read_claims WHERE session_id = ?",
         (session_id,),
     )
     await db.commit()
@@ -5727,6 +6870,7 @@ async def get_file_claims(
     """
     normalized = _normalize_file_path(file_path)
     await expire_file_locks(db)
+    await expire_file_read_claims(db)
     async with db.execute(
         "SELECT fl.*, s.name AS session_name FROM file_locks fl "
         "LEFT JOIN sessions s ON s.id = fl.session_id "
@@ -5738,6 +6882,8 @@ async def get_file_claims(
         "file_path": normalized,
         "file_lock": _row_to_dict(row),
         "symbol_claims": await get_symbol_claims(db, normalized),
+        # ffa03655 — shared read claims held on this file (many concurrent).
+        "read_claims": await _all_read_claims(db, normalized),
     }
     if project_id:
         result["code_notes"] = await get_code_notes_for_file(
@@ -6312,6 +7458,241 @@ async def get_parallelizable_groups(
     }
 
 
+async def analyze_sprint(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """e77f09d1 — synthesize a structured planning brief for the current sprint.
+
+    One call combines what a planner otherwise assembles from four:
+      * parallelizability — conflict-free batches from
+        :func:`get_parallelizable_groups` (group_count, max fan-out, blocked).
+      * dependency chains — ``depends_on`` walked to the root for each open item.
+      * resource conflicts — open items whose ``touches_resources`` intersect
+        (why they can't co-schedule).
+      * stalls — open items with a non-zero ``stall_count``.
+
+    Returns a single dict with a human ``summary`` line and a
+    ``recommended_strategy`` ('parallel' when any group holds >1 item).
+    """
+    groups_info = await get_parallelizable_groups(db, project_id, version=version)
+    items = await get_sprint_items(db, project_id)
+    if version is not None:
+        items = [it for it in items if it.get("version") == version]
+    _open = {"pending", "todo", "in_progress"}
+    open_items = [it for it in items if (it.get("status") or "pending") in _open]
+    by_id = {it["id"]: it for it in items}
+
+    # Dependency chains: walk depends_on to the root for each open dependent item.
+    def _chain_for(item: dict[str, Any]) -> list[dict[str, Any]]:
+        chain: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cur: dict[str, Any] | None = item
+        while cur is not None and cur["id"] not in seen:
+            seen.add(cur["id"])
+            chain.append({
+                "id": cur["id"],
+                "title": cur.get("title", ""),
+                "status": cur.get("status"),
+            })
+            dep = cur.get("depends_on")
+            cur = by_id.get(dep) if dep else None
+        chain.reverse()
+        return chain
+
+    chains = [
+        _chain_for(it) for it in open_items if it.get("depends_on")
+    ]
+    chains = [c for c in chains if len(c) > 1]
+    longest_chain = max((len(c) for c in chains), default=1)
+
+    # Resource/file conflicts among open items (shared touches_resources).
+    res_map: dict[str, list[str]] = {}
+    for it in open_items:
+        for res in parse_touches_resources(it.get("touches_resources")):
+            res_map.setdefault(res, []).append(it["id"])
+    conflicts = [
+        {"resource": res, "item_ids": ids}
+        for res, ids in sorted(res_map.items()) if len(ids) > 1
+    ]
+
+    stalls = [
+        {"id": it["id"], "title": it.get("title", ""),
+         "stall_count": it.get("stall_count") or 0}
+        for it in open_items if (it.get("stall_count") or 0) > 0
+    ]
+
+    groups = groups_info.get("groups", [])
+    max_group = max((len(g) for g in groups), default=0)
+    strategy = "parallel" if max_group > 1 else "sequential"
+    summary = (
+        f"{groups_info.get('eligible_count', 0)} eligible item(s) in "
+        f"{groups_info.get('group_count', 0)} group(s) (max {max_group} parallel); "
+        f"longest dependency chain {longest_chain}; {len(conflicts)} resource "
+        f"conflict(s); {len(stalls)} stalled; "
+        f"{len(groups_info.get('blocked', []))} blocked."
+    )
+    return {
+        "version": version,
+        "summary": summary,
+        "recommended_strategy": strategy,
+        "parallelism": {
+            "group_count": groups_info.get("group_count", 0),
+            "eligible_count": groups_info.get("eligible_count", 0),
+            "max_parallel": max_group,
+            "undeclared_count": groups_info.get("undeclared_count", 0),
+            "groups": [
+                [{"id": it["id"], "title": it.get("title", "")} for it in g]
+                for g in groups
+            ],
+        },
+        "dependency_chains": chains,
+        "longest_chain": longest_chain,
+        "file_conflicts": conflicts,
+        "stalls": stalls,
+        "blocked": groups_info.get("blocked", []),
+        "running": groups_info.get("running", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Parallel-coordination primitives (Wave 4): findings + messaging + barrier.
+# ---------------------------------------------------------------------------
+
+async def store_finding(
+    db: aiosqlite.Connection,
+    project_id: str,
+    content: str,
+    *,
+    session_id: str | None = None,
+    key: str | None = None,
+    title: str | None = None,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    """c35370cc — persist a per-task intermediate result to ``session_findings``.
+
+    Parallel reader agents write findings that survive session boundaries; an
+    orchestrator or writer agent reads them back via :func:`get_findings`. ``key``
+    is an optional bucket (e.g. a subsystem name) for scoped retrieval.
+    """
+    fid = _new_id()
+    await db.execute(
+        "INSERT INTO session_findings "
+        "(id, project_id, session_id, key, title, content, task_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (fid, project_id, session_id, key, title, content, task_id),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM session_findings WHERE id = ?", (fid,)
+    ) as cur:
+        return _row_to_dict(await cur.fetchone()) or {}
+
+
+async def get_findings(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    key: str | None = None,
+    session_id: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """c35370cc — read stored findings for a project (newest first), optionally
+    scoped by ``key`` and/or ``session_id``."""
+    sql = "SELECT * FROM session_findings WHERE project_id = ?"
+    params: list[Any] = [project_id]
+    if key is not None:
+        sql += " AND key = ?"
+        params.append(key)
+    if session_id is not None:
+        sql += " AND session_id = ?"
+        params.append(session_id)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(int(limit))
+    async with db.execute(sql, params) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+async def send_message(
+    db: aiosqlite.Connection,
+    project_id: str,
+    to_session_id: str,
+    payload: str,
+    *,
+    from_session_id: str | None = None,
+    kind: str | None = None,
+) -> dict[str, Any]:
+    """d3a3a01d — enqueue an actor-model message to another session."""
+    mid = _new_id()
+    await db.execute(
+        "INSERT INTO session_messages "
+        "(id, project_id, from_session_id, to_session_id, kind, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (mid, project_id, from_session_id, to_session_id, kind, payload),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM session_messages WHERE id = ?", (mid,)
+    ) as cur:
+        return _row_to_dict(await cur.fetchone()) or {}
+
+
+async def receive_messages(
+    db: aiosqlite.Connection,
+    session_id: str,
+    *,
+    mark_read: bool = True,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """d3a3a01d — fetch unread messages addressed to ``session_id`` (oldest
+    first) and, by default, mark them read so the next poll only sees new ones."""
+    async with db.execute(
+        "SELECT * FROM session_messages WHERE to_session_id = ? AND read_at IS NULL "
+        "ORDER BY created_at ASC, id ASC LIMIT ?",
+        (session_id, int(limit)),
+    ) as cur:
+        rows = [_row_to_dict(r) for r in await cur.fetchall()]
+    if mark_read and rows:
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        await db.execute(
+            f"UPDATE session_messages SET read_at = datetime('now') WHERE id IN ({placeholders})",
+            ids,
+        )
+        await db.commit()
+    return rows
+
+
+async def idle_until_all_done(
+    db: aiosqlite.Connection,
+    session_ids: list[str],
+) -> dict[str, Any]:
+    """d3a3a01d — non-blocking barrier check across sibling sessions.
+
+    Returns ``{all_done, pending, statuses}``. A session counts as done when it
+    is closed/archived (or missing); active/idle sessions are still running. The
+    server can't block, so the caller polls until ``all_done`` is True — the
+    A2A-compatible "wait for X, Y, Z to finish" primitive.
+    """
+    statuses: dict[str, Any] = {}
+    pending: list[str] = []
+    for sid in session_ids or []:
+        async with db.execute(
+            "SELECT status FROM sessions WHERE id = ?", (sid,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            statuses[sid] = "missing"
+            continue
+        status = row["status"] if isinstance(row, dict) else row[0]
+        statuses[sid] = status
+        if status in ("active", "idle"):
+            pending.append(sid)
+    return {"all_done": not pending, "pending": pending, "statuses": statuses}
+
+
 # ---------------------------------------------------------------------------
 # Symbol-level parallel protection (4bac57ff)
 # ---------------------------------------------------------------------------
@@ -6735,6 +8116,105 @@ async def delete_blog_post(db: aiosqlite.Connection, post_id: str) -> bool:
     return cur.rowcount > 0
 
 
+_BLOG_STATUSES = ("draft", "published", "archived")
+
+
+def _blog_url(post: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Attach a computed ``url`` (``/blog/<slug>``) to a blog-post dict."""
+    if post is None:
+        return None
+    slug = post.get("slug")
+    post["url"] = f"/blog/{slug}" if slug else None
+    return post
+
+
+async def save_blog_post(
+    db: aiosqlite.Connection,
+    title: str,
+    body: str = "",
+    *,
+    status: str = "draft",
+    tenant_id: str | None = None,
+    slug: str | None = None,
+    post_id: str | None = None,
+) -> dict[str, Any]:
+    """8843250f — create (or update, when ``post_id`` is given) a
+    workspace-scoped blog post with a draft|published|archived lifecycle.
+
+    Workspace-scoped by ``tenant_id`` like ``add_workspace_note``. Reuses the
+    existing ``_slugify_title`` / ``_unique_blog_slug`` helpers. Sets
+    ``published_at`` the first time a post becomes 'published'. Returns the
+    stored row with a computed ``/blog/<slug>`` ``url`` field.
+    """
+    title = (title or "").strip() or "Untitled"
+    status = status if status in _BLOG_STATUSES else "draft"
+
+    if post_id:
+        existing = await get_blog_post(db, post_id)
+        if existing is None:
+            raise ValueError("blog post not found")
+        new_slug = await _unique_blog_slug(
+            db, _slugify_title(slug or existing.get("slug") or title), exclude_id=post_id
+        )
+        # First publish stamps published_at; keep it once set.
+        pub = existing.get("published_at")
+        pub_sql = ", published_at = COALESCE(published_at, datetime('now'))" if status == "published" else ""
+        await db.execute(
+            "UPDATE blog_posts SET title = ?, body_md = ?, slug = ?, status = ?, "
+            "tenant_id = ?, updated_at = datetime('now')" + pub_sql + " WHERE id = ?",
+            (title, body or "", new_slug, status, tenant_id, post_id),
+        )
+        await db.commit()
+        return _blog_url(await get_blog_post(db, post_id))
+
+    bid = _new_id()
+    new_slug = await _unique_blog_slug(db, _slugify_title(slug or title))
+    if status == "published":
+        await db.execute(
+            "INSERT INTO blog_posts (id, title, slug, body_md, status, tenant_id, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            (bid, title, new_slug, body or "", status, tenant_id),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO blog_posts (id, title, slug, body_md, status, tenant_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (bid, title, new_slug, body or "", status, tenant_id),
+        )
+    await db.commit()
+    return _blog_url(await get_blog_post(db, bid))
+
+
+async def get_blog_posts(
+    db: aiosqlite.Connection,
+    tenant_id: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """8843250f — list workspace-scoped blog posts, newest first.
+
+    Scoped to ``tenant_id`` (like ``get_workspace_notes``) and optionally
+    filtered by ``status`` (draft|published|archived). Each row carries a
+    computed ``url`` (``/blog/<slug>``) rather than a stored column.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status in _BLOG_STATUSES:
+        clauses.append("status = ?")
+        params.append(status)
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    if scope:
+        clauses.append(scope)
+        params.extend(scope_params)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db.execute(
+        "SELECT * FROM blog_posts" + where
+        + " ORDER BY COALESCE(published_at, updated_at) DESC, created_at DESC",
+        params or None,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_blog_url(r) for r in (_row_to_dict(row) for row in rows) if r]  # type: ignore[misc]
+
+
 # ---------------------------------------------------------------------------
 # Active worktrees — per-session git worktree tracking
 # ---------------------------------------------------------------------------
@@ -6950,6 +8430,71 @@ async def get_pinned_decisions(
     # band. urgent (0) < normal (1) < low (2).
     decisions.sort(key=lambda d: _DECISION_PRIORITY_RANK.get(d["priority"], 1))  # type: ignore[index,union-attr]
     return decisions  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# 0b711a9d — strategic insights (first-class knowledge type)
+# ---------------------------------------------------------------------------
+
+_INSIGHT_HORIZONS = ("permanent", "year", "quarter")
+
+
+async def create_insight(
+    db: aiosqlite.Connection,
+    project_id: str,
+    title: str,
+    body: str,
+    horizon: str = "quarter",
+    tags: "list | str | None" = None,
+) -> dict[str, Any]:
+    """Create a durable strategic insight. horizon is coerced to a valid value
+    (permanent|year|quarter, default quarter). tags may be a list or a
+    comma-string; stored comma-joined."""
+    iid = _new_id()
+    _horizon = horizon if horizon in _INSIGHT_HORIZONS else "quarter"
+    if isinstance(tags, (list, tuple)):
+        _tags = ",".join(str(t).strip() for t in tags if str(t).strip()) or None
+    else:
+        _tags = (str(tags).strip() or None) if tags else None
+    await db.execute(
+        "INSERT INTO insights (id, project_id, title, body, horizon, tags) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (iid, project_id, title, body or "", _horizon, _tags),
+    )
+    await db.commit()
+    _publish_project_event(project_id, "insight_added", {"insight_id": iid, "horizon": _horizon})
+    return (await get_insight(db, iid)) or {"id": iid}
+
+
+async def get_insight(db: aiosqlite.Connection, insight_id: str) -> dict[str, Any] | None:
+    """Fetch a single insight row by id."""
+    async with db.execute("SELECT * FROM insights WHERE id = ?", (insight_id,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_insights(
+    db: aiosqlite.Connection,
+    project_id: str,
+    horizon: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return active insights for a project, newest first. Optional horizon filter
+    (permanent|year|quarter); any other value is ignored (returns all horizons)."""
+    if horizon in _INSIGHT_HORIZONS:
+        sql = (
+            "SELECT * FROM insights WHERE project_id = ? AND horizon = ? "
+            "AND status = 'active' ORDER BY created_at DESC"
+        )
+        args: tuple[Any, ...] = (project_id, horizon)
+    else:
+        sql = (
+            "SELECT * FROM insights WHERE project_id = ? AND status = 'active' "
+            "ORDER BY created_at DESC"
+        )
+        args = (project_id,)
+    async with db.execute(sql, args) as cur:
+        rows = await cur.fetchall()
+    return [d for d in (_row_to_dict(r) for r in rows) if d is not None]
 
 
 async def get_decisions_for_file(
@@ -7768,6 +9313,32 @@ async def get_project_note(
     return _row_to_dict(row)
 
 
+async def get_project_document_by_source(
+    db: aiosqlite.Connection, project_id: str, source: str
+) -> dict[str, Any] | None:
+    """e9addcb0 — fetch a ``kind='document'`` note by its stable source identity.
+
+    ``source`` is the document's stable handle — a file path or a Drive file id —
+    set by :func:`ingest_document`. Re-ingesting the same document targets this
+    row so an upsert refreshes it in place instead of creating a duplicate.
+
+    Scoped to (``project_id``, ``source``, ``note_kind='document'``): a plain
+    note that happens to share a source string is never matched. Returns the
+    newest matching row (oldest are legacy pre-upsert duplicates) or None.
+    """
+    src = (source or "").strip()
+    if not src:
+        return None
+    async with db.execute(
+        "SELECT * FROM project_notes "
+        "WHERE project_id = ? AND note_kind = 'document' AND source = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (project_id, src),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
 async def ingest_document(
     db: aiosqlite.Connection,
     project_id: str,
@@ -7792,6 +9363,15 @@ async def ingest_document(
     ``doc_ingest.DOC_BODY_MAX_CHARS`` (truncated with a clear "…[truncated]"
     marker if longer; the kept prefix stays full-text searchable). The note is
     stored via :func:`add_project_note` with ``kind='document'`` and ``source``.
+
+    e9addcb0 — **upsert by stable identity.** When a ``source`` resolves (an
+    explicit ``source``, else ``file_path``), re-ingesting the same document
+    UPDATES the existing ``kind='document'`` note for this project in place
+    (refreshing body / title / tags / ``updated_at``) instead of creating a
+    duplicate — so re-touching a path or Drive file id yields one row, not N.
+    When no source can be resolved (``content`` with no ``source``/``file_path``)
+    the document is not identifiable, so it always inserts a fresh note — two
+    anonymous ingests never silently merge.
 
     Meridian is a coordination store, not an LLM: this never summarizes. Pass a
     summary as ``content`` if you want one stored instead of the raw text.
@@ -7821,6 +9401,26 @@ async def ingest_document(
             doc_title = "Untitled document"
 
     capped = cap_body(body or "")
+    stored_source = (ingest_source or "").strip() or None
+
+    # e9addcb0 — upsert by stable identity: if this project already has a
+    # kind='document' note for the same source, refresh it in place instead of
+    # creating a duplicate. Only when a source resolves — an anonymous ingest
+    # (content with no source/file_path) can't be identified, so it inserts.
+    if stored_source is not None:
+        existing = await get_project_document_by_source(db, project_id, stored_source)
+        if existing is not None:
+            # tags is passed through as-is: None (caller omitted it) leaves the
+            # prior ingest's tags untouched; a value replaces them.
+            updated = await update_project_note(
+                db,
+                existing["id"],
+                title=doc_title,
+                body=capped,
+                tags=tags,
+            )
+            return updated or existing
+
     return await add_project_note(
         db,
         project_id,
@@ -7828,7 +9428,7 @@ async def ingest_document(
         capped,
         tags,
         kind="document",
-        source=(ingest_source or None),
+        source=stored_source,
     )
 
 
@@ -7907,6 +9507,77 @@ async def get_project_notes(
     async with db.execute(sql, params or None) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+def _note_relevance_score(
+    reference_count: int, age_days: float, has_decision_link: bool, read_count: int = 0
+) -> float:
+    """98890df1 — PageRank-ish note relevance. Reference/read counts pass through a
+    saturating transform so a heavily-referenced note ranks high without a single
+    outlier dominating; recency decays on a ~30-day scale. read_count stays 0 until
+    note-read tracking lands (semantic similarity is the pgvector Phase 2)."""
+    ref = 1.0 - 1.0 / (1.0 + max(0, reference_count))
+    rec = 1.0 / (1.0 + max(0.0, age_days) / 30.0)
+    read = 1.0 - 1.0 / (1.0 + max(0, read_count))
+    dec = 1.0 if has_decision_link else 0.0
+    return 0.45 * ref + 0.30 * rec + 0.15 * read + 0.10 * dec
+
+
+async def get_project_notes_ranked(
+    db: aiosqlite.Connection,
+    project_id: str,
+    tag: str | None = None,
+    query: str | None = None,
+    bodies: bool = False,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """98890df1 — like get_project_notes but ordered by a relevance score
+    (reference_count / recency / decision-link) instead of pure recency, so
+    heavily cross-referenced notes surface and stale ones sink. Each returned row
+    carries a ``relevance`` float."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+    where, params = _project_notes_where(db, project_id, tag, query)
+    # Fetch full rows (bodies are needed to count [[slug]] references) unpaged so
+    # scoring sees the whole corpus, then trim after ranking.
+    sql = f"SELECT * FROM project_notes WHERE {where}"
+    async with db.execute(sql, params or None) as cur:
+        rows = await cur.fetchall()
+    notes = [_row_to_dict(r) for r in rows if r is not None]
+    combined_bodies = " ".join((n.get("body") or "") for n in notes)
+    try:
+        decisions = await get_pinned_decisions(db, project_id)
+        decision_blob = " ".join((d.get("body") or "") for d in (decisions or []))
+    except Exception:  # noqa: BLE001
+        decision_blob = ""
+    now = datetime.now(timezone.utc)
+    for n in notes:
+        slug = n.get("slug") or ""
+        marker = f"[[{slug}]]"
+        # count references from OTHER notes (subtract self-references in own body)
+        ref_count = 0
+        if slug:
+            ref_count = combined_bodies.count(marker) - (n.get("body") or "").count(marker)
+        has_dec = bool(slug) and (marker in decision_blob)
+        age_days = 0.0
+        created = n.get("created_at")
+        if created:
+            try:
+                cdt = datetime.strptime(
+                    str(created)[:19], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+                age_days = max(0.0, (now - cdt).total_seconds() / 86400.0)
+            except (ValueError, TypeError):
+                pass
+        n["relevance"] = round(
+            _note_relevance_score(max(0, ref_count), age_days, has_dec), 4
+        )
+    notes.sort(key=lambda x: (x.get("relevance", 0.0), x.get("created_at") or ""), reverse=True)
+    if not bodies:
+        for n in notes:
+            n.pop("body", None)
+    if limit is not None:
+        notes = notes[: max(1, min(int(limit), 500))]
+    return notes
 
 
 async def get_project_notes_page(
@@ -8423,7 +10094,9 @@ async def get_workspace_settings(
     _cols = (
         "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
         "log_task_sprint_nudge_threshold, handoff_template, "
-        "execution_mode_default, code_intel_enabled_default, updated_at "
+        "execution_mode_default, code_intel_enabled_default, "
+        "loop_enabled_default, auto_refresh_enabled, refresh_interval_turns, "
+        "refresh_triggers, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -8444,6 +10117,21 @@ async def get_workspace_settings(
     # projects keep their own built-in default); a value ⇒ seed new projects.
     _emode = data.get("execution_mode_default")
     _ci_default = data.get("code_intel_enabled_default")
+    # 76cf8bda — /loop auto-continue workspace default. Missing column/row ⇒
+    # True (Meridian sessions default to auto-continue); a stored 0 turns it off.
+    _loop_default = data.get("loop_enabled_default")
+    # bf51b12e — planner context-refresh config. refresh_triggers is a JSON list
+    # (NULL ⇒ None ⇒ hook uses its built-in default trigger set).
+    _refresh_triggers_raw = data.get("refresh_triggers")
+    _refresh_triggers: list[str] | None = None
+    if _refresh_triggers_raw:
+        try:
+            _decoded = json.loads(_refresh_triggers_raw)
+            if isinstance(_decoded, list):
+                _refresh_triggers = [str(t) for t in _decoded]
+        except Exception:  # noqa: BLE001 — malformed row ⇒ fall back to default
+            _refresh_triggers = None
+    _interval = data.get("refresh_interval_turns")
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -8454,6 +10142,10 @@ async def get_workspace_settings(
         "handoff_template": data.get("handoff_template"),
         "execution_mode_default": _emode if _emode in ("autonomous", "interactive") else None,
         "code_intel_enabled_default": (None if _ci_default is None else bool(_ci_default)),
+        "loop_enabled_default": (True if _loop_default is None else bool(_loop_default)),
+        "auto_refresh_enabled": bool(data.get("auto_refresh_enabled")),
+        "refresh_interval_turns": (int(_interval) if _interval is not None else 10) or 10,
+        "refresh_triggers": _refresh_triggers,
         "updated_at": data.get("updated_at"),
     }
 
@@ -8468,6 +10160,10 @@ async def update_workspace_settings(
     handoff_template: str | None = None,
     execution_mode_default: str | None = None,
     code_intel_enabled_default: "bool | int | str | None" = None,
+    loop_enabled_default: "bool | int | str | None" = None,
+    auto_refresh_enabled: "bool | int | str | None" = None,
+    refresh_interval_turns: int | None = None,
+    refresh_triggers: "list[str] | str | None" = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -8514,6 +10210,28 @@ async def update_workspace_settings(
             params.append(None)
         else:
             params.append(1 if code_intel_enabled_default and code_intel_enabled_default not in ("0", "false", "False") else 0)
+    if loop_enabled_default is not None:
+        # 76cf8bda — /loop auto-continue default. Truthy/1 → 1, falsey/0 → 0.
+        updates.append("loop_enabled_default = ?")
+        params.append(1 if loop_enabled_default and loop_enabled_default not in ("0", "false", "False") else 0)
+    if auto_refresh_enabled is not None:
+        # bf51b12e — planner context-refresh toggle. Truthy/1 → 1, falsey/0 → 0.
+        updates.append("auto_refresh_enabled = ?")
+        params.append(1 if auto_refresh_enabled and auto_refresh_enabled not in ("0", "false", "False") else 0)
+    if refresh_interval_turns is not None:
+        # At least 1 turn between interval-based refreshes.
+        updates.append("refresh_interval_turns = ?")
+        params.append(max(1, int(refresh_interval_turns)))
+    if refresh_triggers is not None:
+        # A list ⇒ JSON-encode; "" clears (revert to default trigger set);
+        # any other string is stored verbatim (already JSON).
+        updates.append("refresh_triggers = ?")
+        if isinstance(refresh_triggers, list):
+            params.append(json.dumps(refresh_triggers))
+        elif isinstance(refresh_triggers, str):
+            params.append(refresh_triggers.strip() or None)
+        else:
+            params.append(None)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -8526,6 +10244,43 @@ async def update_workspace_settings(
         )
     await db.commit()
     return await get_workspace_settings(db, tenant_id=tenant_id)
+
+
+async def seed_workspace_settings_from_toml(db: aiosqlite.Connection) -> None:
+    """1d69d5d9 — seed the self-host singleton workspace_settings row from
+    meridian.toml (env > toml > default, via toml_config) on first boot. This is
+    what makes the 46c83e55 toml readers actually take effect. No-op when the
+    singleton row already exists (the DB is authoritative once configured) or
+    when no self-host config (a meridian.toml file or MERIDIAN_* env var) is
+    present. Fully guarded — a seed failure must never block server startup."""
+    try:
+        from .. import toml_config  # local: avoid import cycle at module load
+        _has_cfg = toml_config.load_toml() is not None or any(
+            os.environ.get(k) for k in (
+                "MERIDIAN_AUTO_REFRESH", "MERIDIAN_REFRESH_INTERVAL_TURNS",
+                "MERIDIAN_REFRESH_TRIGGERS", "MERIDIAN_LOOP_ENABLED",
+                "MERIDIAN_MAX_TURNS", "MERIDIAN_FILESYSTEM_ROOTS",
+            )
+        )
+        if not _has_cfg:
+            return
+        async with db.execute(
+            "SELECT id FROM workspace_settings WHERE id = ?", ("singleton",)
+        ) as cur:
+            if await cur.fetchone() is not None:
+                return  # already configured — the DB row wins over toml
+        refresh = toml_config.get_context_refresh_config()
+        defaults = toml_config.get_self_host_defaults()
+        await update_workspace_settings(
+            db,
+            auto_refresh_enabled=bool(refresh.get("auto_refresh_enabled")),
+            refresh_interval_turns=int(refresh.get("refresh_interval_turns") or 10),
+            refresh_triggers=refresh.get("refresh_triggers"),
+            loop_enabled_default=bool(defaults.get("loop_enabled_default", True)),
+            tenant_id=None,
+        )
+    except Exception:  # noqa: BLE001 — seeding must never block startup
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -8678,6 +10433,53 @@ async def pop_queued_session(
 
 
 # ---------------------------------------------------------------------------
+# 5efe254b — trusted handoff channel (projects.pending_goal)
+# ---------------------------------------------------------------------------
+
+
+async def set_pending_goal(
+    db: aiosqlite.Connection, project_id: str, goal: str | None
+) -> None:
+    """Persist the handoff /goal so the next start_session can surface it through
+    a trusted MCP tool result (keyed on project_id) instead of a copy-pasted,
+    spoofable chat string. Empty/None clears it. Read-once via pop_pending_goal."""
+    await db.execute(
+        "UPDATE projects SET pending_goal = ? WHERE id = ?",
+        ((goal or None), project_id),
+    )
+    await db.commit()
+
+
+async def get_pending_goal(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the stored handoff /goal, or None when nothing is pending."""
+    async with db.execute(
+        "SELECT pending_goal FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    val = row["pending_goal"] if isinstance(row, dict) else row[0]
+    return val or None
+
+
+async def pop_pending_goal(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the pending /goal and clear it (read-once) so start_session
+    surfaces it exactly once and a stale goal never resurfaces in a later
+    session."""
+    goal = await get_pending_goal(db, project_id)
+    if goal:
+        await db.execute(
+            "UPDATE projects SET pending_goal = NULL WHERE id = ?", (project_id,)
+        )
+        await db.commit()
+    return goal
+
+
+# ---------------------------------------------------------------------------
 # v3.1 — per-session checkpoint snapshots (sessions.checkpoint_data)
 # ---------------------------------------------------------------------------
 
@@ -8713,6 +10515,111 @@ async def get_session_checkpoint(
         return json.loads(raw)
     except (ValueError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# 5abf3e12 — per-session goal-compliance metric (sessions.goal_compliance)
+# ---------------------------------------------------------------------------
+
+
+async def compute_session_goal_compliance(
+    db: aiosqlite.Connection, project_id: str, session_id: str
+) -> dict[str, Any]:
+    """Measure whether a session's /goal item list was fully completed.
+
+    The /goal instructs an executor to "claim and execute the following sprint
+    items … you are DONE only when complete_sprint_item() has been called for
+    every listed item". This computes that compliance from the durable board
+    state, using ``sprint_items.actor`` as the link between a session and the
+    items it took on. ``actor`` is set by claim_sprint_item (COALESCE — the
+    first claimer wins) and OVERWRITTEN by complete_sprint_item to the completing
+    session (5823db0b). For the standard executor loop — where ONE session both
+    claims and completes each item — the claimer and completer are the same, so
+    this measures exactly that session's compliance. In a cross-session hand-off
+    (parallel / coordinator patterns) the item is reattributed to whichever
+    session called complete_sprint_item(): credit follows the completer, and a
+    claimer whose item is finalised by another session no longer counts it.
+    Attribution therefore reflects the FINAL owner of each item.
+
+    * ``listed`` (N): sprint items whose ``actor`` is this session at compute
+      time — the items it currently owns (claimed and/or completed). This
+      includes items left in any non-'done' terminal state (e.g. skipped /
+      failed / pushed), so an item this session owns but legitimately skipped
+      still counts toward N while never counting toward M.
+    * ``completed`` (M): of those, how many reached status 'done' (i.e. were
+      finished via complete_sprint_item()). Only 'done' counts as compliance.
+    * ``fully_completed``: True iff N > 0 and M == N (every taken-on item shipped).
+    * ``zero_listed``: True when N == 0 (the session claimed no items, so there is
+      nothing to have completed — ``fully_completed`` is False, not vacuously
+      True).
+    * ``compliance_pct``: round(100 * M / N) when N > 0 else 0.
+
+    Returns a plain dict (JSON-serialisable) so callers can store it verbatim on
+    ``sessions.goal_compliance`` and surface it in progress / handoff output.
+    """
+    async with db.execute(
+        "SELECT "
+        "  COUNT(*) AS listed, "
+        "  COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS completed "
+        "FROM sprint_items WHERE project_id = ? AND actor = ?",
+        (project_id, session_id),
+    ) as cur:
+        row = await cur.fetchone()
+    listed = int((row["listed"] if row else 0) or 0)
+    completed = int((row["completed"] if row else 0) or 0)
+    return {
+        "session_id": session_id,
+        "listed": listed,
+        "completed": completed,
+        "fully_completed": listed > 0 and completed == listed,
+        "zero_listed": listed == 0,
+        "compliance_pct": round(100 * completed / listed) if listed else 0,
+    }
+
+
+async def set_session_goal_compliance(
+    db: aiosqlite.Connection, session_id: str, metric: dict[str, Any]
+) -> None:
+    """Persist the computed goal-compliance metric on the session row (JSON text)."""
+    await db.execute(
+        "UPDATE sessions SET goal_compliance = ? WHERE id = ?",
+        (json.dumps(metric), session_id),
+    )
+    await db.commit()
+
+
+async def get_session_goal_compliance(
+    db: aiosqlite.Connection, session_id: str
+) -> dict[str, Any] | None:
+    """Return the stored goal-compliance metric for a session, or None."""
+    async with db.execute(
+        "SELECT goal_compliance FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    raw = row["goal_compliance"]
+    if not raw:
+        return None
+    if isinstance(raw, dict):  # Postgres may return parsed JSON
+        return raw
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+async def record_session_goal_compliance(
+    db: aiosqlite.Connection, project_id: str, session_id: str
+) -> dict[str, Any]:
+    """Compute the goal-compliance metric for a session and store it. Returns it.
+
+    Called at session end (generate_handoff) so every completed session leaves a
+    durable, queryable record of whether its /goal item list was fully done.
+    """
+    metric = await compute_session_goal_compliance(db, project_id, session_id)
+    await set_session_goal_compliance(db, session_id, metric)
+    return metric
 
 
 # ---------------------------------------------------------------------------
@@ -8756,6 +10663,31 @@ async def store_magic_token(
     )
     await db.commit()
     return {"id": tid, "email": email.lower(), "expires_at": expires_at}
+
+
+async def record_signup_attempt(
+    db: aiosqlite.Connection, ip_hash: str, email_hash: str
+) -> None:
+    """925909aa — log one magic-link signup attempt keyed by salted IP/email
+    hashes, for persistent per-IP rate limiting (survives restarts)."""
+    await db.execute(
+        "INSERT INTO signup_attempts (id, ip_hash, email_hash) VALUES (?, ?, ?)",
+        (_new_id(), ip_hash, email_hash),
+    )
+    await db.commit()
+
+
+async def count_recent_signup_attempts(
+    db: aiosqlite.Connection, ip_hash: str, since_iso: str
+) -> int:
+    """Count signup attempts from ``ip_hash`` at or after ``since_iso``
+    (``YYYY-MM-DD HH:MM:SS`` UTC)."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM signup_attempts WHERE ip_hash = ? AND created_at >= ?",
+        (ip_hash, since_iso),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def consume_magic_token(

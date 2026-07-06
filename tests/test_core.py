@@ -159,6 +159,107 @@ async def test_keepalive_keeps_busy_session_alive_but_expires_dead_ones(db):
 
 
 @pytest.mark.asyncio
+async def test_touch_latest_active_session_bumps_most_recent(db):
+    """4b698ea5 — touch_latest_active_session refreshes the ONE most-recently-active
+    live session and returns its id; picks the latest by last_seen; skips closed."""
+    from datetime import datetime, timezone
+
+    p = await db_module.create_project(db, "alpha")
+    older = await db_module.register_session(db, p["id"], "older")
+    newer = await db_module.register_session(db, p["id"], "newer")
+    closed = await db_module.register_session(db, p["id"], "closed")
+    # older last_seen 9 min ago; newer 5 min ago; closed most recent but not live.
+    await db.execute("UPDATE sessions SET last_seen = datetime('now','-9 minutes') WHERE id = ?", (older["id"],))
+    await db.execute("UPDATE sessions SET last_seen = datetime('now','-5 minutes') WHERE id = ?", (newer["id"],))
+    await db.execute("UPDATE sessions SET last_seen = datetime('now'), status='closed' WHERE id = ?", (closed["id"],))
+    await db.commit()
+
+    touched = await db_module.touch_latest_active_session(db, p["id"])
+    assert touched == newer["id"]  # the most-recently-active LIVE session
+
+    rows = {r["id"]: r for r in await db_module.get_sessions(db, p["id"], active_only=False)}
+
+    def _age_of(sid) -> float:
+        ls = datetime.fromisoformat(rows[sid]["last_seen"].replace(" ", "T")).replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ls).total_seconds()
+
+    assert _age_of(newer["id"]) < 60       # bumped to now
+    assert _age_of(older["id"]) > 8 * 60   # untouched
+
+
+@pytest.mark.asyncio
+async def test_touch_latest_active_session_no_live_returns_none(db):
+    """4b698ea5 — no live session ⇒ returns None (nothing to keep alive)."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db.execute("UPDATE sessions SET status='closed' WHERE id = ?", (s["id"],))
+    await db.commit()
+    assert await db_module.touch_latest_active_session(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_tunnel_keepalive_refreshes_live_session_without_meridian_tool(db):
+    """4b698ea5 (core regression) — an executor with a LIVE tunnel doing minutes of
+    non-Meridian work calls no Meridian tool, so its last_seen goes stale. The
+    server keepalive loop's tunnel pass must refresh it purely from the open
+    socket — a passive signal, no tool call involved."""
+    from meridian import _deps as deps_module
+    from meridian.routes import tunnel as tunnel_module
+
+    # A tenant + its cached project DB (the seam _open_tenant_db_by_id populates).
+    tenant_id = "tenant-4b698ea5"
+    p = await db_module.create_project(db, "alpha")
+    sess = await db_module.register_session(db, p["id"], "busy-executor")
+    # Session pinged Meridian 9 minutes ago — how a long non-Meridian run looks.
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now','-9 minutes') WHERE id = ?",
+        (sess["id"],),
+    )
+    await db.commit()
+
+    # Register the live tunnel socket + cache the tenant DB.
+    tunnel_module._tunnel_sockets[tenant_id] = object()  # sentinel "live socket"
+    deps_module._tenant_db_cache[tenant_id] = db
+    try:
+        # Drive one keepalive tick via the server-loop seam (app is truthy).
+        refreshed = await server_module._keepalive_tunnel_sessions(app=object())
+    finally:
+        tunnel_module._tunnel_sockets.pop(tenant_id, None)
+        deps_module._tenant_db_cache.pop(tenant_id, None)
+
+    assert sess["id"] in refreshed  # the passive path touched it — NO tool call
+
+    from datetime import datetime, timezone
+    rows = {r["id"]: r for r in await db_module.get_sessions(db, p["id"], active_only=False)}
+    ls = datetime.fromisoformat(rows[sess["id"]]["last_seen"].replace(" ", "T")).replace(tzinfo=timezone.utc)
+    assert (datetime.now(timezone.utc) - ls).total_seconds() < 60  # live again
+
+
+@pytest.mark.asyncio
+async def test_tunnel_keepalive_skips_tenant_without_cached_db(db):
+    """4b698ea5 — a tenant with a live socket but no cached DB (no MCP call yet)
+    is skipped: nothing to keep alive, and we never open a fresh DB from the loop."""
+    from meridian import _deps as deps_module
+    from meridian.routes import tunnel as tunnel_module
+
+    tenant_id = "tenant-nodb-4b698ea5"
+    tunnel_module._tunnel_sockets[tenant_id] = object()
+    deps_module._tenant_db_cache.pop(tenant_id, None)
+    try:
+        refreshed = await server_module._keepalive_tunnel_sessions(app=object())
+    finally:
+        tunnel_module._tunnel_sockets.pop(tenant_id, None)
+    assert tenant_id not in {s for s in refreshed}
+
+
+@pytest.mark.asyncio
+async def test_tunnel_keepalive_noop_when_no_app(db):
+    """4b698ea5 — self-host stdio has no tunnels; the pass is a no-op (app=None)."""
+    refreshed = await server_module._keepalive_tunnel_sessions(app=None)
+    assert refreshed == []
+
+
+@pytest.mark.asyncio
 async def test_log_task_and_get_tasks_newest_first(db):
     p = await db_module.create_project(db, "alpha")
     s = await db_module.register_session(db, p["id"], "sess-1")
@@ -199,8 +300,10 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     assert "sess-1" in content and "sess-2" in content
     assert "did A" in content and "did B" in content
     assert "## Quick Start" in content
-    assert "/goal Verify remaining work is complete." in content
-    assert "pixi run test passes 524+" in content
+    # 5abf3e12 — empty-board /goal is XML-structured: the verify text is the
+    # <role> body now, not inline after "/goal ".
+    assert "<role>Verify remaining work is complete.</role>" in content
+    assert "pixi run test passes 2150+" in content
     assert "## Resume Instructions" in content
     on_disk = tmp_path / "alpha_handoff.md"
     assert on_disk.exists()
@@ -270,12 +373,13 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "2. [pending] Second fix" in content
     assert f"Depends on item 1 (`{first['id']}`): First fix" in content
     assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
-    assert (
-        f"Complete sprint items: {first['id']}, {second['id']}."
-        in content
-    )
+    # eeee02c6 — a depends_on relationship renders the /goal as a flattened
+    # dependency-ordered id list (no "Wave" headers, which invite stopping).
+    assert "dependency order" in content
+    assert f"{first['id']}, {second['id']}." in content
     # f628b880 — the /goal leads with the non-deferential executor directive.
-    assert "/goal You are an executor. Claim and execute" in content
+    # 5abf3e12 — now inside the <role> tag of the XML-structured /goal.
+    assert "<role>You are an executor. Claim and execute" in content
     assert "complete_sprint_item()" in content
 
 
@@ -349,8 +453,8 @@ async def test_handoff_starter_mode(db, tmp_path):
     )
     lines = [l for l in content.splitlines() if l]
     assert len(lines) <= 20, f"starter mode must be ≤20 non-empty lines, got {len(lines)}"
-    assert f'project_id: {p["id"]}' in content
-    assert 'start_session' in content
+    assert f'start_session(project_name="{p["name"]}"' in content  # 11a91d31 — name-first
+    assert f'project_id (fallback): {p["id"]}' in content
     assert it2["id"][:8] in content   # pending item ID appears
     assert "/goal" in content
 
@@ -1159,21 +1263,27 @@ def test_tunnel_plugins_install_accepts_uvx_command(client):
 
 
 def test_tunnel_registry_proxy_returns_servers_list(client):
-    """GET /tunnel/registry returns {servers: [], next_cursor: ...} even when offline."""
+    """GET /tunnel/registry returns a structured response.
+
+    200 with servers list when upstream is reachable or cache exists.
+    503 with error field when upstream is unreachable and no cache exists
+    (client falls back to curated list on 503).
+    """
     r = client.get("/tunnel/registry?limit=5")
-    assert r.status_code == 200
+    assert r.status_code in (200, 503)
     data = r.json()
-    # Must always return the servers key (may be empty if registry is unreachable)
-    assert "servers" in data
-    assert isinstance(data["servers"], list)
-    # next_cursor is present (may be None)
-    assert "next_cursor" in data
+    if r.status_code == 200:
+        assert "servers" in data
+        assert isinstance(data["servers"], list)
+        assert "next_cursor" in data
+    else:
+        assert "error" in data
 
 
 def test_tunnel_registry_proxy_rejects_large_limit(client):
-    """GET /tunnel/registry caps limit at 50."""
+    """GET /tunnel/registry caps limit at 50 — must not return 4xx for a large limit."""
     r = client.get("/tunnel/registry?limit=999")
-    assert r.status_code == 200  # capped, not rejected
+    assert r.status_code in (200, 503)  # capped, not rejected with 4xx
 
 
 # ---------------------------------------------------------------------------
@@ -4627,6 +4737,45 @@ async def test_workspace_settings_db_defaults(db):
 
 
 # ---------------------------------------------------------------------------
+# bf51b12e — planner context-refresh config on workspace_settings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_refresh_config_defaults(db):
+    """New context-refresh columns default to off / interval 10 / no triggers."""
+    ws = await db_module.get_workspace_settings(db)
+    assert ws["auto_refresh_enabled"] is False
+    assert ws["refresh_interval_turns"] == 10
+    assert ws["refresh_triggers"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_refresh_config_roundtrip(db):
+    """auto_refresh_enabled / refresh_interval_turns / refresh_triggers roundtrip."""
+    ws = await db_module.update_workspace_settings(
+        db,
+        auto_refresh_enabled=True,
+        refresh_interval_turns=3,
+        refresh_triggers=["pin_decision", "set_goal"],
+    )
+    assert ws["auto_refresh_enabled"] is True
+    assert ws["refresh_interval_turns"] == 3
+    assert ws["refresh_triggers"] == ["pin_decision", "set_goal"]
+    # Persists on re-read.
+    ws2 = await db_module.get_workspace_settings(db)
+    assert ws2["auto_refresh_enabled"] is True
+    assert ws2["refresh_interval_turns"] == 3
+    assert ws2["refresh_triggers"] == ["pin_decision", "set_goal"]
+    # interval is clamped to a minimum of 1.
+    ws3 = await db_module.update_workspace_settings(db, refresh_interval_turns=0)
+    assert ws3["refresh_interval_turns"] == 1
+    # "" clears the trigger list (reverts to the default trigger set → None).
+    ws4 = await db_module.update_workspace_settings(db, refresh_triggers="")
+    assert ws4["refresh_triggers"] is None
+
+
+# ---------------------------------------------------------------------------
 # 637dd900 — workspace layer tenant isolation
 # ---------------------------------------------------------------------------
 
@@ -5024,6 +5173,317 @@ async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "=== QUEUED NEXT SESSION ===" not in content2
+
+
+# ---------------------------------------------------------------------------
+# 5efe254b — trusted handoff channel (projects.pending_goal + load_handoff)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pending_goal_set_get_pop(db):
+    """projects.pending_goal read-once trio (mirrors queued_session)."""
+    p = await db_module.create_project(db, "pgoal-proj")
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    await db_module.set_pending_goal(db, p["id"], "/goal do the trusted thing")
+    assert await db_module.get_pending_goal(db, p["id"]) == "/goal do the trusted thing"
+    # pop is read-once.
+    assert await db_module.pop_pending_goal(db, p["id"]) == "/goal do the trusted thing"
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    assert await db_module.pop_pending_goal(db, p["id"]) is None
+    # Empty/None clears.
+    await db_module.set_pending_goal(db, p["id"], "/goal x")
+    await db_module.set_pending_goal(db, p["id"], None)
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_persists_pending_goal(db, tmp_path):
+    """generate_handoff stores the /goal to the trusted channel (pending_goal)."""
+    from meridian import handoff as handoff_module
+    p = await db_module.create_project(db, "pgoal-proj2")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Do a thing")
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    stored = await db_module.get_pending_goal(db, p["id"])
+    assert stored is not None
+    assert "/goal" in stored
+
+
+def test_start_session_delivers_and_clears_pending_goal(tmp_path):
+    """start_session surfaces the stored /goal via the trusted MCP tool result
+    (keyed on project_id) and clears it read-once — a second start_session no
+    longer carries it."""
+    import asyncio
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        proj = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "pg-e2e"}, db, out))
+        pid = proj["id"]
+        asyncio.run(db_module.set_pending_goal(db, pid, "/goal RESUME trusted work"))
+        sess = asyncio.run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, out))
+        assert sess.get("pending_goal") == "/goal RESUME trusted work"
+        # Read-once: cleared after a single delivery.
+        assert asyncio.run(db_module.get_pending_goal(db, pid)) is None
+        sess2 = asyncio.run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, out))
+        assert not sess2.get("pending_goal")
+    finally:
+        asyncio.run(db.close())
+
+
+def test_load_handoff_tool_returns_stored_handoff(tmp_path):
+    """load_handoff returns the latest stored handoff + pending_goal as a trusted
+    tool result, and is idempotent (does NOT consume pending_goal)."""
+    import asyncio
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        proj = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "lh-e2e"}, db, out))
+        pid = proj["id"]
+        # Nothing stored yet.
+        empty = asyncio.run(mh._dispatch_mcp_tool("load_handoff", {"project_id": pid}, db, out))
+        assert empty["has_handoff"] is False
+        assert empty["handoff"] is None and empty["pending_goal"] is None
+        # A handoff persists both a body row and pending_goal.
+        asyncio.run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": pid, "mode": "full"}, db, out))
+        loaded = asyncio.run(mh._dispatch_mcp_tool("load_handoff", {"project_id": pid}, db, out))
+        assert loaded["has_handoff"] is True
+        assert loaded["handoff"] is not None and loaded["handoff"]["content"]
+        assert loaded["pending_goal"] and "/goal" in loaded["pending_goal"]
+        # Idempotent: a repeat load still returns pending_goal (not consumed).
+        loaded2 = asyncio.run(mh._dispatch_mcp_tool("load_handoff", {"project_id": pid}, db, out))
+        assert loaded2["pending_goal"] == loaded["pending_goal"]
+    finally:
+        asyncio.run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# 76cf8bda — /loop auto-continue: workspace default + project override + max_turns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_loop_enabled_default_roundtrip(db):
+    """workspace_settings.loop_enabled_default defaults True and is updatable."""
+    ws = await db_module.get_workspace_settings(db)
+    assert ws["loop_enabled_default"] is True
+    ws = await db_module.update_workspace_settings(db, loop_enabled_default=False)
+    assert ws["loop_enabled_default"] is False
+    assert (await db_module.get_workspace_settings(db))["loop_enabled_default"] is False
+    ws = await db_module.update_workspace_settings(db, loop_enabled_default=True)
+    assert ws["loop_enabled_default"] is True
+
+
+def test_loop_enabled_from_settings_merge():
+    """Project override wins; 'workspace'/missing defers to the workspace default."""
+    from meridian import handoff as h
+    ws_on = {"loop_enabled_default": True}
+    ws_off = {"loop_enabled_default": False}
+    # Explicit bool override ignores the workspace default.
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": True}}, ws_off) is True
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": False}}, ws_on) is False
+    # String override forms.
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "off"}}, ws_on) is False
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "on"}}, ws_off) is True
+    # 'workspace' (or a missing key) defers to the workspace default — never falsy.
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "workspace"}}, ws_on) is True
+    assert h._loop_enabled_from_settings({"executor_config": {"loop_enabled": "workspace"}}, ws_off) is False
+    assert h._loop_enabled_from_settings({"executor_config": {}}, ws_off) is False
+    # No workspace settings at all → default True.
+    assert h._loop_enabled_from_settings(None, None) is True
+
+
+def test_max_turns_from_settings_clamps_to_500():
+    from meridian import handoff as h
+    assert h._max_turns_from_settings({"executor_config": {"max_turns": 999}}) == 500
+    assert h._max_turns_from_settings({"executor_config": {"max_turns": 300}}) == 300
+    assert h._max_turns_from_settings({"executor_config": {"max_turns": 0}}) == 200
+    assert h._max_turns_from_settings(None) == 200
+
+
+def test_build_quick_start_goal_loop_prefix():
+    from meridian import handoff as h
+    # 5abf3e12 — the XML-structured /goal starts with "/goal\n" (newline before
+    # the first tag), and "/loop /goal\n" when auto-continue is enabled.
+    # Empty-board path.
+    assert h._build_quick_start_goal([], loop_enabled=False).startswith("/goal\n")
+    assert h._build_quick_start_goal([], loop_enabled=True).startswith("/loop /goal\n")
+    # Items path.
+    items = [{"id": "abc123", "version": None}]
+    assert h._build_quick_start_goal(items, loop_enabled=False).startswith("/goal\n")
+    assert h._build_quick_start_goal(items, loop_enabled=True).startswith("/loop /goal\n")
+
+
+def test_build_quick_start_goal_parallel_batches():
+    """e20db0be — get_parallelizable_groups batches render as parallel-safe in the
+    /goal; without groups the flat clause is unchanged (so existing callers that
+    pass no groups keep the current behaviour)."""
+    from meridian import handoff as h
+    items = [{"id": "a1", "version": None}, {"id": "b2", "version": None}, {"id": "c3", "version": None}]
+    groups = {
+        "group_count": 2,
+        "groups": [
+            [{"id": "a1", "title": "x"}, {"id": "b2", "title": "y"}],  # parallel-safe pair
+            [{"id": "c3", "title": "z"}],
+        ],
+    }
+    goal = h._build_quick_start_goal(items, parallel_groups=groups)
+    assert "resource-conflict-free batches" in goal
+    assert "batch 1: a1, b2" in goal
+    assert "batch 2: c3" in goal
+    # No parallel_groups → the flat clause, no batch language (unchanged default).
+    goal_flat = h._build_quick_start_goal(items)
+    assert "resource-conflict-free batches" not in goal_flat
+    assert "Complete sprint items: a1, b2, c3" in goal_flat
+    # A single group (no genuine cross-item parallelism) does NOT trigger batches.
+    single = {"group_count": 1, "groups": [[{"id": "a1"}, {"id": "b2"}, {"id": "c3"}]]}
+    assert "resource-conflict-free batches" not in h._build_quick_start_goal(items, parallel_groups=single)
+    # A batched id outside the /goal's item list is filtered; a leftover pending id
+    # is still listed so the /goal never drops an item.
+    groups2 = {"group_count": 2, "groups": [[{"id": "a1"}, {"id": "zzz"}], [{"id": "b2"}]]}
+    goal2 = h._build_quick_start_goal(items, parallel_groups=groups2)
+    assert "zzz" not in goal2  # out-of-scope id filtered
+    assert "c3" in goal2       # leftover pending id preserved
+
+
+# ---------------------------------------------------------------------------
+# 0b711a9d — strategic insights (table + tools + planning brief)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_insights_create_get_horizon_filter(db):
+    """create_insight + get_insights: horizon filter, tag join, bad-horizon coercion."""
+    p = await db_module.create_project(db, "insights-proj")
+    pid = p["id"]
+    assert await db_module.get_insights(db, pid) == []
+    i1 = await db_module.create_insight(
+        db, pid, "Perm truth", "always matters", horizon="permanent", tags=["strategy", "core"]
+    )
+    assert i1["horizon"] == "permanent"
+    assert i1["title"] == "Perm truth"
+    assert i1["tags"] == "strategy,core"  # list joined
+    await db_module.create_insight(db, pid, "Q insight", "this quarter", horizon="quarter")
+    # An invalid horizon coerces to the default 'quarter' (Python-validated, no CHECK).
+    i3 = await db_module.create_insight(db, pid, "Bad h", "x", horizon="decade")
+    assert i3["horizon"] == "quarter"
+    assert len(await db_module.get_insights(db, pid)) == 3
+    perms = await db_module.get_insights(db, pid, horizon="permanent")
+    assert len(perms) == 1 and perms[0]["title"] == "Perm truth"
+    assert len(await db_module.get_insights(db, pid, horizon="quarter")) == 2
+
+
+def test_insights_mcp_tools_and_planning_brief(tmp_path):
+    """add_insight/get_insights MCP tools + permanent insights surface in get_planning_brief."""
+    import asyncio
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        pid = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "ins-mcp"}, db, out))["id"]
+        asyncio.run(mh._dispatch_mcp_tool(
+            "add_insight",
+            {"project_id": pid, "title": "North star holds", "body": "durable", "horizon": "permanent"},
+            db, out))
+        asyncio.run(mh._dispatch_mcp_tool(
+            "add_insight",
+            {"project_id": pid, "title": "Q thing", "body": "temp", "horizon": "quarter"}, db, out))
+        got = asyncio.run(mh._dispatch_mcp_tool("get_insights", {"project_id": pid}, db, out))
+        assert len(got) == 2
+        perms = asyncio.run(mh._dispatch_mcp_tool(
+            "get_insights", {"project_id": pid, "horizon": "permanent"}, db, out))
+        assert len(perms) == 1 and perms[0]["title"] == "North star holds"
+        # Permanent insight is injected into the planning brief.
+        brief = asyncio.run(mh._dispatch_mcp_tool("get_planning_brief", {"project_id": pid}, db, out))
+        assert "permanent_insights" in brief
+        assert any(pi["title"] == "North star holds" for pi in brief["permanent_insights"])
+        # The quarter insight is NOT in the permanent list.
+        assert all(pi["title"] != "Q thing" for pi in brief["permanent_insights"])
+    finally:
+        asyncio.run(db.close())
+
+
+def test_insights_rest_roundtrip(client):
+    """0b711a9d — POST/GET /projects/{id}/insights + horizon filter + guards."""
+    pid = client.post("/projects", json={"name": "ins-rest"}).json()["id"]
+    assert client.get(f"/projects/{pid}/insights").json() == []
+    r = client.post(
+        f"/projects/{pid}/insights",
+        json={"title": "Perm", "body": "b", "horizon": "permanent"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["horizon"] == "permanent"
+    client.post(f"/projects/{pid}/insights", json={"title": "Q", "horizon": "quarter"})
+    assert len(client.get(f"/projects/{pid}/insights").json()) == 2
+    perms = client.get(f"/projects/{pid}/insights?horizon=permanent").json()
+    assert len(perms) == 1 and perms[0]["title"] == "Perm"
+    # Title required → 400; unknown project → 404.
+    assert client.post(f"/projects/{pid}/insights", json={"body": "no title"}).status_code == 400
+    assert client.get("/projects/does-not-exist/insights").status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_prepends_loop_when_workspace_default_on(db, tmp_path):
+    """The /goal in a generated handoff carries a leading /loop when the effective
+    loop flag (workspace default here) is on, and omits it when off."""
+    from meridian import handoff as handoff_module
+    p = await db_module.create_project(db, "loop-proj")
+    await db_module.add_sprint_item(db, p["id"], "v1", "an item")
+    await db_module.update_workspace_settings(db, loop_enabled_default=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    # 5abf3e12 — XML-structured /goal starts with "/loop /goal\n" / "/goal\n".
+    assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal\n")
+    # Workspace default OFF (and no project override) → no /loop.
+    await db_module.update_workspace_settings(db, loop_enabled_default=False)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    stored2 = await db_module.get_pending_goal(db, p["id"])
+    assert stored2.startswith("/goal\n") and not stored2.startswith("/loop")
+
+
+def test_workspace_settings_http_loop_default(client):
+    """PATCH /workspace/settings forwards loop_enabled_default end-to-end (the
+    path the dashboard Workspace toggle uses)."""
+    assert client.get("/workspace/settings").json()["loop_enabled_default"] is True
+    r = client.patch("/workspace/settings", json={"loop_enabled_default": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["loop_enabled_default"] is False
+    assert client.get("/workspace/settings").json()["loop_enabled_default"] is False
+    client.patch("/workspace/settings", json={"loop_enabled_default": True})
+    assert client.get("/workspace/settings").json()["loop_enabled_default"] is True
+
+
+def test_seed_workspace_settings_from_toml(monkeypatch):
+    """1d69d5d9 — meridian.toml (via env) seeds the singleton workspace_settings on
+    first boot; once the row exists the DB is authoritative (idempotent)."""
+    import asyncio
+    from meridian import toml_config
+    db = asyncio.run(db_module.init_db(":memory:"))
+    try:
+        monkeypatch.setattr(toml_config, "load_toml", lambda: None)
+        for k in ("MERIDIAN_AUTO_REFRESH", "MERIDIAN_REFRESH_INTERVAL_TURNS",
+                  "MERIDIAN_REFRESH_TRIGGERS", "MERIDIAN_LOOP_ENABLED",
+                  "MERIDIAN_MAX_TURNS", "MERIDIAN_FILESYSTEM_ROOTS"):
+            monkeypatch.delenv(k, raising=False)
+        # No config present → no seed (nothing to consume).
+        asyncio.run(db_module.seed_workspace_settings_from_toml(db))
+        # Provide config via env → the singleton row is seeded from it.
+        monkeypatch.setenv("MERIDIAN_AUTO_REFRESH", "true")
+        monkeypatch.setenv("MERIDIAN_REFRESH_INTERVAL_TURNS", "7")
+        asyncio.run(db_module.seed_workspace_settings_from_toml(db))
+        ws = asyncio.run(db_module.get_workspace_settings(db))
+        assert ws["auto_refresh_enabled"] is True
+        assert ws["refresh_interval_turns"] == 7
+        # Idempotent: a second boot with different env does NOT overwrite the DB.
+        monkeypatch.setenv("MERIDIAN_REFRESH_INTERVAL_TURNS", "40")
+        asyncio.run(db_module.seed_workspace_settings_from_toml(db))
+        assert asyncio.run(db_module.get_workspace_settings(db))["refresh_interval_turns"] == 7
+    finally:
+        asyncio.run(db.close())
 
 
 def test_queue_session_http_roundtrip(client):
@@ -5620,6 +6080,37 @@ def test_dashboard_uses_static_assets(client):
     assert "/static/dashboard.css" in r.text
 
 
+def test_dashboard_bundle_cache_busted_by_content_hash(client):
+    """9aba783f — the bundle <script> ?v= token is the bundle's sha256 content
+    hash (from asset-manifest.json), so a deploy busts the browser cache even
+    when no version / git SHA is available in prod."""
+    import hashlib
+    from pathlib import Path
+    from meridian import _deps
+
+    static = Path(_deps.__file__).parent / "static"
+    actual = hashlib.sha256((static / "dashboard.bundle.js").read_bytes()).hexdigest()[:12]
+    # Manifest reader, loaded constant, and served HTML all agree on the hash.
+    assert _deps._read_bundle_hash() == actual
+    assert _deps._BUNDLE_HASH == actual
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert f"/static/dashboard.bundle.js?v={actual}" in r.text
+
+
+def test_read_bundle_hash_falls_back_when_manifest_missing(monkeypatch, tmp_path):
+    """9aba783f — a dev checkout with no asset-manifest.json falls back to
+    _ASSET_VERSION rather than crashing import."""
+    from meridian import _deps
+
+    monkeypatch.setattr(_deps, "Path", _deps.Path)  # keep Path
+    # Point the manifest lookup at an empty dir by monkeypatching __file__ dir.
+    fake_pkg = tmp_path / "meridian"
+    (fake_pkg / "static").mkdir(parents=True)
+    monkeypatch.setattr(_deps, "__file__", str(fake_pkg / "_deps.py"))
+    assert _deps._read_bundle_hash() == _deps._ASSET_VERSION
+
+
 # ---------------------------------------------------------------------------
 # v1.3.0 — "Last X days" project rewind view
 # ---------------------------------------------------------------------------
@@ -6196,6 +6687,218 @@ async def test_run_pg_migrations_survives_a_failing_migration(caplog):
                for r in caplog.records), "failing migration should log a WARNING"
 
 
+# ---------------------------------------------------------------------------
+# 3b6ff466 — subprojects (parent_project_id) + north_star inheritance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_subproject_stores_parent_project_id(db):
+    """A child created with parent_project_id records it; the parent is None."""
+    parent = await db_module.create_project(db, "sub-parent")
+    child = await db_module.create_project(
+        db, "sub-child", parent_project_id=parent["id"]
+    )
+    assert child["parent_project_id"] == parent["id"]
+    # Round-trips through the DB, not just the return value.
+    fetched = await db_module.get_project(db, child["id"])
+    assert fetched["parent_project_id"] == parent["id"]
+    # The parent itself stays top-level.
+    assert parent["parent_project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_subproject_rejects_missing_parent(db):
+    """A parent_project_id that doesn't resolve is rejected."""
+    with pytest.raises(ValueError, match="does not exist"):
+        await db_module.create_project(
+            db, "sub-orphan", parent_project_id="nonexistent-id"
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_grandchild_rejected_one_level_deep(db):
+    """Subprojects are ONE level deep — a grandchild (child of a child) is
+    rejected so the hierarchy never nests."""
+    parent = await db_module.create_project(db, "gc-parent")
+    child = await db_module.create_project(
+        db, "gc-child", parent_project_id=parent["id"]
+    )
+    with pytest.raises(ValueError, match="one level deep"):
+        await db_module.create_project(
+            db, "gc-grandchild", parent_project_id=child["id"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_inherits_parent_north_star_via_get_goal(db):
+    """A child with no north_star of its own inherits the parent's, flagged
+    inherited, when the child has its own goal row (empty north_star)."""
+    parent = await db_module.create_project(db, "ns-parent")
+    await db_module.set_goal(
+        db, parent["id"], "parent version goal", north_star="Ship the platform"
+    )
+    child = await db_module.create_project(
+        db, "ns-child", parent_project_id=parent["id"]
+    )
+    # Child has its own goal but no north_star.
+    await db_module.set_goal(db, child["id"], "child version goal")
+    goal = await db_module.get_goal(db, child["id"])
+    assert goal is not None
+    assert goal["north_star"] == "Ship the platform"
+    assert goal["north_star_inherited"] is True
+    assert goal["north_star_source_project_id"] == parent["id"]
+    # The child's own content is preserved — only the north_star is borrowed.
+    assert goal["content"] == "child version goal"
+
+
+@pytest.mark.asyncio
+async def test_child_with_no_goal_row_still_inherits_north_star(db):
+    """A child that has never set a goal at all still surfaces the parent's
+    north_star (synthesised goal dict), rather than get_goal returning None."""
+    parent = await db_module.create_project(db, "ns2-parent")
+    await db_module.set_goal(
+        db, parent["id"], "pg", north_star="Inherited star"
+    )
+    child = await db_module.create_project(
+        db, "ns2-child", parent_project_id=parent["id"]
+    )
+    goal = await db_module.get_goal(db, child["id"])
+    assert goal is not None
+    assert goal["north_star"] == "Inherited star"
+    assert goal["north_star_inherited"] is True
+    assert goal["north_star_source_project_id"] == parent["id"]
+    assert goal["version"] == 0
+
+
+@pytest.mark.asyncio
+async def test_child_with_own_north_star_not_overridden(db):
+    """When the child sets its OWN north_star it wins — no inheritance."""
+    parent = await db_module.create_project(db, "ns3-parent")
+    await db_module.set_goal(db, parent["id"], "pg", north_star="Parent star")
+    child = await db_module.create_project(
+        db, "ns3-child", parent_project_id=parent["id"]
+    )
+    await db_module.set_goal(
+        db, child["id"], "cg", north_star="Child's own star"
+    )
+    goal = await db_module.get_goal(db, child["id"])
+    assert goal["north_star"] == "Child's own star"
+    assert goal["north_star_inherited"] is False
+    assert goal["north_star_source_project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_top_level_project_north_star_unchanged(db):
+    """A top-level project (no parent) is completely unaffected: no inheritance
+    keys leak a source, and an unset north_star stays unset."""
+    top = await db_module.create_project(db, "top-level")
+    # Own north_star set — plain passthrough, not flagged inherited.
+    await db_module.set_goal(db, top["id"], "tg", north_star="My star")
+    goal = await db_module.get_goal(db, top["id"])
+    assert goal["north_star"] == "My star"
+    assert goal["north_star_inherited"] is False
+    assert goal["north_star_source_project_id"] is None
+    # A different top-level project with no goal at all still returns None.
+    top2 = await db_module.create_project(db, "top-level-2")
+    assert await db_module.get_goal(db, top2["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_child_no_inheritance_when_parent_has_no_north_star(db):
+    """If the parent itself has no north_star there is nothing to inherit; the
+    child's own (empty) goal is returned unflagged."""
+    parent = await db_module.create_project(db, "ns4-parent")
+    await db_module.set_goal(db, parent["id"], "pg")  # no north_star
+    child = await db_module.create_project(
+        db, "ns4-child", parent_project_id=parent["id"]
+    )
+    await db_module.set_goal(db, child["id"], "cg")
+    goal = await db_module.get_goal(db, child["id"])
+    assert (goal["north_star"] or "") == ""
+    assert goal["north_star_inherited"] is False
+
+
+@pytest.mark.asyncio
+async def test_context_block_and_planning_brief_show_inherited_north_star(db):
+    """The two rendered read-paths (get_context_block / get_planning_brief)
+    both resolve the goal through get_goal, so a child with no north_star of
+    its own shows the parent's inherited north_star in each."""
+    from meridian._deps import _render_context_block
+
+    parent = await db_module.create_project(db, "brief-parent")
+    await db_module.set_goal(
+        db, parent["id"], "pg", north_star="Inherited brief star"
+    )
+    child = await db_module.create_project(
+        db, "brief-child", parent_project_id=parent["id"]
+    )
+    goal = await db_module.get_goal(db, child["id"])
+    # get_context_block renders via _render_context_block(project, goal, ...).
+    rendered = _render_context_block(
+        child, goal, [], [], [], [], mode="full",
+    )
+    assert "Inherited brief star" in rendered
+    # get_planning_brief embeds goal["north_star"] the same way — assert the
+    # shared source dict carries the inherited value.
+    assert goal["north_star"] == "Inherited brief star"
+    assert goal["north_star_inherited"] is True
+
+
+def test_migrate_project_parent_id_survives_pre_column_projects_table():
+    """3b6ff466 — existing-DB upgrade (spirit of the pre-tenant_id blog test).
+
+    A projects table that predates parent_project_id must get the column added
+    by init_db without crashing, existing rows preserved, and the guarded
+    index created — all idempotently on re-init."""
+    import sqlite3
+
+    def _run(db_path):
+        legacy = sqlite3.connect(db_path)
+        legacy.executescript(
+            """
+            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')));
+            INSERT INTO projects (id, name) VALUES ('p1', 'legacy-proj');
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+    import tempfile
+
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "legacy_parent.db")
+            _run(db_path)
+            # First init applies the migration (adds column + index).
+            conn = await db_module.init_db(db_path)
+            try:
+                assert await db_module._column_exists(
+                    conn, "projects", "parent_project_id"
+                )
+                proj = await db_module.get_project(conn, "p1")
+                assert proj is not None
+                assert proj["parent_project_id"] is None
+                # The guarded index exists.
+                async with conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND name='idx_projects_parent'"
+                ) as cur:
+                    assert await cur.fetchone() is not None
+            finally:
+                await conn.close()
+            # Second init is a no-op (idempotent) and preserves the row.
+            conn2 = await db_module.init_db(db_path)
+            try:
+                proj2 = await db_module.get_project(conn2, "p1")
+                assert proj2["name"] == "legacy-proj"
+            finally:
+                await conn2.close()
+
+    asyncio.run(run())
+
+
 def test_pg_migration_registry_matches_historical_order():
     """The migration registry tuples must concatenate to the exact historical
     call order (core → hosted → late) so refactoring the runner can't silently
@@ -6242,6 +6945,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_admin_plan",
         "_migrate_pg_tunnel_active",
         "_migrate_pg_tunnel_plugins",
+        "_migrate_pg_tunnel_plugins_by_host",
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
@@ -6251,6 +6955,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_api_token_type",
         "_migrate_pg_api_token_expires_at",
         "_migrate_pg_oauth_codes",
+        "_migrate_pg_device_codes",
         "_migrate_pg_github_to_projects",
         "_migrate_pg_touches_resources",
         "_migrate_pg_resource_locks",
@@ -6272,6 +6977,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_note_source",
         "_migrate_pg_session_sprint_version",
         "_migrate_pg_project_execution_mode",
+        "_migrate_pg_project_status_priority",
         "_migrate_pg_decision_code_anchor",
         "_migrate_pg_session_graph_snapshots",
         "_migrate_pg_agent_tasks_table",
@@ -6280,10 +6986,163 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_handoffs_table",
         "_migrate_pg_decision_assumption",
         "_migrate_pg_github_connections",
+        "_migrate_pg_blog_posts",
+        "_migrate_pg_sprint_item_quality_gates",
+        "_migrate_pg_parallel_primitives",
+        "_migrate_pg_signup_attempts",
+        "_migrate_pg_user_session_metadata",
+        "_migrate_pg_provision_queue",
+        "_migrate_pg_codebase_graph_entities",
+        "_migrate_pg_pending_goal",
+        "_migrate_pg_insights_table",
+        "_migrate_pg_sprint_item_slug",
+        "_migrate_pg_capture_insight_notes_to_insights",
+        "_migrate_pg_blog_posts_tenant",
+        "_migrate_pg_project_parent_id",
+        "_migrate_pg_session_goal_compliance",
+        "_migrate_pg_sprint_item_pointers",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 68
+    assert len(allnames) == len(set(allnames)) == 86
+
+
+def test_core_schema_literals_have_no_inline_tenant_id_indexes():
+    """Regression guard for the 2026-07-04 prod outage.
+
+    Both base schema literals — Postgres ``CREATE_TABLES_CORE`` and SQLite
+    ``CREATE_TABLES`` — are applied via an *unguarded* ``executescript`` at
+    startup, so one failing statement aborts the whole boot (Postgres
+    crash-looped every prod machine, exit 3; SQLite raised 'no such column:
+    tenant_id'). ``tenant_id`` is added to ``blog_posts`` /
+    ``workspace_sprint_items`` by later ALTER migrations, so on an existing DB
+    ``CREATE TABLE IF NOT EXISTS`` keeps the old columnless table and an inline
+    ``CREATE INDEX ... (tenant_id)`` fails. Those indexes must live ONLY in the
+    guarded ``_migrate_*`` migrations. CI runs SQLite-only (PG fixtures skip
+    without TEST_DATABASE_URL), so this static check guards both literals.
+    """
+    from meridian.pg_adapter import CREATE_TABLES_CORE
+    from meridian.db import CREATE_TABLES
+
+    def _executable_sql(sql: str) -> str:
+        # Drop ``--`` comment lines so the assertions match executable SQL only,
+        # not the explanatory comments that (intentionally) name these indexes.
+        return "\n".join(
+            ln for ln in sql.splitlines() if not ln.lstrip().startswith("--")
+        )
+
+    for name, literal in (
+        ("CREATE_TABLES_CORE", CREATE_TABLES_CORE),
+        ("CREATE_TABLES", CREATE_TABLES),
+    ):
+        body = _executable_sql(literal)
+        assert "blog_posts(tenant_id)" not in body, name
+        assert "workspace_sprint_items(tenant_id" not in body, name
+        assert "idx_blog_posts_tenant" not in body, name
+        assert "idx_workspace_sprint_items_tenant" not in body, name
+
+
+def test_sprint_item_pointers_index_not_inline_in_base_literals():
+    """2976e168 — the sprint_item_pointers index must live ONLY in the guarded
+    migration, never inline in either base schema literal (the 2026-07-04
+    inline-index-on-a-migration-added-table outage trap)."""
+    from meridian.pg_adapter import CREATE_TABLES_CORE
+    from meridian.db import CREATE_TABLES
+
+    for name, literal in (
+        ("CREATE_TABLES_CORE", CREATE_TABLES_CORE),
+        ("CREATE_TABLES", CREATE_TABLES),
+    ):
+        body = "\n".join(
+            ln for ln in literal.splitlines() if not ln.lstrip().startswith("--")
+        )
+        # The table itself IS in the base literal (fresh DBs), but its index is not.
+        assert "CREATE TABLE IF NOT EXISTS sprint_item_pointers" in body, name
+        assert "idx_sprint_item_pointers_item" not in body, name
+
+
+@pytest.mark.asyncio
+async def test_sprint_item_pointers_migration_creates_table_and_index_idempotently():
+    """2976e168 — the guarded SQLite migration creates the table + index, and is
+    idempotent (safe to re-run). Exercised against a bare connection that has
+    NEITHER, so both the CREATE TABLE and the CREATE INDEX paths run."""
+    import aiosqlite
+    from meridian.db import migrations as _mig
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        conn.row_factory = aiosqlite.Row
+        # Table + index absent to start.
+        await _mig._migrate_sprint_item_pointers(conn)
+        # Re-run must be a no-op (idempotent) and not raise.
+        await _mig._migrate_sprint_item_pointers(conn)
+
+        async with conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='sprint_item_pointers'"
+        ) as cur:
+            assert await cur.fetchone() is not None
+        async with conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_sprint_item_pointers_item'"
+        ) as cur:
+            assert await cur.fetchone() is not None
+        # Column parity with both base literals.
+        async with conn.execute("PRAGMA table_info(sprint_item_pointers)") as cur:
+            cols = {r["name"] for r in await cur.fetchall()}
+        assert cols == {
+            "id", "project_id", "sprint_item_id", "source_type",
+            "targets", "label", "created_at",
+        }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_create_tables_survives_pre_tenant_id_blog_posts():
+    """Behavioral regression for the 2026-07-04 outage.
+
+    Exercises the exact statement that crashed startup —
+    ``executescript(CREATE_TABLES)`` in ``init_db`` — against a connection that
+    already holds a ``blog_posts`` predating the ``tenant_id`` column. Before the
+    fix this raised 'no such column: tenant_id' from the inline
+    ``CREATE INDEX ... (tenant_id)`` (and, because ``init_db`` never closed the
+    half-open connection, left a non-daemon aiosqlite worker thread that hung
+    interpreter shutdown for hours). The connection is closed in ``finally`` so a
+    re-broken literal fails fast instead of zombie-hanging the suite.
+    """
+    import aiosqlite
+    from meridian.db import CREATE_TABLES
+    from meridian.db import migrations as _mig
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        conn.row_factory = aiosqlite.Row
+        # A blog_posts from before 8843250f added tenant_id.
+        await conn.executescript(
+            "CREATE TABLE blog_posts ("
+            " id TEXT PRIMARY KEY, title TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,"
+            " body_md TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft',"
+            " created_at TEXT, updated_at TEXT, published_at TEXT);"
+            "INSERT INTO blog_posts (id,title,slug) VALUES ('b1','Old Post','old-post');"
+        )
+        await conn.commit()
+        # The base schema literal must apply cleanly over the pre-existing table.
+        await conn.executescript(CREATE_TABLES)
+        await conn.commit()
+        # The guarded migration then ALTERs tenant_id + its index idempotently.
+        await _mig._migrate_blog_posts_tenant(conn)
+        async with conn.execute("PRAGMA table_info(blog_posts)") as cur:
+            cols = {r["name"] for r in await cur.fetchall()}
+        assert "tenant_id" in cols
+        # Pre-existing data survived the upgrade.
+        async with conn.execute(
+            "SELECT title FROM blog_posts WHERE id='b1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["title"] == "Old Post"
+    finally:
+        await conn.close()
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -7768,15 +8627,41 @@ def test_install_mcp_page(client):
 
 
 def test_landing_page_footer_uses_meridian_email(client):
-    """Landing page footer contact uses hello@usemeridian.us, not personal email."""
+    """71c70308 — landing footer contact is JS-obfuscated: it assembles to
+    hello@usemeridian.us from data attributes (never plaintext) and is never a
+    personal email."""
     r = client.get("/")
     assert r.status_code == 200
-    assert "hello@usemeridian.us" in r.text
+    assert 'data-user="hello"' in r.text
+    assert 'data-domain="usemeridian.us"' in r.text
+    # The full address must NOT appear as plaintext / mailto in served HTML.
+    assert "mailto:hello@usemeridian.us" not in r.text
+    assert "hello@usemeridian.us" not in r.text
     assert "ajc3xc@" not in r.text  # no personal emails in landing page
 
 
-def test_auth_login_page_has_google_button(client):
-    """GET /auth/login shows Google OAuth button."""
+def test_landing_page_anti_solicitation_hardening(client):
+    """71c70308 — noai/noarchive meta, anti-solicitation footer notice, and a
+    honeypot trap on the landing page; robots.txt blocks AI/LLM crawlers."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "noai" in r.text and "noarchive" in r.text
+    assert "does not accept unsolicited" in r.text
+    assert "hp-trap" in r.text
+    rb = client.get("/robots.txt")
+    assert rb.status_code == 200
+    assert "GPTBot" in rb.text and "ClaudeBot" in rb.text
+    assert "Google-Extended" in rb.text
+    assert "Disallow: /" in rb.text
+
+
+def test_auth_login_page_has_google_button(client, monkeypatch):
+    """GET /auth/login shows the Google OAuth button when GOOGLE_CLIENT_ID is set.
+
+    98c45dd0 — the button only renders for a configured provider, so the test
+    configures the client id first.
+    """
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-fake")
     r = client.get("/auth/login", follow_redirects=False)
     assert r.status_code == 200
     assert "Google" in r.text
@@ -8370,6 +9255,67 @@ async def test_start_session_skips_continuation_for_stale_session():
         )
         assert second.get("continuation") is not True
         assert second["session_id"] != first_sid
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_continue_mode_returns_pending_and_goal():
+    """c793377d — auto-detected continuation returns a compact resume payload:
+    session_id + live pending items + ready-to-paste /goal, no full re-read."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "continue-proj")
+        item = await db_module.add_sprint_item(db, p["id"], "v9", "Wire the widget")
+        first = await _start_session_composite(
+            db, p["id"], "resume-me", "/tmp", version="v9",
+        )
+        assert "continuation" not in first
+        # Immediate re-call within the heartbeat window → continue payload.
+        second = await _start_session_composite(
+            db, p["id"], "resume-me", "/tmp", source="resume",
+        )
+        assert second.get("continuation") is True
+        assert second.get("mode") == "continue"
+        assert second["session_id"] == first["session_id"]
+        assert second["pending_count"] == 1
+        assert second["pending_items"][0]["id"] == item["id"]
+        # The /goal string is ready to paste and names the pending item.
+        assert second["goal_string"].startswith("/goal")
+        assert item["id"] in second["goal_string"]
+        # No heavy L0/L1/L2 context.
+        assert "goal_xml" not in second
+        assert "cache_blocks" not in second
+        assert "meridian_instructions" not in second
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_continue_mode_resumes_past_heartbeat_window():
+    """c793377d — explicit mode='continue' resumes a same-name session even when
+    last_seen is older than the 5-min auto-detect window."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "continue-stale")
+        first = await _start_session_composite(db, p["id"], "long-task", "/tmp")
+        first_sid = first["session_id"]
+        await db.execute(
+            "UPDATE sessions SET last_seen = datetime('now', '-30 minutes') WHERE id = ?",
+            (first_sid,),
+        )
+        await db.commit()
+        # 30 min > the 5-min auto-detect window, so a plain re-call would register
+        # fresh (see test_start_session_skips_continuation_for_stale_session).
+        # mode='continue' widens the window and resumes the original session.
+        cont = await _start_session_composite(
+            db, p["id"], "long-task", "/tmp", mode="continue",
+        )
+        assert cont.get("continuation") is True
+        assert cont.get("mode") == "continue"
+        assert cont["session_id"] == first_sid
     finally:
         await db.close()
 
@@ -10405,6 +11351,113 @@ async def test_ingest_document_requires_content_or_file_path(db):
 
 
 @pytest.mark.asyncio
+async def test_ingest_document_upserts_by_source(db):
+    """e9addcb0 — re-ingesting the SAME source updates the existing document in
+    place: one row, refreshed body/title/tags/updated_at, same note id."""
+    p = await db_module.create_project(db, "e9addcb0-upsert")
+    pid = p["id"]
+    src = "onedrive://file/ABC123"
+
+    first = await db_module.ingest_document(
+        db, pid, content="v1 body", title="Spec v1", source=src, tags="draft",
+    )
+    # Re-ingest the same document (same source) with new content/title/tags.
+    second = await db_module.ingest_document(
+        db, pid, content="v2 body — revised", title="Spec v2", source=src, tags="final",
+    )
+
+    # Same underlying row was updated, not a new one created.
+    assert second["id"] == first["id"]
+    assert second["note_kind"] == "document"
+    assert second["source"] == src
+    assert second["body"] == "v2 body — revised"
+    assert second["title"] == "Spec v2"
+    assert second["tags"] == "final"
+
+    # Exactly ONE document note for this source in the project.
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document" and n.get("source") == src
+    ]
+    assert len(docs) == 1
+    assert docs[0]["body"] == "v2 body — revised"
+
+    # The stable-identity lookup returns that single row.
+    found = await db_module.get_project_document_by_source(db, pid, src)
+    assert found is not None and found["id"] == first["id"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_different_sources_are_distinct_rows(db):
+    """e9addcb0 — ingesting two DIFFERENT sources creates two document rows;
+    the upsert only collapses re-ingests of the same identity."""
+    p = await db_module.create_project(db, "e9addcb0-distinct")
+    pid = p["id"]
+
+    a = await db_module.ingest_document(
+        db, pid, content="alpha", title="A", source="path/a.md",
+    )
+    b = await db_module.ingest_document(
+        db, pid, content="beta", title="B", source="path/b.md",
+    )
+    assert a["id"] != b["id"]
+
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document"
+    ]
+    assert len(docs) == 2
+    assert {n["source"] for n in docs} == {"path/a.md", "path/b.md"}
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_without_source_never_merges(db):
+    """e9addcb0 — an anonymous ingest (content, no source/file_path) can't be
+    identified, so two such ingests stay two distinct rows — no silent merge."""
+    p = await db_module.create_project(db, "e9addcb0-anon")
+    pid = p["id"]
+
+    first = await db_module.ingest_document(db, pid, content="first anon", title="Doc")
+    second = await db_module.ingest_document(db, pid, content="second anon", title="Doc")
+    assert first["id"] != second["id"]
+    # Neither carries a source (nothing to key an upsert on).
+    assert not (first.get("source") or "")
+    assert not (second.get("source") or "")
+
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document"
+    ]
+    assert len(docs) == 2
+    # Lookup by empty source is a no-op, not a wildcard match.
+    assert await db_module.get_project_document_by_source(db, pid, "") is None
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_file_path_upserts_by_path(db, tmp_path):
+    """e9addcb0 — a file_path is the stable identity when no explicit source is
+    given: re-ingesting the same path (with changed contents) upserts one row."""
+    p = await db_module.create_project(db, "e9addcb0-file-upsert")
+    pid = p["id"]
+    doc = tmp_path / "spec.md"
+    doc.write_text("original text", encoding="utf-8")
+
+    first = await db_module.ingest_document(db, pid, file_path=str(doc))
+    doc.write_text("edited text — v2", encoding="utf-8")
+    second = await db_module.ingest_document(db, pid, file_path=str(doc))
+
+    assert second["id"] == first["id"]
+    assert second["source"] == str(doc)
+    assert second["body"] == "edited text — v2"
+
+    docs = [
+        n for n in await db_module.get_project_notes(db, pid, bodies=True)
+        if n.get("note_kind") == "document" and n.get("source") == str(doc)
+    ]
+    assert len(docs) == 1
+
+
+@pytest.mark.asyncio
 async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
     """e3f150d0 — the ingest_document MCP tool extracts a .docx server-side and
     stores a kind='document' note; the PDF path returns a clear error payload.
@@ -10443,6 +11496,99 @@ async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
     assert "project_name" in by_name["ingest_document"]["inputSchema"]["properties"]
     # It writes, so it must not be flagged read-only.
     assert by_name["ingest_document"]["annotations"]["readOnlyHint"] is False
+
+
+def test_upload_document_txt_ingests_and_lists(client):
+    """f1c7e7d1 — POST /documents/upload with a .txt reuses ingest_document's
+    content path: 201, a kind='document' note is stored and shows in the list,
+    and the uploaded content is body-searchable (i.e. it reached ingest)."""
+    project = client.post("/projects", json={"name": "f1c7e7d1-upload"}).json()
+    pid = project["id"]
+    r = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "design-notes.txt", "content": "The API must debounce writes by 300ms."},
+    )
+    assert r.status_code == 201, r.text
+    note = r.json()
+    assert note["note_kind"] == "document"
+    assert note["title"] == "design-notes.txt"
+    assert note["source"] == "design-notes.txt"
+    assert "debounce" in note["body"]
+    # It appears in the project's document list (what the panel renders).
+    listed = client.get(f"/projects/{pid}/notes").json()
+    docs = [n for n in listed if str(n.get("note_kind")) == "document"]
+    assert any(d["id"] == note["id"] for d in docs)
+    # And the content is full-text searchable (proves it reached ingest).
+    hits = client.get(f"/projects/{pid}/notes?query=debounce").json()
+    assert any(h["id"] == note["id"] for h in hits)
+
+
+def test_upload_document_md_ingested(client):
+    """f1c7e7d1 — a .md upload is accepted too."""
+    project = client.post("/projects", json={"name": "f1c7e7d1-md"}).json()
+    pid = project["id"]
+    r = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "README.md", "content": "# Title\n\nBody text."},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["note_kind"] == "document"
+
+
+def test_upload_document_rejects_bad_extension(client):
+    """f1c7e7d1 — non-.txt/.md uploads (.pdf, .exe, .docx) are 400-rejected."""
+    project = client.post("/projects", json={"name": "f1c7e7d1-badext"}).json()
+    pid = project["id"]
+    for bad in ("report.pdf", "malware.exe", "chapter.docx", "noext"):
+        r = client.post(
+            f"/projects/{pid}/documents/upload",
+            json={"filename": bad, "content": "x"},
+        )
+        assert r.status_code == 400, f"{bad} should be rejected: {r.text}"
+    # Nothing was ingested.
+    listed = client.get(f"/projects/{pid}/notes").json()
+    assert not [n for n in listed if str(n.get("note_kind")) == "document"]
+
+
+def test_upload_document_rejects_oversize_and_empty(client):
+    """f1c7e7d1 — an oversize body is rejected and an empty body is a 400.
+
+    Oversize: the global request-body guard (limits.BODY_BYTES, default 100KB)
+    fires first with a 429 when Content-Length is present; the handler's own
+    check is defense-in-depth. Either way the oversize upload is rejected and
+    no document is ingested — assert on that, not a single status code.
+    """
+    project = client.post("/projects", json={"name": "f1c7e7d1-size"}).json()
+    pid = project["id"]
+    from meridian import limits as _limits
+    big = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "huge.txt", "content": "x" * (_limits.BODY_BYTES + 5000)},
+    )
+    assert big.status_code in (400, 429), big.text
+    assert not [
+        n for n in client.get(f"/projects/{pid}/notes").json()
+        if str(n.get("note_kind")) == "document"
+    ]
+    empty = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"filename": "blank.txt", "content": "   "},
+    )
+    assert empty.status_code == 400, empty.text
+    missing_name = client.post(
+        f"/projects/{pid}/documents/upload",
+        json={"content": "hello"},
+    )
+    assert missing_name.status_code == 400, missing_name.text
+
+
+def test_upload_document_unknown_project_404(client):
+    """f1c7e7d1 — uploading to a non-existent project is a 404."""
+    r = client.post(
+        "/projects/does-not-exist/documents/upload",
+        json={"filename": "a.txt", "content": "hi"},
+    )
+    assert r.status_code == 404, r.text
 
 
 @pytest.mark.asyncio
@@ -10871,6 +12017,87 @@ def test_mcp_sse_cors_headers_on_post(client):
     assert r.headers.get("access-control-allow-origin") == "*"
 
 
+# ---------------------------------------------------------------------------
+# bb16f9a7 — SSE keepalive heartbeat wrapper (_with_sse_heartbeat)
+# ---------------------------------------------------------------------------
+
+
+async def _collect(agen, limit):
+    """Drain up to ``limit`` frames from an async generator, then stop it."""
+    out = []
+    async for frame in agen:
+        out.append(frame)
+        if len(out) >= limit:
+            break
+    await agen.aclose()
+    return out
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_passes_data_through_without_ping():
+    """Frames from a fast upstream pass through promptly — no spurious pings."""
+    async def upstream():
+        yield "event: endpoint\ndata: /x\n\n"
+        yield "data: real\n\n"
+
+    # Long interval so the timer never fires while real data is flowing.
+    frames = [f async for f in server_module._with_sse_heartbeat(upstream(), interval=30)]
+    assert frames == ["event: endpoint\ndata: /x\n\n", "data: real\n\n"]
+    assert server_module._SSE_HEARTBEAT_FRAME not in frames
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_emits_ping_after_idle_interval():
+    """A silent upstream triggers a ``: ping`` keepalive after the interval."""
+    started = asyncio.Event()
+
+    async def idle_upstream():
+        # Never yields until cancelled/closed — simulates an idle SSE connection.
+        started.set()
+        while True:
+            await asyncio.sleep(3600)
+        yield  # pragma: no cover - unreachable, marks this an async generator
+
+    # Tiny interval keeps the test fast; the wrapper must still emit exactly one
+    # ping per idle interval with no upstream data.
+    frames = await _collect(
+        server_module._with_sse_heartbeat(idle_upstream(), interval=0.02),
+        limit=3,
+    )
+    assert started.is_set()
+    assert frames == [server_module._SSE_HEARTBEAT_FRAME] * 3
+    assert server_module._SSE_HEARTBEAT_FRAME == ": ping\n\n"
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_interleaves_ping_then_delivers_data():
+    """After an idle ping, a subsequent real frame is still delivered (shielded read)."""
+    async def slow_then_data():
+        await asyncio.sleep(0.05)   # idle gap longer than the interval → ping
+        yield "data: after-idle\n\n"
+
+    frames = await _collect(
+        server_module._with_sse_heartbeat(slow_then_data(), interval=0.02),
+        limit=4,
+    )
+    # At least one ping fired during the idle gap, and the real frame arrived.
+    assert server_module._SSE_HEARTBEAT_FRAME in frames
+    assert "data: after-idle\n\n" in frames
+    # The real data frame comes after the ping(s).
+    assert frames.index("data: after-idle\n\n") == len(frames) - 1
+
+
+@pytest.mark.asyncio
+async def test_sse_heartbeat_stops_when_upstream_exhausts():
+    """An empty upstream ends the wrapper cleanly (no hang, no ping)."""
+    async def empty():
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    frames = [f async for f in server_module._with_sse_heartbeat(empty(), interval=0.01)]
+    assert frames == []
+
+
 def test_mcp_responses_carry_csp_header(client):
     """All /mcp route responses carry a strict Content-Security-Policy header.
 
@@ -10914,16 +12141,20 @@ def test_remote_mcp_401_invalid_bearer_includes_www_authenticate(client):
     assert "Bearer" in www_auth
 
 
-def test_login_page_preserves_next_param(client):
-    """GET /auth/login?next=/foo injects ?next= into all login button hrefs."""
+def test_login_page_preserves_next_param(client, monkeypatch):
+    """GET /auth/login?next=/foo injects ?next= into all configured login hrefs."""
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-fake")
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "gh-fake")
     r = client.get("/auth/login?next=/oauth/authorize%3Fclient_id%3Dabc")
     assert r.status_code == 200
     assert "/auth/google/login?next=" in r.text
     assert "/auth/github/login?next=" in r.text
 
 
-def test_login_page_no_next_param(client):
+def test_login_page_no_next_param(client, monkeypatch):
     """GET /auth/login without ?next= keeps bare login hrefs (no ?next= appended)."""
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-fake")
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "gh-fake")
     r = client.get("/auth/login")
     assert r.status_code == 200
     assert 'href="/auth/google/login"' in r.text
@@ -11372,6 +12603,98 @@ async def test_dispatch_mcp_tool_set_sprint(db):
         "set_sprint", {"project_id": p["id"], "sprint": "week-1-auth"}, db, "/tmp"
     )
     assert result["sprint"] == "week-1-auth"
+
+
+# ---------------------------------------------------------------------------
+# bf51b12e — planner context-refresh dispatch hook
+# ---------------------------------------------------------------------------
+
+
+async def _new_project_and_session(db, name):
+    """Create a project + start a session, returning (project_id, session_id)."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, name)
+    sess = await srv._dispatch_mcp_tool(
+        "start_session", {"project_id": p["id"]}, db, "/tmp"
+    )
+    return p["id"], sess["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_fires_on_trigger_tool(db):
+    """auto_refresh_enabled + a trigger tool (add_insight) + a session_id ⇒ the
+    result carries '_context_refresh'."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-trigger")
+    await db_module.update_workspace_settings(db, auto_refresh_enabled=True)
+    result = await srv._dispatch_mcp_tool(
+        "add_insight",
+        {"project_id": pid, "session_id": sid, "title": "T", "body": "B"},
+        db, "/tmp",
+    )
+    assert "_context_refresh" in result
+    assert result["_context_refresh"]["project_id"] == pid
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_absent_when_disabled(db):
+    """auto_refresh disabled ⇒ no '_context_refresh' even on a trigger tool."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-disabled")
+    # auto_refresh_enabled defaults False — do not enable it.
+    result = await srv._dispatch_mcp_tool(
+        "add_insight",
+        {"project_id": pid, "session_id": sid, "title": "T", "body": "B"},
+        db, "/tmp",
+    )
+    assert "_context_refresh" not in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_skips_executor_session(db):
+    """A session registered as role=executor never gets '_context_refresh'."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    p = await db_module.create_project(db, "refresh-executor")
+    sess = await srv._dispatch_mcp_tool(
+        "start_session", {"project_id": p["id"], "role": "executor"}, db, "/tmp"
+    )
+    sid = sess["session_id"]
+    assert sid in mh._EXECUTOR_SESSIONS  # registered by the start_session hook
+    await db_module.update_workspace_settings(db, auto_refresh_enabled=True)
+    result = await srv._dispatch_mcp_tool(
+        "add_insight",
+        {"project_id": p["id"], "session_id": sid, "title": "T", "body": "B"},
+        db, "/tmp",
+    )
+    assert "_context_refresh" not in result
+
+
+@pytest.mark.asyncio
+async def test_build_context_refresh_returns_expected_keys(db):
+    """_build_context_refresh returns the compact orientation dict shape."""
+    from meridian.mcp import handler as mh
+    p = await db_module.create_project(db, "refresh-builder")
+    await db_module.set_goal(db, p["id"], "the goal")
+    ctx = await mh._build_context_refresh(db, p["id"])
+    assert ctx is not None
+    for key in (
+        "project_id", "project_name", "sprint", "north_star",
+        "sprint_progress", "next_pending_items", "recent_handoffs",
+        "high_priority_decisions", "unvalidated_assumptions", "key_note_slugs",
+    ):
+        assert key in ctx, f"missing key {key}"
+    assert ctx["project_id"] == p["id"]
+    # Unknown project ⇒ None (caller raises "project not found").
+    assert await mh._build_context_refresh(db, "no-such-project") is None
 
 
 @pytest.mark.asyncio
@@ -12062,6 +13385,16 @@ def test_github_status_graceful_on_db_error(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _run_async(coro):
+    """Run a coroutine against the app DB on a fresh loop (aiosqlite is
+    thread-backed, so a private loop is safe here)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 def test_oauth_device_returns_required_fields(client):
     """POST /oauth/device returns all RFC 8628 required fields."""
     r = client.post("/oauth/device")
@@ -12131,7 +13464,7 @@ def test_oauth_device_expired_code(client):
 
 
 def test_oauth_device_deny_no_token(client):
-    """Deny action deletes the device code so subsequent poll returns expired_token."""
+    """Deny marks the code denied so the poll returns RFC 8628 access_denied."""
     resp = client.post("/oauth/device").json()
     device_code = resp["device_code"]
     user_code = resp["user_code"]
@@ -12139,13 +13472,22 @@ def test_oauth_device_deny_no_token(client):
     # User denies
     client.post("/activate", data={"user_code": user_code, "action": "deny"})
 
-    # Poll — code deleted on deny, so expired_token
+    # Poll — denial surfaces as access_denied (per RFC 8628), and the code is
+    # consumed so a second poll can't be redeemed.
     r = client.post("/oauth/token", json={
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
         "device_code": device_code,
     })
     assert r.status_code == 400
-    assert r.json()["error"] == "expired_token"
+    assert r.json()["error"] == "access_denied"
+
+    # Consumed on denial — subsequent poll is expired_token (row gone).
+    r2 = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "expired_token"
 
 
 def test_oauth_device_token_consumed_after_issue(client):
@@ -12196,6 +13538,111 @@ def test_oauth_device_table_in_create_tables():
     """CREATE_TABLES must define device_codes table for RFC 8628 persistence."""
     from meridian.db import CREATE_TABLES
     assert "device_codes" in CREATE_TABLES, "CREATE_TABLES missing 'device_codes'"
+
+
+def test_oauth_device_slow_down_on_fast_poll(client):
+    """Two rapid polls of the same pending code return slow_down on the second (e9f18530)."""
+    dc = client.post("/oauth/device").json()["device_code"]
+    body = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": dc,
+    }
+    r1 = client.post("/oauth/token", json=body)
+    assert r1.json()["error"] == "authorization_pending"
+    # Immediate second poll is faster than the 5s interval → slow_down.
+    r2 = client.post("/oauth/token", json=body)
+    assert r2.status_code == 200
+    assert r2.json()["error"] == "slow_down"
+
+
+def test_oauth_device_codes_stored_hashed_not_plaintext(client):
+    """device_code / user_code are persisted as SHA-256 hashes, never plaintext (e9f18530)."""
+    import hashlib
+
+    resp = client.post("/oauth/device").json()
+    device_code = resp["device_code"]
+    user_code = resp["user_code"]
+
+    async def _fetch():
+        db = client.app.state.db
+        async with db.execute(
+            "SELECT device_code, user_code FROM device_codes"
+        ) as cur:
+            return await cur.fetchall()
+
+    rows = _run_async(_fetch())
+    stored = [
+        (r["device_code"], r["user_code"]) if hasattr(r, "keys") else (r[0], r[1])
+        for r in rows
+    ]
+    stored_device = {s[0] for s in stored}
+    stored_user = {s[1] for s in stored}
+
+    # The raw codes must NOT appear anywhere in the table...
+    assert device_code not in stored_device
+    assert user_code not in stored_user
+    # ...but their SHA-256 hashes must.
+    assert hashlib.sha256(device_code.encode()).hexdigest() in stored_device
+    assert hashlib.sha256(user_code.encode()).hexdigest() in stored_user
+
+
+def test_oauth_device_tenant_token_authenticates(client):
+    """Hosted path: an approved code bound to a tenant mints a working API token
+    via create_api_token that authenticates via get_tenant_from_token_hash (e9f18530)."""
+    import hashlib
+    from meridian import db as db_module
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "device-flow@example.com")
+        # Insert an already-approved device code bound to this tenant.
+        resp = await _post_device(db)
+        return tenant["id"], resp
+
+    async def _post_device(db):
+        # Reuse the real endpoint logic by inserting a known pair directly.
+        import secrets as _s
+        from datetime import datetime, timezone, timedelta
+        from meridian.routes.oauth import _device_hash
+        device_code = _s.token_hex(32)
+        user_code = "TEST-CODE"
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?, ?, ?)",
+            (_device_hash(device_code), _device_hash(user_code), expires_at),
+        )
+        await db.commit()
+        return device_code
+
+    tenant_id, device_code = _run_async(_setup())
+
+    async def _approve():
+        db = client.app.state.db
+        from meridian.routes.oauth import _device_hash
+        await db.execute(
+            "UPDATE device_codes SET tenant_id = ?, approved = 1 WHERE device_code = ?",
+            (tenant_id, _device_hash(device_code)),
+        )
+        await db.commit()
+
+    _run_async(_approve())
+
+    r = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r.status_code == 200
+    tok = r.json()["access_token"]
+    assert tok.startswith("sk_meridian_")
+
+    async def _verify():
+        db = client.app.state.db
+        tok_hash = hashlib.sha256(tok.encode()).hexdigest()
+        return await db_module.get_tenant_from_token_hash(db, tok_hash)
+
+    tenant_row = _run_async(_verify())
+    assert tenant_row is not None
+    assert tenant_row["id"] == tenant_id
 
 
 # ---------------------------------------------------------------------------
@@ -12261,6 +13708,55 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     assert "git worktree add" in result["worktree_setup_cmd"]
     assert "git worktree remove" in result["worktree_cleanup_cmd"]
     assert "git merge" in result["worktree_merge_cmd"]
+
+
+@pytest.mark.asyncio
+async def test_claim_returns_code_context_from_touches_resources(db):
+    """04a15d3f — claim surfaces code_context (files + symbols + prospect calls)
+    parsed from the item's typed touches_resources."""
+    import json as _json
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "prospect-tr")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the registry proxy")
+    await db.execute(
+        "UPDATE sprint_items SET touches_resources = ? WHERE id = ?",
+        (_json.dumps(["file:meridian/routes/tunnel.py", "symbol:get_mcp_registry"]), item["id"]),
+    )
+    await db.commit()
+
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+    ctx = result.get("code_context")
+    assert ctx is not None
+    assert ctx["source"] == "touches_resources"
+    assert ctx["files"] == ["meridian/routes/tunnel.py"]
+    assert ctx["symbols"] == ["get_mcp_registry"]
+    assert any("get_mcp_registry" in c for c in ctx["find_symbol_calls"])
+    assert any("tunnel.py" in c for c in ctx["search_graph_calls"])
+
+
+@pytest.mark.asyncio
+async def test_claim_code_context_falls_back_to_title_inference(db):
+    """04a15d3f — with no touches_resources, code_context is inferred from the
+    item title via the hotspot keyword rules (_suggest_files_for_title)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "prospect-title")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix dashboard button styling")
+
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+    ctx = result.get("code_context")
+    assert ctx is not None
+    assert ctx["source"] == "title_inference"
+    assert ctx["files"]  # at least one file inferred from the title
 
 
 @pytest.mark.asyncio
@@ -12768,7 +14264,9 @@ async def test_get_sprint_progress_basic(db):
     assert res["done"] == 1
     assert res["pending"] == 1
     assert res["percent_complete"] == 50
-    assert len(res["items"]) == 2
+    # 1da83459 — get_sprint_progress is summary-only now (no per-item list).
+    assert "items" not in res
+    assert res["by_status"]["done"] == 1
 
 
 @pytest.mark.asyncio
@@ -12783,8 +14281,26 @@ async def test_get_sprint_progress_version_filter(db):
     res = await srv._dispatch_mcp_tool(
         "get_sprint_progress", {"project_id": pid, "version": "v1"}, db, "/tmp"
     )
-    assert res["total"] == 1
-    assert res["items"][0]["title"].startswith("v1 task")
+    assert res["total"] == 1  # v1-only scoping (v2 item excluded)
+    assert "items" not in res  # 1da83459 — summary-only
+    assert res["by_status"].get("pending") == 1
+
+
+@pytest.mark.asyncio
+async def test_sprint_item_slug_autopopulated(db):
+    """b944c905 — add_sprint_item auto-populates a human-readable slug from the
+    title (deduped per project). human_id (the assignee) is left untouched."""
+    p = await db_module.create_project(db, "slug-proj")
+    pid = p["id"]
+    a = await db_module.add_sprint_item(db, pid, "v1", "Wire the OAuth Login Flow")
+    assert a["slug"] == "wire-the-oauth-login-flow"
+    assert a.get("human_id") is None  # slug is NOT the assignee field
+    # Same title (forced past the dup guard) → -2 suffix.
+    b = await db_module.add_sprint_item(db, pid, "v1", "Wire the OAuth Login Flow", force=True)
+    assert b["slug"] == "wire-the-oauth-login-flow-2"
+    # A caller-supplied slug base is slugified too.
+    c = await db_module.add_sprint_item(db, pid, "v1", "Something else", slug="Custom Slug")
+    assert c["slug"] == "custom-slug"
 
 
 # ---------------------------------------------------------------------------
@@ -13157,50 +14673,53 @@ async def test_claim_sprint_item_soft_file_overlap_warning(db):
 
 
 # ---------------------------------------------------------------------------
-# Planning chat save mechanism (db9edba3)
+# capture_insight retirement — legacy note_kind='insight' → insights table (b5ed8a61)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_capture_insight_body(db):
-    import meridian.server as srv
+async def test_migrate_capture_insight_notes_to_insights(db):
+    """b5ed8a61 — the migration MOVES legacy kind='insight' project_notes into the
+    dedicated insights table: the note is gone afterward and the insight is present."""
+    from meridian.db.migrations import _migrate_capture_insight_notes_to_insights
 
-    p = await db_module.create_project(db, "ins-body")
-    res = await srv._dispatch_mcp_tool(
-        "capture_insight",
-        {"project_id": p["id"], "title": "Pricing", "body": "Workspace tiers, not per-seat."},
-        db, "/tmp",
+    p = await db_module.create_project(db, "insight-migrate")
+    note = await db_module.add_project_note(
+        db, p["id"], "Pricing takeaway", "Workspace tiers, not per-seat.",
+        "strategy", kind="insight",
     )
-    assert res["note_kind"] == "insight"
-    assert "Workspace tiers" in res["body"]
-    assert "insight" in (res.get("tags") or "")
+    # Precondition: the note exists as a kind='insight' project_note.
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM project_notes WHERE note_kind = 'insight'"
+    ) as cur:
+        pre = await cur.fetchone()
+    assert (pre["c"] if isinstance(pre, dict) else pre[0]) == 1
 
+    await _migrate_capture_insight_notes_to_insights(db)
 
-@pytest.mark.asyncio
-async def test_capture_insight_bullet_points(db):
-    import meridian.server as srv
+    # The note is gone from project_notes...
+    gone = await db_module.get_project_note(db, note["id"])
+    assert gone is None
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM project_notes WHERE note_kind = 'insight'"
+    ) as cur:
+        post = await cur.fetchone()
+    assert (post["c"] if isinstance(post, dict) else post[0]) == 0
 
-    p = await db_module.create_project(db, "ins-bullets")
-    res = await srv._dispatch_mcp_tool(
-        "capture_insight",
-        {"project_id": p["id"], "title": "Takeaways",
-         "bullet_points": ["Ship device flow", "Defer WS tunnel"]},
-        db, "/tmp",
-    )
-    assert res["note_kind"] == "insight"
-    assert "- Ship device flow" in res["body"]
-    assert "- Defer WS tunnel" in res["body"]
+    # ...and present in the insights table (id reused → pure MOVE).
+    insights = await db_module.get_insights(db, p["id"])
+    assert len(insights) == 1
+    moved = insights[0]
+    assert moved["id"] == note["id"]
+    assert moved["title"] == "Pricing takeaway"
+    assert moved["body"] == "Workspace tiers, not per-seat."
+    assert moved["horizon"] == "quarter"
+    assert moved["status"] == "active"
+    assert moved["tags"] == "strategy"
 
-
-@pytest.mark.asyncio
-async def test_capture_insight_requires_content(db):
-    import meridian.server as srv
-
-    p = await db_module.create_project(db, "ins-empty")
-    res = await srv._dispatch_mcp_tool(
-        "capture_insight", {"project_id": p["id"], "title": "Empty"}, db, "/tmp",
-    )
-    assert "error" in res
+    # Idempotent: a second run is a no-op (no rows to move, no duplicate insight).
+    await _migrate_capture_insight_notes_to_insights(db)
+    assert len(await db_module.get_insights(db, p["id"])) == 1
 
 
 def test_select_strategic_notes_includes_insights():
@@ -13286,6 +14805,82 @@ async def test_blog_post_db_lifecycle(db):
     # Delete.
     assert await db_module.delete_blog_post(db, p1["id"]) is True
     assert await db_module.get_blog_post(db, p1["id"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Workspace-scoped blog (8843250f)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_blog_save_and_get(db):
+    """8843250f — save_blog_post / get_blog_posts: workspace-scoped, status
+    filter, computed /blog/<slug> url, tenant isolation, first-publish stamps."""
+    a1 = await db_module.save_blog_post(
+        db, "Tenant A Launch", "# Hi", status="published", tenant_id="tenant-a",
+    )
+    assert a1["status"] == "published"
+    assert a1["url"] == f"/blog/{a1['slug']}"
+    assert a1["published_at"] is not None
+    a2 = await db_module.save_blog_post(
+        db, "Tenant A Draft", "wip", tenant_id="tenant-a",
+    )
+    assert a2["status"] == "draft"
+    await db_module.save_blog_post(db, "Tenant B Post", "b", tenant_id="tenant-b")
+
+    # Tenant isolation.
+    a_titles = {p["title"] for p in await db_module.get_blog_posts(db, tenant_id="tenant-a")}
+    assert a_titles == {"Tenant A Launch", "Tenant A Draft"}
+    b_titles = {p["title"] for p in await db_module.get_blog_posts(db, tenant_id="tenant-b")}
+    assert b_titles == {"Tenant B Post"}
+
+    # Status filter.
+    pub = await db_module.get_blog_posts(db, tenant_id="tenant-a", status="published")
+    assert [p["title"] for p in pub] == ["Tenant A Launch"]
+
+    # Update: promote the draft to archived (keeps id, sets status).
+    a2b = await db_module.save_blog_post(
+        db, "Tenant A Draft", "wip", status="archived",
+        post_id=a2["id"], tenant_id="tenant-a",
+    )
+    assert a2b["id"] == a2["id"] and a2b["status"] == "archived"
+    arch = await db_module.get_blog_posts(db, tenant_id="tenant-a", status="archived")
+    assert [p["id"] for p in arch] == [a2["id"]]
+
+
+def test_mcp_workspace_blog_roundtrip(client):
+    """MCP: save_blog_post creates a post; get_blog_posts lists it with a url."""
+    import json as _json
+
+    def _result(resp):
+        assert resp.get("result") is not None, resp
+        return _json.loads(resp["result"]["content"][0]["text"])
+
+    saved = _result(_mcp_call(client, "save_blog_post", {
+        "title": "MCP Blog Post", "body": "# hi", "status": "published",
+    }))
+    assert saved["status"] == "published"
+    assert saved["url"] == f"/blog/{saved['slug']}"
+    posts = _result(_mcp_call(client, "get_blog_posts", {"status": "published"}))
+    assert any(p["id"] == saved["id"] and p["url"] == saved["url"] for p in posts)
+
+
+def test_workspace_blog_rest_endpoint(client):
+    """REST: POST /workspace/blog creates; GET /workspace/blog lists newest-first
+    with a computed url and honours the status filter."""
+    r = client.post("/workspace/blog", json={
+        "title": "REST Blog Post", "body": "body", "status": "published",
+    })
+    assert r.status_code == 201, r.text
+    post = r.json()
+    assert post["url"] == f"/blog/{post['slug']}"
+
+    listed = client.get("/workspace/blog").json()
+    assert any(p["id"] == post["id"] for p in listed)
+    pub = client.get("/workspace/blog?status=published").json()
+    assert any(p["id"] == post["id"] for p in pub)
+    # A missing title is rejected.
+    assert client.post("/workspace/blog", json={"title": ""}).status_code == 400
 
 
 def test_blog_admin_and_public_http(client):
@@ -14239,6 +15834,32 @@ async def test_list_plugins_returns_builtin_plugins(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_list_plugins_invocation_note_and_invocable_flag(db, tmp_path):
+    """8f66d85e — list_plugins clarifies how plugin tools are invoked and flags
+    each plugin's invocability (False when no tunnel is active)."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    result = await _dispatch_mcp_tool("list_plugins", {}, db, str(tmp_path), tenant=None)
+    assert "invocation_note" in result
+    assert "tunnel connector" in result["invocation_note"]
+    for p in result["plugins"]:
+        assert "invocable" in p
+        assert p["invocable"] is False  # no tunnel active
+
+
+def test_agent_instructions_include_reindex_at_session_start():
+    """eacf7063 — default executor instructions tell agents to reindex at session
+    start; the standard version + marker are bumped so stored copies detect it."""
+    from meridian.agent_defaults import (
+        DEFAULT_AGENT_INSTRUCTIONS,
+        AGENT_INSTRUCTIONS_STANDARD_VERSION,
+    )
+    assert 'index_repository(mode="fast")' in DEFAULT_AGENT_INSTRUCTIONS
+    assert AGENT_INSTRUCTIONS_STANDARD_VERSION >= 3
+    assert "meridian-executor-standard: v3" in DEFAULT_AGENT_INSTRUCTIONS
+
+
+@pytest.mark.asyncio
 async def test_get_plugin_details_known_plugin(db, tmp_path):
     """get_plugin_details returns correct structure for a known plugin name."""
     from meridian.mcp.handler import _dispatch_mcp_tool
@@ -14779,3 +16400,107 @@ def test_patch_sprint_item_touches_resources(client):
     resources = json.loads(data["touches_resources"] or "[]")
     assert "note:my-note" in resources
     assert "decision:d1" in resources
+
+
+# ---------------------------------------------------------------------------
+# 46c83e55 — meridian.toml self-host config readers (env > toml > default)
+# ---------------------------------------------------------------------------
+
+
+def _point_toml_at(monkeypatch, tmp_path, text):
+    """Write ``text`` to a tmp meridian.toml and make toml_config read it."""
+    import meridian.toml_config as tc
+    p = tmp_path / "meridian.toml"
+    p.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(tc, "_toml_path", lambda: p)
+    return tc
+
+
+def _clear_refresh_env(monkeypatch):
+    for var in (
+        "MERIDIAN_AUTO_REFRESH",
+        "MERIDIAN_REFRESH_INTERVAL_TURNS",
+        "MERIDIAN_REFRESH_TRIGGERS",
+        "MERIDIAN_LOOP_ENABLED",
+        "MERIDIAN_MAX_TURNS",
+        "MERIDIAN_FILESYSTEM_ROOTS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_context_refresh_config_hardcoded_default(monkeypatch):
+    """No env, no toml ⇒ built-in defaults (disabled / 10 / default trigger set)."""
+    import meridian.toml_config as tc
+    _clear_refresh_env(monkeypatch)
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+    cfg = tc.get_context_refresh_config()
+    assert cfg["auto_refresh_enabled"] is False
+    assert cfg["refresh_interval_turns"] == 10
+    assert cfg["refresh_triggers"] == tc._DEFAULT_REFRESH_TRIGGERS
+    assert "pin_decision" in cfg["refresh_triggers"]
+
+
+def test_context_refresh_config_toml_over_default(monkeypatch, tmp_path):
+    """[context_refresh] toml table overrides the hardcoded default."""
+    _clear_refresh_env(monkeypatch)
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[context_refresh]\n"
+        "auto_refresh_enabled = true\n"
+        "refresh_interval_turns = 5\n"
+        'refresh_triggers = ["set_goal", "pin_decision"]\n',
+    )
+    cfg = tc.get_context_refresh_config()
+    assert cfg["auto_refresh_enabled"] is True
+    assert cfg["refresh_interval_turns"] == 5
+    assert cfg["refresh_triggers"] == ["set_goal", "pin_decision"]
+
+
+def test_context_refresh_config_env_over_toml(monkeypatch, tmp_path):
+    """Env vars win over the toml table (env-first precedence)."""
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[context_refresh]\n"
+        "auto_refresh_enabled = false\n"
+        "refresh_interval_turns = 5\n"
+        'refresh_triggers = ["set_goal"]\n',
+    )
+    monkeypatch.setenv("MERIDIAN_AUTO_REFRESH", "1")
+    monkeypatch.setenv("MERIDIAN_REFRESH_INTERVAL_TURNS", "20")
+    monkeypatch.setenv("MERIDIAN_REFRESH_TRIGGERS", "add_insight, generate_handoff")
+    cfg = tc.get_context_refresh_config()
+    assert cfg["auto_refresh_enabled"] is True
+    assert cfg["refresh_interval_turns"] == 20
+    assert cfg["refresh_triggers"] == ["add_insight", "generate_handoff"]
+
+
+def test_self_host_defaults_env_over_toml_over_default(monkeypatch, tmp_path):
+    """get_self_host_defaults resolves loop/max_turns/filesystem_roots env>toml>default."""
+    import meridian.toml_config as tc
+    _clear_refresh_env(monkeypatch)
+    # 1. hardcoded default (no toml, no env).
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+    d = tc.get_self_host_defaults()
+    assert d["loop_enabled_default"] is True
+    assert d["max_turns_default"] == 0
+    assert d["filesystem_roots"] == []
+    # 2. toml over default.
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[meridian]\n"
+        "loop_enabled_default = false\n"
+        "max_turns_default = 25\n"
+        'filesystem_roots = ["/repo", "/outputs"]\n',
+    )
+    d = tc.get_self_host_defaults()
+    assert d["loop_enabled_default"] is False
+    assert d["max_turns_default"] == 25
+    assert d["filesystem_roots"] == ["/repo", "/outputs"]
+    # 3. env over toml.
+    monkeypatch.setenv("MERIDIAN_LOOP_ENABLED", "true")
+    monkeypatch.setenv("MERIDIAN_MAX_TURNS", "7")
+    monkeypatch.setenv("MERIDIAN_FILESYSTEM_ROOTS", "/a,/b,/c")
+    d = tc.get_self_host_defaults()
+    assert d["loop_enabled_default"] is True
+    assert d["max_turns_default"] == 7
+    assert d["filesystem_roots"] == ["/a", "/b", "/c"]

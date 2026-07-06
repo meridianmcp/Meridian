@@ -71,6 +71,50 @@ def test_has_active_tunnel():
     assert tn.has_active_tunnel("t1") is True
 
 
+def test_slot_health_tracks_non_fs_slots():
+    """a898710a — dc/ppt/word slots (served by _serve_tunnel_ws) can now record
+    health via plugin_status, so a failed pre-flight surfaces as 'unhealthy'
+    rather than falling back to 'inactive'. A later healthy report clears it."""
+    try:
+        # Default: assumed healthy until a plugin_status says otherwise.
+        assert tn._slot_is_healthy("t-dc", "dc") is True
+        tn._record_slot_health("t-dc", "dc", False, reason="preflight failed", detail="port 8813")
+        assert tn._slot_is_healthy("t-dc", "dc") is False
+        # Recovery / healthy report flips it back and clears any diagnostic.
+        tn._record_slot_health("t-dc", "dc", True)
+        assert tn._slot_is_healthy("t-dc", "dc") is True
+    finally:
+        tn._clear_slot_health("t-dc")
+
+
+def test_custom_slots_registered_and_routed():
+    """8fb69d54 — the 4 custom slots (p0-p3) are in _TUNNEL_LABELS + display names,
+    _label_maps routes each to its own registry, has_active_tunnel detects a live
+    custom socket, and CUSTOM_SLOT_PORTS pre-allocates ports 8814-8817."""
+    from meridian.tunnel_plugins import CUSTOM_SLOT_PORTS
+    assert CUSTOM_SLOT_PORTS == {"p0": 8814, "p1": 8815, "p2": 8816, "p3": 8817}
+    for s in ("p0", "p1", "p2", "p3"):
+        assert s in tn._TUNNEL_LABELS
+        assert s in tn.SLOT_DISPLAY_NAMES
+        sockets, pending = tn._label_maps(s)
+        assert sockets is tn._tunnel_custom_sockets[s]
+        assert pending is tn._pending_custom_reqs[s]
+    assert tn.has_active_tunnel("t-custom") is False
+    tn._tunnel_custom_sockets["p1"]["t-custom"] = object()
+    try:
+        assert tn.has_active_tunnel("t-custom") is True
+    finally:
+        tn._tunnel_custom_sockets["p1"].pop("t-custom", None)
+
+
+def test_custom_slot_ws_routes_registered():
+    """8fb69d54 — the /tunnel-p0 … /tunnel-p3 WebSocket routes exist on the app."""
+    import meridian.server as _srv
+    paths = [getattr(r, "path", "") for r in _srv.app.routes]
+    for s in ("p0", "p1", "p2", "p3"):
+        assert any(f"/tunnel-{s}/" in p for p in paths), f"missing route for {s}"
+
+
 # ---------------------------------------------------------------------------
 # list_tunnel_tools / call_tunnel_tool
 # ---------------------------------------------------------------------------
@@ -109,6 +153,45 @@ def test_list_tunnel_tools_aggregates_and_reserves(monkeypatch):
         "filesystem__read_file": "fs", "filesystem__list_directory": "fs",
         "codebase__trace_path": "code",
     }
+
+
+def test_list_tunnel_tools_namespaces_titles_for_source(monkeypatch):
+    """connector-source — a slot whose inner server advertises a bare tool
+    ``title`` (filesystem's "Read File") gets its title namespaced with the
+    source ("Filesystem: Read File") so claude.ai's tool-permission UI shows the
+    plugin; a tool with NO title is unchanged (its prefixed name carries the
+    source); nested inputSchema param titles are left alone; no double-prefixing."""
+    tn._tunnel_sockets["t1"] = object()
+    tn._tunnel_code_sockets["t1"] = object()
+
+    def responder(label, method, params):
+        if label == "fs":
+            return {"result": {"tools": [
+                {"name": "read_file", "title": "Read File",
+                 "inputSchema": {"properties": {"path": {"title": "File Path"}}}},
+                {"name": "already", "title": "Filesystem: Already"},  # pre-namespaced
+            ]}}
+        if label == "code":
+            return {"result": {"tools": [{"name": "trace_path"}]}}  # no tool title
+        return {"result": {"tools": []}}
+
+    _stub_proxy(monkeypatch, responder)
+    try:
+        tools = asyncio.run(tn.list_tunnel_tools("t1"))
+        by_name = {t["name"]: t for t in tools}
+        # fs tool title namespaced with the source connector.
+        assert by_name["filesystem__read_file"]["title"] == "Filesystem: Read File"
+        # nested inputSchema param title left untouched.
+        assert (by_name["filesystem__read_file"]["inputSchema"]["properties"]
+                ["path"]["title"] == "File Path")
+        # an already-namespaced title is NOT double-prefixed.
+        assert by_name["filesystem__already"]["title"] == "Filesystem: Already"
+        # a tool with no title gets none added (its prefixed name shows the source).
+        assert "title" not in by_name["codebase__trace_path"]
+    finally:
+        tn._tunnel_sockets.pop("t1", None)
+        tn._tunnel_code_sockets.pop("t1", None)
+        tn._tunnel_tool_routes.pop("t1", None)
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +304,46 @@ def test_call_tunnel_tool_routes_to_owner(monkeypatch):
     assert seen["method"] == "tools/call"
     # The prefix is stripped before forwarding to the tunnel's local proxy.
     assert seen["params"] == {"name": "trace_path", "arguments": {"symbol": "foo"}}
+
+
+def test_build_graph_searcher_none_without_tunnel():
+    """4cfaecc2 — no active tunnel → no searcher (enrichment stays a no-op)."""
+    assert tn.build_graph_searcher(None) is None
+    assert tn.build_graph_searcher("no-tunnel") is None
+
+
+def test_build_graph_searcher_queries_code_intel_slot(monkeypatch):
+    """4cfaecc2 — with a tunnel, the searcher issues search_graph over the tunnel
+    and unwraps the MCP text envelope into the raw match payload."""
+    tn._tunnel_sockets["t1"] = object()
+    tn._tunnel_code_sockets["t1"] = object()
+    tn._tunnel_tool_routes["t1"] = {"search_graph": "code"}
+    seen = {}
+
+    def responder(label, method, params):
+        seen["params"] = params
+        payload = {"results": [{"file": "x.py", "name": "foo"}]}
+        return {"result": {"content": [{"type": "text", "text": json.dumps(payload)}]}}
+
+    _stub_proxy(monkeypatch, responder)
+    searcher = tn.build_graph_searcher("t1")
+    assert searcher is not None
+    matches = asyncio.run(searcher("some query"))
+    assert seen["params"]["name"] == "search_graph"
+    assert matches["results"][0]["file"] == "x.py"
+
+
+def test_build_graph_searcher_swallows_tunnel_errors(monkeypatch):
+    """The searcher never raises — a tunnel error yields None for that query."""
+    tn._tunnel_sockets["t1"] = object()
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("tunnel down")
+
+    monkeypatch.setattr(tn, "call_tunnel_tool", boom)
+    searcher = tn.build_graph_searcher("t1")
+    assert searcher is not None
+    assert asyncio.run(searcher("q")) is None
 
 
 def test_call_tunnel_tool_strips_prefix_before_forward(monkeypatch):

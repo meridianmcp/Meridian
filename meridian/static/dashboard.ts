@@ -1,46 +1,83 @@
 ﻿// --- ITEM 4 esbuild: pull module scripts into the bundle graph ---
-import "./dashboard-core.js";
-import "./dashboard-utils.js";
-import "./dashboard-demo.js";
-import "./dashboard-timeline.js";
-import "./dashboard-mcp.js";
-import "./dashboard-sprint.js";
-import "./dashboard-settings.js";
-import "./dashboard-plugins.js";
+// 423f5929 — modules migrated .js → .ts; imports are extensionless so esbuild
+// (resolveExtensions) and tsc (bundler resolution) both resolve the .ts files.
+import "./dashboard-core";
+import "./dashboard-utils";
+import "./dashboard-demo";
+import "./dashboard-timeline";
+import "./dashboard-mcp";
+import "./dashboard-sprint";
+import "./dashboard-settings";
+import "./dashboard-plugins";
 
-import "./dashboard-notes.js";
-import "./dashboard-files.js";
-import "./dashboard-rewind.js";
+import "./dashboard-notes";
+import "./dashboard-files";
+import "./dashboard-rewind";
+// ff8ff615 — Preact Code Intel panel (layered package DAG, replaces ECharts circles).
+import { mountCodeIntelPanel } from "./components/CodeIntelPanel";
+// ed5512b6 — standalone, decoupled codegraph visualizer (folder->file->function
+// drill-down, color by role, static metadata on click). The dashboard is ONE
+// consumer via a thin adapter; the module itself has zero Meridian coupling.
+import { buildCodeGraphModel, renderCodeGraph } from "./codegraph";
+import type { GraphNodeInput } from "./codegraph";
+import { createStore } from "zustand/vanilla";
 ﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
 
 // const _PLAN_LABELS -- moved to dashboard-utils.js
 
-const state = {
+// 88e66aa9 — Phase 1: back window.state with a Zustand (vanilla) store so all
+// dashboard state flows through one store. UI panels are untouched — they still
+// read/write window.state.xxx; a Proxy bridges the legacy object API to the
+// store (reassignments call setState; in-place mutations share the same refs).
+interface DashboardState {
+  projects: any[];
+  tabs: any[];
+  activeTab: any;
+  panels: Record<string, any>;
+  apiKeyConfigured: boolean;
+  serverConfig: { server_url: string; host: string; port: number; version: string };
+  activeWorkspaceTenantId: any;
+  [k: string]: any;
+}
 
+const _initialDashboardState: DashboardState = {
   projects: [],
-
-  tabs: [], // [{id, project}]
-
+  tabs: [],            // [{id, project}]
   activeTab: null,
-
-  panels: {}, // tabId -> { ws, taskCache, sessionName, goalRaw, goalIsJson }
-
+  panels: {},          // tabId -> { ws, taskCache, sessionName, goalRaw, goalIsJson }
   apiKeyConfigured: false,
-
   // v0.6.5 — server runtime config fetched from /config on startup.
-
   serverConfig: { server_url: '', host: '', port: 0, version: '' },
-
-  // workspace switcher — tenant_id of the currently active workspace (null = own)
-
+  // workspace switcher — tenant_id of the active workspace (null = own)
   activeWorkspaceTenantId: null,
-
 };
 
-// Expose state on window so esbuild IIFE modules can access it via window.state
+const dashboardStore = createStore<DashboardState>(() => ({ ..._initialDashboardState }));
+
+// Proxy bridging the legacy `state.xxx` object API to the Zustand store.
+const state: DashboardState = new Proxy(_initialDashboardState, {
+  get: (_t, prop) => (dashboardStore.getState() as any)[prop as any],
+  set: (_t, prop, value) => { dashboardStore.setState({ [prop as any]: value } as any); return true; },
+  has: (_t, prop) => (prop as any) in dashboardStore.getState(),
+  deleteProperty: (_t, prop) => {
+    const next: any = { ...dashboardStore.getState() };
+    delete next[prop as any];
+    dashboardStore.setState(next, true);
+    return true;
+  },
+  ownKeys: () => Reflect.ownKeys(dashboardStore.getState()),
+  getOwnPropertyDescriptor: (_t, prop) => ({
+    enumerable: true, configurable: true,
+    value: (dashboardStore.getState() as any)[prop as any],
+  }),
+}) as DashboardState;
+
+// Expose state (+ the underlying store, for later slice migration) on window so
+// esbuild IIFE modules can access it via window.state.
 window.state = state;
+(window as any).dashboardStore = dashboardStore;
 
 
 
@@ -156,7 +193,7 @@ async function hideHostedAdminControls() {
 
     }
 
-  } catch (e) { /* not hosted / not logged in */ }
+  } catch (e: any) { /* not hosted / not logged in */ }
 
 
 
@@ -170,7 +207,7 @@ async function hideHostedAdminControls() {
 
 
 
-function ensureSignOutLink(emailHint) {
+function ensureSignOutLink(emailHint?: any) {
 
   const footer = document.querySelector('.sidebar-footer');
 
@@ -210,7 +247,7 @@ function ensureSignOutLink(emailHint) {
 
   if (document.getElementById('signout-link')) {
 
-    if (emailHint) document.getElementById('signout-link').title = `Signed in as ${emailHint}`;
+    if (emailHint) document.getElementById('signout-link')!.title = `Signed in as ${emailHint}`;
 
     return;
 
@@ -282,7 +319,7 @@ async function ensureWorkspaceSwitcher() {
 
   sel.style.cssText = 'width:100%;font-size:11px;font-family:var(--font-mono);background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;cursor:pointer;outline:none';
 
-  workspaces.forEach(ws => {
+  workspaces.forEach((ws: any) => {
 
     const opt = document.createElement('option');
 
@@ -304,7 +341,7 @@ async function ensureWorkspaceSwitcher() {
 
     const chosen = sel.value;
 
-    const own = workspaces.find(w => w.is_own);
+    const own = workspaces.find((w: any) => w.is_own);
 
     state.activeWorkspaceTenantId = (own && chosen === own.tenant_id) ? null : chosen;
 
@@ -316,7 +353,7 @@ async function ensureWorkspaceSwitcher() {
 
     // Show which workspace is active.
 
-    const active = workspaces.find(w => w.tenant_id === chosen);
+    const active = workspaces.find((w: any) => w.tenant_id === chosen);
 
     sel.title = active ? (active.is_own ? 'My workspace' : `${active.owner_email} (${active.role})`) : '';
 
@@ -373,7 +410,7 @@ async function getActiveWorkspaceRole() {
   if (!isHostedMode() || !state.activeWorkspaceTenantId) return 'owner';
   try {
     const wss = await fetch('/me/workspaces').then(r => r.ok ? r.json() : null);
-    const ws = (wss || []).find(w => w.tenant_id === state.activeWorkspaceTenantId);
+    const ws = (wss || []).find((w: any) => w.tenant_id === state.activeWorkspaceTenantId);
     return (ws && ws.role) || 'owner';
   } catch (_) { return 'owner'; }
 }
@@ -382,7 +419,7 @@ async function getActiveWorkspaceRole() {
 // fcb02a6d — plan/role badge in the sidebar. On your own workspace it shows your
 // plan (Free/Trial/Standard/Pro); on a workspace you were invited to it shows an
 // "invite · {role}" badge. Re-rendered on every workspace switch.
-function _renderWorkspaceContextBadge(wrap, workspaces) {
+function _renderWorkspaceContextBadge(wrap: any, workspaces: any) {
   if (!wrap) return;
   let badge = wrap.querySelector('.ws-context-badge');
   if (!badge) {
@@ -391,9 +428,9 @@ function _renderWorkspaceContextBadge(wrap, workspaces) {
     badge.style.cssText = 'display:inline-block;margin-top:6px;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:700;letter-spacing:.05em;font-family:var(--font-mono);text-transform:uppercase';
     wrap.appendChild(badge);
   }
-  const active = (workspaces || []).find(w =>
+  const active = (workspaces || []).find((w: any) =>
     state.activeWorkspaceTenantId ? w.tenant_id === state.activeWorkspaceTenantId : w.is_own);
-  const colors = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af', invite: '#f59e0b' };
+  const colors: Record<string, string> = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af', invite: '#f59e0b' };
   let label, color;
   if (active && !active.is_own) {
     label = `invite · ${active.role || 'member'}`;
@@ -412,16 +449,16 @@ function _renderWorkspaceContextBadge(wrap, workspaces) {
 
 // 2271635e — client-side search/filter for tab lists. Matches a row's
 // data-search attribute (preferred) or its textContent; hides non-matches.
-function _filterTabRows(query, container, rowSelector) {
+function _filterTabRows(query: any, container: any, rowSelector: any) {
   if (!container) return;
   const q = (query || '').trim().toLowerCase();
-  container.querySelectorAll(rowSelector).forEach(row => {
+  container.querySelectorAll(rowSelector).forEach((row: any) => {
     const hay = (row.dataset.search || row.textContent || '').toLowerCase();
     row.style.display = (!q || hay.includes(q)) ? '' : 'none';
   });
 }
 
-function _wireTabSearch(inputId, containerId, rowSelector) {
+function _wireTabSearch(inputId: any, containerId: any, rowSelector: any) {
   const input = document.getElementById(inputId);
   const container = document.getElementById(containerId);
   if (!input || !container) return;
@@ -490,37 +527,37 @@ function showConnectDbModal() {
 
   const statusEl = box.querySelector('#connect-db-status');
 
-  box.querySelector('#connect-db-cancel').onclick = () => overlay.remove();
+  box.querySelector('#connect-db-cancel')!.onclick = () => overlay.remove();
 
   overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
 
-  box.querySelector('#connect-db-save').onclick = async () => {
+  box.querySelector('#connect-db-save')!.onclick = async () => {
 
-    const url = urlInput.value.trim();
+    const url = urlInput!.value.trim();
 
-    if (!url) { statusEl.textContent = 'Enter a connection string.'; statusEl.style.color = 'var(--danger,#dc2626)'; return; }
+    if (!url) { statusEl!.textContent = 'Enter a connection string.'; statusEl!.style.color = 'var(--danger,#dc2626)'; return; }
 
-    statusEl.textContent = 'Connecting…'; statusEl.style.color = 'var(--muted)';
+    statusEl!.textContent = 'Connecting…'; statusEl!.style.color = 'var(--muted)';
 
     try {
 
       await api('/workspace/connect-db', { method: 'POST', body: JSON.stringify({ url }) });
 
-      statusEl.textContent = 'Connected! Reloading…'; statusEl.style.color = '#059669';
+      statusEl!.textContent = 'Connected! Reloading…'; statusEl!.style.color = '#059669';
 
       setTimeout(() => { overlay.remove(); loadProjects(); }, 800);
 
-    } catch (e) {
+    } catch (e: any) {
 
-      statusEl.textContent = e.message || 'Connection failed — check the URL and credentials.';
+      statusEl!.textContent = e.message || 'Connection failed — check the URL and credentials.';
 
-      statusEl.style.color = 'var(--danger,#dc2626)';
+      statusEl!.style.color = 'var(--danger,#dc2626)';
 
     }
 
   };
 
-  urlInput.focus();
+  urlInput!.focus();
 
 }
 
@@ -572,7 +609,7 @@ function showLocalServerControls() {
 
 
 
-const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.replace(/^meridian[._]/, '');
+const STORAGE_KEY = (k: any) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.replace(/^meridian[._]/, '');
 
 // const QUEUE_DONE_PAGE_SIZE, SESSION_LIVE_WINDOW_MS, DEFAULT_MAX_PINNED_DECISIONS, DEFAULT_CONTEXT_THRESHOLD -- moved to dashboard-utils.js
 
@@ -586,7 +623,7 @@ const GITHUB_OCTICON_PATH = 'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4
 
 
 
-function _summarizeApiErrorText(raw) {
+function _summarizeApiErrorText(raw: any) {
 
   if (raw === undefined || raw === null) return 'Request failed before data could load.';
 
@@ -626,13 +663,13 @@ function _summarizeApiErrorText(raw) {
 
 
 
-function _projectLoadErrorInfo(path, error) {
+function _projectLoadErrorInfo(path: any, error: any) {
 
   const status = Number.isFinite(Number(error?.status))
 
     ? Number(error.status)
 
-    : (String(error?.message || '').match(/^(\d{3})\s*:/) ? parseInt(String(error.message).match(/^(\d{3})\s*:/)[1], 10) : null);
+    : (String(error?.message || '').match(/^(\d{3})\s*:/) ? parseInt(String(error.message).match(/^(\d{3})\s*:/)![1], 10) : null);
 
   const rawText = error?.responseText || error?.message || String(error || 'Request failed');
 
@@ -652,9 +689,9 @@ function _projectLoadErrorInfo(path, error) {
 
 
 
-function wireProjectLoadRetry(container, projectId) {
+function wireProjectLoadRetry(container: any, projectId: any) {
 
-  container?.querySelectorAll('[data-project-retry]').forEach((btn) => {
+  container?.querySelectorAll('[data-project-retry]').forEach((btn: any) => {
 
     btn.onclick = () => retryProjectSurface(projectId);
 
@@ -664,7 +701,7 @@ function wireProjectLoadRetry(container, projectId) {
 
 
 
-function renderProjectLoadError(projectId, title, path, error) {
+function renderProjectLoadError(projectId: any, title: any, path: any, error: any) {
 
   const info = _projectLoadErrorInfo(path, error);
 
@@ -694,7 +731,7 @@ function renderProjectLoadError(projectId, title, path, error) {
 
 
 
-function recordProjectLoadError(projectId, path, error) {
+function recordProjectLoadError(projectId: any, path: any, error: any) {
 
   const panel = getPanelState(projectId);
 
@@ -712,7 +749,7 @@ function recordProjectLoadError(projectId, path, error) {
 
 
 
-function clearProjectLoadError(projectId, path) {
+function clearProjectLoadError(projectId: any, path: any) {
 
   const panel = getPanelState(projectId);
 
@@ -726,7 +763,7 @@ function clearProjectLoadError(projectId, path) {
 
 
 
-function renderProjectLoadAlert(projectId) {
+function renderProjectLoadAlert(projectId: any) {
 
   const host = document.getElementById(`project-fetch-alert-${projectId}`);
 
@@ -734,7 +771,7 @@ function renderProjectLoadAlert(projectId) {
 
   const panel = getPanelState(projectId);
 
-  const errors = Object.values(panel.loadErrors || {}).sort((a, b) => b.at - a.at);
+  const errors = Object.values(panel.loadErrors || {}).sort((a: any, b: any) => b.at - a.at);
 
   if (!errors.length) {
 
@@ -770,7 +807,7 @@ function renderProjectLoadAlert(projectId) {
 
     <div class="project-fetch-alert__list">
 
-      ${visible.map((info) => {
+      ${visible.map((info: any) => {
 
         const statusLabel = info.status ? `HTTP ${info.status}` : 'Request failed';
 
@@ -808,7 +845,7 @@ function renderProjectLoadAlert(projectId) {
 
 
 
-async function retryProjectSurface(projectId) {
+async function retryProjectSurface(projectId: any) {
 
   const panel = getPanelState(projectId);
 
@@ -870,7 +907,7 @@ function syncSidebarActiveProject() {
 
 
 
-function autosizeGoalField(el, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
+function autosizeGoalField(el: any, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
 
   if (!el) return;
 
@@ -892,7 +929,7 @@ function githubIconSvg(size = 12, color = 'currentColor') {
 
 
 
-function getConstitutionLimit(projectId) {
+function getConstitutionLimit(projectId: any) {
 
   const panel = getPanelState(projectId);
 
@@ -904,7 +941,7 @@ function getConstitutionLimit(projectId) {
 
 
 
-async function loadProjectSettings(projectId, opts={}) {
+async function loadProjectSettings(projectId: any, opts: any = {}) {
 
   const panel = getPanelState(projectId);
 
@@ -934,7 +971,7 @@ async function loadProjectSettings(projectId, opts={}) {
 
 
 
-async function saveProjectSettings(projectId, patch) {
+async function saveProjectSettings(projectId: any, patch: any) {
 
   const panel = getPanelState(projectId);
 
@@ -958,7 +995,7 @@ async function saveProjectSettings(projectId, patch) {
 // the full-settings module (dashboard-settings.js loadSettingsTab) so both render
 // together. These two used to collide on the name `loadSettingsTab`, which made
 // this section shadow the full settings tab — only this rendered. (fix-settings-tab)
-async function loadExecutorRulesSection(projectId) {
+async function loadExecutorRulesSection(projectId: any) {
 
   const host = document.getElementById(`settings-body-${projectId}`);
 
@@ -1037,13 +1074,13 @@ async function loadExecutorRulesSection(projectId) {
 
     const charEl = document.getElementById(`agent-instructions-chars-${projectId}`);
 
-    ta.addEventListener('input', () => {
+    ta!.addEventListener('input', () => {
 
-      charEl.textContent = `${ta.value.length} chars`;
+      charEl!.textContent = `${ta!.value.length} chars`;
 
     });
 
-    document.getElementById(`agent-instructions-save-${projectId}`).onclick = async () => {
+    document.getElementById(`agent-instructions-save-${projectId}`)!.onclick = async () => {
 
       try {
 
@@ -1051,17 +1088,17 @@ async function loadExecutorRulesSection(projectId) {
 
           method: 'PATCH',
 
-          body: JSON.stringify({ agent_instructions: ta.value }),
+          body: JSON.stringify({ agent_instructions: ta!.value }),
 
         });
 
         toast('Executor rules saved');
 
-      } catch (e) { toast('Save failed: ' + e.message, true); }
+      } catch (e: any) { toast('Save failed: ' + e.message, true); }
 
     };
 
-    document.getElementById(`agent-instructions-reset-${projectId}`).onclick = async () => {
+    document.getElementById(`agent-instructions-reset-${projectId}`)!.onclick = async () => {
 
       if (!confirm('Reset to Meridian default executor rules? Your custom rules will be replaced.')) return;
 
@@ -1075,13 +1112,13 @@ async function loadExecutorRulesSection(projectId) {
 
         });
 
-        ta.value = r.agent_instructions || defaultText;
+        ta!.value = r.agent_instructions || defaultText;
 
-        charEl.textContent = `${ta.value.length} chars`;
+        charEl!.textContent = `${ta!.value.length} chars`;
 
         toast('Reset to defaults');
 
-      } catch (e) { toast('Reset failed: ' + e.message, true); }
+      } catch (e: any) { toast('Reset failed: ' + e.message, true); }
 
     };
 
@@ -1130,11 +1167,11 @@ async function loadExecutorRulesSection(projectId) {
 
     const ciInfo = document.getElementById(`code-intel-info-${projectId}`);
 
-    ciToggle.onchange = async () => {
+    ciToggle!.onchange = async () => {
 
-      const enabled = ciToggle.checked ? 1 : 0;
+      const enabled = ciToggle!.checked ? 1 : 0;
 
-      ciInfo.style.display = enabled ? 'block' : 'none';
+      ciInfo!.style.display = enabled ? 'block' : 'none';
 
       try {
 
@@ -1148,11 +1185,11 @@ async function loadExecutorRulesSection(projectId) {
 
         toast(enabled ? 'Code Intelligence enabled' : 'Code Intelligence disabled');
 
-      } catch (e) { toast('Save failed: ' + e.message, true); }
+      } catch (e: any) { toast('Save failed: ' + e.message, true); }
 
     };
 
-  } catch (e) { section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load executor rules: ${escapeHtml(e.message)}</div>`; }
+  } catch (e: any) { section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load executor rules: ${escapeHtml(e.message)}</div>`; }
 
 }
 
@@ -1353,19 +1390,19 @@ const _DEMO_TOUR_STEPS = [
 
 function _demoTourDone() {
 
-  try { return localStorage.getItem(STORAGE_KEY('tour.done')) === '1'; } catch(e) { return false; }
+  try { return localStorage.getItem(STORAGE_KEY('tour.done')) === '1'; } catch(e: any) { return false; }
 
 }
 
 function _demoTourSavedStep() {
 
-  try { return parseInt(localStorage.getItem(STORAGE_KEY('tour.step')) || '0', 10) || 0; } catch(e) { return 0; }
+  try { return parseInt(localStorage.getItem(STORAGE_KEY('tour.step')) || '0', 10) || 0; } catch(e: any) { return 0; }
 
 }
 
-function _demoTourSaveStep(step) {
+function _demoTourSaveStep(step: any) {
 
-  try { localStorage.setItem(STORAGE_KEY('tour.step'), String(step)); } catch(e) {}
+  try { localStorage.setItem(STORAGE_KEY('tour.step'), String(step)); } catch(e: any) {}
 
 }
 
@@ -1377,7 +1414,7 @@ function _demoTourMarkDone() {
 
     localStorage.removeItem(STORAGE_KEY('tour.step'));
 
-  } catch(e) {}
+  } catch(e: any) {}
 
 }
 
@@ -1395,7 +1432,7 @@ function _demoTourClose() {
 
 // step's tip lands on the right surface. No-op if the panel isn't mounted yet.
 
-function _tourActivateVtab(vtab, gtab) {
+function _tourActivateVtab(vtab: any, gtab: any) {
 
   const pid = state.activeTab;
 
@@ -1417,7 +1454,7 @@ function _tourActivateVtab(vtab, gtab) {
 
 
 
-function startDemoTour(step) {
+function startDemoTour(step: any) {
 
   _demoTourClose();
 
@@ -1439,7 +1476,7 @@ function startDemoTour(step) {
 
   // measuring the highlight target.
 
-  try { _tourActivateVtab(s.vtab, s.gtab); } catch(e) {}
+  try { _tourActivateVtab(s.vtab, s.gtab); } catch(e: any) {}
 
 
 
@@ -1565,7 +1602,7 @@ function startDemoTour(step) {
 
   // Next on the last step marks the tour done (never auto-shown again).
 
-  document.getElementById('demo-tour-next').onclick = () => {
+  document.getElementById('demo-tour-next')!.onclick = () => {
 
     if (isLast) { _demoTourClose(); _demoTourMarkDone(); }
 
@@ -1579,7 +1616,7 @@ function startDemoTour(step) {
 
   // Explicit Finish: mark done so the tour never auto-shows again.
 
-  document.getElementById('demo-tour-finish').onclick = () => {
+  document.getElementById('demo-tour-finish')!.onclick = () => {
 
     _demoTourClose();
 
@@ -1662,7 +1699,7 @@ async function loadServerConfig() {
 
     _updateConnectionIndicator(cfg);
 
-  } catch (e) { /* offline / older server — ignore */ }
+  } catch (e: any) { /* offline / older server — ignore */ }
 
   // Show demo overlay whenever on /demo path (regardless of MERIDIAN_DEMO env var)
 
@@ -1670,9 +1707,9 @@ async function loadServerConfig() {
 
     // Clear stale project IDs from prior logins so /demo never 404s on a stale project.
 
-    try { localStorage.removeItem(STORAGE_KEY(TABS_KEY)); } catch(e) {}
+    try { localStorage.removeItem(STORAGE_KEY(TABS_KEY)); } catch(e: any) {}
 
-    try { localStorage.removeItem(STORAGE_KEY(ACTIVE_PROJECT_KEY)); } catch(e) {}
+    try { localStorage.removeItem(STORAGE_KEY(ACTIVE_PROJECT_KEY)); } catch(e: any) {}
 
     hideDemoAdminControls();
 
@@ -1712,7 +1749,7 @@ async function loadServerConfig() {
 
     }
 
-  } catch (e) { /* not hosted or not logged in */ }
+  } catch (e: any) { /* not hosted or not logged in */ }
 
 }
 
@@ -1732,7 +1769,7 @@ async function loadServerConfig() {
 
 // than let that happen silently, watch /me and prompt a refresh.
 
-function _armAccountSwitchWatch(loadedEmail) {
+function _armAccountSwitchWatch(loadedEmail: any) {
 
   if (!isHostedMode()) return;
 
@@ -1836,7 +1873,7 @@ async function _checkAccountSwitch() {
 
 
 
-function _showAccountSwitchBanner(newEmail) {
+function _showAccountSwitchBanner(newEmail: any) {
 
   if (document.getElementById('account-switch-banner')) return;
 
@@ -1868,7 +1905,7 @@ function _showAccountSwitchBanner(newEmail) {
 
 // v1.9.x — show active DB connection in sidebar footer
 
-function updateGitHubConnectionIndicator(source) {
+function updateGitHubConnectionIndicator(source: any) {
 
   const badge = document.getElementById('connection-github');
 
@@ -1893,7 +1930,7 @@ function updateGitHubConnectionIndicator(source) {
 
 
 // b43b0c6a — Pro tunnel status dot in sidebar footer
-function updateTunnelConnectionIndicator(me) {
+function updateTunnelConnectionIndicator(me: any) {
 
   const wrap = document.getElementById('connection-tunnel');
 
@@ -1921,7 +1958,7 @@ function updateTunnelConnectionIndicator(me) {
 
 
 
-function _updateConnectionIndicator(cfg) {
+function _updateConnectionIndicator(cfg: any) {
 
   if (!cfg) return;
 
@@ -1949,7 +1986,7 @@ function _updateConnectionIndicator(cfg) {
 
     label.textContent = 'demo (' + (cfg.demo_db || 'sqlite') + ')';
 
-    dot.style.background = 'var(--accent-green)';
+    dot!.style.background = 'var(--accent-green)';
 
     wrap.style.cursor = 'default';
 
@@ -1973,7 +2010,7 @@ function _updateConnectionIndicator(cfg) {
 
   label.textContent = connLabelText;
 
-  dot.style.background = dbType === 'postgres' ? 'var(--accent)' : 'var(--accent-green)';
+  dot!.style.background = dbType === 'postgres' ? 'var(--accent)' : 'var(--accent-green)';
 
   // Make indicator clickable to show connection popup
 
@@ -2031,7 +2068,7 @@ function _updateConnectionIndicator(cfg) {
 
       const activeName = cfg.connection_name || (cfg.db === 'postgres' ? 'env (postgres)' : 'local');
 
-      let displayConns = (conns || []).map(c => ({...c, active: c.name === activeName}));
+      let displayConns = (conns || []).map((c: any) => ({...c, active: c.name === activeName}));
 
       if (hosted) {
 
@@ -2041,17 +2078,17 @@ function _updateConnectionIndicator(cfg) {
 
         // meaningful on a hosted server.
 
-        displayConns = displayConns.filter(c => (c.type || 'sqlite') === 'postgres');
+        displayConns = displayConns.filter((c: any) => (c.type || 'sqlite') === 'postgres');
 
       }
 
-      if (!displayConns.find(c => c.active)) {
+      if (!displayConns.find((c: any) => c.active)) {
 
         displayConns.unshift({name: activeName, type: cfg.db, active: true});
 
       }
 
-      displayConns.forEach(c => {
+      displayConns.forEach((c: any) => {
 
         const item = document.createElement('div');
 
@@ -2151,7 +2188,7 @@ function _updateConnectionIndicator(cfg) {
 
               await loadServerConfig();
 
-            } catch(ex) { toast('Remove failed: ' + ex.message, true); }
+            } catch(ex: any) { toast('Remove failed: ' + ex.message, true); }
 
           };
 
@@ -2165,7 +2202,7 @@ function _updateConnectionIndicator(cfg) {
 
         item.onclick = async (e) => {
 
-          if (e.target.tagName === 'BUTTON') return; // don't activate on delete click
+          if (e.target!.tagName === 'BUTTON') return; // don't activate on delete click
 
           popup.remove();
 
@@ -2215,7 +2252,7 @@ function _updateConnectionIndicator(cfg) {
 
             if (label) label.textContent = c.name + ' (' + (c.type || 'sqlite') + ')';
 
-          } catch(e) { console.error('Switch failed:', e); toast('Switch failed: ' + e.message, true); }
+          } catch(e: any) { console.error('Switch failed:', e); toast('Switch failed: ' + e.message, true); }
 
         };
 
@@ -2239,7 +2276,7 @@ function _updateConnectionIndicator(cfg) {
 
         addItem.onmouseleave = () => addItem.style.color = 'var(--muted)';
 
-        addItem.onclick = () => { popup.remove(); document.getElementById('conn-setup-modal').style.display = 'flex'; };
+        addItem.onclick = () => { popup.remove(); document.getElementById('conn-setup-modal')!.style.display = 'flex'; };
 
         popup.appendChild(addItem);
 
@@ -2271,7 +2308,7 @@ function _updateConnectionIndicator(cfg) {
 
     switcher.style.display = 'none'; // replaced by popup
 
-    switcher.innerHTML = conns.map(c =>
+    switcher.innerHTML = conns.map((c: any) =>
 
       `<option value="${c.name}" ${c.active ? 'selected' : ''}>${c.name}</option>`
 
@@ -2283,7 +2320,7 @@ function _updateConnectionIndicator(cfg) {
 
         const sel = switcher.value;
 
-        const conn = (cfg.connections || []).find(c => c.name === sel) || {};
+        const conn = (cfg.connections || []).find((c: any) => c.name === sel) || {};
 
         await api('/config/connections', {
 
@@ -2313,7 +2350,7 @@ function _updateConnectionIndicator(cfg) {
 
         }
 
-      } catch(e) { toast('Switch failed: ' + e.message, true); }
+      } catch(e: any) { toast('Switch failed: ' + e.message, true); }
 
     };
 
@@ -2371,7 +2408,7 @@ async function checkGitStatus() {
 
     }
 
-  } catch(e) {
+  } catch(e: any) {
 
     if (btn) { btn.textContent = 'check updates'; btn.style.color = 'var(--muted)'; }
 
@@ -2463,23 +2500,23 @@ async function loadConfig() {
 
     if (cfg.method === 'oauth') {
 
-      methodEl.textContent = 'Auth: Claude Max OAuth';
+      methodEl!.textContent = 'Auth: Claude Max OAuth';
 
-      methodEl.style.display = 'block';
+      methodEl!.style.display = 'block';
 
     } else if (cfg.method === 'api_key') {
 
-      methodEl.textContent = 'Auth: API key';
+      methodEl!.textContent = 'Auth: API key';
 
-      methodEl.style.display = 'block';
+      methodEl!.style.display = 'block';
 
     } else {
 
-      methodEl.style.display = 'none';
+      methodEl!.style.display = 'none';
 
     }
 
-  } catch (e) { /* ignore */ }
+  } catch (e: any) { /* ignore */ }
 
 }
 
@@ -2493,7 +2530,7 @@ async function loadProjects() {
 
     state.projects = await api('/projects');
 
-  } catch (e) {
+  } catch (e: any) {
 
     state.projects = [];
 
@@ -2507,7 +2544,7 @@ async function loadProjects() {
 
   }
 
-  list.innerHTML = '';
+  list!.innerHTML = '';
 
   state.projects.forEach(p => {
 
@@ -2559,7 +2596,7 @@ async function loadProjects() {
 
     div.onclick = (e) => { if (e.target !== menuBtn) openTab(p); };
 
-    list.appendChild(div);
+    list!.appendChild(div);
 
   });
 
@@ -2609,7 +2646,7 @@ async function loadProjects() {
 
 
 
-function openTab(project) {
+function openTab(project: any) {
 
   const existing = state.tabs.find(t => t.id === project.id);
 
@@ -2643,7 +2680,7 @@ function openTab(project) {
 
 
 
-function closeTab(id) {
+function closeTab(id: any) {
 
   state.tabs = state.tabs.filter(t => t.id !== id);
 
@@ -2651,7 +2688,7 @@ function closeTab(id) {
 
   if (panel) {
 
-    try { panel.ws && panel.ws.close(); } catch(e){}
+    try { panel.ws && panel.ws.close(); } catch(e: any){}
 
     delete state.panels[id];
 
@@ -2671,7 +2708,7 @@ function closeTab(id) {
 
     if (next) activateTab(next.id);
 
-    else document.getElementById('tab-bodies').innerHTML = '<div class="empty">no project open — pick one on the left</div>';
+    else document.getElementById('tab-bodies')!.innerHTML = '<div class="empty">no project open — pick one on the left</div>';
 
   }
 
@@ -2687,7 +2724,7 @@ function saveTabs() {
 
     localStorage.setItem(STORAGE_KEY(TABS_KEY), JSON.stringify(state.tabs.map(t => t.id)));
 
-  } catch(e) {}
+  } catch(e: any) {}
 
 }
 
@@ -2701,7 +2738,7 @@ function renderTabs() {
 
   const bar = document.getElementById('tabs');
 
-  bar.innerHTML = '';
+  bar!.innerHTML = '';
 
 
 
@@ -2715,7 +2752,7 @@ function renderTabs() {
 
 
 
-  visible.forEach(t => bar.appendChild(_makeTabEl(t)));
+  visible.forEach(t => bar!.appendChild(_makeTabEl(t)));
 
 
 
@@ -2777,7 +2814,7 @@ function renderTabs() {
 
     };
 
-    bar.appendChild(more);
+    bar!.appendChild(more);
 
   }
 
@@ -2785,7 +2822,7 @@ function renderTabs() {
 
 
 
-function _makeTabEl(t) {
+function _makeTabEl(t: any) {
 
   const div = document.createElement('div');
 
@@ -2855,7 +2892,7 @@ function _makeTabEl(t) {
 
 
 
-function _openTabMenu(t, anchor) {
+function _openTabMenu(t: any, anchor: any) {
 
   // Close any existing menu.
 
@@ -2871,7 +2908,7 @@ function _openTabMenu(t, anchor) {
 
 
 
-  function menuItem(label, fn) {
+  function menuItem(label: any, fn: any) {
 
     const item = document.createElement('div');
 
@@ -2927,7 +2964,7 @@ function _openTabMenu(t, anchor) {
 
 
 
-async function _setProjectIcon(t) {
+async function _setProjectIcon(t: any) {
 
   /** G4.17 — quick prompt-based emoji picker. Paste one emoji or leave
 
@@ -2969,7 +3006,7 @@ async function _setProjectIcon(t) {
 
     toast(icon ? `Icon set to ${icon}` : 'Icon cleared');
 
-  } catch (e) {
+  } catch (e: any) {
 
     toast('Update failed: ' + e.message, true);
 
@@ -2979,7 +3016,7 @@ async function _setProjectIcon(t) {
 
 
 
-async function _renameProject(t) {
+async function _renameProject(t: any) {
 
   const newName = window.prompt(`Rename "${t.project.name}" to:`, t.project.name);
 
@@ -3005,14 +3042,14 @@ async function _renameProject(t) {
 
     toast('Renamed to ' + updated.name);
 
-  } catch(e) { toast('Rename failed: ' + e.message, true); }
+  } catch(e: any) { toast('Rename failed: ' + e.message, true); }
 
 }
 
 
 
-async function _deleteProject(t) {
-  await new Promise((resolve) => {
+async function _deleteProject(t: any) {
+  await new Promise<void>((resolve) => {
     if (document.getElementById('delete-project-modal')) return resolve();
     const overlay = document.createElement('div');
     overlay.id = 'delete-project-modal';
@@ -3023,9 +3060,9 @@ async function _deleteProject(t) {
     box.innerHTML = `<div style="font-weight:700;font-size:14px;color:var(--danger,#dc2626)">Delete "${name}"?</div><div style="font-size:12px;color:var(--muted)">Permanently deletes all sessions, tasks, decisions, and goal history. <strong>Cannot be undone.</strong></div><div style="display:flex;gap:8px;justify-content:flex-end"><button id="del-proj-cancel" class="secondary" style="font-size:12px">Cancel</button><button id="del-proj-confirm" style="font-size:12px;background:var(--danger,#dc2626);color:#fff;border:none;border-radius:5px;padding:6px 16px;cursor:pointer">Delete project</button></div>`;
     overlay.appendChild(box);
     document.body.appendChild(overlay);
-    box.querySelector('#del-proj-cancel').onclick = () => { overlay.remove(); resolve(); };
+    box.querySelector('#del-proj-cancel')!.onclick = () => { overlay.remove(); resolve(); };
     overlay.onclick = e => { if (e.target === overlay) { overlay.remove(); resolve(); } };
-    box.querySelector('#del-proj-confirm').onclick = async () => {
+    box.querySelector('#del-proj-confirm')!.onclick = async () => {
       overlay.remove();
       try {
         await api(`/projects/${t.id}`, { method: 'DELETE' });
@@ -3033,7 +3070,7 @@ async function _deleteProject(t) {
         state.projects = state.projects.filter(p => p.id !== t.id);
         await loadProjects();
         toast('Project deleted');
-      } catch(e) {
+      } catch(e: any) {
         if (e.status === 404) {
           closeTab(t.id); state.projects = state.projects.filter(p => p.id !== t.id);
           await loadProjects(); toast('Project removed');
@@ -3048,7 +3085,7 @@ async function _deleteProject(t) {
 
 
 
-function activateTab(id) {
+function activateTab(id: any) {
 
   state.activeTab = id;
 
@@ -3070,7 +3107,7 @@ function activateTab(id) {
 
   // Persist active project so a refresh reopens to the same tab.
 
-  try { localStorage.setItem(STORAGE_KEY(ACTIVE_PROJECT_KEY), id); } catch(e) {}
+  try { localStorage.setItem(STORAGE_KEY(ACTIVE_PROJECT_KEY), id); } catch(e: any) {}
 
   // Keep the sidebar dropdown in sync with whichever tab the user is on.
 
@@ -3078,15 +3115,29 @@ function activateTab(id) {
 
   if (switcher) switcher.value = id;
 
+  // 73907f9e — re-init the Settings panel on project-tab switch. Its renderer has
+  // a 30s TTL cache + a MutationObserver lifecycle, so switching to an already-built
+  // project tab whose active vtab is Settings can show a blank panel (the observer
+  // was disconnected and the cache marked fresh while the DOM was empty). Other
+  // vtabs re-fetch on focus; Settings did not. Force a fresh render here.
+  try {
+    const _panel = getPanelState(id);
+    let _activeVtab = _panel && _panel.activeVtab;
+    if (!_activeVtab) { try { _activeVtab = localStorage.getItem('meridian_last_tab_' + id); } catch (_) {} }
+    if (_activeVtab === 'settings' && typeof loadSettingsTab === 'function') {
+      loadSettingsTab(id, { force: true });
+    }
+  } catch (_) {}
+
 }
 
 
 
-function buildTabBody(project) {
+function buildTabBody(project: any) {
 
   const root = document.getElementById('tab-bodies');
 
-  const empty = root.querySelector(':scope > .empty');
+  const empty = root!.querySelector(':scope > .empty');
 
   if (empty) empty.remove();
 
@@ -3129,6 +3180,12 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
 
       <button class="vtab-btn" data-vtab="codeintel" title="Code Intel — codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">🔍</button>
+
+      <button class="vtab-btn" data-vtab="documents" title="Documents — ingested docs &amp; structure">📄</button>
+
+      <button class="vtab-btn" data-vtab="insights" title="Insights — durable strategic understanding">💡</button>
+
+      <button class="vtab-btn" data-vtab="blog" title="Blog — workspace posts (draft/published/archived)">✍️</button>
 
     </div>
 
@@ -3702,10 +3759,18 @@ function buildTabBody(project) {
 
             <select id="notes-tagsel-${project.id}" title="Filter by tag" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;max-width:130px"><option value="">all tags</option></select>
 
-            <label title="Show auto-captured session summaries (checkpoint notes)" style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--muted);cursor:pointer;user-select:none"><input type="checkbox" id="notes-show-auto-${project.id}" style="margin:0;cursor:pointer">summaries</label>
+            <!-- 42e9f7b5 — the "summaries" toggle is replaced by the Notes/Log/Archive tab bar below -->
+            <input type="checkbox" id="notes-show-auto-${project.id}" style="display:none">
+            <span data-notes-tab-active="notes" id="notes-active-tab-${project.id}" style="display:none">notes</span>
 
           </span>
 
+        </div>
+
+        <div class="notes-tabbar" style="display:flex;gap:6px;padding:6px 14px 0;border-bottom:1px solid var(--border)">
+          <button data-notes-tab="notes" id="notes-tab-notes-${project.id}" class="notes-tab-btn" style="background:none;border:none;border-bottom:2px solid var(--accent);color:var(--text);font-size:10px;font-weight:600;padding:3px 6px;cursor:pointer">Notes</button>
+          <button data-notes-tab="log" id="notes-tab-log-${project.id}" class="notes-tab-btn" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);font-size:10px;font-weight:600;padding:3px 6px;cursor:pointer">Log</button>
+          <button data-notes-tab="archive" id="notes-tab-archive-${project.id}" class="notes-tab-btn" style="background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);font-size:10px;font-weight:600;padding:3px 6px;cursor:pointer">Archive</button>
         </div>
 
         <div style="flex:1;overflow-y:auto;overflow-x:hidden;word-break:break-word;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="notes-body-${project.id}">
@@ -3870,6 +3935,54 @@ function buildTabBody(project) {
 
       </div>
 
+      <div class="drawer-panel" id="drawer-documents-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>DOCUMENTS · ${escapeHtml(project.name)}</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="documents-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading…</div>
+
+        </div>
+
+      </div>
+
+      <div class="drawer-panel" id="drawer-insights-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>INSIGHTS · ${escapeHtml(project.name)}</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="insights-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading…</div>
+
+        </div>
+
+      </div>
+
+      <div class="drawer-panel" id="drawer-blog-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>BLOG · workspace</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="blog-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading…</div>
+
+        </div>
+
+      </div>
+
     </div>
 
     <section class="claude-handoff-panel">
@@ -4014,7 +4127,7 @@ function buildTabBody(project) {
 
   `;
 
-  root.appendChild(body);
+  root!.appendChild(body);
 
 
 
@@ -4114,6 +4227,12 @@ function buildTabBody(project) {
 
         if (vtab === 'codeintel') loadCodeIntelTab(project.id);
 
+        if (vtab === 'documents') loadDocumentsTab(project.id);
+
+        if (vtab === 'insights') loadInsightsTab(project.id);
+
+        if (vtab === 'blog') loadBlogTab(project.id);
+
       };
 
     });
@@ -4186,7 +4305,7 @@ function buildTabBody(project) {
       if (!visible && decFormTitle) decFormTitle.focus();
     };
   }
-  if (decFormCancel) decFormCancel.onclick = () => { decForm.style.display = 'none'; };
+  if (decFormCancel) decFormCancel.onclick = () => { decForm!.style.display = 'none'; };
   if (decFormAdd) {
     const doAddDecision = async () => {
       const title = (decFormTitle?.value || '').trim();
@@ -4201,10 +4320,10 @@ function buildTabBody(project) {
         await api(`/projects/${project.id}/decisions-pinned`, { method: 'POST', body: JSON.stringify({ title, body, category }) });
         if (decFormTitle) decFormTitle.value = '';
         if (decFormBody) decFormBody.value = '';
-        decForm.style.display = 'none';
+        decForm!.style.display = 'none';
         toast('decision pinned');
         loadPinnedDecisions(project.id);
-      } catch(e) {
+      } catch(e: any) {
         if (decFormStatus) decFormStatus.textContent = `Error: ${escapeHtml(String(e))}`;
       } finally {
         decFormAdd.disabled = false;
@@ -4223,7 +4342,7 @@ function buildTabBody(project) {
       if (decFormStatus) decFormStatus.textContent = (over || near) ? `Body: ${len.toLocaleString()}/${limit.toLocaleString()}` : '';
     };
     [decFormTitle, decFormBody].forEach(el => {
-      if (el) el.addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') doAddDecision(); });
+      if (el) el.addEventListener('keydown', (e: any) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') doAddDecision(); });
     });
   }
 
@@ -4272,17 +4391,17 @@ function buildTabBody(project) {
 
       const activeStatuses = new Set(['pending', 'todo', 'in_progress']);
 
-      const activeVersions = new Set(items.filter(it => activeStatuses.has(it.status)).map(it => it.version));
+      const activeVersions = new Set(items.filter((it: any) => activeStatuses.has(it.status)).map((it: any) => it.version));
 
-      const scopeItems = items.filter(it =>
+      const scopeItems = items.filter((it: any) =>
 
         activeStatuses.has(it.status) || (it.version && activeVersions.has(it.version))
 
       );
 
-      const doneCount = scopeItems.filter(i => i.status === 'done' || i.status === 'skipped').length;
+      const doneCount = scopeItems.filter((i: any) => i.status === 'done' || i.status === 'skipped').length;
 
-      const activeCount = scopeItems.filter(i => activeStatuses.has(i.status)).length;
+      const activeCount = scopeItems.filter((i: any) => activeStatuses.has(i.status)).length;
 
       const total = scopeItems.length;
 
@@ -4290,9 +4409,9 @@ function buildTabBody(project) {
 
       const pctColor = doneCount === 0 ? 'var(--muted)' : doneCount === total ? 'var(--accent-green)' : '#fbbf24';
 
-      const pendingItems = scopeItems.filter(i => activeStatuses.has(i.status));
-      const statusColors = { pending: 'var(--muted)', todo: 'var(--muted)', in_progress: '#fbbf24' };
-      const itemsHtml = pendingItems.slice(0, 10).map(it => {
+      const pendingItems = scopeItems.filter((i: any) => activeStatuses.has(i.status));
+      const statusColors: Record<string, string> = { pending: 'var(--muted)', todo: 'var(--muted)', in_progress: '#fbbf24' };
+      const itemsHtml = pendingItems.slice(0, 10).map((it: any) => {
         const color = statusColors[it.status] || 'var(--muted)';
         const badge = it.status === 'in_progress' ? '⚡' : '·';
         return `<div style="display:flex;align-items:center;gap:5px;padding:2px 0;border-top:1px solid var(--border)20">` +
@@ -4314,7 +4433,7 @@ function buildTabBody(project) {
 
       </div>${itemsHtml}`;
 
-    } catch(e) {
+    } catch(e: any) {
 
       const board = document.getElementById(`sprint-board-goal-${project.id}`);
 
@@ -4348,17 +4467,17 @@ function buildTabBody(project) {
 
       const sessions = await projectApi(project.id, `/projects/${project.id}/sessions`);
 
-      const active = (sessions || []).filter(s => s.status !== 'closed' && s.status !== 'archived');
+      const active = (sessions || []).filter((s: any) => s.status !== 'closed' && s.status !== 'archived');
 
-      const opts = active.map(s => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`).join('');
+      const opts = active.map((s: any) => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`).join('');
 
       sel.innerHTML = opts + '<option value="__custom__">Custom…</option>';
 
-      _sprintSelectSyncers[project.id] = function(val) {
+      _sprintSelectSyncers[project.id] = function(val: any) {
 
         if (!sel) return;
 
-        const match = Array.from(sel.options).find(o => o.value === val && o.value !== '__custom__');
+        const match = Array.from(sel.options).find((o: any) => o.value === val && o.value !== '__custom__');
 
         if (match) { sel.value = val; inp.value = val; inp.style.display = 'none'; }
 
@@ -4414,7 +4533,7 @@ function buildTabBody(project) {
 
         loadSprintBoard();
 
-      } catch(e) { console.error('Add sprint item failed:', e); }
+      } catch(e: any) { console.error('Add sprint item failed:', e); }
 
     };
 
@@ -4449,13 +4568,13 @@ function buildTabBody(project) {
           await api(`/projects/${project.id}/devlog`, { method: 'POST', body: JSON.stringify({ text }) });
           appendText.value = '';
           toast('Appended to DEVLOG.md');
-        } catch(e) {
+        } catch(e: any) {
           if (appendStatus) appendStatus.textContent = `Error: ${escapeHtml(String(e))}`;
         } finally {
           appendBtn.disabled = false;
         }
       };
-      appendText.addEventListener('keydown', (e) => {
+      appendText.addEventListener('keydown', (e: any) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') appendBtn.click();
       });
     }
@@ -4465,15 +4584,15 @@ function buildTabBody(project) {
 
   wireClaudeLaunchPanel(project.id);
 
-  document.getElementById(`goal-${project.id}`).addEventListener('blur', () => saveGoal(project.id));
+  document.getElementById(`goal-${project.id}`)!.addEventListener('blur', () => saveGoal(project.id));
 
-  document.getElementById(`goal-north-star-${project.id}`).addEventListener('blur', () => saveNorthStar(project.id));
+  document.getElementById(`goal-north-star-${project.id}`)!.addEventListener('blur', () => saveNorthStar(project.id));
 
-  document.getElementById(`goal-sprint-${project.id}`).addEventListener('blur', () => saveSprint(project.id));
+  document.getElementById(`goal-sprint-${project.id}`)!.addEventListener('blur', () => saveSprint(project.id));
 
   // v0.6.4 — dirty state: highlight textarea border when unsaved changes exist
 
-  document.getElementById(`goal-${project.id}`).addEventListener('input', function() {
+  document.getElementById(`goal-${project.id}`)!.addEventListener('input', function() {
 
     const p = state.panels[project.id];
 
@@ -4481,7 +4600,7 @@ function buildTabBody(project) {
 
   });
 
-  document.getElementById(`goal-north-star-${project.id}`).addEventListener('input', function() {
+  document.getElementById(`goal-north-star-${project.id}`)!.addEventListener('input', function() {
 
     const p = state.panels[project.id];
 
@@ -4491,7 +4610,7 @@ function buildTabBody(project) {
 
   });
 
-  document.getElementById(`goal-sprint-${project.id}`).addEventListener('input', function() {
+  document.getElementById(`goal-sprint-${project.id}`)!.addEventListener('input', function() {
 
     const p = state.panels[project.id];
 
@@ -4551,11 +4670,11 @@ const LIVE_REFRESH_MS = 30000;
 
 const LIVE_THROTTLE_MS = 10000;
 
-const liveRefreshState = {}; // keyed by projectId
+const liveRefreshState: Record<string, any> = {}; // keyed by projectId
 
 
 
-function scheduleLiveRefresh(projectId) {
+function scheduleLiveRefresh(projectId: any) {
 
   const s = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
 
@@ -4587,7 +4706,7 @@ function scheduleLiveRefresh(projectId) {
 
 
 
-function initLiveAutoRefresh(projectId) {
+function initLiveAutoRefresh(projectId: any) {
 
   const s = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
 
@@ -4627,7 +4746,7 @@ function initLiveAutoRefresh(projectId) {
 
 
 
-async function loadLiveTab(projectId) {
+async function loadLiveTab(projectId: any) {
 
   const panel = state.panels[projectId];
 
@@ -4703,7 +4822,7 @@ async function loadLiveTab(projectId) {
 
         addArea.style.display = 'none';
 
-        addToggle.textContent = '+ Expand';
+        addToggle!.textContent = '+ Expand';
 
         if (addText) addText.value = '';
 
@@ -4749,11 +4868,11 @@ async function loadLiveTab(projectId) {
 
           if (addText) addText.value = '';
 
-          addArea.style.display = 'none';
+          addArea!.style.display = 'none';
 
-          addToggle.textContent = '+ Expand';
+          addToggle!.textContent = '+ Expand';
 
-        } catch (e) { toast('Failed: ' + e.message, true); }
+        } catch (e: any) { toast('Failed: ' + e.message, true); }
 
       };
 
@@ -4801,19 +4920,19 @@ async function loadLiveTab(projectId) {
 
         const close = () => overlay.remove();
 
-        overlay.querySelector('#_new-sprint-cancel').onclick = close;
+        overlay.querySelector('#_new-sprint-cancel')!.onclick = close;
 
         overlay.onclick = (e) => { if (e.target === overlay) close(); };
 
         const submit = async () => {
 
-          const name = (inp.value || '').trim();
+          const name = (inp!.value || '').trim();
 
-          if (!name) { errEl.textContent = 'Sprint name is required'; errEl.style.display = ''; return; }
+          if (!name) { errEl!.textContent = 'Sprint name is required'; errEl!.style.display = ''; return; }
 
           try {
 
-            overlay.querySelector('#_new-sprint-submit').disabled = true;
+            overlay.querySelector('#_new-sprint-submit')!.disabled = true;
 
             await api(`/projects/${projectId}/goal/sprint`, { method: 'POST', body: JSON.stringify({ sprint: name }) });
 
@@ -4821,15 +4940,15 @@ async function loadLiveTab(projectId) {
 
             close();
 
-          } catch (e) { errEl.textContent = e.message || 'Failed'; errEl.style.display = ''; overlay.querySelector('#_new-sprint-submit').disabled = false; }
+          } catch (e: any) { errEl!.textContent = e.message || 'Failed'; errEl!.style.display = ''; overlay.querySelector('#_new-sprint-submit')!.disabled = false; }
 
         };
 
-        overlay.querySelector('#_new-sprint-submit').onclick = submit;
+        overlay.querySelector('#_new-sprint-submit')!.onclick = submit;
 
-        inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') close(); });
+        inp!.addEventListener('keydown', (e: any) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') close(); });
 
-        setTimeout(() => inp.focus(), 50);
+        setTimeout(() => inp!.focus(), 50);
 
       };
 
@@ -4849,7 +4968,7 @@ async function loadLiveTab(projectId) {
 
 
 
-async function refreshLiveTab(projectId) {
+async function refreshLiveTab(projectId: any) {
 
   /** Fetch fresh sessions + tasks + sprint items + worktrees and repaint all Live sections. */
 
@@ -4909,7 +5028,7 @@ async function refreshLiveTab(projectId) {
 
       // Sprint notes: load for the most recently active session.
 
-      const activeSession = sessions.find(s => s.status === 'active') || sessions[0];
+      const activeSession = sessions.find((s: any) => s.status === 'active') || sessions[0];
 
       if (activeSession && activeSession.id) {
 
@@ -4923,7 +5042,7 @@ async function refreshLiveTab(projectId) {
 
       if (sessionsRoot) {
 
-        const liveError = sessionsResult.status === 'rejected' ? sessionsResult.reason : tasksResult.reason;
+        const liveError = sessionsResult.status === 'rejected' ? (sessionsResult as any).reason : (tasksResult as any).reason;
 
         const livePath = sessionsResult.status === 'rejected' ? sessionsPath : tasksPath;
 
@@ -4955,7 +5074,7 @@ async function refreshLiveTab(projectId) {
 
     }
 
-  } catch(e) { /* ignore — WS will retry on next event */ }
+  } catch(e: any) { /* ignore — WS will retry on next event */ }
 
 }
 
@@ -4965,19 +5084,19 @@ async function refreshLiveTab(projectId) {
 
 
 
-function wireSprintAddEnter(projectId, root) {
+function wireSprintAddEnter(projectId: any, root: any) {
 
   /** Allow Enter in the sprint-add input to submit. */
 
   const inp = root.querySelector(`#sprint-add-input-${projectId}`);
 
-  if (inp) inp.onkeydown = e => { if (e.key === 'Enter') addSprintItemFromInput(projectId); };
+  if (inp) inp.onkeydown = (e: any) => { if (e.key === 'Enter') addSprintItemFromInput(projectId); };
 
 }
 
 
 
-async function sprintAction(projectId, itemId, action) {
+async function sprintAction(projectId: any, itemId: any, action: any) {
 
   /** POST to one of the sprint-item action endpoints. */
 
@@ -4991,12 +5110,12 @@ async function sprintAction(projectId, itemId, action) {
 
     await refreshLiveTab(projectId);
 
-  } catch(e) { toast(`Failed: ${e.message}`, true); }
+  } catch(e: any) { toast(`Failed: ${e.message}`, true); }
 
 }
 
 
-async function sprintArchive(projectId, itemId) {
+async function sprintArchive(projectId: any, itemId: any) {
 
   /** e62ce019 — permanently delete a backburner item decided against. */
 
@@ -5012,12 +5131,12 @@ async function sprintArchive(projectId, itemId) {
 
     await refreshLiveTab(projectId);
 
-  } catch(e) { toast(`Delete failed: ${e.message}`, true); }
+  } catch(e: any) { toast(`Delete failed: ${e.message}`, true); }
 
 }
 
 
-function filterBackburner(projectId, value) {
+function filterBackburner(projectId: any, value: any) {
 
   /** e62ce019 — client-side filter of the backburner section by title/group. */
 
@@ -5047,7 +5166,7 @@ function filterBackburner(projectId, value) {
 
 
 
-async function sprintPushPrompt(projectId, itemId) {
+async function sprintPushPrompt(projectId: any, itemId: any) {
 
   /** Prompt for a target version then push the item. */
 
@@ -5065,13 +5184,13 @@ async function sprintPushPrompt(projectId, itemId) {
 
     await refreshLiveTab(projectId);
 
-  } catch(e) { toast(`Push failed: ${e.message}`, true); }
+  } catch(e: any) { toast(`Push failed: ${e.message}`, true); }
 
 }
 
 
 
-async function sprintFeedback(projectId, itemId, thumb, currentThumb, event) {
+async function sprintFeedback(projectId: any, itemId: any, thumb: any, currentThumb: any, event: any) {
 
   event && event.stopPropagation();
 
@@ -5085,13 +5204,13 @@ async function sprintFeedback(projectId, itemId, thumb, currentThumb, event) {
 
     await refreshLiveTab(projectId);
 
-  } catch(e) { toast('Feedback failed: ' + e.message, true); }
+  } catch(e: any) { toast('Feedback failed: ' + e.message, true); }
 
 }
 
 
 
-async function sprintFeedbackNote(projectId, itemId, note) {
+async function sprintFeedbackNote(projectId: any, itemId: any, note: any) {
 
   if (!note || !note.trim()) return;
 
@@ -5103,13 +5222,13 @@ async function sprintFeedbackNote(projectId, itemId, note) {
 
     await refreshLiveTab(projectId);
 
-  } catch(e) { toast('Note save failed: ' + e.message, true); }
+  } catch(e: any) { toast('Note save failed: ' + e.message, true); }
 
 }
 
 
 
-async function sprintItemEdit(projectId, itemId) {
+async function sprintItemEdit(projectId: any, itemId: any) {
 
   /** Inline-edit title and version of a sprint item. */
 
@@ -5183,7 +5302,7 @@ async function sprintItemEdit(projectId, itemId) {
 
       await refreshLiveTab(projectId);
 
-    } catch(e) { toast(`Save failed: ${e.message}`, true); cancel(); }
+    } catch(e: any) { toast(`Save failed: ${e.message}`, true); cancel(); }
 
   };
 
@@ -5219,7 +5338,7 @@ async function sprintItemEdit(projectId, itemId) {
 
 
 
-async function sprintItemNotesEdit(projectId, itemId) {
+async function sprintItemNotesEdit(projectId: any, itemId: any) {
 
   /** Inline-edit the notes field of a sprint item. */
 
@@ -5253,7 +5372,7 @@ async function sprintItemNotesEdit(projectId, itemId) {
 
     const titleSpan = row.querySelector('.sprint-item-title');
 
-    if (titleSpan) titleSpan.parentNode.insertBefore(textarea, titleSpan.nextSibling);
+    if (titleSpan) titleSpan.parentNode!.insertBefore(textarea, titleSpan.nextSibling);
 
     else row.appendChild(textarea);
 
@@ -5279,7 +5398,7 @@ async function sprintItemNotesEdit(projectId, itemId) {
 
       await refreshLiveTab(projectId);
 
-    } catch(e) { toast(`Save failed: ${e.message}`, true); cancel(); }
+    } catch(e: any) { toast(`Save failed: ${e.message}`, true); cancel(); }
 
   };
 
@@ -5308,7 +5427,7 @@ async function sprintItemNotesEdit(projectId, itemId) {
 }
 
 
-async function sprintItemResourcesEdit(projectId, itemId, rawJson) {
+async function sprintItemResourcesEdit(projectId: any, itemId: any, rawJson: any) {
 
   /** Inline-edit the touches_resources field of a sprint item. */
 
@@ -5344,7 +5463,7 @@ async function sprintItemResourcesEdit(projectId, itemId, rawJson) {
 
     const anchor = notesEl || row.querySelector('.sprint-item-title');
 
-    if (anchor) anchor.parentNode.insertBefore(textarea, anchor.nextSibling);
+    if (anchor) anchor.parentNode!.insertBefore(textarea, anchor.nextSibling);
 
     else row.appendChild(textarea);
 
@@ -5368,7 +5487,7 @@ async function sprintItemResourcesEdit(projectId, itemId, rawJson) {
 
       await refreshLiveTab(projectId);
 
-    } catch(e) { toast(`Save failed: ${e.message}`, true); cancel(); }
+    } catch(e: any) { toast(`Save failed: ${e.message}`, true); cancel(); }
 
   };
 
@@ -5397,7 +5516,7 @@ async function sprintItemResourcesEdit(projectId, itemId, rawJson) {
 }
 
 
-async function resourceChipClick(projectId, resourceId) {
+async function resourceChipClick(projectId: any, resourceId: any) {
 
   /** Show a small popover listing sprint items that declare this resource. */
 
@@ -5411,7 +5530,7 @@ async function resourceChipClick(projectId, resourceId) {
 
     items = await api(`/projects/${projectId}/resources/sprint-items?resource=${encodeURIComponent(resourceId)}`);
 
-  } catch(e) {
+  } catch(e: any) {
 
     toast(`Lookup failed: ${e.message}`, true);
 
@@ -5425,29 +5544,29 @@ async function resourceChipClick(projectId, resourceId) {
 
   pop.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--surface-0,#1a1a1a);border:1px solid var(--border);border-radius:6px;padding:12px 14px;z-index:9999;min-width:280px;max-width:480px;max-height:320px;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.6)';
 
-  const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const esc = (s: any) => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
   pop.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <span style="font-size:11px;font-weight:600;color:var(--text)">Sprint items touching <code style="font-size:10px">${esc(resourceId)}</code></span>
-      <button onclick="document.getElementById('resource-chip-popover').remove()" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px;line-height:1;padding:0 2px">✕</button>
+      <button onclick="document.getElementById('resource-chip-popover')!.remove()" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px;line-height:1;padding:0 2px">✕</button>
     </div>
     ${items.length === 0
       ? `<div style="font-size:10px;color:var(--muted)">No sprint items reference this resource.</div>`
-      : items.map(it => `<div style="font-size:10px;padding:4px 0;border-top:1px solid var(--border);color:var(--text)"><span style="color:var(--muted);margin-right:4px">${esc(it.status)}</span>${esc(it.title)}</div>`).join('')
+      : items.map((it: any) => `<div style="font-size:10px;padding:4px 0;border-top:1px solid var(--border);color:var(--text)"><span style="color:var(--muted);margin-right:4px">${esc(it.status)}</span>${esc(it.title)}</div>`).join('')
     }
   `;
 
   document.body.appendChild(pop);
 
-  const close = e => { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener('click', close); } };
+  const close = (e: any) => { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener('click', close); } };
 
   setTimeout(() => document.addEventListener('click', close), 50);
 
 }
 
 
-async function loadSprintNotesPanel(projectId, sessionId) {
+async function loadSprintNotesPanel(projectId: any, sessionId: any) {
 
   /** Load and render ephemeral session scratch-pad notes in the sprint panel. */
 
@@ -5477,7 +5596,7 @@ async function loadSprintNotesPanel(projectId, sessionId) {
 
     if (divider) divider.style.display = '';
 
-    container.innerHTML = notes.map(n => `
+    container.innerHTML = notes.map((n: any) => `
 
       <div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent-green,#22c55e);border-radius:0 4px 4px 0;padding:6px 8px;margin-bottom:6px">
 
@@ -5507,7 +5626,7 @@ async function loadSprintNotesPanel(projectId, sessionId) {
 
 
 
-async function addSprintItemFromInput(projectId) {
+async function addSprintItemFromInput(projectId: any) {
 
   /** Parse "version:title" or fall back to current sprint version. */
 
@@ -5567,13 +5686,13 @@ async function addSprintItemFromInput(projectId) {
 
     await refreshLiveTab(projectId);
 
-  } catch(e) { toast('Add failed: ' + e.message, true); }
+  } catch(e: any) { toast('Add failed: ' + e.message, true); }
 
 }
 
 
 
-function cacheMostRecentSession(projectId, sessions) {
+function cacheMostRecentSession(projectId: any, sessions: any) {
 
   /** Pick the most recent active session id for "add task" attribution. */
 
@@ -5581,13 +5700,13 @@ function cacheMostRecentSession(projectId, sessions) {
 
   if (!panel) return;
 
-  const sorted = sessions.slice().sort((a, b) =>
+  const sorted = sessions.slice().sort((a: any, b: any) =>
 
     (b.last_seen || '').localeCompare(a.last_seen || '')
 
   );
 
-  const top = sorted.find(s => isLiveSession(s)) || sorted.find(s => s.status !== 'closed') || sorted[0];
+  const top = sorted.find((s: any) => isLiveSession(s)) || sorted.find((s: any) => s.status !== 'closed') || sorted[0];
 
   if (top) panel.liveLastSessionId = top.id;
 
@@ -5595,7 +5714,7 @@ function cacheMostRecentSession(projectId, sessions) {
 
 
 
-function renderLiveSessions(projectId, sessions, tasks, worktrees) {
+function renderLiveSessions(projectId: any, sessions: any, tasks: any, worktrees: any) {
 
   const root = document.getElementById(`live-sessions-${projectId}`);
 
@@ -5603,7 +5722,7 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
 
   // Build a map of session_id → active worktree branches
   const worktreeMap = new Map();
-  (worktrees || []).forEach(wt => {
+  (worktrees || []).forEach((wt: any) => {
     if (!worktreeMap.has(wt.session_id)) worktreeMap.set(wt.session_id, []);
     worktreeMap.get(wt.session_id).push(wt.branch);
   });
@@ -5611,7 +5730,7 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
   const claimMap = new Map();
   const taskMap = new Map();
 
-  tasks.forEach(t => {
+  tasks.forEach((t: any) => {
 
     if (t.claimed_by && (t.status === 'pending' || t.status === 'in_progress')) {
 
@@ -5626,11 +5745,11 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
     }
 
   });
-  taskMap.forEach(rows => rows.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))));
+  taskMap.forEach(rows => rows.sort((a: any, b: any) => String(b.created_at || '').localeCompare(String(a.created_at || ''))));
 
   const rows = sessions
 
-    .map(s => {
+    .map((s: any) => {
 
       const ageMs = sessionAgeMs(s);
 
@@ -5638,9 +5757,9 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
 
     })
 
-    .filter(({ ageMs }) => ageMs > 0 && ageMs <= 24 * 3600 * 1000)
+    .filter(({ ageMs }: any) => ageMs > 0 && ageMs <= 24 * 3600 * 1000)
 
-    .sort((a, b) => a.ageMs - b.ageMs);
+    .sort((a: any, b: any) => a.ageMs - b.ageMs);
 
   // dc234d4e — hide the Active sessions panel entirely when nothing is live in
   // the last 10 min, instead of showing an empty "No active sessions" block
@@ -5648,7 +5767,7 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
   const LIVE_PRESENCE_MS = 10 * 60 * 1000;
   const liveSection = root.closest('.live-section');
   const sectionDivider = liveSection ? liveSection.nextElementSibling : null;
-  const anyLivePresence = rows.some(({ ageMs }) => ageMs <= LIVE_PRESENCE_MS);
+  const anyLivePresence = rows.some(({ ageMs }: any) => ageMs <= LIVE_PRESENCE_MS);
   if (!anyLivePresence) {
     if (liveSection) liveSection.style.display = 'none';
     if (sectionDivider && sectionDivider.classList && sectionDivider.classList.contains('live-divider')) sectionDivider.style.display = 'none';
@@ -5666,7 +5785,7 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
 
   }
 
-  root.innerHTML = rows.map(({ s, ageMs }) => {
+  root.innerHTML = rows.map(({ s, ageMs }: any) => {
 
     const mins = ageMs / 60000;
 
@@ -5684,7 +5803,7 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
 
       : '';
     const sessionTasks = taskMap.get(s.id) || [];
-    const taskRows = sessionTasks.slice(0, 3).map(t =>
+    const taskRows = sessionTasks.slice(0, 3).map((t: any) =>
       `<div class="live-session-task">↳ ${escapeHtml((t.description || '').slice(0, 140))}</div>`
     ).join('') || claimedRow;
     const taskLink = sessionTasks.length > 0
@@ -5721,7 +5840,7 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
 
     const sessionWorktrees = worktreeMap.get(s.id) || [];
 
-    const worktreeBadges = sessionWorktrees.map(branch =>
+    const worktreeBadges = sessionWorktrees.map((branch: any) =>
       `<span class="worktree-badge" title="active worktree: ${escapeHtml(branch)}" style="display:inline-block;background:var(--surface-2);color:#a78bfa;font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">⎇ ${escapeHtml(branch.replace('worktree/', ''))}</span>`
     ).join('');
 
@@ -5760,7 +5879,7 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
 
 }
 
-async function endLiveSession(projectId, sessionId) {
+async function endLiveSession(projectId: any, sessionId: any) {
   if (!sessionId) return;
   try {
     await api(`/sessions/${sessionId}`, {
@@ -5769,12 +5888,12 @@ async function endLiveSession(projectId, sessionId) {
     });
     toast('Session marked idle');
     await refreshLiveTab(projectId);
-  } catch(e) {
+  } catch(e: any) {
     toast(`End session failed: ${e.message}`, true);
   }
 }
 
-function openTimelineForSession(projectId, sessionId) {
+function openTimelineForSession(projectId: any, sessionId: any) {
   const panel = getPanelState(projectId);
   panel.timelineSessionFilter = sessionId || null;
   try { localStorage.setItem('meridian_tl_view_' + projectId, 'tasks'); } catch(_) {}
@@ -5785,13 +5904,13 @@ function openTimelineForSession(projectId, sessionId) {
 
 
 
-function renderLiveQueue(projectId, tasks) {
+function renderLiveQueue(projectId: any, tasks: any) {
 
   const root = document.getElementById(`live-queue-${projectId}`);
 
   if (!root) return;
 
-  const live = tasks.filter(t => t.status === 'pending' || t.status === 'in_progress');
+  const live = tasks.filter((t: any) => t.status === 'pending' || t.status === 'in_progress');
 
   if (!live.length) {
 
@@ -5801,7 +5920,7 @@ function renderLiveQueue(projectId, tasks) {
 
   }
 
-  live.sort((a, b) => {
+  live.sort((a: any, b: any) => {
 
     if (a.status !== b.status) return a.status === 'in_progress' ? -1 : 1;
 
@@ -5809,7 +5928,7 @@ function renderLiveQueue(projectId, tasks) {
 
   });
 
-  root.innerHTML = live.map(t => {
+  root.innerHTML = live.map((t: any) => {
 
     const dot = t.status === 'in_progress' ? '🔵' : '📋';
 
@@ -5867,7 +5986,7 @@ function renderLiveQueue(projectId, tasks) {
 
 
 
-async function addLiveTask(projectId, description) {
+async function addLiveTask(projectId: any, description: any) {
 
   /** POST /tasks with the most recent active session as attribution. */
 
@@ -5885,7 +6004,7 @@ async function addLiveTask(projectId, description) {
 
       cacheMostRecentSession(projectId, sessions || []);
 
-    } catch(e) {}
+    } catch(e: any) {}
 
   }
 
@@ -5921,7 +6040,7 @@ async function addLiveTask(projectId, description) {
 
     return true;
 
-  } catch(e) {
+  } catch(e: any) {
 
     toast('add task failed: ' + e.message, true);
 
@@ -5933,7 +6052,7 @@ async function addLiveTask(projectId, description) {
 
 
 
-async function cancelLiveTask(projectId, taskId) {
+async function cancelLiveTask(projectId: any, taskId: any) {
 
   /** PATCH /tasks/{id} → status=done. WebSocket broadcast triggers refresh. */
 
@@ -5951,7 +6070,7 @@ async function cancelLiveTask(projectId, taskId) {
 
     await refreshLiveTab(projectId);
 
-  } catch(e) {
+  } catch(e: any) {
 
     toast('cancel failed: ' + e.message, true);
 
@@ -5963,7 +6082,7 @@ async function cancelLiveTask(projectId, taskId) {
 
 // v1.5.x — Claude launch control panel. Wires the 4 sections:
 
-function showCopyPreview(title, content) {
+function showCopyPreview(title: any, content: any) {
 
   const overlay = document.createElement('div');
 
@@ -6001,11 +6120,11 @@ function showCopyPreview(title, content) {
 
     try {
 
-      await navigator.clipboard.writeText(ta.value);
+      await navigator.clipboard.writeText(ta!.value);
 
     } catch(_) {
 
-      ta.select();
+      ta!.select();
 
       document.execCommand('copy');
 
@@ -6029,16 +6148,16 @@ function showCopyPreview(title, content) {
 
 // (4) open in claude.ai
 
-function wireClaudeLaunchPanel(projectId) {
+function wireClaudeLaunchPanel(projectId: any) {
 
   const PROJECT_QUOTE = projectId.replace(/"/g, '\\"');
   const sequentialKey = `meridian.sequentialMode.${projectId}`;
 
-  function normalizeTouchesFile(path) {
+  function normalizeTouchesFile(path: any) {
     return String(path || '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
   }
 
-  function parseTouchesFiles(raw) {
+  function parseTouchesFiles(raw: any) {
     if (!raw) return [];
     if (Array.isArray(raw)) return raw.map(normalizeTouchesFile).filter(Boolean);
     const text = String(raw).trim();
@@ -6047,15 +6166,15 @@ function wireClaudeLaunchPanel(projectId) {
       const parsed = JSON.parse(text);
       if (Array.isArray(parsed)) return parsed.map(normalizeTouchesFile).filter(Boolean);
       return [normalizeTouchesFile(parsed)].filter(Boolean);
-    } catch(e) {
+    } catch(e: any) {
       return text.split(',').map(normalizeTouchesFile).filter(Boolean);
     }
   }
 
-  function findTouchesFilesConflicts(items) {
-    const active = (items || []).filter(it => ['pending', 'todo', 'in_progress'].includes(it.status || 'pending'));
+  function findTouchesFilesConflicts(items: any) {
+    const active = (items || []).filter((it: any) => ['pending', 'todo', 'in_progress'].includes(it.status || 'pending'));
     const byFile = new Map();
-    active.forEach((item) => {
+    active.forEach((item: any) => {
       parseTouchesFiles(item.touches_files).forEach((file) => {
         const key = file.toLowerCase();
         const list = byFile.get(key) || [];
@@ -6064,11 +6183,11 @@ function wireClaudeLaunchPanel(projectId) {
       });
     });
     return Array.from(byFile.values())
-      .filter(list => list.length > 1 && list.some(entry => entry.item.status === 'in_progress'))
+      .filter(list => list.length > 1 && list.some((entry: any) => entry.item.status === 'in_progress'))
       .flat();
   }
 
-  function applySequentialMode(text) {
+  function applySequentialMode(text: any) {
     const toggle = document.getElementById(`sequential-mode-${projectId}`);
     if (!toggle || !toggle.checked || !text) return text;
     return `${text}\n\nSEQUENTIAL MODE:\n- Work one sprint item at a time.\n- Call claim_file(session_id, path) before editing shared files.\n- Stop and coordinate if start_session returns file_warnings or claim_sprint_item returns CONFLICT.`;
@@ -6083,16 +6202,16 @@ function wireClaudeLaunchPanel(projectId) {
       if (!conflicts.length) return true;
       const files = Array.from(new Set(conflicts.map(c => c.file))).join(', ');
       return confirm(`touches_files conflict warning:\n\n${files}\n\nContinue copying the handoff?`);
-    } catch(e) {
+    } catch(e: any) {
       return true;
     }
   }
 
   const sequentialToggle = document.getElementById(`sequential-mode-${projectId}`);
   if (sequentialToggle) {
-    try { sequentialToggle.checked = localStorage.getItem(sequentialKey) === '1'; } catch(e) {}
+    try { sequentialToggle.checked = localStorage.getItem(sequentialKey) === '1'; } catch(e: any) {}
     sequentialToggle.onchange = () => {
-      try { localStorage.setItem(sequentialKey, sequentialToggle.checked ? '1' : '0'); } catch(e) {}
+      try { localStorage.setItem(sequentialKey, sequentialToggle.checked ? '1' : '0'); } catch(e: any) {}
     };
   }
 
@@ -6135,7 +6254,7 @@ function wireClaudeLaunchPanel(projectId) {
 
       showCopyPreview('Claude / Codex Handoff', text);
 
-    } catch(e) { toast('handoff failed: ' + e.message, true); }
+    } catch(e: any) { toast('handoff failed: ' + e.message, true); }
 
     finally { copyStartChatBtn.disabled = false; copyStartChatBtn.textContent = orig; }
 
@@ -6275,7 +6394,7 @@ function wireClaudeLaunchPanel(projectId) {
 
       toast('worker session ready');
 
-    } catch(e) { toast('start worker failed: ' + e.message, true); }
+    } catch(e: any) { toast('start worker failed: ' + e.message, true); }
 
   };
 
@@ -6295,7 +6414,7 @@ function wireClaudeLaunchPanel(projectId) {
 
       toast('worker context copied');
 
-    } catch(e) { toast('copy failed: ' + e.message, true); }
+    } catch(e: any) { toast('copy failed: ' + e.message, true); }
 
   };
 
@@ -6350,7 +6469,7 @@ function wireClaudeLaunchPanel(projectId) {
 
       }
 
-    } catch(e) { toast('handoff failed: ' + e.message, true); }
+    } catch(e: any) { toast('handoff failed: ' + e.message, true); }
 
     finally { copyHandoffBtn.disabled = false; copyHandoffBtn.textContent = orig; }
 
@@ -6400,7 +6519,7 @@ function wireClaudeLaunchPanel(projectId) {
 
       showCopyPreview('Chat Context — paste into claude.ai', text);
 
-    } catch(e) { toast('copy context failed: ' + e.message, true); }
+    } catch(e: any) { toast('copy context failed: ' + e.message, true); }
 
     finally { copyContextBtn.disabled = false; copyContextBtn.textContent = orig; }
 
@@ -6442,7 +6561,7 @@ function wireClaudeLaunchPanel(projectId) {
 
       toast('handoff regenerated');
 
-    } catch(e) { toast('regenerate failed: ' + e.message, true); }
+    } catch(e: any) { toast('regenerate failed: ' + e.message, true); }
 
     finally {
 
@@ -6458,7 +6577,7 @@ function wireClaudeLaunchPanel(projectId) {
 
 
 
-function stampHandoffTs(projectId, when) {
+function stampHandoffTs(projectId: any, when: any) {
 
   const tsEl = document.getElementById(`handoff-ts-${projectId}`);
 
@@ -6472,7 +6591,7 @@ function stampHandoffTs(projectId, when) {
 
 
 
-function populateSessionDropdown(projectId, sessions) {
+function populateSessionDropdown(projectId: any, sessions: any) {
 
   /** v1.5.x — fill the "Continue session" dropdown with the last 5 sessions
 
@@ -6482,7 +6601,7 @@ function populateSessionDropdown(projectId, sessions) {
 
   if (!sel) return;
 
-  const sorted = (sessions || []).slice().sort((a, b) =>
+  const sorted = (sessions || []).slice().sort((a: any, b: any) =>
 
     (b.last_seen || '').localeCompare(a.last_seen || '')
 
@@ -6498,7 +6617,7 @@ function populateSessionDropdown(projectId, sessions) {
 
   const prev = sel.value;
 
-  sel.innerHTML = sorted.map(s => {
+  sel.innerHTML = sorted.map((s: any) => {
 
     const label = `${s.name} — ${formatRelativeTime(s.last_seen)}`;
 
@@ -6506,7 +6625,7 @@ function populateSessionDropdown(projectId, sessions) {
 
   }).join('');
 
-  if (prev && sorted.some(s => s.name === prev)) sel.value = prev;
+  if (prev && sorted.some((s: any) => s.name === prev)) sel.value = prev;
 
 }
 
@@ -6516,7 +6635,7 @@ function populateSessionDropdown(projectId, sessions) {
 
 // per session, paint task pills positioned on a shared time axis.
 
-async function loadTimeline(projectId) {
+async function loadTimeline(projectId: any) {
 
   const wrap = document.getElementById(`timeline-wrap-${projectId}`);
 
@@ -6530,7 +6649,7 @@ async function loadTimeline(projectId) {
 
     data = await api(`/projects/${projectId}/timeline`);
 
-  } catch (e) {
+  } catch (e: any) {
 
     wrap.innerHTML = `<div class="timeline-empty">timeline failed: ${escapeHtml(e.message)}</div>`;
 
@@ -6572,7 +6691,7 @@ async function loadTimeline(projectId) {
 
 
 
-function _renderTimelineLog(projectId, data) {
+function _renderTimelineLog(projectId: any, data: any) {
 
   /** Fallback text log when vis-timeline isn't available. */
 
@@ -6584,7 +6703,7 @@ function _renderTimelineLog(projectId, data) {
 
   const isAbs = !!(state.panels[projectId] && state.panels[projectId]._timelineAbsolute);
 
-  const fmtTs = ts => {
+  const fmtTs = (ts: any) => {
 
     if (!ts) return '';
 
@@ -6594,11 +6713,11 @@ function _renderTimelineLog(projectId, data) {
 
   };
 
-  const events = [];
+  const events: any[] = [];
 
-  tasks.forEach(t => {
+  tasks.forEach((t: any) => {
 
-    const icon = { done: '✅', failed: '❌' }[t.status] || '•';
+    const icon = ({ done: '✅', failed: '❌' } as any)[t.status] || '•';
 
     events.push({ ts: t.created_at, actor: t.session_name || '(unknown)', desc: `${icon} ${(t.description || '').slice(0, 100)}` });
 
@@ -6606,7 +6725,7 @@ function _renderTimelineLog(projectId, data) {
 
   const goalByField = new Map();
 
-  goal_events.forEach(g => {
+  goal_events.forEach((g: any) => {
 
     const key = g.field + (g.updated_at || '').slice(0, 13);
 
@@ -6656,7 +6775,7 @@ const _TOOL_CATEGORIES = {
 
 };
 
-const _CATEGORY_LABELS = {
+const _CATEGORY_LABELS: Record<string, string> = {
 
   goal: 'Goal Tools', task: 'Task & Sprint Tools', session: 'Session Tools',
 
@@ -6666,7 +6785,7 @@ const _CATEGORY_LABELS = {
 
 
 
-async function loadDocsTab(projectId) {
+async function loadDocsTab(projectId: any) {
 
   const body = document.getElementById(`docs-body-${projectId}`);
 
@@ -6684,9 +6803,9 @@ async function loadDocsTab(projectId) {
 
     // Build lookup
 
-    const byName = {};
+    const byName: Record<string, any> = {};
 
-    tools.forEach(t => { byName[t.name] = t; });
+    tools.forEach((t: any) => { byName[t.name] = t; });
 
     // Render by category
 
@@ -6718,13 +6837,13 @@ async function loadDocsTab(projectId) {
 
     // Catch-all for uncategorized tools
 
-    const rest = tools.filter(t => !categorized.has(t.name));
+    const rest = tools.filter((t: any) => !categorized.has(t.name));
 
     if (rest.length) {
 
       html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Other</div>`;
 
-      rest.forEach(tool => { html += _renderToolEntry(tool); });
+      rest.forEach((tool: any) => { html += _renderToolEntry(tool); });
 
       html += '</div>';
 
@@ -6736,7 +6855,7 @@ async function loadDocsTab(projectId) {
 
     _wireTabSearch(`docs-search-${projectId}`, `docs-body-${projectId}`, '.tool-entry');
 
-  } catch (e) {
+  } catch (e: any) {
 
     body.innerHTML = `<div style="color:var(--error)">Failed to load tools: ${escapeHtml(String(e))}</div>`;
 
@@ -6748,7 +6867,7 @@ async function loadDocsTab(projectId) {
 
 // Code Intel tab — show only when tunnel:code socket is live.
 // Called once per project panel after vtab strip is wired.
-async function _initCodeIntelTabVisibility(projectId) {
+async function _initCodeIntelTabVisibility(projectId: any) {
   if (!window.MERIDIAN_HOSTED) return;
   try {
     const data = await api('/tunnel/plugins');
@@ -6763,7 +6882,7 @@ async function _initCodeIntelTabVisibility(projectId) {
 // drive-colon and path separators (\\ / :) collapse to single dashes, e.g.
 // C:\Users\13144\Documents\Meridian\repository -> C-Users-13144-Documents-Meridian-repository.
 // The index_status / get_architecture tools take this `project` slug, NOT a raw repo_path.
-function _repoPathToProject(repoPath) {
+function _repoPathToProject(repoPath: any) {
   return String(repoPath || '').replace(/[\\/:]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
@@ -6774,16 +6893,16 @@ function _repoPathToProject(repoPath) {
 // once their <canvas> elements are in the DOM. Schema (codebase-memory-mcp):
 //   node_labels[{label,count}] edge_types[{type,count}] hotspots[{name,fan_in}]
 //   packages[{name,node_count}] layers[{name,layer}] boundaries[{from,to,call_count}]
-function _codeArchSection(archText) {
-  const rawPre = (t) => `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(t || '(no architecture returned)')}</pre>`;
+function _codeArchSection(archText: any) {
+  const rawPre = (t: any) => `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(t || '(no architecture returned)')}</pre>`;
   let arch = null;
   try { arch = JSON.parse(archText); } catch (_) { arch = null; }
   // Not JSON (older server returns formatted text) → keep the honest raw view.
   if (!arch || typeof arch !== 'object') return { html: rawPre(archText), charts: [] };
 
-  const arr = (v) => Array.isArray(v) ? v : [];
-  const num = (v) => (typeof v === 'number' ? v : parseFloat(v));
-  const fin = (v) => Number.isFinite(num(v));
+  const arr = (v: any) => Array.isArray(v) ? v : [];
+  const num = (v: any) => (typeof v === 'number' ? v : parseFloat(v));
+  const fin = (v: any) => Number.isFinite(num(v));
   const charts = [];
   let html = '';
 
@@ -6863,10 +6982,10 @@ function _codeArchSection(archText) {
 // 65742e42 — normalize a codebase__query_graph result (package-edge Cypher) into
 // a list of {source, target, value} edges. Defensive: tolerates row arrays
 // ([a, b, count]) and a few common object shapes; bad input → []. Pure + tested.
-function _normalizeGraphEdges(queryResult) {
+function _normalizeGraphEdges(queryResult: any) {
   let rows = [];
   try {
-    const txt = ((queryResult && queryResult.content) || []).map(c => c.text || '').join('').trim();
+    const txt = ((queryResult && queryResult.content) || []).map((c: any) => c.text || '').join('').trim();
     if (!txt) return [];
     const obj = JSON.parse(txt);
     rows = Array.isArray(obj) ? obj : (obj.rows || obj.data || obj.results || obj.records || []);
@@ -6892,24 +7011,24 @@ if (typeof window !== 'undefined') window._normalizeGraphEdges = _normalizeGraph
 // cross-package edges. Nodes are packages (sized by node_count, colored by
 // layer); the 'hotspots' view instead sizes by connection degree to surface the
 // most-connected packages. Returns null when there are no packages. Pure + tested.
-function _buildCodebaseForceGraph(packages, edges, view) {
-  const pkgs = (packages || []).filter(p => p && p.name != null);
+function _buildCodebaseForceGraph(packages: any, edges: any, view: any) {
+  const pkgs = (packages || []).filter((p: any) => p && p.name != null);
   if (!pkgs.length) return null;
-  const layers = [...new Set(pkgs.map(p => String(p.layer != null ? p.layer : 'other')))];
+  const layers = [...new Set(pkgs.map((p: any) => String(p.layer != null ? p.layer : 'other')))];
   const palette = ['#60a5fa', '#34d399', '#fbbf24', '#f87171', '#a78bfa', '#f472b6', '#22d3ee'];
-  const layerColor = {};
-  layers.forEach((l, i) => { layerColor[l] = palette[i % palette.length]; });
-  const degree = {};
-  (edges || []).forEach(e => {
+  const layerColor: Record<string, string> = {};
+  layers.forEach((l: any, i: any) => { layerColor[l] = palette[i % palette.length]; });
+  const degree: Record<string, number> = {};
+  (edges || []).forEach((e: any) => {
     if (!e) return;
     degree[e.source] = (degree[e.source] || 0) + (Number(e.value) || 1);
     degree[e.target] = (degree[e.target] || 0) + (Number(e.value) || 1);
   });
-  const metric = (p) => view === 'hotspots'
+  const metric = (p: any) => view === 'hotspots'
     ? (degree[String(p.name)] || 0)
     : (Number(p.node_count) || 0);
   const maxMetric = Math.max(1, ...pkgs.map(metric));
-  const nodes = pkgs.map(p => {
+  const nodes = pkgs.map((p: any) => {
     const lyr = String(p.layer != null ? p.layer : 'other');
     return {
       name: String(p.name),
@@ -6919,10 +7038,10 @@ function _buildCodebaseForceGraph(packages, edges, view) {
       itemStyle: { color: layerColor[lyr] },
     };
   });
-  const names = new Set(nodes.map(n => n.name));
+  const names = new Set(nodes.map((n: any) => n.name));
   const links = (edges || [])
-    .filter(e => e && names.has(e.source) && names.has(e.target) && e.source !== e.target)
-    .map(e => ({
+    .filter((e: any) => e && names.has(e.source) && names.has(e.target) && e.source !== e.target)
+    .map((e: any) => ({
       source: e.source, target: e.target, value: Number(e.value) || 1,
       lineStyle: { width: Math.min(6, 1 + (Number(e.value) || 1) / 3) },
     }));
@@ -6944,7 +7063,7 @@ if (typeof window !== 'undefined') window._buildCodebaseForceGraph = _buildCodeb
 
 // Render the force-graph into a container + wire the Packages/Hotspots toggle.
 // Best-effort: missing echarts / no packages → leaves the placeholder text.
-function _renderCodebaseGraph(containerId, packages, edges) {
+function _renderCodebaseGraph(containerId: any, packages: any, edges: any) {
   if (typeof window === 'undefined' || !window.echarts) return;
   const el = document.getElementById(containerId);
   if (!el) return;
@@ -6953,7 +7072,7 @@ function _renderCodebaseGraph(containerId, packages, edges) {
   let chart;
   try { chart = window.echarts.init(el); } catch (_) { return; }
   chart.setOption(opt);
-  const setView = (view) => {
+  const setView = (view: any) => {
     const o = _buildCodebaseForceGraph(packages, edges, view);
     if (o) chart.setOption(o, true);
     document.querySelectorAll(`[data-cg-toggle][data-cg-for="${containerId}"]`).forEach(b => {
@@ -6972,7 +7091,7 @@ if (typeof window !== 'undefined') window._renderCodebaseGraph = _renderCodebase
 // 5813affe — POST the (already-fetched) package graph to the server, which
 // renders a static Graphviz PNG and returns it as a base64 data URI. Surfaces an
 // actionable hint when Graphviz isn't installed (503 graphviz_missing).
-async function _generateCodebaseMap(projectId) {
+async function _generateCodebaseMap(projectId: any) {
   const data = (window._codeGraphData || {})[projectId];
   const out = data && document.getElementById(`${data.cgId}-map`);
   if (!data || !out) return;
@@ -6999,14 +7118,249 @@ async function _generateCodebaseMap(projectId) {
     } else {
       out.innerHTML = `<div style="font-size:10px;color:var(--error)">No image returned.</div>`;
     }
-  } catch (e) {
+  } catch (e: any) {
     out.innerHTML = `<div style="font-size:10px;color:var(--error)">Map generation failed: ${escapeHtml(String(e))}</div>`;
   }
 }
 if (typeof window !== 'undefined') window._generateCodebaseMap = _generateCodebaseMap;
 
 
-async function loadCodeIntelTab(projectId) {
+// 3f596f81 — Project Documents panel. Lists ingested documents (project_notes
+// note_kind='document') and, per doc, an on-demand heading-tree structure view
+// via GET /projects/{id}/document-structure (docs_intel.document_outline).
+// Honest scope: structure = heading tree + paragraph/heading counts only;
+// figures/cross-refs/equations/comments are not extracted by docs_intel Phase 1.
+// 0b711a9d — Project Insights panel. Lists durable strategic insights (the
+// dedicated insights table) grouped by horizon (permanent / year / quarter).
+// Permanent insights always surface in the planning brief; add via add_insight.
+async function loadInsightsTab(projectId: any) {
+  const body = document.getElementById(`insights-body-${projectId}`);
+  if (!body) return;
+  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+
+  let insights: any[] = [];
+  try {
+    insights = ((await api(`/projects/${projectId}/insights`)) as any[]) || [];
+  } catch (e: any) {
+    body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load insights: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+
+  const HORIZON: Record<string, { label: string; color: string }> = {
+    permanent: { label: 'PERMANENT', color: 'var(--accent)' },
+    year: { label: 'YEAR', color: 'var(--warning, #d29922)' },
+    quarter: { label: 'QUARTER', color: 'var(--muted)' },
+  };
+  const _pill = (h: any) => {
+    const m = HORIZON[String(h)] || { label: String(h || 'quarter').toUpperCase(), color: 'var(--muted)' };
+    return `<span style="font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid ${m.color};color:${m.color};letter-spacing:.04em">${m.label}</span>`;
+  };
+
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <div style="font-size:11px;color:var(--text)"><b>${insights.length}</b> insight${insights.length === 1 ? '' : 's'}</div>
+  </div>
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Durable strategic understanding — separate from decisions (choices) and notes (reference). Add via the <code>add_insight</code> MCP tool. Permanent insights always appear in the planning brief.</div>`;
+
+  if (!insights.length) {
+    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No insights yet. Capture accumulated understanding with <code>add_insight(project_id, title, body, horizon)</code>.</div>`;
+  } else {
+    const order: Record<string, number> = { permanent: 0, year: 1, quarter: 2 };
+    const sorted = [...insights].sort((a, b) => (order[String(a.horizon)] ?? 3) - (order[String(b.horizon)] ?? 3));
+    for (const ins of sorted) {
+      const tags = String(ins.tags || '').split(',').map((t: string) => t.trim()).filter(Boolean);
+      html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(ins.title || ''))}</span>
+          ${_pill(ins.horizon)}
+        </div>
+        ${ins.body ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;white-space:pre-wrap">${escapeHtml(String(ins.body))}</div>` : ''}
+        ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t: string) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(t)}</span>`).join('')}</div>` : ''}
+      </div>`;
+    }
+  }
+  body.innerHTML = html;
+}
+
+
+async function loadBlogTab(projectId: any) {
+  // Blog is WORKSPACE-scoped, not per-project — read the workspace endpoint.
+  const body = document.getElementById(`blog-body-${projectId}`);
+  if (!body) return;
+  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+
+  let posts: any[] = [];
+  try {
+    posts = ((await api('/workspace/blog')) as any[]) || [];
+  } catch (e: any) {
+    body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load blog posts: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+
+  const GROUPS: Array<{ key: string; label: string; color: string }> = [
+    { key: 'draft', label: 'DRAFTS', color: 'var(--muted)' },
+    { key: 'published', label: 'PUBLISHED', color: 'var(--accent)' },
+    { key: 'archived', label: 'ARCHIVED', color: 'var(--warning, #d29922)' },
+  ];
+
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <div style="font-size:11px;color:var(--text)"><b>${posts.length}</b> post${posts.length === 1 ? '' : 's'}</div>
+  </div>
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Author via the <code>save_blog_post</code> MCP tool; published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+
+  if (!posts.length) {
+    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one with <code>save_blog_post(title, body, status="published")</code>.</div>`;
+  } else {
+    for (const g of GROUPS) {
+      const inGroup = posts.filter(p => String(p.status || 'draft') === g.key);
+      if (!inGroup.length) continue;
+      html += `<div style="font-size:9px;color:${g.color};letter-spacing:.06em;margin:12px 0 6px">${g.label} · ${inGroup.length}</div>`;
+      for (const p of inGroup) {
+        const slug = String(p.slug || '');
+        const url = String(p.url || (slug ? `/blog/${slug}` : ''));
+        html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+          <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(p.title || 'Untitled'))}</div>
+          <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px">${escapeHtml(slug)}</div>
+          ${url ? `<div style="margin-top:4px"><a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="font-size:10px;color:var(--accent)">${escapeHtml(url)}</a></div>` : ''}
+        </div>`;
+      }
+    }
+  }
+  body.innerHTML = html;
+}
+
+
+async function loadDocumentsTab(projectId: any) {
+  const body = document.getElementById(`documents-body-${projectId}`);
+  if (!body) return;
+  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+
+  let docs: any[] = [];
+  try {
+    const dp = await api(`/projects/${projectId}/notes?paginate=true&limit=200`);
+    docs = (((dp && dp.notes) || []) as any[])
+      .filter(n => String(n.note_kind || '').toLowerCase() === 'document');
+  } catch (e: any) {
+    body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load documents: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+
+  const _srcBadge = (src: any) => {
+    const s = String(src || 'local').toLowerCase();
+    const label = s.includes('onedrive') ? 'OneDrive'
+      : (s.includes('gdrive') || s.includes('google')) ? 'GDrive'
+      : (src || 'local');
+    return `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">${escapeHtml(String(label))}</span>`;
+  };
+
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? '' : 's'} <span style="color:var(--muted)">(note_kind=document)</span></div>
+  </div>`;
+
+  // f1c7e7d1 — tunnel-free upload: pick a local .txt/.md, read it client-side,
+  // POST {filename, content} to /documents/upload (reuses ingest_document's
+  // content path). No tunnel / server-side file access needed.
+  html += `<div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;padding:8px 10px;border:1px dashed var(--border);border-radius:4px;background:var(--surface-1)">
+    <input type="file" id="doc-upload-input-${escapeHtml(String(projectId))}" accept=".txt,.md" style="font-size:10px;flex:1;min-width:0" />
+    <button id="doc-upload-btn-${escapeHtml(String(projectId))}" class="secondary" style="font-size:10px;padding:3px 10px" disabled>Upload .txt/.md</button>
+  </div>
+  <div id="doc-upload-status-${escapeHtml(String(projectId))}" style="font-size:9px;color:var(--muted);margin-bottom:8px">Plain .txt / .md only — the file text is read in your browser and stored as a searchable document note.</div>`;
+
+  if (!docs.length) {
+    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Upload a .txt/.md above, or ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) — it is stored as a project note with kind=document and appears here.</div>`;
+  } else {
+    for (const d of docs) {
+      const title = d.title || d.slug || d.id;
+      const fp = d.file_path || '';
+      const tags = Array.isArray(d.tags) ? d.tags : [];
+      const did = String(d.id);
+      html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(title))}</span>
+          ${_srcBadge(d.source)}
+        </div>
+        ${fp ? `<div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px;word-break:break-all">${escapeHtml(String(fp))}</div>` : ''}
+        ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t: any) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(String(t))}</span>`).join('')}</div>` : ''}
+        ${fp
+          ? `<div style="margin-top:6px"><button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button></div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div>`
+          : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path — structure view unavailable.</div>'}
+      </div>`;
+    }
+    html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
+  }
+  body.innerHTML = html;
+
+  // f1c7e7d1 — wire the upload picker: enable the button once a .txt/.md is
+  // chosen, then read text client-side and POST it to the upload route.
+  const _fileInput = document.getElementById(`doc-upload-input-${projectId}`) as HTMLInputElement | null;
+  const _uploadBtn = document.getElementById(`doc-upload-btn-${projectId}`) as HTMLButtonElement | null;
+  const _uploadStatus = document.getElementById(`doc-upload-status-${projectId}`);
+  const _setStatus = (msg: string, color: string) => {
+    if (_uploadStatus) { _uploadStatus.textContent = msg; (_uploadStatus as HTMLElement).style.color = color; }
+  };
+  if (_fileInput && _uploadBtn) {
+    _fileInput.addEventListener('change', () => {
+      _uploadBtn.disabled = !(_fileInput.files && _fileInput.files.length > 0);
+    });
+    _uploadBtn.addEventListener('click', async () => {
+      const file = _fileInput.files && _fileInput.files[0];
+      if (!file) return;
+      const name = file.name || '';
+      if (!/\.(txt|md)$/i.test(name)) {
+        _setStatus('Only .txt and .md files are supported.', 'var(--error)');
+        return;
+      }
+      _uploadBtn.disabled = true;
+      _setStatus(`Reading ${name}…`, 'var(--muted)');
+      try {
+        const text = await file.text();
+        const res = await api(`/projects/${projectId}/documents/upload`, {
+          method: 'POST',
+          body: JSON.stringify({ filename: name, content: text }),
+        });
+        if (res && res.error) throw new Error(String(res.error));
+        _setStatus(`Uploaded "${name}".`, 'var(--accent)');
+        await loadDocumentsTab(projectId);  // refresh the list
+      } catch (e: any) {
+        // api() throws on 4xx; try to surface the FastAPI `detail` message.
+        let msg = String(e && e.message ? e.message : e);
+        try {
+          const rt = e && e.responseText;
+          if (rt) { const j = JSON.parse(rt); if (j && j.detail) msg = String(j.detail); }
+        } catch (_) { /* keep raw message */ }
+        _setStatus(`Upload failed: ${msg}`, 'var(--error)');
+        _uploadBtn.disabled = false;
+      }
+    });
+  }
+
+  body.querySelectorAll('.doc-struct-btn').forEach(btn => {
+    (btn as HTMLElement).addEventListener('click', async () => {
+      const fp = (btn as HTMLElement).dataset.fp || '';
+      const did = (btn as HTMLElement).dataset.did || '';
+      const target = document.getElementById(`doc-struct-${did}`);
+      if (!target) return;
+      target.innerHTML = '<span style="font-size:9px;color:var(--muted)">loading structure…</span>';
+      try {
+        const st = await api(`/projects/${projectId}/document-structure?path=${encodeURIComponent(fp)}`);
+        if (st && st.error) {
+          target.innerHTML = `<span style="font-size:9px;color:var(--warning,#d29922)">${escapeHtml(String(st.error))}</span>`;
+          return;
+        }
+        const headings = (st && st.headings) || [];
+        const tree = headings.map((h: any) => {
+          const lvl = Math.max(1, Math.min(6, parseInt(h.level, 10) || 1));
+          return `<div style="font-size:10px;color:var(--text);padding-left:${(lvl - 1) * 12}px">${escapeHtml(String(h.text || ''))}</div>`;
+        }).join('');
+        target.innerHTML = `<div style="font-size:9px;color:var(--muted);margin-bottom:3px">${st.paragraph_count} paragraphs · ${st.heading_count} headings</div>${tree || '<span style="font-size:9px;color:var(--muted)">No headings found.</span>'}`;
+      } catch (e: any) {
+        target.innerHTML = `<span style="font-size:9px;color:var(--error)">Failed: ${escapeHtml(String(e))}</span>`;
+      }
+    });
+  });
+}
+
+
+async function loadCodeIntelTab(projectId: any) {
   const body = document.getElementById(`codeintel-body-${projectId}`);
   if (!body) return;
 
@@ -7032,7 +7386,7 @@ async function loadCodeIntelTab(projectId) {
 
     const codeBase = `/code/mcp/${tenantId}/mcp`;
 
-    async function _codeMcpCall(method, params) {
+    async function _codeMcpCall(method: any, params: any) {
       const r = await fetch(codeBase, {
         method: 'POST',
         headers: {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'},
@@ -7066,11 +7420,13 @@ async function loadCodeIntelTab(projectId) {
     const repoPaths = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
 
     let html = '';
-    let archCharts = [];  // {id, config} pairs instantiated after body.innerHTML
+    let archCharts: any[] = [];  // {id, config} pairs instantiated after body.innerHTML
     // 65742e42 — codebase force-graph data, populated in the Architecture section
     // below and rendered after body.innerHTML into the container added here.
     let _graphPackages = [];
-    let _graphEdges = [];
+    let _graphEdges: any[] = [];
+    let _graphArch = null;   // ff8ff615 — full get_architecture payload (packages+layers)
+    let _archError = '';     // ff8ff615 — arch fetch error → panel error state
     const _cgId = `ci-forcegraph-${projectId}`;
 
     // Live indicator
@@ -7080,24 +7436,39 @@ async function loadCodeIntelTab(projectId) {
       ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? 's' : ''}</span>` : ''}
     </div>`;
 
-    // 65742e42 — codebase force-graph at the top of the tab (filled below).
-    // 5813affe — "Generate Map" exports a static graphviz PNG of the same graph.
-    html += `<div style="margin-bottom:16px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-        <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Package Graph</div>
-        <div style="display:flex;gap:4px;align-items:center">
-          <button data-cg-toggle="packages" data-cg-for="${_cgId}" style="background:none;border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer">Packages</button>
-          <button data-cg-toggle="hotspots" data-cg-for="${_cgId}" style="background:none;border:1px solid var(--border);border-radius:3px;color:var(--muted);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer">Hotspots</button>
-          <button id="${_cgId}-genmap" onclick="_generateCodebaseMap(${JSON.stringify(projectId)})" style="background:none;border:1px solid var(--border);border-radius:3px;color:var(--muted);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer" title="Render a static PNG map via Graphviz">Generate Map</button>
-        </div>
+    // 3e28f593 — Resources: unified codebase + documents summary so the scattered
+    // repo-path / document fields have one coherent view (which repo(s) this
+    // project indexes + how many ingested documents).
+    let _docsCount = 0;
+    try {
+      const _dp = await api(`/projects/${projectId}/notes?paginate=true&limit=200`);
+      _docsCount = (((_dp && _dp.notes) || []) as any[])
+        .filter(n => String(n.note_kind || '').toLowerCase() === 'document').length;
+    } catch (_) { /* docs count is best-effort */ }
+    const _cwds = repoPaths.map((rp: any) => typeof rp === 'string' ? rp : (rp.cwd || '')).filter(Boolean);
+    html += `<div style="margin-bottom:16px;padding:10px 12px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px">
+      <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Resources</div>
+      <div style="font-size:11px;color:var(--text);line-height:1.7">
+        <div>Codebases: <b>${_cwds.length}</b> repo path${_cwds.length !== 1 ? 's' : ''}${_cwds.length ? ` — ${escapeHtml(_cwds.join(', '))}` : ' <span style="color:var(--muted)">(add in Settings → Executor Config)</span>'}</div>
+        <div>Documents: <b>${_docsCount}</b> ingested <span style="color:var(--muted)">(kind=document)</span></div>
       </div>
-      <div id="${_cgId}" style="width:100%;height:400px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px"></div>
-      <div id="${_cgId}-empty" style="display:none;font-size:10px;color:var(--muted);margin-top:4px">No package graph yet — index the repo to populate it.</div>
-      <div id="${_cgId}-map" style="margin-top:8px"></div>
+    </div>`;
+
+    // ff8ff615 — the Preact CodeIntelPanel renders the layered package DAG +
+    // zoom + Generate Map into this mount point (mounted after body.innerHTML).
+    html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
+
+    // ed5512b6 — the standalone codegraph visualizer (folder->file->function
+    // drill-down, color by role, static metadata on click). Mounted after
+    // body.innerHTML via the thin adapter below; the module never reaches back
+    // into the dashboard — data flows in only.
+    html += `<div style="margin-bottom:16px">
+      <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Code Tree</div>
+      <div id="${_cgId}-codegraph"></div>
     </div>`;
 
     // Index status per repo path
-    html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Index Status</div>`;
+    html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
     if (repoPaths.length) {
       for (const rp of repoPaths) {
         const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
@@ -7105,12 +7476,12 @@ async function loadCodeIntelTab(projectId) {
         if (!cwd) continue;
         try {
           const result = await _codeMcpCall('tools/call', {name: 'index_status', arguments: {project: _repoPathToProject(cwd)}});
-          const text = (result?.content || []).map(c => c.text || '').join('').trim();
+          const text = (result?.content || []).map((c: any) => c.text || '').join('').trim();
           html += `<div style="margin-bottom:10px">
             <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> · ${escapeHtml(hostname)}</span>` : ''}</div>
             <pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(text || '(no status returned)')}</pre>
           </div>`;
-        } catch (e) {
+        } catch (e: any) {
           html += `<div style="margin-bottom:10px">
             <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}</div>
             <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e))}</div>
@@ -7128,13 +7499,14 @@ async function loadCodeIntelTab(projectId) {
       const archPath = repoPaths.length ? (typeof repoPaths[0] === 'string' ? repoPaths[0] : (repoPaths[0].cwd || '')) : '';
       const archArgs = archPath ? {project: _repoPathToProject(archPath)} : {};
       const archResult = await _codeMcpCall('tools/call', {name: 'get_architecture', arguments: archArgs});
-      const archText = (archResult?.content || []).map(c => c.text || '').join('').trim();
+      const archText = (archResult?.content || []).map((c: any) => c.text || '').join('').trim();
       const archSection = _codeArchSection(archText);
       html += archSection.html;
       archCharts = archSection.charts;
       // 65742e42 — capture packages + fetch cross-package edges for the force-graph.
       try {
         const _arch = JSON.parse(archText);
+        _graphArch = _arch;
         _graphPackages = Array.isArray(_arch?.packages) ? _arch.packages : [];
       } catch (_) { _graphPackages = []; }
       if (_graphPackages.length) {
@@ -7146,7 +7518,8 @@ async function loadCodeIntelTab(projectId) {
           _graphEdges = _normalizeGraphEdges(_edgeRes);
         } catch (_) { _graphEdges = []; }  // nodes-only graph still renders
       }
-    } catch (e) {
+    } catch (e: any) {
+      _archError = String(e);
       html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
     }
     html += `<div style="margin-top:8px;display:flex;gap:6px">
@@ -7169,16 +7542,106 @@ async function loadCodeIntelTab(projectId) {
     // 5813affe — stash the graph so "Generate Map" can POST it for a PNG render.
     window._codeGraphData = window._codeGraphData || {};
     window._codeGraphData[projectId] = { packages: _graphPackages, edges: _graphEdges, cgId: _cgId };
-    if (_graphPackages.length) {
-      _renderCodebaseGraph(_cgId, _graphPackages, _graphEdges);
-    } else {
-      const _ph = document.getElementById(_cgId);
-      const _em = document.getElementById(`${_cgId}-empty`);
-      if (_ph) _ph.style.display = 'none';
-      if (_em) _em.style.display = 'block';
+    // ff8ff615 — mount the Preact Code Intel panel (layered DAG + zoom + Generate Map).
+    const _panelEl = document.getElementById(`${_cgId}-panel`);
+    if (_panelEl) {
+      mountCodeIntelPanel(_panelEl, {
+        status: _archError ? 'error' : 'ready',
+        error: _archError,
+        architecture: _graphArch || { packages: _graphPackages },
+        onGenerateMap: async () => {
+          const r = await fetch(`/projects/${encodeURIComponent(projectId)}/codebase-map`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ packages: _graphPackages, edges: _graphEdges, hotspots: false }),
+          });
+          if (r.status === 503) {
+            const b = await r.json().catch(() => ({}));
+            throw new Error(b.message || 'Graphviz is not installed on the server.');
+          }
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const b = await r.json();
+          if (!b.image) throw new Error('No image returned.');
+          return b.image;
+        },
+      });
     }
 
-  } catch (e) {
+    // ed5512b6 — thin adapter: the dashboard is ONE consumer of the standalone
+    // codegraph module. It fetches per-symbol graph nodes via search_graph
+    // (folder->file->function detail beyond the package-level get_architecture),
+    // shapes them with the pure buildCodeGraphModel, and hands the model + a
+    // mount element to renderCodeGraph. The module never reaches back here.
+    const _codegraphEl = document.getElementById(`${_cgId}-codegraph`);
+    if (_codegraphEl) {
+      const archArgs = repoPaths.length
+        ? { project: _repoPathToProject(typeof repoPaths[0] === 'string' ? repoPaths[0] : (repoPaths[0].cwd || '')) }
+        : {};
+      // Pull real per-symbol nodes (signature/docstring/complexity/callers-callees
+      // live on these). Best-effort: on failure we still render the package-level
+      // tree from get_architecture alone.
+      let _nodes: GraphNodeInput[] = [];
+      try {
+        const _res = await _codeMcpCall('tools/call', {
+          name: 'search_graph',
+          arguments: { ...archArgs, limit: 1000, min_degree: 0 },
+        });
+        const _txt = (_res?.content || []).map((c: any) => c.text || '').join('').trim();
+        if (_txt) {
+          const _parsed = JSON.parse(_txt);
+          const _rows = Array.isArray(_parsed)
+            ? _parsed
+            : (_parsed.results || _parsed.nodes || _parsed.data || []);
+          if (Array.isArray(_rows)) _nodes = _rows as GraphNodeInput[];
+        }
+      } catch (_) { _nodes = []; }  // package-level tree still renders
+
+      try {
+        const _model = buildCodeGraphModel({
+          architecture: _graphArch || { packages: _graphPackages },
+          nodes: _nodes,
+        });
+        renderCodeGraph(_codegraphEl, _model, {
+          // LLM summary — SEPARATE, last-resort on-click action wired to the
+          // existing code-intel get_code_snippet path. Only invoked on demand;
+          // never part of the deterministic render.
+          onRequestSummary: async (node) => {
+            const qn = node.meta.qualifiedName;
+            if (!qn) throw new Error('No qualified_name to summarize.');
+            const _snip = await _codeMcpCall('tools/call', {
+              name: 'get_code_snippet',
+              arguments: { ...archArgs, qualified_name: qn },
+            });
+            const _snipTxt = (_snip?.content || []).map((c: any) => c.text || '').join('').trim();
+            return _snipTxt || 'No snippet returned.';
+          },
+        });
+      } catch (e: any) {
+        _codegraphEl.innerHTML = `<div style="font-size:10px;color:var(--error)">Code tree failed: ${escapeHtml(String(e))}</div>`;
+      }
+    }
+
+    // 31d0caa6 — manual reindex button: re-run index_repository for each repo
+    // path via the code MCP, then reload the tab to show fresh index status.
+    const _reindexBtn = document.getElementById(`${_cgId}-reindex`) as HTMLButtonElement | null;
+    if (_reindexBtn) {
+      _reindexBtn.addEventListener('click', async () => {
+        _reindexBtn.disabled = true;
+        _reindexBtn.textContent = 'Reindexing…';
+        try {
+          for (const rp of repoPaths) {
+            const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
+            if (cwd) await _codeMcpCall('tools/call', { name: 'index_repository', arguments: { path: cwd } });
+          }
+          loadCodeIntelTab(projectId);
+        } catch (e: any) {
+          _reindexBtn.disabled = false;
+          _reindexBtn.textContent = 'Reindex failed — retry';
+        }
+      });
+    }
+
+  } catch (e: any) {
     body.innerHTML = `<div style="color:var(--error)">Failed to load code intel: ${escapeHtml(String(e))}</div>`;
   }
 }
@@ -7189,7 +7652,7 @@ async function loadCodeIntelTab(projectId) {
 
 // email addresses, and anything containing a slash untouched.
 
-function normalizeNotifyTarget(raw) {
+function normalizeNotifyTarget(raw: any) {
 
   const v = (raw || '').trim();
 
@@ -7209,7 +7672,7 @@ function normalizeNotifyTarget(raw) {
 
 // Emails and non-ntfy webhooks pass through untouched.
 
-function displayNotifyTarget(raw) {
+function displayNotifyTarget(raw: any) {
 
   const v = (raw || '').trim();
 
@@ -7239,25 +7702,25 @@ function displayNotifyTarget(raw) {
 
 // Users who want stronger privacy can paste a longer, custom value.
 
-function osExecutorHintBanner(projectId) {
+function osExecutorHintBanner(projectId: any) {
   // ITEM 2 — Settings hooks banner: tell the user which shell/Python their
   // executor will use, based on the browser's OS. Dismiss persists in localStorage.
-  try { if (localStorage.getItem('meridian.hooks.osbanner.dismissed') === '1') return ''; } catch (e) {}
-  const ua = String(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || '').toLowerCase();
+  try { if (localStorage.getItem('meridian.hooks.osbanner.dismissed') === '1') return ''; } catch (e: any) {}
+  const ua = String((navigator as any).userAgentData?.platform || navigator.platform || navigator.userAgent || '').toLowerCase();
   const isWin = ua.includes('win');
   const msg = isWin
     ? 'Windows detected — executors use <strong>PowerShell</strong>; run Python with <code>pixi run python</code>.'
     : 'Mac / Linux detected — executors use <strong>bash</strong>; run Python with <code>python3</code>.';
   return `<div data-os-hint style="display:flex;align-items:flex-start;gap:8px;background:var(--surface-1);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:4px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--text);line-height:1.5">`
     + `<span style="flex:1">${msg}</span>`
-    + `<button title="Dismiss" onclick="try{localStorage.setItem('meridian.hooks.osbanner.dismissed','1')}catch(e){}; var _b=this.closest('[data-os-hint]'); if(_b)_b.remove();" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;flex-shrink:0">×</button>`
+    + `<button title="Dismiss" onclick="try{localStorage.setItem('meridian.hooks.osbanner.dismissed','1')}catch(e: any){}; var _b=this.closest('[data-os-hint]'); if(_b)_b.remove();" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;flex-shrink:0">×</button>`
     + `</div>`;
 }
 
 function showFailoverBannerIfNeeded() {
   // ITEM 7 — failover banner: poll /failover-status once on load; if the server
   // reports failover mode, show a dismissible yellow bar (sessionStorage dismiss).
-  try { if (sessionStorage.getItem('meridian.failover.dismissed') === '1') return; } catch (e) {}
+  try { if (sessionStorage.getItem('meridian.failover.dismissed') === '1') return; } catch (e: any) {}
   fetch('/failover-status').then(r => r.ok ? r.json() : null).then(data => {
     if (!data || !data.is_failover) return;
     if (document.getElementById('failover-banner')) return;
@@ -7271,7 +7734,7 @@ function showFailoverBannerIfNeeded() {
     btn.textContent = '×';
     btn.title = 'Dismiss';
     btn.style.cssText = 'background:none;border:none;color:#92400e;font-size:16px;font-weight:700;cursor:pointer;line-height:1;padding:0 4px';
-    btn.onclick = () => { try { sessionStorage.setItem('meridian.failover.dismissed', '1'); } catch (e) {} bar.remove(); };
+    btn.onclick = () => { try { sessionStorage.setItem('meridian.failover.dismissed', '1'); } catch (e: any) {} bar.remove(); };
     bar.appendChild(label);
     bar.appendChild(btn);
     document.body.insertBefore(bar, document.body.firstChild);
@@ -7288,7 +7751,7 @@ function showFailoverBannerIfNeeded() {
 
 
 
-async function loadHitlTab(projectId) {
+async function loadHitlTab(projectId: any) {
 
   const body = document.getElementById(`hitl-body-${projectId}`);
 
@@ -7300,9 +7763,9 @@ async function loadHitlTab(projectId) {
 
 
 
-  const urgencyColor = { blocking: 'var(--red,#e05252)', high: 'var(--yellow,#d4a017)', normal: 'var(--muted)' };
+  const urgencyColor: Record<string, string> = { blocking: 'var(--red,#e05252)', high: 'var(--yellow,#d4a017)', normal: 'var(--muted)' };
 
-  const statusBadge = { pending: '#f59e0b', answered: '#22c55e', dismissed: 'var(--muted)' };
+  const statusBadge: Record<string, string> = { pending: '#f59e0b', answered: '#22c55e', dismissed: 'var(--muted)' };
 
 
 
@@ -7330,11 +7793,11 @@ async function loadHitlTab(projectId) {
 
       }
 
-      const pending = rows.filter(r => r.status === 'pending');
+      const pending = rows.filter((r: any) => r.status === 'pending');
 
-      const resolved = rows.filter(r => r.status !== 'pending');
+      const resolved = rows.filter((r: any) => r.status !== 'pending');
 
-      const renderDiff = (diffText) => {
+      const renderDiff = (diffText: any) => {
 
         const lines = String(diffText || '').split('\n').map(ln => {
 
@@ -7356,7 +7819,7 @@ async function loadHitlTab(projectId) {
 
       };
 
-      const renderCard = (r) => {
+      const renderCard = (r: any) => {
 
         const urg = r.urgency || 'normal';
 
@@ -7368,7 +7831,7 @@ async function loadHitlTab(projectId) {
 
         let pl = null;
 
-        if (isMd && r.payload) { try { pl = JSON.parse(r.payload); } catch (e) { pl = null; } }
+        if (isMd && r.payload) { try { pl = JSON.parse(r.payload); } catch (e: any) { pl = null; } }
 
         const mdMeta = (isMd && pl) ? `<div style="margin-top:6px;font-size:10px;color:var(--accent)"><b>${escapeHtml(pl.file || '')}</b> § ${escapeHtml(pl.anchor || '')}</div>` : '';
 
@@ -7382,7 +7845,7 @@ async function loadHitlTab(projectId) {
 
         // cd134cf1 — selectable answer options + a highlighted recommended default.
         let optPayload = null;
-        try { optPayload = r.payload ? JSON.parse(r.payload) : null; } catch (e) { optPayload = null; }
+        try { optPayload = r.payload ? JSON.parse(r.payload) : null; } catch (e: any) { optPayload = null; }
         const hitlOpts = (optPayload && Array.isArray(optPayload.options)) ? optPayload.options : [];
         const hitlRec = (optPayload && typeof optPayload.recommended === 'string') ? optPayload.recommended : null;
 
@@ -7410,7 +7873,7 @@ async function loadHitlTab(projectId) {
 
         } else if (st === 'pending' && hitlOpts.length) {
 
-          const optBtns = hitlOpts.map((o, i) => {
+          const optBtns = hitlOpts.map((o: any, i: any) => {
             const isRec = hitlRec !== null && String(o) === hitlRec;
             const recStyle = isRec
               ? 'border:1px solid var(--accent);background:var(--accent)1a;font-weight:600'
@@ -7513,7 +7976,7 @@ async function loadHitlTab(projectId) {
 
             render();
 
-          } catch (e) { toast('failed: ' + e.message, true); }
+          } catch (e: any) { toast('failed: ' + e.message, true); }
 
         };
 
@@ -7535,7 +7998,7 @@ async function loadHitlTab(projectId) {
 
             render();
 
-          } catch (e) { toast('failed: ' + e.message, true); }
+          } catch (e: any) { toast('failed: ' + e.message, true); }
 
         };
 
@@ -7544,7 +8007,7 @@ async function loadHitlTab(projectId) {
       // cd134cf1 — keyboard: digits 1-9 pick an option, Enter picks recommended.
       body.querySelectorAll('.hitl-opts').forEach(box => {
 
-        box.addEventListener('keydown', (e) => {
+        box.addEventListener('keydown', (e: any) => {
 
           const btns = Array.from(box.querySelectorAll('.hitl-opt-btn'));
 
@@ -7584,7 +8047,7 @@ async function loadHitlTab(projectId) {
 
             render();
 
-          } catch (e) { toast('failed: ' + e.message, true); }
+          } catch (e: any) { toast('failed: ' + e.message, true); }
 
         };
 
@@ -7606,7 +8069,7 @@ async function loadHitlTab(projectId) {
 
             render();
 
-          } catch (e) { toast('failed: ' + e.message, true); }
+          } catch (e: any) { toast('failed: ' + e.message, true); }
 
         };
 
@@ -7626,7 +8089,7 @@ async function loadHitlTab(projectId) {
 
             render();
 
-          } catch (e) { toast('failed: ' + e.message, true); }
+          } catch (e: any) { toast('failed: ' + e.message, true); }
 
         };
 
@@ -7655,7 +8118,7 @@ async function loadHitlTab(projectId) {
 
       });
 
-    } catch (e) {
+    } catch (e: any) {
 
       body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
 
@@ -7675,7 +8138,7 @@ async function loadHitlTab(projectId) {
 
 
 
-async function loadTeamTab(projectId) {
+async function loadTeamTab(projectId: any) {
 
   /** v2.4 — Team tab: per-human presence cards + standup digest +
 
@@ -7719,9 +8182,9 @@ async function loadTeamTab(projectId) {
 
       // Presence cards.
 
-      const dotColor = { active: '#4ade80', recent: '#fbbf24', idle: '#6b7280' };
+      const dotColor: Record<string, string> = { active: '#4ade80', recent: '#fbbf24', idle: '#6b7280' };
 
-      const cards = humans.map(h => {
+      const cards = humans.map((h: any) => {
 
         const c = _colorForHuman(h.human_id);
 
@@ -7737,7 +8200,7 @@ async function loadTeamTab(projectId) {
 
         const lastSeen = h.last_seen ? formatRelativeTime(h.last_seen) : 'never';
 
-        const recent = (h.recent || []).slice(0, 3).map(t => {
+        const recent = (h.recent || []).slice(0, 3).map((t: any) => {
 
           const s = (t.status || '?').toUpperCase();
 
@@ -7777,7 +8240,7 @@ async function loadTeamTab(projectId) {
 
       // gets the correct colour (sprint=blue, north-star=amber, content=purple).
 
-      let goalMarkers = [];
+      let goalMarkers: any[] = [];
 
       try {
 
@@ -7865,11 +8328,11 @@ async function loadTeamTab(projectId) {
 
       // descriptions concatenated.
 
-      const standup = humans.map(h => {
+      const standup = humans.map((h: any) => {
 
         const c = _colorForHuman(h.human_id);
 
-        const last = (h.recent || []).map(t => (t.description || '').slice(0, 60)).slice(0, 4).join('; ');
+        const last = (h.recent || []).map((t: any) => (t.description || '').slice(0, 60)).slice(0, 4).join('; ');
 
         return `<div style="padding:3px 0;border-left:2px solid ${c};padding-left:8px;font-size:11px">
 
@@ -7891,7 +8354,7 @@ async function loadTeamTab(projectId) {
 
         if (pinned && pinned.length) {
 
-          const rows = pinned.slice(0, 8).map(d => {
+          const rows = pinned.slice(0, 8).map((d: any) => {
 
             const cat = d.category ? `<span style="font-size:9px;color:var(--muted);margin-left:4px">${escapeHtml(d.category)}</span>` : '';
 
@@ -7941,7 +8404,7 @@ async function loadTeamTab(projectId) {
 
       _wireTabSearch(`team-search-${projectId}`, `team-body-${projectId}`, '.team-card');
 
-    } catch (e) {
+    } catch (e: any) {
 
       body.innerHTML = renderProjectLoadError(projectId, 'Team summary unavailable', `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e);
 
@@ -7963,7 +8426,7 @@ async function loadTeamTab(projectId) {
 
 
 
-async function updateLiveFeed(projectId) {
+async function updateLiveFeed(projectId: any) {
 
   /**v2.3 — live "Currently Running" section at top of Queue tab.
 
@@ -7981,7 +8444,7 @@ async function updateLiveFeed(projectId) {
 
     const sessions = await api(`/projects/${projectId}/sessions?active_only=true`);
 
-    const active = sessions && sessions.filter(s => s.status === 'active');
+    const active = sessions && sessions.filter((s: any) => s.status === 'active');
 
     if (!active || active.length === 0) {
 
@@ -8007,7 +8470,7 @@ async function updateLiveFeed(projectId) {
 
     const elapsedStr = elapsed !== null ? (elapsed < 2 ? 'just now' : `${elapsed}m ago`) : '';
 
-    const taskRows = (tasks || []).map(t => {
+    const taskRows = (tasks || []).map((t: any) => {
 
       const icon = t.status === 'done' ? '✓' : t.status === 'failed' ? '✗' : t.status === 'in_progress' ? '▶' : '·';
 
@@ -8027,7 +8490,7 @@ async function updateLiveFeed(projectId) {
 
     const extraCount = active.length - 1;
 
-    const extraRows = active.slice(1).map(s => {
+    const extraRows = active.slice(1).map((s: any) => {
 
       const age = s.last_seen ? Math.round((Date.now() - new Date(s.last_seen + 'Z').getTime()) / 60000) : null;
 
@@ -8092,7 +8555,7 @@ async function updateLiveFeed(projectId) {
 
     el.style.display = 'block';
 
-  } catch(e) {
+  } catch(e: any) {
 
     panel.liveSessionId = null;
 
@@ -8104,7 +8567,7 @@ async function updateLiveFeed(projectId) {
 
 
 
-async function loadRecentSessions(projectId, sessions = null) {
+async function loadRecentSessions(projectId: any, sessions = null) {
 
   /** Recent Sessions list for non-live sessions with a copyable start_session(). */
 
@@ -8124,9 +8587,9 @@ async function loadRecentSessions(projectId, sessions = null) {
 
     const recent = (allSessions || [])
 
-      .filter(s => s.id !== panel.liveSessionId && !isLiveSession(s))
+      .filter((s: any) => s.id !== panel.liveSessionId && !isLiveSession(s))
 
-      .sort((a, b) => String(b.last_seen || b.created_at || '').localeCompare(String(a.last_seen || a.created_at || '')))
+      .sort((a: any, b: any) => String(b.last_seen || b.created_at || '').localeCompare(String(a.last_seen || a.created_at || '')))
 
       .slice(0, 5);
 
@@ -8136,7 +8599,7 @@ async function loadRecentSessions(projectId, sessions = null) {
 
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Recent Sessions</div>
 
-      ${recent.map(s => {
+      ${recent.map((s: any) => {
 
         const seenAt = s.last_seen || s.created_at || '';
 
@@ -8189,7 +8652,7 @@ async function loadRecentSessions(projectId, sessions = null) {
 
     el.querySelectorAll('.resume-session-btn').forEach(btn => {
 
-      btn.onclick = (event) => {
+      btn.onclick = (event: any) => {
         event.stopPropagation();
 
         const cmd = btn.dataset.cmd || '';
@@ -8200,13 +8663,13 @@ async function loadRecentSessions(projectId, sessions = null) {
 
     });
     el.querySelectorAll('.recent-session-timeline-btn').forEach(btn => {
-      btn.onclick = (event) => {
+      btn.onclick = (event: any) => {
         event.stopPropagation();
         openTimelineForSession(projectId, btn.dataset.sessionId);
       };
     });
     el.querySelectorAll('.recent-session-row').forEach(row => {
-      row.onclick = async (evt) => {
+      row.onclick = async (evt: any) => {
         if (evt.target.closest('.resume-session-btn, .recent-session-timeline-btn')) return;
         const target = row.querySelector('.recent-session-tasks');
         const chevron = row.querySelector('.recent-session-chevron');
@@ -8226,11 +8689,11 @@ async function loadRecentSessions(projectId, sessions = null) {
               ? `<div style="color:var(--text-dim);margin-bottom:5px;white-space:pre-wrap;word-break:break-word">${escapeHtml(fullSummary)}</div>`
               : '';
             const tasksHtml = taskRows && taskRows.length
-              ? taskRows.map(t => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || '').toUpperCase())}</span> ${escapeHtml((t.description || '').slice(0, 180))}</div>`).join('')
+              ? taskRows.map((t: any) => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || '').toUpperCase())}</span> ${escapeHtml((t.description || '').slice(0, 180))}</div>`).join('')
               : '<div>(no task log for this session)</div>';
             target.innerHTML = summaryHtml + tasksHtml;
             target.dataset.loaded = '1';
-          } catch(e) {
+          } catch(e: any) {
             target.textContent = 'failed to load tasks';
           }
         }
@@ -8251,7 +8714,7 @@ async function loadRecentSessions(projectId, sessions = null) {
 
 
 
-async function loadMilestones(projectId) {
+async function loadMilestones(projectId: any) {
 
   const el = document.getElementById(`milestones-strip-${projectId}`);
 
@@ -8265,11 +8728,11 @@ async function loadMilestones(projectId) {
 
     const doneStatuses = new Set(['done', 'skipped', 'failed', 'pushed']);
 
-    const milestones = (all || []).filter(i =>
+    const milestones = (all || []).filter((i: any) =>
 
       i.milestone_type === 'milestone' || doneStatuses.has(i.status)
 
-    ).sort((a, b) => {
+    ).sort((a: any, b: any) => {
 
       // Done items first, then by completed_at desc
 
@@ -8283,9 +8746,9 @@ async function loadMilestones(projectId) {
 
     if (!milestones.length) { el.style.display = 'none'; return; }
 
-    const statusIcon = s => s === 'done' ? '✓' : s === 'failed' ? '✗' : s === 'pushed' ? '→' : s === 'skipped' ? '—' : s === 'in_progress' ? '▶' : '◦';
+    const statusIcon = (s: any) => s === 'done' ? '✓' : s === 'failed' ? '✗' : s === 'pushed' ? '→' : s === 'skipped' ? '—' : s === 'in_progress' ? '▶' : '◦';
 
-    const statusColor = s => s === 'done' ? 'var(--accent-green,#34d399)' : s === 'failed' ? '#e05' : s === 'pushed' ? 'var(--accent)' : s === 'in_progress' ? 'var(--accent)' : 'var(--muted)';
+    const statusColor = (s: any) => s === 'done' ? 'var(--accent-green,#34d399)' : s === 'failed' ? '#e05' : s === 'pushed' ? 'var(--accent)' : s === 'in_progress' ? 'var(--accent)' : 'var(--muted)';
 
     el.innerHTML = `
 
@@ -8293,7 +8756,7 @@ async function loadMilestones(projectId) {
 
       <div style="display:flex;flex-wrap:wrap;gap:6px">
 
-        ${milestones.slice(0, 20).map(m => {
+        ${milestones.slice(0, 20).map((m: any) => {
 
           const date = (m.completed_at || m.added_at || '').slice(0, 10);
 
@@ -8329,7 +8792,7 @@ async function loadMilestones(projectId) {
 
 
 
-async function loadRecentRuns(projectId) {
+async function loadRecentRuns(projectId: any) {
 
   const body = document.getElementById(`recent-runs-body-${projectId}`);
 
@@ -8373,18 +8836,25 @@ async function loadRecentRuns(projectId) {
 
     }
 
-    body.innerHTML = runs.map(run => {
+    body.innerHTML = runs.map((run: any) => {
 
       const sid = (run.session_id || '').slice(0, 8);
       const runLabel = run.session_name || sid;
 
       const ts = (run.started_at || '').slice(0, 16).replace('T', ' ');
 
+      // 59ab2f9f — the "live" fallback must match displayRunStatus's liveness
+      // logic: cross-check the session's status AND a recency window (via
+      // isLiveSession), not just the raw run.status. Otherwise a run whose
+      // duration_s is null (never finalized) shows "live" forever even after
+      // its session went inactive / the run went stale. Map the run onto the
+      // SessionLike shape isLiveSession expects: session_status (same field
+      // displayRunStatus checks) + started_at as the recency timestamp.
       const dur = run.duration_s != null
 
         ? (run.duration_s < 60 ? `${run.duration_s}s` : `${Math.round(run.duration_s / 60)}m`)
 
-        : (run.status === 'running' ? 'live' : '—');
+        : (isLiveSession({ status: run.session_status, last_seen: run.started_at }) ? 'live' : '—');
 
       const cnt = run.task_count || 0;
 
@@ -8470,7 +8940,7 @@ async function loadRecentRuns(projectId) {
 
 
 
-async function loadQueue(projectId) {
+async function loadQueue(projectId: any) {
 
   /** Sprint queue panel sourced from sprint_items, not task_log history. */
 
@@ -8494,14 +8964,14 @@ async function loadQueue(projectId) {
 
     ]);
 
-    const liveSession = (sessions || []).find(s => isLiveSession(s));
+    const liveSession = (sessions || []).find((s: any) => isLiveSession(s));
 
     panel.liveSessionId = liveSession ? liveSession.id : null;
 
     const sprintPayload = sprintItems || [];
     panel.queueSprintItems = Array.isArray(sprintPayload) ? sprintPayload : (sprintPayload.items || []);
     panel.queueTotalDoneCount = Array.isArray(sprintPayload)
-      ? panel.queueSprintItems.filter(it => it.status === 'done').length
+      ? panel.queueSprintItems.filter((it: any) => it.status === 'done').length
       : (sprintPayload.total_done_count || 0);
 
 
@@ -8556,7 +9026,7 @@ async function loadQueue(projectId) {
 
         searchInput._wired = true;
 
-        let _searchTimer = null;
+        let _searchTimer: any = null;
 
         searchInput.addEventListener('input', function() {
 
@@ -8574,7 +9044,7 @@ async function loadQueue(projectId) {
 
               body.innerHTML = renderSearchResults(q, results);
 
-            } catch (e) { body.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
+            } catch (e: any) { body.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
 
           }, 300);
 
@@ -8584,7 +9054,7 @@ async function loadQueue(projectId) {
 
     }
 
-  } catch (e) {
+  } catch (e: any) {
 
     body.innerHTML = renderProjectLoadError(projectId, 'Queue unavailable', `/projects/${projectId}/sprint-items`, e);
 
@@ -8596,7 +9066,7 @@ async function loadQueue(projectId) {
 
 
 
-async function runReconcile(projectId) {
+async function runReconcile(projectId: any) {
 
   /** Fetch reconcile results and show inline in the Queue tab header area. */
 
@@ -8619,7 +9089,7 @@ async function runReconcile(projectId) {
     if (!data.matches || data.matches.length === 0) {
 
       container.innerHTML = `<span style="color:var(--muted)">✓ No drift detected (checked ${data.commit_count || 0} commits against ${data.pending_count || 0} pending items)</span>
-        <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">✕</button>`;
+        <button onclick="document.getElementById('reconcile-results-${projectId}')!.style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">✕</button>`;
 
     } else {
 
@@ -8627,11 +9097,11 @@ async function runReconcile(projectId) {
 
       let html = `<div style="margin-bottom:6px;color:var(--warning,#f59e0b);font-weight:600">${n} item${n !== 1 ? 's' : ''} may already be shipped — verify before executing</div>`;
 
-      data.matches.forEach(m => {
+      data.matches.forEach((m: any) => {
 
         const confidence = m.confidence === 'high' ? '🔴 high' : '🟡 medium';
 
-        const commits = (m.matching_commits || []).slice(0, 2).map(c =>
+        const commits = (m.matching_commits || []).slice(0, 2).map((c: any) =>
           `<span style="color:var(--muted)">${escapeHtml(c.sha)} — ${escapeHtml(c.message)}</span>`
         ).join('<br>');
 
@@ -8653,16 +9123,16 @@ async function runReconcile(projectId) {
 
       });
 
-      html += `<button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px;margin-top:2px">Dismiss</button>`;
+      html += `<button onclick="document.getElementById('reconcile-results-${projectId}')!.style.display='none'" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px;margin-top:2px">Dismiss</button>`;
 
       container.innerHTML = html;
 
     }
 
-  } catch (e) {
+  } catch (e: any) {
 
     container.innerHTML = `<span style="color:var(--danger,#ef4444)">Reconcile failed: ${escapeHtml(e.message)}</span>
-      <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">✕</button>`;
+      <button onclick="document.getElementById('reconcile-results-${projectId}')!.style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">✕</button>`;
 
   } finally {
 
@@ -8673,7 +9143,7 @@ async function runReconcile(projectId) {
 }
 
 
-async function reconcileMarkDone(projectId, itemId, btnEl) {
+async function reconcileMarkDone(projectId: any, itemId: any, btnEl: any) {
 
   /** Mark a sprint item done from the reconcile panel. */
 
@@ -8697,7 +9167,7 @@ async function reconcileMarkDone(projectId, itemId, btnEl) {
 
     loadQueue(projectId);
 
-  } catch (e) {
+  } catch (e: any) {
 
     btnEl.disabled = false;
 
@@ -8710,7 +9180,7 @@ async function reconcileMarkDone(projectId, itemId, btnEl) {
 }
 
 
-function renderSearchResults(query, results) {
+function renderSearchResults(query: any, results: any) {
 
   /** Render universal search results grouped by type. */
 
@@ -8720,7 +9190,7 @@ function renderSearchResults(query, results) {
 
   }
 
-  const section = (label, items, renderFn) => {
+  const section = (label: any, items: any, renderFn: any) => {
 
     if (!items || !items.length) return '';
 
@@ -8734,7 +9204,7 @@ function renderSearchResults(query, results) {
 
   };
 
-  const taskRow = t => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
+  const taskRow = (t: any) => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
 
     <div style="display:flex;justify-content:space-between;gap:6px">
 
@@ -8746,7 +9216,7 @@ function renderSearchResults(query, results) {
 
   </div>`;
 
-  const noteRow = n => `<div style="border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(n.body || '')}">
+  const noteRow = (n: any) => `<div style="border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(n.body || '')}">
 
     <div style="font-size:11px;font-weight:600;color:var(--accent)" title="${escapeHtml(n.title || '')}">${escapeHtml((n.title || '').slice(0, 80))}</div>
 
@@ -8754,7 +9224,7 @@ function renderSearchResults(query, results) {
 
   </div>`;
 
-  const decisionRow = d => `<div style="border:1px solid var(--border);border-left:3px solid var(--warning,#fa0);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(d.body || '')}">
+  const decisionRow = (d: any) => `<div style="border:1px solid var(--border);border-left:3px solid var(--warning,#fa0);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(d.body || '')}">
 
     <div style="font-size:11px;font-weight:600;color:var(--text)" title="${escapeHtml(d.title || '')}">${escapeHtml((d.title || '').slice(0, 80))}</div>
 
@@ -8762,7 +9232,7 @@ function renderSearchResults(query, results) {
 
   </div>`;
 
-  const sprintRow = s => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
+  const sprintRow = (s: any) => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
 
     <div style="display:flex;justify-content:space-between;gap:6px">
 
@@ -8794,7 +9264,7 @@ function renderSearchResults(query, results) {
 
 
 
-function wireQueueSectionToggles(projectId) {
+function wireQueueSectionToggles(projectId: any) {
 
   const body = document.getElementById(`queue-body-${projectId}`);
 
@@ -8830,7 +9300,7 @@ function wireQueueSectionToggles(projectId) {
 
 
 
-    const applyState = (collapsed, animate) => {
+    const applyState = (collapsed: any, animate: any) => {
 
       section.dataset.collapsed = collapsed ? 'true' : 'false';
 
@@ -8882,7 +9352,7 @@ function wireQueueSectionToggles(projectId) {
 
         sectionBody.style.height = `${targetHeight}px`;
 
-        const onEnd = (ev) => {
+        const onEnd = (ev: any) => {
 
           if (ev.target !== sectionBody || ev.propertyName !== 'height') return;
 
@@ -8912,7 +9382,7 @@ function wireQueueSectionToggles(projectId) {
 
       header.onclick = toggle;
 
-      header.onkeydown = (e) => {
+      header.onkeydown = (e: any) => {
 
         if (e.key === 'Enter' || e.key === ' ') {
 
@@ -8938,7 +9408,7 @@ function wireQueueSectionToggles(projectId) {
 
 // Global queue action handler — called from inline onclick in renderQueue
 
-window._queueAction = async function(taskId, action) {
+window._queueAction = async function(taskId: any, action: any) {
 
   try {
 
@@ -8968,7 +9438,7 @@ window._queueAction = async function(taskId, action) {
 
     });
 
-  } catch(e) { toast('Action failed: ' + e.message, true); }
+  } catch(e: any) { toast('Action failed: ' + e.message, true); }
 
 };
 
@@ -8986,7 +9456,7 @@ window._queueAction = async function(taskId, action) {
 
 
 
-async function refreshTab(projectId) {
+async function refreshTab(projectId: any) {
 
   await Promise.all([
 
@@ -9002,7 +9472,7 @@ async function refreshTab(projectId) {
 
 
 
-async function refreshGoal(projectId) {
+async function refreshGoal(projectId: any) {
 
   const ta = document.getElementById(`goal-${projectId}`);
 
@@ -9134,7 +9604,7 @@ async function refreshGoal(projectId) {
 
     }
 
-    v.textContent = `v${goal.version}`;
+    v!.textContent = `v${goal.version}`;
 
     const vState = document.getElementById(`goal-state-${projectId}`);
 
@@ -9214,13 +9684,13 @@ async function refreshGoal(projectId) {
 
     loadPinnedDecisions(projectId);
 
-  } catch (e) {
+  } catch (e: any) {
 
     ta.value = '';
 
     ta.placeholder = 'Goal state failed to load.';
 
-    v.textContent = '(load failed)';
+    v!.textContent = '(load failed)';
 
     const titleEl = document.getElementById(`goal-title-${projectId}`);
 
@@ -9232,7 +9702,7 @@ async function refreshGoal(projectId) {
 
 
 
-function parseDecisionsBlob(blob) {
+function parseDecisionsBlob(blob: any) {
 
   /** v2.3 — split the append-only decisions log into [{date, text}] rows.
 
@@ -9266,7 +9736,7 @@ function parseDecisionsBlob(blob) {
 
 
 
-const _DECISION_CATEGORY_COLORS = {
+const _DECISION_CATEGORY_COLORS: Record<string, string> = {
 
   STRATEGIC:     '#a78bfa',
 
@@ -9286,7 +9756,7 @@ const _DECISION_CATEGORY_COLORS = {
 
 // 366317e9 — decision priority badge colors + cycle order. Clicking the badge
 // cycles urgent → normal → low → urgent. urgent decisions sort to the top.
-const _DECISION_PRIORITY_COLORS = {
+const _DECISION_PRIORITY_COLORS: Record<string, string> = {
 
   urgent: '#f87171',
 
@@ -9300,7 +9770,7 @@ const _DECISION_PRIORITY_ORDER = ['urgent', 'normal', 'low'];
 
 
 
-function renderConstitutionWarning(projectId) {
+function renderConstitutionWarning(projectId: any) {
 
   const host = document.getElementById(`constitution-warning-${projectId}`);
 
@@ -9376,7 +9846,7 @@ function renderConstitutionWarning(projectId) {
 
         loadPinnedDecisions(projectId);
 
-      } catch (e) { toast('archive failed: ' + e.message, true); }
+      } catch (e: any) { toast('archive failed: ' + e.message, true); }
 
     };
 
@@ -9394,7 +9864,7 @@ function renderConstitutionWarning(projectId) {
 
 
 
-const _HITL_URGENCY_COLOR = {
+const _HITL_URGENCY_COLOR: Record<string, string> = {
 
   blocking: '#f87171',  // red — session paused, answer now
 
@@ -9406,7 +9876,7 @@ const _HITL_URGENCY_COLOR = {
 
 
 
-let _hitlPollTimer = null;
+let _hitlPollTimer: any = null;
 
 
 
@@ -9487,7 +9957,7 @@ function initHitlPanel() {
 
 
 
-function setVtabCountBadge(selector, count) {
+function setVtabCountBadge(selector: any, count: any) {
 
   /** G1.2 — single source of truth for vtab/gtab count chip display.
 
@@ -9505,7 +9975,7 @@ function setVtabCountBadge(selector, count) {
 
 
 
-async function refreshProjectCountBadges(projectId) {
+async function refreshProjectCountBadges(projectId: any) {
 
   /** G1.2 — populate the muted count chips on the Notes vtab and the
 
@@ -9529,7 +9999,7 @@ async function refreshProjectCountBadges(projectId) {
 
   if (notesRes.status === 'fulfilled') {
 
-    const visible = (notesRes.value || []).filter(n => {
+    const visible = (notesRes.value || []).filter((n: any) => {
 
       const title = String(n.title || '').trim().toLowerCase();
 
@@ -9556,10 +10026,10 @@ async function refreshProjectCountBadges(projectId) {
 // 0b9b12c8 — render recently auto-answered HITLs greyed out so the human can
 // see what the auto-answer resolved vs. what's genuinely pending. Pure +
 // exported for the UI test. Returns '' when there are none.
-function _renderAutoAnsweredHitls(answered) {
-  const auto = (answered || []).filter(r => r && r.answered_by === 'auto').slice(0, 5);
+function _renderAutoAnsweredHitls(answered: any) {
+  const auto = (answered || []).filter((r: any) => r && r.answered_by === 'auto').slice(0, 5);
   if (!auto.length) return '';
-  const rows = auto.map(r => {
+  const rows = auto.map((r: any) => {
     const ts = formatRelativeTime(r.answered_at || r.created_at);
     return `<div data-hitl-auto-id="${escapeHtml(r.id)}" style="opacity:0.55;border-left:3px solid var(--muted);background:var(--surface-1);padding:8px 12px;margin-bottom:6px;border-radius:0 4px 4px 0">
         <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px">
@@ -9574,7 +10044,7 @@ function _renderAutoAnsweredHitls(answered) {
 }
 window._renderAutoAnsweredHitls = _renderAutoAnsweredHitls;
 
-async function refreshHitl() {
+async function refreshHitl(_pid?: any) {
 
   /** v2.4 — fetch pending HITL requests across all projects + repaint. */
 
@@ -9622,7 +10092,7 @@ async function refreshHitl() {
 
       bar.style.display = 'none';
 
-      document.getElementById('hitl-panel').style.display = 'none';
+      document.getElementById('hitl-panel')!.style.display = 'none';
 
       return;
 
@@ -9630,7 +10100,7 @@ async function refreshHitl() {
 
     bar.style.display = 'flex';
 
-    list.innerHTML = items.map(r => {
+    list.innerHTML = items.map((r: any) => {
 
       const color = _HITL_URGENCY_COLOR[r.urgency] || _HITL_URGENCY_COLOR.normal;
 
@@ -9702,7 +10172,7 @@ async function refreshHitl() {
 
     list.querySelectorAll('.hitl-answer-input').forEach(inp => {
 
-      inp.onkeydown = (ev) => {
+      inp.onkeydown = (ev: any) => {
 
         if (ev.key === 'Enter') _hitlAnswer(inp.dataset.hitlId);
 
@@ -9719,13 +10189,13 @@ async function refreshHitl() {
 
       if (autoHtml) list.insertAdjacentHTML('beforeend', autoHtml);
 
-    } catch (e) {
+    } catch (e: any) {
 
       console.error('[meridian] auto-answered HITL fetch failed:', e);
 
     }
 
-  } catch (e) {
+  } catch (e: any) {
 
     // 0b9b12c8 — don't toast every poll (noisy when offline), but DO log to the
     // console so a non-200 /hitl (HITLs silently never appearing) is debuggable
@@ -9738,7 +10208,7 @@ async function refreshHitl() {
 
 
 
-async function _hitlAnswer(id) {
+async function _hitlAnswer(id: any) {
 
   const inp = document.querySelector(`.hitl-answer-input[data-hitl-id="${id}"]`);
 
@@ -9760,13 +10230,13 @@ async function _hitlAnswer(id) {
 
     refreshHitl();
 
-  } catch (e) { toast('answer failed: ' + e.message, true); }
+  } catch (e: any) { toast('answer failed: ' + e.message, true); }
 
 }
 
 
 
-async function _hitlDismiss(id) {
+async function _hitlDismiss(id: any) {
 
   if (!confirm('Dismiss this HITL request without answering?')) return;
 
@@ -9782,13 +10252,13 @@ async function _hitlDismiss(id) {
 
     refreshHitl();
 
-  } catch (e) { toast('dismiss failed: ' + e.message, true); }
+  } catch (e: any) { toast('dismiss failed: ' + e.message, true); }
 
 }
 
 
 
-async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
+async function loadPinnedDecisions(projectId: any, { showArchived = false } = {}) {
 
   /** v2.4 — fetch the active pinned decisions for this project and render
 
@@ -9812,7 +10282,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
     const allItems = await api(url);
     const items = showArchived
       ? (allItems || [])
-      : (allItems || []).filter(d => d.status !== 'superseded');
+      : (allItems || []).filter((d: any) => d.status !== 'superseded');
 
     getPanelState(projectId)._pinnedDecisions = items || [];
 
@@ -9828,7 +10298,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
     }
 
-    host.innerHTML = items.map(d => {
+    host.innerHTML = items.map((d: any) => {
 
       const cat = d.category || 'TECHNICAL';
 
@@ -9900,31 +10370,31 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
 
 
-    const showEdit = (id) => {
+    const showEdit = (id: any) => {
 
       const card = host.querySelector(`[data-decision-card="${id}"]`);
 
       if (!card) return;
 
-      card.querySelector('.decision-body-view').style.display = 'none';
+      card.querySelector('.decision-body-view')!.style.display = 'none';
 
-      card.querySelector('.decision-title-view').style.display = 'none';
+      card.querySelector('.decision-title-view')!.style.display = 'none';
 
-      card.querySelector('.decision-edit-area').style.display = 'block';
+      card.querySelector('.decision-edit-area')!.style.display = 'block';
 
     };
 
-    const hideEdit = (id) => {
+    const hideEdit = (id: any) => {
 
       const card = host.querySelector(`[data-decision-card="${id}"]`);
 
       if (!card) return;
 
-      card.querySelector('.decision-body-view').style.display = '';
+      card.querySelector('.decision-body-view')!.style.display = '';
 
-      card.querySelector('.decision-title-view').style.display = '';
+      card.querySelector('.decision-title-view')!.style.display = '';
 
-      card.querySelector('.decision-edit-area').style.display = 'none';
+      card.querySelector('.decision-edit-area')!.style.display = 'none';
 
     };
 
@@ -9939,7 +10409,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
     // Category tag — inline dropdown to change category
     const _CATS = ['TECHNICAL','STRATEGIC','ARCHITECTURAL','PRODUCT','TACTICAL','BUSINESS','COMPETITIVE'];
     host.querySelectorAll('.decision-cat-tag').forEach(tag => {
-      tag.onclick = (e) => {
+      tag.onclick = (e: any) => {
         e.stopPropagation();
         const id = tag.dataset.id;
         const cur = tag.dataset.cat;
@@ -9969,7 +10439,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
             const pid = host.closest('[data-project-tab]')?.dataset.projectTab || host.dataset.projectId || '';
             await api(`/projects/${pid}/decisions-pinned/${id}`, { method: 'PATCH', body: JSON.stringify({ category: newCat }) });
             await loadPinnedDecisions(pid);
-          } catch(err) { toast('category update failed: ' + err.message, true); }
+          } catch(err: any) { toast('category update failed: ' + err.message, true); }
         };
       };
     });
@@ -9990,9 +10460,9 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
         const card = host.querySelector(`[data-decision-card="${id}"]`);
 
-        const newTitle = card.querySelector('.decision-edit-title').value.trim();
+        const newTitle = card!.querySelector('.decision-edit-title')!.value.trim();
 
-        const newBody = card.querySelector('.decision-edit-body').value.trim();
+        const newBody = card!.querySelector('.decision-edit-body')!.value.trim();
 
         if (!newTitle || !newBody) return toast('title and body required', true);
 
@@ -10010,7 +10480,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
           loadPinnedDecisions(pid);
 
-        } catch (e) { toast('save failed: ' + e.message, true); }
+        } catch (e: any) { toast('save failed: ' + e.message, true); }
 
       };
 
@@ -10049,7 +10519,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
           loadPinnedDecisions(pid);
 
-        } catch (e) { toast('priority change failed: ' + e.message, true); }
+        } catch (e: any) { toast('priority change failed: ' + e.message, true); }
 
       };
 
@@ -10072,7 +10542,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
           loadPinnedDecisions(projectId);
 
-        } catch (e) { toast('archive failed: ' + e.message, true); }
+        } catch (e: any) { toast('archive failed: ' + e.message, true); }
 
       };
 
@@ -10082,11 +10552,11 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
     const toggleEl = document.getElementById(`decisions-view-archived-${projectId}`);
     if (toggleEl) {
       if (showArchived) {
-        const archivedCount = (allItems || []).filter(d => d.status === 'superseded').length;
+        const archivedCount = (allItems || []).filter((d: any) => d.status === 'superseded').length;
         toggleEl.innerHTML = `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:false})">← Hide archived</button> <span style="color:var(--muted)">${archivedCount} archived</span>`;
       } else {
         api(`/projects/${projectId}/decisions-pinned?include_superseded=true`).then(all => {
-          const n = (all || []).filter(d => d.status === 'superseded').length;
+          const n = (all || []).filter((d: any) => d.status === 'superseded').length;
           const el2 = document.getElementById(`decisions-view-archived-${projectId}`);
           if (el2) el2.innerHTML = n > 0
             ? `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:true})">View archived (${n}) ▸</button>`
@@ -10107,7 +10577,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
       supersededEl.id = `superseded-decisions-${projectId}`;
 
-      host.parentElement.insertBefore(supersededEl, host.nextSibling);
+      host.parentElement!.insertBefore(supersededEl, host.nextSibling);
 
     }
 
@@ -10115,7 +10585,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
       const all = await api(`/projects/${projectId}/decisions-pinned?include_superseded=true`);
 
-      const superseded = (all || []).filter(d => d.status === 'superseded');
+      const superseded = (all || []).filter((d: any) => d.status === 'superseded');
 
       if (superseded.length > 0) {
 
@@ -10129,7 +10599,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
           <div style="margin-top:6px">
 
-            ${superseded.map(d => {
+            ${superseded.map((d: any) => {
 
               const cat = d.category || 'TECHNICAL';
 
@@ -10169,7 +10639,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
     } catch (_) { /* non-fatal — superseded section is optional */ }
 
-  } catch (e) {
+  } catch (e: any) {
 
     if (state.panels[projectId]) state.panels[projectId]._pinnedDecisions = [];
 
@@ -10183,7 +10653,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
 
 
-async function supersedePinnedDecision(projectId, decisionId) {
+async function supersedePinnedDecision(projectId: any, decisionId: any) {
 
   /** v2.4 — supersede flow: prompt for new title + body, atomic call to
 
@@ -10213,13 +10683,13 @@ async function supersedePinnedDecision(projectId, decisionId) {
 
     loadPinnedDecisions(projectId);
 
-  } catch (e) { toast('supersede failed: ' + e.message, true); }
+  } catch (e: any) { toast('supersede failed: ' + e.message, true); }
 
 }
 
 
 
-async function addPinnedDecision(projectId) {
+async function addPinnedDecision(projectId: any) {
 
   /** v2.4 — quick-add flow from the [+ Pin] button. */
 
@@ -10249,13 +10719,13 @@ async function addPinnedDecision(projectId) {
 
     loadPinnedDecisions(projectId);
 
-  } catch (e) { toast('pin failed: ' + e.message, true); }
+  } catch (e: any) { toast('pin failed: ' + e.message, true); }
 
 }
 
 
 
-async function consolidateDecisions(projectId) {
+async function consolidateDecisions(projectId: any) {
 
   /** v2.8 — AI consolidation flow for pinned decisions.
 
@@ -10319,21 +10789,21 @@ async function consolidateDecisions(projectId) {
 
   overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
 
-  document.getElementById('_consolidate-cancel').onclick = () => overlay.remove();
+  document.getElementById('_consolidate-cancel')!.onclick = () => overlay.remove();
 
 
 
-  document.getElementById('_consolidate-run').onclick = async () => {
+  document.getElementById('_consolidate-run')!.onclick = async () => {
 
-    const apiKey = document.getElementById('_consolidate-key').value.trim();
+    const apiKey = document.getElementById('_consolidate-key')!.value.trim();
 
-    const model = document.getElementById('_consolidate-model').value;
+    const model = document.getElementById('_consolidate-model')!.value;
 
     if (!apiKey) { toast('API key required', true); return; }
 
     const runBtn = document.getElementById('_consolidate-run');
 
-    runBtn.textContent = 'Working…'; runBtn.disabled = true;
+    runBtn!.textContent = 'Working…'; runBtn!.disabled = true;
 
     try {
 
@@ -10355,7 +10825,7 @@ async function consolidateDecisions(projectId) {
 
       previewOverlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9999;display:flex;align-items:center;justify-content:center';
 
-      const previewHtml = consolidated.map(d => {
+      const previewHtml = consolidated.map((d: any) => {
 
         const cat = (d.category || 'TECHNICAL').toUpperCase();
 
@@ -10401,13 +10871,13 @@ async function consolidateDecisions(projectId) {
 
       previewOverlay.addEventListener('click', e => { if (e.target === previewOverlay) previewOverlay.remove(); });
 
-      document.getElementById('_preview-cancel').onclick = () => previewOverlay.remove();
+      document.getElementById('_preview-cancel')!.onclick = () => previewOverlay.remove();
 
-      document.getElementById('_preview-apply').onclick = async () => {
+      document.getElementById('_preview-apply')!.onclick = async () => {
 
         const applyBtn = document.getElementById('_preview-apply');
 
-        applyBtn.textContent = 'Applying…'; applyBtn.disabled = true;
+        applyBtn!.textContent = 'Applying…'; applyBtn!.disabled = true;
 
         try {
 
@@ -10425,13 +10895,13 @@ async function consolidateDecisions(projectId) {
 
           loadPinnedDecisions(projectId);
 
-        } catch (e) { toast('Apply failed: ' + e.message, true); applyBtn.textContent = 'Apply →'; applyBtn.disabled = false; }
+        } catch (e: any) { toast('Apply failed: ' + e.message, true); applyBtn!.textContent = 'Apply →'; applyBtn!.disabled = false; }
 
       };
 
-    } catch (e) {
+    } catch (e: any) {
 
-      runBtn.textContent = 'Consolidate →'; runBtn.disabled = false;
+      runBtn!.textContent = 'Consolidate →'; runBtn!.disabled = false;
 
       toast('Consolidation failed: ' + e.message, true);
 
@@ -10443,7 +10913,7 @@ async function consolidateDecisions(projectId) {
 
 
 
-function renderDecisionsTable(projectId, blob) {
+function renderDecisionsTable(projectId: any, blob: any) {
 
   /** v2.3 — render the decisions blob as a proper accent-bordered table.
 
@@ -10495,7 +10965,7 @@ function renderDecisionsTable(projectId, blob) {
 
 
 
-function wireGoalPreviewToggle(taEl, previewEl) {
+function wireGoalPreviewToggle(taEl: any, previewEl: any) {
 
   /**v1.4.1 — repurposed as generic edit/preview toggle for a single
 
@@ -10563,7 +11033,7 @@ function wireGoalPreviewToggle(taEl, previewEl) {
 
 
 
-async function saveGoal(projectId) {
+async function saveGoal(projectId: any) {
 
   const ta = document.getElementById(`goal-${projectId}`);
 
@@ -10595,7 +11065,7 @@ async function saveGoal(projectId) {
 
   if (state.panels[projectId].goalIsJson) {
 
-    try { content = JSON.parse(raw); } catch(e) { /* fall back to string */ }
+    try { content = JSON.parse(raw); } catch(e: any) { /* fall back to string */ }
 
   }
 
@@ -10609,7 +11079,7 @@ async function saveGoal(projectId) {
 
     refreshGoal(projectId);
 
-  } catch (e) {
+  } catch (e: any) {
 
     toast('save failed: ' + e.message, true);
 
@@ -10619,7 +11089,7 @@ async function saveGoal(projectId) {
 
 
 
-async function saveNorthStar(projectId) {
+async function saveNorthStar(projectId: any) {
 
   const ta = document.getElementById(`goal-north-star-${projectId}`);
 
@@ -10661,7 +11131,7 @@ async function saveNorthStar(projectId) {
 
     refreshGoal(projectId);
 
-  } catch (e) {
+  } catch (e: any) {
 
     toast('save failed: ' + e.message, true);
 
@@ -10671,7 +11141,7 @@ async function saveNorthStar(projectId) {
 
 
 
-async function saveSprint(projectId) {
+async function saveSprint(projectId: any) {
 
   const ta = document.getElementById(`goal-sprint-${projectId}`);
   const sel = document.getElementById(`goal-sprint-select-${projectId}`);
@@ -10699,7 +11169,7 @@ async function saveSprint(projectId) {
 
     refreshGoal(projectId);
 
-  } catch (e) {
+  } catch (e: any) {
 
     toast('save failed: ' + e.message, true);
 
@@ -10709,11 +11179,11 @@ async function saveSprint(projectId) {
 
 
 
-function _sessionPresenceDot(last_seen) {
+function _sessionPresenceDot(last_seen: any) {
 
   if (!last_seen) return '⚫';
 
-  const mins = (Date.now() - new Date(last_seen.replace(' ', 'T') + 'Z')) / 60000;
+  const mins = (Date.now() - new Date(last_seen.replace(' ', 'T') + 'Z').getTime()) / 60000;
 
   if (mins < 6) return '🟢';
 
@@ -10725,7 +11195,7 @@ function _sessionPresenceDot(last_seen) {
 
 
 
-async function refreshSessions(projectId) {
+async function refreshSessions(projectId: any) {
 
   const root = document.getElementById(`sessions-${projectId}`);
 
@@ -10749,7 +11219,7 @@ async function refreshSessions(projectId) {
 
     // Group by human_id, ungrouped into own bucket
 
-    const groups = {};
+    const groups: Record<string, any> = {};
 
     const order = [];
 
@@ -10765,7 +11235,7 @@ async function refreshSessions(projectId) {
 
     for (const g of Object.values(groups)) {
 
-      g.sort((a, b) => (b.last_seen || '').localeCompare(a.last_seen || ''));
+      g.sort((a: any, b: any) => (b.last_seen || '').localeCompare(a.last_seen || ''));
 
     }
 
@@ -10787,7 +11257,7 @@ async function refreshSessions(projectId) {
 
         `</div>`;
 
-      const children = humanSessions.map(s => {
+      const children = humanSessions.map((s: any) => {
 
         let ageMs = 0;
 
@@ -10797,7 +11267,7 @@ async function refreshSessions(projectId) {
 
           if (ts) ageMs = Date.now() - new Date(ts).getTime();
 
-        } catch(e) {}
+        } catch(e: any) {}
 
         const ageH = ageMs / 3_600_000;
 
@@ -10825,7 +11295,7 @@ async function refreshSessions(projectId) {
 
     root.innerHTML = rows;
 
-  } catch(e) {
+  } catch(e: any) {
 
     root.innerHTML = renderProjectLoadError(projectId, 'Sessions unavailable', sessionsPath, e);
 
@@ -10837,7 +11307,7 @@ async function refreshSessions(projectId) {
 
 
 
-async function refreshTasks(projectId) {
+async function refreshTasks(projectId: any) {
 
   const tasksPath = `/projects/${projectId}/tasks?limit=100`;
 
@@ -10851,7 +11321,7 @@ async function refreshTasks(projectId) {
 
     renderTasks(projectId);
 
-  } catch(e) {
+  } catch(e: any) {
 
     const root = document.getElementById(`tasks-${projectId}`);
 
@@ -10877,7 +11347,7 @@ async function refreshTasks(projectId) {
 
 
 
-function renderTasks(projectId) {
+function renderTasks(projectId: any) {
 
   const tasks = state.panels[projectId].taskCache || [];
 
@@ -10889,15 +11359,15 @@ function renderTasks(projectId) {
 
   if (!root || !hitlRoot) return;
 
-  const hitl = tasks.filter(t => t.status === 'pending-hitl');
+  const hitl = tasks.filter((t: any) => t.status === 'pending-hitl');
 
-  banner.style.display = hitl.length ? 'block' : 'none';
+  banner!.style.display = hitl.length ? 'block' : 'none';
 
-  hitlRoot.innerHTML = hitl.map(t => renderHitlRow(projectId, t)).join('');
+  hitlRoot.innerHTML = hitl.map((t: any) => renderHitlRow(projectId, t)).join('');
 
-  hitl.forEach(t => wireHitlRow(projectId, t));
+  hitl.forEach((t: any) => wireHitlRow(projectId, t));
 
-  root.innerHTML = tasks.map(t => renderTaskRow(t)).join('');
+  root.innerHTML = tasks.map((t: any) => renderTaskRow(t)).join('');
 
   _wireTabSearch(`devlog-search-${projectId}`, `tasks-${projectId}`, '.task');
 
@@ -10921,7 +11391,7 @@ function renderTasks(projectId) {
 
     btn.onclick = () => _loadMoreTasks(projectId, btn);
 
-    root.parentElement.appendChild(btn);
+    root.parentElement!.appendChild(btn);
 
   }
 
@@ -10929,7 +11399,7 @@ function renderTasks(projectId) {
 
 
 
-async function _loadMoreTasks(projectId, btn) {
+async function _loadMoreTasks(projectId: any, btn: any) {
 
   const p = state.panels[projectId];
 
@@ -10949,7 +11419,7 @@ async function _loadMoreTasks(projectId, btn) {
 
     const root = document.getElementById(`tasks-${projectId}`);
 
-    if (root) root.innerHTML += more.map(t => renderTaskRow(t)).join('');
+    if (root) root.innerHTML += more.map((t: any) => renderTaskRow(t)).join('');
 
     if (more.length < 100) {
 
@@ -10963,7 +11433,7 @@ async function _loadMoreTasks(projectId, btn) {
 
     }
 
-  } catch(e) {
+  } catch(e: any) {
 
     btn.disabled = false;
 
@@ -10975,7 +11445,7 @@ async function _loadMoreTasks(projectId, btn) {
 
 
 
-function renderTaskRow(t) {
+function renderTaskRow(t: any) {
 
   const claimBadge = t.claimed_by
 
@@ -11007,7 +11477,7 @@ function renderTaskRow(t) {
 
 
 
-async function deleteTaskRow(e, taskId, status) {
+async function deleteTaskRow(e: any, taskId: any, status: any) {
 
   e.stopPropagation();
 
@@ -11033,7 +11503,7 @@ async function deleteTaskRow(e, taskId, status) {
 
 
 
-function renderHitlRow(projectId, t) {
+function renderHitlRow(projectId: any, t: any) {
 
   const isExecute = t.description.startsWith('[EXECUTE]');
 
@@ -11081,7 +11551,7 @@ function renderHitlRow(projectId, t) {
 
 
 
-function wireHitlRow(projectId, t) {
+function wireHitlRow(projectId: any, t: any) {
 
   const row = document.querySelector(`#hitl-queue-${projectId} [data-task="${t.id}"]`);
 
@@ -11121,7 +11591,7 @@ function wireHitlRow(projectId, t) {
 
 
 
-async function appendToGoal(projectId, line) {
+async function appendToGoal(projectId: any, line: any) {
 
   // Pull latest goal, append, push back. String-only for HITL markers.
 
@@ -11133,7 +11603,7 @@ async function appendToGoal(projectId, line) {
 
     current = typeof goal.content === 'string' ? goal.content : JSON.stringify(goal.content, null, 2);
 
-  } catch(e) { /* unset goal is fine */ }
+  } catch(e: any) { /* unset goal is fine */ }
 
   const next = current ? current.trimEnd() + '\n' + line : line;
 
@@ -11143,7 +11613,7 @@ async function appendToGoal(projectId, line) {
 
 
 
-async function hitlReply(projectId, taskId, text) {
+async function hitlReply(projectId: any, taskId: any, text: any) {
 
   try {
 
@@ -11153,13 +11623,13 @@ async function hitlReply(projectId, taskId, text) {
 
     toast('reply sent');
 
-  } catch(e) { toast('reply failed: ' + e.message, true); }
+  } catch(e: any) { toast('reply failed: ' + e.message, true); }
 
 }
 
 
 
-async function hitlExecute(projectId, taskId, confirmed) {
+async function hitlExecute(projectId: any, taskId: any, confirmed: any) {
 
   try {
 
@@ -11181,13 +11651,13 @@ async function hitlExecute(projectId, taskId, confirmed) {
 
     }
 
-  } catch(e) { toast('execute failed: ' + e.message, true); }
+  } catch(e: any) { toast('execute failed: ' + e.message, true); }
 
 }
 
 
 
-function connectWs(projectId) {
+function connectWs(projectId: any) {
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
@@ -11221,7 +11691,7 @@ function connectWs(projectId) {
 
       handleWsEvent(projectId, event);
 
-    } catch(e){}
+    } catch(e: any){}
 
   };
 
@@ -11231,7 +11701,7 @@ function connectWs(projectId) {
 
 
 
-function handleWsEvent(projectId, event) {
+function handleWsEvent(projectId: any, event: any) {
 
   if (event.type === 'update_available') {
 
@@ -11373,7 +11843,7 @@ function handleWsEvent(projectId, event) {
 
   } else if (event.type === 'task_updated') {
 
-    const i = cache.findIndex(t => t.id === event.task.id);
+    const i = cache.findIndex((t: any) => t.id === event.task.id);
 
     if (i >= 0) cache[i] = event.task;
 
@@ -11411,17 +11881,17 @@ function handleWsEvent(projectId, event) {
 
 
 
-document.getElementById('new-project-btn').onclick = async () => {
+document.getElementById('new-project-btn')!.onclick = async () => {
 
   const inp = document.getElementById('new-project-name');
 
   const humanInp = document.getElementById('new-project-human');
 
-  const name = inp.value.trim();
+  const name = inp!.value.trim();
 
   if (!name) return;
 
-  const body = { name };
+  const body: any = { name };
 
   const humanId = (humanInp && humanInp.value || '').trim();
 
@@ -11431,7 +11901,7 @@ document.getElementById('new-project-btn').onclick = async () => {
 
     const p = await api('/projects', { method: 'POST', body: JSON.stringify(body) });
 
-    inp.value = '';
+    inp!.value = '';
 
     if (humanInp) humanInp.value = '';
 
@@ -11439,7 +11909,7 @@ document.getElementById('new-project-btn').onclick = async () => {
 
     openTab(p);
 
-  } catch(e) { toast('create failed: ' + e.message, true); }
+  } catch(e: any) { toast('create failed: ' + e.message, true); }
 
 };
 
@@ -11457,7 +11927,7 @@ document.getElementById('new-project-btn').onclick = async () => {
 
     switcher.addEventListener('change', (ev) => {
 
-      const id = ev.target.value;
+      const id = ev.target!.value;
 
       if (!id) return;
 
@@ -11480,9 +11950,9 @@ async function restoreTabs() {
   // Read preferred before the loop -- openTab calls activateTab which would
   // overwrite ACTIVE_PROJECT_KEY with each successive tab opened.
   let preferred = null;
-  try { preferred = localStorage.getItem(STORAGE_KEY(ACTIVE_PROJECT_KEY)); } catch(e) {}
+  try { preferred = localStorage.getItem(STORAGE_KEY(ACTIVE_PROJECT_KEY)); } catch(e: any) {}
 
-  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY(TABS_KEY)) || '[]'); } catch(e){}
+  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY(TABS_KEY)) || '[]'); } catch(e: any){}
 
   for (const id of saved) {
 
@@ -11543,7 +12013,7 @@ async function restoreTabs() {
   if (state.projects.length === 0 && !state.activeWorkspaceTenantId && isHostedMode() && !isDemoMode()) {
     try {
       const wss = await fetch('/me/workspaces').then(r => r.ok ? r.json() : null);
-      const first = wss && wss.find(w => !w.is_own);
+      const first = wss && wss.find((w: any) => !w.is_own);
       if (first) {
         state.activeWorkspaceTenantId = first.tenant_id;
         await loadProjects();
@@ -11576,7 +12046,7 @@ async function restoreTabs() {
 
   if (state.projects.length === 0 && !isDemoMode()) {
 
-    document.getElementById('ez-wizard').style.display = 'flex';
+    document.getElementById('ez-wizard')!.style.display = 'flex';
 
     return; // don't restore tabs until wizard completes
 
@@ -11650,7 +12120,7 @@ async function restoreTabs() {
 
           if (restartBtn) restartBtn.style.display = 'none';
 
-        } catch(e) {
+        } catch(e: any) {
 
           toast('Shutdown request sent.', false);
 
@@ -11744,13 +12214,13 @@ async function restoreTabs() {
 
 
 
-const _sprintBoardReloaders = {};
+const _sprintBoardReloaders: Record<string, any> = {};
 
-const _sprintSelectSyncers = {};
+const _sprintSelectSyncers: Record<string, any> = {};
 
 
 
-async function _deleteSprintItem(projectId, itemId) {
+async function _deleteSprintItem(projectId: any, itemId: any) {
 
   if (!confirm('Remove this sprint item?')) return;
 
@@ -11760,13 +12230,13 @@ async function _deleteSprintItem(projectId, itemId) {
 
     if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
 
-  } catch(e) { console.error('Delete sprint item failed:', e); }
+  } catch(e: any) { console.error('Delete sprint item failed:', e); }
 
 }
 
 
 
-async function _sprintAction(projectId, itemId, action) {
+async function _sprintAction(projectId: any, itemId: any, action: any) {
 
   try {
 
@@ -11774,13 +12244,13 @@ async function _sprintAction(projectId, itemId, action) {
 
     if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
 
-  } catch(e) { console.error('Sprint action failed:', action, e); }
+  } catch(e: any) { console.error('Sprint action failed:', action, e); }
 
 }
 
 
 
-async function completeSprintItem(projectId, itemId) {
+async function completeSprintItem(projectId: any, itemId: any) {
 
   try {
 
@@ -11788,13 +12258,13 @@ async function completeSprintItem(projectId, itemId) {
 
     if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
 
-  } catch(e) { console.error('Complete sprint item failed:', e); }
+  } catch(e: any) { console.error('Complete sprint item failed:', e); }
 
 }
 
 
 
-async function failSprintItem(projectId, itemId) {
+async function failSprintItem(projectId: any, itemId: any) {
 
   try {
 
@@ -11802,7 +12272,7 @@ async function failSprintItem(projectId, itemId) {
 
     if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
 
-  } catch(e) { console.error('Fail sprint item failed:', e); }
+  } catch(e: any) { console.error('Fail sprint item failed:', e); }
 
 }
 
@@ -11814,7 +12284,7 @@ async function failSprintItem(projectId, itemId) {
 
 // v0.6.6 — EZ wizard logic
 
-document.getElementById('ez-create-btn').onclick = async () => {
+document.getElementById('ez-create-btn')!.onclick = async () => {
 
   const nameEl = document.getElementById('ez-project-name');
 
@@ -11822,21 +12292,21 @@ document.getElementById('ez-create-btn').onclick = async () => {
 
   const errEl = document.getElementById('ez-error');
 
-  const name = nameEl.value.trim();
+  const name = nameEl!.value.trim();
 
-  if (!name) { errEl.textContent = 'project name is required'; errEl.style.display = 'block'; return; }
+  if (!name) { errEl!.textContent = 'project name is required'; errEl!.style.display = 'block'; return; }
 
-  errEl.style.display = 'none';
+  errEl!.style.display = 'none';
 
   try {
 
-    const body = { name };
+    const body: any = { name };
 
-    if (humanEl.value.trim()) body.human_id = humanEl.value.trim();
+    if (humanEl!.value.trim()) body.human_id = humanEl!.value.trim();
 
     const p = await api('/projects', { method: 'POST', body: JSON.stringify(body) });
 
-    document.getElementById('ez-wizard').style.display = 'none';
+    document.getElementById('ez-wizard')!.style.display = 'none';
 
     await loadProjects();
 
@@ -11844,25 +12314,25 @@ document.getElementById('ez-create-btn').onclick = async () => {
 
     openTab(p);
 
-  } catch(e) { errEl.textContent = 'create failed: ' + e.message; errEl.style.display = 'block'; }
+  } catch(e: any) { errEl!.textContent = 'create failed: ' + e.message; errEl!.style.display = 'block'; }
 
 };
 
-document.getElementById('ez-project-name').addEventListener('keydown', (e) => {
+document.getElementById('ez-project-name')!.addEventListener('keydown', (e: any) => {
 
-  if (e.key === 'Enter') document.getElementById('ez-create-btn').click();
+  if (e.key === 'Enter') document.getElementById('ez-create-btn')!.click();
 
 });
 
-document.getElementById('ez-advanced-link').onclick = (e) => {
+document.getElementById('ez-advanced-link')!.onclick = (e) => {
 
   e.preventDefault();
 
-  document.getElementById('ez-wizard').style.display = 'none';
+  document.getElementById('ez-wizard')!.style.display = 'none';
 
   // Show the sidebar new-project form and focus it
 
-  document.getElementById('new-project-name').focus();
+  document.getElementById('new-project-name')!.focus();
 
   restoreTabs();
 
@@ -11902,11 +12372,11 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 
 
 
-  function showErr(msg) { if (errEl) { errEl.textContent = msg; errEl.style.display = msg ? 'block' : 'none'; } }
+  function showErr(msg: any) { if (errEl) { errEl.textContent = msg; errEl.style.display = msg ? 'block' : 'none'; } }
 
 
 
-  document.addEventListener('keydown', (e) => {
+  document.addEventListener('keydown', (e: any) => {
 
     if (e.key === 'Escape') {
 
@@ -11920,7 +12390,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 
 
 
-  window._showConnSetupIfNeeded = (cfg) => {
+  window._showConnSetupIfNeeded = (cfg: any) => {
 
     // G3.13 — demo mode never sets up its own connection; suppressing the
 
@@ -11950,7 +12420,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 
 
 
-  function setActiveBtn(which) {
+  function setActiveBtn(which: any) {
 
     // which: 'sqlite' | 'postgres' | null
 
@@ -12010,7 +12480,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 
       await _doRestart(false);
 
-    } catch(e) {
+    } catch(e: any) {
 
       showErr('Failed: ' + e.message);
 
@@ -12070,7 +12540,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 
       await _doRestart(false);
 
-    } catch(e) {
+    } catch(e: any) {
 
       showErr('Failed: ' + e.message);
 
@@ -12099,7 +12569,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 
 
 
-function toggleExpand(id) {
+function toggleExpand(id: any) {
 
   const el = document.getElementById(id);
 
@@ -12155,4 +12625,4 @@ function toggleExpand(id) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e) {}
+try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e: any) {}

@@ -474,6 +474,24 @@ def test_dispatch_github_tool_no_repo_connected():
     assert out["error"] == "no_github_repo"
 
 
+def test_dispatch_github_tool_search_code_no_repo_connected():
+    """dc462628 — search_code hits the shared no-repo guard and returns a clear
+    error rather than a misleading empty result (removes the 'false confidence'
+    the tool description now documents)."""
+    import meridian.db as db_module
+
+    tenant = {"id": "t", "plan": "pro", "github_pat": db_module.encrypt_field("ghp_fake")}
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "gh-search-proj"))
+        out = _run(mh._dispatch_github_tool(
+            "search_code", {"project_id": proj["id"], "query": "foo"}, tenant, db,
+        ))
+    finally:
+        _run(db.close())
+    assert out["error"] == "no_github_repo"
+
+
 def test_dispatch_github_tool_unknown_name():
     import meridian.db as db_module
 
@@ -810,6 +828,246 @@ def test_planning_brief_last_session_none_when_no_sessions():
         _run(db.close())
 
 
+def test_planning_brief_latest_retrospective_present_and_absent():
+    """aef94e4a — get_planning_brief surfaces the latest sprint retrospective
+    note (tag=retrospective), and None when none exists."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "retro-brief"))
+        b0 = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert "latest_retrospective" in b0
+        assert b0["latest_retrospective"] is None
+        _run(db_module.add_project_note(
+            db, proj["id"], "Sprint Retrospective — v1",
+            "What shipped: lots. Patterns: good. Direction: forward.",
+            tags="retrospective,strategy", kind="insight", priority="high"))
+        b1 = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        lr = b1["latest_retrospective"]
+        assert lr is not None
+        assert lr["title"] == "Sprint Retrospective — v1"
+        assert "What shipped" in lr["body"]
+        assert lr["slug"]
+    finally:
+        _run(db.close())
+
+
+def test_planning_brief_includes_current_timestamp():
+    """de193a81 — get_planning_brief returns current_timestamp so a planner
+    spanning multiple calendar days never guesses 'today'/'yesterday'."""
+    import re
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "ts-proj"))
+        brief = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert "current_timestamp" in brief
+        assert re.match(
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", brief["current_timestamp"]
+        )
+    finally:
+        _run(db.close())
+
+
+def test_detect_insight_candidate_matches_and_ignores():
+    """2d932f60 — the keyword detector flags decision/insight phrasing and
+    ignores neutral text."""
+    from meridian.handoff import detect_insight_candidate
+    assert detect_insight_candidate("We decided to use psycopg3") == "we decided"
+    assert detect_insight_candidate("Root cause: event-loop deadlock") == "root cause"
+    assert detect_insight_candidate("Add a logout button") is None
+    assert detect_insight_candidate("") is None
+    assert detect_insight_candidate(None) is None
+
+
+def test_add_sprint_item_proposes_insight_capture():
+    """2d932f60 — add_sprint_item surfaces an insight_hint when the title reads
+    like a decision, and stays quiet for a plain title."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "insight-proj"))
+        hinted = _run(mh._dispatch_mcp_tool("add_sprint_item", {
+            "project_id": proj["id"], "version": "v1",
+            "title": "Decision: we chose Cytoscape over ECharts for the graph",
+            "force": True,
+        }, db, "/tmp"))
+        assert "insight_hint" in hinted
+        assert "add_insight" in hinted["insight_hint"]
+        plain = _run(mh._dispatch_mcp_tool("add_sprint_item", {
+            "project_id": proj["id"], "version": "v1",
+            "title": "Add a logout button to the header",
+            "force": True,
+        }, db, "/tmp"))
+        assert "insight_hint" not in plain
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_surfaces_insight_hints(tmp_path):
+    """2d932f60 — generate_handoff scans the session task log and surfaces
+    insight candidates so they aren't lost at session end."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "ih-handoff-proj"))
+        sess = _run(db_module.register_session(db, proj["id"], "exec-ih"))
+        _run(db_module.log_task(
+            db, sess["id"], proj["id"],
+            "Turns out the ProactorEventLoop deadlocks watchfiles on Windows"))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff",
+            {"project_id": proj["id"], "session_id": sess["id"]},
+            db, str(tmp_path)))
+        assert "insight_hints" in out
+        assert any(h["signal"] == "turns out" for h in out["insight_hints"])
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_warns_on_long_goal(tmp_path):
+    """0fe01e93 — generate_handoff flags a /goal text over the 4000-char limit."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "longgoal-proj"))
+        _run(db_module.set_goal(db, proj["id"], "", sprint="x" * 4100))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
+        assert out["goal_length_warning"] is not None
+        assert "4000" in out["goal_length_warning"]
+
+        proj2 = _run(db_module.create_project(db, "shortgoal-proj"))
+        _run(db_module.set_goal(db, proj2["id"], "", sprint="short and tidy"))
+        out2 = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj2["id"]}, db, str(tmp_path)))
+        assert out2["goal_length_warning"] is None
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_content_is_fence_free(tmp_path):
+    """642b1818 — generate_handoff returns a single plain-text copyable block:
+    markdown code-fence lines are stripped so it pastes cleanly into a fenced
+    chat / dashboard textarea."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "fence-proj"))
+        _run(db_module.set_goal(db, proj["id"], "", sprint="do the thing"))
+        # a strategic note whose body has a fenced block that the handoff renders
+        _run(db_module.add_project_note(
+            db, proj["id"], "Config", "```json\n{\"a\": 1}\n```", "planning",
+            priority="high"))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
+        assert "```" not in out["content"]
+    finally:
+        _run(db.close())
+
+
+def test_add_note_warns_on_similar_existing_note():
+    """6e4e2371 — adding a note whose title closely matches an existing one
+    returns a similar_notes warning (never blocks the write)."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "dedup-proj"))
+        _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Windows event loop deadlock gotcha",
+            "body": "Use SelectorEventLoop on Windows.",
+        }, db, "/tmp"))
+        dup = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Windows event loop deadlock gotchas",  # near-identical
+            "body": "Different body entirely.",
+        }, db, "/tmp"))
+        assert "similar_notes" in dup
+        assert dup["similar_notes"][0]["similarity"] >= 0.82
+        # A clearly different note does not trigger the warning.
+        fresh = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Stripe billing overage metering",
+            "body": "unrelated",
+        }, db, "/tmp"))
+        assert "similar_notes" not in fresh
+    finally:
+        _run(db.close())
+
+
+def test_add_note_extracts_hashtags_as_tags():
+    """41b8a927 — #hashtags in a note's title/body are recognised as tags so
+    the note is searchable by tag; explicit tags are preserved alongside them."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "hashtag-proj"))
+        created = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Windows fix",
+            "body": "Use SelectorEventLoop. #windows #eventloop",
+        }, db, "/tmp"))
+        slug = created.get("slug")
+        by_win = _run(db_module.get_project_notes(db, proj["id"], tag="windows"))
+        assert any(n.get("slug") == slug for n in by_win)
+        by_evl = _run(db_module.get_project_notes(db, proj["id"], tag="eventloop"))
+        assert any(n.get("slug") == slug for n in by_evl)
+        created2 = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"],
+            "title": "Billing",
+            "body": "Stripe overage #billing",
+            "tags": "finance",
+        }, db, "/tmp"))
+        slug2 = created2.get("slug")
+        assert any(n.get("slug") == slug2
+                   for n in _run(db_module.get_project_notes(db, proj["id"], tag="finance")))
+        assert any(n.get("slug") == slug2
+                   for n in _run(db_module.get_project_notes(db, proj["id"], tag="billing")))
+    finally:
+        _run(db.close())
+
+
+def test_note_relevance_score_weights():
+    """98890df1 — more references / recency / a decision link each raise the score."""
+    from meridian.db import _note_relevance_score
+    base = _note_relevance_score(0, 100.0, False)
+    assert _note_relevance_score(5, 100.0, False) > base   # references help
+    assert _note_relevance_score(0, 0.0, False) > base     # recency helps
+    assert _note_relevance_score(0, 100.0, True) > base    # decision link helps
+
+
+def test_get_notes_relevance_sort_surfaces_referenced_note():
+    """98890df1 — get_notes(sort=relevance) ranks a heavily cross-referenced note
+    above unreferenced ones (relevance > pure recency)."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "rank-proj"))
+        a = _run(mh._dispatch_mcp_tool("add_note", {
+            "project_id": proj["id"], "title": "Core architecture decision",
+            "body": "The keystone note.",
+        }, db, "/tmp"))
+        a_slug = a["slug"]
+        for i in range(2):
+            _run(mh._dispatch_mcp_tool("add_note", {
+                "project_id": proj["id"], "title": f"Follow-up note number {i}",
+                "body": f"See [[{a_slug}]] for the rationale.",
+            }, db, "/tmp"))
+        ranked = _run(mh._dispatch_mcp_tool("get_notes", {
+            "project_id": proj["id"], "sort": "relevance",
+        }, db, "/tmp"))
+        assert isinstance(ranked, list)
+        assert ranked[0]["slug"] == a_slug
+        assert "relevance" in ranked[0]
+        assert ranked[0]["relevance"] > ranked[-1]["relevance"]
+    finally:
+        _run(db.close())
+
+
 def test_planning_brief_new_handoff_signal():
     # ab514e43 — new-handoff signal: latest_handoff + since-based new flag.
     import meridian.db as db_module
@@ -1021,6 +1279,338 @@ def test_dispatch_complete_sprint_item_not_found_raises():
         _run(db.close())
 
 
+def test_dispatch_sprint_item_quality_gates_and_actor():
+    """5823db0b — required_notes blocks completion until evidence exists; claim
+    and complete record the actor."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "qg"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "gated work", "version": "v1"}, db, "/tmp"))
+        iid = item["id"]
+        # Flag the item as requiring evidence.
+        _run(mh._dispatch_mcp_tool(
+            "update_sprint_item",
+            {"project_id": pid, "item_id": iid, "required_notes": True}, db, "/tmp"))
+        # Claim with an actor — recorded on the item.
+        claimed = _run(mh._dispatch_mcp_tool(
+            "claim_sprint_item",
+            {"project_id": pid, "item_id": iid, "actor": "agent-A"}, db, "/tmp"))
+        assert claimed["actor"] == "agent-A"
+        # Completing without evidence is refused by the gate.
+        blocked = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": iid, "actor": "agent-A"}, db, "/tmp"))
+        assert blocked["error"] == "EVIDENCE_REQUIRED"
+        # Completing with evidence notes succeeds and records actor + notes.
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": iid, "actor": "agent-A",
+             "notes": "shipped X; tests green"}, db, "/tmp"))
+        assert done["status"] == "done"
+        assert done["actor"] == "agent-A"
+        assert "shipped X" in (done["notes"] or "")
+    finally:
+        _run(db.close())
+
+
+def test_dispatch_analyze_sprint_synthesizes_brief():
+    """e77f09d1 — analyze_sprint reports parallelism, dependency chains, and
+    resource conflicts in one structured brief."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "as"}, db, "/tmp"))
+        pid = proj["id"]
+        a = _run(mh._dispatch_mcp_tool("add_sprint_item",
+            {"project_id": pid, "title": "provision cache", "version": "v1",
+             "touches_resources": ["file:server.py"]}, db, "/tmp"))
+        _run(mh._dispatch_mcp_tool("add_sprint_item",
+            {"project_id": pid, "title": "tune indexer", "version": "v1",
+             "touches_resources": ["file:server.py"]}, db, "/tmp"))
+        _run(mh._dispatch_mcp_tool("add_sprint_item",
+            {"project_id": pid, "title": "wire billing", "version": "v1",
+             "touches_resources": ["file:db.py"], "depends_on": a["id"]}, db, "/tmp"))
+        brief = _run(mh._dispatch_mcp_tool("analyze_sprint",
+            {"project_id": pid, "version": "v1"}, db, "/tmp"))
+        assert "summary" in brief
+        assert brief["recommended_strategy"] in ("parallel", "sequential")
+        # The two file:server.py items conflict — reported explicitly.
+        conflict_resources = [c["resource"] for c in brief["file_conflicts"]]
+        assert "file:server.py" in conflict_resources
+        # "wire billing" depends_on "provision cache" — a chain of length >= 2.
+        assert brief["longest_chain"] >= 2
+        assert brief["parallelism"]["eligible_count"] >= 2
+    finally:
+        _run(db.close())
+
+
+def test_generate_default_session_name_from_pending_item():
+    """599d0097 — an unnamed session is named from the first pending item title
+    + timestamp, and start_session works with no session_name."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "dn"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(mh._dispatch_mcp_tool("add_sprint_item",
+            {"project_id": pid, "title": "Wire Billing OAuth", "version": "v1"}, db, "/tmp"))
+        name = _run(db_module.generate_default_session_name(db, pid))
+        assert name.startswith("wire-billing-oauth-")
+        # start_session with NO session_name succeeds and registers a named session.
+        res = _run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, "/tmp"))
+        sid = res["session_id"]
+        sessions = _run(db_module.get_sessions(db, pid, active_only=False))
+        sess = next(s for s in sessions if s["id"] == sid)
+        assert sess["name"] and "wire-billing-oauth" in sess["name"]
+    finally:
+        _run(db.close())
+
+
+def test_generate_default_session_name_empty_board():
+    """2bce89ed — empty board falls back to a memorable adjective+noun+timestamp
+    (e.g. 'brisk-otter-0701-213045'), not the anonymous 'session-<ts>'."""
+    import re
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "eb"}, db, "/tmp"))
+        name = _run(db_module.generate_default_session_name(db, proj["id"]))
+        assert not name.startswith("session-")
+        # adjective-noun-mmdd-hhmmss
+        assert re.match(r"^[a-z]+-[a-z]+-\d{4}-\d{6}$", name), name
+    finally:
+        _run(db.close())
+
+
+def test_dispatch_complete_sprint_item_no_gate_when_not_flagged():
+    """5823db0b — items without required_notes complete freely (no regression)."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ng"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "free work", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done["status"] == "done"
+    finally:
+        _run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# bb29a06f — ADVISORY completion sanity-check (plausibility of evidence).
+# Extends the required_notes gate: a weakly-supported completion whose title
+# shares no keywords with a recent commit gets a soft advisory. Never blocks.
+# ---------------------------------------------------------------------------
+
+def _no_commits(monkeypatch):
+    """Force _fetch_recent_commits to return no commits (advisory should fire
+    for a weakly-supported completion)."""
+    async def _fake(_project, _tenant):
+        return []
+    monkeypatch.setattr(mh, "_fetch_recent_commits", _fake)
+
+
+def _commits(monkeypatch, commits):
+    """Force _fetch_recent_commits to return a fixed commit list."""
+    async def _fake(_project, _tenant):
+        return list(commits)
+    monkeypatch.setattr(mh, "_fetch_recent_commits", _fake)
+
+
+def test_sprint_item_advisory_weak_completion_no_commit(monkeypatch):
+    """(a) Weak completion (no task/notes) + no matching commit → advisory present,
+    and the completion still succeeds."""
+    _no_commits(monkeypatch)
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-a"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done["status"] == "done"  # completion never blocked
+        assert "completion_advisory" in done
+        assert "double-check it actually shipped" in done["completion_advisory"]
+    finally:
+        _run(db.close())
+
+
+def test_sprint_item_advisory_absent_when_commit_matches(monkeypatch):
+    """(b) Weak completion but a recent commit shares >=3 keywords with the
+    title → plausibly supported → NO advisory."""
+    _commits(monkeypatch, [
+        {"sha": "abc123def456",
+         "message": "Add rate limiter middleware bucket for API"},
+    ])
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-b"}, db, "/tmp"))
+        pid = proj["id"]
+        # force=True so add_sprint_item's own drift guard (which fires when the
+        # mocked commit matches the title) doesn't refuse to create the item.
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1", "force": True}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done["status"] == "done"
+        assert "completion_advisory" not in done
+    finally:
+        _run(db.close())
+
+
+def test_sprint_item_advisory_absent_with_notes_evidence(monkeypatch):
+    """(c) Completion carrying evidence (notes= arg) → evidence exists → NO
+    advisory even when no commit matches."""
+    _no_commits(monkeypatch)
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-c"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"],
+             "notes": "shipped the limiter; tests green"}, db, "/tmp"))
+        assert done["status"] == "done"
+        assert "completion_advisory" not in done
+    finally:
+        _run(db.close())
+
+
+def test_sprint_item_advisory_absent_with_task_id_evidence(monkeypatch):
+    """(c') Completion linking a task_id → evidence exists → NO advisory."""
+    _no_commits(monkeypatch)
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-c2"}, db, "/tmp"))
+        pid = proj["id"]
+        sess = _run(db_module.register_session(db, pid, "adv-sess"))
+        task = _run(db_module.log_task(db, sess["id"], pid, "did the work"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "task_id": task["id"]},
+            db, "/tmp"))
+        assert done["status"] == "done"
+        assert "completion_advisory" not in done
+    finally:
+        _run(db.close())
+
+
+def test_sprint_item_advisory_never_blocks_on_commit_fetch_error(monkeypatch):
+    """(d) A failing commit-fetch must never break completion — the advisory is
+    silently skipped and the item still completes."""
+    async def _boom(_project, _tenant):
+        raise RuntimeError("git unavailable")
+    monkeypatch.setattr(mh, "_fetch_recent_commits", _boom)
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "adv-d"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Add rate limiter middleware bucket",
+             "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done["status"] == "done"  # completion succeeded despite git error
+    finally:
+        _run(db.close())
+
+
+def test_read_write_claim_distinction():
+    """ffa03655 — shared read claims coexist; write is exclusive and waits for readers."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "rw"))
+        pid = proj["id"]
+        s1 = _run(db_module.register_session(db, pid, "reader-1"))
+        s2 = _run(db_module.register_session(db, pid, "reader-2"))
+        s3 = _run(db_module.register_session(db, pid, "writer"))
+        r1 = _run(db_module.claim_file(db, "x.py", s1["id"], mode="read"))
+        r2 = _run(db_module.claim_file(db, "x.py", s2["id"], mode="read"))
+        assert r1["claimed"] and r1["claim_mode"] == "read"
+        assert r2["claimed"] and set(r2["readers"]) >= {s1["id"], s2["id"]}
+        # Writer blocked while readers hold the file.
+        w = _run(db_module.claim_file(db, "x.py", s3["id"], mode="write"))
+        assert not w["claimed"] and w["reason"] == "read_locked"
+        # Readers release → writer can claim exclusively.
+        _run(db_module.release_file(db, "x.py", s1["id"]))
+        _run(db_module.release_file(db, "x.py", s2["id"]))
+        w2 = _run(db_module.claim_file(db, "x.py", s3["id"], mode="write"))
+        assert w2["claimed"] and w2["claim_mode"] == "write"
+        # New reader blocked by the exclusive write lock.
+        r3 = _run(db_module.claim_file(db, "x.py", s1["id"], mode="read"))
+        assert not r3["claimed"] and r3["reason"] == "write_locked"
+    finally:
+        _run(db.close())
+
+
+def test_store_and_get_findings_roundtrip():
+    """c35370cc — findings persist and read back by key, incl. via dispatch."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "f"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(mh._dispatch_mcp_tool("store_finding",
+            {"project_id": pid, "content": "auth uses JWT", "key": "auth"}, db, "/tmp"))
+        _run(db_module.store_finding(db, pid, "db is postgres", key="db"))
+        allf = _run(mh._dispatch_mcp_tool("get_findings", {"project_id": pid}, db, "/tmp"))
+        assert len(allf) == 2
+        authf = _run(mh._dispatch_mcp_tool("get_findings", {"project_id": pid, "key": "auth"}, db, "/tmp"))
+        assert len(authf) == 1 and "JWT" in authf[0]["content"]
+    finally:
+        _run(db.close())
+
+
+def test_session_messaging_and_barrier():
+    """d3a3a01d — send/receive + non-blocking idle_until_all_done barrier."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "m"))
+        pid = proj["id"]
+        s1 = _run(db_module.register_session(db, pid, "a"))
+        s2 = _run(db_module.register_session(db, pid, "b"))
+        _run(db_module.send_message(db, pid, s2["id"], "do Y", from_session_id=s1["id"]))
+        msgs = _run(db_module.receive_messages(db, s2["id"]))
+        assert len(msgs) == 1 and msgs[0]["payload"] == "do Y"
+        # Marked read → next receive is empty.
+        assert _run(db_module.receive_messages(db, s2["id"])) == []
+        # Barrier: both active → not done.
+        st = _run(db_module.idle_until_all_done(db, [s1["id"], s2["id"]]))
+        assert not st["all_done"] and set(st["pending"]) == {s1["id"], s2["id"]}
+        # Close both → done.
+        _run(db_module.close_session(db, s1["id"]))
+        _run(db_module.close_session(db, s2["id"]))
+        st2 = _run(db_module.idle_until_all_done(db, [s1["id"], s2["id"]]))
+        assert st2["all_done"] and st2["pending"] == []
+    finally:
+        _run(db.close())
+
+
 def test_dispatch_get_context_block_project_not_found_raises():
     db = _make_db()
     try:
@@ -1053,32 +1643,6 @@ def test_dispatch_reconcile_sprint_drift_project_not_found_raises():
                 "reconcile_sprint_drift",
                 {"project_id": "ffffffff-ffff-ffff-ffff-ffffffffffff"}, db, "/tmp",
             ))
-    finally:
-        _run(db.close())
-
-
-def test_dispatch_capture_insight_requires_body():
-    db = _make_db()
-    try:
-        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ins"}, db, "/tmp"))
-        out = _run(mh._dispatch_mcp_tool(
-            "capture_insight", {"project_id": proj["id"], "title": "t"}, db, "/tmp",
-        ))
-        assert "requires body" in out["error"]
-    finally:
-        _run(db.close())
-
-
-def test_dispatch_capture_insight_from_bullets():
-    db = _make_db()
-    try:
-        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ins2"}, db, "/tmp"))
-        out = _run(mh._dispatch_mcp_tool(
-            "capture_insight",
-            {"project_id": proj["id"], "title": "t", "bullet_points": ["a", "b"]},
-            db, "/tmp",
-        ))
-        assert "error" not in out
     finally:
         _run(db.close())
 
@@ -1160,6 +1724,48 @@ def test_handle_request_tools_call_success_envelope():
         data = json.loads(content["text"])
         assert any(p["id"] == proj["id"] for p in data)
     finally:
+        _run(db.close())
+
+
+def test_hosted_tools_call_bumps_session_last_seen():
+    """4b698ea5 — on the HOSTED path, any native Meridian tool carrying a
+    session_id refreshes that session's last_seen (mirrors the stdio handler).
+    Previously the hosted /mcp path never did this, so hosted/tunnel sessions
+    went stale between the sparse tools that happen to write last_seen."""
+    import meridian.db as db_module
+    import meridian.server as srv
+    from datetime import datetime, timezone
+
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "hb"))
+        sess = _run(db_module.register_session(db, proj["id"], "s1"))
+        # Age last_seen to 9 minutes ago.
+        _run(db.execute(
+            "UPDATE sessions SET last_seen = datetime('now','-9 minutes') WHERE id = ?",
+            (sess["id"],),
+        ))
+        _run(db.commit())
+        srv._CONNECTED_SESSIONS.pop(sess["id"], None)
+
+        # A read-only native tool that carries session_id (no last_seen write of
+        # its own) must still refresh last_seen via the handler's implicit bump.
+        resp = _run(mh._handle_mcp_request(
+            _req("tools/call", {
+                "name": "get_session_brief",
+                "arguments": {"session_id": sess["id"], "project_id": proj["id"]},
+            }),
+            db=db, data_dir="/tmp",
+        ))
+        assert "result" in resp
+
+        rows = {r["id"]: r for r in _run(db_module.get_sessions(db, proj["id"], active_only=False))}
+        ls = datetime.fromisoformat(rows[sess["id"]]["last_seen"].replace(" ", "T")).replace(tzinfo=timezone.utc)
+        assert (datetime.now(timezone.utc) - ls).total_seconds() < 60  # refreshed
+        # And it was marked "connected" so the keepalive loop holds it fresh.
+        assert sess["id"] in srv._CONNECTED_SESSIONS
+    finally:
+        srv._CONNECTED_SESSIONS.pop(sess["id"], None)
         _run(db.close())
 
 
@@ -1263,7 +1869,6 @@ def test_broad_tool_happy_paths():
         call("add_note", {"project_id": pid, "title": "wiki", "body": "note body"})
         call("add_note", {"project_id": pid, "title": "MANUAL: do thing", "body": "todo"})
         assert isinstance(call("get_notes", {"project_id": pid}), list)
-        call("capture_insight", {"project_id": pid, "title": "insight", "body": "learned X"})
 
         # Workspace layer
         call("add_workspace_note", {"title": "ws", "body": "b"})

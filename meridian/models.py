@@ -20,6 +20,15 @@ class ProjectCreate(BaseModel):
         default=None,
         description="Optional creator identifier. Becomes the project's owner.",
     )
+    parent_project_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional parent project id (3b6ff466). When set, this project is a "
+            "subproject that inherits the parent's north_star when it has none of "
+            "its own. Subprojects are one level deep: the parent must exist and "
+            "must not itself be a subproject."
+        ),
+    )
 
 
 class GoalSet(BaseModel):
@@ -122,6 +131,8 @@ class Project(BaseModel):
     name: str
     creator_human_id: str | None = None
     icon: str | None = None
+    status: str = "active"       # 8db00fcb — active | parked | archived
+    priority: str = "P2"         # 8db00fcb — P0 | P1 | P2
     created_at: str
 
 
@@ -240,6 +251,13 @@ class GoalModeSet(BaseModel):
     """Body for PATCH /projects/{id}/goal-mode."""
 
     mode: Literal["manual", "auto"]
+
+
+class ProjectOrganizationSet(BaseModel):
+    """Body for PATCH /projects/{id}/organization (8db00fcb)."""
+
+    status: Literal["active", "parked", "archived"] | None = None
+    priority: Literal["P0", "P1", "P2"] | None = None
 
 
 class Session(BaseModel):

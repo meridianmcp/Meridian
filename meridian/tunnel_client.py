@@ -31,6 +31,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import __version__
 from . import serena_pool as _serena_pool
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
@@ -53,6 +54,69 @@ _IDLE_KILL_SECONDS = 30 * 60
 # (e.g. the missing npx/binary became available). On success the client tells
 # the server to re-advertise the slot's tools.
 _SLOT_REPROBE_INTERVAL = 60.0
+
+# 089a936a — the DEFAULT first-spawn pre-flight probe budget (attempts, delay):
+# attempts=2 × delay=3s with a 10s per-attempt httpx timeout ≈ up to ~23s. Fine
+# for slots whose launcher is already on disk.
+_PREFLIGHT_BUDGET_DEFAULT: "tuple[int, float]" = (2, 3.0)
+# 089a936a — a LARGER first-spawn budget for "cold-fetch" slots whose very first
+# spawn triggers an npx cold download (e.g. Desktop Commander:
+# `npx -y @wonderwhy-er/desktop-commander@latest`) that can exceed the default
+# ~23s. attempts=4 × delay=5s with the 10s per-attempt timeout ≈ up to ~55s.
+# This applies ONLY to the first-spawn pre-flight, NOT the 60s background reprobe
+# (which stays attempts=1).
+_PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
+# 089a936a — slots that npx-download their inner server on first launch. These
+# get the larger cold-fetch pre-flight budget above. (dc = Desktop Commander.)
+_COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc"})
+
+
+# ---------------------------------------------------------------------------
+# Version check (4bde9437) — nudge an upgrade when the local tunnel binary is
+# behind the deployed server. Pure + fail-safe: never raises, so a bad/absent
+# version string can never block the tunnel from starting.
+# ---------------------------------------------------------------------------
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """Parse a dotted version into a comparable int tuple.
+
+    Each dot-segment contributes its leading run of digits (so ``0.1.6`` →
+    ``(0, 1, 6)`` and ``0.2.0rc1`` → ``(0, 2, 0)``). Parsing stops at the first
+    segment with no leading digit, and any wholly-unparseable input yields the
+    empty tuple — which callers treat as "unknown, don't nag".
+    """
+    parts: list[int] = []
+    for seg in str(v).strip().split("."):
+        digits = ""
+        for ch in seg:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _update_notice(local: str, server: str) -> str | None:
+    """Return a one-line upgrade notice iff ``server`` is newer than ``local``.
+
+    Returns ``None`` (no nag) when either version is missing/unparseable or when
+    the local version is already >= the server's. Never raises — the whole point
+    is that a version check must never be able to abort ``run_tunnel``.
+    """
+    try:
+        lt = _version_tuple(local)
+        st = _version_tuple(server)
+        if lt and st and st > lt:
+            return (
+                f"  meridian update available: server {server} > local {local} "
+                "— upgrade: uv tool install meridian-server --upgrade"
+            )
+    except Exception:  # noqa: BLE001 — informational only, never block startup
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -267,17 +331,109 @@ def _classify_serena_failure(err: object) -> "tuple[str, str] | None":
     return None
 
 
-async def _preflight_slot(ws, port: int, label: str) -> bool:
+# 089a936a — human-readable hint per slot when its first-spawn pre-flight probe
+# fails (the proxy accepted the Popen but never answered a `tools/list`). The
+# dc/office hint is specific (cold npx download); everything else gets a generic
+# "proxy didn't respond" message. Keyed on the slot label used by the tunnel.
+_DC_PREFLIGHT_HINT = (
+    "Desktop Commander did not respond on port {port} — if it isn't installed, "
+    "add it via the dashboard (npx -y @wonderwhy-er/desktop-commander@latest); "
+    "the first launch can take ~a minute to download."
+)
+_OFFICE_PREFLIGHT_HINTS = {
+    "ppt": (
+        "The PowerPoint slot did not respond on port {port} — its launcher may "
+        "not be installed yet; the first launch can take a while to download."
+    ),
+    "word": (
+        "The Word slot did not respond on port {port} — its launcher may not be "
+        "installed yet; the first launch can take a while to download."
+    ),
+}
+
+
+def _preflight_failure_hint(label: str, port: int) -> "tuple[str, str]":
+    """Classify a first-spawn pre-flight probe failure into ``(reason, detail)``.
+
+    The proxy Popen-succeeded but never answered ``tools/list``. ``reason`` is a
+    short snake-case code consistent with :func:`_classify_serena_failure` /
+    ``_mark_unhealthy`` (which use e.g. ``access_denied``); here it is
+    ``unreachable``. ``detail`` is a human, slot-aware hint — specific for the
+    dc/office cold-fetch slots, generic otherwise. Pure + unit-tested. (089a936a)"""
+    reason = "unreachable"
+    if label == "dc":
+        return (reason, _DC_PREFLIGHT_HINT.format(port=port))
+    office = _OFFICE_PREFLIGHT_HINTS.get(label)
+    if office is not None:
+        return (reason, office.format(port=port))
+    return (
+        reason,
+        f"The {label} slot's proxy did not respond on port {port} — its tools "
+        "are suppressed until it comes up (auto-retried in the background).",
+    )
+
+
+async def _reprobe_once(proxy, probe) -> bool:
+    """One slot-recovery attempt (a898710a). Ensure the proxy is running, probe
+    its health, and — critically — if it is running but UNHEALTHY (a persistent
+    slot like Desktop Commander whose inner MCP server died while the parent
+    ``cmd /c npx`` stays alive, so ``ensure_running()`` is a no-op) force a
+    kill + respawn and re-probe. Without this a stuck persistent slot never
+    recovers. Returns True when healthy. ``probe`` is an async fn(port) -> bool.
+    """
+    if not proxy.is_running:
+        await proxy.ensure_running()
+    healthy = proxy.is_running and await probe(proxy.port)
+    if not healthy and proxy.is_running:
+        proxy.kill()
+        await proxy.ensure_running()
+        healthy = proxy.is_running and await probe(proxy.port)
+    return healthy
+
+
+async def _preflight_slot(
+    ws,
+    port: int,
+    label: str,
+    *,
+    attempts: int | None = None,
+    delay: float | None = None,
+) -> bool:
     """Probe a slot after its first spawn; report unhealthy on failure. Returns
-    the health result so callers can log it. (d71ba2e7)"""
-    healthy = await _probe_slot_health(port)
+    the health result so callers can log it. (d71ba2e7)
+
+    089a936a — two robustness additions, both scoped to the failure path (the
+    HEALTHY path is unchanged):
+
+    * On failure, report a ``reason``/``detail`` (via :func:`_preflight_failure_hint`)
+      instead of a bare unhealthy dot, so the dashboard shows an actionable hint
+      — matching what the Serena slot already does with
+      :func:`_classify_serena_failure`.
+    * ``attempts``/``delay`` override the pre-flight probe budget so cold-fetch
+      slots (dc/office, which npx-download on first launch) can be given a longer
+      first-spawn budget. When omitted, the default budget is derived from the
+      slot label: cold-fetch slots use ``_PREFLIGHT_BUDGET_COLD_FETCH``, all
+      others ``_PREFLIGHT_BUDGET_DEFAULT``.
+    """
+    if attempts is None or delay is None:
+        _def_attempts, _def_delay = (
+            _PREFLIGHT_BUDGET_COLD_FETCH
+            if label in _COLD_FETCH_SLOTS
+            else _PREFLIGHT_BUDGET_DEFAULT
+        )
+        if attempts is None:
+            attempts = _def_attempts
+        if delay is None:
+            delay = _def_delay
+    healthy = await _probe_slot_health(port, attempts=attempts, delay=delay)
     if not healthy:
+        reason, detail = _preflight_failure_hint(label, port)
         print(
             f"tunnel:{label}: pre-flight health check FAILED on port {port} — "
-            "marking slot unhealthy (its tools will be suppressed)",
+            f"marking slot unhealthy (its tools will be suppressed): {detail}",
             file=sys.stderr, flush=True,
         )
-        await _report_slot_health(ws, label, False)
+        await _report_slot_health(ws, label, False, reason=reason, detail=detail)
     return healthy
 
 
@@ -324,9 +480,11 @@ async def _run_connection_lazy(
         while True:
             await asyncio.sleep(_SLOT_REPROBE_INTERVAL)
             try:
-                if not proxy.is_running:
-                    await proxy.ensure_running()
-                if proxy.is_running and await _probe_slot_health(proxy.port, attempts=1):
+                # a898710a — _reprobe_once force-restarts a persistent slot that's
+                # alive-but-unhealthy (parent process up, inner MCP server dead).
+                if await _reprobe_once(
+                    proxy, lambda port: _probe_slot_health(port, attempts=1)
+                ):
                     _unhealthy = False
                     _reprobe_task = None
                     await _report_slot_health(ws, label, True)
@@ -374,6 +532,25 @@ async def _run_connection_lazy(
                                 await proxy.ensure_running()
                             print(
                                 f"tunnel:{label}: expanded allowed dirs → {new_roots}",
+                                flush=True,
+                            )
+                        continue
+                    if msg.get("type") == "set_fs_roots":
+                        # live-fs-roots — full-list REPLACE: rebuild the fs proxy's
+                        # allowed dirs to EXACTLY these roots (a removal shrinks the
+                        # served set, which add_fs_roots cannot do), then respawn.
+                        want_roots: list[str] = msg.get("roots") or []
+                        updated_cmd, changed = _set_fs_roots_on_cmd(proxy.cmd, want_roots)
+                        if changed:
+                            proxy.cmd = updated_cmd
+                            if proxy.is_running:
+                                proxy.kill()
+                                await proxy.ensure_running()
+                            served = [
+                                d for d in (_normalize_path_arg(r) for r in want_roots) if d
+                            ]
+                            print(
+                                f"tunnel:{label}: set allowed dirs → {served}",
                                 flush=True,
                             )
                         continue
@@ -682,6 +859,20 @@ def _spawn_kwargs() -> dict:
     return {}
 
 
+def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
+    """Merge a plugin's optional ``env`` overrides over the parent process env
+    for ``subprocess.Popen``. Returns ``None`` (inherit the parent env) when
+    there is nothing valid to override. Keys/values are coerced to str and blank
+    keys dropped. Shared by the Office and custom local-plugin spawns (194a7776
+    — a local Zotero MCP needs ``ZOTERO_LOCAL=true``)."""
+    if not isinstance(env, dict) or not env:
+        return None
+    coerced = {str(k): str(v) for k, v in env.items() if str(k)}
+    if not coerced:
+        return None
+    return {**os.environ, **coerced}
+
+
 def _terminate_proc_tree(proc: "subprocess.Popen | None") -> None:
     """Stop a spawned proxy *and its whole child tree*. Best-effort; never raises.
 
@@ -787,6 +978,74 @@ def _resolve_base_url(arg_url: str | None = None) -> str:
 
 def _config_path() -> Path:
     return Path.home() / ".meridian" / "config.json"
+
+
+# ---------------------------------------------------------------------------
+# Package cache locations — shown once on first tunnel run (a887155d)
+# ---------------------------------------------------------------------------
+
+def _package_cache_locations() -> dict[str, str]:
+    """Where npx (Node MCPs) and uvx (Python MCPs) land downloaded packages.
+
+    Derived from the package managers' env vars with per-OS defaults — no
+    subprocess is spawned, so this never slows tunnel startup. Best-effort:
+    the paths are the documented defaults, accurate unless the user overrode
+    them outside the standard env vars.
+    """
+    home = Path.home()
+    local = os.environ.get("LOCALAPPDATA")
+    win = sys.platform == "win32"
+
+    npm_cache = os.environ.get("npm_config_cache")
+    if not npm_cache:
+        npm_cache = str(Path(local) / "npm-cache") if (win and local) else str(home / ".npm")
+
+    uv_cache = os.environ.get("UV_CACHE_DIR")
+    if not uv_cache:
+        uv_cache = str(Path(local) / "uv" / "cache") if (win and local) else str(home / ".cache" / "uv")
+
+    uv_tools = os.environ.get("UV_TOOL_DIR")
+    if not uv_tools:
+        uv_tools = str(Path(local) / "uv" / "tools") if (win and local) else str(home / ".local" / "share" / "uv" / "tools")
+
+    return {
+        "npx": str(Path(npm_cache) / "_npx"),
+        "uvx": uv_cache,
+        "uv_tools": uv_tools,
+    }
+
+
+def _cache_locations_marker() -> Path:
+    """Marker whose existence means cache locations were already shown once."""
+    return Path.home() / ".meridian" / ".cache_locations_shown"
+
+
+def _print_package_cache_locations(*, force: bool = False) -> bool:
+    """Print where npx/uvx cache downloaded MCP servers — once, on first run.
+
+    A marker file under ``~/.meridian`` suppresses the banner on later runs so
+    repeat starts stay terse. Returns True if it printed. Best-effort: any FS
+    error is swallowed (we'd just print again next time) and never blocks
+    startup. (a887155d)
+    """
+    marker = _cache_locations_marker()
+    if not force:
+        try:
+            if marker.exists():
+                return False
+        except OSError:
+            pass
+    loc = _package_cache_locations()
+    print("  Package caches (first run — where downloaded MCP servers land):", flush=True)
+    print(f"    npx (Node MCPs):   {loc['npx']}", flush=True)
+    print(f"    uvx (Python MCPs): {loc['uvx']}", flush=True)
+    print(f"    uv tools:          {loc['uv_tools']}", flush=True)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("1", encoding="utf-8")
+    except OSError:
+        pass
+    return True
 
 
 def _read_cached_token(base_url: str) -> str | None:
@@ -1041,6 +1300,47 @@ def _managed_bin_dir() -> "Path":
     return Path.home() / ".meridian" / "bin"
 
 
+def _win_shell_safe_path(path: str) -> str:
+    """Make *path* safe to pass as a single token through mcp-proxy ``--shell``
+    on Windows (89bc72c4).
+
+    mcp-proxy's ``--shell`` hands the inner command to ``cmd.exe``, which splits
+    unquoted arguments on spaces. A binary path with a space — e.g. the
+    auto-downloaded ``C:\\Users\\John Smith\\.meridian\\bin\\codebase-memory-mcp.exe``
+    — is therefore truncated at the first space, so ``cmd.exe`` tries to run
+    ``C:\\Users\\John`` and fails with WinError 3, "The system cannot find the
+    path specified". This is why the code-intel slot failed to launch while the
+    filesystem / Office / extractor slots (whose inner token is a bare npm
+    package name or a space-free path) came up clean.
+
+    Fix: when the path contains a space, resolve it to its 8.3 short-name form
+    (``GetShortPathNameW``), which is space-free and understood by ``cmd.exe``.
+    This preserves the required ``--shell`` spawn for native ``.exe`` binaries
+    (mcp-proxy/Node can't always spawn them directly) *and* for ``.cmd`` shims.
+
+    Fail-soft: on any non-Windows platform, a space-free path, a nonexistent
+    path, or a volume with 8.3 name generation disabled (short-name lookup
+    returns empty / raises), the original *path* is returned unchanged — the
+    caller is no worse off than before this guard existed.
+    """
+    if sys.platform != "win32" or not path or " " not in path:
+        return path
+    try:
+        import ctypes  # Windows-only stdlib; imported lazily so non-win32 is untouched.
+
+        _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW  # type: ignore[attr-defined]
+        buf = ctypes.create_unicode_buffer(512)
+        n = _GetShortPathNameW(path, buf, len(buf))
+        # n == 0 → failure (path missing / 8.3 disabled); n > len → buffer too small.
+        if 0 < n < len(buf):
+            short = buf.value
+            if short and " " not in short:
+                return short
+    except Exception:  # noqa: BLE001 — any failure: fall back to the original path.
+        pass
+    return path
+
+
 def _find_codebase_memory_mcp() -> str | None:
     """Return path to codebase-memory-mcp, checking PATH, npm global, then managed dir.
 
@@ -1205,11 +1505,26 @@ def _build_code_proxy_command(
     shell (``--shell``) — mcp-proxy's direct spawn hits EINVAL under Node 24's
     CVE-2024-27980 mitigation. A real ``.exe`` spawns directly (and preserves
     support for paths with spaces), so ``--shell`` is added only for shims.
+
+    89bc72c4 — under ``--shell`` cmd.exe splits args on spaces, so a *binary*
+    path containing a space (e.g. a user whose home is ``C:\\Users\\John Smith``)
+    was truncated and spawned as ``C:\\Users\\John`` → WinError 3, "The system
+    cannot find the path specified". That was the isolated cause of the code-intel
+    slot failing to launch while the space-free / bare-package slots came up clean.
+    We now resolve the binary to its 8.3 short-name form when it contains a space
+    (:func:`_win_shell_safe_path`), which is space-safe for cmd.exe.
     """
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
            "--server", "stream", "--stateless"]
-    if sys.platform == "win32" and binary.lower().endswith((".cmd", ".bat")):
+    if sys.platform == "win32":
+        # Always add --shell on Windows: mcp-proxy (Node.js) cannot spawn .exe
+        # binaries directly in some environments (missing DLL PATH, Node spawn
+        # restrictions). cmd.exe handles resolution reliably. Mirrors the FS slot's
+        # unconditional --shell. A space in the binary path would be split by
+        # cmd.exe, so make it shell-safe (8.3 short path); .cmd shims need shell
+        # anyway per Node 24 CVE-2024-27980. (89bc72c4)
         cmd.append("--shell")
+        binary = _win_shell_safe_path(binary)
     cmd += ["--", binary]
     return cmd
 
@@ -1364,6 +1679,45 @@ def _find_npx() -> str:
     return shutil.which("npx") or "npx"
 
 
+def _normalize_path_arg(path: str) -> str:
+    """Strip surrounding whitespace and matched surrounding quotes from a user-
+    supplied path (e.g. a pasted '"C:\\Users\\me\\My Docs"'). Repeated/mixed
+    wrapping is unwound; interior characters (incl. spaces) are untouched.
+    Idempotent — a clean path is returned unchanged.
+
+    path-quote-strip: only MATCHED surrounding single/double quotes are removed
+    — never a lone quote, never an interior character."""
+    s = (path or "").strip()
+    while len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s
+
+
+def _unservable_roots(roots: "list[str] | None") -> "list[tuple[str, str]]":
+    """59c0e609 — configured filesystem_roots the connector will SILENTLY not
+    serve, each with a reason, so the caller can WARN instead of the user seeing
+    an unexplained "2 of 3 dirs" after a tunnel restart.
+
+    The Python pipeline passes every configured root through correctly (verified);
+    the drop happens at the inner ``@modelcontextprotocol/server-filesystem``
+    process, which two ways silently omits a dir: (1) the directory does not exist
+    at spawn time (e.g. a renamed folder, or a OneDrive/cloud dir that is
+    dehydrated/offline), and (2) on Windows, mcp-proxy runs with ``--shell`` and
+    concatenates args unescaped, so a path containing a SPACE is mis-parsed (see
+    :func:`_build_proxy_command`). Pure/deterministic for testing — it only reads
+    the filesystem via ``os.path.isdir``; the caller does the printing."""
+    out: list[tuple[str, str]] = []
+    for r in roots or []:
+        r = _normalize_path_arg(r)
+        if not r:
+            continue
+        if not os.path.isdir(r):
+            out.append((r, "does not exist / not a directory at tunnel start"))
+        elif sys.platform == "win32" and " " in r:
+            out.append((r, "contains a space — not served on Windows (mcp-proxy --shell limitation)"))
+    return out
+
+
 def _build_proxy_command(
     npx: str, repo_path: str, port: int = DEFAULT_PROXY_PORT,
     roots: "list[str] | None" = None,
@@ -1392,7 +1746,7 @@ def _build_proxy_command(
     Note: with ``--shell`` mcp-proxy concatenates args unescaped, so a
     directory containing spaces is not yet supported on Windows.
     """
-    dirs = [r for r in (roots or []) if r and r.strip()] or [repo_path]
+    dirs = [_normalize_path_arg(r) for r in (roots or []) if _normalize_path_arg(r)] or [repo_path]
     # --server stream: serve only Streamable HTTP (/mcp), no SSE.
     # --stateless: each POST is handled independently — required for the
     #   tunnel relay's one-shot request/response model (no persistent SSE pipe).
@@ -1426,10 +1780,42 @@ def _add_fs_roots_to_cmd(cmd: "list[str]", new_roots: "list[str]") -> "tuple[lis
     except ValueError:
         return cmd, False
     existing: set[str] = set(cmd[idx + 1:])
-    to_add = [r for r in new_roots if r and r.strip() and r.strip() not in existing]
+    to_add = [
+        nr for nr in (_normalize_path_arg(r) for r in new_roots)
+        if nr and nr not in existing
+    ]
     if not to_add:
         return cmd, False
     return cmd[:idx + 1] + list(cmd[idx + 1:]) + to_add, True
+
+
+def _set_fs_roots_on_cmd(cmd: "list[str]", roots: "list[str]") -> "tuple[list[str], bool]":
+    """live-fs-roots — REPLACE the served dirs in a ``_build_proxy_command`` result
+    with EXACTLY *roots* (normalized, deduped, order preserved).
+
+    Unlike :func:`_add_fs_roots_to_cmd` (which only appends), this rebuilds the
+    trailing dir list after the ``@modelcontextprotocol/server-filesystem`` token
+    so a removal shrinks the served set. Returns ``(updated_cmd, changed)`` —
+    *changed* is ``False`` (and *cmd* returned unchanged) when the token is absent
+    or the requested dirs already match the current ones. An empty/all-blank
+    *roots* list is a no-op (``changed=False``): the inner filesystem server needs
+    at least one dir, so we never strip it down to zero.
+    """
+    try:
+        idx = cmd.index("@modelcontextprotocol/server-filesystem")
+    except ValueError:
+        return cmd, False
+    new_dirs: list[str] = []
+    for r in roots:
+        nr = _normalize_path_arg(r)
+        if nr and nr not in new_dirs:
+            new_dirs.append(nr)
+    if not new_dirs:
+        # Refuse to leave the filesystem server with zero dirs.
+        return cmd, False
+    if list(cmd[idx + 1:]) == new_dirs:
+        return cmd, False
+    return cmd[:idx + 1] + new_dirs, True
 
 
 def _extract_denied_path(resp: dict) -> "str | None":
@@ -1453,15 +1839,23 @@ def _extract_denied_path(resp: dict) -> "str | None":
 
 async def _fetch_filesystem_roots(
     base_url: str, token: str
-) -> "tuple[list[str], list[str]]":
+) -> "tuple[list[str], list[str], str, list[str]]":
     """GET /tunnel/filesystem-roots — the dirs the fs connector may serve.
 
-    Returns ``(filesystem_roots, known_repo_paths)``.  ``filesystem_roots`` are
-    the explicit allowed dirs (unioned ``executor_config.filesystem_roots`` across
-    projects); ``known_repo_paths`` are the implicit trust anchors
+    Returns ``(filesystem_roots, known_repo_paths, serena_repo_path,
+    codebase_code_dirs)``.  ``filesystem_roots`` are the explicit allowed dirs
+    (unioned ``executor_config.filesystem_roots`` across projects);
+    ``known_repo_paths`` are the implicit trust anchors
     (``executor_config.repo_path`` per project) used for silent auto-add.
-    Both lists are empty on any error so the caller falls back to the
-    home-directory default.
+
+    b970fe07 — ``serena_repo_path`` is the first non-empty
+    ``executor_config.serena_repo_path`` (Serena's default ``--project``) and
+    ``codebase_code_dirs`` the deduped union of ``executor_config.codebase_code_dirs``
+    (the code-intel slot's auto-index dirs). Fall-back-safe: the caller applies
+    each only when the matching CLI flag is absent.
+
+    All fields degrade to empty (``[]`` / ``""``) on any error so the caller
+    falls back to today's defaults (home dir / cwd / no auto-index).
     """
     import httpx
 
@@ -1475,13 +1869,17 @@ async def _fetch_filesystem_roots(
                 data = r.json() or {}
                 roots = data.get("filesystem_roots") or []
                 known = data.get("known_repo_paths") or []
+                serena_repo = data.get("serena_repo_path") or ""
+                code_dirs = data.get("codebase_code_dirs") or []
                 return (
-                    [str(x).strip() for x in roots if isinstance(x, str) and x.strip()],
-                    [str(x).strip() for x in known if isinstance(x, str) and x.strip()],
+                    [_normalize_path_arg(x) for x in roots if isinstance(x, str) and _normalize_path_arg(x)],
+                    [_normalize_path_arg(x) for x in known if isinstance(x, str) and _normalize_path_arg(x)],
+                    _normalize_path_arg(serena_repo) if isinstance(serena_repo, str) else "",
+                    [_normalize_path_arg(x) for x in code_dirs if isinstance(x, str) and _normalize_path_arg(x)],
                 )
     except Exception:  # noqa: BLE001 — network/parse error → defaults
         pass
-    return [], []
+    return [], [], "", []
 
 
 # ---------------------------------------------------------------------------
@@ -1708,14 +2106,25 @@ async def _relay_request(
 # ---------------------------------------------------------------------------
 
 async def _fetch_me(base_url: str, token: str) -> dict:
-    """GET /me and return the JSON body (raises on transport/HTTP error)."""
-    import httpx
+    """GET /me and return the JSON body (raises on transport/HTTP error).
 
+    8660d701 — sends this machine's hostname (X-Meridian-Hostname) so the server
+    resolves THIS machine's tunnel plugin config (per-machine, since different
+    machines have different software installed). Best-effort: a missing hostname
+    just falls back to the per-tenant default config server-side.
+    """
+    import httpx
+    import socket
+
+    try:
+        _hostname = socket.gethostname() or ""
+    except Exception:  # noqa: BLE001
+        _hostname = ""
+    headers = {"Authorization": f"Bearer {token}"}
+    if _hostname:
+        headers["X-Meridian-Hostname"] = _hostname
     async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(
-            f"{base_url}/me",
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        r = await client.get(f"{base_url}/me", headers=headers)
         r.raise_for_status()
         return r.json()
 
@@ -1829,8 +2238,68 @@ async def _proc_watchdog(
 # Local MCP config auto-update (.mcp.json / .cursor/mcp.json) — pure, unit tested
 # ---------------------------------------------------------------------------
 
-# Connector keys we inject; used for restore so we only touch our own entries.
-TUNNEL_MCP_KEYS = ("meridian-fs", "meridian-code", "meridian-extractor")
+# ef162c28 — Connector keys were historically named by transport SLOT
+# (meridian-fs / meridian-code / meridian-extractor). They now derive from the
+# PLUGIN behind each slot so the .mcp.json names read as what the connector
+# actually is: filesystem / codebase-memory / serena. The static slot→name map
+# below is the canonical source. We deliberately do NOT derive these from the
+# resolved plugin's ``name`` field: the plugin names are "filesystem" /
+# "code-intel" / "code-extractor", which would give the wrong labels for the
+# code and extract slots (codebase-memory-mcp rides "code"; Serena rides
+# "extract"). A hardcoded slot→name map is therefore the cleanest option and
+# avoids threading the plugin registry through these pure helpers. Known
+# limitation: a tenant who overrides the extract slot's command (e.g. back to
+# mcp-server-code-extractor) still gets the connector name "serena" — the name
+# tracks the slot's default implementation, not the live override.
+_TUNNEL_MCP_SLOT_NAMES = {
+    "fs": "filesystem",
+    "code": "codebase-memory",
+    "extract": "serena",
+}
+
+# The connector keys the CURRENT code injects (new, plugin-derived names).
+TUNNEL_MCP_KEYS = tuple(_TUNNEL_MCP_SLOT_NAMES.values())
+
+# ef162c28 — the legacy slot-named keys older tunnel builds wrote. Kept so the
+# migration on inject (drop stale duplicates) and the restore/cleanup path
+# (remove our entries on tunnel stop) both cover the old names as well as the
+# new ones. Existing users must not accumulate both meridian-fs AND filesystem
+# pointing at the same relay URL.
+_LEGACY_TUNNEL_MCP_KEYS = ("meridian-fs", "meridian-code", "meridian-extractor")
+
+# Keys that are unambiguously ours by NAME alone: the legacy slot names and the
+# custom-plugin prefix. No user names a server ``meridian-fs`` /
+# ``meridian-custom-*``, so seeing one is proof we wrote it.
+#
+# The NEW built-in names (``filesystem`` / ``codebase-memory`` / ``serena``) are
+# deliberately NOT in this set: a user may legitimately run their own server
+# called ``filesystem``. Such a key counts as ours ONLY when its URL also points
+# at our relay (see :func:`_is_our_mcp_entry`); otherwise it's the user's and we
+# suffix ours around it.
+_OWN_TUNNEL_MCP_KEYS_BY_NAME = frozenset(_LEGACY_TUNNEL_MCP_KEYS)
+
+
+def _is_our_mcp_entry(key: str, value: object, base_url: str, tenant_id: str) -> bool:
+    """Whether an existing ``mcpServers`` entry was written by this tunnel.
+
+    ef162c28 — ours if the key is a legacy slot name or a ``meridian-custom-*``
+    key (unambiguous by name), OR the entry's ``url`` points at this tenant's
+    relay/permanent tunnel URL (a connector a prior run wrote — even under a
+    new-name key like ``filesystem`` or a collision-suffixed key). A key that is
+    merely NAMED like one of our new built-ins but whose URL is NOT ours is the
+    USER's own server and must never be clobbered.
+    """
+    if key in _OWN_TUNNEL_MCP_KEYS_BY_NAME or key.startswith("meridian-custom-"):
+        return True
+    url = value.get("url") if isinstance(value, dict) else None
+    if not isinstance(url, str):
+        return False
+    ours = {
+        _permanent_url(base_url, tenant_id),
+        _permanent_code_url(base_url, tenant_id),
+        _permanent_extract_url(base_url, tenant_id),
+    }
+    return url in ours
 
 
 def _tunnel_mcp_entries(
@@ -1838,16 +2307,23 @@ def _tunnel_mcp_entries(
 ) -> dict[str, dict]:
     """The HTTP MCP connector entries pointing at this tenant's tunnel.
 
-    The three built-in slots point at the hosted relay URLs (claude.ai-reachable).
-    *custom* is the list of running user-defined plugins (``{"name", "port"}``);
-    each gets an entry keyed ``meridian-custom-<name>`` pointing at its LOCAL
-    mcp-proxy (``http://127.0.0.1:<port>/mcp``) — they are LOCAL-ONLY and have no
-    server route, so a co-located client reaches them directly, not via the relay.
+    ef162c28 — the three built-in slots are keyed by the plugin behind each slot
+    (``filesystem`` / ``codebase-memory`` / ``serena``, see
+    :data:`_TUNNEL_MCP_SLOT_NAMES`), pointing at the hosted relay URLs
+    (claude.ai-reachable). *custom* is the list of running user-defined plugins
+    (``{"name", "port"}``); each gets an entry keyed ``meridian-custom-<name>``
+    pointing at its LOCAL mcp-proxy (``http://127.0.0.1:<port>/mcp``) — they are
+    LOCAL-ONLY and have no server route, so a co-located client reaches them
+    directly, not via the relay.
+
+    Collision handling and legacy-key migration happen in
+    :func:`_inject_mcp_entries`, which sees the existing config; this function is
+    a pure name→url map and stays trivially unit-testable.
     """
     entries = {
-        "meridian-fs": {"type": "http", "url": _permanent_url(base_url, tenant_id)},
-        "meridian-code": {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
-        "meridian-extractor": {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
+        _TUNNEL_MCP_SLOT_NAMES["fs"]: {"type": "http", "url": _permanent_url(base_url, tenant_id)},
+        _TUNNEL_MCP_SLOT_NAMES["code"]: {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
+        _TUNNEL_MCP_SLOT_NAMES["extract"]: {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
     }
     for cp in custom or []:
         name = cp.get("name")
@@ -1875,11 +2351,49 @@ def _mcp_json_paths(cwd: "str | Path") -> list["Path"]:
     return paths
 
 
-def _inject_mcp_entries(text: "str | None", entries: dict[str, dict]) -> str:
+def _unique_mcp_key(desired: str, taken: "set[str]") -> str:
+    """A connector key not already in *taken*, derived from *desired*.
+
+    ef162c28 — on collision with a user's own server we append ``-meridian``,
+    then ``-meridian-2``, ``-meridian-3`` … so we never clobber their entry.
+    """
+    if desired not in taken:
+        return desired
+    candidate = f"{desired}-meridian"
+    n = 2
+    while candidate in taken:
+        candidate = f"{desired}-meridian-{n}"
+        n += 1
+    return candidate
+
+
+def _inject_mcp_entries(
+    text: "str | None",
+    entries: dict[str, dict],
+    base_url: str = "",
+    tenant_id: str = "",
+) -> str:
     """Merge *entries* under ``mcpServers`` in an existing `.mcp.json` body.
 
     *text* is the current file content (``None``/empty for a new file). Existing
     servers and other top-level keys are preserved. Returns the new file text.
+
+    ef162c28 — three behaviours layered on the plain merge:
+
+    * **Legacy migration:** any of our *legacy* slot-named keys
+      (``meridian-fs`` / ``meridian-code`` / ``meridian-extractor``) already in
+      the file are removed before we write the new plugin-named entries, so
+      resuming users don't accumulate stale duplicates pointing at the same URL.
+      Our *new* keys are simply overwritten with the current URL.
+    * **Collision handling:** if the file has a key matching one of our incoming
+      built-in names (e.g. the user runs their OWN ``filesystem`` server) that
+      is NOT ours, we write under a suffixed key (``filesystem-meridian``, …)
+      and leave the user's entry untouched.
+    * Custom (``meridian-custom-*``) keys are always ours — overwritten in place.
+
+    *base_url*/*tenant_id* enable ours-vs-theirs detection by URL (a connector a
+    prior run wrote under a suffixed key). Both default to "" for callers that
+    only merge already-unique entries (e.g. simple unit tests).
     """
     data = {}
     if text:
@@ -1892,7 +2406,20 @@ def _inject_mcp_entries(text: "str | None", entries: dict[str, dict]) -> str:
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
         servers = {}
-    servers.update(entries)
+
+    # 1. Migration + de-dup: drop every entry that is OURS (legacy slot names,
+    #    prior new-name writes, custom keys, or any URL pointing at our relay).
+    #    We rebuild them fresh below, so this prevents stale duplicates and lets
+    #    collision detection see only the USER's remaining servers.
+    for key in list(servers):
+        if _is_our_mcp_entry(key, servers.get(key), base_url, tenant_id):
+            del servers[key]
+
+    # 2. Merge our entries, suffixing on collision with a user-owned key.
+    for desired, entry in entries.items():
+        key = _unique_mcp_key(desired, set(servers))
+        servers[key] = entry
+
     data["mcpServers"] = servers
     return json.dumps(data, indent=2) + "\n"
 
@@ -1918,21 +2445,79 @@ def _install_mcp_json(
         original = path.read_text(encoding="utf-8") if existed else None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(_inject_mcp_entries(original, entries), encoding="utf-8")
+            path.write_text(
+                _inject_mcp_entries(original, entries, base_url, tenant_id),
+                encoding="utf-8",
+            )
             snapshots.append((path, original))
         except Exception as exc:  # noqa: BLE001
             print(f"  warning: could not update {path}: {exc}", file=sys.stderr, flush=True)
     return snapshots
 
 
-def _restore_mcp_json(snapshots: list[tuple["Path", "str | None"]]) -> None:
-    """Undo :func:`_install_mcp_json`: restore originals, delete files we created."""
+def _strip_our_mcp_entries(
+    text: "str | None", base_url: str = "", tenant_id: str = "",
+) -> "str | None":
+    """Remove every connector entry that is OURS from a `.mcp.json` body.
+
+    ef162c28 — used on restore to guarantee neither the LEGACY slot names
+    (``meridian-fs`` / ``meridian-code`` / ``meridian-extractor``) nor the NEW
+    plugin names (``filesystem`` / ``codebase-memory`` / ``serena``), nor any
+    ``meridian-custom-*`` key, nor a suffixed key whose URL points at our relay,
+    survives after the tunnel stops.
+
+    Returns the re-serialized cleaned text WHEN something of ours was removed, or
+    ``None`` when there was nothing of ours to strip (``None``/unparseable input,
+    or a body that already contained none of our keys). ``None`` tells the caller
+    to keep the original text byte-for-byte — so a user's file we never touched
+    is restored exactly, not reformatted by ``json.dumps``.
+    """
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:  # noqa: BLE001 — malformed → keep original verbatim
+        return None
+    if not isinstance(data, dict):
+        return None
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return None
+    removed = False
+    for key in list(servers):
+        if _is_our_mcp_entry(key, servers.get(key), base_url, tenant_id):
+            del servers[key]
+            removed = True
+    if not removed:
+        return None
+    data["mcpServers"] = servers
+    return json.dumps(data, indent=2) + "\n"
+
+
+def _restore_mcp_json(
+    snapshots: list[tuple["Path", "str | None"]],
+    base_url: str = "",
+    tenant_id: str = "",
+) -> None:
+    """Undo :func:`_install_mcp_json`: restore originals, delete files we created.
+
+    ef162c28 — before restoring an original that we merged into, strip any of
+    OUR connector entries (legacy + new + custom) from it. Normally the original
+    had none of ours, so :func:`_strip_our_mcp_entries` returns ``None`` and we
+    write the original text BYTE-FOR-BYTE (no json.dumps reformatting). But if a
+    prior tunnel crashed and left stale ``meridian-fs``/etc. entries in the file
+    we snapshotted, those are stripped so we never resurrect them. Files we
+    CREATED (original is ``None``) are deleted outright.
+    """
     for path, original in snapshots:
         try:
             if original is None:
                 path.unlink(missing_ok=True)
             else:
-                path.write_text(original, encoding="utf-8")
+                cleaned = _strip_our_mcp_entries(original, base_url, tenant_id)
+                path.write_text(
+                    cleaned if cleaned is not None else original, encoding="utf-8"
+                )
         except Exception:  # noqa: BLE001 — best-effort cleanup
             pass
 
@@ -1965,6 +2550,13 @@ async def run_tunnel(
     _force_utf8_io()
     # Resolve base_url first — it's the cache key for the stored token.
     base_url = _resolve_base_url(base_url)
+    # b970fe07 — remember whether the caller explicitly set repo_path / code_dirs
+    # on the CLI *before* we default repo_path to cwd. When a flag is absent, a
+    # dashboard-configured value (serena_repo_path / codebase_code_dirs, fetched
+    # below) may fill it in; when a flag IS present, the CLI always wins and the
+    # config is ignored — so an unset config reproduces today's exact behaviour.
+    _repo_path_from_cli = bool(repo_path)
+    _code_dirs_from_cli = bool(code_dirs)
     repo_path = str(Path(repo_path or Path.cwd()).resolve())
 
     # Token priority: --token / env vars > cached token > browser auth flow.
@@ -2062,7 +2654,37 @@ async def run_tunnel(
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
     # known_repo_paths are trust anchors for silent auto-add (b9d1b606).
-    fs_roots, known_repo_paths = await _fetch_filesystem_roots(base_url, token)
+    # b970fe07 — also fetch the dashboard-configured Serena default repo path and
+    # code-intel index dirs (extract/code slots), consumed fall-back-safe below.
+    fs_roots, known_repo_paths, cfg_serena_repo_path, cfg_code_dirs = (
+        await _fetch_filesystem_roots(base_url, token)
+    )
+    # b970fe07 — Serena's default --project. The CLI --repo always wins; only when
+    # it was absent (repo_path defaulted to cwd) does a configured serena_repo_path
+    # take over. Unset config → serena_repo_path stays == repo_path (today's cwd
+    # default, unchanged behaviour).
+    serena_repo_path = repo_path
+    if not _repo_path_from_cli and cfg_serena_repo_path:
+        cfg_serena_repo_path = _normalize_path_arg(cfg_serena_repo_path)
+        try:
+            serena_repo_path = str(Path(cfg_serena_repo_path).resolve())
+            print(
+                f"  code-extractor:    Serena default repo from dashboard config: "
+                f"{serena_repo_path}",
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 — bad config path → keep the cwd default
+            serena_repo_path = repo_path
+    # b970fe07 — code-intel auto-index dirs. --code-dir always wins; only when it
+    # was absent does the configured codebase_code_dirs fill in. Unset config →
+    # code_dirs stays as passed (today's behaviour: no auto-index unless flagged).
+    if not _code_dirs_from_cli and cfg_code_dirs:
+        code_dirs = list(cfg_code_dirs)
+        print(
+            f"  code-intel:        auto-index dirs from dashboard config: "
+            f"{', '.join(code_dirs)}",
+            flush=True,
+        )
     # cbbd0eb4 — extra --repo paths (after the first) become additional fs roots,
     # resolved + deduped onto the front so the connector serves exactly the dirs
     # the user named (and the active repo_path) — not a broad parent dir.
@@ -2119,6 +2741,13 @@ async def run_tunnel(
         )
         _served = ", ".join(fs_roots) if fs_roots else repo_path
         print(f"meridian tunnel: serving {_served}", flush=True)
+        # 59c0e609 — surface roots the inner filesystem server will silently drop
+        # (missing dir / Windows space-in-path) so a "served 2 of 3" is diagnosable.
+        for _r, _why in _unservable_roots(fs_roots if fs_override is None else None):
+            print(
+                f"  filesystem: WARNING configured root will NOT be served — {_r} ({_why})",
+                flush=True, file=sys.stderr,
+            )
         print(f"  filesystem:        lazy-spawn on port {fs_port}", flush=True)
         proxy_fs = SlotProxy(cmd_fs, fs_port, "fs")
         slot_proxies.append(proxy_fs)
@@ -2142,6 +2771,19 @@ async def run_tunnel(
             if managed_bin not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = managed_bin + os.pathsep + os.environ.get("PATH", "")
             cmd_code = _build_code_proxy_command(npx, code_binary, code_port)
+            # 89bc72c4 — the command builder makes a spaced binary path safe for
+            # cmd.exe via its 8.3 short name. If the resolved inner token STILL
+            # contains a space (8.3 generation disabled on the volume), the slot
+            # would hit WinError 3 on spawn — warn so it's diagnosable rather than
+            # a silent dead dot. Mirrors the FS slot's _unservable_roots warning.
+            if sys.platform == "win32" and " " in cmd_code[-1]:
+                print(
+                    "  code-intel: WARNING binary path contains a space and no 8.3 "
+                    f"short name was available — {cmd_code[-1]!r}. The slot may fail "
+                    "to launch (cmd.exe splits on spaces). Install codebase-memory-mcp "
+                    "under a space-free path, or enable 8.3 name generation.",
+                    flush=True, file=sys.stderr,
+                )
             print(f"  code-intel:        lazy-spawn on port {code_port}", flush=True)
             proxy_code = SlotProxy(cmd_code, code_port, "code")
             slot_proxies.append(proxy_code)
@@ -2162,7 +2804,9 @@ async def run_tunnel(
             # single fixed --project instance, so executor sessions touching other
             # repos no longer hit Serena's "outside configured workspaces" error.
             serena_pool = SerenaDaemonPool(
-                default_repo_path=repo_path,
+                # b970fe07 — dashboard serena_repo_path fills this in when --repo
+                # was not passed; otherwise it's the CLI repo_path (== cwd default).
+                default_repo_path=serena_repo_path,
                 spawn=lambda cmd: subprocess.Popen(cmd, **_spawn_kwargs()),
             )
             print(
@@ -2200,10 +2844,7 @@ async def run_tunnel(
         if not cmd:
             continue
         oport = office_ports[slot]
-        plugin_env = plugin.get("env") or {}
-        spawn_env = None
-        if plugin_env:
-            spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
+        spawn_env = _plugin_spawn_env(plugin.get("env"))
         # 4ea1b9d5 — persistent slots omit --stateless so their inner process
         # keeps state across requests (DC terminal sessions).
         _persistent = plugin.get("session_mode") == "persistent"
@@ -2231,16 +2872,30 @@ async def run_tunnel(
         if not cmd_inner:
             continue
         cmd_custom = _build_proxy_for_inner(npx, list(cmd_inner), cport)
+        # 194a7776 — merge the plugin's optional env over the parent env at spawn
+        # (e.g. a local Zotero MCP needs ZOTERO_LOCAL=true). None inherits parent.
+        spawn_env = _plugin_spawn_env(cp.get("env"))
         print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
         try:
-            proc_custom = subprocess.Popen(cmd_custom, **_spawn_kwargs())
-            proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": None, "label": f"custom:{cname}"})
+            proc_custom = subprocess.Popen(cmd_custom, env=spawn_env, **_spawn_kwargs())
+            proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": spawn_env, "label": f"custom:{cname}"})
             running_custom.append({"name": cname, "port": cport})
         except Exception as exc:
             print(f"  warning: could not start custom plugin {cname!r}: {exc}", file=sys.stderr)
 
     # 5. Print permanent URLs.
     print("", flush=True)
+    # Best-effort update nudge: the server reports its version in /me (already
+    # fetched above). Fully fail-open — a missing/unparseable version, or any
+    # exception, silently skips the notice and never blocks the tunnel.
+    try:
+        _srv_ver = me.get("server_version")
+        if _srv_ver:
+            _notice = _update_notice(__version__, str(_srv_ver))
+            if _notice:
+                print(_notice, flush=True)
+    except Exception:  # noqa: BLE001 — informational only, never block startup
+        pass
     print("  Tunnel URLs (for Cursor / non-claude.ai clients only):", flush=True)
     if proxy_fs is not None:
         print(f"    Filesystem:      {_permanent_url(base_url, tenant_id)}", flush=True)
@@ -2256,6 +2911,11 @@ async def run_tunnel(
     if proxy_fs is not None:
         print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print(f"  Proxies start on first use; idle for >{_IDLE_KILL_SECONDS // 60}min → auto-kill + restart.", flush=True)
+    # First-run orientation: where npx/uvx drop downloaded MCP packages.
+    try:
+        _print_package_cache_locations()
+    except Exception:  # noqa: BLE001 — informational only, never block startup
+        pass
     print("", flush=True)
 
     # 5b. Auto-update local MCP client config.
@@ -2270,8 +2930,11 @@ async def run_tunnel(
         _custom_conns = "".join(
             f", meridian-custom-{cp['name']}" for cp in running_custom
         )
+        # ef162c28 — connectors are now named by the plugin behind each slot
+        # (filesystem / codebase-memory / serena) rather than by transport slot.
+        _builtin_conns = ", ".join(TUNNEL_MCP_KEYS)
         print(
-            "    added connectors: meridian-fs, meridian-code, meridian-extractor"
+            f"    added connectors: {_builtin_conns}"
             f"{_custom_conns} (removed on Ctrl+C)",
             flush=True,
         )
@@ -2289,9 +2952,12 @@ async def run_tunnel(
             await proxy.ensure_running()
             if proxy.is_running:
                 await _index_code_dir(proxy.port, code_dir)
-        for d in code_dirs:
+        for _d in (code_dirs or []):
+            _d = _normalize_path_arg(_d)
+            if not _d:
+                continue
             index_tasks.append(
-                asyncio.ensure_future(_lazy_index(proxy_code, str(Path(d).resolve())))
+                asyncio.ensure_future(_lazy_index(proxy_code, str(Path(_d).resolve())))
             )
 
     # 7. Run lazy reconnect loops — one per enabled slot. Each loop also gets an
@@ -2331,7 +2997,9 @@ async def run_tunnel(
         # single SlotProxy + idle-killer.
         tasks.append(asyncio.ensure_future(
             _reconnect_loop_extract_pool(
-                ws_extract, serena_pool, repo_path, "extract",
+                # b970fe07 — match the pool's default_repo_path (serena_repo_path,
+                # which is the CLI repo_path unless a dashboard config overrode it).
+                ws_extract, serena_pool, serena_repo_path, "extract",
                 tool_prefix=slot_prefixes.get("extract"),
             )
         ))
@@ -2384,7 +3052,7 @@ async def run_tunnel(
                 pass
         # Restore local MCP config before killing processes.
         if mcp_snapshots:
-            _restore_mcp_json(mcp_snapshots)
+            _restore_mcp_json(mcp_snapshots, base_url, tenant_id)
             print("  Restored local MCP config (removed tunnel connectors).", flush=True)
         for t in tasks + index_tasks:
             t.cancel()

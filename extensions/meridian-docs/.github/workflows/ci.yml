@@ -1,0 +1,28 @@
+# CI skeleton for the standalone meridian-docs package. Active once this
+# directory becomes its own GitHub repo (meridianmcp/meridian-docs); in the
+# monorepo it is not wired to the root CI.
+name: meridian-docs CI
+
+on:
+  push:
+    paths:
+      - "extensions/meridian-docs/**"
+  pull_request:
+    paths:
+      - "extensions/meridian-docs/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/meridian-docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install .
+      - name: Import smoke test
+        run: python -c "import meridian_docs, meridian_docs.docs_intel, meridian_docs.server; print(meridian_docs.__version__)"

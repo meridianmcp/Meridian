@@ -20,7 +20,7 @@ router = APIRouter()
 @router.get("/admin/health")
 async def admin_health_json(request: Request) -> dict[str, Any]:
     """JSON health check for ops/curl — restricted to admin users."""
-    from ..hosted import get_current_tenant, is_admin_db, check_admin_password  # noqa: PLC0415
+    from ..hosted import get_current_tenant, is_admin_db, check_admin_password, provisioning_health  # noqa: PLC0415
     try:
         tenant = await get_current_tenant(request)
     except HTTPException:
@@ -65,6 +65,87 @@ async def admin_health_json(request: Request) -> dict[str, Any]:
         "tasks_today": tasks_today,
         "sprint_pending": sprint_pending,
         "hosted_mode": _hosted_mode(),
+        "pending_provisions": (await provisioning_health(db)).get("pending_provisions"),
+    }
+
+
+@router.get("/health/deep")
+async def health_deep(request: Request) -> JSONResponse:
+    """4c559d4e — deep health probe for post-deploy checks + external monitoring.
+    Public, but reveals only booleans/counts (no secrets): DB reachability, hosted
+    mode, version, and the provisioning-queue backlog. 503 if the DB is
+    unreachable so a load balancer / deploy gate can fail fast."""
+    from ..hosted import provisioning_health  # noqa: PLC0415
+    db = request.app.state.db
+    db_ok = False
+    try:
+        async with db.execute("SELECT 1") as cur:
+            await cur.fetchone()
+        db_ok = True
+    except Exception:  # noqa: BLE001
+        db_ok = False
+    try:
+        prov = await provisioning_health(db)
+    except Exception:  # noqa: BLE001
+        prov = {"pending_provisions": None}
+    try:
+        from meridian.server import _REPO_ROOT  # noqa: PLC0415
+        import re as _re
+        ver_text = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        ver_m = _re.search(r'version\s*=\s*"([^"]+)"', ver_text)
+        version = ver_m.group(1) if ver_m else "unknown"
+    except Exception:  # noqa: BLE001
+        version = "unknown"
+    return JSONResponse(
+        {
+            "ok": db_ok,
+            "db": db_ok,
+            "hosted_mode": _hosted_mode(),
+            "version": version,
+            "pending_provisions": prov.get("pending_provisions"),
+        },
+        status_code=200 if db_ok else 503,
+    )
+
+
+@router.get("/admin/stats")
+async def admin_stats_json(request: Request) -> dict[str, Any]:
+    """d1cb1100 — launch/user stats for the admin Users widget: free-tier count
+    vs the launch cap (+ percent), total tenants, provisioned count, waitlist."""
+    from ..hosted import (  # noqa: PLC0415
+        get_current_tenant, is_admin_db, check_admin_password, _cfg,
+    )
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="not authenticated")
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        raise HTTPException(status_code=403, detail="admin only")
+    if not check_admin_password(request):
+        raise HTTPException(status_code=403, detail="admin password required")
+
+    db = request.app.state.db
+
+    async def _count(sql: str) -> int:
+        async with db.execute(sql) as cur:
+            row = await cur.fetchone()
+        return (row[0] if row else 0) or 0
+
+    free_count = await db_module.count_tenants_by_plan(db, "free", provisioned_only=True)
+    cap = int(_cfg("MERIDIAN_FREE_LAUNCH_CAP", "1000") or "1000")
+    total_tenants = await _count("SELECT COUNT(*) FROM tenants")
+    provisioned = await _count(
+        "SELECT COUNT(*) FROM tenants "
+        "WHERE neon_project_id IS NOT NULL OR neon_db_url IS NOT NULL"
+    )
+    waitlist = len(await db_module.get_waitlist(db))
+    return {
+        "free_count": free_count,
+        "cap": cap,
+        "percent": round(100.0 * free_count / cap, 1) if cap else 0.0,
+        "total_tenants": total_tenants,
+        "provisioned": provisioned,
+        "waitlist": waitlist,
     }
 
 

@@ -30,6 +30,7 @@ from pathlib import Path
 from ._deps import (
     _VERSION,
     _ASSET_VERSION,
+    _BUNDLE_HASH,
     _GIT_SHA,
     _resource_path,
     _templates,
@@ -284,15 +285,51 @@ async def _keepalive_connected_sessions(db, now=None, ttl_s=SESSION_KEEPALIVE_TT
     return fresh
 
 
-async def _run_session_keepalive_loop(db) -> None:
+async def _keepalive_tunnel_sessions(app) -> list:
+    """4b698ea5 — passive, tool-independent liveness pass.
+
+    For every tenant that currently holds a live tunnel WebSocket, refresh the
+    ``last_seen`` of that tenant's most-recently-active session. The liveness
+    proof is the open socket (the local ``meridian --tunnel`` binary is running),
+    so this keeps a busy executor's session fresh even across long stretches of
+    NON-Meridian work (reading files, thinking, running tests) that touch no
+    Meridian tool. Not circular: it renews off socket-liveness, not off
+    ``last_seen``.
+
+    Split out from the loop so a single tick can be driven from tests. No-op
+    (returns []) when ``app`` is None (self-host stdio, which has no tunnels)."""
+    if app is None:
+        return []
+    try:
+        from .routes import tunnel as _tunnel_mod  # noqa: PLC0415
+        return await _tunnel_mod.keepalive_tunnel_sessions(app)
+    except Exception:  # noqa: BLE001 — a failed sweep must not kill the loop
+        return []
+
+
+async def _run_session_keepalive_loop(db, app=None) -> None:
     """Periodically refresh connected sessions. Started by both the FastAPI
     lifespan (hosted/HTTP clients) and the stdio entrypoint (local clients) so
     a busy session never looks dead to a coordinating one regardless of how it
-    connected."""
+    connected.
+
+    ``app`` (4b698ea5) — the FastAPI app, passed on the hosted path so each tick
+    can also run the tunnel-liveness pass (touch the live session of every tenant
+    holding an open tunnel socket). None on the self-host stdio path, where there
+    are no tunnels."""
     while True:
         try:
             await asyncio.sleep(SESSION_KEEPALIVE_INTERVAL_S)
             await _keepalive_connected_sessions(db)
+            await _keepalive_tunnel_sessions(app)
+            # 56cd8712 — release the semantic model if it has gone idle, so the
+            # ~90MB isn't pinned on a quiet box after a single escalation. No-op
+            # when semantic is off / no model loaded; import is lazy + guarded.
+            try:
+                from . import semantic_search as _sem  # noqa: PLC0415
+                _sem.maybe_idle_unload()
+            except Exception:  # noqa: BLE001 — best-effort; never break the loop
+                pass
         except asyncio.CancelledError:
             break
         except Exception:  # noqa: BLE001 — never let the loop die
@@ -352,6 +389,24 @@ async def lifespan(app: FastAPI):
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         db = await db_module.init_db(db_path)
     app.state.db = db
+
+    # 1d69d5d9 — seed workspace_settings from meridian.toml on first boot so the
+    # 46c83e55 toml keys actually take effect (self-host). Guarded; no-op when a
+    # settings row already exists or no toml/env config is present.
+    await db_module.seed_workspace_settings_from_toml(db)
+
+    # c00b1ccf — wire the offline codebase-graph-snapshot searcher into handoff
+    # code-pointer enrichment. Fallback used when generate_handoff isn't handed a
+    # live tunnel searcher; it reads the persisted snapshot so a fresh session
+    # still gets code pointers. Fully guarded + degrades to [].
+    try:
+        from . import handoff as _handoff_mod  # noqa: PLC0415
+        from .graph_snapshot import make_snapshot_searcher as _mk_snap_searcher  # noqa: PLC0415
+        _handoff_mod.set_graph_searcher_resolver(
+            lambda pid: _mk_snap_searcher(db, pid)
+        )
+    except Exception:  # noqa: BLE001 — never block startup on enrichment wiring
+        pass
 
     # Per-tenant neon_db_url re-key (security item 3dbe23e3). NO-OP unless
     # MERIDIAN_MASTER_SECRET is set — so this is a zero-behavior-change deploy
@@ -424,6 +479,30 @@ async def lifespan(app: FastAPI):
                 "MERIDIAN_DEMO=true but MERIDIAN_DEMO_DB_URL not set — "
                 "using in-memory SQLite demo DB. Set MERIDIAN_DEMO_DB_URL for persistence."
             )
+
+    # 9ee6d2ec — tiered document-structure store. Open a DEFAULT store on the
+    # self-hosted / solo path (local SQLite sidecar next to the main DB, or the
+    # MERIDIAN_DOC_STORE_URL override). Fully guarded: a failure here must NEVER
+    # block startup — the stateless get_document_structure / get_latex_structure
+    # parse tools keep working with app.state.doc_store = None. Per-tenant cloud
+    # stores (pro/admin) are opened lazily at ingest time via open_doc_store_for.
+    app.state.doc_store = None
+    try:
+        from .doc_store import open_doc_store_for  # noqa: PLC0415
+        app.state.doc_store = await open_doc_store_for(
+            plan=None,
+            hosted=_hosted_mode(),
+            data_dir=str(data_dir),
+            tenant_pg_url=None,
+            override_url=os.environ.get("MERIDIAN_DOC_STORE_URL"),
+        )
+    except Exception:  # noqa: BLE001 — structure persistence is best-effort
+        import logging as _ds_log  # noqa: PLC0415
+        _ds_log.getLogger(__name__).warning(
+            "document-structure store failed to open; continuing without it",
+            exc_info=True,
+        )
+        app.state.doc_store = None
 
     # v0.4.2 — periodic auto-summary task. Interval comes from env so
     # tests can run it on a sub-second cadence; default is ten minutes.
@@ -539,7 +618,7 @@ async def lifespan(app: FastAPI):
         for rel in [
             "meridian/server.py",
             "meridian/db.py",
-            "meridian/static/dashboard.js",
+            "meridian/static/dashboard.ts",
         ]:
             try:
                 h.update(Path(rel).read_bytes())
@@ -563,7 +642,7 @@ async def lifespan(app: FastAPI):
     version_task = asyncio.create_task(_version_check_loop())
     app.state.version_task = version_task
 
-    keepalive_task = asyncio.create_task(_run_session_keepalive_loop(db))
+    keepalive_task = asyncio.create_task(_run_session_keepalive_loop(db, app))
     app.state.keepalive_task = keepalive_task
 
     # 57f7f7ba — autonomous dispatcher daemon.
@@ -610,6 +689,23 @@ async def lifespan(app: FastAPI):
                 await _disp.stop()
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # 9ee6d2ec — close ALL document-structure stores alongside demo_db, before
+        # the main DB. Called UNCONDITIONALLY (not gated on app.state.doc_store):
+        # close_all_doc_stores() closes every cached store, including per-tenant
+        # cloud stores opened lazily at ingest time, so none leak even if the
+        # default store never opened. Guarded: a close error must not mask
+        # shutdown of the main connection.
+        try:
+            from .doc_store import close_all_doc_stores  # noqa: PLC0415
+            await close_all_doc_stores()
+        except Exception:  # noqa: BLE001 — shutdown best-effort
+            pass
+        _demo_db = getattr(app.state, "demo_db", None)
+        if _demo_db is not None and _demo_db is not db:
+            try:
+                await _demo_db.close()
+            except Exception:  # noqa: BLE001 — shutdown best-effort
+                pass
         await db.close()
 
 
@@ -625,6 +721,7 @@ app = FastAPI(
 # Include these BEFORE middleware so route matching is registered correctly.
 # ---------------------------------------------------------------------------
 from .routes.notes import router as _notes_router            # noqa: E402
+from .routes.insights import router as _insights_router      # noqa: E402
 from .routes.hitl import router as _hitl_router              # noqa: E402
 from .routes.sprint import router as _sprint_router          # noqa: E402
 from .routes.sessions import router as _sessions_router      # noqa: E402
@@ -648,6 +745,7 @@ from .routes.a2a import router as _a2a_router                # noqa: E402
 
 app.include_router(_oauth_router)
 app.include_router(_notes_router)
+app.include_router(_insights_router)
 app.include_router(_hitl_router)
 app.include_router(_sprint_router)
 app.include_router(_sessions_router)
@@ -696,13 +794,48 @@ button{{width:100%;margin-top:14px;padding:11px;background:#6c8fff;border:none;b
 <input type="password" name="password" autofocus placeholder="Enter preview password">
 {err}<button type="submit">Continue</button></form></div></body></html>"""
 
+# 95499c3e / decision 6fe5210c — Option A: airtight per-request project-scope
+# enforcement. Matches a /projects/{uuid} or /projects/{uuid}/... path so we only
+# gate by-ID project access (not the /projects listing or /projects/by-name lookup).
+_PROJECT_ID_PATH_RE = re.compile(
+    r"^/projects/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)"
+)
+
+
+@app.middleware("http")
+async def project_scope_enforcement(request: Request, call_next):
+    """95499c3e / decision 6fe5210c — a project-scoped workspace member is 403'd on
+    any project outside their scope, even by direct ID (not just hidden from
+    listings). Workspace-wide members and the tenant owner are unaffected.
+
+    This is the single chokepoint for every ``/projects/{uuid}/*`` HTTP route —
+    routes scatter ``get_project`` calls with no shared dependency, so enforcing
+    here covers them all at once. Returns 403 (not 404) so existence isn't leaked.
+    The MCP dispatch layer enforces the same rule separately (see /mcp).
+    """
+    m = _PROJECT_ID_PATH_RE.match(request.url.path)
+    if m is not None:
+        from ._deps import _scoped_project_ids_for_request  # noqa: PLC0415
+        try:
+            scoped = await _scoped_project_ids_for_request(request)
+        except Exception:  # noqa: BLE001 — a scope-check failure must never 500 a request
+            scoped = None
+        if scoped is not None and m.group(1) not in scoped:
+            return JSONResponse(
+                {"detail": "Project is outside your access scope."},
+                status_code=403,
+            )
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def site_password_gate(request: Request, call_next):
     site_pw = os.environ.get("SITE_PASSWORD", "")
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/setup/health", "/static", "/sw.js", "/manifest.webmanifest", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -1233,7 +1366,22 @@ async def landing_page(request: Request) -> HTMLResponse:
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
 async def robots_txt() -> str:
-    return "User-agent: *\nAllow: /\nSitemap: https://usemeridian.us/sitemap.xml"
+    # 71c70308 — search crawlers welcome; AI/LLM training + scraping crawlers are
+    # disallowed. Compliance is voluntary, but this documents intent and the
+    # well-behaved ones honor it. Pairs with the noai/noarchive landing meta tags.
+    _ai_bots = (
+        "GPTBot", "OAI-SearchBot", "ChatGPT-User", "ClaudeBot", "anthropic-ai",
+        "Claude-Web", "CCBot", "Google-Extended", "PerplexityBot", "Amazonbot",
+        "Bytespider", "meta-externalagent", "Applebot-Extended", "cohere-ai",
+        "Diffbot", "ImagesiftBot", "Omgilibot", "FriendlyCrawler",
+    )
+    blocks = "\n\n".join(f"User-agent: {b}\nDisallow: /" for b in _ai_bots)
+    return (
+        "# Search crawlers welcome; AI/LLM training crawlers are not (71c70308).\n"
+        "User-agent: *\nAllow: /\n\n"
+        f"{blocks}\n\n"
+        "Sitemap: https://usemeridian.us/sitemap.xml\n"
+    )
 
 
 @app.get("/favicon.ico")
@@ -1246,6 +1394,54 @@ async def favicon() -> Response:
     tags already point modern browsers at /static/logo.svg.)
     """
     return RedirectResponse(url="/static/logo.svg", status_code=301)
+
+
+# ---------------------------------------------------------------------------
+# b03be6a6 — Minimal installable PWA (manifest + service worker).
+#
+# The service worker's scope is limited to the directory it is served from, so
+# to control /dashboard it MUST be served at the ROOT (/sw.js → scope "/"). The
+# static mount lives at /static, whose scope would only cover /static/*, so we
+# expose sw.js and the manifest via explicit root routes here. The underlying
+# files live in meridian/static/ alongside the rest of the assets.
+#
+# The SW itself is deliberately NETWORK-FIRST (see sw.js) so dashboard edits show
+# up on next open with no rebuild/republish. These routes send no-cache headers
+# too, so a fresh sw.js is always fetched.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/sw.js")
+async def service_worker() -> Response:
+    """b03be6a6 — serve the PWA service worker at the site root.
+
+    Root scope ("/") is required so the worker can control /dashboard. The
+    ``Service-Worker-Allowed: /`` header is belt-and-suspenders; serving from /
+    already yields root scope. Sent no-cache so the network-first SW itself is
+    never pinned to a stale version.
+    """
+    from fastapi.responses import FileResponse  # noqa: PLC0415
+
+    return FileResponse(
+        _resource_path("meridian/static/sw.js"),
+        media_type="text/javascript",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Service-Worker-Allowed": "/",
+        },
+    )
+
+
+@app.get("/manifest.webmanifest")
+async def web_manifest() -> Response:
+    """b03be6a6 — serve the web app manifest at the site root (PWA installability)."""
+    from fastapi.responses import FileResponse  # noqa: PLC0415
+
+    return FileResponse(
+        _resource_path("meridian/static/manifest.webmanifest"),
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 @app.get("/sitemap.xml")
@@ -1646,6 +1842,7 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     if tenant is None:
         return {}
     from .hosted import _admin_emails
+    from . import __version__ as _meridian_version
     from datetime import datetime, timezone
     plan = tenant.get("plan") or "standard"
     expires_raw = tenant.get("inactivity_expires_at")
@@ -1659,14 +1856,42 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
             expired = delta.total_seconds() <= 0
         except ValueError:
             pass
+    # 509d9de1 — free/trial users who haven't created a project yet have no
+    # inactivity_expires_at, so the banner showed "limited time" with no number.
+    # Fall back to a 30-day window anchored on trial_started_at (or the tenant's
+    # created_at) so an actual day count always renders. Display-only.
+    if days_remaining is None and plan in ("free", "trial"):
+        _anchor = tenant.get("trial_started_at") or tenant.get("created_at")
+        if _anchor:
+            try:
+                _anchor_dt = datetime.strptime(
+                    str(_anchor)[:19], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+                _elapsed = (datetime.now(timezone.utc) - _anchor_dt).days
+                days_remaining = max(0, 30 - _elapsed)
+            except (ValueError, TypeError):
+                pass
     # G2.10 — internal tenants never see the "expired" / "days remaining"
     # banner. The lifecycle jobs already skip them, but a positive UX cue
     # is cleaner than leaving the expired flag set with no consequence.
     if tenant.get("is_internal"):
         expired = False
         days_remaining = None
+    # 8660d701 — per-machine tunnel config. The client sends its hostname; resolve
+    # that machine's config (or the per-tenant default for unconfigured machines).
+    from .tunnel_plugins import resolve_plugins, select_host_config
+    _me_hostname = (request.headers.get("X-Meridian-Hostname") or "").strip() or None
+    _me_eff_cfg = select_host_config(
+        _parsed_tunnel_plugins(tenant.get("tunnel_plugins")),
+        tenant.get("tunnel_plugins_by_host"),
+        _me_hostname,
+    )
     return {
         "plan": plan,
+        # Tunnel client reads this to nudge an upgrade when it's behind the
+        # deployed server (see tunnel_client._update_notice). Single source:
+        # meridian.__version__.
+        "server_version": _meridian_version,
         "email": tenant.get("email", ""),
         "trial_started_at": tenant.get("trial_started_at"),
         "inactivity_expires_at": expires_raw,
@@ -1686,11 +1911,15 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         # Resolved tunnel plugin registry (3-slot model) — the client spawns
         # whatever is enabled here, applying any per-tenant command/port
         # overrides over the built-in defaults. NULL config → built-in defaults.
-        "tunnel_plugins": _resolved_tunnel_plugins(tenant.get("tunnel_plugins")),
+        # 8660d701 — per-machine config: the tunnel client sends X-Meridian-Hostname,
+        # so we resolve THIS machine's config from tunnel_plugins_by_host (falling
+        # back to the per-tenant default). Different machines, different software.
+        "tunnel_plugins": resolve_plugins(_me_eff_cfg),
         # Raw per-tenant overrides so the client can re-resolve locally with
         # binary-detection (auto-enabling Office slots) while still honouring any
         # explicit enabled setting the user saved.
-        "tunnel_plugins_config": _parsed_tunnel_plugins(tenant.get("tunnel_plugins")),
+        "tunnel_plugins_config": _me_eff_cfg,
+        "tunnel_hostname": _me_hostname,
     }
 
 
@@ -2207,6 +2436,7 @@ async def dashboard_html(request: Request) -> Any:
         {
             "version": _VERSION,
             "asset_version": _ASSET_VERSION,
+            "bundle_hash": _BUNDLE_HASH,
             "demo_mode": False,
             "hosted_mode": os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes"),
             "is_admin": is_admin,
@@ -2245,6 +2475,7 @@ async def demo_dashboard(request: Request) -> Any:
         {
             "version": _VERSION,
             "asset_version": _ASSET_VERSION,
+            "bundle_hash": _BUNDLE_HASH,
             "demo_mode": True,
             "hosted_mode": False,
             "is_admin": False,
@@ -2441,7 +2672,7 @@ async def _regenerate_claude_md(
             "**Key Files:**",
             "- `meridian/server.py` — FastAPI app + MCP handlers",
             "- `meridian/db.py` — all DB functions (SQLite + Postgres)",
-            "- `meridian/static/dashboard.js` — dashboard UI",
+            "- `meridian/static/dashboard.ts` — dashboard UI",
             "- `tests/test_core.py` — full test suite",
             "- `data/meridian-build_handoff.md` — session handoff",
             "",
@@ -2822,10 +3053,11 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
         )
     if not github_access:
         github_access = default_github_access_for_role(role)
-    # d116642e — optional project-level invite. When omitted/blank the member
-    # is workspace-wide (current behavior). When set, the member is scoped to
-    # that single project (listing-only scoping; airtight per-request access
-    # enforcement deferred pending product decision, pin b11c7cf6).
+    # d116642e — optional project-level invite. When omitted/blank the member is
+    # workspace-wide. When set, the member is scoped to that single project. As of
+    # 95499c3e (decision 6fe5210c, Option A) this is airtight per-request access
+    # enforcement (403 on any other project by direct ID), not just listing-only.
+    # A scoped member with an admin role is a "co-admin" (admin of that project).
     raw_project_id = body.get("project_id")
     project_id = raw_project_id.strip() if isinstance(raw_project_id, str) else None
     project_id = project_id or None
@@ -3173,7 +3405,7 @@ The 5 tools you use 90% of the time:
 
 | Tool | One-liner | Example |
 |------|-----------|---------|
-| start_session | Register session, get full project context | start_session(project_id="abc-123", session_name="feature-x") |
+| start_session | Register session, get full project context | start_session(project_name="my-project", session_name="feature-x") |
 | log_task | Record completed work | log_task(session_id="sid", project_id="abc-123", description="Fixed OAuth redirect") |
 | checkpoint | Snapshot: auto-capture + delta handoff + next /goal | checkpoint(session_id="sid", project_id="abc-123") |
 | pin_decision | Add to live constitution | pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL") |
@@ -3252,7 +3484,7 @@ async def mcp_tools_doc() -> str:
         "\n",
         "| Tool | One-liner | Example call |\n",
         "|------|-----------|-------------|\n",
-        "| `start_session` | Register session, get full project context | `start_session(project_id=\"abc-123\", session_name=\"feature-x\", human_id=\"alice\")` |\n",
+        "| `start_session` | Register session, get full project context | `start_session(project_name=\"my-project\", session_name=\"feature-x\", human_id=\"alice\")` |\n",
         "| `log_task` | Record completed work to the shared task log | `log_task(session_id=\"sid\", project_id=\"abc-123\", description=\"Wired OAuth redirect\")` |\n",
         "| `checkpoint` | Snapshot progress: auto-capture + delta handoff + next /goal | `checkpoint(session_id=\"sid\", project_id=\"abc-123\")` |\n",
         "| `pin_decision` | Add an architectural decision to the live constitution | `pin_decision(project_id=\"abc-123\", title=\"Use psycopg3\", body=\"asyncpg has DLL issues on Windows\", category=\"TECHNICAL\")` |\n",
@@ -3302,6 +3534,12 @@ async def mcp_tools_doc() -> str:
         "Release a file lock held by this session when you're done editing.")
     lines += _render_tool("idle_until_session_done",
         "Read-only: Wait on another session before touching a shared file. The tool polls every 30 seconds until the watched session is done.")
+    lines += ["## Parallel coordination\n"]
+    lines += _render_tool("store_finding")
+    lines += _render_tool("get_findings")
+    lines += _render_tool("send_message")
+    lines += _render_tool("receive_messages")
+    lines += _render_tool("idle_until_all_done")
     lines += ["## Decisions\n"]
     lines += _render_tool("pin_decision",
         "Record an authoritative decision that supersedes earlier statements. Pinned decisions appear in every "
@@ -3345,6 +3583,7 @@ async def mcp_tools_doc() -> str:
         "in-progress items, recent tasks, active sessions, recent decisions, pending HITLs). "
         "No session registration needed — designed for planning chat sessions that need to see "
         "project state without side effects.")
+    lines += _render_tool("analyze_sprint")
     lines += _render_tool("reconcile_sprint_drift",
         "Read-only: Cross-reference pending sprint items against recent git commits and return "
         "items that may already be done. confidence='high' means 3+ keywords overlap (safe to "
@@ -3542,6 +3781,80 @@ async def _find_continuation_session(
     return None
 
 
+async def _build_continue_payload(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session: dict[str, Any],
+    *,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """c793377d — compact 'just continue' resume block.
+
+    Returns only what an executor needs to pick up where it left off — the
+    session_id, the live pending sprint items (scoped to the session's version),
+    and the ready-to-paste /goal string — and deliberately skips the heavy
+    L0/L1/L2 orientation (goal_xml / cache_blocks / instructions / workspace).
+    Used both by the auto-detected heartbeat-window continuation and an explicit
+    mode='continue'. Every enrichment is best-effort so a resume never fails.
+    """
+    scoped_version = session.get("sprint_version") or None
+    try:
+        _all = await db_module.get_sprint_items(
+            db, project_id, include_human=False, version=scoped_version,
+        )
+    except Exception:  # noqa: BLE001
+        _all = []
+    pending = [it for it in _all if (it.get("status") in ("pending", "todo"))]
+    try:
+        _proj = await db_module.get_project(db, project_id)
+        _mode = db_module.normalize_execution_mode((_proj or {}).get("execution_mode"))
+    except Exception:  # noqa: BLE001
+        _mode = "autonomous"
+    try:
+        _settings = await db_module.get_project_settings(db, project_id)
+        _max_turns = handoff_module._max_turns_from_settings(_settings)
+    except Exception:  # noqa: BLE001
+        _max_turns = handoff_module._DEFAULT_GOAL_MAX_TURNS
+    _hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
+    # `goal_string` (not `goal`) deliberately — consumers like hooks_session_start
+    # treat a result `goal` key as the goal *dict* (north_star/sprint); this is the
+    # ready-to-paste /goal *command* string, a distinct shape.
+    goal_string = handoff_module._build_quick_start_goal(
+        pending,
+        version=scoped_version,
+        execution_mode=_mode,
+        max_turns=_max_turns,
+        hitl_auto_answer_mode=_hitl_mode,
+    )
+    recent = await db_module.get_tasks(db, project_id, limit=5)
+    pending_slim = [
+        {
+            "id": it.get("id"),
+            "title": it.get("title"),
+            "status": it.get("status"),
+            "version": it.get("version"),
+        }
+        for it in pending
+    ]
+    return {
+        "continuation": True,
+        "mode": "continue",
+        "session_id": session["id"],
+        "session": session,
+        "source": source,
+        "sprint_version": scoped_version,
+        "pending_items": pending_slim,
+        "pending_count": len(pending_slim),
+        "goal_string": goal_string,
+        "recent_tasks": recent,
+        "note": (
+            "Continue mode — resumed without re-reading L0/L1/L2 context. Claim "
+            "the first pending item and keep going; call "
+            "get_session_brief(project_id) only if you need the full orientation."
+        ),
+    }
+
+
 # ecf69de8 — protocol-level EXECUTION MODE directive. start_session leads the
 # agent_instructions / orientation with this line so the posture is a structured
 # instruction the session can't miss, not buried freetext. 'autonomous' tells the
@@ -3632,7 +3945,8 @@ async def _build_orchestration_hint(
     strategy = "parallel" if any_multi else "sequential"
     compact_groups = [
         [
-            {"id": it.get("id"), "title": it.get("title", "")}
+            # 1da83459 — cap title length to keep the orientation hint compact.
+            {"id": it.get("id"), "title": (it.get("title") or "")[:80]}
             for it in group
         ]
         for group in groups
@@ -3824,6 +4138,7 @@ async def _start_session_composite(
     source: str | None = None,
     compact: bool = False,
     version: str | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -3850,19 +4165,15 @@ async def _start_session_composite(
     (project_id, session_name); NEVER on Mcp-Session-Id since ChatGPT
     regenerates that header per tool call.
     """
-    existing = await _find_continuation_session(db, project_id, session_name)
+    # c793377d — "just continue" resume. Auto-detect uses the 5-min heartbeat
+    # window; an explicit mode='continue' widens it so an executor can resume a
+    # session it knows is still its own without re-reading L0/L1/L2 context.
+    _continue_window = 7 * 24 * 60 if (mode or "").lower() == "continue" else 5
+    existing = await _find_continuation_session(
+        db, project_id, session_name, max_idle_minutes=_continue_window
+    )
     if existing is not None:
-        # Compact resume block — caller already has the heavy context.
-        recent = await db_module.get_tasks(db, project_id, limit=10)
-        return {
-            "continuation": True,
-            "session": existing,
-            "source": source,
-            "recent_tasks": recent,
-            "note": "Resumed existing session (last_seen within 5 min). "
-                    "Call start_session(source='startup') after a real cold boot "
-                    "to get the full orientation block.",
-        }
+        return await _build_continue_payload(db, project_id, existing, source=source)
     # v1.8.x — archive sessions silent for 7+ days so they don't crowd
     # the active list seen by new sessions.
     await db_module.archive_empty_sessions(db)
@@ -4022,15 +4333,30 @@ async def _start_session_composite(
                     if _c_first else ""
                 )
             )
+        # dc462628 — surface GitHub connection status so executors know upfront
+        # whether search_code / read_file / etc. are usable for this project.
+        _c_github_repo = (_c_project or {}).get("github_repo") or ""
+        _c_github_branch = (_c_project or {}).get("github_branch") or "main"
+        _c_github_status = (
+            f"connected (repo: {_c_github_repo}, branch: {_c_github_branch})"
+            if _c_github_repo
+            else "not connected — GitHub tools (search_code, read_file, etc.) will error until you connect a repo in Settings"
+        )
+        from datetime import datetime as _dt, timezone as _tz  # de193a81
+        _c_now = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
         _c_payload = {
             "session_id": session["id"],
             "compact": True,
+            # de193a81 — anchor the executor to the real date/time so a session
+            # spanning multiple calendar days doesn't drift on "today".
+            "current_timestamp": _c_now,
             "execution_mode": _c_mode,  # ecf69de8 — structured posture field
             "execution_mode_directive": _c_mode_directive,
             "execute_immediately": _c_execute_now,
             "execute_immediately_signal": _c_execute_signal,
             "hitl_auto_answer_mode": _c_hitl_mode,
             "hitl_auto_answer_directive": _hitl_mode_directive(_c_hitl_mode),
+            "github_status": _c_github_status,
             "sprint": (str(_c_sprint)[:300] if _c_sprint else None),
             "sprint_version": scoped_version,
             "sprint_summary": {
@@ -4039,7 +4365,12 @@ async def _start_session_composite(
                 "in_progress": _c_counts.get("in_progress", 0),
                 "pending": _c_pending,
             },
-            "recent_tasks": recent_tasks[:3],
+            # 1da83459 — truncate each task's description so a verbose executor
+            # log can't bloat the compact orientation (context-budget guard).
+            "recent_tasks": [
+                {**_t, "description": ((_t.get("description") or "")[:200])}
+                for _t in recent_tasks[:3]
+            ],
             "board_change": _c_board_change,
             "note": (
                 "Compact orientation. For full goal/decisions/instructions call "
@@ -5059,8 +5390,21 @@ async def auth_install_page(request: Request) -> HTMLResponse:
     tenant = await _get_authenticated_tenant(request)
     db = request.app.state.db
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-    raw_token, _ = await db_module.create_api_token(
+    # 0e9bb6ef — rotate-and-dedup so repeated installer runs don't accumulate a
+    # pile of valid install keys. Install tokens are hash-only (raw not
+    # recoverable server-side), so we can't hand back a prior key's raw value;
+    # instead each install supersedes the previous. Mint the new token FIRST,
+    # then delete this tenant's OTHER label="install" tokens (exclude_id keeps
+    # the row we just created). This create-new-then-revoke-old ordering means
+    # there is never an instant with zero valid install keys even if the prune
+    # were to fail. Identity is tenant_id + label="install" (no hostname column
+    # exists on api_tokens). Same pattern already used by /auth/tokens and the
+    # tunnel-cli flow.
+    raw_token, install_row = await db_module.create_api_token(
         db, tenant["id"], label="install", expires_at=expires_at
+    )
+    await db_module.delete_api_tokens_by_label(
+        db, tenant["id"], "install", exclude_id=install_row["id"]
     )
     email = tenant.get("email", "")
     html = f"""<!DOCTYPE html>
@@ -5381,7 +5725,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "search_code",
-            "description": "Search code in the project's connected GitHub repository using GitHub code search.",
+            "description": "Search code in the project's connected GitHub repository using GitHub code search. Returns helpful error if no GitHub repo is connected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5583,6 +5927,64 @@ _SSE_CORS_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
+# bb16f9a7 — SSE keepalive heartbeat.
+# Idle SSE connections get dropped by intermediary proxies (Fly / Cloudflare
+# have ~60s idle-read timeouts). This wrapper races an interval timer against
+# the upstream generator: whenever the upstream produces no frame within
+# ``interval`` seconds, it emits a single SSE comment ping (``: ping\n\n``) to
+# keep the socket warm, then resumes waiting on the upstream. Real data always
+# passes through promptly — the ping only fires on genuine idle gaps, never
+# alongside flowing data. Kept as a standalone async-generator so it can be
+# unit-tested with a fake upstream and a short interval (no live connection).
+_SSE_HEARTBEAT_FRAME = ": ping\n\n"
+
+
+async def _with_sse_heartbeat(upstream, interval: float = 30.0):
+    """Yield frames from ``upstream``, injecting a ``: ping`` every ``interval``s of idle.
+
+    ``upstream`` is any async iterator of already-framed SSE strings/bytes. The
+    heartbeat is a bare SSE comment line, which every compliant client silently
+    ignores, so it never disturbs the MCP framing. When the upstream is
+    exhausted (client disconnect / normal completion) the wrapper stops too.
+    """
+    it = upstream.__aiter__()
+    nxt = asyncio.ensure_future(it.__anext__())
+    try:
+        while True:
+            try:
+                # shield() protects the in-flight read from wait_for's timeout
+                # cancellation, so we can keep awaiting the SAME read across
+                # successive heartbeat intervals on a fully idle upstream.
+                frame = await asyncio.wait_for(asyncio.shield(nxt), timeout=interval)
+            except asyncio.TimeoutError:
+                # wait_for timed out. But the read may have *just* completed in
+                # the same tick (its result/exception raced the timer) — if so,
+                # deliver that instead of a spurious ping.
+                if nxt.done():
+                    exc = nxt.exception()
+                    if isinstance(exc, StopAsyncIteration):
+                        return
+                    if exc is not None:
+                        raise exc
+                    frame = nxt.result()
+                    yield frame
+                    nxt = asyncio.ensure_future(it.__anext__())
+                    continue
+                # Genuinely idle — emit one keepalive and loop, re-waiting on the
+                # still-pending read. A perpetually idle upstream thus pings
+                # exactly once per interval, indefinitely.
+                yield _SSE_HEARTBEAT_FRAME
+                continue
+            except StopAsyncIteration:
+                return
+            yield frame
+            # Frame delivered — start the next read.
+            nxt = asyncio.ensure_future(it.__anext__())
+    finally:
+        # Don't leak the pending read if the consumer closes us mid-flight.
+        if not nxt.done():
+            nxt.cancel()
+
 
 @app.options("/mcp/sse")
 async def mcp_sse_options(request: Request) -> Response:
@@ -5594,9 +5996,11 @@ async def mcp_sse_options(request: Request) -> Response:
 async def mcp_sse_get(request: Request) -> StreamingResponse:
     """MCP SSE transport GET — opens event stream for dnakov/claude-mcp.
 
-    Sends ``event: endpoint`` with POST URL, then heartbeats every 15 s.
-    No strict auth required: uses the same _db() resolver (Bearer / cookie /
-    local fallback) so both local and hosted-tier clients work.
+    Sends ``event: endpoint`` with POST URL, then a keepalive ``: ping`` every
+    ~30 s while idle (bb16f9a7) so intermediary proxies (Fly / Cloudflare) don't
+    drop the idle connection. No strict auth required: uses the same _db()
+    resolver (Bearer / cookie / local fallback) so both local and hosted-tier
+    clients work.
     """
     import uuid as _uuid
     import anyio as _anyio
@@ -5615,20 +6019,24 @@ async def mcp_sse_get(request: Request) -> StreamingResponse:
 
     endpoint_path = f"/mcp/sse?session_id={session_id}"
 
-    async def _stream():
+    async def _source():
+        # Real SSE frames for this transport. Currently just the initial
+        # ``endpoint`` event; afterwards the stream idles (the client POSTs its
+        # JSON-RPC out-of-band and reads responses from the POST body), so this
+        # generator parks on a disconnect poll. bb16f9a7: the ~30s keepalive is
+        # supplied by _with_sse_heartbeat wrapping this source, so we no longer
+        # emit manual heartbeats here.
         try:
             yield f"event: endpoint\ndata: {endpoint_path}\n\n"
-            # Heartbeat loop — exit when client disconnects
             while True:
                 if await request.is_disconnected():
                     break
-                yield ": heartbeat\n\n"
-                await _anyio.sleep(15)
+                await _anyio.sleep(1)
         finally:
             _SSE_SESSIONS.pop(session_id, None)
 
     return StreamingResponse(
-        _stream(),
+        _with_sse_heartbeat(_source(), interval=30),
         media_type="text/event-stream",
         headers=_SSE_CORS_HEADERS,
     )
@@ -5850,6 +6258,11 @@ async def _remote_mcp_inner(request: Request) -> Any:
     # claude.ai connector never sends it, so this is a no-op (no DB hit) on the
     # hot path.
     _enf_role = None
+    # 95499c3e — project-scope ids for API-token callers (mirrors the HTTP
+    # middleware): a scoped member's token is 403'd on out-of-scope projects at
+    # the MCP dispatch layer. Both only fire when an X-Workspace-Tenant-Id header
+    # rides along (the claude.ai connector never sends it → no-op, no DB hit).
+    _scoped_pids = None
     if request.headers.get("x-workspace-tenant-id", "").strip():
         try:
             _ctx = await _enforcement_context(request)
@@ -5857,12 +6270,17 @@ async def _remote_mcp_inner(request: Request) -> Any:
                 _enf_role = _ctx[2]
         except Exception:
             _enf_role = None
+        try:
+            from ._deps import _scoped_project_ids_for_request as _scoped_fn  # noqa: PLC0415
+            _scoped_pids = await _scoped_fn(request)
+        except Exception:
+            _scoped_pids = None
 
     if isinstance(body, list):
-        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role) for item in body]
+        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids) for item in body]
         return JSONResponse(results)
 
-    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role)
+    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids)
     return JSONResponse(result)
 
 # ---------------------------------------------------------------------------

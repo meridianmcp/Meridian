@@ -33,6 +33,12 @@ DEFAULT_PPT_PORT = 8811
 DEFAULT_WORD_PORT = 8812
 DEFAULT_DC_PORT = 8813
 
+# 8fb69d54 — 4 pre-allocated custom slots (p0-p3) on ports 8814-8817 so a custom
+# plugin bound to a slot gets a real server route (/tunnel-p0 … /tunnel-p3) and
+# appears in the claude.ai connector (closes ecf5b8c6). The server-side slot
+# routes/registries live in routes/tunnel.py (_CUSTOM_SLOTS).
+CUSTOM_SLOT_PORTS = {"p0": 8814, "p1": 8815, "p2": 8816, "p3": 8817}
+
 # The code-extractor slot's default launcher: Serena (LSP-based symbol tools —
 # find_symbol / replace_symbol_body, etc.), run ephemerally via uvx. The
 # ``{repo_path}`` placeholder is expanded to the tunnel's working directory at
@@ -108,6 +114,12 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "core": True,
         # default: Serena (LSP symbol tools); {repo_path} expanded at spawn time.
         "command": list(SERENA_EXTRACT_COMMAND),
+        # cc904bfe — historical defaults this slot has shipped. A saved override
+        # matching one of these (but not the current default) is a stale copy of
+        # an old default → the dashboard shows a "newer default available" badge.
+        # The extract slot defaulted to `uvx mcp-server-code-extractor` (command
+        # None → that builder) before Serena (commit 1428f1b).
+        "previous_defaults": [["uvx", "mcp-server-code-extractor"]],
         # MUST stay None — the server bridge namespaces extract-slot tools as
         # "extractor__find_symbol" via SLOT_DISPLAY_NAMES. A client prefix here
         # would double them to "extractor__Serena__find_symbol". (49905647)
@@ -141,12 +153,15 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": ["uvx", "--from", "word-mcp-live", "word_mcp_server.exe"],
+        # ba02a1f7 — swapped word-mcp-live -> docx-mcp-server: a single uvx-
+        # installable, cross-platform DOCX server (no Windows-only .exe entry
+        # point), for local thesis / Word authoring.
+        "command": ["uvx", "docx-mcp-server"],
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
-        # word-mcp-live self-prefixes its tools — leave empty.
+        # docx-mcp-server self-prefixes its tools — leave empty.
         "prefix": None,
         "session_mode": "stateless",
-        "description": "Word authoring (word-mcp-live)",
+        "description": "Word / DOCX authoring (docx-mcp-server)",
         "description_overrides": {},
     },
     {
@@ -275,6 +290,110 @@ _BUILTIN_DEFAULT_PORTS = frozenset({
     DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT,
 })
 
+# 9811d04c — first port a freshly-added custom plugin (from the browse "Add"
+# button) is auto-assigned when the caller supplies no port. Starts just above
+# the built-in default range (8808–8817, incl. the 4 pre-allocated custom
+# slots), so an auto-assigned port never collides with a built-in slot.
+_CUSTOM_PORT_START = 8820
+
+# 9811d04c — the built-in *slot* names (fs/code/extract/ppt/word/dc). A custom
+# plugin's name must not collide with a built-in slot name (task rule) nor with a
+# built-in plugin's display name (filesystem/code-intel/… — see builtin_names),
+# since either is a slot override rather than a genuine custom plugin.
+_RESERVED_CUSTOM_NAMES = frozenset(SLOTS)
+
+# Safe custom-plugin name charset: letters, digits, dash, underscore, dot. The
+# name becomes an ``.mcp.json`` key (``meridian-custom-<name>``) and part of a
+# local proxy identity, so we keep it to a conservative, shell/JSON-safe set.
+import re as _re
+_CUSTOM_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def is_reserved_custom_name(name: Any) -> bool:
+    """9811d04c — True if *name* collides with a built-in slot or plugin name.
+
+    A custom plugin may not be named like a built-in slot (fs/code/extract/ppt/
+    word/dc) or a built-in plugin (filesystem/code-intel/…): such a name is a slot
+    override, never a stand-alone custom plugin, and ``resolve_custom_plugins``
+    would silently drop it. Case-insensitive on the stripped value.
+    """
+    n = str(name or "").strip().lower()
+    if not n:
+        return False
+    return n in _RESERVED_CUSTOM_NAMES or n in {b.lower() for b in builtin_names()}
+
+
+def validate_custom_plugin(
+    name: Any, command: Any, port: Any = None,
+    *, existing_ports: Any = (), env: Any = None,
+) -> "tuple[dict | None, str | None]":
+    """9811d04c — validate one custom-plugin selection, returning ``(entry, error)``.
+
+    Exactly one of the pair is non-None. On success ``entry`` is a normalized
+    ``{"name", "command" (list[str]), "port" (int), "enabled": True}`` dict (plus
+    an ``"env"`` dict when supplied and non-empty), ready to merge into the stored
+    ``tunnel_plugins`` config; ``error`` is None. On failure ``entry`` is None and
+    ``error`` is a short human-readable reason.
+
+    Rules (mirror :func:`resolve_custom_plugins`, but *reject* instead of silently
+    dropping so the add API can report why):
+
+    - ``name``: stripped, matches :data:`_CUSTOM_NAME_RE` (letters/digits plus
+      ``._-``, ≤64 chars), and not a built-in slot/plugin name.
+    - ``command``: coerced via :func:`_coerce_command`; must be non-empty.
+    - ``port``: when given, a real ``int`` (``bool`` rejected) in 1024–65535, not a
+      built-in default port (8808–8813) and not already in ``existing_ports``. When
+      omitted/None, the first free port at/after :data:`_CUSTOM_PORT_START` that
+      avoids the built-in ports and ``existing_ports`` is auto-assigned.
+    - ``env`` (optional): a dict → coerced to ``{str: str}`` (blank keys dropped);
+      attached only when non-empty.
+    """
+    nm = str(name or "").strip()
+    if not nm:
+        return None, "name is required"
+    if not _CUSTOM_NAME_RE.match(nm):
+        return None, (
+            "name must be 1–64 chars of letters, digits, dot, dash or underscore "
+            "(and start alphanumeric)"
+        )
+    if is_reserved_custom_name(nm):
+        return None, f"'{nm}' collides with a built-in slot/plugin name"
+
+    cmd = _coerce_command(command)
+    if not cmd:
+        return None, "command is required"
+
+    used = {p for p in existing_ports if isinstance(p, int) and not isinstance(p, bool)}
+    if port is None or port == "":
+        assigned: int | None = None
+        for candidate in range(_CUSTOM_PORT_START, 65536):
+            if candidate in _BUILTIN_DEFAULT_PORTS or candidate in used:
+                continue
+            assigned = candidate
+            break
+        if assigned is None:  # pragma: no cover — 57k-port exhaustion is unreachable
+            return None, "no free port available"
+        port_int = assigned
+    else:
+        if not isinstance(port, int) or isinstance(port, bool):
+            return None, "port must be an integer"
+        if not (1024 <= port <= 65535):
+            return None, "port must be in 1024–65535"
+        if port in _BUILTIN_DEFAULT_PORTS:
+            return None, "port collides with a built-in slot (8808–8813)"
+        if port in used:
+            return None, f"port {port} is already used by another custom plugin"
+        port_int = port
+
+    entry: dict[str, Any] = {
+        "name": nm, "command": cmd, "port": port_int, "enabled": True,
+    }
+    if isinstance(env, dict):
+        coerced = {str(k): str(v) for k, v in env.items() if str(k)}
+        if coerced:
+            entry["env"] = coerced
+    return entry, None
+
 
 def resolve_custom_plugins(raw_config: Any) -> list[dict]:
     """Resolve user-defined (non-built-in) plugins from the stored config.
@@ -289,8 +408,9 @@ def resolve_custom_plugins(raw_config: Any) -> list[dict]:
 
     Returns validated descriptors
     ``{"name", "command" (list[str]), "port" (int), "enabled" (bool),
-    "builtin": False, "custom": True}``. Invalid entries are dropped silently
-    (they simply don't run); validation rules:
+    "builtin": False, "custom": True}``, plus an optional ``"env"`` dict when the
+    entry carries valid environment overrides. Invalid entries are dropped
+    silently (they simply don't run); validation rules:
 
     - ``name``: non-empty (stripped), not a built-in name, unique (first wins).
     - ``command``: coerced via :func:`_coerce_command`; must be non-empty. The
@@ -299,6 +419,10 @@ def resolve_custom_plugins(raw_config: Any) -> list[dict]:
     - ``port``: a real ``int`` (``bool`` rejected), in 1024–65535, and not one of
       the built-in default ports (8808–8813) so a custom proxy can't collide
       with a built-in slot.
+    - ``env`` (optional): a dict of ``{VAR: value}`` (keys/values coerced to
+      str, blank keys dropped) merged into the plugin's spawn environment by the
+      client — e.g. ``{"ZOTERO_LOCAL": "true"}`` for a local Zotero MCP. A
+      non-dict or empty env is omitted so the descriptor shape is unchanged.
 
     Pure: no I/O, no subprocess. An empty/absent/garbage config yields ``[]``.
     """
@@ -319,15 +443,24 @@ def resolve_custom_plugins(raw_config: Any) -> list[dict]:
             continue
         if not (1024 <= port <= 65535) or port in _BUILTIN_DEFAULT_PORTS:
             continue
-        seen.add(name)
-        out.append({
+        descriptor: dict[str, Any] = {
             "name": name,
             "command": cmd,
             "port": port,
             "enabled": bool(it.get("enabled", True)),
             "builtin": False,
             "custom": True,
-        })
+        }
+        # ba02a1f7/194a7776 — carry optional per-plugin env (e.g. a local
+        # Zotero MCP needs ZOTERO_LOCAL=true). Only attach when it coerces to a
+        # non-empty dict, so entries without env keep the historical shape.
+        env = it.get("env")
+        if isinstance(env, dict):
+            coerced = {str(k): str(v) for k, v in env.items() if str(k)}
+            if coerced:
+                descriptor["env"] = coerced
+        seen.add(name)
+        out.append(descriptor)
     return out
 
 
@@ -359,12 +492,62 @@ def resolve_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[
         # slot / url_prefix are immutable for built-ins.
         merged["slot"] = base["slot"]
         merged["url_prefix"] = base["url_prefix"]
+        # cc904bfe — flag a stale custom command override: the tenant saved a
+        # `command` that matches a *previous* built-in default for this slot (so
+        # it was a copy of the old default, now superseded by a new one). The
+        # tunnel still runs the override, but the dashboard surfaces a "newer
+        # default available" badge so the user can opt back into the new default.
+        # A genuinely-custom command (not in previous_defaults) is left untouched.
+        ov_cmd = ov.get("command")
+        prev_defaults = base.get("previous_defaults") or []
+        if (ov_cmd and ov_cmd != base.get("command")
+                and any(ov_cmd == pd for pd in prev_defaults)):
+            merged["stale_override"] = True
+            merged["newer_default_command"] = base.get("command")
+            merged["newer_default_label"] = base.get("description")
+        merged.pop("previous_defaults", None)  # internal — don't leak to clients
         resolved.append(merged)
     return resolved
 
 
+def parse_plugins_by_host(raw: Any) -> dict[str, Any]:
+    """8660d701 — parse ``tenants.tunnel_plugins_by_host`` into ``{hostname: config}``.
+
+    Tolerant of None / empty / malformed JSON / non-dict input (all → ``{}``), so a
+    junk value never breaks tunnel resolution.
+    """
+    import json
+    val: Any = raw
+    if isinstance(raw, str):
+        if not raw.strip():
+            return {}
+        try:
+            val = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return {}
+    if not isinstance(val, dict):
+        return {}
+    return {str(k): v for k, v in val.items() if str(k)}
+
+
+def select_host_config(default_config: Any, by_host_raw: Any, hostname: str | None) -> Any:
+    """8660d701 — the effective tunnel-plugins config for one machine.
+
+    Returns the machine's per-host config when ``hostname`` has an entry in
+    ``by_host_raw`` (``tenants.tunnel_plugins_by_host``); otherwise the per-tenant
+    default ``default_config`` (already-parsed ``tunnel_plugins``). This is how a
+    machine running ``meridian --tunnel`` gets its own config while existing
+    single-machine tenants keep working unchanged.
+    """
+    if hostname:
+        by_host = parse_plugins_by_host(by_host_raw)
+        if hostname in by_host:
+            return by_host[hostname]
+    return default_config
+
+
 # Office slots auto-enable when their MCP launcher is on PATH (sprint 6c2b3562).
-OFFICE_BINARIES = {"ppt": "powerpoint-mcp", "word": "word-mcp-live"}
+OFFICE_BINARIES = {"ppt": "powerpoint-mcp", "word": "docx-mcp-server"}
 
 
 def detect_office_binaries(which: Any = None) -> set[str]:

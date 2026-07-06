@@ -67,9 +67,28 @@ def _read_git_sha() -> str:
         return _read_version()
 
 
+def _read_bundle_hash() -> str:
+    """9aba783f — content hash of the dashboard bundle, emitted by build.mjs into
+    ``meridian/static/asset-manifest.json``. Used as the bundle's ``?v=`` token so
+    every content change busts the browser cache even when no version / git SHA is
+    available in prod. Falls back to ``_ASSET_VERSION`` when the manifest is absent
+    (e.g. a dev checkout that hasn't run ``node build.mjs`` yet)."""
+    import json
+    try:
+        manifest = Path(__file__).parent / "static" / "asset-manifest.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        h = str(data.get("bundle_hash") or "").strip()
+        if h:
+            return h
+    except Exception:
+        pass
+    return _ASSET_VERSION
+
+
 _VERSION = _read_version()
 _GIT_SHA = _read_git_sha()
 _ASSET_VERSION = f"{_VERSION}-{_GIT_SHA}" if _GIT_SHA != _VERSION else _VERSION
+_BUNDLE_HASH = _read_bundle_hash()
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +173,26 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
             status_code=503,
             detail="tenant database not provisioned - please wait or contact support",
         )
-    conn = await init_pg_db(url)
+    # 894f7645 — provisioning can race the first request (the DB URL is written
+    # but Postgres isn't accepting connections yet). Retry a few times before
+    # surfacing the 503 so a freshly-provisioned tenant doesn't hard-fail.
+    import asyncio  # noqa: PLC0415
+    conn = None
+    for _attempt in range(3):
+        try:
+            conn = await init_pg_db(url)
+            break
+        except Exception as exc:  # noqa: BLE001
+            if _attempt == 2:
+                _log.warning(
+                    "tenant %s DB init failed after %d attempts: %s",
+                    tenant_id, _attempt + 1, exc,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="tenant database is provisioning — please retry in a moment",
+                )
+            await asyncio.sleep(0.5 * (_attempt + 1))
     _tenant_db_cache[tenant_id] = conn
     return conn
 

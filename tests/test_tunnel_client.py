@@ -178,7 +178,69 @@ def test_build_proxy_command_uses_shell_on_windows(monkeypatch):
     assert "--shell" not in tc._build_proxy_command("npx", "/repo")
 
 
-def test_build_code_proxy_command_structure():
+# ---------------------------------------------------------------------------
+# path-quote-strip — _normalize_path_arg de-quotes pasted path args so a
+# literal surrounding '"C:\\My Docs"' / "'C:/x'" is served correctly. Only
+# MATCHED surrounding quote pairs are removed; interior chars & lone quotes
+# are left untouched. Idempotent.
+# ---------------------------------------------------------------------------
+
+def test_normalize_path_arg_strips_matched_double_quotes():
+    assert tc._normalize_path_arg('"C:\\Users\\me\\My Docs"') == "C:\\Users\\me\\My Docs"
+
+
+def test_normalize_path_arg_strips_matched_single_quotes():
+    assert tc._normalize_path_arg("'C:/x'") == "C:/x"
+
+
+def test_normalize_path_arg_strips_surrounding_whitespace_then_quotes():
+    assert tc._normalize_path_arg('  "p"  ') == "p"
+
+
+def test_normalize_path_arg_clean_path_unchanged():
+    p = r"C:\Users\me\Documents"
+    assert tc._normalize_path_arg(p) == p
+
+
+def test_normalize_path_arg_preserves_interior_space():
+    # An interior space (unquoted) is a real path char — never stripped.
+    assert tc._normalize_path_arg("C:/Program Files/App") == "C:/Program Files/App"
+
+
+def test_normalize_path_arg_leaves_lone_leading_quote():
+    # A single unmatched quote is NOT a wrapping pair — keep it verbatim.
+    assert tc._normalize_path_arg('"C:/x') == '"C:/x'
+    assert tc._normalize_path_arg("C:/x'") == "C:/x'"
+
+
+def test_normalize_path_arg_unwinds_repeated_and_mixed_wrapping():
+    assert tc._normalize_path_arg('\'"C:/x"\'') == "C:/x"
+
+
+def test_normalize_path_arg_empty_and_whitespace():
+    assert tc._normalize_path_arg("") == ""
+    assert tc._normalize_path_arg("   ") == ""
+    assert tc._normalize_path_arg('""') == ""
+
+
+def test_build_proxy_command_strips_quotes_from_real_root(tmp_path):
+    # A quoted root pointing at a REAL dir must be served as that (de-quoted)
+    # dir — proving the quote-strip took effect end-to-end in the builder.
+    quoted = f'"{tmp_path}"'
+    cmd = tc._build_proxy_command("npx", str(tmp_path), roots=[quoted])
+    assert str(tmp_path) in cmd
+    assert quoted not in cmd
+
+
+def test_unservable_roots_ignores_quotes_for_real_dir(tmp_path):
+    # A quoted root that resolves to an existing dir is NOT flagged unservable
+    # (the quotes are stripped before the os.path.isdir check).
+    quoted = f'"{tmp_path}"'
+    assert tc._unservable_roots([quoted]) == []
+
+
+def test_build_code_proxy_command_structure(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")  # test POSIX path — no --shell
     cmd = tc._build_code_proxy_command("npx", "/usr/local/bin/codebase-memory-mcp", port=9009)
     assert cmd[0] == "npx"
     assert "mcp-proxy" in cmd
@@ -190,7 +252,6 @@ def test_build_code_proxy_command_structure():
     assert "--" in cmd
     sep = cmd.index("--")
     assert cmd[sep + 1] == "/usr/local/bin/codebase-memory-mcp"
-    # codebase-memory-mcp is a native binary — no --shell needed
     assert "--shell" not in cmd
 
 
@@ -325,14 +386,66 @@ def test_build_code_proxy_command_uses_shell_for_cmd_shim_on_windows(monkeypatch
     assert cmd[sep + 1] == shim
 
 
-def test_build_code_proxy_command_no_shell_for_native_exe_on_windows(monkeypatch):
+def test_build_code_proxy_command_shell_for_native_exe_on_windows(monkeypatch):
+    # .exe binaries also need --shell on Windows: mcp-proxy (Node.js) can't spawn
+    # them directly in all environments. Matches FS slot's unconditional --shell.
     monkeypatch.setattr(tc.sys, "platform", "win32")
     exe = r"C:\Users\13144\.meridian\bin\codebase-memory-mcp.exe"
     cmd = tc._build_code_proxy_command("npx.cmd", exe, port=9009)
-    # A real .exe spawns directly — no --shell (preserves space-in-path support).
-    assert "--shell" not in cmd
+    assert "--shell" in cmd
     sep = cmd.index("--")
     assert cmd[sep + 1] == exe
+
+
+# ---------------------------------------------------------------------------
+# 89bc72c4 — code-intel slot: a binary path with a SPACE was split by cmd.exe
+# under mcp-proxy --shell → WinError 3 "The system cannot find the path
+# specified". The command builder now resolves such a path to its 8.3 short
+# name (_win_shell_safe_path) so cmd.exe sees a single space-free token.
+# ---------------------------------------------------------------------------
+
+def test_win_shell_safe_path_noop_on_posix(monkeypatch):
+    # Non-Windows: never rewrite the path (no cmd.exe splitting to worry about).
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    p = "/home/john smith/.meridian/bin/codebase-memory-mcp"
+    assert tc._win_shell_safe_path(p) == p
+
+
+def test_win_shell_safe_path_noop_without_space(monkeypatch):
+    # Space-free path: nothing to fix, returned verbatim (no short-path lookup).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    p = r"C:\Users\13144\.meridian\bin\codebase-memory-mcp.exe"
+    assert tc._win_shell_safe_path(p) == p
+
+
+def test_win_shell_safe_path_uses_short_name_for_spaced_path(monkeypatch):
+    # When the path has a space, resolve it to the 8.3 short (space-free) form.
+    # GetShortPathNameW is Windows-only, so stub the ctypes call so this runs on
+    # the Linux CI runner too (no real Windows stdlib attr is touched).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    spaced = r"C:\Users\John Smith\.meridian\bin\codebase-memory-mcp.exe"
+    short = r"C:\Users\JOHNSM~1\.meridian\bin\CODEBA~1.EXE"
+
+    def fake_safe(path):
+        return short if path == spaced else path
+
+    monkeypatch.setattr(tc, "_win_shell_safe_path", fake_safe)
+    cmd = tc._build_code_proxy_command("npx.cmd", spaced, port=9009)
+    assert "--shell" in cmd
+    sep = cmd.index("--")
+    # The inner binary token is the space-free short path — cmd.exe won't split it.
+    assert cmd[sep + 1] == short
+    assert " " not in cmd[sep + 1]
+
+
+def test_win_shell_safe_path_falls_back_when_short_name_unavailable(monkeypatch):
+    # 8.3 generation disabled / lookup fails → return the original path unchanged
+    # (fail-soft: no worse than before; the startup warning surfaces the risk).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    spaced = r"C:\Users\John Smith\.meridian\bin\codebase-memory-mcp.exe"
+    # ctypes.windll doesn't exist on non-Windows → the lazy import raises inside
+    # _win_shell_safe_path, which swallows it and returns the input unchanged.
+    assert tc._win_shell_safe_path(spaced) == spaced
 
 
 # ---------------------------------------------------------------------------
@@ -814,18 +927,24 @@ def test_resolve_plugins_carries_prefix():
 # ---------------------------------------------------------------------------
 
 def test_tunnel_mcp_entries_urls():
+    # ef162c28 — connectors are keyed by the plugin behind each slot.
     entries = tc._tunnel_mcp_entries("https://usemeridian.us", "tid-123")
-    assert set(entries) == {"meridian-fs", "meridian-code", "meridian-extractor"}
-    assert entries["meridian-fs"]["type"] == "http"
-    assert entries["meridian-fs"]["url"] == "https://usemeridian.us/fs/mcp/tid-123/mcp"
-    assert entries["meridian-code"]["url"] == "https://usemeridian.us/code/mcp/tid-123/mcp"
-    assert entries["meridian-extractor"]["url"] == "https://usemeridian.us/extract/mcp/tid-123/mcp"
+    assert set(entries) == {"filesystem", "codebase-memory", "serena"}
+    assert entries["filesystem"]["type"] == "http"
+    assert entries["filesystem"]["url"] == "https://usemeridian.us/fs/mcp/tid-123/mcp"
+    assert entries["codebase-memory"]["url"] == "https://usemeridian.us/code/mcp/tid-123/mcp"
+    assert entries["serena"]["url"] == "https://usemeridian.us/extract/mcp/tid-123/mcp"
+    # The new keys are exactly TUNNEL_MCP_KEYS; the legacy set is distinct.
+    assert set(tc.TUNNEL_MCP_KEYS) == {"filesystem", "codebase-memory", "serena"}
+    assert tc._LEGACY_TUNNEL_MCP_KEYS == (
+        "meridian-fs", "meridian-code", "meridian-extractor",
+    )
 
 
 def test_inject_mcp_entries_into_empty():
-    out = tc._inject_mcp_entries(None, {"meridian-fs": {"type": "http", "url": "u"}})
+    out = tc._inject_mcp_entries(None, {"filesystem": {"type": "http", "url": "u"}})
     data = json.loads(out)
-    assert data["mcpServers"]["meridian-fs"]["url"] == "u"
+    assert data["mcpServers"]["filesystem"]["url"] == "u"
 
 
 def test_inject_mcp_entries_preserves_existing_servers_and_keys():
@@ -834,19 +953,87 @@ def test_inject_mcp_entries_preserves_existing_servers_and_keys():
         "otherTopLevel": 7,
     })
     entries = tc._tunnel_mcp_entries("https://usemeridian.us", "t1")
-    out = tc._inject_mcp_entries(existing, entries)
+    out = tc._inject_mcp_entries(existing, entries, "https://usemeridian.us", "t1")
     data = json.loads(out)
     # Existing connector and unrelated keys survive; ours are merged in.
     assert data["mcpServers"]["meridian"]["command"] == "pixi"
     assert data["otherTopLevel"] == 7
-    assert data["mcpServers"]["meridian-fs"]["url"].endswith("/fs/mcp/t1/mcp")
-    assert "meridian-code" in data["mcpServers"]
+    assert data["mcpServers"]["filesystem"]["url"].endswith("/fs/mcp/t1/mcp")
+    assert "codebase-memory" in data["mcpServers"]
 
 
 def test_inject_mcp_entries_recovers_from_malformed_json():
-    out = tc._inject_mcp_entries("{not json", {"meridian-fs": {"type": "http", "url": "u"}})
+    out = tc._inject_mcp_entries("{not json", {"filesystem": {"type": "http", "url": "u"}})
     data = json.loads(out)
-    assert data["mcpServers"]["meridian-fs"]["url"] == "u"
+    assert data["mcpServers"]["filesystem"]["url"] == "u"
+
+
+def test_inject_mcp_entries_migrates_legacy_slot_named_keys():
+    # ef162c28 — an existing .mcp.json from an OLD tunnel build has the legacy
+    # slot-named keys. Injecting must REMOVE those and write the new plugin
+    # names, leaving no stale duplicates pointing at the same URLs.
+    base, tid = "https://usemeridian.us", "t9"
+    existing = json.dumps({"mcpServers": {
+        "meridian-fs": {"type": "http", "url": f"{base}/fs/mcp/{tid}/mcp"},
+        "meridian-code": {"type": "http", "url": f"{base}/code/mcp/{tid}/mcp"},
+        "meridian-extractor": {"type": "http", "url": f"{base}/extract/mcp/{tid}/mcp"},
+        "user-thing": {"command": "node"},
+    }})
+    entries = tc._tunnel_mcp_entries(base, tid)
+    out = tc._inject_mcp_entries(existing, entries, base, tid)
+    servers = json.loads(out)["mcpServers"]
+    # Legacy keys gone, new keys present, exactly once each — no duplicates.
+    assert "meridian-fs" not in servers
+    assert "meridian-code" not in servers
+    assert "meridian-extractor" not in servers
+    assert servers["filesystem"]["url"] == f"{base}/fs/mcp/{tid}/mcp"
+    assert servers["codebase-memory"]["url"] == f"{base}/code/mcp/{tid}/mcp"
+    assert servers["serena"]["url"] == f"{base}/extract/mcp/{tid}/mcp"
+    # The user's own server is untouched.
+    assert servers["user-thing"] == {"command": "node"}
+
+
+def test_inject_mcp_entries_reinject_is_idempotent():
+    # ef162c28 — running the tunnel twice must not accumulate duplicate or
+    # suffixed entries: a prior run's new-named entries are ours (by URL/name)
+    # and get rewritten in place.
+    base, tid = "https://usemeridian.us", "t7"
+    entries = tc._tunnel_mcp_entries(base, tid)
+    first = tc._inject_mcp_entries(None, entries, base, tid)
+    second = tc._inject_mcp_entries(first, entries, base, tid)
+    servers = json.loads(second)["mcpServers"]
+    assert set(servers) == {"filesystem", "codebase-memory", "serena"}
+
+
+def test_inject_mcp_entries_collision_with_user_server_is_suffixed():
+    # ef162c28 — the user runs their OWN `filesystem` server (different URL).
+    # We must NOT clobber it: write under a suffixed key instead.
+    base, tid = "https://usemeridian.us", "t3"
+    existing = json.dumps({"mcpServers": {
+        "filesystem": {"type": "http", "url": "https://example.com/my-fs"},
+    }})
+    entries = tc._tunnel_mcp_entries(base, tid)
+    out = tc._inject_mcp_entries(existing, entries, base, tid)
+    servers = json.loads(out)["mcpServers"]
+    # The user's server is untouched at its original key.
+    assert servers["filesystem"] == {"type": "http", "url": "https://example.com/my-fs"}
+    # Ours landed under a suffixed key pointing at our relay.
+    assert servers["filesystem-meridian"]["url"] == f"{base}/fs/mcp/{tid}/mcp"
+    # code/extract had no collision → plain names.
+    assert servers["codebase-memory"]["url"] == f"{base}/code/mcp/{tid}/mcp"
+    assert servers["serena"]["url"] == f"{base}/extract/mcp/{tid}/mcp"
+
+
+def test_unique_mcp_key_suffix_escalation():
+    # ef162c28 — first collision → -meridian, then -meridian-2, -3, …
+    assert tc._unique_mcp_key("filesystem", set()) == "filesystem"
+    assert tc._unique_mcp_key("filesystem", {"filesystem"}) == "filesystem-meridian"
+    assert tc._unique_mcp_key(
+        "filesystem", {"filesystem", "filesystem-meridian"}
+    ) == "filesystem-meridian-2"
+    assert tc._unique_mcp_key(
+        "filesystem", {"filesystem", "filesystem-meridian", "filesystem-meridian-2"}
+    ) == "filesystem-meridian-3"
 
 
 def test_mcp_json_paths_includes_cursor_only_when_present(tmp_path):
@@ -866,10 +1053,41 @@ def test_install_mcp_json_creates_then_restore_deletes(tmp_path):
     mcp = tmp_path / ".mcp.json"
     assert mcp.exists()
     data = json.loads(mcp.read_text(encoding="utf-8"))
-    assert "meridian-extractor" in data["mcpServers"]
+    assert "serena" in data["mcpServers"]  # ef162c28 — new plugin-derived name
     # original was None (we created it) → restore deletes the file
-    tc._restore_mcp_json(snaps)
+    tc._restore_mcp_json(snaps, "https://usemeridian.us", "tid")
     assert not mcp.exists()
+
+
+def test_install_mcp_json_fresh_file_gets_new_names(tmp_path):
+    # ef162c28 (a) — a brand new .mcp.json gets the plugin-derived names, and
+    # none of the legacy slot names.
+    tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid")
+    servers = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    assert set(servers) == {"filesystem", "codebase-memory", "serena"}
+    assert not (set(servers) & set(tc._LEGACY_TUNNEL_MCP_KEYS))
+
+
+def test_install_mcp_json_migrates_existing_legacy_entries(tmp_path):
+    # ef162c28 (b) — an existing .mcp.json with the OLD keys is migrated:
+    # old removed, new present, no duplicates, user's own server preserved.
+    base, tid = "https://usemeridian.us", "tid"
+    mcp = tmp_path / ".mcp.json"
+    mcp.write_text(json.dumps({"mcpServers": {
+        "meridian-fs": {"type": "http", "url": f"{base}/fs/mcp/{tid}/mcp"},
+        "meridian-code": {"type": "http", "url": f"{base}/code/mcp/{tid}/mcp"},
+        "meridian-extractor": {"type": "http", "url": f"{base}/extract/mcp/{tid}/mcp"},
+        "mine": {"command": "x"},
+    }}), encoding="utf-8")
+
+    tc._install_mcp_json(tmp_path, base, tid)
+    servers = json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+    assert not (set(servers) & set(tc._LEGACY_TUNNEL_MCP_KEYS))
+    assert {"filesystem", "codebase-memory", "serena"} <= set(servers)
+    assert servers["mine"] == {"command": "x"}
+    # No legacy+new duplicate pair for the fs relay URL.
+    fs_url = f"{base}/fs/mcp/{tid}/mcp"
+    assert [k for k, v in servers.items() if v.get("url") == fs_url] == ["filesystem"]
 
 
 def test_install_mcp_json_restore_returns_exact_original(tmp_path):
@@ -880,12 +1098,32 @@ def test_install_mcp_json_restore_returns_exact_original(tmp_path):
     snaps = tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid")
     # During the session our entries are present alongside the user's.
     live = json.loads(mcp.read_text(encoding="utf-8"))
-    assert "meridian-fs" in live["mcpServers"]
+    assert "filesystem" in live["mcpServers"]
     assert live["mcpServers"]["meridian"]["command"] == "pixi"
 
-    tc._restore_mcp_json(snaps)
-    # Restored byte-for-byte to what the user had.
+    tc._restore_mcp_json(snaps, "https://usemeridian.us", "tid")
+    # Restored byte-for-byte to what the user had (they had none of ours).
     assert mcp.read_text(encoding="utf-8") == original
+
+
+def test_restore_mcp_json_removes_both_legacy_and_new_keys(tmp_path):
+    # ef162c28 (d) — cleanup must strip BOTH legacy and new keys even if the
+    # snapshotted original still held stale entries (e.g. a prior crash).
+    base, tid = "https://usemeridian.us", "tid"
+    mcp = tmp_path / ".mcp.json"
+    # The "original" we snapshot already carries a stale legacy AND a stale new
+    # entry (both ours) plus the user's own server.
+    original = json.dumps({"mcpServers": {
+        "meridian-fs": {"type": "http", "url": f"{base}/fs/mcp/{tid}/mcp"},
+        "serena": {"type": "http", "url": f"{base}/extract/mcp/{tid}/mcp"},
+        "mine": {"command": "x"},
+    }})
+    tc._restore_mcp_json([(mcp, original)], base, tid)
+    servers = json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+    # Both a legacy and a new key were stripped; only the user's survives.
+    assert "meridian-fs" not in servers
+    assert "serena" not in servers
+    assert servers == {"mine": {"command": "x"}}
 
 
 def test_install_mcp_json_updates_existing_cursor_config(tmp_path):
@@ -897,7 +1135,7 @@ def test_install_mcp_json_updates_existing_cursor_config(tmp_path):
     paths = {p for p, _ in snaps}
     assert cursor in paths
     data = json.loads(cursor.read_text(encoding="utf-8"))
-    assert "meridian-fs" in data["mcpServers"]
+    assert "filesystem" in data["mcpServers"]
 
 
 # ---------------------------------------------------------------------------
@@ -936,6 +1174,49 @@ def test_force_utf8_io_tolerates_streams_without_reconfigure(monkeypatch):
 def test_config_path_under_home(monkeypatch, tmp_path):
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
     assert tc._config_path() == tmp_path / ".meridian" / "config.json"
+
+
+# ---------------------------------------------------------------------------
+# Package cache locations — _package_cache_locations / first-run banner (a887155d)
+# ---------------------------------------------------------------------------
+
+def test_package_cache_locations_has_keys(monkeypatch):
+    """Returns npx/uvx/uv_tools, all non-empty strings, no subprocess needed."""
+    loc = tc._package_cache_locations()
+    assert set(loc) == {"npx", "uvx", "uv_tools"}
+    assert all(isinstance(v, str) and v for v in loc.values())
+    # npx packages live under the npm cache's _npx subdir.
+    assert loc["npx"].endswith("_npx")
+
+
+def test_package_cache_locations_respects_env(monkeypatch):
+    """Explicit package-manager env vars override the per-OS defaults."""
+    monkeypatch.setenv("npm_config_cache", "/custom/npm")
+    monkeypatch.setenv("UV_CACHE_DIR", "/custom/uvcache")
+    monkeypatch.setenv("UV_TOOL_DIR", "/custom/uvtools")
+    loc = tc._package_cache_locations()
+    assert loc["npx"] == str(tc.Path("/custom/npm") / "_npx")
+    assert loc["uvx"] == "/custom/uvcache"
+    assert loc["uv_tools"] == "/custom/uvtools"
+
+
+def test_print_package_cache_locations_first_run_then_suppressed(monkeypatch, tmp_path, capsys):
+    """Prints once on first run, writes a marker, and stays silent thereafter."""
+    marker = tmp_path / ".cache_locations_shown"
+    monkeypatch.setattr(tc, "_cache_locations_marker", lambda: marker)
+
+    assert tc._print_package_cache_locations() is True
+    out1 = capsys.readouterr().out
+    assert "Package caches" in out1
+    assert marker.exists()
+
+    # Second run: marker present → no print, returns False.
+    assert tc._print_package_cache_locations() is False
+    assert capsys.readouterr().out == ""
+
+    # force=True prints again even with the marker present.
+    assert tc._print_package_cache_locations(force=True) is True
+    assert "Package caches" in capsys.readouterr().out
 
 
 def test_read_cached_token_missing_file_returns_none(monkeypatch, tmp_path):
@@ -1028,6 +1309,177 @@ def test_build_proxy_for_inner_persistent_omits_stateless():
 def test_build_proxy_for_inner_stateless_default_true():
     cmd = tc._build_proxy_for_inner("npx", ["x"], 8813)
     assert "--stateless" in cmd
+
+
+def test_reprobe_once_kills_and_respawns_stuck_persistent_slot():
+    """a898710a — a persistent slot that's is_running=True but failing its health
+    probe (inner server dead, parent alive) is force-restarted via kill+respawn
+    and recovers on the re-probe."""
+    class FakeProxy:
+        def __init__(self):
+            self.port = 8813
+            self.is_running = True
+            self.killed = 0
+            self.ensured = 0
+
+        def kill(self):
+            self.killed += 1
+            self.is_running = False
+
+        async def ensure_running(self):
+            self.ensured += 1
+            self.is_running = True
+
+    proxy = FakeProxy()
+    calls = {"n": 0}
+
+    async def probe(_port):
+        calls["n"] += 1
+        return calls["n"] >= 2  # unhealthy first, healthy after kill+respawn
+
+    loop = asyncio.new_event_loop()
+    try:
+        healthy = loop.run_until_complete(tc._reprobe_once(proxy, probe))
+    finally:
+        loop.close()
+    assert healthy is True
+    assert proxy.killed == 1
+    assert proxy.ensured == 1
+    assert calls["n"] == 2
+
+
+def test_reprobe_once_no_kill_when_healthy_first_probe():
+    """a898710a — a slot healthy on the first probe is not needlessly killed."""
+    class FakeProxy:
+        port = 8813
+        is_running = True
+        killed = 0
+
+        def kill(self):
+            type(self).killed += 1
+
+        async def ensure_running(self):
+            pass
+
+    proxy = FakeProxy()
+
+    async def probe(_port):
+        return True
+
+    loop = asyncio.new_event_loop()
+    try:
+        healthy = loop.run_until_complete(tc._reprobe_once(proxy, probe))
+    finally:
+        loop.close()
+    assert healthy is True
+    assert proxy.killed == 0
+
+
+# ---------------------------------------------------------------------------
+# 089a936a — pre-flight diagnostics (reason/detail) + cold-fetch probe budget
+# ---------------------------------------------------------------------------
+
+def test_preflight_failure_hint_dc_is_specific():
+    """089a936a — the dc slot's pre-flight failure hint names Desktop Commander,
+    the port, and the npx install command."""
+    reason, detail = tc._preflight_failure_hint("dc", 8813)
+    assert reason == "unreachable"
+    assert "Desktop Commander" in detail
+    assert "8813" in detail
+    assert "desktop-commander" in detail
+
+
+def test_preflight_failure_hint_generic_slot():
+    """089a936a — a non-cold-fetch slot still gets a non-empty reason + detail
+    mentioning the slot label and port (generic, not the dc-specific text)."""
+    reason, detail = tc._preflight_failure_hint("fs", 8810)
+    assert reason == "unreachable"
+    assert "fs" in detail
+    assert "8810" in detail
+    assert "Desktop Commander" not in detail
+
+
+def test_preflight_slot_failure_reports_reason_and_detail(monkeypatch):
+    """089a936a — a FAILED pre-flight reports a non-empty reason AND detail to
+    _report_slot_health (not a bare healthy=False), so the dashboard can show an
+    actionable warning. Uses the dc slot (port 8813) as the example, matching the
+    _reprobe_once tests."""
+    # Force the probe to fail without spawning anything real.
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+    report = AsyncMock()
+    monkeypatch.setattr(tc, "_report_slot_health", report)
+
+    ws = object()  # never touched — _report_slot_health is mocked
+    loop = asyncio.new_event_loop()
+    try:
+        healthy = loop.run_until_complete(tc._preflight_slot(ws, 8813, "dc"))
+    finally:
+        loop.close()
+
+    assert healthy is False
+    report.assert_awaited_once()
+    args, kwargs = report.call_args
+    # positional: (ws, label, healthy)
+    assert args[1] == "dc"
+    assert args[2] is False
+    # 089a936a — reason + detail are populated (not a bare False report).
+    assert kwargs.get("reason") == "unreachable"
+    assert kwargs.get("detail")
+    assert "Desktop Commander" in kwargs["detail"]
+    assert "8813" in kwargs["detail"]
+
+
+def test_preflight_slot_dc_uses_larger_cold_fetch_budget(monkeypatch):
+    """089a936a — the dc (cold-fetch) slot's first pre-flight uses the LARGER
+    probe budget (attempts=4, delay=5.0) to tolerate the npx cold download, while
+    a normal slot uses the default (attempts=2, delay=3.0)."""
+    calls: list[dict] = []
+
+    async def fake_probe(port, *, attempts=2, delay=3.0):
+        calls.append({"port": port, "attempts": attempts, "delay": delay})
+        return True  # healthy → no unhealthy report path
+
+    monkeypatch.setattr(tc, "_probe_slot_health", fake_probe)
+    monkeypatch.setattr(tc, "_report_slot_health", AsyncMock())
+
+    ws = object()
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(tc._preflight_slot(ws, 8813, "dc"))
+        loop.run_until_complete(tc._preflight_slot(ws, 8810, "fs"))
+    finally:
+        loop.close()
+
+    assert calls[0] == {"port": 8813, "attempts": 4, "delay": 5.0}
+    assert calls[1] == {"port": 8810, "attempts": 2, "delay": 3.0}
+    # The larger budget must match the declared cold-fetch constant.
+    assert (calls[0]["attempts"], calls[0]["delay"]) == tc._PREFLIGHT_BUDGET_COLD_FETCH
+    assert (calls[1]["attempts"], calls[1]["delay"]) == tc._PREFLIGHT_BUDGET_DEFAULT
+
+
+def test_preflight_slot_explicit_budget_overrides_default(monkeypatch):
+    """089a936a — explicit attempts/delay override the label-derived default, so
+    callers keep full control and the background reprobe (attempts=1) is
+    unaffected by the cold-fetch defaults."""
+    calls: list[dict] = []
+
+    async def fake_probe(port, *, attempts=2, delay=3.0):
+        calls.append({"attempts": attempts, "delay": delay})
+        return True
+
+    monkeypatch.setattr(tc, "_probe_slot_health", fake_probe)
+    monkeypatch.setattr(tc, "_report_slot_health", AsyncMock())
+
+    loop = asyncio.new_event_loop()
+    try:
+        # dc slot but explicit budget → explicit wins over the cold-fetch default.
+        loop.run_until_complete(
+            tc._preflight_slot(object(), 8813, "dc", attempts=1, delay=0.0)
+        )
+    finally:
+        loop.close()
+
+    assert calls[0] == {"attempts": 1, "delay": 0.0}
 
 
 def test_builtin_plugins_session_mode():
@@ -1301,3 +1753,93 @@ def test_extract_pool_set_active_repo_blank_is_noop():
         pool.default_repo_path = pool._normalize(new_path)
 
     assert pool.default_repo_path == original
+
+
+# ---------------------------------------------------------------------------
+# Script-mode entrypoint — `python meridian/__main__.py` (regression for 9ec44f0)
+# ---------------------------------------------------------------------------
+
+def test_tunnel_script_mode_import():
+    """`python meridian/__main__.py --help` must run in script mode (no package
+    context) without tripping the relative-import guard.
+
+    Regression for 9ec44f0: before the __package__ shim in __main__.py, a
+    script-mode invocation (`python meridian/__main__.py --tunnel`, or the
+    installer's `python meridian ...`) raised "attempted relative import with no
+    known parent package" the moment it hit `from .tunnel_client import ...`.
+    --help is the hermetic smoke test: it exercises module import + the shim
+    without needing Node/npx or the network.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    main_py = root / "meridian" / "__main__.py"
+    proc = subprocess.run(
+        [sys.executable, str(main_py), "--help"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"script-mode --help exited {proc.returncode}\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    # The exact failure 9ec44f0 fixed, and any adjacent import breakage.
+    assert "attempted relative import" not in proc.stderr, proc.stderr
+    assert "ImportError" not in proc.stderr, proc.stderr
+    assert "ModuleNotFoundError" not in proc.stderr, proc.stderr
+    # argparse writes usage to stdout on --help.
+    assert "usage" in proc.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# Version check — _version_tuple / _update_notice (4bde9437)
+# ---------------------------------------------------------------------------
+
+def test_version_tuple_parses_dotted():
+    assert tc._version_tuple("0.1.6") == (0, 1, 6)
+    assert tc._version_tuple("1.2.3") == (1, 2, 3)
+    assert tc._version_tuple("2.0") == (2, 0)
+
+
+def test_version_tuple_truncates_at_nonnumeric_segment():
+    # PEP 440 pre-release suffixes: leading digits of a segment count, the rest
+    # is ignored; a fully non-numeric segment stops parsing.
+    assert tc._version_tuple("0.2.0rc1") == (0, 2, 0)
+    assert tc._version_tuple("1.4.0.dev1") == (1, 4, 0)
+    assert tc._version_tuple("1.2.beta") == (1, 2)
+
+
+def test_version_tuple_unparseable_is_empty():
+    assert tc._version_tuple("") == ()
+    assert tc._version_tuple("nightly") == ()
+    assert tc._version_tuple("   ") == ()
+
+
+def test_update_notice_when_server_newer():
+    notice = tc._update_notice("0.1.6", "0.1.7")
+    assert notice is not None
+    assert "0.1.7" in notice and "0.1.6" in notice
+    assert "upgrade" in notice.lower()
+
+
+def test_update_notice_none_when_equal_or_ahead():
+    assert tc._update_notice("0.1.6", "0.1.6") is None
+    assert tc._update_notice("0.2.0", "0.1.9") is None  # local ahead of server
+
+
+def test_update_notice_none_on_missing_or_bad_version():
+    # Fail-open: any missing/unparseable version yields no nag, never raises.
+    assert tc._update_notice("0.1.6", "") is None
+    assert tc._update_notice("", "0.1.7") is None
+    assert tc._update_notice("0.1.6", "unknown") is None
+    assert tc._update_notice("0.1.6", None) is None  # type: ignore[arg-type]
+
+
+def test_update_notice_minor_and_major_bumps():
+    assert tc._update_notice("0.1.6", "0.2.0") is not None   # minor
+    assert tc._update_notice("0.9.9", "1.0.0") is not None   # major
+    assert tc._update_notice("1.0.0", "1.0.1") is not None   # patch

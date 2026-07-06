@@ -456,7 +456,11 @@ CREATE TABLE IF NOT EXISTS projects (
     github_repo TEXT,
     github_branch TEXT,
     queued_session TEXT,
+    pending_goal TEXT,
+    parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'parked', 'archived')),
+    priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN ('P0', 'P1', 'P2')),
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -483,7 +487,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     session_summary TEXT,
     checkpoint_data TEXT,
-    sprint_version TEXT
+    sprint_version TEXT,
+    goal_compliance TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_log (
@@ -515,7 +520,8 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     notes TEXT,
     feedback_thumb SMALLINT,
     feedback_note TEXT,
-    milestone_type TEXT NOT NULL DEFAULT 'task'
+    milestone_type TEXT NOT NULL DEFAULT 'task',
+    slug TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -529,6 +535,19 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     edit_log TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     superseded_by TEXT REFERENCES decisions_pinned(id),
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS})
+);
+
+-- 0b711a9d — insights: durable strategic understanding (mirrors SQLite).
+CREATE TABLE IF NOT EXISTS insights (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    horizon TEXT NOT NULL DEFAULT 'quarter',
+    tags TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
@@ -678,7 +697,10 @@ CREATE TABLE IF NOT EXISTS workspace_sprint_items (
     updated_at TEXT NOT NULL DEFAULT ({_TS}),
     completed_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant ON workspace_sprint_items(tenant_id, status);
+-- idx_workspace_sprint_items_tenant is created by _migrate_pg_workspace_sprint_board,
+-- NOT inline here: a pre-tenant_id copy of this table would make this unguarded
+-- executescript CREATE INDEX crash startup (see the init_pg_db note above about the
+-- 2026-06-13 outage). The migration runs in _run_pg_migrations, which survives it.
 
 -- v3.4 — workspace-level settings singleton (tenant-global defaults).
 CREATE TABLE IF NOT EXISTS workspace_settings (
@@ -690,7 +712,46 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     handoff_template TEXT,
     execution_mode_default TEXT,
     code_intel_enabled_default INTEGER,
+    loop_enabled_default INTEGER NOT NULL DEFAULT 1,
+    auto_refresh_enabled INTEGER NOT NULL DEFAULT 0,
+    refresh_interval_turns INTEGER NOT NULL DEFAULT 10,
+    refresh_triggers TEXT,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
+);
+
+-- 6234f9b8 — blog_posts: admin-authored posts served at /blog/<slug>.
+-- 8843250f — workspace-scoped via tenant_id.
+CREATE TABLE IF NOT EXISTS blog_posts (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    body_md TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    tenant_id TEXT,
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS}),
+    published_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
+-- idx_blog_posts_tenant is created by _migrate_pg_blog_posts_tenant (which also
+-- ALTERs the column onto pre-8843250f blog_posts tables). It must NOT be inline
+-- here: blog_posts predates tenant_id, so on an existing DB this unguarded
+-- executescript CREATE INDEX hit a missing column and crash-looped startup
+-- (exit 3) on the 2026-07-04 promote. The guarded migration handles both paths.
+
+-- 2976e168 — sprint_item_pointers: the GENERIC POINTER PRIMITIVE (mirrors SQLite).
+-- ONE table, a JSON ``targets`` array of composite target objects — NOT
+-- per-domain columns. idx_sprint_item_pointers_item is created ONLY by the
+-- guarded _migrate_pg_sprint_item_pointers migration, never inline here.
+-- (NB: this literal is an f-string; keep curly braces out of these comments.)
+CREATE TABLE IF NOT EXISTS sprint_item_pointers (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    sprint_item_id TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    targets TEXT NOT NULL,
+    label TEXT,
+    created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 """
 
@@ -957,16 +1018,38 @@ async def _run_pg_migrations(conn: PostgresConnection, migrations: tuple) -> Non
     A migration error must never abort startup — see init_pg_db for the
     outage that motivated this. Each migration is idempotent, so a failure
     here is retried on the next boot.
+
+    bb16f9a7/1280c66e — bound how long any single migration statement may wait
+    on a lock or run, so a canary deploy can't HANG the app past Fly's health
+    check when the still-live old machine holds a lock on a hot table (e.g. an
+    ``ALTER TABLE sprint_items ADD COLUMN`` behind active sprint-board queries).
+    A timed-out statement raises → caught below → logged → retried next boot once
+    contention clears. Reset afterward so app queries keep the pool's defaults.
     """
-    for migration in migrations:
-        try:
-            await migration(conn)
-        except Exception as exc:  # noqa: BLE001 — startup must survive any migration error
-            logger.warning(
-                "pg migration %s failed (continuing startup): %s",
-                getattr(migration, "__name__", repr(migration)),
-                exc,
-            )
+    _timeouts_set = False
+    try:
+        await conn.execute("SET lock_timeout = '5s'")
+        await conn.execute("SET statement_timeout = '120s'")
+        _timeouts_set = True
+    except Exception:  # noqa: BLE001 — best-effort guard; never block startup
+        pass
+    try:
+        for migration in migrations:
+            try:
+                await migration(conn)
+            except Exception as exc:  # noqa: BLE001 — startup must survive any migration error
+                logger.warning(
+                    "pg migration %s failed (continuing startup): %s",
+                    getattr(migration, "__name__", repr(migration)),
+                    exc,
+                )
+    finally:
+        if _timeouts_set:
+            try:
+                await conn.execute("SET lock_timeout = DEFAULT")
+                await conn.execute("SET statement_timeout = DEFAULT")
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def _migrate_pg_sprint_items_claimed_at(conn: PostgresConnection) -> None:
@@ -1015,6 +1098,31 @@ async def _migrate_pg_oauth_codes(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_device_codes(conn: PostgresConnection) -> None:
+    """e9f18530 — RFC 8628 device authorization grant table (Postgres).
+
+    device_code / user_code hold SHA-256 HASHES of the codes, never the raw
+    values. last_polled_at backs the slow_down poll-rate limiter. CREATE … IF
+    NOT EXISTS + ADD COLUMN IF NOT EXISTS so re-running is a no-op and older PG
+    DBs that never had the table get the full hardened schema. Mirrors
+    db._migrate_device_codes_table + db._migrate_device_codes_denied_polled.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS device_codes ("
+        "    device_code TEXT PRIMARY KEY,"
+        "    user_code TEXT NOT NULL UNIQUE,"
+        "    tenant_id TEXT,"
+        "    expires_at TEXT NOT NULL,"
+        "    approved INTEGER NOT NULL DEFAULT 0,"
+        "    denied INTEGER NOT NULL DEFAULT 0,"
+        "    last_polled_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "ALTER TABLE device_codes ADD COLUMN IF NOT EXISTS denied INTEGER NOT NULL DEFAULT 0;"
+        "ALTER TABLE device_codes ADD COLUMN IF NOT EXISTS last_polled_at TEXT"
+    )
+
+
 async def _migrate_pg_github_to_projects(conn: PostgresConnection) -> None:
     """Move github_repo + github_branch from tenants to projects (Task 1)."""
     await conn.executescript(
@@ -1028,6 +1136,62 @@ async def _migrate_pg_queued_session(conn: PostgresConnection) -> None:
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS queued_session TEXT"
     )
+
+
+async def _migrate_pg_pending_goal(conn: PostgresConnection) -> None:
+    """5efe254b — projects.pending_goal: the handoff /goal delivered through a
+    trusted MCP tool result (keyed on project_id) instead of a spoofable
+    copy-pasted chat string. Read-once. Nullable."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS pending_goal TEXT"
+    )
+
+
+async def _migrate_pg_insights_table(conn: PostgresConnection) -> None:
+    """0b711a9d — strategic insights table (mirrors SQLite). Idempotent."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS insights ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    title TEXT NOT NULL,"
+        "    body TEXT NOT NULL,"
+        "    horizon TEXT NOT NULL DEFAULT 'quarter',"
+        "    tags TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'active',"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project_id, horizon);"
+    )
+
+
+async def _migrate_pg_sprint_item_slug(conn: PostgresConnection) -> None:
+    """b944c905 — sprint_items.slug human-readable id (mirrors SQLite). Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS slug TEXT"
+    )
+
+
+async def _migrate_pg_capture_insight_notes_to_insights(conn: PostgresConnection) -> None:
+    """b5ed8a61 — retire the legacy ``capture_insight`` tool: MOVE every
+    ``project_notes`` row with ``note_kind = 'insight'`` into the dedicated
+    ``insights`` table (mirrors SQLite _migrate_capture_insight_notes_to_insights).
+
+    Per row: INSERT into ``insights`` (reusing the note's id, horizon='quarter',
+    status='active') THEN DELETE the note — insert-before-delete so a crash
+    mid-row can never lose data. Reusing the note id makes this a pure MOVE and
+    idempotent: after it runs there are no ``note_kind = 'insight'`` rows left,
+    so a re-run selects nothing and is a no-op. PG runs autocommit — no commit.
+    The adapter rewrites ``?`` → ``%s`` in the raw SQL below.
+    """
+    # bb16f9a7 — set-based (was per-row) so it can't slow-loop and delay startup
+    # on a large table. Pure idempotent MOVE (id reuse; re-run selects nothing).
+    await conn.execute(
+        "INSERT INTO insights (id, project_id, title, body, horizon, tags, status) "
+        "SELECT id, project_id, title, COALESCE(body, ''), 'quarter', tags, 'active' "
+        "FROM project_notes WHERE note_kind = 'insight'"
+    )
+    await conn.execute("DELETE FROM project_notes WHERE note_kind = 'insight'")
 
 
 async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
@@ -1208,10 +1372,82 @@ async def _migrate_pg_tunnel_plugins(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_tunnel_plugins_by_host(conn: PostgresConnection) -> None:
+    """8660d701 — tenants.tunnel_plugins_by_host: per-machine tunnel plugin config
+    (JSON {hostname: overrides}). The legacy tunnel_plugins stays the default for
+    hosts without a per-host entry. Mirrors SQLite _migrate_tunnel_plugins_by_host.
+    Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tunnel_plugins_by_host TEXT"
+    )
+
+
 async def _migrate_pg_code_intel(conn: PostgresConnection) -> None:
     """Sprint-2/3 — projects.code_intel_enabled: per-project Code Intelligence toggle."""
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS code_intel_enabled INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_project_status_priority(conn: PostgresConnection) -> None:
+    """8db00fcb — projects.status (active|parked|archived) + priority (P0|P1|P2)."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'P2'"
+    )
+
+
+async def _migrate_pg_signup_attempts(conn: PostgresConnection) -> None:
+    """925909aa — persistent per-IP signup-attempt log (mirrors the SQLite
+    signup_attempts table) for magic-link abuse limiting. Salted hashes only."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS signup_attempts ("
+        "    id TEXT PRIMARY KEY,"
+        "    ip_hash TEXT NOT NULL,"
+        "    email_hash TEXT NOT NULL,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_signup_attempts_ip ON signup_attempts(ip_hash, created_at);"
+    )
+
+
+async def _migrate_pg_user_session_metadata(conn: PostgresConnection) -> None:
+    """3c28450d — device metadata on user_sessions (mirrors SQLite)."""
+    await conn.executescript(
+        "ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS user_agent TEXT;"
+        "ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS ip TEXT;"
+        "ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS last_seen_at TEXT"
+    )
+
+
+async def _migrate_pg_provision_queue(conn: PostgresConnection) -> None:
+    """4c559d4e — durable provisioning queue (mirrors SQLite provision_queue)."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS provision_queue ("
+        "    tenant_id TEXT PRIMARY KEY,"
+        "    status TEXT NOT NULL DEFAULT 'pending',"
+        "    attempts INTEGER NOT NULL DEFAULT 0,"
+        "    last_error TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_provision_queue_status ON provision_queue(status);"
+    )
+
+
+async def _migrate_pg_codebase_graph_entities(conn: PostgresConnection) -> None:
+    """c00b1ccf — cached codebase-graph snapshot (mirrors SQLite)."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS codebase_graph_entities ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    qualified_name TEXT NOT NULL,"
+        "    file TEXT,"
+        "    kind TEXT,"
+        "    signature TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_cge_project ON codebase_graph_entities(project_id);"
     )
 
 
@@ -1431,6 +1667,63 @@ async def _migrate_pg_sprint_item_owner(conn: PostgresConnection) -> None:
     """
     await conn.executescript(
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS owner TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_quality_gates(conn: PostgresConnection) -> None:
+    """5823db0b — quality gates + actor attribution on sprint_items.
+
+    Nullable ``required_notes`` (gate) + ``actor`` (attribution) columns. ADD
+    COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db.migrations._migrate_sprint_item_quality_gates.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS required_notes INTEGER DEFAULT 0;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS actor TEXT;"
+    )
+
+
+async def _migrate_pg_parallel_primitives(conn: PostgresConnection) -> None:
+    """Wave-4 parallel-coordination primitives (ffa03655, c35370cc, d3a3a01d).
+
+    Postgres mirror of db.migrations._migrate_parallel_primitives: session_findings,
+    session_messages, file_read_claims. CREATE ... IF NOT EXISTS (idempotent).
+    """
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS session_findings (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            session_id TEXT,
+            key TEXT,
+            title TEXT,
+            content TEXT NOT NULL,
+            task_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_findings_project ON session_findings(project_id, key);
+        CREATE TABLE IF NOT EXISTS session_messages (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            from_session_id TEXT,
+            to_session_id TEXT NOT NULL,
+            kind TEXT,
+            payload TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            read_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_to ON session_messages(to_session_id, read_at);
+        CREATE TABLE IF NOT EXISTS file_read_claims (
+            id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NOT NULL,
+            UNIQUE(file_path, session_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_read_claims_file ON file_read_claims(file_path);
+        CREATE INDEX IF NOT EXISTS idx_read_claims_expires ON file_read_claims(expires_at);
+        """
     )
 
 
@@ -1737,7 +2030,15 @@ async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> No
         "log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS handoff_template TEXT;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS execution_mode_default TEXT;"
-        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS code_intel_enabled_default INTEGER"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS code_intel_enabled_default INTEGER;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "loop_enabled_default INTEGER NOT NULL DEFAULT 1;"
+        # bf51b12e — planner context-refresh config.
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "auto_refresh_enabled INTEGER NOT NULL DEFAULT 0;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "refresh_interval_turns INTEGER NOT NULL DEFAULT 10;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS refresh_triggers TEXT"
     )
 
 
@@ -1988,6 +2289,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_admin_plan,
     _migrate_pg_tunnel_active,
     _migrate_pg_tunnel_plugins,
+    _migrate_pg_tunnel_plugins_by_host,
 )
 
 async def _migrate_pg_decision_code_anchor(conn: PostgresConnection) -> None:
@@ -2108,6 +2410,94 @@ async def _migrate_pg_github_connections(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_blog_posts(conn: PostgresConnection) -> None:
+    """6234f9b8 — blog_posts table for the admin Blog CMS.
+
+    Was added to the SQLite schema only; Postgres DBs 500'd on /admin/blog/posts
+    with 'relation blog_posts does not exist'. CREATE IF NOT EXISTS so re-running
+    is a no-op. Mirrors db._migrate_blog_posts.
+    """
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS blog_posts ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    title TEXT NOT NULL,"
+        f"    slug TEXT NOT NULL UNIQUE,"
+        f"    body_md TEXT NOT NULL DEFAULT '',"
+        f"    status TEXT NOT NULL DEFAULT 'draft',"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    published_at TEXT"
+        f");"
+        f"CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status)"
+    )
+
+
+async def _migrate_pg_blog_posts_tenant(conn: PostgresConnection) -> None:
+    """8843250f — workspace-scope the blog: add a nullable ``tenant_id`` to
+    ``blog_posts`` + an index on it. Idempotent (ADD COLUMN IF NOT EXISTS).
+    Mirrors db._migrate_blog_posts_tenant. The 'archived' lifecycle status is
+    enforced at the app layer (the PG blog_posts table has no status CHECK)."""
+    await conn.executescript(
+        "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS tenant_id TEXT;"
+        "CREATE INDEX IF NOT EXISTS idx_blog_posts_tenant ON blog_posts(tenant_id)"
+    )
+
+
+async def _migrate_pg_project_parent_id(conn: PostgresConnection) -> None:
+    """3b6ff466 — projects.parent_project_id: one-level-deep subprojects.
+
+    Nullable self-reference; NULL means a top-level project. The one-level
+    depth rule and parent-exists check are enforced at the app layer
+    (db.create_project). The north_star fall-back to the parent lives in
+    db.get_goal so every read-path (get_goal / get_planning_brief /
+    get_context_block) inherits it. Idempotent (ADD COLUMN IF NOT EXISTS).
+    The index lives here, never inline in CREATE_TABLES_CORE, to avoid the
+    unguarded-index boot crash on a projects table predating the column.
+    Mirrors db._migrate_project_parent_id."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS parent_project_id TEXT;"
+        "CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_project_id)"
+    )
+
+
+async def _migrate_pg_session_goal_compliance(conn: PostgresConnection) -> None:
+    """5abf3e12 — sessions.goal_compliance: stored per-session goal-compliance
+    metric (JSON: listed N vs completed M vs fully_completed).
+
+    Written at generate_handoff by db.compute_session_goal_compliance. Nullable;
+    no index (read only by the session's primary key). Idempotent
+    (ADD COLUMN IF NOT EXISTS). Mirrors db._migrate_session_goal_compliance.
+    """
+    await conn.executescript(
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS goal_compliance TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_pointers(conn: PostgresConnection) -> None:
+    """2976e168 — sprint_item_pointers: the GENERIC POINTER PRIMITIVE (mirrors SQLite).
+
+    ONE table for pointers of ANY source_type, keyed to a sprint item; ``targets``
+    is a JSON array of {uri, selector, subSelector?} (composite shape stored as
+    JSON, NOT per-domain columns). CREATE_TABLES_CORE covers fresh DBs; this is
+    the upgrade path. The index lives here, never inline in CREATE_TABLES_CORE, to
+    avoid the unguarded-index boot crash. Idempotent. Mirrors
+    db._migrate_sprint_item_pointers.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sprint_item_pointers ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    sprint_item_id TEXT NOT NULL,"
+        "    source_type TEXT NOT NULL,"
+        "    targets TEXT NOT NULL,"
+        "    label TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_sprint_item_pointers_item "
+        "ON sprint_item_pointers(sprint_item_id);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2117,6 +2507,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_api_token_type,
     _migrate_pg_api_token_expires_at,
     _migrate_pg_oauth_codes,
+    _migrate_pg_device_codes,
     _migrate_pg_github_to_projects,
     _migrate_pg_touches_resources,
     _migrate_pg_resource_locks,
@@ -2138,6 +2529,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_note_source,
     _migrate_pg_session_sprint_version,
     _migrate_pg_project_execution_mode,
+    _migrate_pg_project_status_priority,
     _migrate_pg_decision_code_anchor,
     _migrate_pg_session_graph_snapshots,
     _migrate_pg_agent_tasks_table,
@@ -2146,4 +2538,19 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoffs_table,
     _migrate_pg_decision_assumption,
     _migrate_pg_github_connections,
+    _migrate_pg_blog_posts,
+    _migrate_pg_sprint_item_quality_gates,
+    _migrate_pg_parallel_primitives,
+    _migrate_pg_signup_attempts,
+    _migrate_pg_user_session_metadata,
+    _migrate_pg_provision_queue,
+    _migrate_pg_codebase_graph_entities,
+    _migrate_pg_pending_goal,
+    _migrate_pg_insights_table,
+    _migrate_pg_sprint_item_slug,
+    _migrate_pg_capture_insight_notes_to_insights,
+    _migrate_pg_blog_posts_tenant,
+    _migrate_pg_project_parent_id,
+    _migrate_pg_session_goal_compliance,
+    _migrate_pg_sprint_item_pointers,
 )

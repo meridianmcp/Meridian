@@ -787,6 +787,7 @@ async def _handle_mcp_request(
     tenant: dict[str, Any] | None = None,
     token_type: str = "readwrite",
     enforce_role: str | None = None,
+    scoped_project_ids: "list[str] | None" = None,
 ) -> dict[str, Any]:
     """Dispatch one JSON-RPC 2.0 MCP request and return the response dict.
 
@@ -852,6 +853,22 @@ async def _handle_mcp_request(
         args = params.get("arguments") or {}
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
+        # 95499c3e / decision 6fe5210c — Option A project-scope enforcement for
+        # API tokens (mirrors the HTTP middleware). A scoped member may only touch
+        # projects in their scope; resolve the tool's target project (by project_id,
+        # else project_name → id) and deny when it's out of scope.
+        if scoped_project_ids is not None:
+            _tgt_pid = (args.get("project_id") or "").strip()
+            if not _tgt_pid and args.get("project_name"):
+                try:
+                    _sp = await db_module.get_project_by_name(db, str(args["project_name"]))
+                    _tgt_pid = (_sp or {}).get("id", "") if _sp else ""
+                except Exception:  # noqa: BLE001
+                    _tgt_pid = ""
+            if _tgt_pid and _tgt_pid not in scoped_project_ids:
+                return _server._jsonrpc_err(
+                    req_id, -32603, "project is outside your access scope",
+                )
         # 393eed0a — workspace-role gate (defense in depth for cross-workspace MCP).
         if enforce_role is not None and name not in _server._mcp_readonly_tools \
                 and name not in _server._GITHUB_TOOL_NAMES:
@@ -880,6 +897,23 @@ async def _handle_mcp_request(
                 result = await _dispatch_github_tool(name, args, tenant, db)
             else:
                 result = await _dispatch_mcp_tool(name, args, db, data_dir, tenant=tenant)
+                # 4b698ea5 — implicit last_seen bump on the HOSTED path, mirroring
+                # the stdio handler. Previously ONLY stdio tool calls refreshed a
+                # session's last_seen; a hosted/tunnel executor's session went
+                # stale between the sparse tools that happen to write it. Any
+                # native Meridian tool carrying a session_id now keeps the session
+                # alive, and marks it "connected" so the keepalive loop holds it
+                # fresh through quiet, non-MCP work. Best-effort: never fail the call.
+                _session_id = args.get("session_id")
+                if _session_id and name != "heartbeat":
+                    try:
+                        await db_module.update_session_seen(db, _session_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        _server._mark_session_connected(_session_id)
+                    except Exception:  # noqa: BLE001
+                        pass
             return _server._jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
         except Exception as exc:
             return _server._jsonrpc_err(req_id, -32603, str(exc))
@@ -924,6 +958,88 @@ async def _maybe_add_log_task_nudge(db: Any, task: dict[str, Any]) -> dict[str, 
     except Exception:  # noqa: BLE001
         pass
     return task
+
+
+async def _build_context_refresh(db: Any, project_id: str) -> dict[str, Any] | None:
+    """Build the compact context-refresh dict for a project.
+
+    d8bd59c4 / bf51b12e — shared builder for both the explicit ``refresh_context``
+    tool and the planner context-refresh dispatch hook. COMPACT by design: counts
+    + ids + slugs, not full bodies. Returns None when the project does not exist.
+    """
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        return None
+    goal = await db_module.get_goal(db, project_id)
+    all_items = await db_module.get_sprint_items(db, project_id)
+    done = sum(1 for it in all_items if it.get("status") == "done")
+    total = len(all_items)
+    pending = [it for it in all_items if it.get("status") == "pending"]
+    active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
+    recent_handoffs = await db_module.get_handoffs(db, project_id, limit=3)
+    pinned = await db_module.get_pinned_decisions(db, project_id)
+    high_priority_decisions = [
+        {"id": d.get("id"), "title": (d.get("title") or "")[:120]}
+        for d in pinned if d.get("priority") == "urgent"
+    ][:5]
+    unvalidated_assumptions = [
+        {
+            "decision_id": d.get("id"),
+            "title": (d.get("title") or "")[:120],
+            "assumption_status": d.get("assumption_status"),
+        }
+        for d in pinned
+        if d.get("assumption") and d.get("assumption_status") != "confirmed"
+    ]
+    notes = await db_module.get_project_notes(db, project_id)
+    _rank = {"high": 0, "normal": 1, "low": 2}
+    key_notes = sorted(
+        [n for n in notes if n.get("slug")],
+        key=lambda n: _rank.get(n.get("priority"), 1),
+    )[:10]
+    key_note_slugs = [
+        {
+            "slug": n.get("slug"),
+            "title": (n.get("title") or "")[:100],
+            "kind": n.get("note_kind") or n.get("kind"),
+        }
+        for n in key_notes
+    ]
+    return {
+        "project_id": project_id,
+        "project_name": project.get("name"),
+        "sprint": (goal.get("sprint") or "") if goal else "",
+        "north_star": (goal.get("north_star") or "") if goal else "",
+        "sprint_progress": {
+            "done": done,
+            "total": total,
+            "pending": len(pending),
+            "percent_complete": round(100 * done / total) if total else 0,
+        },
+        "next_pending_items": [
+            {"id": it["id"], "title": (it.get("title") or "")[:100]}
+            for it in pending[:5]
+        ],
+        "active_session_id": (
+            active_sessions[0]["id"] if active_sessions else None
+        ),
+        "active_sessions": [
+            {"id": s.get("id"), "name": s.get("name")}
+            for s in active_sessions[:5]
+        ],
+        "recent_handoffs": [
+            {
+                "id": h.get("id"),
+                "session_id": h.get("session_id"),
+                "mode": h.get("mode"),
+                "created_at": h.get("created_at"),
+            }
+            for h in recent_handoffs
+        ],
+        "high_priority_decisions": high_priority_decisions,
+        "unvalidated_assumptions": unvalidated_assumptions,
+        "key_note_slugs": key_note_slugs,
+    }
 
 
 def _parse_touches_files(raw: Any) -> list[str]:
@@ -1072,6 +1188,62 @@ def _infer_touches_resources(title: str) -> list[str]:
     return [f"inferred:file:{path}" for path in _suggest_files_for_title(title or "")]
 
 
+def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
+    """04a15d3f — best-effort code-prospecting context for a freshly-claimed item.
+
+    Parses the item's typed ``touches_resources`` into the files and symbols an
+    executor should prospect before editing and emits the exact code-intel calls
+    to run — ``codebase__search_graph`` for ``file:`` entries, Serena
+    ``find_symbol`` for ``symbol:`` entries. With no declared resources it falls
+    back to title-keyword file inference (:func:`_suggest_files_for_title`).
+
+    The code index lives behind the executor's tunnel, so the server surfaces
+    the prospecting *targets and commands* rather than inlining graph results:
+    this never touches the tunnel and returns ``None`` when there's nothing to
+    suggest, so it can't fail (or block) a claim — non-fatal by construction.
+    """
+    files: list[str] = []
+    symbols: list[str] = []
+    for entry in _parse_touches_files(item.get("touches_resources")):
+        if entry.startswith("file:"):
+            files.append(entry[len("file:"):])
+        elif entry.startswith("symbol:"):
+            symbols.append(entry[len("symbol:"):])
+        elif entry.startswith("inferred:file:"):
+            files.append(entry[len("inferred:file:"):])
+    if files or symbols:
+        ctx: dict[str, Any] = {"source": "touches_resources"}
+        if files:
+            ctx["files"] = files
+            ctx["search_graph_calls"] = [
+                f'codebase__search_graph(query="{f}")' for f in files
+            ]
+        if symbols:
+            ctx["symbols"] = symbols
+            ctx["find_symbol_calls"] = [
+                f'find_symbol(name_path="{s}")' for s in symbols
+            ]
+        ctx["hint"] = (
+            "Prospect before editing: run the listed code-intel calls "
+            "(no-op if the code tunnel/index isn't connected)."
+        )
+        return ctx
+    inferred = _suggest_files_for_title(item.get("title") or "")
+    if inferred:
+        return {
+            "source": "title_inference",
+            "files": inferred,
+            "search_graph_calls": [
+                f'codebase__search_graph(query="{f}")' for f in inferred
+            ],
+            "hint": (
+                "No touches_resources declared; these files were inferred from "
+                "the item title. Prospect before editing."
+            ),
+        }
+    return None
+
+
 async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
     """fd86aacc — names of executor sessions seen active in the last 10 minutes.
 
@@ -1205,6 +1377,32 @@ async def _fetch_recent_commits(
 # None, which is a legitimate handler return value (e.g. get_goal).
 _MISS: Any = object()
 
+# bf51b12e — planner context-refresh nudge.
+# Default set of tool names that trigger a compact context-refresh being
+# attached to a planner (non-executor) tool result. A workspace can override
+# this via workspace_settings.refresh_triggers (a JSON list). NOTE: add_insight,
+# not capture_insight — capture_insight was removed by b5ed8a61.
+_PLANNER_REFRESH_TRIGGERS = frozenset({
+    "add_insight",
+    "pin_decision",
+    "pin_workspace_decision",
+    "set_north_star",
+    "set_goal",
+    "generate_handoff",
+})
+
+# In-memory, best-effort per-process state for the planner context-refresh nudge.
+# This is intentionally NOT persisted: turn tracking + gating for a UX refresh
+# nudge is fine as best-effort per-process state (avoids a sessions-table
+# migration + a per-call DB write).
+#   _EXECUTOR_SESSIONS  — session_ids that started with role='executor'; the
+#                         nudge is planner-only, so these are skipped.
+#   _SESSION_REFRESH_STATE — session_id -> {"calls": int, "last_refresh": int};
+#                         "calls" counts tool calls seen, "last_refresh" is the
+#                         call index at which we last attached a refresh.
+_EXECUTOR_SESSIONS: set[str] = set()
+_SESSION_REFRESH_STATE: dict[str, dict] = {}
+
 
 async def _handle_project_tools(
     name: str,
@@ -1219,11 +1417,17 @@ async def _handle_project_tools(
         existing = await db_module.get_project_by_name(db, args["name"])
         if existing is not None:
             return {"error": f"project '{args['name']}' already exists", "project": existing}
-        return await db_module.create_project(
-            db, args["name"], execution_mode=args.get("execution_mode"),
-            # 0bf67524 — seed from workspace cascade defaults when authenticated.
-            tenant_id=(tenant.get("id") if tenant else None),
-        )
+        # 3b6ff466 — optional parent_project_id makes this a one-level-deep
+        # subproject; an invalid/nested parent raises ValueError → error dict.
+        try:
+            return await db_module.create_project(
+                db, args["name"], execution_mode=args.get("execution_mode"),
+                # 0bf67524 — seed from workspace cascade defaults when authenticated.
+                tenant_id=(tenant.get("id") if tenant else None),
+                parent_project_id=args.get("parent_project_id"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
     if name == "register_session":
         hid = args.get("human_id")
         if not hid and not _hosted_mode():
@@ -1240,17 +1444,35 @@ async def _handle_project_tools(
         # Pass compact=False explicitly for the full block.
         # a76cb7c0 — optional `version` scopes the session to a sprint-version
         # bucket (orientation counts/items + /goal filter to it).
+        # 599d0097 — session_name is optional: when omitted/blank, generate a
+        # meaningful default from the first pending item title + timestamp.
+        _sname = (args.get("session_name") or "").strip()
+        if not _sname:
+            _sname = await db_module.generate_default_session_name(
+                db, args["project_id"]
+            )
         result = await _server._start_session_composite(
             db,
             args["project_id"],
-            args["session_name"],
+            _sname,
             data_dir,
             human_id=args.get("human_id"),
             client_type=args.get("client"),
             role=args.get("role"),
             compact=args.get("compact", True),
             version=args.get("version"),
+            mode=args.get("mode"),
         )
+        # bf51b12e — register executor sessions in-memory so the planner
+        # context-refresh hook skips them (the nudge is planner-only). Best-effort:
+        # any failure here must never break start_session.
+        try:
+            if args.get("role") == "executor" and isinstance(result, dict):
+                _sid = result.get("session_id") or result.get("session", {}).get("id")
+                if _sid:
+                    _EXECUTOR_SESSIONS.add(_sid)
+        except Exception:  # noqa: BLE001 — non-fatal
+            pass
         # b9d1b606 — expand fs proxy roots so the executor's repo_path is
         # accessible without a separate set_active_repo call.
         # b2a417ad — also point the Serena daemon pool at this project's repo so
@@ -1313,6 +1535,18 @@ async def _handle_project_tools(
                         )
             except Exception:  # noqa: BLE001 — orientation must not break
                 pass
+        # 5efe254b — deliver any pending handoff /goal through this trusted tool
+        # result (keyed on project_id) rather than as a spoofable copy-pasted
+        # chat string. Read-once: pop clears it so it surfaces exactly once.
+        # Outside the tenant gate so self-hosted sessions receive it too.
+        # Guarded so a pre-migration DB never breaks the orientation.
+        try:
+            if isinstance(result, dict):
+                _pg = await db_module.pop_pending_goal(db, args["project_id"])
+                if _pg:
+                    result["pending_goal"] = _pg
+        except Exception:  # noqa: BLE001
+            pass
         return result
     if name == "list_projects":
         return await db_module.list_project_summaries(db)
@@ -1382,6 +1616,18 @@ async def _handle_task_tools(
         # Fetch recent commits for reconcile annotations (non-fatal)
         _gh_project = await db_module.get_project(db, args["project_id"])
         _gh_commits = await _fetch_recent_commits(_gh_project or {}, tenant)
+        # 4cfaecc2 — wire code-pointer enrichment to the tunnel code-intel slot.
+        # Build a tunnel-backed graph searcher when a tunnel is active; None
+        # otherwise (enrichment degrades to no pointers). Fully guarded — never
+        # break the mandatory handoff over an enrichment convenience.
+        _graph_searcher = None
+        try:
+            from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+            _graph_searcher = _tunnel_mod.build_graph_searcher(
+                tenant.get("id") if tenant else None
+            )
+        except Exception:  # noqa: BLE001
+            _graph_searcher = None
         try:
             path, content = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -1391,6 +1637,7 @@ async def _handle_task_tools(
                     mode=mode,
                     session_id=session_id,
                     commit_messages=[c["message"] for c in _gh_commits],
+                    graph_searcher=_graph_searcher,
                 ),
                 timeout=90.0,
             )
@@ -1399,8 +1646,210 @@ async def _handle_task_tools(
                 db, args["project_id"], data_dir
             )
             mode = "full"
-        return {"file_path": path, "content": content, "mode": mode}
+        # 99e50a1d — surface a machine-readable staleness flag so the dashboard /
+        # caller can offer a one-click sync when the project's stored executor
+        # rules predate the current standard.
+        _tpl_stale = False
+        try:
+            from ..agent_defaults import agent_instructions_stale  # noqa: PLC0415
+            _stored_ai = await db_module.get_agent_instructions(db, args["project_id"])
+            _tpl_stale = agent_instructions_stale(_stored_ai)
+        except Exception:  # noqa: BLE001
+            _tpl_stale = False
+        # 2d932f60 — scan this session's task log for insight candidates so the
+        # handoff prompts an add_insight()/pin_decision() before context is lost.
+        _insight_hints: list[dict[str, str]] = []
+        try:
+            _ih_tasks = await db_module.get_tasks(db, args["project_id"], limit=15)
+            for _t in _ih_tasks:
+                _desc = _t.get("description") or ""
+                _sig = handoff_module_local.detect_insight_candidate(_desc)
+                if _sig:
+                    _insight_hints.append({"signal": _sig, "text": _desc[:160]})
+        except Exception:  # noqa: BLE001
+            _insight_hints = []
+        # 0fe01e93 — warn when the project's /goal text is over the 4000-char soft
+        # limit (a bloated goal crowds out sprint context); the dashboard live
+        # counter + auto-bury handle the editing UX.
+        _goal_warn = None
+        try:
+            _gh_goal = await db_module.get_goal(db, args["project_id"])
+            _goal_len = len((_gh_goal or {}).get("sprint") or "") + len(
+                (_gh_goal or {}).get("north_star") or ""
+            )
+            if _goal_len > 4000:
+                _goal_warn = (
+                    f"/goal text is {_goal_len} chars (>4000) — bury step detail into "
+                    "sprint-item notes so the goal stays scannable."
+                )
+        except Exception:  # noqa: BLE001
+            _goal_warn = None
+        # 642b1818 — hotfix: return the handoff as one plain-text copyable block
+        # (strip markdown code-fence markers anywhere they appear — incl. inline in
+        # rendered note bodies — so it pastes cleanly into a fenced chat / a
+        # dashboard textarea without breaking the surrounding fence).
+        import re as _re_fence  # noqa: PLC0415
+        _plain_content = _re_fence.sub(r"```[A-Za-z0-9_+.-]*", "", content)
+        # 5abf3e12 — surface the stored per-session goal-compliance metric
+        # (generate_handoff computed & persisted it) so the caller / dashboard
+        # sees whether this session's /goal item list was fully completed.
+        _goal_compliance = None
+        if session_id:
+            try:
+                _goal_compliance = await db_module.get_session_goal_compliance(
+                    db, session_id
+                )
+            except Exception:  # noqa: BLE001
+                _goal_compliance = None
+        return {
+            "file_path": path,
+            "content": _plain_content,
+            "mode": mode,
+            "template_stale": _tpl_stale,
+            "insight_hints": _insight_hints[:5],
+            "goal_length_warning": _goal_warn,
+            "goal_compliance": _goal_compliance,
+        }
+    if name == "load_handoff":
+        # 5efe254b — trusted retrieval of the latest stored handoff for a project
+        # as an MCP tool result: an explicit, idempotent alternative to
+        # start_session's pending_goal delivery. Read-only — it does NOT clear
+        # pending_goal (start_session's pop owns read-once consumption), so it is
+        # safe to call repeatedly.
+        _pid = args["project_id"]
+        _latest = None
+        try:
+            _rows = await db_module.get_handoffs(db, _pid, limit=1)
+            _latest = _rows[0] if _rows else None
+        except Exception:  # noqa: BLE001
+            _latest = None
+        _pending = None
+        try:
+            _pending = await db_module.get_pending_goal(db, _pid)
+        except Exception:  # noqa: BLE001
+            _pending = None
+        return {
+            "pending_goal": _pending,
+            "handoff": (
+                {
+                    "content": _latest.get("body"),
+                    "mode": _latest.get("mode"),
+                    "session_id": _latest.get("session_id"),
+                    "created_at": _latest.get("created_at"),
+                }
+                if _latest else None
+            ),
+            "has_handoff": bool(_latest) or bool(_pending),
+        }
     return _MISS
+
+
+def _doc_type_for_path(file_path: str | None) -> str | None:
+    """Map a file path to a doc_store doc_type, or None if unsupported.
+
+    Only the formats whose *structure* the server can parse today qualify:
+    ``.docx`` (docs_intel) and ``.tex`` (latex_intel). Everything else (plain
+    text, PDF-as-content, …) has no structure to persist, so ingest just stores
+    the flat note and skips the structure store.
+    """
+    if not file_path:
+        return None
+    lowered = file_path.strip().lower()
+    if lowered.endswith(".docx"):
+        return "docx"
+    if lowered.endswith(".tex"):
+        return "latex"
+    return None
+
+
+async def _resolve_ingest_doc_store(
+    db: Any, data_dir: str, tenant: dict[str, Any] | None
+) -> Any:
+    """Resolve the document-structure store to persist an ingest into, or None.
+
+    Best-effort + fully guarded: any failure returns None so ingest itself never
+    breaks. Prefers the tier-resolved store (pro/admin tenants with a cloud PG
+    url get their tenant Postgres; everyone else the local sidecar). A tenant
+    ``neon_db_url`` is decrypted here exactly like ``_deps._open_tenant_db_by_id``
+    does. Falls back to the process-default ``app.state.doc_store``.
+    """
+    try:
+        from ..doc_store import open_doc_store_for  # noqa: PLC0415
+
+        plan: str | None = None
+        tenant_pg_url: str | None = None
+        if tenant:
+            plan = tenant.get("plan")
+            enc = tenant.get("neon_db_url")
+            tid = tenant.get("id")
+            if enc and tid:
+                try:
+                    from ..tenant_crypto import decrypt_tenant_db_url  # noqa: PLC0415
+                    tenant_pg_url = decrypt_tenant_db_url(tid, enc) or None
+                except Exception:  # noqa: BLE001 — degrade to local sidecar
+                    tenant_pg_url = None
+
+        return await open_doc_store_for(
+            plan=plan,
+            hosted=_hosted_mode(),
+            data_dir=data_dir,
+            tenant_pg_url=tenant_pg_url,
+            override_url=os.environ.get("MERIDIAN_DOC_STORE_URL"),
+        )
+    except Exception:  # noqa: BLE001 — never let store resolution break ingest
+        store = getattr(getattr(_server, "app", None), "state", None)
+        return getattr(store, "doc_store", None) if store is not None else None
+
+
+async def _persist_ingest_structure(
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    project_id: str,
+    file_path: str | None,
+    source: str | None,
+    title: str | None,
+) -> None:
+    """Best-effort: parse + persist a docx/latex structure into the doc store.
+
+    Called AFTER a successful ``ingest_document``. Wrapped so any failure
+    (unsupported type, parse error, store unavailable, backend error) is
+    swallowed — structure persistence is additive and must never regress ingest.
+    """
+    doc_type = _doc_type_for_path(file_path)
+    if doc_type is None:
+        return
+    try:
+        from ..doc_store import (  # noqa: PLC0415
+            elements_from_docx_outline,
+            elements_from_latex_analysis,
+        )
+
+        if doc_type == "docx":
+            from ..docs_intel import document_outline  # noqa: PLC0415
+            outline = document_outline(file_path)
+            elements = elements_from_docx_outline(outline)
+        else:  # latex
+            from ..latex_intel import analyze_latex  # noqa: PLC0415
+            analysis = analyze_latex(file_path)
+            elements = elements_from_latex_analysis(analysis)
+
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return
+        stored_source = (source or file_path or "").strip() or None
+        await store.put_document(
+            project_id,
+            doc_type,
+            elements,
+            source=stored_source,
+            title=title,
+        )
+    except Exception:  # noqa: BLE001 — persistence is best-effort, never break ingest
+        import logging as _ds_log  # noqa: PLC0415
+        _ds_log.getLogger(__name__).debug(
+            "doc-structure persistence skipped for %s", file_path, exc_info=True
+        )
 
 
 async def _handle_notes_decisions(
@@ -1411,7 +1860,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, capture_insight, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -1479,10 +1928,25 @@ async def _handle_notes_decisions(
         validate_input_size(args.get("file_path"), "note file_path", 2_000)
         validate_input_size(args.get("symbol"), "note symbol", 500)
         validate_input_size(args.get("source"), "note source", 2_000)
+        # 41b8a927 — recognise #hashtags in the title/body as tags so a note is
+        # searchable by tag without a separate tags argument.
+        import re as _re_ht  # noqa: PLC0415
+        _ht = _re_ht.findall(
+            r"(?<!\w)#([A-Za-z][\w-]{1,40})",
+            f"{args.get('title') or ''} {args.get('body') or ''}",
+        )
+        _tags_arg = args.get("tags")
+        if _ht:
+            _have = {t.strip().lower() for t in (_tags_arg or "").split(",") if t.strip()}
+            _add = [h for h in _ht if h.lower() not in _have]
+            if _add:
+                _tags_arg = ", ".join(
+                    [p for p in [(_tags_arg or "").strip()] if p] + _add
+                )
         try:
             result = await db_module.add_project_note(
                 db, args["project_id"], args["title"], args["body"],
-                args.get("tags"), kind=args.get("kind"),
+                _tags_arg, kind=args.get("kind"),
                 priority=args.get("priority", "normal"),
                 file_path=args.get("file_path"), symbol=args.get("symbol"),
                 source=args.get("source"),
@@ -1495,6 +1959,47 @@ async def _handle_notes_decisions(
         # e5592013 — lint: "MANUAL" notes are usually human tasks, not wiki.
         if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
             result = {**result, "lint": _MANUAL_NOTE_LINT}
+        # 6e4e2371 — warn (never block) when a near-duplicate note already exists,
+        # so notes don't accumulate repetitive near-copies. Advisory: any failure
+        # here must not fail the write.
+        if isinstance(result, dict) and not result.get("error"):
+            try:
+                import difflib as _difflib  # noqa: PLC0415
+                _new_title = (args.get("title") or "").strip().lower()
+                if _new_title:
+                    _new_id = result.get("id")
+                    _new_slug = result.get("slug")
+                    _existing = await db_module.get_project_notes(
+                        db, args["project_id"], limit=200
+                    )
+                    _similar = []
+                    for _n in (_existing or []):
+                        if (_new_id and _n.get("id") == _new_id) or (
+                            _new_slug and _n.get("slug") == _new_slug
+                        ):
+                            continue  # skip the note we just created
+                        _et = (_n.get("title") or "").strip().lower()
+                        if not _et:
+                            continue
+                        _ratio = _difflib.SequenceMatcher(None, _new_title, _et).ratio()
+                        if _ratio >= 0.82:
+                            _similar.append({
+                                "slug": _n.get("slug"),
+                                "title": _n.get("title"),
+                                "similarity": round(_ratio, 2),
+                            })
+                    if _similar:
+                        _similar.sort(key=lambda s: s["similarity"], reverse=True)
+                        result = {
+                            **result,
+                            "similar_notes": _similar[:3],
+                            "similar_notes_warning": (
+                                "A similar note already exists — consider updating it "
+                                "instead of accumulating near-duplicates."
+                            ),
+                        }
+            except Exception:  # noqa: BLE001 — dedup is advisory
+                pass
         return result
     if name == "ingest_document":
         # e3f150d0 — extract a Word/PDF/text document into a kind='document'
@@ -1507,7 +2012,7 @@ async def _handle_notes_decisions(
         validate_input_size(args.get("content"), "document content", 50_000_000)
         from ..doc_ingest import DocExtractionError  # local import: optional dep-free
         try:
-            return await db_module.ingest_document(
+            _ingest_result = await db_module.ingest_document(
                 db, args["project_id"],
                 file_path=args.get("file_path"),
                 content=args.get("content"),
@@ -1517,25 +2022,113 @@ async def _handle_notes_decisions(
             )
         except (ValueError, DocExtractionError, FileNotFoundError) as exc:
             return {"error": str(exc)}
-    if name == "capture_insight":
-        # db9edba3 — one-call insight capture for planning (claude.ai) sessions:
-        # persists a kind='insight' note (prominent in the dashboard + surfaced in
-        # the planner handoff) WITHOUT the auto-capture "Session summary" noise.
+        # 9ee6d2ec — best-effort: persist the parsed docx/latex STRUCTURE into the
+        # tiered doc-structure store. Fully guarded inside — a persistence failure
+        # never touches _ingest_result (no regression to the flat-note ingest).
+        await _persist_ingest_structure(
+            db,
+            data_dir,
+            tenant,
+            args["project_id"],
+            args.get("file_path"),
+            args.get("source"),
+            args.get("title"),
+        )
+        return _ingest_result
+    if name == "get_document_structure":
+        # 13462df2 — stateless docs_intel: heading outline of a server-side .docx
+        # (no sidecar index). Same server-side file access as ingest_document
+        # (self-hosted / tunnel).
+        validate_input_size(args.get("file_path"), "document file_path", 2_000)
+        fp = args.get("file_path")
+        if not fp:
+            return {"error": "file_path is required"}
+        try:
+            from ..docs_intel import document_outline  # noqa: PLC0415
+            return document_outline(fp)
+        except FileNotFoundError:
+            return {"error": f"file not found: {fp}"}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not parse document: {exc}"}
+    if name == "get_latex_structure":
+        # 106118cd — docs_intel Phase 3: native LaTeX (.tex) structure + biblio,
+        # no PDF intermediary. Accepts a server-side file_path (like
+        # get_document_structure) OR raw `source` inline. latex_intel never
+        # raises — malformed LaTeX yields a partial/empty tree, not a crash.
+        validate_input_size(args.get("file_path"), "latex file_path", 2_000)
+        validate_input_size(args.get("source"), "latex source", 5_000_000)
+        fp = args.get("file_path")
+        src = args.get("source")
+        if not fp and not src:
+            return {"error": "file_path or source is required"}
+        from ..latex_intel import analyze_latex  # noqa: PLC0415
+        try:
+            if fp:
+                import os  # noqa: PLC0415
+                if not os.path.isfile(fp):
+                    return {"error": f"file not found: {fp}"}
+                return analyze_latex(fp)
+            return analyze_latex(src)
+        except Exception as exc:  # noqa: BLE001 — defense in depth; analyze_latex is already safe
+            return {"error": f"could not parse latex: {exc}"}
+    if name == "get_citation_edges":
+        # fefb596a — read the citation graph: every kind='citation' marker in a
+        # project (optionally scoped to one document via source/document_id) with
+        # its intra-doc bibentry edges AND cross-doc zotero_item edges. Reads the
+        # tier-resolved doc-structure store; returns an empty graph (never an
+        # error) when no structure has been persisted yet.
+        validate_input_size(args.get("source"), "citation source", 2_000)
+        validate_input_size(args.get("document_id"), "citation document_id", 200)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"project_id": args["project_id"], "markers": []}
+        try:
+            graph = await store.get_citation_graph(
+                args["project_id"],
+                source=args.get("source"),
+                document_id=args.get("document_id"),
+            )
+        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+            return {"error": f"could not read citation graph: {exc}"}
+        return {"project_id": args["project_id"], **graph}
+    if name == "resolve_citations":
+        # fefb596a — opt-in cross-document resolve pass: walk unresolved citation
+        # markers and link each to a canonical Zotero item via Zotero's LOCAL API
+        # (zotero_client.resolve_citation_ref). NETWORK — deliberately a separate
+        # tool, never in ingest/put_document. Idempotent: only fills gaps. When
+        # Zotero is closed / its local API is disabled every marker just stays
+        # unresolved (the resolver returns None, never raises).
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        _max = args.get("max_items")
+        try:
+            _max = int(_max) if _max is not None else None
+        except (TypeError, ValueError):
+            _max = None
+        try:
+            summary = await store.resolve_zotero_edges(
+                args["project_id"], max_items=_max,
+            )
+        except Exception as exc:  # noqa: BLE001 — the pass is best-effort
+            return {"error": f"could not resolve citations: {exc}"}
+        return {"project_id": args["project_id"], **summary}
+    if name == "add_insight":
+        # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)
-        _ins_body = args.get("body")
-        _bullets = args.get("bullet_points")
-        if (not _ins_body) and isinstance(_bullets, list) and _bullets:
-            _ins_body = "\n".join(f"- {str(b).strip()}" for b in _bullets if str(b).strip())
-        _ins_body = _ins_body or ""
-        validate_input_size(_ins_body, "insight body", 10_000_000)
-        if not _ins_body:
-            return {"error": "capture_insight requires body or non-empty bullet_points"}
-        _ins_tags = args.get("tags")
-        _ins_tags = f"{_ins_tags},insight" if _ins_tags else "insight"
-        return await db_module.add_project_note(
-            db, args["project_id"], args["title"], _ins_body,
-            _ins_tags, kind="insight",
-            priority=args.get("priority", "normal"),
+        validate_input_size(args.get("body"), "insight body", 1_000_000)
+        return await db_module.create_insight(
+            db, args["project_id"], args["title"], args.get("body") or "",
+            horizon=args.get("horizon", "quarter"),
+            tags=args.get("tags"),
+        )
+    if name == "get_insights":
+        return await db_module.get_insights(
+            db, args["project_id"], horizon=args.get("horizon")
         )
     if name == "save_finding":
         # e1f43ee7 — phase-agnostic capture primitive (decoupled from search).
@@ -1580,6 +2173,14 @@ async def _handle_notes_decisions(
         # ``cursor`` and/or ``limit`` to get the {notes, has_more, next_cursor}
         # envelope, then re-call with cursor=next_cursor for the next page.
         # Without either arg the legacy bare list is returned for back-compat.
+        # 98890df1 — relevance sort (reference_count/recency/decision-link) takes
+        # precedence over cursor/limit paging.
+        if args.get("sort") == "relevance":
+            return await db_module.get_project_notes_ranked(
+                db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+                bodies=bool(args.get("bodies", False)),
+                limit=(int(args["limit"]) if "limit" in args else None),
+            )
         if "cursor" in args or "limit" in args:
             return await db_module.get_project_notes_page(
                 db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
@@ -1638,7 +2239,23 @@ async def _handle_notes_decisions(
             # 0bf67524 — cascade defaults for new projects.
             execution_mode_default=args.get("execution_mode_default"),
             code_intel_enabled_default=args.get("code_intel_enabled_default"),
+            # 76cf8bda — /loop auto-continue workspace default.
+            loop_enabled_default=args.get("loop_enabled_default"),
             tenant_id=_mcp_tenant_id,
+        )
+    if name == "save_blog_post":
+        validate_input_size(args.get("title"), "blog title", 500)
+        validate_input_size(args.get("body"), "blog body", 1_000_000)
+        return await db_module.save_blog_post(
+            db, args["title"], args.get("body", ""),
+            status=args.get("status", "draft"),
+            slug=args.get("slug"),
+            post_id=args.get("id"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "get_blog_posts":
+        return await db_module.get_blog_posts(
+            db, tenant_id=_mcp_tenant_id, status=args.get("status"),
         )
     if name == "add_workspace_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
@@ -1877,7 +2494,16 @@ async def _handle_session_tools(
             f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
         ) if pending_items else "/goal Continue work — all sprint items done."
         # 04f03ee4 — include start_session one-liner so next session can resume immediately
-        start_fresh = f'start_session(project_id="{project_id}", session_name="describe-what-youre-doing")'
+        # 11a91d31 — default to project_name (idiomatic per 8a449ec0); project_id as a comment.
+        try:
+            _ck_proj = await db_module.get_project(db, project_id)
+            _ck_pname = (_ck_proj or {}).get("name") or project_id
+        except Exception:  # noqa: BLE001
+            _ck_pname = project_id
+        start_fresh = (
+            f'start_session(project_name="{_ck_pname}", session_name="describe-what-youre-doing")'
+            f'  # project_id={project_id}'
+        )
         # fa595ad8 — store snapshot for Recent Sessions dashboard panel (non-fatal)
         # v3.1 — snapshot now lives on sessions.checkpoint_data, not a checkpoint:* note.
         try:
@@ -2046,7 +2672,10 @@ async def _handle_session_tools(
         for k in ("repo_path", "env_file", "test_cmd", "test_min",
                   "deploy_cmd", "shell_type", "branch",
                   "filesystem_roots", "hostnames", "context_threshold",
-                  "isolation", "max_turns"):
+                  "isolation", "max_turns",
+                  # b970fe07 — dashboard-configurable Serena default repo + code-intel
+                  # index dirs (mirror filesystem_roots: scalar/list overwrite).
+                  "serena_repo_path", "codebase_code_dirs"):
             if k in args:
                 cfg[k] = args[k]
         if "repo_paths" in args:
@@ -2386,6 +3015,15 @@ async def _handle_sprint_tools(
                 "WARNING: " + "; ".join(_active_session_warnings)
                 + " — new item added but may not be picked up until next session start."
             )
+        # 2d932f60 — if the title reads like a decision/insight, propose capturing
+        # it (no auto-write; the planner confirms).
+        from .. import handoff as _handoff_ins  # noqa: PLC0415
+        _ins_sig = _handoff_ins.detect_insight_candidate(args.get("title") or "")
+        if _ins_sig:
+            _extra["insight_hint"] = (
+                f"The wording ('{_ins_sig}') looks like a decision/insight — consider "
+                "add_insight() or pin_decision() so it isn't lost at session end."
+            )
         if _extra:
             _new_item = {**_new_item, **_extra}
         return _new_item
@@ -2451,6 +3089,9 @@ async def _handle_sprint_tools(
         # so omitting the key leaves the stored value untouched (_UNSET sentinel).
         if "touches_resources" in args:
             _patch_kwargs["touches_resources"] = args.get("touches_resources")
+        # 5823db0b — allow flagging an item as requiring completion evidence.
+        if "required_notes" in args:
+            _patch_kwargs["required_notes"] = args.get("required_notes")
         try:
             item = await db_module.patch_sprint_item(
                 db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -2511,14 +3152,28 @@ async def _handle_sprint_tools(
             "skipped": _counts.get("skipped", 0),
             "percent_complete": _pct,
             "by_status": _counts,
-            "items": [
-                {"id": it["id"], "title": (it.get("title") or "")[:80], "status": it.get("status")}
-                for it in _all
-            ],
         }
+        # 1da83459 — summary-only: the per-item list scaled ~100 chars/item and
+        # bloated every between-item progress poll on a large board. Counts +
+        # by_status + board_change are what an executor needs; call
+        # get_sprint_items(status="pending") for the live item list.
         _bc = await _board_change_for_session(db, args["project_id"], args.get("session_id"))
         if _bc:
             _resp_progress["board_change"] = _bc
+        # 5abf3e12 — when scoped to a session, report that session's live goal
+        # compliance (N items it took on via actor= vs M complete_sprint_item()'d)
+        # so an executor can see mid-run whether it's on track to fully complete
+        # its /goal list. Guarded: never break the progress poll.
+        _sess_id = args.get("session_id")
+        if _sess_id:
+            try:
+                _resp_progress["goal_compliance"] = (
+                    await db_module.compute_session_goal_compliance(
+                        db, args["project_id"], _sess_id
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return _resp_progress
     if name == "get_sprint_items":
         include_human = args.get("human", True)
@@ -2560,6 +3215,12 @@ async def _handle_sprint_tools(
                 "touches_resources to let them parallelize."
             )
         return _grp
+    if name == "analyze_sprint":
+        # e77f09d1 — one-call planning brief: parallelism + dependency chains +
+        # resource conflicts + stalls synthesized for a planning session.
+        return await db_module.analyze_sprint(
+            db, args["project_id"], version=args.get("version")
+        )
     if name == "claim_sprint_item":
         # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
         # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.
@@ -2614,7 +3275,12 @@ async def _handle_sprint_tools(
                 }
 
         try:
-            item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
+            # 5823db0b — actor attribution: record who claimed the item (explicit
+            # actor arg, else the claiming session id).
+            _claim_actor = args.get("actor") or args.get("session_id")
+            item = await db_module.claim_sprint_item(
+                db, args["project_id"], args["item_id"], actor=_claim_actor
+            )
         except ValueError:
             # 10c0f6a0 — if already in_progress, check for stale claim and surface info
             _stale_item = await db_module.get_sprint_item(db, args["item_id"])
@@ -2730,6 +3396,17 @@ async def _handle_sprint_tools(
             item = dict(item)
             item["suggested_files"] = _sug
 
+        # 04a15d3f — auto-prospect: surface the code-intel targets (files/symbols)
+        # the executor should search before editing, derived from touches_resources
+        # (or inferred from the title). Best-effort; never blocks the claim.
+        try:
+            _code_ctx = _prospect_code_context(item)
+        except Exception:  # noqa: BLE001
+            _code_ctx = None
+        if _code_ctx:
+            item = dict(item)
+            item["code_context"] = _code_ctx
+
         return item
     if name == "add_subtask":
         return await db_module.add_subtask(
@@ -2772,10 +3449,22 @@ async def _handle_sprint_tools(
             except Exception:  # noqa: BLE001
                 pass
 
-        item = await db_module.complete_sprint_item(
-            db, args["project_id"], args["item_id"],
-            task_id=args.get("task_id"),
-        )
+        # 5823db0b — quality gate + actor attribution. Pass evidence notes and
+        # the completing actor; surface the required_notes gate as a clean error.
+        _complete_actor = args.get("actor") or _complete_session_id or None
+        try:
+            item = await db_module.complete_sprint_item(
+                db, args["project_id"], args["item_id"],
+                task_id=args.get("task_id"),
+                notes=args.get("notes"),
+                actor=_complete_actor,
+            )
+        except db_module.SprintItemEvidenceRequired as exc:
+            return {
+                "error": "EVIDENCE_REQUIRED",
+                "item_id": args["item_id"],
+                "message": str(exc),
+            }
         if item is None:
             raise ValueError("sprint item not found")
         if _merge_warning:
@@ -2801,6 +3490,41 @@ async def _handle_sprint_tools(
         if _bc_complete:
             item = dict(item)
             item["board_change"] = _bc_complete
+        # bb29a06f — ADVISORY completion sanity-check. Extends the required_notes
+        # gate (evidence EXISTS) with a check that evidence is PLAUSIBLE: when the
+        # completion looks weakly-supported (no linked task, no notes anywhere) and
+        # no recent commit/migration shares keywords with the title, add a soft
+        # nudge. NEVER blocks, never raises — the completion already succeeded. The
+        # drift heuristic is noisy, so this is a hint, not a gate.
+        try:
+            _weakly_supported = not (
+                args.get("task_id")
+                or (args.get("notes") or "").strip()
+                or (item.get("notes") or "").strip()
+                or item.get("task_id")
+            )
+            if _weakly_supported:
+                from .. import handoff as _handoff_advisory
+                try:
+                    _adv_project = await db_module.get_project(db, args["project_id"])
+                    _adv_commits = (
+                        await _fetch_recent_commits(_adv_project, tenant)
+                        if _adv_project else []
+                    )
+                except Exception:  # noqa: BLE001 — never let commit-fetch break completion
+                    _adv_commits = []
+                _adv_matches = _handoff_advisory.detect_sprint_item_drift(
+                    item.get("title") or "", _adv_commits,
+                )
+                if not _adv_matches:
+                    item = dict(item)
+                    item["completion_advisory"] = (
+                        "No recent commit or linked evidence appears to reference "
+                        "this item — double-check it actually shipped (this is a "
+                        "heuristic; ignore if you completed it via docs/config/decision)."
+                    )
+        except Exception:  # noqa: BLE001 — advisory must never affect completion
+            pass
         # Notify only when the sprint is fully complete.
         active_statuses = {"pending", "todo", "in_progress"}
         remaining_items = await db_module.get_sprint_items(db, args["project_id"])
@@ -2814,6 +3538,71 @@ async def _handle_sprint_tools(
                 pref_key="sprint",
             )
         return item
+    if name == "add_sprint_item_pointer":
+        # 2976e168 — attach a GENERIC POINTER to a sprint item. Validation lives in
+        # db.add_sprint_item_pointer (via meridian.pointers.validate_pointer); a
+        # malformed pointer raises ValueError, surfaced here as a clean {error}.
+        if not args.get("project_id"):
+            return {"error": "project_id is required (or pass project_name)"}
+        if not args.get("sprint_item_id"):
+            return {"error": "sprint_item_id is required"}
+        validate_input_size(args.get("label"), "pointer label", 500)
+        try:
+            return await db_module.add_sprint_item_pointer(
+                db,
+                args["project_id"],
+                args["sprint_item_id"],
+                args.get("source_type") or "",
+                args.get("targets") or [],
+                label=args.get("label"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+    if name == "get_sprint_item_pointers":
+        if not args.get("sprint_item_id"):
+            return {"error": "sprint_item_id is required"}
+        pointers = await db_module.get_sprint_item_pointers(
+            db, args["sprint_item_id"]
+        )
+        return {"sprint_item_id": args["sprint_item_id"], "pointers": pointers}
+    if name == "resolve_sprint_item_pointers":
+        # 2976e168 — resolve EVERY pointer on an item, dispatching by selector.type.
+        # Best-effort + guarded: unresolvable targets become {resolved:false}; the
+        # pass NEVER raises. node_id targets need the doc-structure store, resolved
+        # via the same tier-aware helper the citation tools use; symbol/zotero use
+        # the pointers module's default seams (db.search_graph_entities /
+        # zotero_client). project_id scopes the code-graph search.
+        if not args.get("project_id"):
+            return {"error": "project_id is required (or pass project_name)"}
+        if not args.get("sprint_item_id"):
+            return {"error": "sprint_item_id is required"}
+        from ..pointers import resolve_pointer  # noqa: PLC0415
+
+        # Resolve the doc-structure store once for node_id lookups (best-effort;
+        # None → node_id targets degrade to {resolved:false}).
+        _ptr_store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+
+        async def _node_resolver(element_id: str) -> Any:
+            if _ptr_store is None:
+                return None
+            try:
+                return await _ptr_store.get_element_by_id(element_id)
+            except Exception:  # noqa: BLE001 — resolver seam must never raise
+                return None
+
+        pointers = await db_module.get_sprint_item_pointers(
+            db, args["sprint_item_id"]
+        )
+        resolved: list[dict[str, Any]] = []
+        for ptr in pointers:
+            resolved.append(
+                await resolve_pointer(
+                    db, ptr,
+                    project_id=args["project_id"],
+                    node_resolver=_node_resolver,
+                )
+            )
+        return {"sprint_item_id": args["sprint_item_id"], "pointers": resolved}
     return _MISS
 
 
@@ -2848,13 +3637,47 @@ async def _handle_file_claims(
                 db, args["session_id"], args["file_path"], _symbol,
             )
             return result
+        # ffa03655 — read|write claim grain (default write/exclusive).
         return await db_module.claim_file(
-            db, args["file_path"], args["session_id"], symbol=_symbol
+            db, args["file_path"], args["session_id"], symbol=_symbol,
+            mode=args.get("mode", "write"),
         )
     if name == "get_file_claims":
         return await db_module.get_file_claims(
             db, args["file_path"], args.get("project_id"), args.get("symbol")
         )
+    if name == "store_finding":
+        validate_input_size(args.get("content"), "finding content", 1_000_000)
+        if not (args.get("content") or "").strip():
+            return {"error": "store_finding requires non-empty content"}
+        return await db_module.store_finding(
+            db, args["project_id"], args["content"],
+            session_id=args.get("session_id"), key=args.get("key"),
+            title=args.get("title"), task_id=args.get("task_id"),
+        )
+    if name == "get_findings":
+        return await db_module.get_findings(
+            db, args["project_id"], key=args.get("key"),
+            session_id=args.get("session_id"), limit=int(args.get("limit", 50)),
+        )
+    if name == "send_message":
+        validate_input_size(args.get("payload"), "message payload", 1_000_000)
+        return await db_module.send_message(
+            db, args["project_id"], args["to_session_id"], args.get("payload", ""),
+            from_session_id=args.get("from_session_id") or args.get("session_id"),
+            kind=args.get("kind"),
+        )
+    if name == "receive_messages":
+        return await db_module.receive_messages(
+            db, args["session_id"],
+            mark_read=args.get("mark_read", True),
+            limit=int(args.get("limit", 50)),
+        )
+    if name == "idle_until_all_done":
+        _sids = args.get("session_ids") or []
+        if isinstance(_sids, str):
+            _sids = [s.strip() for s in _sids.split(",") if s.strip()]
+        return await db_module.idle_until_all_done(db, _sids)
     if name == "get_symbol_claims":
         return {"claims": await db_module.get_symbol_claims(db, args["file_path"])}
     if name == "get_symbol_hotspots":
@@ -2968,10 +3791,38 @@ async def _handle_planning_tools(
             for d in pinned
             if d.get("assumption") and d.get("assumption_status") != "confirmed"
         ]
+        # 0b711a9d — permanent strategic insights ALWAYS surface in the planning
+        # brief (durable understanding that shapes future decisions). Guarded so a
+        # pre-migration DB never breaks the brief; never truncated by a list cap.
+        permanent_insights: list[dict[str, Any]] = []
+        try:
+            for _ins in await db_module.get_insights(db, project_id, horizon="permanent"):
+                permanent_insights.append({
+                    "id": _ins.get("id"),
+                    "title": (_ins.get("title") or "")[:120],
+                    "body": (_ins.get("body") or "")[:400],
+                })
+        except Exception:  # noqa: BLE001
+            permanent_insights = []
         # 81170c84 — "what did the last session do": surface the most recent
         # session's completed items + task log + recent decisions so a planner
         # sees executor output without manual copy-paste.
         last_session = await db_module.get_last_session_brief(db, project_id)
+        # aef94e4a — surface the latest auto-generated sprint retrospective so a
+        # planner sees the strategic through-line (what shipped / patterns /
+        # direction) without opening the note.
+        _retro_notes = await db_module.get_project_notes(
+            db, project_id, tag="retrospective", bodies=True, limit=1
+        )
+        latest_retrospective = None
+        if _retro_notes:
+            _r = _retro_notes[0]
+            latest_retrospective = {
+                "title": _r.get("title"),
+                "body": (_r.get("body") or "")[:800],
+                "updated_at": _r.get("updated_at") or _r.get("created_at"),
+                "slug": _r.get("slug"),
+            }
         # ab514e43 — "new handoff available" signal. ``generated_at`` lets the
         # planner pass it back as ``since`` next call; a handoff filed after
         # ``since`` (or any handoff when ``since`` is omitted) flags as new.
@@ -3030,8 +3881,13 @@ async def _handle_planning_tools(
             ],
             "recent_decisions": recent_decisions,
             "unvalidated_assumptions": unvalidated_assumptions,
+            "permanent_insights": permanent_insights,
             "last_session": last_session,
+            "latest_retrospective": latest_retrospective,
             "generated_at": brief_generated_at,
+            # de193a81 — explicit "now" so a planner spanning multiple calendar
+            # days never guesses at "today"/"yesterday".
+            "current_timestamp": brief_generated_at,
             "latest_handoff": latest_handoff,
             "new_handoff_available": new_handoff_available,
             "handoff_signal": handoff_signal,
@@ -3048,82 +3904,13 @@ async def _handle_planning_tools(
         # d8bd59c4 — single-call post-compaction recovery for planning chats.
         # COMPACT by design: counts + ids + slugs, not full bodies, so it can be
         # called the moment a chat feels disoriented without overflowing context.
+        # bf51b12e — the body now lives in the module-level _build_context_refresh
+        # builder so both the explicit tool and the dispatch hook share one path.
         project_id = args["project_id"]
-        project = await db_module.get_project(db, project_id)
-        if project is None:
+        result = await _build_context_refresh(db, project_id)
+        if result is None:
             raise ValueError("project not found")
-        goal = await db_module.get_goal(db, project_id)
-        all_items = await db_module.get_sprint_items(db, project_id)
-        done = sum(1 for it in all_items if it.get("status") == "done")
-        total = len(all_items)
-        pending = [it for it in all_items if it.get("status") == "pending"]
-        active_sessions = await db_module.get_sessions(
-            db, project_id, active_only=True
-        )
-        recent_handoffs = await db_module.get_handoffs(db, project_id, limit=3)
-        pinned = await db_module.get_pinned_decisions(db, project_id)
-        high_priority_decisions = [
-            {"id": d.get("id"), "title": (d.get("title") or "")[:120]}
-            for d in pinned if d.get("priority") == "urgent"
-        ][:5]
-        unvalidated_assumptions = [
-            {
-                "decision_id": d.get("id"),
-                "title": (d.get("title") or "")[:120],
-                "assumption_status": d.get("assumption_status"),
-            }
-            for d in pinned
-            if d.get("assumption") and d.get("assumption_status") != "confirmed"
-        ]
-        notes = await db_module.get_project_notes(db, project_id)
-        _rank = {"high": 0, "normal": 1, "low": 2}
-        key_notes = sorted(
-            [n for n in notes if n.get("slug")],
-            key=lambda n: _rank.get(n.get("priority"), 1),
-        )[:10]
-        key_note_slugs = [
-            {
-                "slug": n.get("slug"),
-                "title": (n.get("title") or "")[:100],
-                "kind": n.get("note_kind") or n.get("kind"),
-            }
-            for n in key_notes
-        ]
-        return {
-            "project_id": project_id,
-            "project_name": project.get("name"),
-            "sprint": (goal.get("sprint") or "") if goal else "",
-            "north_star": (goal.get("north_star") or "") if goal else "",
-            "sprint_progress": {
-                "done": done,
-                "total": total,
-                "pending": len(pending),
-                "percent_complete": round(100 * done / total) if total else 0,
-            },
-            "next_pending_items": [
-                {"id": it["id"], "title": (it.get("title") or "")[:100]}
-                for it in pending[:5]
-            ],
-            "active_session_id": (
-                active_sessions[0]["id"] if active_sessions else None
-            ),
-            "active_sessions": [
-                {"id": s.get("id"), "name": s.get("name")}
-                for s in active_sessions[:5]
-            ],
-            "recent_handoffs": [
-                {
-                    "id": h.get("id"),
-                    "session_id": h.get("session_id"),
-                    "mode": h.get("mode"),
-                    "created_at": h.get("created_at"),
-                }
-                for h in recent_handoffs
-            ],
-            "high_priority_decisions": high_priority_decisions,
-            "unvalidated_assumptions": unvalidated_assumptions,
-            "key_note_slugs": key_note_slugs,
-        }
+        return result
     return _MISS
 
 
@@ -3204,6 +3991,10 @@ async def _handle_plugin_tools(
                 "description": plugin.get("description", ""),
                 "tool_count": tool_count,
                 "active": slot in slot_tool_counts,
+                # 8f66d85e — plugin tools are connector-proxied; they are only
+                # invocable while the tunnel is live (otherwise they appear in the
+                # list but calling one returns "unknown tool").
+                "invocable": slot in slot_tool_counts,
             }
             if skill:
                 entry["skill_note"] = {
@@ -3217,6 +4008,14 @@ async def _handle_plugin_tools(
             "plugins": result_plugins,
             "tunnel_active": bool(tenant_id and _tunnel_mod.has_active_tunnel(tenant_id)),
             "hint": "Call get_plugin_details(name=<plugin_name>) for full tool schema.",
+            # 8f66d85e — clarify HOW plugin tools are called so agents stop trying
+            # to invoke them as native Meridian tools.
+            "invocation_note": (
+                "Plugin tools are invoked through the tunnel connector (claude.ai) "
+                "using slot-prefixed names like 'filesystem__read_file' — not as "
+                "native Meridian MCP tools. Each is callable only while the tunnel "
+                "is connected (see each plugin's 'invocable' flag)."
+            ),
         }
 
     if name == "get_plugin_details":
@@ -3362,6 +4161,49 @@ async def _dispatch_mcp_tool(
     for _grp in _groups:
         _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
         if _result is not _MISS:
+            # bf51b12e — planner context-refresh nudge. Fully defensive: any error
+            # falls through to the untouched _result. In-memory turn tracking +
+            # gating (best-effort, per-process). Skips executor sessions entirely.
+            try:
+                if isinstance(_result, dict):
+                    session_id = args.get("session_id")
+                    if session_id:
+                        _state = _SESSION_REFRESH_STATE.setdefault(
+                            session_id, {"calls": 0, "last_refresh": 0}
+                        )
+                        _state["calls"] += 1
+                        if session_id not in _EXECUTOR_SESSIONS:
+                            settings = await db_module.get_workspace_settings(
+                                db, tenant_id=_mcp_tenant_id
+                            )
+                            if settings.get("auto_refresh_enabled"):
+                                _triggers = settings.get("refresh_triggers")
+                                enabled_triggers = (
+                                    _triggers if isinstance(_triggers, list)
+                                    else _PLANNER_REFRESH_TRIGGERS
+                                )
+                                _interval = settings.get("refresh_interval_turns") or 10
+                                _calls = _state["calls"]
+                                _last = _state["last_refresh"]
+                                _fire = (
+                                    name in enabled_triggers
+                                    or (_calls - _last) >= _interval
+                                )
+                                # One-per-call: only fire if we haven't already
+                                # refreshed at this call index.
+                                if _fire and _last < _calls:
+                                    project_id = args.get("project_id")
+                                    if project_id:
+                                        _refresh = await _build_context_refresh(
+                                            db, project_id
+                                        )
+                                        if _refresh is not None:
+                                            _state["last_refresh"] = _calls
+                                            r = dict(_result)
+                                            r["_context_refresh"] = _refresh
+                                            return r
+            except Exception:  # noqa: BLE001 — nudge must never break a tool call
+                pass
             return _result
     raise ValueError(f"unknown tool: {name}")
 

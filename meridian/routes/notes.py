@@ -47,6 +47,39 @@ async def list_project_notes_endpoint(
     )
 
 
+@router.get("/projects/{project_id}/document-structure")
+async def document_structure_endpoint(
+    project_id: str,
+    request: Request,
+    path: str,
+) -> dict[str, Any]:
+    """3f596f81 — heading-tree structure of an ingested .docx for the Documents
+    panel. Calls the stateless docs_intel.document_outline (paragraph_count +
+    heading_count + an ordered heading list). Returns ``{"error": ...}`` on a
+    missing/unreadable/non-docx file rather than a 500 so the panel renders the
+    failure inline.
+
+    NOTE: ``path`` is resolved on the SERVER — this works for self-hosted / tunnel
+    setups where the server can see the file; a hosted server has no access to
+    the user's local filesystem, so it returns an error the panel surfaces.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    fp = (path or "").strip()
+    validate_input_size(fp, "path", 2000)
+    if not fp:
+        return {"error": "path is required"}
+    from .. import docs_intel  # local: pure-stdlib parse, cheap import
+    try:
+        return docs_intel.document_outline(fp)
+    except FileNotFoundError:
+        return {"error": f"file not found on server: {fp}"}
+    except Exception as exc:  # noqa: BLE001 — surface parse errors inline
+        return {"error": f"could not parse document: {exc}"}
+
+
 @router.post("/projects/{project_id}/notes", status_code=201)
 async def create_project_note_endpoint(
     project_id: str, body: dict[str, Any], request: Request
@@ -81,6 +114,80 @@ async def create_project_note_endpoint(
     # e5592013 — non-blocking lint: "MANUAL" notes are usually human tasks.
     if isinstance(note, dict) and "MANUAL" in title:
         note = {**note, "lint": _MANUAL_NOTE_LINT}
+    return note
+
+
+@router.post("/projects/{project_id}/documents/upload", status_code=201)
+async def upload_document_endpoint(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """f1c7e7d1 — tunnel-free document upload (plain .txt/.md only, v1).
+
+    The dashboard Documents panel reads a picked file's text client-side and
+    POSTs ``{filename, content}`` here. We validate the extension is .txt/.md
+    and the text is a sane size, then reuse the existing
+    ``db.ingest_document`` **content** path (no server-side file access / tunnel
+    needed): it stores a queryable ``kind='document'`` note, applies the body
+    cap, and appears in the Documents list. Returns the ingested note.
+
+    Rejections are 400 with a clear message: a non-.txt/.md extension (e.g.
+    .pdf/.docx/.exe), an empty/oversize body, or a missing filename.
+    """
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    filename = (body.get("filename") or "").strip()
+    content = body.get("content")
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+    validate_input_size(filename, "filename", 500)
+
+    # Extension allow-list — plain text only for v1. Reject anything else.
+    _ALLOWED_UPLOAD_EXTS = (".txt", ".md")
+    import os as _os  # noqa: PLC0415 — local, stdlib
+    ext = _os.path.splitext(filename)[1].lower()
+    if ext not in _ALLOWED_UPLOAD_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unsupported file type '{ext or '(none)'}'. Only .txt and .md "
+                "uploads are supported. For other formats, extract the text and "
+                "use the ingest_document MCP tool with content=..."
+            ),
+        )
+
+    if not isinstance(content, str) or content.strip() == "":
+        raise HTTPException(status_code=400, detail="content is required")
+    # Sane max upload size. Kept in lockstep with the global request-body guard
+    # (limits.BODY_BYTES) so this in-handler 400 is a clear, upload-specific
+    # message and never larger than what the body-size middleware already lets
+    # through (that middleware returns a 429 first when Content-Length is sent).
+    from .. import limits as _limits  # noqa: PLC0415
+    _max_upload = _limits._current_limit("BODY_BYTES")
+    if len(content) > _max_upload:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"content too large ({len(content)} chars); the upload limit is "
+                f"{_max_upload} chars. Split the file or use the MCP tool."
+            ),
+        )
+
+    # G4.15 — same per-project note cap as manual note creation.
+    existing = await db_module.get_project_notes(await _db(request), project_id)
+    _limits.check_notes_per_project(len(existing))
+
+    try:
+        note = await db_module.ingest_document(
+            await _db(request), project_id,
+            content=content,
+            title=filename,
+            source=filename,
+            tags=body.get("tags"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return note
 
 

@@ -222,6 +222,105 @@ def test_status_server_badge(client):
     assert body["message"] == "online"
 
 
+# ---------------------------------------------------------------------------
+# 13583103 — /setup/health self-hosted auth diagnostics
+# ---------------------------------------------------------------------------
+
+_AUTH_ENV_VARS = (
+    "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+    "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
+    "MICROSOFT_CLIENT_ID", "MICROSOFT_CLIENT_SECRET",
+    "RESEND_API_KEY", "SESSION_SECRET", "MERIDIAN_SESSION_SECRET",
+)
+
+
+def test_setup_health_all_missing(client, monkeypatch):
+    for var in _AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    r = client.get("/setup/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["auth_available"] is False
+    assert body["session_secret_configured"] is False
+    assert body["providers"]["google"]["configured"] is False
+    assert body["providers"]["google"]["missing_env"] == [
+        "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"
+    ]
+    assert body["providers"]["magic_link"]["missing_env"] == ["RESEND_API_KEY"]
+
+
+def test_setup_health_google_configured(client, monkeypatch):
+    for var in _AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "goog-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "goog-secret")
+    r = client.get("/setup/health")
+    body = r.json()
+    assert body["providers"]["google"]["configured"] is True
+    assert body["providers"]["google"]["missing_env"] == []
+    assert body["providers"]["github"]["configured"] is False
+    assert body["auth_available"] is True
+
+
+def test_setup_health_magic_link_configured(client, monkeypatch):
+    for var in _AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("RESEND_API_KEY", "re_fake")
+    body = client.get("/setup/health").json()
+    assert body["providers"]["magic_link"]["configured"] is True
+    assert body["auth_available"] is True
+
+
+def test_setup_health_session_secret_alias(client, monkeypatch):
+    for var in _AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    assert client.get("/setup/health").json()["session_secret_configured"] is False
+    # SESSION_SECRET resolves through _cfg's alias to MERIDIAN_SESSION_SECRET.
+    monkeypatch.setenv("SESSION_SECRET", "s3cr3t")
+    assert client.get("/setup/health").json()["session_secret_configured"] is True
+
+
+def test_setup_health_public_under_site_password(client, monkeypatch):
+    """The diagnostics endpoint must stay reachable even when SITE_PASSWORD is
+    set — otherwise a locked-out self-hoster can't see why auth is failing."""
+    monkeypatch.setenv("SITE_PASSWORD", "letmein")
+    r = client.get("/setup/health")
+    assert r.status_code == 200
+    assert "providers" in r.json()
+
+
+@pytest.mark.asyncio
+async def test_project_status_priority_default_and_set(db):
+    """8db00fcb — projects default to active/P2; set_project_status updates and
+    validates the enums."""
+    import meridian.db as db_module
+    proj = await db_module.create_project(db, "org-proj")
+    p = await db_module.get_project(db, proj["id"])
+    assert p["status"] == "active"
+    assert p["priority"] == "P2"
+    updated = await db_module.set_project_status(
+        db, proj["id"], status="parked", priority="P0")
+    assert updated["status"] == "parked"
+    assert updated["priority"] == "P0"
+    with pytest.raises(ValueError):
+        await db_module.set_project_status(db, proj["id"], status="bogus")
+
+
+def test_patch_project_organization_route(client):
+    """8db00fcb — PATCH /projects/{id}/organization sets status/priority and the
+    Project response carries them; an invalid enum is a 422."""
+    proj = client.post("/projects", json={"name": "org-route-proj"}).json()
+    pid = proj["id"]
+    r = client.patch(
+        f"/projects/{pid}/organization", json={"status": "archived", "priority": "P1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "archived"
+    assert body["priority"] == "P1"
+    r2 = client.patch(f"/projects/{pid}/organization", json={"status": "nope"})
+    assert r2.status_code == 422
+
+
 def test_status_tools_badge(client):
     r = client.get("/status/tools")
     assert r.status_code == 200
@@ -618,6 +717,120 @@ def test_auth_install_hosted_happy(monkeypatch, tmp_path):
         r = client.get("/auth/install", headers=_hdr(raw))
         assert r.status_code == 200
         assert "Meridian Connect" in r.text
+
+
+# --- 0e9bb6ef: install token rotate-and-dedup --------------------------------
+
+def _install_token_from_html(html: str) -> str:
+    """Pull the raw ``sk_meridian_...`` install token out of the install page.
+
+    The token is rendered inside the ``token-box`` div (and repeated in the
+    copyToken() JS). Grabbing the first ``sk_meridian_`` run is sufficient.
+    """
+    import re
+    m = re.search(r"sk_meridian_[A-Za-z0-9_\-]+", html)
+    assert m, "no install token found in /auth/install HTML"
+    return m.group(0)
+
+
+def _count_install_tokens(db, tenant_id: str) -> int:
+    from meridian import db as db_module
+    rows = _run(db_module.list_api_tokens(db, tenant_id))
+    return sum(1 for r in rows if r.get("label") == "install")
+
+
+def test_auth_install_dedups_repeated_installs(monkeypatch, tmp_path):
+    """0e9bb6ef — hitting /auth/install repeatedly must NOT accumulate a pile of
+    valid install keys; each install supersedes the prior one (rotate-and-dedup).
+    The token returned by the latest install must still authenticate."""
+    import hashlib as _hashlib
+    from meridian import db as db_module
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        db = client.app.state.db
+        tenant, raw = _run(_new_tenant_token(db, "dedup-install@example.com"))
+        tid = tenant["id"]
+
+        # Simulate several repeated installer runs.
+        last_token = None
+        for _ in range(4):
+            r = client.get("/auth/install", headers=_hdr(raw))
+            assert r.status_code == 200
+            last_token = _install_token_from_html(r.text)
+
+        # Exactly ONE install-labelled key survives (not 4).
+        assert _count_install_tokens(db, tid) == 1
+
+        # ...and the most-recently-returned token still authenticates.
+        h = _hashlib.sha256(last_token.encode()).hexdigest()
+        resolved = _run(db_module.get_tenant_from_token_hash(db, h))
+        assert resolved is not None
+        assert resolved["id"] == tid
+
+
+def test_auth_install_does_not_touch_other_tenants(monkeypatch, tmp_path):
+    """0e9bb6ef — dedup is scoped to the installing tenant; another tenant's
+    install key must be left completely untouched."""
+    from meridian import db as db_module
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        db = client.app.state.db
+
+        # Tenant A gets an install token via a direct mint (stands in for a
+        # prior install on a different account).
+        other = _run(db_module.upsert_tenant(db, "other-install@example.com"))
+        raw_other, _row = _run(
+            db_module.create_api_token(db, other["id"], label="install")
+        )
+        import hashlib as _hashlib
+        h_other = _hashlib.sha256(raw_other.encode()).hexdigest()
+
+        # Tenant B runs the installer twice.
+        tenant_b, raw_b = _run(_new_tenant_token(db, "installer-b@example.com"))
+        for _ in range(2):
+            r = client.get("/auth/install", headers=_hdr(raw_b))
+            assert r.status_code == 200
+
+        # B is deduped to a single install key...
+        assert _count_install_tokens(db, tenant_b["id"]) == 1
+        # ...and A's install key is untouched (still exactly one, still valid).
+        assert _count_install_tokens(db, other["id"]) == 1
+        resolved = _run(db_module.get_tenant_from_token_hash(db, h_other))
+        assert resolved is not None
+        assert resolved["id"] == other["id"]
+
+
+def test_delete_api_tokens_by_label_exclude_id(monkeypatch, tmp_path):
+    """0e9bb6ef — the exclude_id path preserves exactly the named row and prunes
+    the rest of the same-label tokens for that tenant, and never reuses a revoked
+    (deleted) key."""
+    from meridian import db as db_module
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        db = client.app.state.db
+        tenant = _run(db_module.upsert_tenant(db, "exclude-id@example.com"))
+        tid = tenant["id"]
+
+        raw_old, row_old = _run(
+            db_module.create_api_token(db, tid, label="install")
+        )
+        _raw_new, row_new = _run(
+            db_module.create_api_token(db, tid, label="install")
+        )
+        assert _count_install_tokens(db, tid) == 2
+
+        deleted = _run(
+            db_module.delete_api_tokens_by_label(
+                db, tid, "install", exclude_id=row_new["id"]
+            )
+        )
+        assert deleted == 1
+        assert _count_install_tokens(db, tid) == 1
+
+        # The excluded (kept) row is the survivor; the old one is gone and does
+        # not resolve any tenant (not reused).
+        import hashlib as _hashlib
+        h_old = _hashlib.sha256(raw_old.encode()).hexdigest()
+        assert _run(db_module.get_tenant_from_token_hash(db, h_old)) is None
+        rows = _run(db_module.list_api_tokens(db, tid))
+        assert [r["id"] for r in rows if r.get("label") == "install"] == [row_new["id"]]
 
 
 # ===========================================================================

@@ -86,7 +86,15 @@ def test_build_quick_start_goal_with_and_without_items():
     assert "abc123" in full and "def456" in full
     assert "complete_sprint_item()" in full
     # f628b880 — non-deferential executor directive leads the items /goal.
-    assert full.startswith("/goal You are an executor. Claim and execute")
+    # 5abf3e12 — the /goal is now XML-structured: /goal, then a <role> tag whose
+    # body is the executor directive.
+    assert full.startswith("/goal\n<role>You are an executor. Claim and execute")
+    assert "<role>You are an executor. Claim and execute" in full
+    # 4cfaecc2 — the items /goal instructs a live board query up front, and the
+    # test floor tracks the real suite size (524 -> 2150).
+    assert 'get_sprint_items(status="pending")' in full
+    assert "pixi run test passes 2150+" in full
+    assert handoff_module._DEFAULT_GOAL_TEST_FLOOR == 2150
 
 
 def test_build_quick_start_goal_max_turns():
@@ -101,6 +109,328 @@ def test_build_quick_start_goal_max_turns():
     # Invalid / non-positive falls back to default.
     assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}], max_turns=0)
     assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}], max_turns="bad")
+
+
+def test_build_quick_start_goal_excludes_manual_items():
+    """3a02041a — MANUAL/human items must be kept OUT of the 'claim and execute'
+    batch list (an AI executor can't do them and may fake-complete under pressure)
+    and surfaced separately as the maintainer's own todo."""
+    from meridian.handoff import _is_manual_sprint_item
+
+    items = [
+        {"id": "code01", "title": "FEAT: real code work"},
+        {"id": "man-title", "title": "MANUAL (Adam): publish the blog post"},
+        {"id": "man-human", "title": "Configure PyPI publisher", "human_id": "adam"},
+        {"id": "man-mile", "title": "Install binary", "milestone_type": "human"},
+    ]
+    goal = handoff_module._build_quick_start_goal(items)
+
+    # The executable item leads the claim-and-execute directive.
+    assert "code01" in goal
+    # 5abf3e12 — XML-structured /goal: /goal then <role>…executor directive…
+    assert goal.startswith("/goal\n<role>You are an executor. Claim and execute")
+    # MANUAL ids appear ONLY in the separate <exclusions> tag, never in the
+    # pressure list. (5abf3e12 — the maintainer todo is now an <exclusions> tag.)
+    exec_clause, _, manual_clause = goal.partition("<exclusions>")
+    assert manual_clause, "expected a separate <exclusions> MANUAL todo section"
+    assert "maintainer's own todo" in manual_clause
+    for mid in ("man-title", "man-human", "man-mile"):
+        assert mid not in exec_clause, f"{mid} leaked into the executor list"
+        assert mid in manual_clause
+    assert "code01" not in manual_clause
+    # The maintainer note carries no completion-pressure / anti-stop language
+    # (no <not_done_until> and no legacy "is a FAILURE" phrasing).
+    assert "is a FAILURE" not in manual_clause
+    assert "not done while any listed item" not in manual_clause
+    assert "must NOT claim, execute, or complete" in manual_clause
+
+    # Helper classifies each MANUAL signal, and leaves real work alone.
+    assert _is_manual_sprint_item({"title": "MANUAL (Adam): x"})
+    assert _is_manual_sprint_item({"title": "x", "human_id": "adam"})
+    assert _is_manual_sprint_item({"title": "x", "milestone_type": "human"})
+    assert not _is_manual_sprint_item({"id": "y", "title": "FEAT: y"})
+
+
+def test_build_quick_start_goal_all_manual_still_surfaces_todo():
+    """3a02041a — when every pending item is MANUAL the executor path has nothing
+    to claim (falls back to the verify goal), but the MANUAL todo is still shown."""
+    goal = handoff_module._build_quick_start_goal(
+        [{"id": "m1", "title": "MANUAL (Adam): screenshots", "human_id": "adam"}]
+    )
+    assert "Verify remaining work is complete" in goal   # empty executable path
+    assert "maintainer's own todo" in goal
+    # 5abf3e12 — the maintainer todo is the <exclusions> tag.
+    before_note = goal.split("<exclusions>")[0]
+    assert "m1" not in before_note   # never in a claim-and-execute clause
+    assert "m1" in goal              # present only in the note
+
+
+def test_infer_sprint_type_heuristics():
+    """f9fa00e4 — sprint-type inference by count / item_group / title keyword."""
+    from meridian.handoff import _infer_sprint_type
+    assert _infer_sprint_type([]) == "feature"
+    assert _infer_sprint_type(
+        [{"id": str(i), "title": "feat x"} for i in range(12)]) == "megasprint"
+    assert _infer_sprint_type(
+        [{"id": "1", "item_group": "research"}, {"id": "2", "item_group": "paper"}]) == "research"
+    assert _infer_sprint_type(
+        [{"id": "1", "title": "REFACTOR: split module"},
+         {"id": "2", "title": "refactor dashboard"}]) == "refactor"
+    assert _infer_sprint_type(
+        [{"id": "1", "item_group": "ops"}, {"id": "2", "item_group": "release"}]) == "ops"
+    assert _infer_sprint_type([{"id": "1", "title": "hotfix: crash on start"}]) == "hotfix"
+    assert _infer_sprint_type(
+        [{"id": "1", "title": "add button"}, {"id": "2", "title": "add page"}]) == "feature"
+
+
+def test_build_quick_start_goal_tags_sprint_type():
+    """f9fa00e4 — the /goal carries an inferred sprint type + guidance, without
+    disturbing the existing structure. 5abf3e12 — the type now rides a
+    <sprint_type value="..."> XML tag instead of a "[sprint:TYPE]" inline tag."""
+    from meridian.handoff import _build_quick_start_goal
+    goal = _build_quick_start_goal([{"id": "a1", "title": "hotfix: crash on start"}])
+    assert '<sprint_type value="hotfix">' in goal
+    assert "HOTFIX sprint" in goal
+    assert "a1" in goal
+    assert 'get_sprint_items(status="pending")' in goal
+    assert "Stop after" in goal
+
+
+def test_build_quick_start_goal_completion_mode_and_group_style():
+    """9f57374b — completion_mode='lenient' drops the anti-stop completion
+    constraint; goal_group_style='waves' restores Wave headers for a dependency
+    graph; the executor_config extractors default to strict/flat.
+
+    5abf3e12 — the anti-stop framing is now the <not_done_until> XML tag (the old
+    prose-threat "is a FAILURE" wording is gone) but the constraint is unchanged:
+    strict mode carries it, lenient mode drops it."""
+    from meridian.handoff import (
+        _build_quick_start_goal,
+        _completion_mode_from_settings,
+        _goal_group_style_from_settings,
+    )
+    strict = _build_quick_start_goal([{"id": "a1"}])
+    assert "<not_done_until>" in strict
+    assert "not done while any listed item is still" in strict
+    assert "is a FAILURE" not in strict  # threat wording removed by 5abf3e12
+    lenient = _build_quick_start_goal([{"id": "a1"}], completion_mode="lenient")
+    assert "<not_done_until>" not in lenient
+
+    deps = [{"id": "a1"}, {"id": "a2", "depends_on": "a1"}]
+    assert "Wave" not in _build_quick_start_goal(deps)  # default flat
+    waved = _build_quick_start_goal(deps, goal_group_style="waves")
+    assert "Wave 1: a1" in waved and "Wave 2: a2" in waved
+
+    assert _completion_mode_from_settings(
+        {"executor_config": {"completion_mode": "lenient"}}) == "lenient"
+    assert _completion_mode_from_settings({}) == "strict"
+    assert _goal_group_style_from_settings(
+        {"executor_config": {"goal_group_style": "waves"}}) == "waves"
+    assert _goal_group_style_from_settings(None) == "flat"
+
+
+def _parse_goal_xml(goal):
+    """Wrap the /goal body (everything after the '/goal' + newline prefix) in a
+    root element and parse it — asserts the /goal is well-formed XML."""
+    import xml.etree.ElementTree as ET
+    body = goal.split("/goal", 1)[1].lstrip("\n")
+    root = ET.fromstring(f"<goal_root>{body}</goal_root>")
+    return {child.tag: (child.text or "") for child in root}, root
+
+
+def test_build_quick_start_goal_xml_structure_preserves_constraints():
+    """5abf3e12 — the /goal is XML-structured (no ALL-CAPS threat prose) yet every
+    semantic constraint from the old prose form is preserved, and the XML parses.
+
+    Constraints checked: executor role/immediacy, live-board first step, the item
+    list, the completion criteria (complete_sprint_item + test floor +
+    generate_handoff), the anti-stop 'not done until every item complete', the
+    turn + HITL stop conditions, the sprint-type tag, and the MANUAL exclusion —
+    all as clean XML tags."""
+    from meridian.handoff import _build_quick_start_goal
+
+    goal = _build_quick_start_goal(
+        [
+            {"id": "code1", "title": "FEAT: real work"},
+            {"id": "code2", "title": "FEAT: more work"},
+            {"id": "m1", "title": "MANUAL (Adam): publish the blog post", "human_id": "adam"},
+        ],
+        test_floor=350,
+    )
+    # No prose-threat / ALL-CAPS framing survives.
+    assert "is a FAILURE" not in goal
+    assert "FAILURE" not in goal
+
+    tags, root = _parse_goal_xml(goal)  # asserts well-formed XML
+    # Every constraint is present as a distinct XML tag.
+    assert set(tags) >= {
+        "role", "first_step", "sprint_items", "completion_criteria",
+        "not_done_until", "stop_conditions", "sprint_type", "exclusions",
+    }
+    # <role> — executor, act immediately, don't ask.
+    assert "You are an executor" in tags["role"]
+    assert "without asking for direction" in tags["role"]
+    # <first_step> — live board query before trusting the snapshot.
+    assert 'get_sprint_items(status="pending")' in tags["first_step"]
+    # <sprint_items> — the executable ids, MANUAL item excluded.
+    assert "code1" in tags["sprint_items"] and "code2" in tags["sprint_items"]
+    assert "m1" not in tags["sprint_items"]
+    # <completion_criteria> — the three done-conditions, verbatim semantics.
+    assert "complete_sprint_item()" in tags["completion_criteria"]
+    assert "pixi run test passes 350+" in tags["completion_criteria"]
+    assert "generate_handoff()" in tags["completion_criteria"]
+    # <not_done_until> — the anti-stop constraint (re-expressed from the threat).
+    assert "every listed item" in tags["not_done_until"]
+    assert "not done while any listed item is still pending" in tags["not_done_until"]
+    assert "do not hand off with items pending" in tags["not_done_until"]
+    # <stop_conditions> — turn ceiling + HITL.
+    assert "Stop after 200 turns" in tags["stop_conditions"]
+    assert "or if HITL triggered." in tags["stop_conditions"]
+    # <sprint_type> — inferred type on the attribute.
+    assert root.find("sprint_type").attrib["value"] == "feature"
+    # <exclusions> — the MANUAL carve-out, still saying the executor must NOT do them.
+    assert "m1" in tags["exclusions"]
+    assert "must NOT claim, execute, or complete" in tags["exclusions"]
+    assert "maintainer's own todo" in tags["exclusions"]
+
+
+def test_build_quick_start_goal_xml_hitl_mode1_no_hitl_rule():
+    """5abf3e12 — the no-HITL rule (auto-answer mode) rides <stop_conditions>, and
+    the goal stays well-formed XML."""
+    from meridian.handoff import _build_quick_start_goal
+    goal = _build_quick_start_goal([{"id": "a1"}], hitl_auto_answer_mode=1)
+    tags, _ = _parse_goal_xml(goal)
+    assert "Do NOT file HITLs" in tags["stop_conditions"]
+    assert "or if HITL triggered." not in goal
+
+
+def test_build_quick_start_goal_xml_escapes_untrusted_manual_title():
+    """5abf3e12 — a MANUAL item title carrying raw XML metacharacters is escaped
+    inside <exclusions>, so it cannot inject tags into the /goal (build_goal_xml
+    escaping discipline). The /goal remains parseable."""
+    from meridian.handoff import _build_quick_start_goal
+    goal = _build_quick_start_goal(
+        [
+            {"id": "c1", "title": "FEAT real"},
+            {"id": "m1", "title": "MANUAL: publish <script>alert(1)</script> & more",
+             "human_id": "adam"},
+        ]
+    )
+    # Raw injected tag must NOT appear; escaped form must.
+    assert "<script>" not in goal
+    assert "&lt;script&gt;" in goal
+    tags, _ = _parse_goal_xml(goal)  # still well-formed
+    assert "alert(1)" in tags["exclusions"]
+
+
+def test_resolve_graph_searcher_uses_registered_resolver():
+    """4cfaecc2 — _resolve_graph_searcher consults the injectable resolver and is
+    guarded so a resolver that raises can never break the mandatory handoff."""
+    try:
+        # No resolver registered -> None (historical default).
+        handoff_module.set_graph_searcher_resolver(None)
+        assert handoff_module._resolve_graph_searcher("proj-1") is None
+        # Registered resolver's return value is passed through, keyed by project.
+        def _sentinel(_q):
+            return [{"file": "a.py"}]
+        handoff_module.set_graph_searcher_resolver(
+            lambda pid: _sentinel if pid == "proj-1" else None
+        )
+        assert handoff_module._resolve_graph_searcher("proj-1") is _sentinel
+        assert handoff_module._resolve_graph_searcher("other") is None
+        # A resolver that raises degrades to None.
+        def _boom(_pid):
+            raise RuntimeError("nope")
+        handoff_module.set_graph_searcher_resolver(_boom)
+        assert handoff_module._resolve_graph_searcher("proj-1") is None
+    finally:
+        handoff_module.set_graph_searcher_resolver(None)
+
+
+def test_partition_into_waves_topological_layers():
+    """3726cf70 — depends_on chains are layered into ordered waves; within-wave
+    items are unordered; cycles/external deps collapse to wave 0."""
+    items = [
+        {"id": "a"},
+        {"id": "b", "depends_on": "a"},
+        {"id": "c", "depends_on": "b"},
+        {"id": "d", "depends_on": "a"},
+        {"id": "e", "depends_on": "external-not-in-set"},
+    ]
+    waves = handoff_module._partition_into_waves(items)
+    ids = [[it["id"] for it in w] for w in waves]
+    assert ids[0] == ["a", "e"]           # roots (a; e's dep is external)
+    assert set(ids[1]) == {"b", "d"}      # depend on a
+    assert ids[2] == ["c"]                # depends on b
+    # A cycle must not hang or drop items.
+    cyc = handoff_module._partition_into_waves(
+        [{"id": "x", "depends_on": "y"}, {"id": "y", "depends_on": "x"}]
+    )
+    assert sum(len(w) for w in cyc) == 2
+
+
+def test_build_quick_start_goal_flattens_deps_no_wave_headers():
+    """eeee02c6 — a dependency graph flattens into one ordered id list (no 'Wave'
+    headers, which invite stopping between waves); a flat list keeps the legacy
+    phrasing. Both carry the anti-stop completion constraint (5abf3e12: now the
+    <not_done_until> XML tag, not the old "is a FAILURE" prose)."""
+    flat = handoff_module._build_quick_start_goal([{"id": "a1"}, {"id": "a2"}])
+    assert "Complete sprint items: a1, a2." in flat
+    assert "Wave" not in flat
+    assert "<not_done_until>" in flat
+    waved = handoff_module._build_quick_start_goal([
+        {"id": "a1"}, {"id": "a2", "depends_on": "a1"},
+    ])
+    assert "dependency order" in waved
+    assert "a1, a2" in waved
+    assert "Wave" not in waved
+    assert "<not_done_until>" in waved
+
+
+def test_agent_instructions_stale_detection():
+    """99e50a1d — stored copies predating the standard are flagged; the current
+    default and genuinely-bespoke docs are not."""
+    from meridian import agent_defaults as ad
+    # Current default carries the marker -> not stale.
+    assert ad.parse_standard_version(ad.DEFAULT_AGENT_INSTRUCTIONS) == \
+        ad.AGENT_INSTRUCTIONS_STANDARD_VERSION
+    assert ad.agent_instructions_stale(ad.DEFAULT_AGENT_INSTRUCTIONS) is False
+    # None / empty -> session uses live default, never stale.
+    assert ad.agent_instructions_stale(None) is False
+    assert ad.agent_instructions_stale("   ") is False
+    # A pre-versioning Meridian rules doc (no marker) -> stale.
+    old = "# Meridian — executor rules\nCall start_session(project_id=...) first."
+    assert ad.parse_standard_version(old) is None
+    assert ad.agent_instructions_stale(old) is True
+    # An explicit older version marker -> stale.
+    assert ad.agent_instructions_stale(
+        "Meridian start_session <!-- meridian-executor-standard: v1 -->"
+    ) is True
+    # Bespoke, non-Meridian instructions -> never nagged.
+    assert ad.agent_instructions_stale("Just do whatever, no rules here.") is False
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_warns_on_stale_executor_rules(db, tmp_path):
+    """99e50a1d — a project whose stored rules predate the standard leads its
+    handoff with a sync notice; a current project does not."""
+    from meridian import agent_defaults as ad
+    stale = await db_module.create_project(db, "stale-proj")
+    await db_module.set_agent_instructions(
+        db, stale["id"],
+        "# Meridian — executor rules\nCall start_session(project_id=...) first.",
+    )
+    _, content = await handoff_module.generate_handoff(
+        db, stale["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "Executor rules are behind the current standard" in content
+
+    fresh = await db_module.create_project(db, "fresh-proj")
+    await db_module.set_agent_instructions(db, fresh["id"], ad.DEFAULT_AGENT_INSTRUCTIONS)
+    _, content2 = await handoff_module.generate_handoff(
+        db, fresh["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "Executor rules are behind the current standard" not in content2
 
 
 def test_max_turns_from_settings():
@@ -154,6 +484,39 @@ def test_render_workspace_handoff_block_empty_and_full():
     assert "Workspace (applies to all projects)" in block
     assert "WS dec" in block
     assert "WS note" in block
+
+
+# ---------------------------------------------------------------------------
+# 2d6d8677 — per-item body clipping so a handoff can't overflow the MCP result cap
+# ---------------------------------------------------------------------------
+
+
+def test_clip_body_short_body_unchanged():
+    """A body at or under the limit passes through verbatim (no marker)."""
+    assert handoff_module._clip_body("short body") == "short body"
+    assert handoff_module._clip_body("") == ""
+    assert handoff_module._clip_body(None) == ""
+    exact = "x" * 300
+    assert handoff_module._clip_body(exact) == exact  # ==limit, untouched
+
+
+def test_clip_body_long_body_truncated_with_marker():
+    """A body over the limit is cut to the limit and marked with the omitted count."""
+    body = "a" * 5000
+    clipped = handoff_module._clip_body(body)  # default 300
+    # The rendered preview is far shorter than the original 5000 chars.
+    assert len(clipped) < 400
+    assert clipped.startswith("a" * 200)  # keeps the head
+    assert "5000" not in clipped[:300]  # not the whole body
+    assert "(+4700 more chars)" in clipped  # 5000 - 300 omitted
+    assert body not in clipped  # NOT the full body
+
+
+def test_clip_body_custom_limit():
+    body = "b" * 1000
+    clipped = handoff_module._clip_body(body, 100)
+    assert "(+900 more chars)" in clipped
+    assert len(clipped) < 150
 
 
 def test_render_custom_handoff_empty_sources_render_none():
@@ -465,6 +828,63 @@ async def test_generate_handoff_full_with_decisions_and_workspace(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_generate_handoff_clips_long_bodies(db, tmp_path):
+    """2d6d8677 — long decision / workspace-note / task bodies are clipped to a
+    ~300-char preview with a truncation marker, NOT dumped at full length (the
+    420K-blob-over-MCP-cap bug). Short bodies stay intact."""
+    long_dec = "D" * 5000
+    long_note = "N" * 5000
+    long_task = "T" * 5000
+    p = await db_module.create_project(db, "alpha-longbody")
+    await db_module.set_goal(db, p["id"], "clip long bodies", sprint="s-clip")
+    await db_module.pin_decision(db, p["id"], "Long decision", long_dec, "TECHNICAL")
+    await db_module.pin_decision(db, p["id"], "Short decision", "brief body", "TECHNICAL")
+    await db_module.add_workspace_note(db, "Long WS note", long_note, "x")
+    s = await db_module.register_session(db, p["id"], "sess-clip")
+    await db_module.log_task(db, s["id"], p["id"], long_task, "done")
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    # None of the full 5000-char bodies survive verbatim.
+    assert long_dec not in content
+    assert long_note not in content
+    assert long_task not in content
+    # But a bounded preview + truncation marker does.
+    assert "D" * 200 in content
+    assert "N" * 200 in content
+    assert "(+4700 more chars)" in content  # 5000 - 300 clip
+    # Titles and short bodies stay intact.
+    assert "Long decision" in content
+    assert "Short decision" in content
+    assert "brief body" in content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_total_size_bounded_with_many_long_items(db, tmp_path):
+    """2d6d8677 — a realistic board of dozens of long-bodied decisions + notes
+    keeps the whole rendered handoff comfortably under the MCP result cap. Without
+    the per-body clip this fixture alone would be ~300K+ chars; with it, well under."""
+    p = await db_module.create_project(db, "alpha-bulk")
+    await db_module.set_goal(db, p["id"], "bulk clip", sprint="s-bulk")
+    s = await db_module.register_session(db, p["id"], "sess-bulk")
+    huge = "Z" * 8000
+    for i in range(30):
+        await db_module.pin_decision(db, p["id"], f"Decision {i}", huge, "TECHNICAL")
+        await db_module.add_project_note(
+            db, p["id"], f"Insight {i}", huge, tags="strategy", kind="insight",
+            priority="high",
+        )
+        await db_module.log_task(db, s["id"], p["id"], huge, "done")
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    # 30 decisions + 30 insight notes + 30 tasks × 8000 chars would be >700K raw;
+    # clipped, the whole handoff stays well under a conservative bound.
+    assert len(content) < 60_000, f"handoff too large: {len(content)} chars"
+    assert huge not in content  # no full 8000-char body leaked through
+
+
+@pytest.mark.asyncio
 async def test_generate_handoff_with_ai_summary_stub(db, tmp_path):
     """summarizer stub injects the ai_summary blurb (non-skip path)."""
     p = await db_module.create_project(db, "alpha-aisum")
@@ -511,6 +931,208 @@ async def test_generate_handoff_delta_empty(db, tmp_path):
     )
     assert "Completed since last handoff:" in content
     assert "- none" in content
+
+
+# ---------------------------------------------------------------------------
+# aef94e4a — sprint retrospective note
+# ---------------------------------------------------------------------------
+
+
+def test_build_retro_prompt_names_three_sections():
+    items = [{"title": "Ship auth fix", "status": "done"},
+             {"title": "Add graph snapshot", "status": "done"}]
+    decisions = [{"decision": "Use psycopg3", "status": "active"}]
+    prompt = handoff_module._build_retro_prompt(items, decisions, "v0.1.x")
+    assert "What shipped" in prompt
+    assert "Patterns revealed" in prompt
+    assert "Direction confirmed" in prompt
+    assert "Ship auth fix" in prompt
+    assert "v0.1.x" in prompt
+    assert "Use psycopg3" in prompt
+    # the retro prompt is a stable discriminator vs. the ai_summary prompt
+    assert "sprint retrospective" in prompt
+
+
+def test_render_retro_fallback_lists_shipped_and_handles_empty():
+    items = [{"title": "Ship auth fix", "status": "done"}]
+    body = handoff_module._render_retro_fallback(items, "v1")
+    assert "Ship auth fix" in body
+    assert "1 item" in body
+    assert handoff_module._render_retro_fallback([], None).startswith("No items")
+
+
+def _retro_summarizer(prompt):
+    # Discriminate the retro prompt from the ai_summary prompt (both share the
+    # injected summarizer) so tests assert on the retrospective body only.
+    if "sprint retrospective" in prompt:
+        return "RETRO STUB: what shipped, patterns, direction."
+    return "AI SUMMARY STUB."
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_writes_retrospective_note(db, tmp_path):
+    p = await db_module.create_project(db, "retro-proj")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v0.1.x")
+    it = await db_module.add_sprint_item(db, p["id"], "v0.1.x", "Ship the retro")
+    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), summarizer=_retro_summarizer,
+        skip_ai_summary=False,
+    )
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 1
+    n = notes[0]
+    assert n["body"] == "RETRO STUB: what shipped, patterns, direction."
+    assert (n.get("note_kind") or n.get("kind")) == "insight"
+    assert "retrospective" in (n.get("tags") or "")
+    assert n["priority"] == "high"
+    assert n["title"] == "Sprint Retrospective — v0.1.x"
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_retrospective_is_idempotent(db, tmp_path):
+    p = await db_module.create_project(db, "retro-idem")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v9")
+    it = await db_module.add_sprint_item(db, p["id"], "v9", "Item one")
+    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+
+    seq = {"n": 0}
+
+    def _seq_summarizer(prompt):
+        if "sprint retrospective" in prompt:
+            seq["n"] += 1
+            return f"RETRO#{seq['n']}"
+        return "AI SUMMARY STUB."
+
+    for _ in range(2):
+        await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), summarizer=_seq_summarizer,
+            skip_ai_summary=False,
+        )
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 1  # updated in place, not duplicated
+    assert notes[0]["body"] == "RETRO#2"
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_skip_ai_summary_no_retrospective(db, tmp_path):
+    p = await db_module.create_project(db, "retro-skip")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v1")
+    it = await db_module.add_sprint_item(db, p["id"], "v1", "Item")
+    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+    )
+    notes = await db_module.get_project_notes(db, p["id"], tag="retrospective")
+    assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_no_completed_items_no_retrospective(db, tmp_path):
+    p = await db_module.create_project(db, "retro-none")
+    await db_module.set_goal(db, p["id"], "ship", sprint="v1")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Still pending")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), summarizer=_retro_summarizer,
+        skip_ai_summary=False,
+    )
+    notes = await db_module.get_project_notes(db, p["id"], tag="retrospective")
+    assert notes == []
+
+
+# ---------------------------------------------------------------------------
+# 78ebc812 — _annotate_touches_files persists to touches_resources (the column
+# that actually exists), not the phantom touches_files column.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_annotate_touches_files_writes_touches_resources(db, tmp_path, monkeypatch):
+    """The auto-inferred file match round-trips: _annotate_touches_files must
+    persist typed touches_resources ids that get_sprint_items reads back — the
+    old touches_files UPDATE targeted a non-existent column and failed silently."""
+    import subprocess as _subprocess
+
+    class _R:
+        stdout = "meridian/pg_adapter.py\n"
+
+    monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _R())
+
+    p = await db_module.create_project(db, "touches-proj")
+    it = await db_module.add_sprint_item(
+        db, p["id"], "v1", "rewrite pg_adapter cursor handling"
+    )
+
+    pending = [{"id": it["id"], "title": "rewrite pg_adapter cursor handling",
+                "status": "pending"}]
+    out = await handoff_module._annotate_touches_files(db, p["id"], pending)
+
+    # In-memory annotation set the typed, provenance-marked resource id.
+    assert out[0]["touches_resources"]
+    assert "inferred:file:meridian/pg_adapter.py" in out[0]["touches_resources"]
+
+    # And it actually persisted — get_sprint_items reads it back (previously the
+    # write hit a phantom touches_files column and silently no-op'd).
+    items = await db_module.get_sprint_items(db, p["id"])
+    stored = next(i for i in items if i["id"] == it["id"])
+    resources = db_module.parse_touches_resources(stored.get("touches_resources"))
+    assert "file:meridian/pg_adapter.py" in resources
+
+
+# ---------------------------------------------------------------------------
+# 093d55e0 — retrospective idempotency keys on the sprint VERSION, not the
+# verbose (drift-prone) sprint description embedded in the note title.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retrospective_idempotent_across_sprint_text_drift(db, tmp_path):
+    """Two retro persists for the SAME sprint version but DIFFERENT sprint text
+    (which drifts the rendered title) must update ONE note in place, not insert a
+    duplicate. Previously the title-embedded verbose description broke the match."""
+    p = await db_module.create_project(db, "retro-drift")
+
+    # First persist: verbose sprint description A.
+    await handoff_module._persist_sprint_retrospective(
+        db, p["id"], "v0.2.x — wire tunnel, add graph searcher, ship docs",
+        "RETRO BODY A", version=7,
+    )
+    # Second persist: SAME version, reworded/expanded description (title drifts).
+    await handoff_module._persist_sprint_retrospective(
+        db, p["id"],
+        "v0.2.x — wire tunnel; add graph searcher; ship docs; fix flaky test",
+        "RETRO BODY B", version=7,
+    )
+
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 1  # updated in place, not duplicated
+    assert notes[0]["body"] == "RETRO BODY B"
+    # The stable per-version tag is present so future runs match regardless of drift.
+    assert "retro:v7" in (notes[0].get("tags") or "")
+
+
+@pytest.mark.asyncio
+async def test_retrospective_distinct_versions_are_separate_notes(db, tmp_path):
+    """Different sprint versions get their own retro notes (the stable key is
+    per-version, so it must not collapse distinct sprints into one)."""
+    p = await db_module.create_project(db, "retro-versions")
+    await handoff_module._persist_sprint_retrospective(
+        db, p["id"], "v1 sprint", "BODY V1", version=1,
+    )
+    await handoff_module._persist_sprint_retrospective(
+        db, p["id"], "v2 sprint", "BODY V2", version=2,
+    )
+    notes = await db_module.get_project_notes(
+        db, p["id"], tag="retrospective", bodies=True
+    )
+    assert len(notes) == 2
 
 
 @pytest.mark.asyncio
@@ -596,8 +1218,8 @@ async def test_generate_handoff_starter_and_compact(db, tmp_path):
         path, content = await handoff_module.generate_handoff(
             db, p["id"], str(tmp_path), mode=mode
         )
-        assert f'project_id: {p["id"]}' in content
-        assert "start_session" in content
+        assert f'start_session(project_name="{p["name"]}"' in content  # 11a91d31
+        assert f'project_id (fallback): {p["id"]}' in content
         assert it2["id"][:8] in content
         assert "Done:" in content
         assert path.endswith("alpha-starter-cov_starter.md")
@@ -830,6 +1452,27 @@ def test_build_quick_start_goal_empty_items_hitl_mode_adapts():
     assert "Do NOT file HITLs" in empty_mode2
 
 
+def test_handoff_start_session_lines_prefer_project_name():
+    """11a91d31 — the starter + delta handoff start_session lines default to
+    project_name (the idiomatic interface per 8a449ec0); project_id stays only as
+    a fallback comment, never as the start_session(project_id=...) call."""
+    proj = {"id": "abc-123-uuid", "name": "meridian-build"}
+    starter = handoff_module._render_starter_handoff(
+        proj, completed_items=[], pending_items=[], quick_start_goal="/goal x",
+    )
+    assert 'start_session(project_name="meridian-build"' in starter
+    assert 'start_session(project_id=' not in starter
+    assert "abc-123-uuid" in starter  # present as the fallback reference
+
+    delta = handoff_module._render_delta_handoff(
+        proj, generated_at="2026-06-30", completed_items=[],
+        in_progress_items=[], pending_sprint_items=[], quick_start_goal="/goal x",
+    )
+    assert 'start_session(project_name="meridian-build"' in delta
+    assert 'start_session(project_id=' not in delta
+    assert "project_id=abc-123-uuid" in delta  # inline fallback comment
+
+
 def test_start_session_agent_instructions_includes_hitl_directive(client):
     """start_session agent_instructions leads with both execution-mode and HITL directives."""
     import json as _json
@@ -847,3 +1490,164 @@ def test_start_session_agent_instructions_includes_hitl_directive(client):
     ai = data.get("agent_instructions", "")
     assert "EXECUTION MODE:" in ai
     assert "HITL:" in ai
+
+
+def test_start_session_includes_current_timestamp(client):
+    """de193a81 — the start_session response carries current_timestamp so an
+    executor session spanning calendar days is anchored to the real date."""
+    import json as _json
+    import re
+    project = client.post("/projects", json={"name": "ts-instr-proj"}).json()
+    pid = project["id"]
+    r = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "start_session",
+                   "arguments": {"project_id": pid, "session_name": "ts-test"}}
+    })
+    assert r.status_code == 200
+    data = _json.loads(r.json()["result"]["content"][0]["text"])
+    assert "current_timestamp" in data
+    assert re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", data["current_timestamp"])
+
+
+# ---------------------------------------------------------------------------
+# 5abf3e12 — per-session goal-compliance metric
+# ---------------------------------------------------------------------------
+
+
+async def _seed_session_with_items(db, project_name, n_listed, n_done):
+    """Create a project + session, claim ``n_listed`` items for the session
+    (actor = session id) and complete the first ``n_done`` of them."""
+    p = await db_module.create_project(db, project_name)
+    sess = await db_module.register_session(db, p["id"], "exec-sess")
+    sid = sess["id"]
+    items = []
+    for i in range(n_listed):
+        it = await db_module.add_sprint_item(db, p["id"], "v1", f"item {i}")
+        await db_module.claim_sprint_item(db, p["id"], it["id"], actor=sid)
+        items.append(it)
+    for it in items[:n_done]:
+        await db_module.complete_sprint_item(db, p["id"], it["id"], actor=sid)
+    return p, sid, items
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_full(db):
+    """Full compliance: every item the session took on (N) was completed (M==N)."""
+    p, sid, _ = await _seed_session_with_items(db, "gc-full", 3, 3)
+    metric = await db_module.compute_session_goal_compliance(db, p["id"], sid)
+    assert metric["listed"] == 3
+    assert metric["completed"] == 3
+    assert metric["fully_completed"] is True
+    assert metric["zero_listed"] is False
+    assert metric["compliance_pct"] == 100
+    assert metric["session_id"] == sid
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_partial(db):
+    """Partial compliance: M < N → not fully completed, pct reflects the ratio."""
+    p, sid, _ = await _seed_session_with_items(db, "gc-partial", 4, 1)
+    metric = await db_module.compute_session_goal_compliance(db, p["id"], sid)
+    assert metric["listed"] == 4
+    assert metric["completed"] == 1
+    assert metric["fully_completed"] is False
+    assert metric["zero_listed"] is False
+    assert metric["compliance_pct"] == 25
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_zero_listed(db):
+    """Zero-listed edge case: a session that claimed no items is NOT vacuously
+    'fully_completed' — nothing was listed, so the flag is False and zero_listed
+    is True."""
+    p = await db_module.create_project(db, "gc-zero")
+    sess = await db_module.register_session(db, p["id"], "idle-sess")
+    metric = await db_module.compute_session_goal_compliance(db, p["id"], sess["id"])
+    assert metric["listed"] == 0
+    assert metric["completed"] == 0
+    assert metric["fully_completed"] is False
+    assert metric["zero_listed"] is True
+    assert metric["compliance_pct"] == 0
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_scoped_to_session(db):
+    """The metric only counts items attributed to THIS session (actor), not the
+    project-wide board — a second session's items are excluded."""
+    p = await db_module.create_project(db, "gc-scope")
+    s1 = (await db_module.register_session(db, p["id"], "s1"))["id"]
+    s2 = (await db_module.register_session(db, p["id"], "s2"))["id"]
+    a = await db_module.add_sprint_item(db, p["id"], "v1", "a")
+    b = await db_module.add_sprint_item(db, p["id"], "v1", "b")
+    await db_module.claim_sprint_item(db, p["id"], a["id"], actor=s1)
+    await db_module.complete_sprint_item(db, p["id"], a["id"], actor=s1)
+    await db_module.claim_sprint_item(db, p["id"], b["id"], actor=s2)  # other session, still pending
+    m1 = await db_module.compute_session_goal_compliance(db, p["id"], s1)
+    m2 = await db_module.compute_session_goal_compliance(db, p["id"], s2)
+    assert m1 == {**m1, "listed": 1, "completed": 1, "fully_completed": True}
+    assert m2["listed"] == 1 and m2["completed"] == 0 and m2["fully_completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_goal_compliance_cross_session_completion_reattributes(db):
+    """5abf3e12 — cross-session hand-off: session A claims an item but session B
+    *completes* it (actor=B, as complete_sprint_item does). The item is
+    reattributed to the completer, so credit follows B — A no longer counts it,
+    B counts it as completed. Pins the documented attribution (complete overwrites
+    actor, unlike claim which COALESCEs); this is correct for the common
+    single-session loop and defined behaviour for parallel/coordinator patterns."""
+    p = await db_module.create_project(db, "gc-xsession")
+    a = (await db_module.register_session(db, p["id"], "claimer"))["id"]
+    b = (await db_module.register_session(db, p["id"], "completer"))["id"]
+    it = await db_module.add_sprint_item(db, p["id"], "v1", "handed-off item")
+    await db_module.claim_sprint_item(db, p["id"], it["id"], actor=a)
+    await db_module.complete_sprint_item(db, p["id"], it["id"], actor=b)
+    ma = await db_module.compute_session_goal_compliance(db, p["id"], a)
+    mb = await db_module.compute_session_goal_compliance(db, p["id"], b)
+    # A claimed it but B finalised it → the item is now attributed to B.
+    assert ma["listed"] == 0 and ma["zero_listed"] is True
+    assert mb["listed"] == 1 and mb["completed"] == 1 and mb["fully_completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_record_session_goal_compliance_persists(db):
+    """record_session_goal_compliance stores the metric on sessions.goal_compliance
+    and get_session_goal_compliance reads it back verbatim."""
+    p, sid, _ = await _seed_session_with_items(db, "gc-store", 2, 1)
+    assert await db_module.get_session_goal_compliance(db, sid) is None  # nothing yet
+    returned = await db_module.record_session_goal_compliance(db, p["id"], sid)
+    stored = await db_module.get_session_goal_compliance(db, sid)
+    assert stored == returned
+    assert stored["listed"] == 2 and stored["completed"] == 1
+    assert stored["fully_completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_stores_goal_compliance(db, tmp_path):
+    """5abf3e12 — the metric is computed & persisted at the canonical session-end
+    point (generate_handoff), so every completed session leaves a durable record
+    of whether its /goal item list was fully done."""
+    p, sid, _ = await _seed_session_with_items(db, "gc-handoff", 2, 2)
+    # No metric until the session ends.
+    assert await db_module.get_session_goal_compliance(db, sid) is None
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=sid
+    )
+    stored = await db_module.get_session_goal_compliance(db, sid)
+    assert stored is not None
+    assert stored["listed"] == 2 and stored["completed"] == 2
+    assert stored["fully_completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_no_session_id_skips_compliance(db, tmp_path):
+    """A session-less handoff must not attempt to store a metric (nothing to key
+    it on) and must not raise."""
+    p = await db_module.create_project(db, "gc-nosess")
+    await db_module.add_sprint_item(db, p["id"], "v1", "an item")
+    # No session_id → no compliance write, no error.
+    path, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert path

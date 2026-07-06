@@ -1,6 +1,6 @@
 [project]
 name = "meridian-server"
-version = "0.1.6"
+version = "0.1.8"
 description = "Multi-session Claude coordinator MCP server"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -34,6 +34,22 @@ dependencies = [
     "tree-sitter-rust>=0.21",
     "tree-sitter-java>=0.21",
     "tree-sitter-c-sharp>=0.21",
+    # Native LaTeX source parsing — docs_intel Phase 3 (106118cd). Pure-Python
+    # latexwalker parser (no PDF intermediary); ships in the Fly image so the
+    # get_latex_structure MCP tool works server-side.
+    "pylatexenc>=2.10,<3",
+]
+
+[project.optional-dependencies]
+# 56cd8712 — Model2Vec semantic-search escalation. OPTIONAL extra, NOT a base dep:
+# it pulls numpy and a ~30MB static model (~90MB WARM RSS), which we keep off the
+# 512MB prod box and out of base/CI installs. Opt in with:
+#   uv pip install '.[semantic]'   (and set MERIDIAN_SEMANTIC_ENABLED=1)
+# model2vec is numpy-only static embeddings (NO torch). psutil is used by the
+# runtime RSS circuit breaker (semantic_search.rss_mb falls back to /proc if absent).
+semantic = [
+    "model2vec>=0.3",
+    "psutil>=5.9",
 ]
 
 [project.scripts]

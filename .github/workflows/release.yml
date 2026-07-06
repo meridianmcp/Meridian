@@ -22,7 +22,7 @@ jobs:
       - name: Install UPX (binary compression)
         run: choco install upx -y --no-progress
       - name: Build Windows executable
-        run: pixi run build-exe
+        run: pixi run -e dev build-exe
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
@@ -40,7 +40,7 @@ jobs:
       - name: Install UPX (binary compression)
         run: sudo apt-get update && sudo apt-get install -y upx-ucl
       - name: Build Linux executable
-        run: pixi run build-exe
+        run: pixi run -e dev build-exe
       - name: Stage artifact
         run: cp dist/meridian dist/meridian-linux
       - name: Upload Linux artifact
@@ -58,7 +58,7 @@ jobs:
           pixi-version: latest
           cache: true
       - name: Build macOS arm64 executable
-        run: pixi run build-exe
+        run: pixi run -e dev build-exe
       - name: Stage artifact
         run: cp dist/meridian dist/meridian-mac-arm64
       - name: Upload macOS arm64 artifact
@@ -67,36 +67,29 @@ jobs:
           name: meridian-mac-arm64
           path: dist/meridian-mac-arm64
 
-  build-mac-x86:
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: latest
-          cache: true
-      - name: Build macOS x86_64 executable
-        run: pixi run build-exe
-      - name: Stage artifact
-        run: cp dist/meridian dist/meridian-mac-x86_64
-      - name: Upload macOS x86_64 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: meridian-mac-x86_64
-          path: dist/meridian-mac-x86_64
+  # 80f1d4bc — macOS x86_64 (Intel) builds are dropped. The macos-13 runner is
+  # effectively unavailable to this repo (its jobs queued 34+ min and never ran
+  # on the v0.1.7 tag), so *requiring* it blocked the entire GitHub release. Apple
+  # Silicon still ships (build-mac-arm64 / the aarch64-apple-darwin connect
+  # variant). Restore an x86-mac job if GitHub provides a working Intel runner.
 
   build-connect:
     strategy:
+      # 80f1d4bc — a failing platform must not cancel the others.
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-20.04
+          # Runner history: ubuntu-20.04 was retired by GitHub (queued forever).
+          # 80f1d4bc — two more platforms dropped as unbuildable here:
+          #  - macos-13 (x86_64 Intel): runner effectively unavailable (queued 34m+).
+          #  - ubuntu-22.04-arm (linux-aarch64): pixi's workspace doesn't declare
+          #    that platform (`pixi install` -> unsupported-platform), so the build
+          #    errors. Re-add after `pixi workspace platform add linux-aarch64` +
+          #    a lock re-solve.
+          - os: ubuntu-22.04
             artifact: meridian-connect-x86_64-unknown-linux
-          - os: ubuntu-22.04-arm64
-            artifact: meridian-connect-aarch64-unknown-linux
           - os: macos-14
             artifact: meridian-connect-aarch64-apple-darwin
-          - os: macos-13
-            artifact: meridian-connect-x86_64-apple-darwin
           - os: windows-latest
             artifact: meridian-connect-x86_64-windows.exe
     runs-on: ${{ matrix.os }}
@@ -107,7 +100,7 @@ jobs:
           pixi-version: latest
           cache: true
       - name: Build meridian-connect
-        run: pixi run build-connect
+        run: pixi run -e dev build-connect
       - name: Stage artifact (Unix)
         if: runner.os != 'Windows'
         run: mv dist/meridian-connect ${{ matrix.artifact }}
@@ -120,8 +113,11 @@ jobs:
           path: ${{ matrix.artifact }}
 
   release:
-    needs: [build-windows, build-linux, build-mac-arm64, build-mac-x86, build-connect]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-windows, build-linux, build-mac-arm64, build-connect]
+    # 80f1d4bc — run as long as we weren't cancelled, even if a build variant
+    # failed, so one flaky/unbuildable platform can't SKIP the whole release.
+    # With fail_on_unmatched_files:false the release ships whatever actually built.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -134,30 +130,39 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # 80f1d4bc — ship whatever built; a missing platform artifact (transient
+          # runner outage) must not fail the whole release. macos-x86 is no longer
+          # produced (dead runner).
+          fail_on_unmatched_files: false
           files: |
             dist-artifacts/meridian-windows/meridian.exe
             dist-artifacts/meridian-linux/meridian-linux
             dist-artifacts/meridian-mac-arm64/meridian-mac-arm64
-            dist-artifacts/meridian-mac-x86_64/meridian-mac-x86_64
             dist-artifacts/meridian-connect-x86_64-unknown-linux/meridian-connect-x86_64-unknown-linux
-            dist-artifacts/meridian-connect-aarch64-unknown-linux/meridian-connect-aarch64-unknown-linux
             dist-artifacts/meridian-connect-aarch64-apple-darwin/meridian-connect-aarch64-apple-darwin
-            dist-artifacts/meridian-connect-x86_64-apple-darwin/meridian-connect-x86_64-apple-darwin
             dist-artifacts/meridian-connect-x86_64-windows.exe/meridian-connect-x86_64-windows.exe
           generate_release_notes: true
 
   docker-publish:
-    needs: [build-windows, build-linux, build-mac-arm64, build-mac-x86]
+    needs: [build-windows, build-linux, build-mac-arm64]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # 80f1d4bc — skip Docker Hub publish cleanly when creds aren't configured
+      # (repo without DOCKER_USERNAME/DOCKER_TOKEN) instead of failing the run.
+      # The ghcr image (docker-ghcr, via GITHUB_TOKEN) still publishes regardless.
+      - name: Check Docker Hub credentials
+        id: dockercreds
+        run: echo "has=${{ secrets.DOCKER_USERNAME != '' }}" >> "$GITHUB_OUTPUT"
       - name: Log in to Docker Hub
+        if: steps.dockercreds.outputs.has == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Build and push Docker image
+        if: steps.dockercreds.outputs.has == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .

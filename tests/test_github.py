@@ -300,8 +300,12 @@ def _github_client(tmp_path, monkeypatch):
     return mod, TestClient(mod.app)
 
 
-def test_auth_login_page_has_github_button(client):
-    """GET /auth/login shows GitHub OAuth button."""
+def test_auth_login_page_has_github_button(client, monkeypatch):
+    """GET /auth/login shows the GitHub OAuth button when GITHUB_CLIENT_ID is set.
+
+    98c45dd0 — the button only renders for a configured provider.
+    """
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "gh-fake")
     r = client.get("/auth/login", follow_redirects=False)
     assert r.status_code == 200
     assert "GitHub" in r.text
@@ -358,6 +362,53 @@ def test_auth_github_repo_connect_redirects_to_repo_callback(tmp_path, monkeypat
         assert "%2Fauth%2Fgithub%2Fcallback" in location
         assert "%2Fauth%2Fgithub%2Frepo-callback" not in location
         assert "state=repo%3Aproj-123" in location
+
+
+def test_get_github_auth_url_prompt_select_account(monkeypatch):
+    """330937c6 — prompt is added only when requested (multi-account picker)."""
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "Ov23liFakeId")
+    default_url = asyncio.run(hosted_module.get_github_auth_url(scope="repo"))
+    assert "prompt=" not in default_url
+    forced = asyncio.run(
+        hosted_module.get_github_auth_url(scope="repo", prompt="select_account")
+    )
+    assert "prompt=select_account" in forced
+
+
+def test_auth_github_repo_connect_select_account_forces_picker(tmp_path, monkeypatch):
+    """330937c6 — select_account=1 makes the redirect carry prompt=select_account."""
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "Ov23liFakeId")
+    monkeypatch.setenv("MERIDIAN_SESSION_SECRET", "test-session-secret")
+    mod, client = _github_client(tmp_path, monkeypatch)
+
+    with client:
+        async def _setup():
+            db = client.app.state.db
+            tenant = await db_module.upsert_tenant(db, "gh_multi@example.com")
+            session = await db_module.create_user_session(
+                db, tenant["id"], "2099-01-01T00:00:00+00:00",
+            )
+            return hosted_module._make_session_cookie(session["id"])
+
+        cookie = asyncio.run(_setup())
+        client.cookies.set(hosted_module._SESSION_COOKIE, cookie)
+
+        # With select_account=1 → picker forced.
+        r = client.get(
+            "/auth/github/repo-connect?project_id=proj-9&select_account=1",
+            follow_redirects=False,
+        )
+        assert r.status_code == 302
+        assert "prompt=select_account" in r.headers["location"]
+
+        # Without it → no prompt param (back-compat with the single-account flow).
+        r2 = client.get(
+            "/auth/github/repo-connect?project_id=proj-9",
+            follow_redirects=False,
+        )
+        client.cookies.clear()
+        assert r2.status_code == 302
+        assert "prompt=" not in r2.headers["location"]
 
 
 def test_exchange_github_repo_code_uses_repo_callback(monkeypatch):

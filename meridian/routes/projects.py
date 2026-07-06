@@ -20,6 +20,7 @@ from .. import goal_md as goal_md_module
 from ..executor_config import normalize_executor_config
 from ..models import (
     GoalModeSet,
+    ProjectOrganizationSet,
     GoalSet,
     GoalState,
     Project,
@@ -144,10 +145,16 @@ async def create_project(
     db = await _db(request)
     # 0bf67524 — pass tenant_id so the new project is seeded from the workspace's
     # cascade defaults (execution mode / HITL / code intel).
-    project = await db_module.create_project(
-        db, body.name, human_id=body.human_id,
-        tenant_id=(tenant.get("id") if tenant else None),
-    )
+    # 3b6ff466 — optional parent_project_id makes this a one-level-deep subproject;
+    # an invalid/nested parent raises ValueError → 400.
+    try:
+        project = await db_module.create_project(
+            db, body.name, human_id=body.human_id,
+            tenant_id=(tenant.get("id") if tenant else None),
+            parent_project_id=body.parent_project_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     from ..agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # noqa: PLC0415
     await db_module.set_agent_instructions(db, project["id"], DEFAULT_AGENT_INSTRUCTIONS)
     # c3e91df4 — start the free-tier trial clock on first own project creation,
@@ -623,6 +630,25 @@ async def get_goal_mode(project_id: str, request: Request) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="project not found")
     mode = await db_module.get_goal_mode(await _db(request), project_id)
     return {"project_id": project_id, "goal_mode": mode}
+
+
+@router.patch("/projects/{project_id}/organization", response_model=Project)
+async def patch_project_organization(
+    project_id: str, body: ProjectOrganizationSet, request: Request
+) -> dict[str, Any]:
+    """8db00fcb — set a project's status (active|parked|archived) and/or
+    priority (P0|P1|P2). Only the provided fields change."""
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        updated = await db_module.set_project_status(
+            db, project_id, status=body.status, priority=body.priority
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return updated
 
 
 @router.post("/projects/{project_id}/goal", response_model=GoalState)

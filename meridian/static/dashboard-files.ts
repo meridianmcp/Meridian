@@ -1,7 +1,7 @@
 // dashboard-files.js — file browser + editor tab extracted from dashboard.js
 // Re-exposes its symbols on window so inline handlers + cross-file references resolve after esbuild IIFE bundling.
 
-export function _rewriteRepoImages(container, projectId) {
+export function _rewriteRepoImages(container: any, projectId: string) {
 
   /** G7.32 — rewrite repo-relative <img src> in a markdown preview to route
 
@@ -13,7 +13,7 @@ export function _rewriteRepoImages(container, projectId) {
 
   if (!container || !projectId) return;
 
-  container.querySelectorAll('img').forEach((img) => {
+  container.querySelectorAll('img').forEach((img: any) => {
 
     const src = img.getAttribute('src') || '';
 
@@ -31,7 +31,7 @@ export function _rewriteRepoImages(container, projectId) {
 
 }
 
-export async function loadFilesTab(projectId) {
+export async function loadFilesTab(projectId: string) {
 
   /**Load the list of editable files from the server and render them as
 
@@ -53,7 +53,7 @@ export async function loadFilesTab(projectId) {
 
     }
 
-    listEl.innerHTML = files.map(f =>
+    listEl.innerHTML = files.map((f: any) =>
 
       `<div class="file-item" data-filename="${escapeHtml(f)}">${escapeHtml(f)}</div>`
 
@@ -65,7 +65,7 @@ export async function loadFilesTab(projectId) {
 
     });
 
-  } catch(e) {
+  } catch(e: any) {
 
     listEl.innerHTML = `<div style="padding:14px;color:var(--status-failed);font-family:'IBM Plex Mono',monospace;font-size:11px">Error: ${escapeHtml(e.message)}</div>`;
 
@@ -73,7 +73,7 @@ export async function loadFilesTab(projectId) {
 
 }
 
-export async function openFileEditor(projectId, filename) {
+export async function openFileEditor(projectId: string, filename: string) {
 
   /**Fetch file content and switch the files panel into editor mode. */
 
@@ -131,15 +131,15 @@ export async function openFileEditor(projectId, filename) {
 
     // Wire edit/preview toggle if not already wired
 
-    if (editBtn && !editBtn._wired) {
+    if (editBtn && previewBtn && previewDiv && !editBtn._wired) {
 
       editBtn._wired = true;
 
-      [editBtn, previewBtn].forEach(btn => {
+      [editBtn, previewBtn].forEach((btn: any) => {
 
         btn.onclick = () => {
 
-          [editBtn, previewBtn].forEach(b => b.classList.toggle('active', b === btn));
+          [editBtn, previewBtn].forEach((b: any) => b.classList.toggle('active', b === btn));
 
           if (btn.dataset.fmode === 'preview') {
 
@@ -169,11 +169,11 @@ export async function openFileEditor(projectId, filename) {
 
     }
 
-  } catch(e) { toast('open failed: ' + e.message, true); }
+  } catch(e: any) { toast('open failed: ' + e.message, true); }
 
 }
 
-export async function saveFile(projectId) {
+export async function saveFile(projectId: string) {
 
   /**Write the current editor content back to the server. */
 
@@ -199,7 +199,7 @@ export async function saveFile(projectId) {
 
     toast(`saved ${filename}`);
 
-  } catch(e) { toast('save failed: ' + e.message, true); }
+  } catch(e: any) { toast('save failed: ' + e.message, true); }
 
 }
 

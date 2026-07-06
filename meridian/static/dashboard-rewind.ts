@@ -1,7 +1,10 @@
 // dashboard-rewind.js — rewind/analytics tab extracted from dashboard.js
 // Re-exposes its symbols on window so inline handlers + cross-file references resolve after esbuild IIFE bundling.
 
-export function initRewindTab(projectId) {
+// 233bae67 — historical sprint-execution gantt (CSS bars from a pure model).
+import { ganttBars, sprintStatusColor } from "./components/sprintGraph";
+
+export function initRewindTab(projectId: string) {
 
   const p = window.state.panels[projectId];
 
@@ -45,7 +48,7 @@ export function initRewindTab(projectId) {
 
     const wrap = document.getElementById(`rewind-wrap-${projectId}`);
 
-    let _st = null;
+    let _st: any = null;
 
     searchInp.addEventListener('input', function() {
 
@@ -75,7 +78,7 @@ export function initRewindTab(projectId) {
 
           wrap.innerHTML = renderSearchResults(q, results);
 
-        } catch (e) { wrap.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
+        } catch (e: any) { wrap.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
 
       }, 350);
 
@@ -89,7 +92,7 @@ export function initRewindTab(projectId) {
 
 }
 
-export async function loadRewindTab(projectId, days) {
+export async function loadRewindTab(projectId: string, days: any) {
 
   const wrap = document.getElementById(`rewind-wrap-${projectId}`);
 
@@ -149,7 +152,7 @@ export async function loadRewindTab(projectId, days) {
 
     if (activeTab === 'charts' && stats) initRewindCharts(projectId, stats);
 
-  } catch (e) {
+  } catch (e: any) {
 
     wrap.innerHTML = `<div style="color:var(--status-failed)">rewind failed: ${escapeHtml(e.message)}</div>`;
 
@@ -157,7 +160,7 @@ export async function loadRewindTab(projectId, days) {
 
 }
 
-export function renderRewindSubtabs(projectId, data, history, stats, activeTab) {
+export function renderRewindSubtabs(projectId: string, data: any, history: any, stats: any, activeTab: any) {
 
   /** Render rewind content split into five subtabs: Activity, Milestones, Sprint, Goals, Charts. */
 
@@ -181,7 +184,7 @@ export function renderRewindSubtabs(projectId, data, history, stats, activeTab) 
 
   }</div>`;
 
-  const make = (id, html) =>
+  const make = (id: any, html: any) =>
 
     `<div class="rewind-subtab-pane" data-tab="${id}" style="${activeTab === id ? '' : 'display:none'}">${html}</div>`;
 
@@ -199,7 +202,7 @@ export function renderRewindSubtabs(projectId, data, history, stats, activeTab) 
 
 }
 
-export function renderRewindCharts(projectId, stats) {
+export function renderRewindCharts(projectId: string, stats: any) {
 
   /** Charts subtab: tasks/day bar chart + sprint completion % by version. */
 
@@ -211,7 +214,7 @@ export function renderRewindCharts(projectId, stats) {
 
   const legendStyle = 'display:flex;gap:14px;margin-top:6px;font-size:10px;color:var(--muted);font-family:var(--font-mono)';
 
-  const swatch = (color) => `<span style="display:inline-block;width:12px;height:12px;background:${color};border-radius:2px;margin-right:4px;vertical-align:middle"></span>`;
+  const swatch = (color: any) => `<span style="display:inline-block;width:12px;height:12px;background:${color};border-radius:2px;margin-right:4px;vertical-align:middle"></span>`;
 
   return `<div style="padding:8px 0">
 
@@ -237,7 +240,7 @@ export function renderRewindCharts(projectId, stats) {
 
 }
 
-export function initRewindCharts(projectId, stats) {
+export function initRewindCharts(projectId: string, stats: any) {
 
   /** Draw (or redraw) Chart.js instances for the Charts subtab. Destroys prior instances first. */
 
@@ -265,9 +268,9 @@ export function initRewindCharts(projectId, stats) {
 
   if (tasksCanvas && sprintItemsPerDay) {
 
-    const labels = sprintItemsPerDay.map(d => d.day.slice(5));  // MM-DD
+    const labels = sprintItemsPerDay.map((d: any) => d.day.slice(5));  // MM-DD
 
-    const totals = sprintItemsPerDay.map(d => d.total);
+    const totals = sprintItemsPerDay.map((d: any) => d.total);
 
     const chart = new Chart(tasksCanvas, {
 
@@ -327,15 +330,15 @@ export function initRewindCharts(projectId, stats) {
 
       data: {
 
-        labels: sv.map(v => v.version),
+        labels: sv.map((v: any) => v.version),
 
         datasets: [{
 
           label: '% done',
 
-          data: sv.map(v => v.pct),
+          data: sv.map((v: any) => v.pct),
 
-          backgroundColor: sv.map(v => v.pct === 100 ? 'rgba(52, 211, 153, 0.7)' : 'rgba(96, 165, 250, 0.7)'),
+          backgroundColor: sv.map((v: any) => v.pct === 100 ? 'rgba(52, 211, 153, 0.7)' : 'rgba(96, 165, 250, 0.7)'),
 
           borderRadius: 2,
 
@@ -369,7 +372,7 @@ export function initRewindCharts(projectId, stats) {
 
 }
 
-export function renderRewindSprint(projectId, data) {
+export function renderRewindSprint(projectId: string, data: any) {
 
   /** Sprint subtab: sprint_items grouped by version, showing done/pending/failed counts. */
 
@@ -391,7 +394,7 @@ export function renderRewindSprint(projectId, data) {
 
   // Group by version
 
-  const byVersion = {};
+  const byVersion: Record<string, any[]> = {};
 
   allItems.forEach(s => {
 
@@ -405,7 +408,7 @@ export function renderRewindSprint(projectId, data) {
 
 
 
-  const statusDot = (s) => {
+  const statusDot = (s: any) => {
 
     if (s.status === 'done') return '<span style="color:var(--status-done)">✓</span>';
 
@@ -419,7 +422,24 @@ export function renderRewindSprint(projectId, data) {
 
 
 
+  // 233bae67 — execution-timeline gantt across all versions (bars positioned by
+  // claimed_at→completed_at). Pure geometry from ganttBars(); no charting lib.
   let html = '';
+  try {
+    const bars = ganttBars(allItems);
+    if (bars.length) {
+      html += '<div class="rewind-gantt" style="margin:8px 0;padding:8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px">'
+        + `<div style="font-size:10px;color:var(--muted);margin-bottom:6px">⏱ Execution timeline (${bars.length} items)</div>`
+        + bars.map(b =>
+            '<div style="position:relative;height:14px;margin-bottom:2px">'
+            + `<div title="${escapeHtml(b.title)}" style="position:absolute;left:${b.leftPct}%;width:${b.widthPct}%;height:12px;`
+            + `background:${sprintStatusColor(b.status)};border-radius:2px;overflow:hidden;white-space:nowrap;`
+            + `font-size:8px;line-height:12px;color:#0b0e14;padding:0 3px;box-sizing:border-box">${escapeHtml(b.title)}</div>`
+            + '</div>',
+          ).join('')
+        + '</div>';
+    }
+  } catch (e) { /* gantt is best-effort */ }
 
   // Sort versions: current first, then descending
 
@@ -479,7 +499,7 @@ export function renderRewindSprint(projectId, data) {
 
 }
 
-export function _rewindSec(icon, title, items, render) {
+export function _rewindSec(icon: any, title: any, items: any, render: any) {
 
   /** Shared section renderer for rewind subtabs. */
 
@@ -505,7 +525,7 @@ export function _rewindSec(icon, title, items, render) {
 
 }
 
-export function renderRewindActivity(projectId, data) {
+export function renderRewindActivity(projectId: string, data: any) {
 
   /** Activity subtab: sessions + decisions + task stats. */
 
@@ -515,7 +535,7 @@ export function renderRewindActivity(projectId, data) {
 
   const sessByName = new Map();
 
-  (data.session_summaries || []).forEach(s => {
+  (data.session_summaries || []).forEach((s: any) => {
 
     const prev = sessByName.get(s.session_name);
 
@@ -529,7 +549,7 @@ export function renderRewindActivity(projectId, data) {
 
   const dedupedSessions = [...sessByName.values()];
 
-  const sessions = _rewindSec('🧠', 'Sessions', dedupedSessions, s =>
+  const sessions = _rewindSec('🧠', 'Sessions', dedupedSessions, (s: any) =>
 
     `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
 
@@ -539,7 +559,7 @@ export function renderRewindActivity(projectId, data) {
 
     </div>`);
 
-  const decisions = _rewindSec('📋', 'Decisions logged', data.decisions_logged, d =>
+  const decisions = _rewindSec('📋', 'Decisions logged', data.decisions_logged, (d: any) =>
 
     `<div style="padding:2px 0"><span style="color:var(--muted);font-size:10px">[${escapeHtml(d.logged_at || '')}]</span> ${escapeHtml(d.text || '')}</div>`);
 
@@ -555,15 +575,15 @@ export function renderRewindActivity(projectId, data) {
 
 }
 
-export function renderRewindVersions(projectId, data) {
+export function renderRewindVersions(projectId: string, data: any) {
 
   /** Versions subtab: milestones shipped + sprint items completed + stats. */
 
   const versions = _rewindSec('📦', 'Milestones shipped', data.versions_shipped,
 
-    v => `<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.6;color:var(--text)">${escapeHtml(v)}</div>`);
+    (v: any) => `<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.6;color:var(--text)">${escapeHtml(v)}</div>`);
 
-  const sprints = _rewindSec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
+  const sprints = _rewindSec('✅', 'Sprint items completed', data.sprint_items_completed, (s: any) =>
 
     `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);
 
@@ -577,13 +597,13 @@ export function renderRewindVersions(projectId, data) {
 
 }
 
-export function renderRewindGoals(projectId, data, history) {
+export function renderRewindGoals(projectId: string, data: any, history: any) {
 
   /** Goals subtab: goal changes (newest first) + goal version history. */
 
   const preStyle = 'margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg-card);padding:6px;border-radius:3px;font-size:10px;font-family:inherit';
 
-  const goals = _rewindSec('🎯', 'Goal changes', (data.goal_changes || []).slice().reverse(), (g, idx) => {
+  const goals = _rewindSec('🎯', 'Goal changes', (data.goal_changes || []).slice().reverse(), (g: any, idx: any) => {
 
     const id = `gc-expand-${projectId}-${idx}`;
 
@@ -673,7 +693,7 @@ export function renderRewindGoals(projectId, data, history) {
 
 }
 
-export async function copyRewindLink(projectId) {
+export async function copyRewindLink(projectId: string) {
 
   const p = window.state.panels[projectId];
 
@@ -713,7 +733,7 @@ export async function copyRewindLink(projectId) {
 
     }
 
-  } catch (e) {
+  } catch (e: any) {
 
     toast('share failed: ' + e.message);
 
@@ -723,4 +743,4 @@ export async function copyRewindLink(projectId) {
 
 // --- esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { initRewindTab, loadRewindTab, renderRewindSubtabs, renderRewindCharts, initRewindCharts, renderRewindSprint, _rewindSec, renderRewindActivity, renderRewindVersions, renderRewindGoals, copyRewindLink }); } catch (e) {}
+try { Object.assign(window, { initRewindTab, loadRewindTab, renderRewindSubtabs, renderRewindCharts, initRewindCharts, renderRewindSprint, _rewindSec, renderRewindActivity, renderRewindVersions, renderRewindGoals, copyRewindLink }); } catch (e: any) {}

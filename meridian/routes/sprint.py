@@ -1,7 +1,9 @@
 """Sprint items routes — extracted from server.py."""
 from __future__ import annotations
 
+import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,6 +13,61 @@ from .._deps import _db, _get_tenant_from_request, validate_input_size
 from .. import db as db_module
 
 router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# b4ce3274 — Stop-hook forced-continuation retry ceiling.
+#
+# The Stop-hook sprint guard (client-side sprint_guard.{sh,ps1}) consults
+# GET /sprint/pending_count and blocks a stop (exit 2) whenever pending_count > 0.
+# Left unbounded, that forces a session to continue indefinitely. We cap the
+# number of forced continuations per session at MERIDIAN_STOP_OVERRIDE_CEILING
+# (default 3, per agentic-RAG retry-budget norms). Once the ceiling is hit the
+# endpoint stops reporting a positive pending_count (so the guard lets the stop
+# through) and flags stopped_at_ceiling so the caller/handoff can react.
+#
+# Design note (counter home): this is an in-memory, per-process dict rather than
+# a new `sessions.stop_override_count` column. Two reasons: (1) the guard endpoint
+# is only ever reached with a project_id (and, now, an optional session_id) — it
+# does not own a session row to UPDATE, and resolving "which session is stopping"
+# server-side would be fragile; (2) a stop-override budget is inherently ephemeral
+# retry state (like an HTTP retry counter), not durable project history, so a DB
+# migration on this SENSITIVE, prod-blocking path would add outage risk for no
+# durability benefit. The server runs single-process (uvicorn, SelectorEventLoop
+# on Windows), so a module global keyed by session (falling back to project when
+# the guard cannot supply a session id) is correct and race-safe under a lock.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_STOP_OVERRIDE_CEILING = 3
+# key -> number of times we have forced a continuation for that key so far.
+_stop_override_counts: dict[str, int] = {}
+_stop_override_lock = threading.Lock()
+
+
+def _stop_override_ceiling() -> int:
+    """N — max forced continuations per session before we allow the stop.
+
+    Read live from MERIDIAN_STOP_OVERRIDE_CEILING each call so tests (and ops)
+    can tune it without a restart. Non-positive / unparseable values disable the
+    ceiling (fall back to the default) rather than accidentally allowing every
+    stop through, which would silently defeat the guard.
+    """
+    raw = os.environ.get("MERIDIAN_STOP_OVERRIDE_CEILING")
+    if raw is None:
+        return _DEFAULT_STOP_OVERRIDE_CEILING
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_STOP_OVERRIDE_CEILING
+    return n if n > 0 else _DEFAULT_STOP_OVERRIDE_CEILING
+
+
+def _reset_stop_override(key: str) -> None:
+    """Clear the forced-continuation counter for a session/project key.
+
+    Called when there is nothing left to block on (pending_count == 0) so a
+    session that legitimately finished — or a reused session id — starts fresh."""
+    with _stop_override_lock:
+        _stop_override_counts.pop(key, None)
 
 
 @router.get("/projects/{project_id}/sprint-items")
@@ -62,6 +119,65 @@ async def list_sprint_items(
         return items
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.get("/projects/{project_id}/sprint/pending_count")
+async def sprint_pending_count(
+    project_id: str, request: Request, session_id: str | None = None
+) -> dict[str, Any]:
+    """c0d2356d — count of not-yet-done sprint items for a project. Powers the
+    Stop-hook sprint guard (a session is blocked from stopping while this is > 0).
+    Distinct ``/sprint/`` path so there's no collision with ``/sprint-items``.
+
+    b4ce3274 — bounded retry ceiling. Each time this reports pending>0 (which the
+    guard turns into a forced continuation) we increment a per-session counter.
+    Once it reaches MERIDIAN_STOP_OVERRIDE_CEILING (default 3) we STOP forcing
+    continuation: the reported ``pending_count`` is clamped to 0 so the guard
+    lets the stop through, and ``stopped_at_ceiling`` is set with a ``reason`` so
+    a delta handoff can be generated. Below the ceiling behaviour is byte-for-byte
+    unchanged. ``session_id`` scopes the counter per session (the guard passes it
+    when known); absent it, the project id keys the counter."""
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    n = await db_module.count_pending_sprint_items(db, project_id)
+
+    # No pending work — nothing to block on. Reset the budget so a later run (or
+    # a reused session id) starts fresh, and return today's plain shape.
+    if n <= 0:
+        key = (session_id or "").strip() or project_id
+        _reset_stop_override(key)
+        return {"pending_count": n}
+
+    # There IS pending work. Decide whether we may still force a continuation.
+    ceiling = _stop_override_ceiling()
+    key = (session_id or "").strip() or project_id
+    with _stop_override_lock:
+        used = _stop_override_counts.get(key, 0)
+        if used >= ceiling:
+            # Ceiling reached — allow the stop. Do NOT increment further; report
+            # pending_count 0 so the guard exits 0, and flag the ceiling hit.
+            return {
+                "pending_count": 0,
+                "actual_pending_count": n,
+                "stopped_at_ceiling": True,
+                "stop_override_count": used,
+                "stop_override_ceiling": ceiling,
+                "reason": (
+                    f"stop-override ceiling ({ceiling}) reached — allowing stop "
+                    "despite pending sprint items; generate a delta handoff."
+                ),
+            }
+        # Below the ceiling — force continuation (unchanged) and count it.
+        _stop_override_counts[key] = used + 1
+        new_count = used + 1
+    return {
+        "pending_count": n,
+        "stopped_at_ceiling": False,
+        "stop_override_count": new_count,
+        "stop_override_ceiling": ceiling,
+    }
 
 
 @router.post("/projects/{project_id}/sprint-items", status_code=201)

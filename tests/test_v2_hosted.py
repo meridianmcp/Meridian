@@ -228,7 +228,9 @@ def test_tunnel_plugins_get_returns_resolved_defaults(monkeypatch, tmp_path):
         ]
         assert body["config"] == {}
         assert body["active"] == {
-            "fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False
+            "fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False,
+            # 8fb69d54 — 4 pre-allocated custom slots
+            "p0": False, "p1": False, "p2": False, "p3": False,
         }
 
 
@@ -285,6 +287,152 @@ def test_tunnel_plugins_requires_auth(monkeypatch, tmp_path):
     with _make_hosted_client(monkeypatch, tmp_path) as client:
         r = client.put("/tunnel/plugins", json={"config": []})
         assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# 9811d04c — custom-plugin add/remove (the persist half of the plugin system)
+# ---------------------------------------------------------------------------
+
+def _tp_token(client):
+    """Create a tenant + API token and return the Bearer header."""
+    from meridian import db as db_module
+
+    async def _setup(db):
+        import uuid
+        tenant = await db_module.upsert_tenant(db, f"custom-{uuid.uuid4().hex[:8]}@example.com")
+        raw, _row = await db_module.create_api_token(db, tenant["id"], label="t")
+        return raw
+
+    raw_token = _run(_setup(client.app.state.db))
+    return {"Authorization": f"Bearer {raw_token}"}
+
+
+def test_add_custom_plugin_persists_and_resolves(monkeypatch, tmp_path):
+    """POST /tunnel/plugins/custom stores a custom plugin; GET reflects it in
+    `custom` and it survives a fresh read (would resolve at tunnel spawn)."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        hdr = _tp_token(client)
+        r = client.post("/tunnel/plugins/custom", headers=hdr,
+                        json={"name": "fetch", "command": "uvx mcp-server-fetch", "port": 8901})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is True
+        assert body["added"]["name"] == "fetch" and body["added"]["port"] == 8901
+        assert [c["name"] for c in body["custom"]] == ["fetch"]
+        # Persisted — a fresh GET still shows it, and built-in slots are untouched.
+        got = client.get("/tunnel/plugins", headers=hdr).json()
+        assert [c["name"] for c in got["custom"]] == ["fetch"]
+        assert got["custom"][0]["command"] == ["uvx", "mcp-server-fetch"]
+        assert [p["name"] for p in got["plugins"]] == [
+            "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
+        ]
+
+
+def test_add_custom_plugin_auto_assigns_port(monkeypatch, tmp_path):
+    """A missing port is auto-assigned (>= 8820, outside the built-in range)."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        hdr = _tp_token(client)
+        r = client.post("/tunnel/plugins/custom", headers=hdr,
+                        json={"name": "git", "command": "uvx mcp-server-git"})
+        assert r.status_code == 200, r.text
+        assert r.json()["added"]["port"] >= 8820
+
+
+def test_add_custom_plugin_rejects_builtin_slot_name(monkeypatch, tmp_path):
+    """A name colliding with a built-in slot/plugin is rejected (400) and NOT stored."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        hdr = _tp_token(client)
+        for bad in ("code", "filesystem", "code-extractor"):
+            r = client.post("/tunnel/plugins/custom", headers=hdr,
+                            json={"name": bad, "command": "uvx x", "port": 8901})
+            assert r.status_code == 400, (bad, r.text)
+            assert "collides" in r.json()["error"]
+        # Nothing persisted.
+        got = client.get("/tunnel/plugins", headers=hdr).json()
+        assert got["custom"] == []
+
+
+def test_add_custom_plugin_rejects_empty_command_and_bad_port(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        hdr = _tp_token(client)
+        r1 = client.post("/tunnel/plugins/custom", headers=hdr,
+                         json={"name": "ok", "command": "  ", "port": 8901})
+        assert r1.status_code == 400 and "command" in r1.json()["error"]
+        r2 = client.post("/tunnel/plugins/custom", headers=hdr,
+                         json={"name": "ok", "command": "uvx x", "port": 8808})
+        assert r2.status_code == 400  # built-in slot port
+
+
+def test_add_custom_plugin_duplicate_name_conflicts(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        hdr = _tp_token(client)
+        client.post("/tunnel/plugins/custom", headers=hdr,
+                    json={"name": "fetch", "command": "uvx x", "port": 8901})
+        r = client.post("/tunnel/plugins/custom", headers=hdr,
+                        json={"name": "fetch", "command": "uvx y", "port": 8902})
+        assert r.status_code == 409 and "already exists" in r.json()["error"]
+
+
+def test_remove_custom_plugin(monkeypatch, tmp_path):
+    """DELETE /tunnel/plugins/custom removes a stored custom plugin by name."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        hdr = _tp_token(client)
+        client.post("/tunnel/plugins/custom", headers=hdr,
+                    json={"name": "fetch", "command": "uvx x", "port": 8901})
+        client.post("/tunnel/plugins/custom", headers=hdr,
+                    json={"name": "git", "command": "uvx y", "port": 8902})
+        r = client.request("DELETE", "/tunnel/plugins/custom?name=fetch", headers=hdr)
+        assert r.status_code == 200, r.text
+        assert [c["name"] for c in r.json()["custom"]] == ["git"]
+        # Persisted removal.
+        got = client.get("/tunnel/plugins", headers=hdr).json()
+        assert [c["name"] for c in got["custom"]] == ["git"]
+
+
+def test_remove_custom_plugin_unknown_is_404(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        hdr = _tp_token(client)
+        r = client.request("DELETE", "/tunnel/plugins/custom?name=nope", headers=hdr)
+        assert r.status_code == 404
+
+
+def test_remove_custom_plugin_preserves_builtin_override(monkeypatch, tmp_path):
+    """Removing a custom plugin must leave built-in slot overrides intact, and a
+    built-in slot name cannot be removed via the custom route."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        hdr = _tp_token(client)
+        # A built-in override + a custom plugin coexist in the config.
+        client.put("/tunnel/plugins", headers=hdr,
+                   json={"config": [{"name": "code-intel", "command": "codegraph --stdio"}]})
+        client.post("/tunnel/plugins/custom", headers=hdr,
+                    json={"name": "fetch", "command": "uvx x", "port": 8901})
+        # Removing the custom plugin keeps the code-intel override.
+        client.request("DELETE", "/tunnel/plugins/custom?name=fetch", headers=hdr)
+        got = client.get("/tunnel/plugins", headers=hdr).json()
+        assert got["custom"] == []
+        code = next(p for p in got["plugins"] if p["name"] == "code-intel")
+        assert code["command"] == ["codegraph", "--stdio"]
+        # A built-in slot name can't be removed via the custom route.
+        r = client.request("DELETE", "/tunnel/plugins/custom?name=code", headers=hdr)
+        assert r.status_code == 400
+
+
+def test_add_custom_plugin_requires_auth(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        r = client.post("/tunnel/plugins/custom",
+                        json={"name": "fetch", "command": "uvx x", "port": 8901})
+        assert r.status_code == 401
+
+
+def test_absent_custom_plugins_unchanged_resolution(monkeypatch, tmp_path):
+    """A fresh tenant with no custom plugins resolves to exactly the built-in
+    defaults (no custom entries) — today's behaviour is preserved."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        hdr = _tp_token(client)
+        got = client.get("/tunnel/plugins", headers=hdr).json()
+        assert got["custom"] == []
+        enabled = {p["name"] for p in got["plugins"] if p["enabled"]}
+        assert enabled == {"filesystem", "code-intel", "code-extractor"}
 
 
 def test_delete_orphaned_oauth_keys_endpoint(monkeypatch, tmp_path):

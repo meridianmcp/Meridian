@@ -48,6 +48,50 @@ def _require_cfg(key: str) -> str:
     return v
 
 
+def _truthy(v: str | None) -> bool:
+    """Interpret an env-style string as a boolean.
+
+    Unset/empty and the usual off-values ('0', 'false', 'no', 'off') are falsy;
+    anything else is truthy. Lets a flag default to on (``"1"``) while still
+    honouring an explicit ``"0"`` — plain ``if _cfg(...)`` can't, because a
+    literal ``"0"`` string is truthy in Python.
+    """
+    return (v or "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def auth_setup_health() -> dict[str, Any]:
+    """13583103 — self-hosted auth diagnostics.
+
+    Reports, per provider, whether it's configured and which required env vars
+    are missing, plus whether the session-signing secret is set and whether any
+    provider is usable at all. Returns names and booleans only — never secret
+    values — so it's safe to expose unauthenticated (like /health and /config).
+    """
+    required = {
+        "google": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+        "github": ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET"],
+        "microsoft": ["MICROSOFT_CLIENT_ID", "MICROSOFT_CLIENT_SECRET"],
+        # Magic-link sign-in can generate links without Resend, but can only
+        # deliver them by email when RESEND_API_KEY is set.
+        "magic_link": ["RESEND_API_KEY"],
+    }
+    providers: dict[str, Any] = {}
+    for name, keys in required.items():
+        missing = [k for k in keys if not _cfg(k)]
+        providers[name] = {
+            "configured": not missing,
+            "missing_env": missing,
+            "required_env": list(keys),
+        }
+    return {
+        "providers": providers,
+        # MERIDIAN_SESSION_SECRET (aliases SESSION_SECRET) signs session cookies;
+        # its absence falls back to an insecure dev default.
+        "session_secret_configured": bool(_cfg("MERIDIAN_SESSION_SECRET")),
+        "auth_available": any(p["configured"] for p in providers.values()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Cookie signing (itsdangerous)
 # ---------------------------------------------------------------------------
@@ -75,6 +119,14 @@ def _read_session_cookie(cookie_value: str) -> str | None:
         return s.loads(cookie_value, max_age=max_age)
     except (BadSignature, SignatureExpired):
         return None
+
+
+def _session_meta(request: Request) -> tuple[str | None, str | None]:
+    """3c28450d — best-effort ``(user_agent, ip)`` for a new web session, shown
+    in the active-sessions view. UA is truncated; IP is the direct client host."""
+    ua = (request.headers.get("user-agent") or "")[:400] or None
+    ip = (request.client.host if request.client else None) or None
+    return ua, ip
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +280,14 @@ async def get_github_auth_url(
     *,
     state: str = "",
     redirect_uri: str | None = None,
+    prompt: str = "",
 ) -> str:
-    """Return the GitHub OAuth authorization URL."""
+    """Return the GitHub OAuth authorization URL.
+
+    ``prompt='select_account'`` forces GitHub to show its account chooser
+    instead of silently reusing the browser's current GitHub session — used by
+    the multi-account "Connect another account" flow (330937c6).
+    """
     from urllib.parse import urlencode
 
     client_id = _require_cfg("GITHUB_CLIENT_ID")
@@ -241,6 +299,8 @@ async def get_github_auth_url(
     ]
     if state:
         params.append(("state", state))
+    if prompt:
+        params.append(("prompt", prompt))
     return f"https://github.com/login/oauth/authorize?{urlencode(params)}"
 
 
@@ -459,14 +519,8 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
 <div class="card">
   <div class="logo">🧭 <span>Meridian</span></div>
   <div class="subtitle">Sign in or create an account</div>
-  <a href="/auth/google/login" class="btn btn-google">
-    <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
-    Continue with Google
-  </a>
-  <a href="/auth/github/login" class="btn btn-github">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
-    Continue with GitHub
-  </a>
+<!-- GOOGLE_BUTTON -->
+<!-- GITHUB_BUTTON -->
 <!-- MICROSOFT_BUTTON -->
   <div class="divider">or</div>
   <form class="email-form" id="magic-form" onsubmit="event.preventDefault();sendMagic();">
@@ -518,24 +572,50 @@ async function sendMagic() {
 
 
 def _build_login_page(next_url: str = "") -> str:
-    """Build the login page HTML, injecting next_url into login button hrefs."""
+    """Build the login page HTML.
+
+    Each OAuth provider button is rendered only when its client-id env var is
+    configured (98c45dd0), so a self-hosted instance never shows a button that
+    503s the moment it's clicked. ``next_url`` is injected into every rendered
+    button href. When no OAuth provider is configured the "or" divider is
+    dropped so the magic-link form isn't left under a dangling separator.
+    """
     from urllib.parse import quote as _q
     next_qs = f"?next={_q(next_url)}" if next_url else ""
-    page = _LOGIN_PAGE_HTML.replace(
-        'href="/auth/google/login"',
-        f'href="/auth/google/login{next_qs}"',
-    ).replace(
-        'href="/auth/github/login"',
-        f'href="/auth/github/login{next_qs}"',
-    )
+
+    google_button = ""
+    if _cfg("GOOGLE_CLIENT_ID"):
+        google_button = (
+            f'  <a href="/auth/google/login{next_qs}" class="btn btn-google">'
+            '<svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>'
+            'Continue with Google</a>'
+        )
+
+    github_button = ""
+    if _cfg("GITHUB_CLIENT_ID"):
+        github_button = (
+            f'  <a href="/auth/github/login{next_qs}" class="btn btn-github">'
+            '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>'
+            'Continue with GitHub</a>'
+        )
+
     ms_button = ""
     if MICROSOFT_CLIENT_ID:
-        ms_button = f"""
-  <a href="/auth/microsoft/login{next_qs}" class="btn btn-microsoft">
-    <svg width="20" height="20" viewBox="0 0 21 21" fill="none"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>
-    Continue with Microsoft
-  </a>"""
-    return page.replace("<!-- MICROSOFT_BUTTON -->", ms_button)
+        ms_button = (
+            f'  <a href="/auth/microsoft/login{next_qs}" class="btn btn-microsoft">'
+            '<svg width="20" height="20" viewBox="0 0 21 21" fill="none"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>'
+            'Continue with Microsoft</a>'
+        )
+
+    page = (
+        _LOGIN_PAGE_HTML
+        .replace("<!-- GOOGLE_BUTTON -->", google_button)
+        .replace("<!-- GITHUB_BUTTON -->", github_button)
+        .replace("<!-- MICROSOFT_BUTTON -->", ms_button)
+    )
+    if not (google_button or github_button or ms_button):
+        page = page.replace('  <div class="divider">or</div>', "")
+    return page
 
 
 async def auth_login(request: Request):
@@ -565,13 +645,14 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
             return next_url
         return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
 
-    # MERIDIAN_LAUNCH_OPEN=true: admit the first N free-tier users directly.
-    # Returning tenants keep access even after the launch cap is reached.
-    if _cfg("MERIDIAN_LAUNCH_OPEN"):
+    # Launch is OPEN by default (98c45dd0): admit the first N free-tier users
+    # directly. Set MERIDIAN_LAUNCH_OPEN=0 to re-enable the pre-launch waitlist
+    # gate. Returning tenants keep access even after the launch cap is reached.
+    if _truthy(_cfg("MERIDIAN_LAUNCH_OPEN", "1")):
         if db is not None:
             from . import db as db_module
 
-            free_cap = int(_cfg("MERIDIAN_FREE_LAUNCH_CAP", "15") or "15")
+            free_cap = int(_cfg("MERIDIAN_FREE_LAUNCH_CAP", "1000") or "1000")
             has_slot = bool(
                 (tenant or {}).get("neon_project_id")
                 or (tenant or {}).get("neon_db_url")
@@ -612,8 +693,16 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
                     return "/waitlist-pending?message=Early%20access%20is%20full"
                 try:
                     tenant = await provision_neon_db(tenant["id"], db)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # 9f584879 — don't swallow silently: a failed provision lands
+                    # the user without a DB (503 on every API call). Log at WARNING
+                    # so operators can see and retry instead of guessing.
+                    import logging as _logging
+                    _logging.getLogger("meridian.hosted").warning(
+                        "provisioning failed for tenant %s: %s — user will land "
+                        "without a DB (likely 503 until retried)",
+                        (tenant or {}).get("id"), exc,
+                    )
         if next_url and next_url.startswith("/") and not next_url.startswith("//"):
             return next_url
         return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
@@ -707,7 +796,9 @@ async def auth_callback(request: Request) -> RedirectResponse:
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
     ).isoformat()
-    session = await db_module.create_user_session(db, tenant["id"], expires_at)
+    session = await db_module.create_user_session(
+        db, tenant["id"], expires_at, *_session_meta(request)
+    )
     cookie_value = _make_session_cookie(session["id"])
 
     import base64 as _b64
@@ -816,7 +907,9 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
     ).isoformat()
-    session = await db_module.create_user_session(db, tenant["id"], expires_at)
+    session = await db_module.create_user_session(
+        db, tenant["id"], expires_at, *_session_meta(request)
+    )
     cookie_value = _make_session_cookie(session["id"])
 
     _invite_url = await _consume_pending_invite_cookie(request, db)
@@ -846,11 +939,16 @@ async def auth_github_repo_connect(request: Request) -> RedirectResponse:
         await get_current_tenant(request)
     except HTTPException:
         return RedirectResponse("/auth/login", status_code=302)
+    # 330937c6 — "Connect another account" passes select_account=1 so GitHub shows
+    # the account chooser rather than reusing the current GitHub browser session,
+    # which is the only way to attach a second account from one browser.
+    select_account = request.query_params.get("select_account", "").strip().lower() in ("1", "true", "yes")
     try:
         url = await get_github_auth_url(
             scope="repo",
             state=f"repo:{project_id}",
             redirect_uri=_github_repo_callback_url(),
+            prompt="select_account" if select_account else "",
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -960,7 +1058,9 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
     ).isoformat()
-    session = await db_module.create_user_session(db, tenant["id"], expires_at)
+    session = await db_module.create_user_session(
+        db, tenant["id"], expires_at, *_session_meta(request)
+    )
     cookie_value = _make_session_cookie(session["id"])
 
     _invite_url = await _consume_pending_invite_cookie(request, db)
@@ -1330,18 +1430,69 @@ async def create_stripe_billing_portal_session(tenant: dict) -> str:
     return session.url
 
 
+async def provision_with_retry(
+    tenant_id: str,
+    db: Any,
+    *,
+    attempts: int = 3,
+    base_delay: float = 1.0,
+    _sleep: Any = None,
+) -> dict[str, Any]:
+    """4c559d4e — provision a tenant's Neon DB with exponential backoff. On the
+    final failure, enqueue the tenant to provision_queue for durable later retry,
+    then re-raise. ``_sleep`` is injectable for tests (no real delays)."""
+    import asyncio as _asyncio
+    from . import db as db_module
+    sleep = _sleep or _asyncio.sleep
+    n = max(1, int(attempts))
+    last_exc: Exception | None = None
+    for i in range(n):
+        try:
+            result = await provision_neon_db(tenant_id, db)
+            try:
+                await db_module.mark_provision_done(db, tenant_id)
+            except Exception:  # noqa: BLE001
+                pass
+            return result
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if i < n - 1:
+                await sleep(base_delay * (2 ** i))
+    try:
+        await db_module.enqueue_provision(
+            db, tenant_id, last_error=(str(last_exc)[:500] if last_exc else None)
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("provisioning failed")  # pragma: no cover
+
+
+async def provisioning_health(db: Any) -> dict[str, Any]:
+    """4c559d4e — provisioning-queue health for /health/deep monitoring."""
+    from . import db as db_module
+    try:
+        pending = await db_module.count_pending_provisions(db)
+    except Exception:  # noqa: BLE001
+        pending = None
+    return {"pending_provisions": pending}
+
+
 async def _provision_tenant_background(tenant_id: str, db: Any) -> None:
     """Best-effort background provisioning called from OAuth callbacks.
 
     Silently swallows errors — login must never fail due to provisioning issues.
-    Logs failures at WARNING level for ops visibility.
+    Logs failures at WARNING level for ops visibility. 4c559d4e — retries with
+    backoff and enqueues to provision_queue on final failure (durable retry).
     """
     import logging as _logging
     try:
-        await provision_neon_db(tenant_id, db)
+        await provision_with_retry(tenant_id, db)
     except Exception as exc:  # noqa: BLE001
         _logging.getLogger(__name__).warning(
-            "Background Neon provisioning failed for tenant %s: %s", tenant_id, exc
+            "Background Neon provisioning failed for tenant %s (queued for retry): %s",
+            tenant_id, exc,
         )
 
 
@@ -2397,6 +2548,89 @@ def _magic_rate_limited(email: str) -> bool:
     return False
 
 
+def _magic_email_subject() -> str:
+    """88affef6 — unique, timestamped subject line so Gmail/Outlook don't thread
+    or collapse repeated 'Sign in to Meridian' emails (which hides the newest
+    link and hurts deliverability). The SPF/DKIM/DMARC DNS records are a separate
+    manual operator step."""
+    return (
+        "Sign in to Meridian ("
+        + datetime.now(timezone.utc).strftime("%b %d, %H:%M:%S UTC")
+        + ")"
+    )
+
+
+# 925909aa — persistent per-IP signup limit (defence in depth beyond the slowapi
+# 5/min IP window; survives restarts via the signup_attempts table).
+_SIGNUP_IP_WINDOW_HOURS = 24
+_SIGNUP_IP_MAX_PER_WINDOW = 20
+
+
+async def _verify_turnstile(token: object) -> bool:
+    """925909aa — verify a Cloudflare Turnstile token. Returns True (allow) when
+    no ``TURNSTILE_SECRET_KEY`` is configured (self-host / dev / tests skip the
+    challenge). When a key IS set, POSTs to Cloudflare's siteverify and returns
+    its success flag; a network error fails OPEN (True) so a Cloudflare outage
+    can never lock everyone out of signup. A configured key with a missing/blank
+    token fails closed (False)."""
+    secret = _cfg("TURNSTILE_SECRET_KEY", "") or ""
+    if not secret:
+        return True
+    tok = token.strip() if isinstance(token, str) else ""
+    if not tok:
+        return False
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=8) as http:
+            resp = await http.post(
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                data={"secret": secret, "response": tok},
+            )
+            data = resp.json()
+        return bool(data.get("success"))
+    except Exception:  # noqa: BLE001 — fail open on Cloudflare/network error
+        return True
+
+
+async def account_sessions_list(request: Request):
+    """3c28450d — list the current tenant's active web sessions with device
+    metadata, marking the session making this request as ``current``. Hosted-only;
+    get_current_tenant raises 401 without a valid session cookie."""
+    from fastapi.responses import JSONResponse
+    from . import db as db_module
+
+    tenant = await get_current_tenant(request)
+    db = request.app.state.db
+    cookie_val = request.cookies.get(_SESSION_COOKIE)
+    current_sid = _read_session_cookie(cookie_val) if cookie_val else None
+    sessions = await db_module.get_user_sessions_for_tenant(db, tenant["id"])
+    out = [
+        {
+            "id": s["id"],
+            "current": s["id"] == current_sid,
+            "user_agent": s.get("user_agent"),
+            "ip": s.get("ip"),
+            "created_at": s.get("created_at"),
+            "last_seen_at": s.get("last_seen_at"),
+            "expires_at": s.get("expires_at"),
+        }
+        for s in sessions
+    ]
+    return JSONResponse({"sessions": out})
+
+
+async def account_session_revoke(request: Request, session_id: str):
+    """3c28450d — revoke (sign out) one of the current tenant's web sessions.
+    Tenant-scoped: a user can never revoke another tenant's session."""
+    from fastapi.responses import JSONResponse
+    from . import db as db_module
+
+    tenant = await get_current_tenant(request)
+    db = request.app.state.db
+    revoked = await db_module.revoke_user_session(db, session_id, tenant["id"])
+    return JSONResponse({"status": "ok", "revoked": bool(revoked)})
+
+
 async def auth_magic_request(request: Request):
     """v0.9 — POST /auth/magic.
 
@@ -2418,6 +2652,17 @@ async def auth_magic_request(request: Request):
     if not email or "@" not in email or len(email) > 320:
         raise HTTPException(status_code=400, detail="valid email required")
 
+    # 925909aa — reject known disposable/throwaway domains. Generic 200 so the
+    # rejection reason is never revealed (no enumeration signal).
+    from .email_blocklist import is_disposable_email
+    if is_disposable_email(email):
+        return JSONResponse({"status": "ok", "message": "check your inbox"})
+
+    # 925909aa — Cloudflare Turnstile: enforced only when TURNSTILE_SECRET_KEY is
+    # set (prod). Self-host / dev / tests have no key → skipped (allowed).
+    if not await _verify_turnstile(body.get("turnstile_token")):
+        return JSONResponse({"status": "ok", "message": "check your inbox"})
+
     if _magic_rate_limited(email):
         # Always return 200 — don't leak whether the email is registered
         # or whether they're rate-limited.
@@ -2426,6 +2671,25 @@ async def auth_magic_request(request: Request):
         )
 
     db = request.app.state.db
+
+    # 925909aa — persistent per-IP signup limit (survives restarts; complements
+    # the slowapi 5/min window). Salted hashes only — never store raw IP/email.
+    try:
+        _ip = (request.client.host if request.client else "") or ""
+        _salt = _cfg("MERIDIAN_HASH_SALT", "meridian-signup") or "meridian-signup"
+        _ip_hash = hashlib.sha256(f"{_salt}:{_ip}".encode()).hexdigest()
+        _since = (
+            datetime.now(timezone.utc) - timedelta(hours=_SIGNUP_IP_WINDOW_HOURS)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        if await db_module.count_recent_signup_attempts(
+            db, _ip_hash, _since
+        ) >= _SIGNUP_IP_MAX_PER_WINDOW:
+            return JSONResponse({"status": "ok", "message": "check your inbox"})
+        _email_hash = hashlib.sha256(f"{_salt}:{email}".encode()).hexdigest()
+        await db_module.record_signup_attempt(db, _ip_hash, _email_hash)
+    except Exception:  # noqa: BLE001 — never block signup on the limiter failing
+        pass
+
     # If a fresh unused token exists, reuse the side-effect (email is
     # already in their inbox) — don't insert another row.
     existing = await db_module.get_active_magic_token(db, email)
@@ -2455,7 +2719,7 @@ async def auth_magic_request(request: Request):
                         "Meridian <hello@usemeridian.us>",
                     ),
                     "to": [email],
-                    "subject": "Sign in to Meridian",
+                    "subject": _magic_email_subject(),
                     "html": (
                         f"<p>Click below to sign in to Meridian:</p>"
                         f"<p><a href='{link}'>{link}</a></p>"
@@ -2468,6 +2732,16 @@ async def auth_magic_request(request: Request):
             sent = True
         except Exception:  # noqa: BLE001 — never reveal Resend errors
             sent = False
+
+    if not sent:
+        # Email delivery unavailable or failed (no RESEND_API_KEY, or Resend
+        # errored) — log the link at WARNING so a self-hoster/operator can
+        # recover it from stdout and still complete sign-in (98c45dd0). This
+        # only fires when the email was NOT delivered.
+        import logging as _logging
+        _logging.getLogger("meridian.auth").warning(
+            "magic link for %s (email delivery unavailable): %s", email, link
+        )
 
     payload: dict[str, Any] = {
         "status": "ok",
@@ -2555,7 +2829,9 @@ async def auth_magic_verify(request: Request, token: str = ""):
         expires_at = (
             datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
         ).isoformat()
-        session = await db_module.create_user_session(db, tenant["id"], expires_at)
+        session = await db_module.create_user_session(
+        db, tenant["id"], expires_at, *_session_meta(request)
+    )
         cookie_value = _make_session_cookie(session["id"])
         redirect_to = await _post_login_redirect(tenant, db)
     except Exception:

@@ -1070,6 +1070,83 @@ def test_kill_port_callable():
     assert callable(_kill_port)
 
 
+def test_main_tunnel_no_kill_skips_port_loop(monkeypatch):
+    """`--tunnel --no-kill` must not run the 8808-8813 port-kill loop. (a887155d)"""
+    from meridian import __main__ as m
+    from meridian import tunnel_client
+
+    killed: list[int] = []
+    monkeypatch.setattr(m, "_kill_port", lambda p: killed.append(p))
+
+    async def _fake_run_tunnel(**_kwargs):
+        return 0
+
+    monkeypatch.setattr(tunnel_client, "run_tunnel", _fake_run_tunnel)
+
+    rc = m.main(["--tunnel", "--no-kill", "--token", "sk_x"])
+    assert rc == 0
+    assert killed == []  # cleanup skipped entirely
+
+
+def test_main_tunnel_default_kills_stale_ports(monkeypatch):
+    """Without --no-kill, --tunnel sweeps the full 8808-8813 range. (a887155d)"""
+    from meridian import __main__ as m
+    from meridian import tunnel_client
+
+    killed: list[int] = []
+    monkeypatch.setattr(m, "_kill_port", lambda p: killed.append(p))
+
+    async def _fake_run_tunnel(**_kwargs):
+        return 0
+
+    monkeypatch.setattr(tunnel_client, "run_tunnel", _fake_run_tunnel)
+
+    rc = m.main(["--tunnel", "--token", "sk_x"])
+    assert rc == 0
+    assert killed == [8808, 8809, 8810, 8811, 8812, 8813]
+
+
+def test_main_tunnel_recovers_from_closed_event_loop(monkeypatch):
+    """Regression: main(--tunnel) must recover when the thread's event loop was
+    closed by a prior test (Python 3.12 get_event_loop() raises) — this surfaced
+    under pytest-xdist on Linux CI. _ensure_event_loop() creates a fresh loop."""
+    import asyncio
+    from meridian import __main__ as m
+    from meridian import tunnel_client
+
+    async def _fake_run_tunnel(**_kwargs):
+        return 0
+
+    monkeypatch.setattr(tunnel_client, "run_tunnel", _fake_run_tunnel)
+    monkeypatch.setattr(m, "_kill_port", lambda p: None)
+    # Reproduce the failure mode: the current loop is set but closed.
+    dead = asyncio.new_event_loop()
+    asyncio.set_event_loop(dead)
+    dead.close()
+
+    rc = m.main(["--tunnel", "--no-kill", "--token", "sk_x"])
+    assert rc == 0
+    assert not asyncio.get_event_loop().is_closed()
+
+
+def test_kill_port_probe_has_timeout(monkeypatch):
+    """The free-port probe sets a short timeout so a dropped SYN can't hang. (a887155d)"""
+    import socket as _socket
+    from meridian.__main__ import _kill_port
+
+    timeouts: list[float] = []
+    real_socket = _socket.socket
+
+    class _SpySocket(real_socket):  # type: ignore[misc,valid-type]
+        def settimeout(self, t):  # noqa: D401
+            timeouts.append(t)
+            return super().settimeout(t)
+
+    monkeypatch.setattr(_socket, "socket", _SpySocket)
+    _kill_port(19998)  # free port → returns fast
+    assert timeouts and timeouts[0] is not None and timeouts[0] <= 1.0
+
+
 # ---------------------------------------------------------------------------
 # Dashboard HTML version placeholder
 # ---------------------------------------------------------------------------
@@ -1841,6 +1918,37 @@ async def test_search_tasks_respects_limit(db):
     assert len(results) <= 3
 
 
+@pytest.mark.asyncio
+async def test_search_tasks_multiword_non_contiguous(db):
+    """fcf90f3a — a multi-word query matches when its terms appear in the
+    description but NOT as a contiguous phrase (the old single %query% LIKE
+    returned zero here). AND semantics: a term absent everywhere still misses."""
+    p = await db_module.create_project(db, "search-multiword")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db_module.log_task(
+        db, s["id"], p["id"],
+        "Fix the authentication bug in the login flow", "done")
+    # Terms present but reordered / non-adjacent → previously 0 results.
+    results = await db_module.search_tasks(db, p["id"], "authentication login")
+    assert len(results) == 1
+    assert await db_module.search_tasks(db, p["id"], "authentication payments") == []
+
+
+def test_multiword_match_clause_helper():
+    """fcf90f3a — the term-AND builder: one clause per term (>=2 chars, capped),
+    OR-ed across columns, AND-ed across terms; single token falls back to whole."""
+    from meridian.db import _multiword_match_clause
+    sql, params = _multiword_match_clause(["title", "body"], "RAG problem", op="LIKE")
+    assert sql == "((title LIKE ? OR body LIKE ?) AND (title LIKE ? OR body LIKE ?))"
+    assert params == ["%RAG%", "%RAG%", "%problem%", "%problem%"]
+    sql1, params1 = _multiword_match_clause(["description"], "auth", op="ILIKE")
+    assert sql1 == "((description ILIKE ?))"
+    assert params1 == ["%auth%"]
+    # All-short tokens → fall back to the whole query as one term.
+    _, params2 = _multiword_match_clause(["c"], "a b", op="LIKE")
+    assert params2 == ["%a b%"]
+
+
 def test_search_tasks_http_endpoint(client):
     """GET /projects/{id}/tasks/search?q=... returns matching tasks."""
     pid = client.post("/projects", json={"name": "search-http"}).json()["id"]
@@ -1889,6 +1997,96 @@ async def test_search_all_sprint_title_still_matches(db):
     await db_module.add_sprint_item(db, p["id"], "v1", "Implement rate limiting")
     result = await db_module.search_all(db, p["id"], "rate limiting")
     assert any(i["title"] == "Implement rate limiting" for i in result["sprint_items"])
+
+
+@pytest.mark.asyncio
+async def test_search_all_multiword_terms_across_fields(db):
+    """fcf90f3a — search_all matches when each query term appears in SOME text
+    field of a row (AND across terms, OR across the row's fields), even when the
+    exact phrase never appears contiguously."""
+    p = await db_module.create_project(db, "sa-multiword")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "RAG evaluation harness")
+    await db_module.patch_sprint_item(
+        db, p["id"], item["id"],
+        notes="covers the problem definition and retrieval augmented generation")
+    # "RAG" is in the title, "problem"/"definition" in the notes — the exact
+    # phrase never appears, so the old single-LIKE returned nothing.
+    result = await db_module.search_all(db, p["id"], "RAG problem definition")
+    assert any(i["title"] == "RAG evaluation harness" for i in result["sprint_items"])
+    # Space-separated query terms still match hyphen-joined / interspersed content.
+    result2 = await db_module.search_all(db, p["id"], "retrieval generation")
+    assert any(i["title"] == "RAG evaluation harness" for i in result2["sprint_items"])
+
+
+# ---------------------------------------------------------------------------
+# 82e0b887 — Postgres tsvector full-text search (search_all / search_tasks).
+#   On PG, search matches stemmed / morphological word forms via
+#   websearch_to_tsquery + ts_rank. The SQLite path stays pure substring
+#   keyword matching (no stemming). These tests prove both:
+#     * SQLite: a stemmed non-substring query does NOT match (behavior
+#       unchanged — keyword semantics only).
+#     * Postgres (gated on TEST_DATABASE_URL, skips cleanly otherwise): the
+#       same stemmed query DOES match where the old substring-AND missed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_all_sqlite_no_stemming_still_keyword(db):
+    """82e0b887 — the SQLite path is unchanged: it matches substrings only, no
+    stemming. A morphological query ("authenticating user") must NOT match a
+    note body reading "authentication for the users" (neither "authenticating"
+    nor "user" is a substring of the stored text) — that stemmed match is a
+    Postgres-only capability. Guards that the tsvector branch didn't leak into
+    the SQLite keyword path."""
+    p = await db_module.create_project(db, "sa-sqlite-nostem")
+    await db_module.add_project_note(
+        db, p["id"], "Auth design", "authentication for the users")
+    # Substring keyword query DOES match (path works as before).
+    hit = await db_module.search_all(db, p["id"], "authentication users")
+    assert any(n["title"] == "Auth design" for n in hit["notes"])
+    # Stemmed / non-substring query does NOT match on SQLite (no FTS).
+    miss = await db_module.search_all(db, p["id"], "authenticating user")
+    assert not any(n["title"] == "Auth design" for n in miss["notes"])
+
+
+@pytest.mark.asyncio
+async def test_search_all_pg_tsvector_stemmed_match(db_pg):
+    """82e0b887 — on Postgres, search_all matches a STEMMED / non-substring
+    query via websearch_to_tsquery. A note body "authentication for the users"
+    is found by the query "authenticating user" — the exact substrings
+    "authenticating"/"user" never appear, so the old substring-AND (and the
+    SQLite path) return zero. SKIPS cleanly when TEST_DATABASE_URL is unset."""
+    db = db_pg
+    p = await db_module.create_project(db, "sa-pg-tsvector")
+    await db_module.add_project_note(
+        db, p["id"], "Auth design", "authentication for the users")
+    result = await db_module.search_all(db, p["id"], "authenticating user")
+    assert any(n["title"] == "Auth design" for n in result["notes"]), (
+        "tsvector should stem 'authenticating'->'authentication' and match")
+    # Also confirm the other content types stem: a decision body.
+    await db_module.pin_decision(
+        db, p["id"], "Retry policy",
+        "the workers retry failed jobs with backoff", "TECHNICAL")
+    dres = await db_module.search_all(db, p["id"], "retrying worker")
+    assert any(d["title"] == "Retry policy" for d in dres["decisions"]), (
+        "tsvector should stem 'retrying'->'retry', 'worker'->'workers'")
+
+
+@pytest.mark.asyncio
+async def test_search_tasks_pg_tsvector_stemmed_match(db_pg):
+    """82e0b887 — search_tasks on Postgres additively matches stemmed queries
+    via the tsvector predicate OR'd alongside pg_trgm similarity(). A task
+    "authentication for the users" is returned for query "authenticating user"
+    even though similarity() alone would likely fall below the 0.05 trigram
+    threshold for a non-substring form. SKIPS when TEST_DATABASE_URL is unset."""
+    db = db_pg
+    p = await db_module.create_project(db, "st-pg-tsvector")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db_module.log_task(
+        db, s["id"], p["id"], "authentication for the users", "done")
+    results = await db_module.search_tasks(db, p["id"], "authenticating user")
+    assert any("authentication" in r["description"].lower() for r in results), (
+        "tsvector predicate should widen search_tasks to stemmed matches")
 
 
 @pytest.mark.asyncio

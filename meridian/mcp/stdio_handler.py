@@ -172,6 +172,16 @@ def build_mcp_server():
                                 "dashboard Settings."
                             ),
                         },
+                        "parent_project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional parent project id — makes this a "
+                                "subproject that inherits the parent's north_star "
+                                "when it has none of its own. Subprojects are one "
+                                "level deep: the parent must exist and must not "
+                                "itself be a subproject."
+                            ),
+                        },
                     },
                     "required": ["name"],
                 },
@@ -821,6 +831,53 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="get_document_structure",
+                description=(
+                    "13462df2 — return the heading outline of a Word .docx WITHOUT "
+                    "ingesting it as a note. Parsed server-side (stdlib only, no "
+                    "python-docx, no persistent index); returns paragraph_count, "
+                    "heading_count, and an ordered list of headings (level, text, "
+                    "para_id) — a fast structural map of a thesis chapter / spec."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to a server-accessible .docx file.",
+                        },
+                    },
+                    "required": ["file_path"],
+                },
+            ),
+            Tool(
+                name="get_latex_structure",
+                description=(
+                    "106118cd — parse a LaTeX (.tex) source's structure WITHOUT a "
+                    "PDF intermediary (pylatexenc, pure-Python). Returns "
+                    "heading_count, an ordered headings outline and a nested tree "
+                    "of \\part/\\chapter/\\section/\\subsection/\\subsubsection/"
+                    "\\paragraph (level, kind, text, children), unexpanded_inputs "
+                    "(\\input/\\include, not expanded) and a bibliography list "
+                    "(thebibliography \\bibitem, and \\bibliography{...} + a "
+                    "sibling .bib). Malformed LaTeX returns a partial/empty result."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to a server-accessible .tex file. A sibling .bib referenced by \\bibliography is resolved relative to it.",
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Raw LaTeX source, as an alternative to file_path. Ignored when file_path is given.",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1363,6 +1420,75 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="add_sprint_item_pointer",
+                description=(
+                    "2976e168 — attach a GENERIC POINTER to a sprint item: a "
+                    "composable reference to a thing-in-a-source (LSP Location + "
+                    "W3C Web Annotation Selector). targets is an ARRAY of {uri, "
+                    "selector, subSelector?} (native multi-file); selector.type is "
+                    "range (line span) | symbol (qualified_name) | node_id "
+                    "(doc_store element) | zotero_key. An optional subSelector "
+                    "nests finer granularity. Stored as JSON, not per-domain "
+                    "columns. Malformed pointers are rejected. Returns the stored "
+                    "pointer."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
+                        "source_type": {"type": "string", "description": "Domain: code | docs | citation | … (free text)."},
+                        "targets": {
+                            "type": "array",
+                            "description": "Non-empty array of {uri, selector, subSelector?} targets.",
+                            "items": {"type": "object"},
+                        },
+                        "label": {"type": "string", "description": "Optional human-readable label."},
+                    },
+                    "required": ["sprint_item_id", "source_type", "targets"],
+                },
+            ),
+            Tool(
+                name="get_sprint_item_pointers",
+                description=(
+                    "2976e168 — list the generic pointers on a sprint item "
+                    "(oldest first). Each is {id, source_type, targets, label, "
+                    "created_at}. Read-only; does NOT resolve targets (use "
+                    "resolve_sprint_item_pointers for that)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to list."},
+                    },
+                    "required": ["sprint_item_id"],
+                },
+            ),
+            Tool(
+                name="resolve_sprint_item_pointers",
+                description=(
+                    "2976e168 — resolve every generic pointer on a sprint item to "
+                    "its concrete location, dispatching by selector.type: range "
+                    "as-is; symbol → file+line via the cached code graph; node_id "
+                    "→ doc_store element; zotero_key → Zotero local API. A "
+                    "subSelector narrows the outer resolution. Best-effort — an "
+                    "unresolvable target yields {resolved:false, reason}; the pass "
+                    "NEVER fails."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to resolve."},
+                    },
+                    "required": ["sprint_item_id"],
+                },
+            ),
+            Tool(
                 name="start_session",
                 description=(
                     "Single call to start a coordinated session. Registers "
@@ -1479,10 +1605,16 @@ def build_mcp_server():
                         "project": existing,
                     }
                 else:
-                    result = await db_module.create_project(
-                        db, arguments["name"],
-                        execution_mode=arguments.get("execution_mode"),
-                    )
+                    # 3b6ff466 — optional parent_project_id → one-level-deep
+                    # subproject; an invalid/nested parent raises ValueError.
+                    try:
+                        result = await db_module.create_project(
+                            db, arguments["name"],
+                            execution_mode=arguments.get("execution_mode"),
+                            parent_project_id=arguments.get("parent_project_id"),
+                        )
+                    except ValueError as exc:
+                        result = {"error": str(exc)}
             elif name == "register_session":
                 result = await db_module.register_session(
                     db,
@@ -1694,7 +1826,10 @@ def build_mcp_server():
                 "list_hitl_requests", "answer_hitl", "dismiss_hitl",
                 "update_md_section",
                 "list_sessions",
-                "add_note", "ingest_document", "get_notes", "read_note", "delete_note",
+                "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
+                "get_citation_edges", "resolve_citations",
+                "add_sprint_item_pointer", "get_sprint_item_pointers",
+                "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",
                 "pin_workspace_decision", "get_workspace_decisions",
             ):

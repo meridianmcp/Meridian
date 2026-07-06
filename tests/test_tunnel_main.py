@@ -66,6 +66,13 @@ def test_build_parser_repo_accepts_multiple_paths():
     assert args.repo == ["/a", "/b", "/c"]
 
 
+def test_build_parser_no_kill_flag():
+    """a887155d — the binary accepts --no-kill for CLI parity (default False)."""
+    parser = tunnel_main._build_parser()
+    assert parser.parse_args([]).no_kill is False
+    assert parser.parse_args(["--tunnel", "--no-kill"]).no_kill is True
+
+
 def test_main_invokes_run_tunnel(monkeypatch):
     """main() should forward parsed args to run_tunnel and return its code."""
     captured = {}

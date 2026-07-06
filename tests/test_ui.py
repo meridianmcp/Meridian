@@ -49,6 +49,49 @@ def css(client):
     return client.get("/static/dashboard.css").text
 
 
+def test_settings_panel_reinits_on_project_tab_switch(js):
+    """73907f9e — the project-tab switch path (activateTab) force-reloads the
+    Settings panel when settings is the active vtab, so switching to an
+    already-built tab doesn't show a blank panel (the renderer's TTL cache +
+    MutationObserver could otherwise leave it empty)."""
+    # The forced settings re-init and its marker live in dashboard.ts (activateTab).
+    assert "loadSettingsTab(id, { force: true })" in js, (
+        "tab switch must force-reload the Settings panel (73907f9e)"
+    )
+    assert "73907f9e" in js
+    # It is gated on the active vtab being settings (not fired for every tab).
+    assert "_activeVtab === 'settings'" in js
+
+
+def test_tunnel_stale_override_badge_rendered(js):
+    """cc904bfe — the Tunnel Plugins section renders a 'newer default available'
+    badge with a Use-new-default action when a slot's saved command is a stale
+    copy of an old built-in default (resolve_plugins sets p.stale_override)."""
+    assert "_renderStaleOverrideWarning" in js
+    assert "newer default available" in js
+    assert "tp-reset-default" in js
+    assert "cc904bfe" in js
+
+
+def test_invite_scope_dropdown_and_co_admin_badge(js):
+    """95499c3e — the team-members UI has a project-scope dropdown on the invite
+    form (blank = full workspace) and labels a project-scoped admin as a co-admin
+    in the member list."""
+    assert "invite-scope-" in js          # scope dropdown on the invite form
+    assert "all projects" in js           # blank option = workspace-wide
+    assert "co-admin @ " in js            # scoped-admin label in the member list
+    assert "95499c3e" in js
+
+
+def test_tunnel_per_machine_picker_rendered(js):
+    """8660d701 — the Tunnel Plugins section renders a per-machine picker and
+    scopes the fetch/save to the selected hostname (?hostname=)."""
+    assert "tp-host-" in js
+    assert "Default (all machines)" in js
+    assert "encodeURIComponent(_selHost)" in js
+    assert "8660d701" in js
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -226,10 +269,107 @@ def test_dashboard_has_timeline_tab(soup, js):
     )
 
 
+def test_dashboard_has_connection_health_dot(soup, js):
+    """bb16f9a7 — the connection-health indicator dot is present and wired.
+
+    The dashboard has no persistent SSE/WebSocket, so the dot is driven off the
+    central api() REST helper: green on a recent success, red on failure, amber
+    when no successful call landed within the stale window.
+    """
+    # 1) The element exists in the sidebar-footer connection indicator.
+    dot = soup.find(id="connection-health-dot")
+    assert dot is not None, (
+        "dashboard.html must include the #connection-health-dot element (bb16f9a7)"
+    )
+    # 2) The frontend source drives it from api() success/failure + staleness.
+    assert "connection-health-dot" in js, (
+        "health dot must be referenced/updated by the frontend source"
+    )
+    assert "_refreshHealthDot" in js
+    assert "bb16f9a7" in js
+
+
 def test_dashboard_js_has_github_connect_card(js):
     """dashboard.js includes the GitHub connect card in Settings."""
     assert "github/connect" in js
     assert "Connect GitHub repo" in js
+
+
+# 8201de19 — the Meridian Connect panel must offer direct per-platform binary
+# downloads for the tunnel connector ("meridian-connect") as a fallback when the
+# install.ps1 / install.sh one-liner 404s. These asset names MUST match
+# .github/workflows/release.yml exactly or the download links 404.
+# 80f1d4bc — macOS Intel (dead macos-13 runner) + Linux ARM64 (pixi lacks the
+# linux-aarch64 platform) were dropped from the release matrix, so their assets
+# 404; removed from the panel. Only the 3 actually-built platforms remain.
+_MERIDIAN_CONNECT_ASSETS = [
+    "meridian-connect-x86_64-windows.exe",
+    "meridian-connect-aarch64-apple-darwin",
+    "meridian-connect-x86_64-unknown-linux",
+]
+_MERIDIAN_DROPPED_ASSETS = [
+    "meridian-connect-x86_64-apple-darwin",      # macOS Intel — dead macos-13
+    "meridian-connect-aarch64-unknown-linux",    # Linux ARM64 — no pixi linux-aarch64
+]
+_MERIDIAN_RELEASES_BASE = (
+    "https://github.com/meridianmcp/Meridian/releases/latest/download"
+)
+
+
+def test_connect_panel_has_direct_binary_download_links(js):
+    """The Connect panel exposes direct release-asset download URLs for all five
+    platforms, pointing at meridianmcp/Meridian's latest release (8201de19)."""
+    # The GitHub repo slug used by every download URL + install.ps1.
+    assert "meridianmcp/Meridian/releases/latest/download" in js, (
+        "Connect panel must link at the meridianmcp/Meridian latest-release asset path"
+    )
+    # The releases base path used to build every download href.
+    assert _MERIDIAN_RELEASES_BASE in js, (
+        "Connect panel must reference the latest-release download base URL"
+    )
+    # A labelled fallback section, shown alongside (not replacing) the one-liner.
+    assert "Direct binary download (if the install script fails)" in js
+    # Each of the five per-platform assets is present with its exact release name.
+    # (The href is built as `${base}/${asset}` so we assert the base + each asset
+    # rather than the pre-concatenated string, which the source never spells out.)
+    for asset in _MERIDIAN_CONNECT_ASSETS:
+        assert asset in js, f"Connect panel missing tunnel binary asset {asset!r}"
+    # 80f1d4bc — dropped (unbuilt) platforms must NOT be linked; they'd 404.
+    for asset in _MERIDIAN_DROPPED_ASSETS:
+        assert asset not in js, f"dropped platform {asset!r} should not be linked (404s)"
+    # The install-script one-liner must still be present (fallback is additive).
+    assert "install.ps1" in js and "install.sh" in js
+
+
+def test_connect_panel_asset_names_match_release_workflow():
+    """The download asset names in the dashboard must exactly match the artifact
+    names published by the release workflow — a mismatch silently 404s (8201de19)."""
+    from pathlib import Path
+
+    release_yml = (
+        Path(__file__).parent.parent / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    for asset in _MERIDIAN_CONNECT_ASSETS:
+        assert asset in release_yml, (
+            f"release.yml no longer publishes {asset!r} — dashboard download link "
+            "would 404; update both together."
+        )
+
+
+def test_connect_download_urls_in_built_bundle():
+    """The rebuilt esbuild bundle (what actually ships) contains the five download
+    URLs, so the fallback survives bundling (8201de19)."""
+    from pathlib import Path
+
+    bundle = (
+        Path(__file__).parent.parent
+        / "meridian"
+        / "static"
+        / "dashboard.bundle.js"
+    ).read_text(encoding="utf-8")
+    assert "meridianmcp/Meridian/releases/latest/download" in bundle
+    for asset in _MERIDIAN_CONNECT_ASSETS:
+        assert asset in bundle, f"built bundle missing download asset {asset!r}"
 
 
 def test_signout_link_created_unconditionally_for_hosted_users(js, client):
@@ -555,6 +695,101 @@ def test_known_locations_has_manual_path_entry(js):
     )
 
 
+def test_max_turns_slider_supports_megasprints():
+    """47af402c / 76cf8bda — Executor Config exposes a max_turns slider (ceiling
+    500) with escalating warnings at 200+/350+, an Auto-continue (/loop) dropdown,
+    and the checkpoint (context_threshold) slider ceiling raised to 200."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    settings_src = (static / "dashboard-settings.ts").read_text(encoding="utf-8")
+    # max_turns slider present with a 500 ceiling (76cf8bda raised 400 -> 500).
+    assert "exec-max_turns-" in settings_src, "max_turns slider missing"
+    assert 'type="range" min="40" max="500"' in settings_src, "max_turns ceiling must be 500"
+    # Escalating inline warnings at 200+/350+ (color bands green/amber/red).
+    assert "Very long sprint (350+" in settings_src, "350+ warning missing"
+    assert "Long sprint (200+" in settings_src, "200+ warning missing"
+    # Saved value is clamped to [40, 500].
+    assert "Math.min(500, Math.max(40, mtRaw))" in settings_src, "max_turns must clamp to [40,500]"
+    # 76cf8bda — Auto-continue (/loop) dropdown persists loop_enabled per project.
+    assert "exec-loop_enabled-" in settings_src, "Auto-continue dropdown missing"
+    # Checkpoint slider ceiling raised 100 -> 200 to match.
+    assert 'id="exec-context_threshold-${projectId}" type="range" min="10" max="200"' in settings_src, (
+        "checkpoint slider ceiling must be raised to 200"
+    )
+    assert "Math.min(200, Math.max(10, ctxRaw))" in settings_src, "checkpoint clamp must be raised to 200"
+
+
+def test_context_refresh_workspace_controls_present():
+    """1688710d — the Workspace settings pane exposes Context Refresh controls
+    (bf51b12e backend): a master #ws-auto-refresh checkbox, a #ws-refresh-interval
+    number input (1–50), and one checkbox per default trigger. Load reads
+    /workspace/settings; save PATCHes auto_refresh_enabled / refresh_interval_turns
+    / refresh_triggers."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    settings_src = (static / "dashboard-settings.ts").read_text(encoding="utf-8")
+    # Master toggle + interval input.
+    assert 'id="ws-auto-refresh"' in settings_src, "master auto-refresh checkbox missing"
+    assert 'id="ws-refresh-interval"' in settings_src, "refresh interval input missing"
+    assert 'min="1" max="50"' in settings_src, "refresh interval must clamp 1–50"
+    # One checkbox per trigger.
+    for trig in (
+        "add_insight", "pin_decision", "pin_workspace_decision",
+        "set_north_star", "set_goal", "generate_handoff",
+    ):
+        assert f'id="ws-trigger-{trig}"' in settings_src, f"trigger checkbox for {trig} missing"
+    # Save PATCH body carries all three fields.
+    assert "auto_refresh_enabled:" in settings_src, "auto_refresh_enabled not in PATCH body"
+    assert "refresh_interval_turns:" in settings_src, "refresh_interval_turns not in PATCH body"
+    assert "refresh_triggers:" in settings_src, "refresh_triggers not in PATCH body"
+
+
+def test_documents_tab_present():
+    """3f596f81 — the dashboard exposes a Documents tab: a vtab button, a drawer
+    panel, a loadDocumentsTab loader that reads project_notes (note_kind=document),
+    and an on-demand heading-tree structure view via /document-structure."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    src = (static / "dashboard.ts").read_text(encoding="utf-8")
+    assert 'data-vtab="documents"' in src, "Documents vtab button missing"
+    assert "drawer-documents-${project.id}" in src, "Documents drawer panel missing"
+    assert "documents-body-${project.id}" in src, "Documents body container missing"
+    assert "async function loadDocumentsTab" in src, "loadDocumentsTab loader missing"
+    assert "if (vtab === 'documents') loadDocumentsTab" in src, "Documents tab dispatch missing"
+    assert "note_kind || '').toLowerCase() === 'document'" in src, "document filter missing"
+    assert "/document-structure?path=" in src, "structure fetch missing"
+
+
+def test_insights_tab_present():
+    """0b711a9d — the dashboard exposes an Insights tab: a vtab button, a drawer
+    panel, and a loadInsightsTab loader reading /projects/{id}/insights."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    src = (static / "dashboard.ts").read_text(encoding="utf-8")
+    assert 'data-vtab="insights"' in src, "Insights vtab button missing"
+    assert "drawer-insights-${project.id}" in src, "Insights drawer panel missing"
+    assert "insights-body-${project.id}" in src, "Insights body container missing"
+    assert "async function loadInsightsTab" in src, "loadInsightsTab loader missing"
+    assert "if (vtab === 'insights') loadInsightsTab" in src, "Insights tab dispatch missing"
+    assert "/projects/${projectId}/insights" in src, "insights fetch missing"
+
+
+def test_blog_tab_present():
+    """8843250f — the dashboard exposes a workspace-scoped Blog tab: a vtab
+    button, a drawer panel, a loadBlogTab loader that GETs the WORKSPACE
+    endpoint /workspace/blog (not a per-project one), and a dispatch."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    src = (static / "dashboard.ts").read_text(encoding="utf-8")
+    assert 'data-vtab="blog"' in src, "Blog vtab button missing"
+    assert "drawer-blog-${project.id}" in src, "Blog drawer panel missing"
+    assert "blog-body-${project.id}" in src, "Blog body container missing"
+    assert "async function loadBlogTab" in src, "loadBlogTab loader missing"
+    assert "if (vtab === 'blog') loadBlogTab" in src, "Blog tab dispatch missing"
+    # Blog is workspace-scoped — must fetch the workspace endpoint.
+    assert "/workspace/blog" in src, "workspace blog fetch missing"
+
+
 def test_execution_mode_toggle_present(js):
     """ecf69de8 — the settings tab renders an Execution Mode select (autonomous
     vs interactive) that persists via saveProjectSettings (PATCH settings)."""
@@ -717,3 +952,152 @@ def test_code_intel_architecture_charts(js):
 
     # Graceful fallback: a raw-JSON view is always available.
     assert "raw JSON" in js, "raw fallback view missing"
+
+
+# ---------------------------------------------------------------------------
+# 3e3da82d — viewport meta + bounded responsive pass (sprint board + nav).
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_has_viewport_meta(soup):
+    """3e3da82d — the dashboard <head> declares a device-width viewport meta.
+
+    Without it, a phone / Add-to-Home-Screen render lays the page out at a
+    zoomed-out desktop width. The PWA item (b03be6a6) added the manifest but
+    not the viewport tag.
+    """
+    vp = soup.find("meta", attrs={"name": "viewport"})
+    assert vp is not None, "dashboard <head> must include a viewport meta (3e3da82d)"
+    content = vp.get("content", "")
+    assert "width=device-width" in content, (
+        "viewport meta must set width=device-width so mobile renders at device width"
+    )
+    assert "initial-scale=1" in content, "viewport meta must set initial-scale=1"
+
+
+def test_dashboard_responsive_sprint_and_nav_media_block(css):
+    """3e3da82d — a bounded @media pass adjusts ONLY the sprint board + top nav
+    at phone widths, tagged with the sprint-item id.
+
+    Appearance can't be unit-tested, so we assert the structural pieces exist:
+    the media query, the tag comment, and rules for the sprint board rows and
+    the top nav tab strip inside a narrow breakpoint.
+    """
+    # The sprint-item tag marks the new block.
+    assert "3e3da82d" in css, "responsive pass must be tagged with the sprint-item id"
+    # A phone-width breakpoint (768px already present for the sidebar; 480px added).
+    assert "@media (max-width: 768px)" in css, "768px breakpoint missing"
+    assert "@media (max-width: 480px)" in css, "480px phone breakpoint missing"
+
+    # The block adjusts the sprint board rows/groups...
+    tail = css[css.index("3e3da82d"):]
+    assert ".sprint-item-row" in tail, "responsive pass must adjust .sprint-item-row"
+    assert ".sprint-item-title" in tail, "responsive pass must adjust .sprint-item-title"
+    # ...and the top nav tab strip.
+    assert ".tabs" in tail, "responsive pass must adjust the top nav (.tabs)"
+    assert ".tab {" in tail or ".tab{" in tail, "responsive pass must adjust nav tabs (.tab)"
+
+
+# ---------------------------------------------------------------------------
+# b03be6a6 — Minimal installable PWA: manifest + icons + network-first SW.
+# ---------------------------------------------------------------------------
+
+
+def test_pwa_service_worker_served_at_root(client):
+    """b03be6a6 — /sw.js is served at the site root with a JS content-type.
+
+    Root scope ("/") is required so the worker can control /dashboard; a SW
+    mounted under /static would only scope to /static/*.
+    """
+    r = client.get("/sw.js")
+    assert r.status_code == 200, f"expected 200 for /sw.js, got {r.status_code}"
+    ctype = r.headers.get("content-type", "")
+    assert "javascript" in ctype.lower(), f"sw.js must be JS, got {ctype!r}"
+    # Root-scope enablement header (belt-and-suspenders).
+    assert r.headers.get("service-worker-allowed") == "/", (
+        "sw.js must advertise Service-Worker-Allowed: / for root scope"
+    )
+
+
+def test_pwa_service_worker_is_network_first(client):
+    """b03be6a6 (HARD REQUIREMENT) — the SW must be network-first, not cache-first.
+
+    Dashboard edits must show up on next open with zero rebuild/republish, so
+    the fetch handler must call fetch(request) *before* any caches.match(), and
+    it must not precache the HTML/JS app shell.
+    """
+    body = client.get("/sw.js").text
+    assert "install" in body and "skipWaiting" in body, "install must skipWaiting"
+    assert "clients.claim" in body, "activate must clients.claim()"
+
+    # fetch() must appear before caches.match() — the defining ordering of a
+    # network-first worker.
+    fetch_idx = body.find("fetch(request)")
+    match_idx = body.find("caches.match")
+    assert fetch_idx != -1, "SW must call fetch(request)"
+    assert match_idx != -1, "SW must fall back to caches.match on failure"
+    assert fetch_idx < match_idx, (
+        "network-first violated: fetch(request) must come before caches.match "
+        "(b03be6a6)"
+    )
+
+    # The app shell must NOT be precached — no HTML/JS/CSS in the SW's cache list.
+    assert "/dashboard" not in body, "SW must not cache the dashboard HTML shell"
+    assert ".bundle.js" not in body and "dashboard.css" not in body, (
+        "SW must not precache the JS/CSS app shell (would break live-edit)"
+    )
+    assert "b03be6a6" in body, "SW must carry the sprint-item tag"
+
+
+def test_pwa_manifest_served_with_icons(client):
+    """b03be6a6 — /manifest.webmanifest returns 200 with the manifest media type
+    and declares both the 192 and 512 icons."""
+    r = client.get("/manifest.webmanifest")
+    assert r.status_code == 200, f"expected 200, got {r.status_code}"
+    ctype = r.headers.get("content-type", "")
+    assert "manifest" in ctype.lower(), f"unexpected manifest content-type {ctype!r}"
+
+    data = r.json()
+    assert data["name"] == "Meridian"
+    assert data["short_name"] == "Meridian"
+    assert data["display"] == "standalone"
+    assert data["start_url"] == "/dashboard", "start_url must open the dashboard"
+
+    sizes = {icon["sizes"] for icon in data["icons"]}
+    assert "192x192" in sizes and "512x512" in sizes, "both icon sizes required"
+    purposes = {icon.get("purpose", "") for icon in data["icons"]}
+    assert any("maskable" in p for p in purposes), "a maskable icon entry is required"
+
+
+def test_pwa_icons_are_pngs(client):
+    """b03be6a6 — both icons return 200 with image/png (no byte-content assertion)."""
+    for size in (192, 512):
+        r = client.get(f"/static/icon-{size}.png")
+        assert r.status_code == 200, f"icon-{size}.png missing"
+        assert r.headers.get("content-type", "").startswith("image/png"), (
+            f"icon-{size}.png must be served as image/png"
+        )
+        # Valid PNG magic bytes (not an exact-content assertion).
+        assert r.content[:8] == bytes((0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)), (
+            "not a valid PNG"
+        )
+
+
+def test_pwa_dashboard_head_wires_manifest_and_sw(soup, html):
+    """b03be6a6 — the dashboard <head> links the manifest, sets theme-color, and
+    registers the service worker inline (in the template, not the TS bundle)."""
+    manifest_link = soup.find("link", rel="manifest")
+    assert manifest_link is not None, "dashboard must <link rel=manifest>"
+    assert manifest_link.get("href") == "/manifest.webmanifest"
+
+    theme = soup.find("meta", attrs={"name": "theme-color"})
+    assert theme is not None and theme.get("content"), "theme-color meta required"
+
+    apple = soup.find("link", rel="apple-touch-icon")
+    assert apple is not None, "apple-touch-icon link required for iOS install"
+
+    # SW registration is inline in the HTML (no bundle rebuild needed).
+    assert "serviceWorker" in html, "SW registration guard missing"
+    assert "navigator.serviceWorker.register('/sw.js'" in html, (
+        "dashboard must register /sw.js"
+    )
