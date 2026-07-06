@@ -3543,6 +3543,43 @@ async def _handle_sprint_tools(
         if _bc_complete:
             item = dict(item)
             item["board_change"] = _bc_complete
+        # b121348e — INDEPENDENT CI verification: cross-reference the ACTUAL GitHub
+        # Actions result for the commit named in the completion notes, so a "tests
+        # pass" claim is checked against real CI. Advisory + fully guarded: CI is
+        # usually still running at completion time (push, then complete), and self-
+        # hosted / no-GitHub setups have nothing to check — so this attaches
+        # ci_verification and, when CI is genuinely FAILING, a ci_warning, but never
+        # blocks the completion or raises.
+        try:
+            from .. import github_ci  # noqa: PLC0415
+            _ci_sha = github_ci.extract_commit_sha(
+                f"{args.get('notes') or ''} {item.get('notes') or ''}"
+            )
+            if _ci_sha:
+                _ci_project = await db_module.get_project(db, args["project_id"])
+                _ci_repo = ((_ci_project or {}).get("github_repo") or "").strip()
+                if _ci_repo:
+                    _ci_token = None
+                    _ci_tid = (tenant or {}).get("id") if tenant else None
+                    if _ci_tid:
+                        try:
+                            _ci_token, _ = await db_module.get_github_token_for_project(
+                                db, _ci_tid, args["project_id"]
+                            )
+                        except Exception:  # noqa: BLE001
+                            _ci_token = None
+                    _ci = await github_ci.verify_commit_ci(_ci_repo, _ci_sha, token=_ci_token)
+                    item = dict(item)
+                    item["ci_verification"] = _ci
+                    if _ci.get("state") == "failure":
+                        item["ci_warning"] = (
+                            f"⚠ GitHub Actions CI is FAILING for commit {_ci_sha} "
+                            f"({_ci.get('failed')}/{_ci.get('total')} checks) — this item "
+                            f"was closed on a commit whose CI did not pass. Verify before "
+                            f"trusting 'done'."
+                        )
+        except Exception:  # noqa: BLE001 — advisory only; completion already succeeded
+            pass
         # bb29a06f — ADVISORY completion sanity-check. Extends the required_notes
         # gate (evidence EXISTS) with a check that evidence is PLAUSIBLE: when the
         # completion looks weakly-supported (no linked task, no notes anywhere) and
