@@ -521,7 +521,8 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     feedback_thumb SMALLINT,
     feedback_note TEXT,
     milestone_type TEXT NOT NULL DEFAULT 'task',
-    slug TEXT
+    slug TEXT,
+    nickname TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -1169,6 +1170,13 @@ async def _migrate_pg_sprint_item_slug(conn: PostgresConnection) -> None:
     """b944c905 — sprint_items.slug human-readable id (mirrors SQLite). Idempotent."""
     await conn.executescript(
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS slug TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_nickname(conn: PostgresConnection) -> None:
+    """b6b0cee6 — sprint_items.nickname short memorable handle (mirrors SQLite). Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS nickname TEXT"
     )
 
 
@@ -2548,6 +2556,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_pending_goal,
     _migrate_pg_insights_table,
     _migrate_pg_sprint_item_slug,
+    _migrate_pg_sprint_item_nickname,
     _migrate_pg_capture_insight_notes_to_insights,
     _migrate_pg_blog_posts_tenant,
     _migrate_pg_project_parent_id,

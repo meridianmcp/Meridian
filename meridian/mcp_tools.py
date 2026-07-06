@@ -900,6 +900,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "query": {"type": "string"},
          "limit": {"type": "integer", "description": "Max results per type (default 10)."}},
          "required": ["query"]}},
+    {"name": "search_synthesis", "description":
+        "Read-only: Natural-language search that returns a short, CITED answer "
+        "(which notes/items it drew from) synthesized over the same retrieval as "
+        "search_all — not just a list of matches. Uses a cheap Haiku call when "
+        "ANTHROPIC_API_KEY is set, with a deterministic fallback to the raw results "
+        "(synthesized=false) otherwise. Returns {query, answer, cited, synthesized, results}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "query": {"type": "string"},
+         "limit": {"type": "integer", "description": "Max results per type fed to synthesis (default 10)."}},
+         "required": ["query"]}},
     {"name": "get_agent_instructions", "description":
         "Read-only: Return the custom agent_instructions for a project. "
         "These are injected automatically by start_session so every session picks them up. "
@@ -1139,7 +1150,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
 
 _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
-    "get_pinned_decisions", "get_tasks", "search_tasks", "search_all",
+    "get_pinned_decisions", "get_tasks", "search_tasks", "search_all", "search_synthesis",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "idle_until_session_done", "generate_handoff", "load_handoff",

@@ -6996,6 +6996,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_pending_goal",
         "_migrate_pg_insights_table",
         "_migrate_pg_sprint_item_slug",
+        "_migrate_pg_sprint_item_nickname",
         "_migrate_pg_capture_insight_notes_to_insights",
         "_migrate_pg_blog_posts_tenant",
         "_migrate_pg_project_parent_id",
@@ -7004,7 +7005,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 86
+    assert len(allnames) == len(set(allnames)) == 87
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -7175,6 +7176,92 @@ def test_default_agent_instructions_has_research_routing_protocol():
     assert "GitHub" in text
     assert "paper-search" in text
     assert "primary source" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# S5a — search synthesis layer (ebc242ad): a NL query gets a short cited answer
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_synthesize_search_answer_cites_with_summarizer():
+    from meridian.handoff import synthesize_search_answer
+    results = {
+        "sprint_items": [{"id": "i1", "title": "add rate limiting to the API"}],
+        "notes": [{"id": "n1", "title": "rate limit uses a token bucket"}],
+        "decisions": [], "tasks": [],
+    }
+
+    async def _summ(prompt):
+        assert "rate limit" in prompt.lower()
+        return "Rate limiting uses a token bucket [2], added to the API [1]."
+
+    out = await synthesize_search_answer("how does rate limiting work?", results, summarizer=_summ)
+    assert out["synthesized"] is True
+    assert "token bucket" in out["answer"]
+    assert {c["n"] for c in out["cited"]} == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_synthesize_search_answer_deterministic_fallback(monkeypatch):
+    from meridian.handoff import synthesize_search_answer
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")  # force the no-AI fallback, no network
+    results = {"sprint_items": [{"id": "i1", "title": "x"}], "notes": [],
+               "decisions": [], "tasks": []}
+    out = await synthesize_search_answer("q", results)
+    assert out["synthesized"] is False and out["answer"] == ""
+    # Empty results → fallback even with a summarizer available.
+    empty = await synthesize_search_answer(
+        "q", {"sprint_items": [], "notes": [], "decisions": [], "tasks": []},
+        summarizer=lambda p: "ignored")
+    assert empty["synthesized"] is False
+
+
+@pytest.mark.asyncio
+async def test_mcp_search_synthesis_tool(db, monkeypatch):
+    from meridian import server as srv
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")  # deterministic: fallback, no network
+    p = await db_module.create_project(db, "synth")
+    await db_module.add_sprint_item(db, p["id"], "v1", "add rate limiting to the API")
+    res = await srv._dispatch_mcp_tool(
+        "search_synthesis", {"project_id": p["id"], "query": "rate limiting"}, db, "/tmp")
+    assert res["query"] == "rate limiting"
+    assert "results" in res and res["synthesized"] is False
+    assert any("rate limit" in (it.get("title") or "").lower()
+               for it in res["results"].get("sprint_items", []))
+
+
+# ---------------------------------------------------------------------------
+# S5b — short, unique sprint-item nicknames (b6b0cee6)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_sprint_item_nickname_generated_and_distinct_from_slug(db):
+    p = await db_module.create_project(db, "nick")
+    it = await db_module.add_sprint_item(
+        db, p["id"], "v1", "FEAT: Search bar synthesis layer on top of retrieval")
+    assert it.get("nickname")
+    assert it["nickname"] != it["slug"]          # distinct from the long slug
+    assert it["nickname"].count("-") <= 1        # short: 1-2 words
+    assert "feat" not in it["nickname"]          # generic prefix dropped
+
+
+@pytest.mark.asyncio
+async def test_sprint_item_nickname_unique_per_project(db):
+    p = await db_module.create_project(db, "nick2")
+    a = await db_module.add_sprint_item(db, p["id"], "v1", "model2vec gate correctness")
+    b = await db_module.add_sprint_item(
+        db, p["id"], "v1", "model2vec gate runtime breaker", force=True)
+    assert a["nickname"] and b["nickname"] and a["nickname"] != b["nickname"]
+    assert b["nickname"].startswith(a["nickname"])  # collision → numeric suffix
+
+
+def test_sprint_item_nickname_base_title_and_deterministic_fallback():
+    from meridian.db import _sprint_item_nickname_base
+    assert _sprint_item_nickname_base("Model2Vec gate corrected", "id1").startswith("model2vec")
+    # No usable title words → deterministic adjective-noun from the item id (stable).
+    n1 = _sprint_item_nickname_base("the a for", "abc123")
+    n2 = _sprint_item_nickname_base("the a for", "abc123")
+    assert n1 == n2 and "-" in n1 and "the" not in n1
 
 
 def test_cached_plan_error_is_retryable():

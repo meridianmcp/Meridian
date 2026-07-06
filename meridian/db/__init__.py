@@ -270,7 +270,12 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     owner TEXT DEFAULT NULL,
     -- b944c905: human-readable per-project id (title slug, deduped). UUID stays
     -- the primary key; slug is the board-facing identifier.
-    slug TEXT
+    slug TEXT,
+    -- b6b0cee6: short, memorable per-project NICKNAME (1-2 words, e.g.
+    -- "search-synthesis" / "brisk-otter"), distinct from the long title slug.
+    -- Deduped per project. Plain column — no inline index here (guarded-migration
+    -- rule); nickname lookups scan the small per-project item set.
+    nickname TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -908,6 +913,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_codebase_graph_entities(db)
     await _migrate_insights_table(db)
     await _migrate_sprint_item_slug(db)
+    await _migrate_sprint_item_nickname(db)
     await _migrate_capture_insight_notes_to_insights(db)
     await _migrate_blog_posts_tenant(db)
     await _migrate_project_parent_id(db)
@@ -3738,6 +3744,70 @@ async def _unique_sprint_slug(
         slug = f"{base}-{n}"
 
 
+# b6b0cee6 — short, memorable sprint-item nicknames. Word lists reuse the
+# adjective+noun idiom already proven for session naming (2bce89ed), widened so a
+# title-less fallback stays unique-ish before the per-project collision suffix.
+_NICKNAME_ADJ = (
+    "brisk", "calm", "clever", "bold", "quiet", "swift", "warm", "keen", "bright",
+    "steady", "nimble", "lucid", "amber", "cobalt", "coral", "dusky", "fabled",
+    "gilded", "hardy", "ivory", "jade", "lush", "mellow", "noble",
+)
+_NICKNAME_NOUN = (
+    "otter", "harbor", "cedar", "falcon", "meadow", "ember", "delta", "willow",
+    "quartz", "sparrow", "atlas", "cove", "beacon", "cypress", "drift", "fjord",
+    "grove", "heron", "isle", "kite", "lagoon", "moss", "nimbus", "onyx",
+)
+# Title words too generic to make a distinctive nickname (mostly sprint-item
+# prefixes / connectives). Dropped before picking the 1-2 keeper words.
+_NICKNAME_STOPWORDS = frozenset({
+    "feat", "bug", "fix", "rule", "the", "and", "for", "add", "adds", "added",
+    "new", "serious", "confirmed", "live", "severe", "paper", "blog", "post",
+    "manual", "correction", "with", "via", "not", "its", "this", "that", "into",
+    "from", "onto", "task", "chore", "docs", "doc", "test", "refactor",
+})
+
+
+def _sprint_item_nickname_base(title: str, iid: str) -> str:
+    """b6b0cee6 — a short (1-2 word) memorable nickname base for a sprint item.
+
+    Prefers the first 1-2 distinctive title words (skipping generic prefixes /
+    connectives); when the title has none usable, falls back to a deterministic
+    adjective+noun derived from the item id (so it is stable, not random).
+    """
+    words = re.findall(r"[a-z0-9]+", (title or "").lower())
+    picks = [w for w in words if w not in _NICKNAME_STOPWORDS and len(w) > 2]
+    if picks:
+        return "-".join(picks[:2])[:32].strip("-") or "item"
+    h = sum(ord(c) for c in (iid or "x"))
+    return (
+        f"{_NICKNAME_ADJ[h % len(_NICKNAME_ADJ)]}-"
+        f"{_NICKNAME_NOUN[(h // len(_NICKNAME_ADJ)) % len(_NICKNAME_NOUN)]}"
+    )
+
+
+async def _unique_sprint_nickname(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """b6b0cee6 — ``base``, or base-2/base-3/… if the nickname is taken in this
+    project (mirrors _unique_sprint_slug; nicknames are unique per project)."""
+    nickname = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM sprint_items WHERE project_id = ? AND nickname = ?",
+            (project_id, nickname),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return nickname
+        n += 1
+        nickname = f"{base}-{n}"
+
+
 async def add_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3814,13 +3884,18 @@ async def add_sprint_item(
     _item_slug = await _unique_sprint_slug(
         db, project_id, _sprint_item_slug_base(slug or title)
     )
+    # b6b0cee6 — a short memorable nickname (1-2 words), deduped per project.
+    _item_nickname = await _unique_sprint_nickname(
+        db, project_id, _sprint_item_nickname_base(title, iid)
+    )
     await db.execute(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
-        "failure_mode, milestone_type, touches_resources, slug) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "failure_mode, milestone_type, touches_resources, slug, nickname) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
-         depends_on, failure_mode or "continue", milestone_type, resources_json, _item_slug),
+         depends_on, failure_mode or "continue", milestone_type, resources_json,
+         _item_slug, _item_nickname),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
