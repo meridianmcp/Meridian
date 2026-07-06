@@ -20,7 +20,10 @@ import re
 #
 #   v1 — pre-versioning baseline (implicit; stored copies with no marker).
 #   v2 — project_name-first start_session idiom + code-intel protocol; marker added.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 3
+#   v3 — reindex-at-session-start guidance (eacf7063).
+#   v4 — request_hitl is the ONLY human-decision channel (never native ask, d261ea2e)
+#        + research-routing protocol (f8c70f9a).
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 4
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -59,8 +62,18 @@ in the Meridian dashboard → Settings → Executor Rules.
 ## During work
 - Call `log_task(session_id, project_id, description)` after every meaningful action.
 - Call `pin_decision(project_id, title, body, category)` for architectural choices.
-- Call `request_hitl(project_id, question)` when blocked on a human decision before
-  continuing — do not guess; pause and ask.
+
+## Human decisions route through `request_hitl` ONLY — never the native "ask" UI
+- Any question that needs a human answer — "how should I proceed", "which option",
+  "is this okay to do", anything blocking on a person — MUST go through
+  `request_hitl(project_id, question)`. Do NOT ask it in the executor's own chat/CLI
+  prompt instead.
+- Asking natively is invisible to Meridian: no dashboard entry, no audit trail, and
+  `list_hitl_requests` stays empty, so the human never actually sees it and the
+  session silently stalls. Reading a pinned decision first does not exempt you — if
+  you still need a human call, `request_hitl` is the only channel.
+- Do not guess and do not ask natively — pause and call `request_hitl`, then continue
+  once it returns an answer.
 
 ## Before ending
 - Call `checkpoint(session_id, project_id)` before context fills and before ending
@@ -94,7 +107,22 @@ files when code intel tools are present is a protocol violation. For non-code
 files (documents, presentations, spreadsheets, config, data), use filesystem
 tools directly.
 
-<!-- meridian-executor-standard: v3 -->
+## RESEARCH ROUTING PROTOCOL
+When a task needs external research, route the query to the most authoritative
+source FIRST — do not default to a generic web search:
+- **GitHub / library / API questions** — search GitHub natively first (that repo's
+  code, issues, releases, and its own docs) before any general web search. The
+  primary source is the code and its issue tracker, not a blog summarizing them.
+- **Academic / paper questions** — use the paper-search MCP first when it is in your
+  tool list (arXiv / Semantic Scholar-style lookup); fall back to web search only if
+  it is unavailable. Cite the paper itself, not a secondary write-up.
+- **General questions** — run MULTIPLE searches from different angles instead of
+  trusting the first hit, and prefer primary sources (official docs, specs, source
+  code, original announcements) over aggregators and SEO content.
+Retrieval beats recall: look it up. Do not answer a decision-relevant factual
+question from memory when a source can be checked.
+
+<!-- meridian-executor-standard: v4 -->
 """
 
 
