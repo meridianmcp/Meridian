@@ -7329,6 +7329,13 @@ async function loadDocumentsTab(projectId: any) {
     return;
   }
 
+  // 79ee73e8 — stateless get_document_structure peeks (viewed, NOT ingested).
+  let peeks: any[] = [];
+  try {
+    const pk = await api('/document-peeks');
+    peeks = (((pk && pk.peeks) || []) as any[]);
+  } catch (_) { peeks = []; }
+
   const _srcBadge = (src: any) => {
     const s = String(src || 'local').toLowerCase();
     const label = s.includes('onedrive') ? 'OneDrive'
@@ -7348,7 +7355,8 @@ async function loadDocumentsTab(projectId: any) {
     <input type="file" id="doc-upload-input-${escapeHtml(String(projectId))}" accept=".txt,.md" style="font-size:10px;flex:1;min-width:0" />
     <button id="doc-upload-btn-${escapeHtml(String(projectId))}" class="secondary" style="font-size:10px;padding:3px 10px" disabled>Upload .txt/.md</button>
   </div>
-  <div id="doc-upload-status-${escapeHtml(String(projectId))}" style="font-size:9px;color:var(--muted);margin-bottom:8px">Plain .txt / .md only — the file text is read in your browser and stored as a searchable document note.</div>`;
+  <div id="doc-upload-status-${escapeHtml(String(projectId))}" style="font-size:9px;color:var(--muted);margin-bottom:4px">Plain .txt / .md only — read in your browser, stored as a searchable document note.</div>
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px;padding:6px 8px;border-left:2px solid var(--accent);background:var(--surface-1)">📄 <b>Word / PDF?</b> Ingest it with the <code>ingest_document</code> MCP tool (<code>file_path</code> or <code>content</code>) — it saves as a searchable <code>kind=document</code> note and appears above. A <code>get_document_structure</code> peek only reads the outline; it does <b>not</b> save the doc (those show under “Recently viewed” below).</div>`;
 
   if (!docs.length) {
     html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Upload a .txt/.md above, or ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) — it is stored as a project note with kind=document and appears here.</div>`;
@@ -7372,7 +7380,42 @@ async function loadDocumentsTab(projectId: any) {
     }
     html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
   }
+
+  // 79ee73e8 — "Recently viewed (not saved)": stateless get_document_structure
+  // peeks. They are NOT ingested/searchable — surface them here with a one-click
+  // "Ingest this" that copies the ingest_document command, so the ingest/peek
+  // distinction is visible exactly where it confused people.
+  if (peeks.length) {
+    html += `<div id="doc-peeks-section-${escapeHtml(String(projectId))}" style="margin-top:16px">
+      <div style="font-size:10px;font-weight:600;color:var(--accent)">Recently viewed (not saved) — ${peeks.length}</div>
+      <div style="font-size:9px;color:var(--muted);margin:2px 0 8px">Peeked with <code>get_document_structure</code> (a stateless outline read) but never ingested — so they are NOT searchable here. Ingest one to save it.</div>`;
+    for (const pk of peeks) {
+      const fp = String(pk.file_path || '');
+      const failed = pk.ok === false;
+      html += `<div style="border:1px dashed var(--border);border-radius:4px;padding:6px 10px;margin-bottom:6px;background:var(--surface-1)">
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+          <span style="font-size:9px;color:var(--muted);font-family:var(--font-mono);word-break:break-all">${escapeHtml(fp)}</span>
+          <button class="doc-peek-ingest-btn" data-fp="${escapeHtml(fp)}" style="font-size:9px;padding:2px 8px;white-space:nowrap">Ingest this</button>
+        </div>
+        <div style="font-size:8px;color:var(--muted);margin-top:2px">viewed ${escapeHtml(String(pk.viewed_at || ''))}${failed ? ' · peek failed (hosted — no file access)' : ''}</div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
   body.innerHTML = html;
+
+  // Wire the peek "Ingest this" buttons: copy the ingest_document command (a real
+  // one-click action that works regardless of hosted/self-hosted file access).
+  body.querySelectorAll('.doc-peek-ingest-btn').forEach((el: any) => {
+    el.addEventListener('click', () => {
+      const fp = el.getAttribute('data-fp') || '';
+      const cmd = `ingest_document(file_path="${fp}")`;
+      try { navigator.clipboard.writeText(cmd); } catch (_) {}
+      const prev = el.textContent;
+      el.textContent = 'Copied ✓';
+      setTimeout(() => { el.textContent = prev || 'Ingest this'; }, 1500);
+    });
+  });
 
   // f1c7e7d1 — wire the upload picker: enable the button once a .txt/.md is
   // chosen, then read text client-side and POST it to the upload route.

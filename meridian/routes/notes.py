@@ -117,6 +117,25 @@ async def create_project_note_endpoint(
     return note
 
 
+@router.get("/document-peeks")
+async def get_document_peeks_endpoint(request: Request) -> dict[str, Any]:
+    """79ee73e8 — recent 'viewed but not saved' get_document_structure peeks
+    (tenant-scoped, ephemeral in-memory). Powers the Documents tab's
+    'Recently viewed (not saved)' section so stateless peeks stop being invisible.
+    """
+    from .. import doc_peeks  # noqa: PLC0415
+    from .._deps import _hosted_mode  # noqa: PLC0415
+    scope = None
+    if _hosted_mode():
+        try:
+            from ..hosted import get_current_tenant  # noqa: PLC0415
+            tenant = await get_current_tenant(request)
+            scope = (tenant or {}).get("id")
+        except Exception:  # noqa: BLE001 — unauthenticated → empty local scope
+            scope = None
+    return {"peeks": doc_peeks.get_peeks(scope)}
+
+
 @router.post("/projects/{project_id}/documents/upload", status_code=201)
 async def upload_document_endpoint(
     project_id: str, body: dict[str, Any], request: Request

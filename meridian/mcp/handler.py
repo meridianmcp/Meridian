@@ -2043,6 +2043,18 @@ async def _handle_notes_decisions(
         fp = args.get("file_path")
         if not fp:
             return {"error": "file_path is required"}
+        # 79ee73e8 — record this stateless peek in the tenant-scoped "recently
+        # viewed (not saved)" log so the Documents tab can surface it. Peeks were
+        # invisible there (only ingested docs showed), silently conflating the two.
+        _peek_scope = (tenant or {}).get("id") if tenant else None
+
+        def _record_peek(ok: bool) -> None:
+            try:
+                from .. import doc_peeks  # noqa: PLC0415
+                doc_peeks.record_peek(_peek_scope, fp, ok=ok)
+            except Exception:  # noqa: BLE001 — the recent-peeks log is best-effort
+                pass
+
         # b43bab91 — this reads the .docx from the SERVER's own filesystem
         # (zipfile.ZipFile), so it only works self-hosted, where the server and the
         # files share a machine. On hosted Meridian (Fly.io) the server has ZERO
@@ -2052,6 +2064,7 @@ async def _handle_notes_decisions(
         # word-document tools, which proxy to their machine — unlike this native
         # tool, which does not).
         if _hosted_mode():
+            _record_peek(ok=False)
             return {
                 "error": (
                     "get_document_structure reads the .docx from the Meridian "
@@ -2066,11 +2079,13 @@ async def _handle_notes_decisions(
             }
         try:
             from ..docs_intel import document_outline  # noqa: PLC0415
-            return document_outline(fp)
+            _outline = document_outline(fp)
         except FileNotFoundError:
             return {"error": f"file not found: {fp}"}
         except Exception as exc:  # noqa: BLE001
             return {"error": f"could not parse document: {exc}"}
+        _record_peek(ok=True)
+        return _outline
     if name == "get_latex_structure":
         # 106118cd — docs_intel Phase 3: native LaTeX (.tex) structure + biblio,
         # no PDF intermediary. Accepts a server-side file_path (like
