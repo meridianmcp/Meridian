@@ -6327,7 +6327,7 @@ project_id = "${displayPid}"`;
     let actionBtn = "";
     if (lifecycleState === "not_installed" && installCmd) {
       const safeCmd = escapeHtml(installCmd);
-      actionBtn = `<button class="secondary tp-install-btn" data-install-cmd="${safeCmd}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Copy install command">Install</button>`;
+      actionBtn = `<button class="secondary tp-install-btn" data-install-cmd="${safeCmd}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Copy the install command to run in your terminal">Copy command</button>`;
     } else if (lifecycleState === "installed_inactive") {
       actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">start tunnel to activate</span>`;
     } else if (lifecycleState === "unhealthy") {

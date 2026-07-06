@@ -910,7 +910,9 @@ window._wireRegistryBrowse = _wireRegistryBrowse;
 // The dashboard shows:
 //   active            → green dot, "active" badge, Deactivate button
 //   installed_inactive → yellow dot, "inactive" badge, Activate button
-//   not_installed     → grey dot, "not installed" badge, Install button (copies cmd)
+//   not_installed     → grey dot, "not installed" badge, "Copy command" button
+//                        (copies the install command — labelled honestly per 9b4aef8b;
+//                        one-click install lands in a later sprint)
 // ---------------------------------------------------------------------------
 
 /**
@@ -933,8 +935,9 @@ window._pluginLifecycleState = _pluginLifecycleState;
 
 /**
  * Render the three-state lifecycle badge + action button for a plugin row.
- * Returns an HTML string. The Install button copies the launch command to
- * clipboard (self-hosted: also offers a server-side binary check).
+ * Returns an HTML string. For not_installed plugins the action is a "Copy
+ * command" button that copies the install command to the clipboard (9b4aef8b —
+ * labelled for what it does; it does NOT run an install).
  */
 function _renderLifecycleBadge(plugin: any, lifecycleState: any, installCmd: any) {
   const styles = {
@@ -950,7 +953,7 @@ function _renderLifecycleBadge(plugin: any, lifecycleState: any, installCmd: any
   let actionBtn = '';
   if (lifecycleState === 'not_installed' && installCmd) {
     const safeCmd = escapeHtml(installCmd);
-    actionBtn = `<button class="secondary tp-install-btn" data-install-cmd="${safeCmd}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Copy install command">Install</button>`;
+    actionBtn = `<button class="secondary tp-install-btn" data-install-cmd="${safeCmd}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Copy the install command to run in your terminal">Copy command</button>`;
   } else if (lifecycleState === 'installed_inactive') {
     actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">start tunnel to activate</span>`;
   } else if (lifecycleState === 'unhealthy') {
