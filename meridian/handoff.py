@@ -1299,6 +1299,93 @@ async def _generate_ai_summary(
         return fallback
 
 
+async def synthesize_search_answer(
+    query: str,
+    results: dict[str, Any],
+    *,
+    summarizer: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
+    """ebc242ad — turn raw search hits into a short, CITED answer, not just a list.
+
+    Reuses the exact Haiku-tier pattern as :func:`_generate_ai_summary`: a cheap
+    Haiku call when ``ANTHROPIC_API_KEY`` is set (or an injected ``summarizer`` in
+    tests), with a DETERMINISTIC fallback — on no key / failure it returns
+    ``synthesized: False`` and the caller shows the raw results list. Not new infra;
+    the summary pattern applied to search.
+
+    ``results`` is :func:`meridian.db.search_all`'s grouped output. Returns
+    ``{answer, cited, synthesized}``: ``answer`` is a 2-3 sentence response that
+    cites its sources inline as ``[n]``; ``cited`` maps those numbers to
+    ``{n, kind, id, title}``; ``synthesized`` is False when it fell back.
+    """
+    sources: list[dict[str, Any]] = []
+    for kind in ("sprint_items", "notes", "decisions", "tasks"):
+        for r in (results.get(kind) or []):
+            title = (r.get("title") or r.get("description") or "").strip().replace("\n", " ")
+            sources.append({"kind": kind, "id": r.get("id"), "title": title[:160]})
+
+    out: dict[str, Any] = {"answer": "", "cited": [], "synthesized": False}
+    if not sources:
+        return out
+
+    numbered = "\n".join(
+        f"[{i + 1}] ({s['kind']}) {s['title']}" for i, s in enumerate(sources[:12])
+    )
+    prompt = (
+        "Answer the question in 2-3 sentences using ONLY the search results below. "
+        "Cite the results you use inline as [n]. If they do not answer it, say so "
+        "plainly. No preamble.\n\n"
+        f"Question: {query}\n\nResults:\n{numbered}"
+    )
+
+    text = ""
+    if summarizer is not None:
+        try:
+            res = summarizer(prompt)
+            if hasattr(res, "__await__"):
+                res = await res  # type: ignore[misc]
+            text = ((res.get("text") or res.get("summary") or "") if isinstance(res, dict)
+                    else str(res)).strip()
+        except Exception:  # noqa: BLE001 — never break search on a synthesis failure
+            text = ""
+
+    if not text:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if api_key:
+            try:
+                import anthropic  # type: ignore[import]
+
+                def _sync_call() -> str:
+                    client = anthropic.Anthropic(api_key=api_key)
+                    resp = client.messages.create(
+                        model="claude-haiku-4-5",
+                        max_tokens=250,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    return "".join(getattr(b, "text", "") for b in resp.content).strip()
+
+                loop = asyncio.get_event_loop()
+                text = await asyncio.wait_for(
+                    loop.run_in_executor(None, _sync_call), timeout=30.0
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                text = ""
+
+    if not text:
+        return out  # deterministic fallback: no answer, caller shows raw results
+
+    cited_nums = {int(m) for m in re.findall(r"\[(\d+)\]", text)}
+    cited = [
+        {"n": i + 1, **sources[i]}
+        for i in range(min(len(sources), 12))
+        if (i + 1) in cited_nums
+    ]
+    # If the model cited nothing parseable, attribute the top few as provenance.
+    if not cited:
+        cited = [{"n": i + 1, **s} for i, s in enumerate(sources[:3])]
+    return {"answer": text, "cited": cited, "synthesized": True}
+
+
 # ---------------------------------------------------------------------------
 # aef94e4a — sprint retrospective: a strategic narrative (what shipped /
 # patterns revealed / direction confirmed) auto-saved at generate_handoff and

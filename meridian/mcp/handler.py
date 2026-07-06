@@ -2728,6 +2728,19 @@ async def _handle_session_tools(
             db, args["project_id"], args["query"],
             limit=args.get("limit", 10),
         )
+    if name == "search_synthesis":
+        # ebc242ad — a natural-language query gets a short, CITED answer on top of
+        # the same tsvector/LIKE retrieval as search_all, not just a list of hits.
+        # Reuses the Haiku-tier pattern (deterministic fallback to raw results when
+        # ANTHROPIC_API_KEY is unset or the call fails).
+        if not args.get("query"):
+            return {"error": "query is required"}
+        results = await db_module.search_all(
+            db, args["project_id"], args["query"], limit=args.get("limit", 10),
+        )
+        from ..handoff import synthesize_search_answer  # noqa: PLC0415
+        synth = await synthesize_search_answer(args["query"], results)
+        return {"query": args["query"], **synth, "results": results}
     if name == "get_session_brief":
         # v2.5 — single-call orientation, <500 tokens, XML output.
         project_id = args["project_id"]
