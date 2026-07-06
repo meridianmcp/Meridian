@@ -304,15 +304,18 @@ class SemanticSearcher:
 
         Runs the RSS breaker check before embedding. Never raises.
         """
-        import numpy as np
-
+        # b3537a8d — import numpy ONLY after the empty/availability/breaker
+        # early-returns, so calling embed() when semantic is unavailable (no
+        # model2vec/numpy installed) or the breaker is tripped returns None WITHOUT
+        # crashing on the import — honouring the module's safe-by-default promise.
         if not texts:
-            return np.empty((0, 0), dtype="float32")
+            return None
         model = self._ensure_model()
         if model is None:
             return None
         if not self._rss_ok():  # breaker before the embed spend
             return None
+        import numpy as np  # reached only when the model loaded → numpy is present
         # 56cd8712 — cap each text + encode in RSS-checked sub-batches so a few large
         # candidates can't spike RSS past the model estimate during one big numpy
         # allocation; a breaker trip mid-corpus aborts to keyword-only.
@@ -345,12 +348,13 @@ class SemanticSearcher:
         semantic is unavailable/tripped or embedding fails — callers fall back to
         keyword-only.
         """
-        import numpy as np
-
-        if floor is None:
-            floor = cosine_floor()
+        # b3537a8d — empty/unavailable early-returns BEFORE importing numpy, so rank()
+        # never crashes without numpy for the degenerate/unavailable cases. numpy is
+        # imported only once embed() has returned real vectors (so numpy is present).
         if not candidates:
             return []
+        if floor is None:
+            floor = cosine_floor()
         texts = [t for _, t in candidates]
         q_emb = self.embed([query])
         if q_emb is None or q_emb.shape[0] == 0:
@@ -358,6 +362,7 @@ class SemanticSearcher:
         c_emb = self.embed(texts)
         if c_emb is None or c_emb.shape[0] == 0:
             return []
+        import numpy as np  # reached only when embed returned real vectors → numpy present
         q = _l2_normalize(q_emb[0])
         c = _l2_normalize_rows(c_emb)
         sims = c @ q  # cosine after normalization

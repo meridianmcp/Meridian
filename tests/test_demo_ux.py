@@ -862,9 +862,12 @@ def test_dashboard_shows_visible_error_when_sessions_request_fails(client):
                 f"http://127.0.0.1:17883/dashboard?project_id={pid}",
                 wait_until="domcontentloaded",
             )
-            page.wait_for_timeout(2500)
 
             alert = page.locator(f"#project-fetch-alert-{pid}")
+            # Wait for the alert to actually render rather than a fixed sleep — CI's
+            # headless chromium is slower than local, so a 2500ms wait raced the
+            # failed-fetch → alert render (this test's only CI flake).
+            alert.wait_for(state="visible", timeout=15000)
             assert alert.is_visible(), "project fetch alert should be visible on sessions failure"
             alert_text = alert.inner_text()
             assert "project data failed to load" in alert_text.lower()
