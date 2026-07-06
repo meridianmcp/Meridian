@@ -12629,6 +12629,46 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     return edges;
   }
   if (typeof window !== "undefined") window._normalizeGraphEdges = _normalizeGraphEdges;
+  function _resolvePackageLayers(packages, layers) {
+    const pkgs = Array.isArray(packages) ? packages : [];
+    const lys = Array.isArray(layers) ? layers : [];
+    if (!pkgs.length || !lys.length) return pkgs;
+    if (pkgs.some((p3) => p3 && p3.layer != null)) return pkgs;
+    const memberToLayer = {};
+    const layerNames = [];
+    for (const ly of lys) {
+      if (!ly || ly.name == null) continue;
+      const rank = ly.layer != null ? ly.layer : ly.name;
+      layerNames.push({ name: String(ly.name), layer: rank });
+      const members = ly.members || ly.packages || ly.package_names || ly.modules;
+      if (Array.isArray(members)) {
+        for (const m3 of members) {
+          const key = String(typeof m3 === "string" ? m3 : m3 && m3.name || "").trim();
+          if (key) memberToLayer[key] = rank;
+        }
+      }
+    }
+    layerNames.sort((a3, b2) => b2.name.length - a3.name.length);
+    const resolve = (name) => {
+      if (name in memberToLayer) return memberToLayer[name];
+      for (const ly of layerNames) {
+        if (name === ly.name || name.startsWith(ly.name + ".") || name.startsWith(ly.name + "/")) {
+          return ly.layer;
+        }
+      }
+      return null;
+    };
+    let matched = false;
+    const out = pkgs.map((p3) => {
+      if (!p3 || p3.name == null) return p3;
+      const lyr = resolve(String(p3.name));
+      if (lyr == null) return p3;
+      matched = true;
+      return { ...p3, layer: lyr };
+    });
+    return matched ? out : pkgs;
+  }
+  if (typeof window !== "undefined") window._resolvePackageLayers = _resolvePackageLayers;
   function _buildCodebaseForceGraph(packages, edges, view) {
     const pkgs = (packages || []).filter((p3) => p3 && p3.name != null);
     if (!pkgs.length) return null;
@@ -13162,7 +13202,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         try {
           const _arch = JSON.parse(archText);
           _graphArch = _arch;
-          _graphPackages = Array.isArray(_arch?.packages) ? _arch.packages : [];
+          _graphPackages = _resolvePackageLayers(_arch?.packages, _arch?.layers);
         } catch (_2) {
           _graphPackages = [];
         }

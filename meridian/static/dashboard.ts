@@ -7115,6 +7115,61 @@ function _normalizeGraphEdges(queryResult: any) {
 }
 if (typeof window !== 'undefined') window._normalizeGraphEdges = _normalizeGraphEdges;
 
+// 20d17e08 — packages from get_architecture can arrive WITHOUT a `layer` field while
+// the arch payload carries a separate `layers` list, so the force-graph colours every
+// package as a single "other" bucket. When the two can be joined, stamp each package's
+// layer. Pure + defensive: assigns a layer only when the data actually supports a join
+// (a layer's explicit member list, or an exact/prefix name match); otherwise the
+// package is returned unchanged (no regression, honest "other"). Never mutates input.
+// NB: get_architecture is proxied from an external code-intel MCP, so if that server
+// emits neither package.layer nor a joinable membership/name relationship, this is a
+// safe no-op and the root fix belongs upstream in that MCP.
+function _resolvePackageLayers(packages: any, layers: any): any[] {
+  const pkgs = Array.isArray(packages) ? packages : [];
+  const lys = Array.isArray(layers) ? layers : [];
+  if (!pkgs.length || !lys.length) return pkgs;
+  // If any package already carries a layer, trust the upstream data as-is.
+  if (pkgs.some((p: any) => p && p.layer != null)) return pkgs;
+
+  const memberToLayer: Record<string, any> = {};
+  const layerNames: Array<{ name: string; layer: any }> = [];
+  for (const ly of lys) {
+    if (!ly || ly.name == null) continue;
+    const rank = ly.layer != null ? ly.layer : ly.name;
+    layerNames.push({ name: String(ly.name), layer: rank });
+    const members = ly.members || ly.packages || ly.package_names || ly.modules;
+    if (Array.isArray(members)) {
+      for (const m of members) {
+        const key = String(typeof m === 'string' ? m : (m && m.name) || '').trim();
+        if (key) memberToLayer[key] = rank;
+      }
+    }
+  }
+  // Longest layer name first so the most specific prefix wins.
+  layerNames.sort((a, b) => b.name.length - a.name.length);
+
+  const resolve = (name: string): any => {
+    if (name in memberToLayer) return memberToLayer[name];
+    for (const ly of layerNames) {
+      if (name === ly.name || name.startsWith(ly.name + '.') || name.startsWith(ly.name + '/')) {
+        return ly.layer;
+      }
+    }
+    return null;
+  };
+
+  let matched = false;
+  const out = pkgs.map((p: any) => {
+    if (!p || p.name == null) return p;
+    const lyr = resolve(String(p.name));
+    if (lyr == null) return p;
+    matched = true;
+    return { ...p, layer: lyr };
+  });
+  return matched ? out : pkgs;
+}
+if (typeof window !== 'undefined') window._resolvePackageLayers = _resolvePackageLayers;
+
 // 65742e42 — build an ECharts force-graph option from architecture packages +
 // cross-package edges. Nodes are packages (sized by node_count, colored by
 // layer); the 'hotspots' view instead sizes by connection degree to surface the
@@ -7738,7 +7793,9 @@ async function loadCodeIntelTab(projectId: any) {
       try {
         const _arch = JSON.parse(archText);
         _graphArch = _arch;
-        _graphPackages = Array.isArray(_arch?.packages) ? _arch.packages : [];
+        // 20d17e08 — join the separate layers list onto packages so the force-graph
+        // colours by layer instead of one "other" bucket (no-op if no join exists).
+        _graphPackages = _resolvePackageLayers(_arch?.packages, _arch?.layers);
       } catch (_) { _graphPackages = []; }
       if (_graphPackages.length) {
         try {
