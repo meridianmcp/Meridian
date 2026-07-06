@@ -2756,6 +2756,17 @@ async def _handle_session_tools(
         from ..handoff import synthesize_search_answer  # noqa: PLC0415
         synth = await synthesize_search_answer(args["query"], results)
         return {"query": args["query"], **synth, "results": results}
+    if name == "paper_search":
+        # 811881c6 — real callable arXiv search so the research-routing protocol's
+        # "use the paper-search MCP first" finally points at a tool that exists (it was
+        # instruction-only before). Keyless external lookup; degrades to {error}, never
+        # raises. No project scope needed — it's an external search.
+        from ..paper_search import arxiv_search  # noqa: PLC0415
+        return await arxiv_search(
+            args.get("query", ""),
+            limit=args.get("limit", 10),
+            sort_by=args.get("sort_by", "relevance"),
+        )
     if name == "get_session_brief":
         # v2.5 — single-call orientation, <500 tokens, XML output.
         project_id = args["project_id"]

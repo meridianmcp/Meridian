@@ -113,8 +113,8 @@ source FIRST — do not default to a generic web search:
 - **GitHub / library / API questions** — search GitHub natively first (that repo's
   code, issues, releases, and its own docs) before any general web search. The
   primary source is the code and its issue tracker, not a blog summarizing them.
-- **Academic / paper questions** — use the paper-search MCP first when it is in your
-  tool list (arXiv / Semantic Scholar-style lookup); fall back to web search only if
+- **Academic / paper questions** — call the `paper_search` tool first (the paper-search
+  MCP: a keyless arXiv lookup, now in your tool list); fall back to web search only if
   it is unavailable. Cite the paper itself, not a secondary write-up.
 - **General questions** — run MULTIPLE searches from different angles instead of
   trusting the first hit, and prefer primary sources (official docs, specs, source
