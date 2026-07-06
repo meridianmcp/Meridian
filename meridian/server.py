@@ -1500,8 +1500,10 @@ async def demo_auth_post(request: Request):
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    """Liveness probe."""
-    return {"status": "ok", "service": "meridian"}
+    """Liveness probe. 056b712f — also report the running build's git SHA + version so an
+    external deploy-drift check can compare what prod is ACTUALLY running against the
+    latest main commit (the durable backstop for the 'CI green but prod stale' class)."""
+    return {"status": "ok", "service": "meridian", "git_sha": _GIT_SHA, "version": _VERSION}
 
 
 @app.get("/failover-status")
