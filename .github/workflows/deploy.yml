@@ -173,13 +173,20 @@ jobs:
   # ─── 5. Production deploy ─────────────────────────────────────────────────
   deploy:
     needs: [test, merge-to-main]
+    # NOTE (priority_zero fix): the deploy job used to additionally require
+    # `github.actor == 'github-actions[bot]'` on a main push. That silently SKIPPED
+    # this job on any direct/human push to main while the workflow still reported
+    # "success" — so a green deploy.yml run did NOT mean prod was redeployed (prod sat
+    # ~19h stale, confirmed via `fly releases`). The actor gate is dropped: any push to
+    # main deploys, still fully gated on the test job passing. The promote=yes dispatch
+    # remains the preferred path (it adds preview + smoke first), but a direct main push
+    # can no longer masquerade as a successful deploy.
     if: >
       always() &&
       (needs.test.result == 'success' || needs.test.result == 'skipped') &&
       (needs.merge-to-main.result == 'success' || needs.merge-to-main.result == 'skipped') &&
       ((github.ref == 'refs/heads/main' &&
-        github.event_name == 'push' &&
-        github.actor == 'github-actions[bot]') ||
+        github.event_name == 'push') ||
        github.event_name == 'workflow_dispatch' ||
        startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
