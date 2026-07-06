@@ -12817,6 +12817,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load documents: ${escapeHtml(String(e3))}</div>`;
       return;
     }
+    let peeks = [];
+    try {
+      const pk = await api("/document-peeks");
+      peeks = pk && pk.peeks || [];
+    } catch (_2) {
+      peeks = [];
+    }
     const _srcBadge = (src) => {
       const s3 = String(src || "local").toLowerCase();
       const label = s3.includes("onedrive") ? "OneDrive" : s3.includes("gdrive") || s3.includes("google") ? "GDrive" : src || "local";
@@ -12829,7 +12836,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     <input type="file" id="doc-upload-input-${escapeHtml(String(projectId))}" accept=".txt,.md" style="font-size:10px;flex:1;min-width:0" />
     <button id="doc-upload-btn-${escapeHtml(String(projectId))}" class="secondary" style="font-size:10px;padding:3px 10px" disabled>Upload .txt/.md</button>
   </div>
-  <div id="doc-upload-status-${escapeHtml(String(projectId))}" style="font-size:9px;color:var(--muted);margin-bottom:8px">Plain .txt / .md only \u2014 the file text is read in your browser and stored as a searchable document note.</div>`;
+  <div id="doc-upload-status-${escapeHtml(String(projectId))}" style="font-size:9px;color:var(--muted);margin-bottom:4px">Plain .txt / .md only \u2014 read in your browser, stored as a searchable document note.</div>
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px;padding:6px 8px;border-left:2px solid var(--accent);background:var(--surface-1)">\u{1F4C4} <b>Word / PDF?</b> Ingest it with the <code>ingest_document</code> MCP tool (<code>file_path</code> or <code>content</code>) \u2014 it saves as a searchable <code>kind=document</code> note and appears above. A <code>get_document_structure</code> peek only reads the outline; it does <b>not</b> save the doc (those show under \u201CRecently viewed\u201D below).</div>`;
     if (!docs.length) {
       html += `<div class="empty" style="color:var(--muted);padding:8px 0">No documents ingested yet. Upload a .txt/.md above, or ingest a Word/PDF doc with the <code>ingest_document</code> MCP tool (file_path or content) \u2014 it is stored as a project note with kind=document and appears here.</div>`;
     } else {
@@ -12850,7 +12858,39 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
       html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
     }
+    if (peeks.length) {
+      html += `<div id="doc-peeks-section-${escapeHtml(String(projectId))}" style="margin-top:16px">
+      <div style="font-size:10px;font-weight:600;color:var(--accent)">Recently viewed (not saved) \u2014 ${peeks.length}</div>
+      <div style="font-size:9px;color:var(--muted);margin:2px 0 8px">Peeked with <code>get_document_structure</code> (a stateless outline read) but never ingested \u2014 so they are NOT searchable here. Ingest one to save it.</div>`;
+      for (const pk of peeks) {
+        const fp = String(pk.file_path || "");
+        const failed = pk.ok === false;
+        html += `<div style="border:1px dashed var(--border);border-radius:4px;padding:6px 10px;margin-bottom:6px;background:var(--surface-1)">
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+          <span style="font-size:9px;color:var(--muted);font-family:var(--font-mono);word-break:break-all">${escapeHtml(fp)}</span>
+          <button class="doc-peek-ingest-btn" data-fp="${escapeHtml(fp)}" style="font-size:9px;padding:2px 8px;white-space:nowrap">Ingest this</button>
+        </div>
+        <div style="font-size:8px;color:var(--muted);margin-top:2px">viewed ${escapeHtml(String(pk.viewed_at || ""))}${failed ? " \xB7 peek failed (hosted \u2014 no file access)" : ""}</div>
+      </div>`;
+      }
+      html += `</div>`;
+    }
     body.innerHTML = html;
+    body.querySelectorAll(".doc-peek-ingest-btn").forEach((el2) => {
+      el2.addEventListener("click", () => {
+        const fp = el2.getAttribute("data-fp") || "";
+        const cmd = `ingest_document(file_path="${fp}")`;
+        try {
+          navigator.clipboard.writeText(cmd);
+        } catch (_2) {
+        }
+        const prev = el2.textContent;
+        el2.textContent = "Copied \u2713";
+        setTimeout(() => {
+          el2.textContent = prev || "Ingest this";
+        }, 1500);
+      });
+    });
     const _fileInput = document.getElementById(`doc-upload-input-${projectId}`);
     const _uploadBtn = document.getElementById(`doc-upload-btn-${projectId}`);
     const _uploadStatus = document.getElementById(`doc-upload-status-${projectId}`);

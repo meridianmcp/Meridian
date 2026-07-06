@@ -1153,3 +1153,47 @@ def test_activity_by_domain_chart_renders(demo_client):
             browser.close()
         finally:
             server.should_exit = True
+
+
+@pytestmark_playwright
+def test_documents_tab_shows_peeks_and_ingest_copy(demo_client):
+    """79ee73e8 — the Documents tab renders the 'Recently viewed (not saved)' peek
+    section (with a one-click Ingest button) + the prominent ingest_document copy
+    that distinguishes stateless peeks from ingested docs — verified in a browser."""
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+    from meridian import doc_peeks
+
+    doc_peeks.clear()
+    doc_peeks.record_peek(None, "/thesis/chapter1.docx")  # same process as the server
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17893, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17893/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
+            try:
+                page.click("#demo-onboarding-overlay button[title='Dismiss']", timeout=1500)
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            page.wait_for_selector('.vtab-btn[data-vtab="documents"]', timeout=8000)
+            page.click('.vtab-btn[data-vtab="documents"]')
+            page.wait_for_selector("text=Recently viewed (not saved)", timeout=8000)
+            content = page.content()
+            assert "Recently viewed (not saved)" in content
+            assert "/thesis/chapter1.docx" in content
+            assert "Word / PDF?" in content  # prominent ingest_document callout
+            assert page.locator(".doc-peek-ingest-btn").count() >= 1
+            browser.close()
+        finally:
+            server.should_exit = True
+            doc_peeks.clear()
