@@ -314,3 +314,94 @@ async def test_generate_handoff_surfaces_skip_note_when_searcher_errors(db, tmp_
     assert "enrichment skipped" in content
     assert "graph searcher errored" in content
     assert "MERIDIAN_CONTEXT" in content
+
+
+# ---------------------------------------------------------------------------
+# 10bfe531 — source_type-aware prospecting: MANUAL items are skipped, and non-code
+# items are prospected via injected backends into a validated generic pointer
+# (2976e168 primitive) instead of code_pointers.
+# ---------------------------------------------------------------------------
+
+
+def test_infer_pointer_source_type_classifies():
+    infer = handoff_module._infer_pointer_source_type
+    assert infer({"title": "Fix OAuth redirect bug"}) == "code"
+    assert infer({"title": "Wire Zotero citation keys into the brief"}) == "citation"
+    assert infer({"title": "get_document_structure docx outline persistence"}) == "docs"
+    assert infer({"title": "Run the DocBank benchmark ablation"}) == "experiment"
+    # tags participate in the classification too
+    assert infer({"title": "misc", "tags": "latex,structure"}) == "docs"
+
+
+@pytest.mark.asyncio
+async def test_annotate_skips_manual_items():
+    """A MANUAL/human item must never be prospected — no misleading pointer, and the
+    searcher is not even consulted (verified fix for the pre-10bfe531 behaviour where
+    MANUAL items reached the code-pointer pass)."""
+    called: list[str] = []
+
+    def searcher(query):
+        called.append(query)
+        return [{"file": "x.py", "function": "y", "qualified_name": "y"}]
+
+    manual_by_title = {"id": "m1", "title": "MANUAL (Adam): form an LLC", "status": "pending"}
+    manual_by_human = {"id": "m2", "title": "install the binary", "human_id": "adam", "status": "pending"}
+    manual_by_milestone = {"id": "m3", "title": "capture screenshots", "milestone_type": "human", "status": "pending"}
+    out = await handoff_module._annotate_code_pointers(
+        [manual_by_title, manual_by_human, manual_by_milestone], searcher
+    )
+    assert called == []  # searcher never consulted for MANUAL items
+    for it in out:
+        assert "code_pointers" not in it
+        assert "pointer_source_type" not in it
+
+
+@pytest.mark.asyncio
+async def test_annotate_non_code_item_uses_injected_prospector():
+    """A non-code item is prospected with the matching injected backend and gets a
+    validated generic pointer (not code_pointers)."""
+    item = {
+        "id": "c1",
+        "title": "Wire Zotero citation keys into the planning brief",
+        "status": "pending",
+    }
+
+    def citation_prospector(query):
+        return [{
+            "uri": "zotero://select/items/ABCD1234",
+            "selector": {"type": "zotero_key", "key": "ABCD1234"},
+            "label": "Kalai et al 2025",
+        }]
+
+    out = await handoff_module._annotate_code_pointers(
+        [item], searcher=None, prospectors={"citation": citation_prospector}
+    )
+    assert out[0]["pointer_source_type"] == "citation"
+    assert "code_pointers" not in out[0]
+    ptr = out[0]["pointers"][0]
+    assert ptr["source_type"] == "citation"
+    assert ptr["targets"][0]["selector"]["key"] == "ABCD1234"
+    assert ptr["label"] == "Kalai et al 2025"
+
+
+@pytest.mark.asyncio
+async def test_annotate_non_code_item_without_backend_is_not_mis_prospected():
+    """A non-code item with only the code searcher wired gets NO pointer (never a
+    spurious code pointer), but its inferred source_type is still recorded."""
+    item = {
+        "id": "d1",
+        "title": "PAPER: OOXML-Graph docx structure benchmark",
+        "status": "pending",
+    }
+
+    def code_searcher(query):
+        return [{
+            "file": "meridian/docs_intel.py",
+            "function": "document_outline",
+            "qualified_name": "document_outline",
+        }]
+
+    out = await handoff_module._annotate_code_pointers([item], code_searcher)
+    assert out[0]["pointer_source_type"] in ("docs", "experiment", "citation")
+    assert "code_pointers" not in out[0]
+    assert "pointers" not in out[0]
