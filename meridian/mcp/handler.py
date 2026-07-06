@@ -2043,6 +2043,27 @@ async def _handle_notes_decisions(
         fp = args.get("file_path")
         if not fp:
             return {"error": "file_path is required"}
+        # b43bab91 — this reads the .docx from the SERVER's own filesystem
+        # (zipfile.ZipFile), so it only works self-hosted, where the server and the
+        # files share a machine. On hosted Meridian (Fly.io) the server has ZERO
+        # access to a caller's local path, so the read would fail with a misleading
+        # "file not found" regardless of tunnel/file state. Fail honestly instead:
+        # tell the caller why and what to do (self-host, or read via the tunnel's
+        # word-document tools, which proxy to their machine — unlike this native
+        # tool, which does not).
+        if _hosted_mode():
+            return {
+                "error": (
+                    "get_document_structure reads the .docx from the Meridian "
+                    "server's own filesystem, so on hosted Meridian it cannot open a "
+                    "path on your machine (that is what surfaces as a misleading "
+                    "'file not found'). Run Meridian self-hosted so the server shares "
+                    "a filesystem with the file, or read the document through your "
+                    "tunnel's word-document tools, which proxy to your machine."
+                ),
+                "hosted": True,
+                "file_path": fp,
+            }
         try:
             from ..docs_intel import document_outline  # noqa: PLC0415
             return document_outline(fp)
@@ -2061,6 +2082,25 @@ async def _handle_notes_decisions(
         src = args.get("source")
         if not fp and not src:
             return {"error": "file_path or source is required"}
+        # b43bab91 — a file_path is read from the SERVER filesystem and is
+        # unreadable on hosted Meridian (same root cause as get_document_structure).
+        # But get_latex_structure ALSO accepts inline `source`, which DOES work
+        # hosted — so on hosted prefer source, and fail honestly when only an
+        # unreadable path was given.
+        if _hosted_mode() and fp:
+            if src:
+                fp = None  # server can't open the caller's path; use inline source
+            else:
+                return {
+                    "error": (
+                        "get_latex_structure reads the .tex from the Meridian "
+                        "server's filesystem, so on hosted Meridian it cannot open a "
+                        "path on your machine. Pass the file contents inline via "
+                        "`source`, or run Meridian self-hosted."
+                    ),
+                    "hosted": True,
+                    "file_path": fp,
+                }
         from ..latex_intel import analyze_latex  # noqa: PLC0415
         try:
             if fp:
