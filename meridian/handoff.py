@@ -1029,44 +1029,117 @@ def _code_pointer_query(title: str, kws: set[str]) -> str:
     ) or title.strip()
 
 
+# 10bfe531 — handoff prospecting is source_type-aware, not code-only. Keyword
+# signals (title + tags) map an item to the pointer source_type that fits it. `code`
+# is the default and the one prospector wired in production today; docs/citation/
+# experiment are reached through an injected prospector seam (2976e168 primitive).
+_POINTER_SOURCE_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("citation", ("zotero", "citation", "bibliograph", "arxiv", " doi", "\\cite", "paper", "related work")),
+    ("docs", ("docx", "ooxml", "latex", "\\section", "document structure", "document outline", ".doc")),
+    ("experiment", ("benchmark", "experiment", "ablation", "dataset", "evaluation", " eval", "finding", "reproduc")),
+)
+
+
+def _infer_pointer_source_type(item: dict[str, Any]) -> str:
+    """10bfe531 — classify the pointer source_type that best fits a sprint item so
+    handoff prospecting isn't code-only. Cheap keyword scan over title + tags;
+    defaults to ``code`` (the overwhelmingly common case in this repo). Returns one of
+    ``citation`` | ``docs`` | ``experiment`` | ``code``."""
+    text = ((item.get("title") or "") + " " + str(item.get("tags") or "")).lower()
+    for stype, needles in _POINTER_SOURCE_KEYWORDS:
+        if any(n in text for n in needles):
+            return stype
+    return "code"
+
+
+def _build_generic_pointer(source_type: str, match: Any) -> dict[str, Any] | None:
+    """10bfe531 — turn a non-code prospector match into a validated generic pointer
+    (2976e168 primitive). Accepts a ready-made ``{targets: [...]}`` shape or a single
+    ``{uri, selector}`` target. Returns a validated pointer, or None when it can't be
+    made valid — best-effort, never raises."""
+    if not isinstance(match, dict):
+        return None
+    from .pointers import validate_pointer, PointerValidationError  # noqa: PLC0415
+    if isinstance(match.get("targets"), list) and match["targets"]:
+        candidate: dict[str, Any] = {"source_type": source_type, "targets": match["targets"]}
+    elif match.get("uri") and match.get("selector"):
+        candidate = {
+            "source_type": source_type,
+            "targets": [{"uri": match["uri"], "selector": match["selector"]}],
+        }
+    else:
+        return None
+    if match.get("label"):
+        candidate["label"] = str(match["label"])
+    try:
+        return validate_pointer(candidate)
+    except PointerValidationError:
+        return None
+
+
 async def _annotate_code_pointers(
     pending_items: list[dict[str, Any]],
     searcher: Callable[[str], Any] | None,
+    *,
+    prospectors: dict[str, Callable[[str], Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Attach ``code_pointers`` to pending items via a code-graph search.
+    """Prospect a pointer for each NON-MANUAL pending item, by fitting source_type.
 
-    For each item, build a keyword query from its title, call ``searcher``, take
-    the top match, normalise it to {file, function, qualified_name}, and store it
-    as ``item["code_pointers"]`` (a one-element list). Items with no match are
-    left untouched.
+    10bfe531 — generalized beyond code: each item is classified via
+    :func:`_infer_pointer_source_type` to ``code`` / ``docs`` / ``citation`` /
+    ``experiment``. ``code`` items are searched with ``searcher`` (the code-graph
+    search) and get a ``code_pointers`` entry, exactly as before. Non-code items are
+    searched with an injected ``prospectors[source_type]`` callable and get a
+    validated generic ``pointers`` entry (2976e168 primitive). The classification is
+    recorded on each prospected item as ``pointer_source_type``. The function name is
+    retained for the existing call site and the monkeypatch tests.
 
-    ``searcher`` may be a coroutine function or a plain callable; results may be
-    a list, a dict with a ``results``/``matches`` key, or a single match dict.
+    MANUAL/human items are skipped entirely — prospecting a maintainer todo (e.g.
+    "form an LLC") only attaches misleading pointers. A non-code item whose backend
+    isn't wired is left un-pointered rather than falling back to a code search, which
+    would attach a spurious code pointer to a paper/citation/experiment item.
 
-    Robustness contract: this must NEVER raise. All failures degrade to no
-    pointer for that item — generate_handoff is mandatory and breaking it is
-    unacceptable.
+    ``searcher`` / prospectors may be sync or coroutine callables; results may be a
+    list, a ``{results|matches: [...]}`` dict, or a single match dict.
+
+    Robustness contract: this must NEVER raise. All failures degrade to no pointer for
+    that item — generate_handoff is mandatory and breaking it is unacceptable.
     """
-    if searcher is None:
+    registry: dict[str, Callable[[str], Any]] = dict(prospectors or {})
+    if searcher is not None:
+        registry.setdefault("code", searcher)
+    if not registry:
         return pending_items
     for item in pending_items[:_MAX_ENRICHED_ITEMS]:
-        if item.get("code_pointers"):
+        if item.get("code_pointers") or item.get("pointers"):
             continue
+        if _is_manual_sprint_item(item):
+            continue  # 10bfe531 — never prospect MANUAL/human maintainer items
         title = item.get("title") or ""
         kws = _extract_keywords(title)
         if not kws:
             continue
+        stype = _infer_pointer_source_type(item)
+        item["pointer_source_type"] = stype
+        prospector = registry.get(stype)
+        if prospector is None:
+            continue  # no backend for this source_type yet — don't mis-prospect
         query = _code_pointer_query(title, kws)
         try:
-            result = searcher(query)
+            result = prospector(query)
             if hasattr(result, "__await__"):
                 result = await result  # type: ignore[misc]
             matches = _coerce_match_list(result)
             if not matches:
                 continue
-            pointer = _normalize_code_pointer(matches[0])
-            if pointer:
-                item["code_pointers"] = [pointer]
+            if stype == "code":
+                pointer = _normalize_code_pointer(matches[0])
+                if pointer:
+                    item["code_pointers"] = [pointer]
+            else:
+                gp = _build_generic_pointer(stype, matches[0])
+                if gp:
+                    item["pointers"] = [gp]
         except Exception:  # noqa: BLE001 — enrichment is best-effort, never fatal
             continue
     return pending_items

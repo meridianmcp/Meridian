@@ -3255,6 +3255,20 @@ function buildTabBody(project: any) {
 
           <div class="live-section">
 
+            <div class="live-section-label">In progress · by session</div>
+
+            <div id="live-inprogress-by-session-${project.id}" class="live-inprogress-by-session">
+
+              <div class="live-empty">Nothing in progress right now.</div>
+
+            </div>
+
+          </div>
+
+          <hr class="live-divider">
+
+          <div class="live-section">
+
             <div class="live-section-label">Active sessions</div>
 
             <div class="live-sessions" id="live-sessions-${project.id}">
@@ -4694,6 +4708,70 @@ const liveRefreshState: Record<string, any> = {}; // keyed by projectId
 
 
 
+// e19c3ca2 — live parallelization: group the CURRENTLY in_progress sprint items by
+// the session (actor) that owns each, color-coded per session, so concurrent
+// execution is visible at a glance. Data is already fetched by refreshLiveTab; this
+// only reshapes + paints it. Distinct from the historical Sessions timeline (1e1bd6b0).
+function renderInProgressBySession(projectId: any, sprintItems: any[], sessions: any[]) {
+  const root = document.getElementById(`live-inprogress-by-session-${projectId}`);
+  if (!root) return;
+  const sessById: Record<string, any> = {};
+  for (const s of (sessions || [])) sessById[String(s.id)] = s;
+
+  const inProgress = (sprintItems || []).filter((it: any) => String(it.status) === 'in_progress');
+  if (!inProgress.length) {
+    root.innerHTML = '<div class="live-empty">Nothing in progress right now.</div>';
+    return;
+  }
+
+  const byActor: Record<string, any[]> = {};
+  const unassigned: any[] = [];
+  for (const it of inProgress) {
+    const actor = it.actor ? String(it.actor) : '';
+    if (actor) (byActor[actor] = byActor[actor] || []).push(it);
+    else unassigned.push(it);
+  }
+
+  const _hue = (s: string) => { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360; return h; };
+  const _elapsed = (ts: any) => {
+    if (!ts) return '';
+    const t = Date.parse(String(ts).replace(' ', 'T'));
+    if (isNaN(t)) return '';
+    const mins = Math.max(0, Math.floor((Date.now() - t) / 60000));
+    return mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h${mins % 60}m`;
+  };
+  const _item = (it: any, color: string) => `<div class="live-ip-item" style="display:flex;gap:6px;align-items:center;margin-top:4px">
+      <span style="width:5px;height:5px;border-radius:50%;background:${color};flex:none"></span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${escapeHtml(String(it.nickname || it.title || it.id || ''))}</span>
+      ${_elapsed(it.claimed_at) ? `<span style="font-size:9px;color:var(--muted);flex:none">${_elapsed(it.claimed_at)}</span>` : ''}
+    </div>`;
+
+  // Busiest session first so the most-active executor leads.
+  const actors = Object.keys(byActor).sort((a, b) => byActor[b].length - byActor[a].length);
+  let html = '';
+  for (const actor of actors) {
+    const sess = sessById[actor] || {};
+    const color = `hsl(${_hue(actor)} 70% 55%)`;
+    const name = sess.name || `${actor.slice(0, 8)}…`;
+    const status = String(sess.status || 'unknown');
+    html += `<div class="live-ip-owner" data-session="${escapeHtml(actor)}" style="border-left:3px solid ${color};padding:4px 0 4px 8px;margin-bottom:8px">
+      <div style="display:flex;gap:6px;align-items:center;justify-content:space-between">
+        <span style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml(String(name))}</span>
+        <span style="font-size:9px;padding:0 5px;border-radius:3px;border:1px solid ${color};color:${color}">${status === 'active' ? 'ACTIVE' : escapeHtml(status.toUpperCase())} · ${byActor[actor].length}</span>
+      </div>
+      ${byActor[actor].map((it: any) => _item(it, color)).join('')}
+    </div>`;
+  }
+  if (unassigned.length) {
+    html += `<div class="live-ip-owner" style="border-left:3px solid var(--muted);padding:4px 0 4px 8px">
+      <div style="font-size:10px;font-weight:600;color:var(--muted)">Unassigned · ${unassigned.length}</div>
+      ${unassigned.map((it: any) => _item(it, 'var(--muted)')).join('')}
+    </div>`;
+  }
+  root.innerHTML = html;
+}
+
+
 function scheduleLiveRefresh(projectId: any) {
 
   const s = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
@@ -5031,6 +5109,16 @@ async function refreshLiveTab(projectId: any) {
         wireProjectLoadRetry(sprintRoot, projectId);
 
       }
+
+    }
+
+
+
+    // e19c3ca2 — live parallelization: group the currently-in_progress sprint items
+    // by the session that owns each (needs both the sprint items and the sessions).
+    if (sprintItemsResult.status === 'fulfilled' && sessionsResult.status === 'fulfilled') {
+
+      renderInProgressBySession(projectId, sprintItemsResult.value || [], sessionsResult.value || []);
 
     }
 
@@ -7166,15 +7254,13 @@ async function loadInsightsTab(projectId: any) {
     return;
   }
 
-  const HORIZON: Record<string, { label: string; color: string }> = {
-    permanent: { label: 'PERMANENT', color: 'var(--accent)' },
-    year: { label: 'YEAR', color: 'var(--warning, #d29922)' },
-    quarter: { label: 'QUARTER', color: 'var(--muted)' },
-  };
-  const _pill = (h: any) => {
-    const m = HORIZON[String(h)] || { label: String(h || 'quarter').toUpperCase(), color: 'var(--muted)' };
-    return `<span style="font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid ${m.color};color:${m.color};letter-spacing:.04em">${m.label}</span>`;
-  };
+  // aefebc9c — horizon buckets rendered as labelled sub-sections (below), so the
+  // header count and the visible list agree instead of an unseparated mix.
+  const HORIZONS: Array<{ key: string; label: string; color: string }> = [
+    { key: 'permanent', label: 'PERMANENT', color: 'var(--accent)' },
+    { key: 'year', label: 'YEAR', color: 'var(--warning, #d29922)' },
+    { key: 'quarter', label: 'QUARTER', color: 'var(--muted)' },
+  ];
 
   let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
     <div style="font-size:11px;color:var(--text)"><b>${insights.length}</b> insight${insights.length === 1 ? '' : 's'}</div>
@@ -7184,18 +7270,30 @@ async function loadInsightsTab(projectId: any) {
   if (!insights.length) {
     html += `<div class="empty" style="color:var(--muted);padding:8px 0">No insights yet. Capture accumulated understanding with <code>add_insight(project_id, title, body, horizon)</code>.</div>`;
   } else {
-    const order: Record<string, number> = { permanent: 0, year: 1, quarter: 2 };
-    const sorted = [...insights].sort((a, b) => (order[String(a.horizon)] ?? 3) - (order[String(b.horizon)] ?? 3));
-    for (const ins of sorted) {
+    // aefebc9c — bucket by horizon; unknown horizons fall into QUARTER. The badge
+    // above counts insights.length (all shown) and each section prints its own
+    // count, so the total and the sum of the sections always agree.
+    const buckets: Record<string, any[]> = { permanent: [], year: [], quarter: [] };
+    for (const ins of insights) {
+      const h = String(ins.horizon || 'quarter').toLowerCase();
+      (buckets[h] || buckets.quarter).push(ins);
+    }
+    const _renderCard = (ins: any) => {
       const tags = String(ins.tags || '').split(',').map((t: string) => t.trim()).filter(Boolean);
-      html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
-        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
-          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(ins.title || ''))}</span>
-          ${_pill(ins.horizon)}
-        </div>
+      return `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+        <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(ins.title || ''))}</div>
         ${ins.body ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;white-space:pre-wrap">${escapeHtml(String(ins.body))}</div>` : ''}
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t: string) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(t)}</span>`).join('')}</div>` : ''}
       </div>`;
+    };
+    for (const hz of HORIZONS) {
+      const items = buckets[hz.key];
+      if (!items.length) continue;
+      html += `<div class="insights-horizon-section" data-horizon="${hz.key}" style="display:flex;align-items:center;gap:6px;margin:12px 0 6px;padding-bottom:3px;border-bottom:1px solid ${hz.color}">
+        <span style="font-size:9px;font-weight:700;letter-spacing:.05em;color:${hz.color}">${hz.label}</span>
+        <span style="font-size:9px;color:var(--muted)">${items.length}</span>
+      </div>`;
+      for (const ins of items) html += _renderCard(ins);
     }
   }
   body.innerHTML = html;
@@ -7582,10 +7680,11 @@ async function loadCodeIntelTab(projectId: any) {
       </div>
     </div>`;
 
-    // ff8ff615 — the Preact CodeIntelPanel renders the layered package DAG +
-    // zoom + Generate Map into this mount point (mounted after body.innerHTML).
-    html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
-
+    // fa9c9abd — the new hierarchical drill-down (ed5512b6) LEADS: injected first so
+    // it renders above the older flat layered panel. A live screenshot suggested the
+    // new codegraph was "unreachable"; it was actually wired and rendering, just below
+    // the old panel. Both mounts below resolve their container by id, so DOM order is
+    // set purely by this html-build order — reordering here is safe.
     // ed5512b6 — the standalone codegraph visualizer (folder->file->function
     // drill-down, color by role, static metadata on click). Mounted after
     // body.innerHTML via the thin adapter below; the module never reaches back
@@ -7594,6 +7693,10 @@ async function loadCodeIntelTab(projectId: any) {
       <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Code Tree</div>
       <div id="${_cgId}-codegraph"></div>
     </div>`;
+
+    // ff8ff615 — the Preact CodeIntelPanel renders the layered package DAG +
+    // zoom + Generate Map into this mount point (mounted after body.innerHTML).
+    html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
 
     // Index status per repo path
     html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
