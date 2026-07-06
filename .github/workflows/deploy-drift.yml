@@ -1,0 +1,55 @@
+name: Deploy drift check
+
+# 056b712f — compare the git SHA prod is ACTUALLY running (from /health) against the
+# latest main commit, and page the admin (ntfy) when prod has drifted behind. The
+# durable, mechanism-independent backstop for the "CI green but prod stale" class of bug
+# (confirmed 2026-07-06: a deploy-job actor gate silently skipped every direct-push
+# deploy and prod sat ~19h behind main while every workflow reported success).
+
+on:
+  schedule:
+    - cron: '15 */2 * * *'   # every 2 hours at :15
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Base URL to check (default: prod)'
+        required: false
+        default: 'https://usemeridian.us'
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check deploy drift
+        id: drift
+        run: |
+          URL="${{ github.event.inputs.url || 'https://usemeridian.us' }}"
+          python3 scripts/deploy_drift.py --url "$URL" --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Page admin on drift (ntfy)
+        if: failure() && steps.drift.outcome == 'failure'
+        run: |
+          NTFY="${{ secrets.MERIDIAN_ADMIN_NTFY_URL }}"
+          if [ -z "$NTFY" ]; then
+            echo "MERIDIAN_ADMIN_NTFY_URL not set — relying on GitHub's native failure email."
+            exit 0
+          fi
+          case "$NTFY" in
+            *://*) TARGET="$NTFY" ;;
+            *)     TARGET="https://ntfy.sh/${NTFY#/}" ;;
+          esac
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s --max-time 10 \
+            -H "Title: [Meridian] Prod deploy DRIFT detected" \
+            -H "Priority: high" \
+            -H "Tags: warning,meridian-drift" \
+            -d "Prod is running an image behind main (CI-green-but-stale). Run: $RUN_URL" \
+            "$TARGET" || echo "ntfy post failed (non-fatal)"

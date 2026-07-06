@@ -176,7 +176,13 @@ def test_dashboard_self_hosted_ok(client):
 def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "service": "meridian"}
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["service"] == "meridian"
+    # 056b712f — /health also reports the running build's git SHA + version so a
+    # deploy-drift check can compare what prod runs against the latest main commit.
+    assert "git_sha" in body
+    assert "version" in body
 
 
 def test_failover_status_default_false(client, monkeypatch):
