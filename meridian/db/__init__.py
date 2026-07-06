@@ -2692,6 +2692,72 @@ async def get_sessions(
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+def _session_item_outcome(item_status: str | None, session_status: str) -> str:
+    """1e1bd6b0 — derive a sprint item's outcome WITHIN a session.
+
+    Distinguishes 'stopped-ambiguously' (the session ended while the item it had
+    claimed was still in_progress — a silent stop, not a real failure) from
+    'failed' (the item actively errored). This is the crux of the session-timeline
+    view: telling "the session died" apart from "the work failed".
+    """
+    s = (item_status or "").lower()
+    if s in ("done", "pushed", "provisional_complete"):
+        return "done"
+    if s == "failed":
+        return "failed"
+    if s == "in_progress":
+        return "stopped-ambiguously" if session_status in ("closed", "archived") else "in_progress"
+    return s or "unknown"
+
+
+async def get_executor_session_timeline(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, Any]:
+    """1e1bd6b0 — per-executor-session timeline, items grouped by item_group.
+
+    Each session carries its start (``created_at``) / end (``last_seen`` once
+    closed) + the sprint items it acted on (matched via ``sprint_items.actor``),
+    grouped by ``item_group``, each item tagged with a derived outcome
+    (done / failed / stopped-ambiguously / in_progress). Reuses existing data only
+    — no new tracking. Sessions are newest-first (``get_sessions`` order).
+    """
+    sessions = await get_sessions(db, project_id, active_only=False)
+    items = await get_sprint_items(db, project_id)
+    by_actor: dict[str, list[dict[str, Any]]] = {}
+    for it in items:
+        actor = it.get("actor")
+        if actor:
+            by_actor.setdefault(str(actor), []).append(it)
+
+    out_sessions: list[dict[str, Any]] = []
+    for sess in sessions:
+        sid = str(sess.get("id"))
+        s_status = (sess.get("status") or "active").lower()
+        ended = sess.get("last_seen") if s_status in ("closed", "archived") else None
+        my_items = by_actor.get(sid, [])
+        groups: dict[str, list[dict[str, Any]]] = {}
+        counts = {"done": 0, "failed": 0, "stopped_ambiguously": 0, "in_progress": 0, "other": 0}
+        for it in my_items:
+            outcome = _session_item_outcome(it.get("status"), s_status)
+            key = it.get("item_group") or "(ungrouped)"
+            groups.setdefault(key, []).append({
+                "id": it.get("id"), "title": it.get("title"),
+                "nickname": it.get("nickname"), "status": it.get("status"),
+                "completed_at": it.get("completed_at"), "outcome": outcome,
+            })
+            ck = outcome.replace("-", "_")
+            counts[ck if ck in counts else "other"] += 1
+        out_sessions.append({
+            "id": sid, "name": sess.get("name"),
+            "session_type": sess.get("session_type"), "client_type": sess.get("client_type"),
+            "status": s_status,
+            "started_at": sess.get("created_at"), "ended_at": ended,
+            "groups": [{"item_group": g, "items": its} for g, its in groups.items()],
+            "outcome_counts": counts, "item_count": len(my_items),
+        })
+    return {"project_id": project_id, "sessions": out_sessions}
+
+
 async def log_task(
     db: aiosqlite.Connection,
     session_id: str,

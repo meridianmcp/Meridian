@@ -815,6 +815,20 @@ async def get_timeline_endpoint(
     }
 
 
+@router.get("/projects/{project_id}/session-timeline")
+async def get_session_timeline_endpoint(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """1e1bd6b0 — per-executor-session timeline: each session's start/end + the
+    sprint items it worked (grouped by item_group), each tagged with a derived
+    outcome that tells 'stopped-ambiguously' (session died mid-item) apart from
+    'failed' (item errored). Read-only aggregation over existing timestamps."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.get_executor_session_timeline(await _db(request), project_id)
+
+
 @router.get("/projects/{project_id}/rewind")
 async def get_rewind(
     project_id: str,
