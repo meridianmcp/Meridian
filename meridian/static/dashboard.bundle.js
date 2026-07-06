@@ -10006,6 +10006,8 @@ Current: ${current || "(none)"}`,
 
       <button class="vtab-btn" data-vtab="blog" title="Blog \u2014 workspace posts (draft/published/archived)">\u270D\uFE0F</button>
 
+      <button class="vtab-btn" data-vtab="sessions" title="Sessions \u2014 executor session timeline (done / failed / stopped-ambiguously)">\u{1F552}</button>
+
     </div>
 
     <div class="vtab-drawer open" id="drawer-${project.id}">
@@ -10786,6 +10788,22 @@ Current: ${current || "(none)"}`,
 
       </div>
 
+      <div class="drawer-panel" id="drawer-sessions-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>SESSIONS \xB7 ${escapeHtml(project.name)}</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="sessions-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading\u2026</div>
+
+        </div>
+
+      </div>
+
       <div class="drawer-panel" id="drawer-blog-${project.id}">
 
         <div class="drawer-header">
@@ -10998,6 +11016,7 @@ Current: ${current || "(none)"}`,
           if (vtab === "documents") loadDocumentsTab(project.id);
           if (vtab === "insights") loadInsightsTab(project.id);
           if (vtab === "blog") loadBlogTab(project.id);
+          if (vtab === "sessions") loadSessionTimelineTab(project.id);
         };
       });
       try {
@@ -12644,6 +12663,60 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${ins.body ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;white-space:pre-wrap">${escapeHtml(String(ins.body))}</div>` : ""}
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t3) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(t3)}</span>`).join("")}</div>` : ""}
       </div>`;
+      }
+    }
+    body.innerHTML = html;
+  }
+  async function loadSessionTimelineTab(projectId) {
+    const body = document.getElementById(`sessions-body-${projectId}`);
+    if (!body) return;
+    body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    let data = null;
+    try {
+      data = await api(`/projects/${projectId}/session-timeline`);
+    } catch (e3) {
+      body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load session timeline: ${escapeHtml(String(e3))}</div>`;
+      return;
+    }
+    const sessions = data && data.sessions || [];
+    const OUTCOME = {
+      "done": { label: "DONE", color: "var(--accent)" },
+      "failed": { label: "FAILED", color: "var(--status-failed, #f85149)" },
+      "stopped-ambiguously": { label: "STOPPED?", color: "var(--warning, #d29922)" },
+      "in_progress": { label: "RUNNING", color: "var(--muted)" }
+    };
+    const _pill = (o3) => {
+      const m3 = OUTCOME[String(o3)] || { label: String(o3 || "").toUpperCase(), color: "var(--muted)" };
+      return `<span style="font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid ${m3.color};color:${m3.color};letter-spacing:.04em" title="${escapeHtml(String(o3))}">${m3.label}</span>`;
+    };
+    let html = `<div style="font-size:9px;color:var(--muted);margin-bottom:10px">Per executor session: start/end + the sprint items it worked, grouped by item group. <b>STOPPED?</b> = the session ended while it still had an item claimed (a silent stop) \u2014 distinct from <b>FAILED</b> (the item actively errored).</div>`;
+    if (!sessions.length) {
+      html += `<div class="empty" id="session-timeline-empty" style="color:var(--muted);padding:8px 0">No executor sessions yet.</div>`;
+    } else {
+      for (const s3 of sessions) {
+        const when = s3.ended_at ? `${escapeHtml(String(s3.started_at || ""))} \u2192 ${escapeHtml(String(s3.ended_at))}` : `${escapeHtml(String(s3.started_at || ""))} \u2192 (${escapeHtml(String(s3.status || "active"))})`;
+        html += `<div class="session-timeline-row" style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(s3.name || s3.id || ""))}</span>
+          <span style="font-size:8px;color:var(--muted)">${s3.item_count || 0} item${s3.item_count === 1 ? "" : "s"}</span>
+        </div>
+        <div style="font-size:9px;color:var(--muted);margin-top:2px">${when}</div>`;
+        const groups = s3.groups || [];
+        if (!groups.length) {
+          html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">no sprint items attributed</div>`;
+        } else {
+          for (const g2 of groups) {
+            html += `<div style="margin-top:6px"><div style="font-size:8px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase;margin-bottom:2px">${escapeHtml(String(g2.item_group || ""))}</div>`;
+            for (const it of g2.items || []) {
+              html += `<div style="display:flex;gap:6px;align-items:center;justify-content:space-between;padding:2px 0">
+              <span style="font-size:10px;color:var(--text)">${escapeHtml(String(it.nickname || it.title || ""))}</span>
+              ${_pill(it.outcome)}
+            </div>`;
+            }
+            html += `</div>`;
+          }
+        }
+        html += `</div>`;
       }
     }
     body.innerHTML = html;
