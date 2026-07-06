@@ -119,6 +119,82 @@ def _update_notice(local: str, server: str) -> str | None:
     return None
 
 
+# 23ba76a2 — tunnel self-update policy. The SAFE DEFAULT is notify-then-explicit-
+# confirm ('ask'), never a silent full-auto update while a session may be live (that
+# risks corrupting in-progress work). Tiers: off (no notice) | warn (notice only,
+# the legacy behaviour) | ask (notice + require a keypress before updating) |
+# full-auto (update without asking — opt-in only, never the default).
+_VALID_UPDATE_MODES = ("off", "warn", "ask", "full-auto")
+
+
+def _resolve_update_mode() -> str:
+    """Return the tunnel update mode, read live from ``MERIDIAN_TUNNEL_UPDATE_MODE``.
+
+    Unknown/blank values fall back to ``'ask'`` (the safe notify-then-confirm default)
+    rather than to any auto-update, so a typo can never silently enable full-auto.
+    """
+    raw = str(os.environ.get("MERIDIAN_TUNNEL_UPDATE_MODE", "") or "").strip().lower()
+    return raw if raw in _VALID_UPDATE_MODES else "ask"
+
+
+def _update_action(mode: str, local: str, server: str, is_tty: bool) -> str:
+    """Decide what the update nudge should DO — pure + testable, no I/O.
+
+    Returns one of:
+      * ``'none'``    — no newer version (or mode ``off``): do nothing.
+      * ``'notify'``  — print the upgrade notice only.
+      * ``'confirm'`` — print the notice AND ask for an explicit keypress before updating.
+      * ``'auto'``    — update without asking (mode ``full-auto`` only).
+
+    ``ask`` degrades to ``notify`` when stdin isn't a TTY: a backgrounded/daemonized
+    tunnel can't be prompted, so it must never block or hang waiting on input.
+    """
+    if not _update_notice(local, server):
+        return "none"  # not newer / missing / unparseable
+    m = mode if mode in _VALID_UPDATE_MODES else "ask"
+    if m == "off":
+        return "none"
+    if m == "warn":
+        return "notify"
+    if m == "full-auto":
+        return "auto"
+    return "confirm" if is_tty else "notify"  # 'ask'
+
+
+def _perform_self_update() -> bool:
+    """Best-effort in-place upgrade via whatever installed meridian (uv, then pipx).
+
+    Installs the new version — which takes effect on the NEXT launch; we never hot-swap
+    the running process mid-session. Fully guarded; returns True only on a clean exit,
+    and always leaves the tunnel able to continue on the current version.
+    """
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    if shutil.which("uv"):
+        cmd = ["uv", "tool", "install", "meridian-server", "--upgrade"]
+    elif shutil.which("pipx"):
+        cmd = ["pipx", "upgrade", "meridian-server"]
+    else:
+        print(
+            "  no uv/pipx found — upgrade manually: uv tool install meridian-server --upgrade",
+            flush=True,
+        )
+        return False
+    print(f"  updating: {' '.join(cmd)}", flush=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except Exception as exc:  # noqa: BLE001 — an update must never crash the tunnel
+        print(f"  update failed to run ({exc}); upgrade manually.", flush=True)
+        return False
+    if proc.returncode == 0:
+        print("  updated — restart the tunnel to run the new version.", flush=True)
+        return True
+    _err = (proc.stderr or proc.stdout or "").strip()[:200]
+    print(f"  update exited {proc.returncode}: {_err}", flush=True)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # SlotProxy — lazy-spawn subprocess manager (3649a61a)
 # ---------------------------------------------------------------------------
@@ -2891,9 +2967,26 @@ async def run_tunnel(
     try:
         _srv_ver = me.get("server_version")
         if _srv_ver:
-            _notice = _update_notice(__version__, str(_srv_ver))
-            if _notice:
-                print(_notice, flush=True)
+            # 23ba76a2 — branch on the update mode (default 'ask' = notify-then-confirm).
+            _action = _update_action(
+                _resolve_update_mode(), __version__, str(_srv_ver), sys.stdin.isatty()
+            )
+            if _action != "none":
+                _notice = _update_notice(__version__, str(_srv_ver))
+                if _notice:
+                    print(_notice, flush=True)
+                if _action == "confirm":
+                    try:
+                        _ans = input("  Update now? [y/N] ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        _ans = ""
+                    if _ans in ("y", "yes"):
+                        _perform_self_update()
+                    else:
+                        print("  skipped — continuing on the current version.", flush=True)
+                elif _action == "auto":
+                    print("  update mode is full-auto — updating now.", flush=True)
+                    _perform_self_update()
     except Exception:  # noqa: BLE001 — informational only, never block startup
         pass
     print("  Tunnel URLs (for Cursor / non-claude.ai clients only):", flush=True)
