@@ -121,13 +121,13 @@
   }
   var _toastTimer;
   function toast2(msg, isError = false) {
-    const el = document.getElementById("toast");
-    if (!el) return;
-    el.textContent = msg;
-    el.classList.toggle("error", isError);
-    el.classList.add("show");
+    const el2 = document.getElementById("toast");
+    if (!el2) return;
+    el2.textContent = msg;
+    el2.classList.toggle("error", isError);
+    el2.classList.add("show");
     clearTimeout(_toastTimer);
-    _toastTimer = setTimeout(() => el.classList.remove("show"), 2600);
+    _toastTimer = setTimeout(() => el2.classList.remove("show"), 2600);
   }
   function escapeHtml2(s3) {
     const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -390,8 +390,8 @@
       '[id^="codex-regen-goal-"]'
     ];
     selectors.forEach((sel) => {
-      document.querySelectorAll(sel).forEach((el) => {
-        el.style.display = "none";
+      document.querySelectorAll(sel).forEach((el2) => {
+        el2.style.display = "none";
       });
     });
     const writeBtnSelectors = [
@@ -426,12 +426,12 @@
     });
   }
   function showDemoReadonlyToast2() {
-    const el = document.getElementById("toast");
-    if (!el) return;
-    el.innerHTML = 'Read-only demo \u2014 <a href="/auth/login" style="color:#fff;font-weight:600;text-decoration:underline">sign in for full access \u2192</a>';
-    el.classList.add("error", "show");
+    const el2 = document.getElementById("toast");
+    if (!el2) return;
+    el2.innerHTML = 'Read-only demo \u2014 <a href="/auth/login" style="color:#fff;font-weight:600;text-decoration:underline">sign in for full access \u2192</a>';
+    el2.classList.add("error", "show");
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => el.classList.remove("show"), 3200);
+    toast._t = setTimeout(() => el2.classList.remove("show"), 3200);
   }
   function showDemoOnboardingOverlay2() {
     if (document.getElementById("demo-onboarding-overlay")) return;
@@ -976,7 +976,7 @@
       calendar: calendars,
       series
     });
-    const renderDetail = (person, date) => {
+    const renderDetail2 = (person, date) => {
       const list = detailByPersonDay[`${person}|${date}`] || [];
       if (!list.length) {
         detailBox.innerHTML = `<span style="color:var(--muted)">${escapeHtml(date)} \u2014 no sessions</span>`;
@@ -991,7 +991,7 @@
     };
     chart.on("click", (params) => {
       if (params.componentType !== "series" || !params.data || !params.data.value) return;
-      renderDetail(params.data.person, params.data.value[0]);
+      renderDetail2(params.data.person, params.data.value[0]);
     });
     slider.addEventListener("input", () => {
       scaleMax = Math.min(100, Math.max(10, parseInt(slider.value, 10) || 25));
@@ -2101,8 +2101,8 @@
       `workspace-section-${projectId}`
       // workspace defaults + decisions/notes
     ].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.style.display = "none";
+      const el2 = document.getElementById(id);
+      if (el2) el2.style.display = "none";
     });
     const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
     if (inviteForm) inviteForm.style.display = "none";
@@ -2155,8 +2155,8 @@
       link.onclick = (e3) => {
         e3.preventDefault();
         const expanded = link.dataset.expanded === "1";
-        grid.querySelectorAll("[data-connect-platform]").forEach((el) => {
-          el.style.display = expanded ? el.dataset.connectPlatform === os ? "" : "none" : "";
+        grid.querySelectorAll("[data-connect-platform]").forEach((el2) => {
+          el2.style.display = expanded ? el2.dataset.connectPlatform === os ? "" : "none" : "";
         });
         link.dataset.expanded = expanded ? "" : "1";
         link.textContent = expanded ? "Show other platforms" : "Show detected platform only";
@@ -2164,8 +2164,8 @@
       grid.insertAdjacentElement("afterend", link);
     });
   }
-  function _classifySettingsSection(el, projectId) {
-    const id = el && el.id || "";
+  function _classifySettingsSection(el2, projectId) {
+    const id = el2 && el2.id || "";
     const has = (frag) => id.indexOf(frag) !== -1;
     if (has("workspace-section")) return "workspace";
     if (has("settings-account-card") || has("settings-account-danger") || has("settings-grp-aw") || has("settings-grp-blog") || has("members-section") || has("fs-mcp-section") || has("tunnel-plugins") || has("github-card")) return "account";
@@ -2216,8 +2216,8 @@
       btn.onclick = () => _activateSettingsTab(projectId, key);
       bar.appendChild(btn);
     });
-    Array.from(body.children).forEach((el) => {
-      panes[_classifySettingsSection(el, projectId)].appendChild(el);
+    Array.from(body.children).forEach((el2) => {
+      panes[_classifySettingsSection(el2, projectId)].appendChild(el2);
     });
     body.appendChild(bar);
     TABS.forEach(([key]) => body.appendChild(panes[key]));
@@ -4381,7 +4381,7 @@ project_id = "${displayPid}"`;
             </div>`;
               }).join("");
               if (_guest) {
-                listEl.querySelectorAll('.member-role-select, .resend-invite-btn, button[title="Remove member"]').forEach((el) => el.remove());
+                listEl.querySelectorAll('.member-role-select, .resend-invite-btn, button[title="Remove member"]').forEach((el2) => el2.remove());
               }
               listEl.querySelectorAll("select.member-role-select").forEach((sel) => {
                 sel.dataset.prev = sel.value;
@@ -5131,8 +5131,8 @@ project_id = "${displayPid}"`;
             [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet2("unix", activeToken)
           };
           Object.entries(snippets).forEach(([id, text]) => {
-            const el = document.getElementById(id);
-            if (el) el.textContent = text;
+            const el2 = document.getElementById(id);
+            if (el2) el2.textContent = text;
           });
           const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
           if (statusEl) {
@@ -5397,10 +5397,10 @@ project_id = "${displayPid}"`;
           const inp = document.getElementById(`ntfy-url-${projectId}`);
           const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
           const testBtn = document.getElementById(`ntfy-test-${projectId}`);
-          [inp, saveBtn, testBtn].forEach((el) => {
-            if (el) {
-              el.disabled = false;
-              el.style.opacity = "1";
+          [inp, saveBtn, testBtn].forEach((el2) => {
+            if (el2) {
+              el2.disabled = false;
+              el2.style.opacity = "1";
             }
           });
         };
@@ -7610,7 +7610,7 @@ ${n2.tags || ""}`.toLowerCase();
   }
   function filterCyElements(elements, enabled) {
     return elements.filter(
-      (el) => el.group === "nodes" || enabled.has(el.data.etype)
+      (el2) => el2.group === "nodes" || enabled.has(el2.data.etype)
     );
   }
   function mountCytoscapeGraph(container, elements, opts = {}) {
@@ -7846,6 +7846,496 @@ ${n2.tags || ""}`.toLowerCase();
     R(/* @__PURE__ */ u3(CodeIntelPanel, { ...props }), container);
   }
 
+  // meridian/static/codegraph/model.ts
+  var ROLE_ALIASES = {
+    folder: "folder",
+    dir: "folder",
+    directory: "folder",
+    file: "file",
+    module: "module",
+    package: "package",
+    pkg: "package",
+    class: "class",
+    interface: "interface",
+    trait: "interface",
+    protocol: "interface",
+    function: "function",
+    func: "function",
+    fn: "function",
+    method: "method",
+    route: "route",
+    endpoint: "route",
+    variable: "variable",
+    var: "variable",
+    const: "variable",
+    constant: "variable"
+  };
+  function normalizeRole(raw) {
+    if (typeof raw !== "string") return "unknown";
+    const key = raw.trim().toLowerCase();
+    return ROLE_ALIASES[key] ?? "unknown";
+  }
+  function splitPath(p3) {
+    if (typeof p3 !== "string") return [];
+    return p3.replace(/\\/g, "/").split("/").map((s3) => s3.trim()).filter((s3) => s3.length > 0 && s3 !== ".");
+  }
+  function toNumber(v3) {
+    if (typeof v3 === "number") return Number.isFinite(v3) ? v3 : void 0;
+    if (typeof v3 === "string" && v3.trim() !== "") {
+      const n2 = Number(v3);
+      return Number.isFinite(n2) ? n2 : void 0;
+    }
+    return void 0;
+  }
+  function toStringList(v3) {
+    if (!Array.isArray(v3)) return void 0;
+    const out = v3.map((x2) => String(x2)).filter((s3) => s3.length > 0);
+    return out.length ? out : void 0;
+  }
+  function symbolRole(n2) {
+    const explicit = normalizeRole(n2.role ?? n2.kind ?? n2.label);
+    if (explicit !== "unknown") return explicit;
+    return "function";
+  }
+  function symbolLabel(n2) {
+    const qn = String(n2.qualified_name ?? n2.qualifiedName ?? "").trim();
+    if (qn) {
+      const parts = qn.split(".");
+      const last = parts[parts.length - 1];
+      if (last) return last;
+      return qn;
+    }
+    const nm = String(n2.name ?? "").trim();
+    return nm || "(anonymous)";
+  }
+  function extractMeta(n2) {
+    const meta = {};
+    const qn = String(n2.qualified_name ?? n2.qualifiedName ?? "").trim();
+    if (qn) meta.qualifiedName = qn;
+    const file = String(n2.file ?? n2.path ?? "").trim();
+    if (file) meta.file = file;
+    const sig = String(n2.signature ?? "").trim();
+    if (sig) meta.signature = sig;
+    const doc = String(n2.docstring ?? n2.doc ?? "").trim();
+    if (doc) meta.docstring = doc;
+    const cx = toNumber(n2.complexity);
+    if (cx !== void 0) meta.complexity = cx;
+    const callers = toStringList(n2.callers);
+    if (callers) meta.callers = callers;
+    const callees = toStringList(n2.callees);
+    if (callees) meta.callees = callees;
+    const fanIn = toNumber(n2.fanIn ?? n2.fan_in);
+    if (fanIn !== void 0) meta.fanIn = fanIn;
+    const fanOut = toNumber(n2.fanOut ?? n2.fan_out);
+    if (fanOut !== void 0) meta.fanOut = fanOut;
+    return meta;
+  }
+  function newBuildNode(id, label, role) {
+    return { id, label, role, children: /* @__PURE__ */ new Map(), symbols: [], meta: {} };
+  }
+  function buildCodeGraphModel(payload) {
+    const roots = /* @__PURE__ */ new Map();
+    let symbolCount = 0;
+    let fileCount = 0;
+    const ensureFolderChain = (segments) => {
+      if (!segments.length) return null;
+      let level = roots;
+      let node = null;
+      let idPrefix = "";
+      for (const seg of segments) {
+        idPrefix = idPrefix ? `${idPrefix}/${seg}` : seg;
+        let child = level.get(seg);
+        if (!child) {
+          child = newBuildNode(idPrefix, seg, "folder");
+          level.set(seg, child);
+        }
+        node = child;
+        level = child.children;
+      }
+      return node;
+    };
+    const arch = payload && payload.architecture;
+    const packages = arch && Array.isArray(arch.packages) ? arch.packages : [];
+    for (const p3 of packages) {
+      const name = String(p3 && p3.name != null ? p3.name : "").trim();
+      if (!name) continue;
+      const segments = splitPath(name).length ? splitPath(name) : [name];
+      const folder = ensureFolderChain(segments);
+      if (folder) folder.role = "package";
+    }
+    const nodes = payload && Array.isArray(payload.nodes) ? payload.nodes : [];
+    for (const n2 of nodes) {
+      if (!n2 || typeof n2 !== "object") continue;
+      const hasIdentity = !!String(n2.qualified_name ?? n2.qualifiedName ?? n2.name ?? "").trim();
+      if (!hasIdentity) continue;
+      const meta = extractMeta(n2);
+      const file = meta.file;
+      const segments = file ? splitPath(file) : [];
+      if (!segments.length) {
+        let unfiled = roots.get("(unfiled)");
+        if (!unfiled) {
+          unfiled = newBuildNode("(unfiled)", "(unfiled)", "folder");
+          roots.set("(unfiled)", unfiled);
+        }
+        unfiled.symbols.push({
+          id: `${unfiled.id}::${meta.qualifiedName ?? symbolLabel(n2)}`,
+          label: symbolLabel(n2),
+          role: symbolRole(n2),
+          depth: 1,
+          children: [],
+          meta
+        });
+        symbolCount += 1;
+        continue;
+      }
+      const fileSeg = segments[segments.length - 1];
+      const folderSegs = segments.slice(0, -1);
+      const parentSegs = folderSegs.length ? folderSegs : ["(root)"];
+      const folder = ensureFolderChain(parentSegs);
+      if (!folder) continue;
+      let fileNode = folder.children.get(fileSeg);
+      if (!fileNode) {
+        fileNode = newBuildNode(`${folder.id}/${fileSeg}`, fileSeg, "file");
+        fileNode.meta = { file };
+        folder.children.set(fileSeg, fileNode);
+        fileCount += 1;
+      }
+      const role = symbolRole(n2);
+      if (role === "file" || role === "module") {
+        fileNode.role = "file";
+        fileNode.meta = { ...fileNode.meta, ...meta, file };
+        continue;
+      }
+      fileNode.symbols.push({
+        id: `${fileNode.id}::${meta.qualifiedName ?? symbolLabel(n2)}`,
+        label: symbolLabel(n2),
+        role,
+        depth: 2,
+        children: [],
+        meta
+      });
+      symbolCount += 1;
+    }
+    const finalized = Array.from(roots.values()).map((r3) => finalize(r3, 0));
+    return { roots: finalized, symbolCount, fileCount };
+  }
+  function finalize(b2, depth) {
+    const folderChildren = [];
+    const fileChildren = [];
+    for (const child of b2.children.values()) {
+      const fc = finalize(child, depth + 1);
+      if (fc.role === "file") fileChildren.push(fc);
+      else folderChildren.push(fc);
+    }
+    const byLabel = (a3, c3) => a3.label < c3.label ? -1 : a3.label > c3.label ? 1 : a3.id < c3.id ? -1 : a3.id > c3.id ? 1 : 0;
+    folderChildren.sort(byLabel);
+    fileChildren.sort(byLabel);
+    const symbols = b2.symbols.map((s3) => ({ ...s3, depth: depth + 1 })).sort(byLabel);
+    return {
+      id: b2.id,
+      label: b2.label,
+      role: b2.role,
+      depth,
+      children: [...folderChildren, ...fileChildren, ...symbols],
+      meta: b2.meta
+    };
+  }
+
+  // meridian/static/codegraph/roles.ts
+  var ROLE_COLORS = {
+    folder: "#64748b",
+    // slate — containers
+    package: "#94a3b8",
+    // lighter slate — top-level containers
+    module: "#38bdf8",
+    // sky
+    file: "#7dd3fc",
+    // light sky
+    class: "#a78bfa",
+    // violet
+    interface: "#c084fc",
+    // lighter violet
+    function: "#34d399",
+    // emerald
+    method: "#4ade80",
+    // green
+    route: "#f59e0b",
+    // amber — entry points
+    variable: "#fbbf24",
+    // yellow
+    unknown: "#94a3b8"
+    // neutral fallback (documented default)
+  };
+  var DEFAULT_ROLE_COLOR = ROLE_COLORS.unknown;
+  function colorForRole(role) {
+    if (typeof role === "string" && role in ROLE_COLORS) {
+      return ROLE_COLORS[role];
+    }
+    return DEFAULT_ROLE_COLOR;
+  }
+
+  // meridian/static/codegraph/render.ts
+  function subtreeSummary(node) {
+    let files = 0;
+    let symbols = 0;
+    const walk = (n2) => {
+      for (const c3 of n2.children) {
+        if (c3.role === "file") files += 1;
+        else if (c3.children.length === 0 && c3.role !== "folder" && c3.role !== "package") symbols += 1;
+        walk(c3);
+      }
+    };
+    walk(node);
+    const parts = [];
+    if (files) parts.push(`${files} file${files === 1 ? "" : "s"}`);
+    if (symbols) parts.push(`${symbols} fn${symbols === 1 ? "" : "s"}`);
+    return parts.join(" \xB7 ");
+  }
+  function isDrillable(node) {
+    return node.children.length > 0;
+  }
+  function startsExpanded(node, expandDepth) {
+    return node.depth < expandDepth;
+  }
+  function metadataLines(node) {
+    const m3 = node.meta;
+    const lines = [];
+    if (m3.qualifiedName) lines.push(`qualified_name: ${m3.qualifiedName}`);
+    if (m3.file) lines.push(`file: ${m3.file}`);
+    if (m3.signature) lines.push(`signature: ${m3.signature}`);
+    if (typeof m3.complexity === "number") lines.push(`complexity: ${m3.complexity}`);
+    if (m3.callers && m3.callers.length) lines.push(`callers (${m3.callers.length}): ${m3.callers.join(", ")}`);
+    else if (typeof m3.fanIn === "number") lines.push(`callers (fan-in): ${m3.fanIn}`);
+    if (m3.callees && m3.callees.length) lines.push(`callees (${m3.callees.length}): ${m3.callees.join(", ")}`);
+    else if (typeof m3.fanOut === "number") lines.push(`callees (fan-out): ${m3.fanOut}`);
+    if (m3.docstring) lines.push(`docstring: ${m3.docstring}`);
+    return lines;
+  }
+  function el(tag, style, text) {
+    const node = document.createElement(tag);
+    if (style) Object.assign(node.style, style);
+    if (text != null) node.textContent = text;
+    return node;
+  }
+  function roleBadge(role) {
+    const badge = el("span", {
+      display: "inline-block",
+      fontSize: "8px",
+      lineHeight: "1",
+      padding: "2px 5px",
+      borderRadius: "3px",
+      color: "#0b0e14",
+      background: colorForRole(role),
+      fontFamily: "var(--font-mono, monospace)",
+      textTransform: "uppercase",
+      letterSpacing: ".03em",
+      flexShrink: "0"
+    });
+    badge.textContent = role;
+    return badge;
+  }
+  function renderCodeGraph(mount, model, options = {}) {
+    const expandDepth = options.initiallyExpandedDepth ?? 1;
+    mount.textContent = "";
+    const root = el("div", {
+      display: "flex",
+      gap: "10px",
+      alignItems: "flex-start",
+      fontFamily: "var(--font-mono, monospace)"
+    });
+    root.className = "codegraph-root";
+    const treePane = el("div", {
+      flex: "1 1 auto",
+      minWidth: "0",
+      maxHeight: "420px",
+      overflow: "auto",
+      border: "1px solid var(--border, #334155)",
+      borderRadius: "4px",
+      padding: "6px",
+      background: "var(--surface-1, #0f172a)"
+    });
+    treePane.className = "codegraph-tree";
+    const detailPane = el("div", {
+      flex: "0 0 300px",
+      maxHeight: "420px",
+      overflow: "auto",
+      border: "1px solid var(--border, #334155)",
+      borderRadius: "4px",
+      padding: "10px",
+      background: "var(--surface-1, #0f172a)",
+      fontSize: "11px",
+      color: "var(--text, #e2e8f0)"
+    });
+    detailPane.className = "codegraph-detail";
+    renderEmptyDetail(detailPane);
+    if (!model.roots.length) {
+      treePane.appendChild(
+        el(
+          "div",
+          { fontSize: "11px", color: "var(--muted, #94a3b8)", padding: "12px" },
+          "No code graph yet \u2014 index the repo to populate it."
+        )
+      );
+    } else {
+      for (const node of model.roots) {
+        treePane.appendChild(renderNode(node, detailPane, expandDepth, options));
+      }
+    }
+    root.appendChild(treePane);
+    root.appendChild(detailPane);
+    mount.appendChild(root);
+    return {
+      element: mount,
+      destroy() {
+        mount.textContent = "";
+      }
+    };
+  }
+  function renderNode(node, detailPane, expandDepth, options) {
+    const wrap = el("div", { marginLeft: node.depth > 0 ? "12px" : "0" });
+    wrap.className = "codegraph-node";
+    wrap.dataset.role = node.role;
+    wrap.dataset.id = node.id;
+    const row = el("div", {
+      display: "flex",
+      alignItems: "center",
+      gap: "6px",
+      padding: "2px 4px",
+      borderRadius: "3px",
+      cursor: "pointer",
+      fontSize: "11px",
+      color: "var(--text, #e2e8f0)",
+      borderLeft: `3px solid ${colorForRole(node.role)}`
+    });
+    row.className = "codegraph-row";
+    const drillable = isDrillable(node);
+    const caret = el("span", {
+      width: "10px",
+      flexShrink: "0",
+      color: "var(--muted, #94a3b8)",
+      fontSize: "9px"
+    });
+    caret.textContent = drillable ? "\u25B8" : "\xB7";
+    const label = el("span", {
+      whiteSpace: "nowrap",
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      flex: "1 1 auto",
+      minWidth: "0"
+    });
+    label.textContent = node.label;
+    const summary = subtreeSummary(node);
+    const summaryEl = el("span", { fontSize: "9px", color: "var(--muted, #94a3b8)", flexShrink: "0" });
+    summaryEl.textContent = summary;
+    row.appendChild(caret);
+    row.appendChild(roleBadge(node.role));
+    row.appendChild(label);
+    if (summary) row.appendChild(summaryEl);
+    wrap.appendChild(row);
+    const childrenWrap = el("div", { display: startsExpanded(node, expandDepth) ? "block" : "none" });
+    childrenWrap.className = "codegraph-children";
+    let built = false;
+    const buildChildren = () => {
+      if (built) return;
+      for (const c3 of node.children) {
+        childrenWrap.appendChild(renderNode(c3, detailPane, expandDepth, options));
+      }
+      built = true;
+    };
+    if (startsExpanded(node, expandDepth)) buildChildren();
+    wrap.appendChild(childrenWrap);
+    row.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      renderDetail(detailPane, node, options);
+      if (options.onSelect) {
+        try {
+          options.onSelect(node);
+        } catch {
+        }
+      }
+      if (drillable) {
+        const open = childrenWrap.style.display !== "none";
+        if (!open) buildChildren();
+        childrenWrap.style.display = open ? "none" : "block";
+        caret.textContent = open ? "\u25B8" : "\u25BE";
+      }
+    });
+    return wrap;
+  }
+  function renderEmptyDetail(pane) {
+    pane.textContent = "";
+    pane.appendChild(
+      el(
+        "div",
+        { color: "var(--muted, #94a3b8)", fontSize: "10px" },
+        "Select a node to see its static metadata."
+      )
+    );
+  }
+  function renderDetail(pane, node, options) {
+    pane.textContent = "";
+    const header = el("div", { display: "flex", gap: "6px", alignItems: "center", marginBottom: "8px" });
+    header.appendChild(roleBadge(node.role));
+    header.appendChild(el("span", { fontWeight: "600", fontSize: "12px", wordBreak: "break-all" }, node.label));
+    pane.appendChild(header);
+    const lines = metadataLines(node);
+    if (!lines.length) {
+      pane.appendChild(
+        el(
+          "div",
+          { color: "var(--muted, #94a3b8)", fontSize: "10px" },
+          "No static metadata on this node."
+        )
+      );
+    } else {
+      for (const line of lines) {
+        pane.appendChild(
+          el("div", {
+            fontSize: "10px",
+            color: "var(--text, #e2e8f0)",
+            padding: "2px 0",
+            borderBottom: "1px solid var(--border, #1f2937)",
+            wordBreak: "break-word",
+            whiteSpace: "pre-wrap"
+          }, line)
+        );
+      }
+    }
+    if (options.onRequestSummary) {
+      const btn = el("button", {
+        marginTop: "10px",
+        fontSize: "10px",
+        padding: "3px 10px",
+        border: "1px solid var(--border, #334155)",
+        borderRadius: "3px",
+        background: "none",
+        color: "var(--accent, #7dd3fc)",
+        cursor: "pointer",
+        fontFamily: "var(--font-mono, monospace)"
+      });
+      btn.textContent = "\u2728 LLM summary";
+      btn.title = "On-demand LLM summary \u2014 not part of the deterministic view";
+      const out = el("div", { marginTop: "8px", fontSize: "10px", color: "var(--muted, #94a3b8)", whiteSpace: "pre-wrap" });
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "summarizing\u2026";
+        try {
+          const summary = await options.onRequestSummary(node);
+          out.style.color = "var(--text, #e2e8f0)";
+          out.textContent = summary;
+        } catch (e3) {
+          out.style.color = "var(--error, #ef4444)";
+          out.textContent = `Summary failed: ${e3 instanceof Error ? e3.message : String(e3)}`;
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "\u2728 LLM summary";
+        }
+      });
+      pane.appendChild(btn);
+      pane.appendChild(out);
+    }
+  }
+
   // node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
@@ -7919,8 +8409,8 @@ ${n2.tags || ""}`.toLowerCase();
       // check-updates and update banner
     ];
     toHide.forEach((sel) => {
-      document.querySelectorAll(sel).forEach((el) => {
-        el.style.display = "none";
+      document.querySelectorAll(sel).forEach((el2) => {
+        el2.style.display = "none";
       });
     });
     const ctrlRow = document.getElementById("server-controls-row");
@@ -7930,7 +8420,7 @@ ${n2.tags || ""}`.toLowerCase();
       if (connInd) connInd.style.display = "none";
       document.querySelectorAll(".conn-popup").forEach((p3) => p3.remove());
     } else {
-      document.querySelectorAll(".hosted-label").forEach((el) => el.remove());
+      document.querySelectorAll(".hosted-label").forEach((el2) => el2.remove());
     }
     const footer = document.querySelector(".sidebar-footer");
     if (!isHostedAdmin() && footer && !footer.querySelector(".hosted-label")) {
@@ -8178,8 +8668,8 @@ ${n2.tags || ""}`.toLowerCase();
   function showLocalServerControls() {
     if (isHostedMode() || isDemoMode()) return;
     ["#git-check-btn", "#restart-server-btn", "#stop-server-btn"].forEach((sel) => {
-      const el = document.querySelector(sel);
-      if (el) el.style.display = "";
+      const el2 = document.querySelector(sel);
+      if (el2) el2.style.display = "";
     });
   }
   var STORAGE_KEY2 = (k3) => (isDemoMode() ? "meridian_demo_" : "meridian_") + k3.replace(/^meridian[._]/, "");
@@ -8332,10 +8822,10 @@ ${n2.tags || ""}`.toLowerCase();
       item.classList.toggle("active", item.dataset.projectId === state.activeTab);
     });
   }
-  function autosizeGoalField(el, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.max(el.scrollHeight, minPx)}px`;
+  function autosizeGoalField(el2, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
+    if (!el2) return;
+    el2.style.height = "auto";
+    el2.style.height = `${Math.max(el2.scrollHeight, minPx)}px`;
   }
   function githubIconSvg2(size = 12, color = "currentColor") {
     return `<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false" style="color:${color};flex-shrink:0"><path d="${GITHUB_OCTICON_PATH}"></path></svg>`;
@@ -9445,7 +9935,7 @@ Current: ${current || "(none)"}`,
     state.activeTab = id;
     renderTabs();
     syncSidebarActiveProject();
-    document.querySelectorAll(".tab-body").forEach((el) => el.classList.remove("active"));
+    document.querySelectorAll(".tab-body").forEach((el2) => el2.classList.remove("active"));
     const body = document.getElementById(`tab-body-${id}`);
     if (body) body.classList.add("active");
     const empty = document.querySelector(".tab-bodies > .empty");
@@ -10597,8 +11087,8 @@ Current: ${current || "(none)"}`,
         decFormBody.style.borderColor = over ? "var(--red, #f87171)" : near ? "var(--warning, #fb923c)" : "";
         if (decFormStatus) decFormStatus.textContent = over || near ? `Body: ${len.toLocaleString()}/${limit.toLocaleString()}` : "";
       };
-      [decFormTitle, decFormBody].forEach((el) => {
-        if (el) el.addEventListener("keydown", (e3) => {
+      [decFormTitle, decFormBody].forEach((el2) => {
+        if (el2) el2.addEventListener("keydown", (e3) => {
           if ((e3.ctrlKey || e3.metaKey) && e3.key === "Enter") doAddDecision();
         });
       });
@@ -11027,12 +11517,12 @@ Current: ${current || "(none)"}`,
     const q2 = (value || "").trim().toLowerCase();
     const sec = document.querySelector('.queue-section[data-section="backburner"]');
     if (!sec) return;
-    sec.querySelectorAll(".queue-item").forEach((el) => {
-      const hit = !q2 || (el.dataset.bbTitle || "").includes(q2) || (el.dataset.bbGroup || "").includes(q2);
-      el.style.display = hit ? "" : "none";
+    sec.querySelectorAll(".queue-item").forEach((el2) => {
+      const hit = !q2 || (el2.dataset.bbTitle || "").includes(q2) || (el2.dataset.bbGroup || "").includes(q2);
+      el2.style.display = hit ? "" : "none";
     });
     sec.querySelectorAll(".bb-group").forEach((g2) => {
-      const anyVisible = Array.from(g2.querySelectorAll(".queue-item")).some((el) => el.style.display !== "none");
+      const anyVisible = Array.from(g2.querySelectorAll(".queue-item")).some((el2) => el2.style.display !== "none");
       g2.style.display = anyVisible ? "" : "none";
     });
   }
@@ -12057,13 +12547,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   if (typeof window !== "undefined") window._buildCodebaseForceGraph = _buildCodebaseForceGraph;
   function _renderCodebaseGraph(containerId, packages, edges) {
     if (typeof window === "undefined" || !window.echarts) return;
-    const el = document.getElementById(containerId);
-    if (!el) return;
+    const el2 = document.getElementById(containerId);
+    if (!el2) return;
     const opt = _buildCodebaseForceGraph(packages, edges, "packages");
     if (!opt) return;
     let chart;
     try {
-      chart = window.echarts.init(el);
+      chart = window.echarts.init(el2);
     } catch (_2) {
       return;
     }
@@ -12396,6 +12886,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       </div>
     </div>`;
       html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
+      html += `<div style="margin-bottom:16px">
+      <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Code Tree</div>
+      <div id="${_cgId}-codegraph"></div>
+    </div>`;
       html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
       if (repoPaths.length) {
         for (const rp of repoPaths) {
@@ -12457,10 +12951,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       body.innerHTML = html;
       if (window.Chart && archCharts.length) {
         for (const c3 of archCharts) {
-          const el = document.getElementById(c3.id);
-          if (el) {
+          const el2 = document.getElementById(c3.id);
+          if (el2) {
             try {
-              new Chart(el, c3.config);
+              new Chart(el2, c3.config);
             } catch (_2) {
             }
           }
@@ -12490,6 +12984,48 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             return b2.image;
           }
         });
+      }
+      const _codegraphEl = document.getElementById(`${_cgId}-codegraph`);
+      if (_codegraphEl) {
+        const archArgs = repoPaths.length ? { project: _repoPathToProject(typeof repoPaths[0] === "string" ? repoPaths[0] : repoPaths[0].cwd || "") } : {};
+        let _nodes = [];
+        try {
+          const _res = await _codeMcpCall("tools/call", {
+            name: "search_graph",
+            arguments: { ...archArgs, limit: 1e3, min_degree: 0 }
+          });
+          const _txt = (_res?.content || []).map((c3) => c3.text || "").join("").trim();
+          if (_txt) {
+            const _parsed = JSON.parse(_txt);
+            const _rows = Array.isArray(_parsed) ? _parsed : _parsed.results || _parsed.nodes || _parsed.data || [];
+            if (Array.isArray(_rows)) _nodes = _rows;
+          }
+        } catch (_2) {
+          _nodes = [];
+        }
+        try {
+          const _model = buildCodeGraphModel({
+            architecture: _graphArch || { packages: _graphPackages },
+            nodes: _nodes
+          });
+          renderCodeGraph(_codegraphEl, _model, {
+            // LLM summary — SEPARATE, last-resort on-click action wired to the
+            // existing code-intel get_code_snippet path. Only invoked on demand;
+            // never part of the deterministic render.
+            onRequestSummary: async (node) => {
+              const qn = node.meta.qualifiedName;
+              if (!qn) throw new Error("No qualified_name to summarize.");
+              const _snip = await _codeMcpCall("tools/call", {
+                name: "get_code_snippet",
+                arguments: { ...archArgs, qualified_name: qn }
+              });
+              const _snipTxt = (_snip?.content || []).map((c3) => c3.text || "").join("").trim();
+              return _snipTxt || "No snippet returned.";
+            }
+          });
+        } catch (e3) {
+          _codegraphEl.innerHTML = `<div style="font-size:10px;color:var(--error)">Code tree failed: ${escapeHtml(String(e3))}</div>`;
+        }
       }
       const _reindexBtn = document.getElementById(`${_cgId}-reindex`);
       if (_reindexBtn) {
@@ -12968,15 +13504,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     render();
   }
   async function updateLiveFeed(projectId) {
-    const el = document.getElementById(`live-session-${projectId}`);
-    if (!el) return;
+    const el2 = document.getElementById(`live-session-${projectId}`);
+    if (!el2) return;
     const panel = getPanelState(projectId);
     try {
       const sessions = await api(`/projects/${projectId}/sessions?active_only=true`);
       const active = sessions && sessions.filter((s3) => s3.status === "active");
       if (!active || active.length === 0) {
         panel.liveSessionId = null;
-        el.style.display = "none";
+        el2.style.display = "none";
         return;
       }
       const sess = active[0];
@@ -13007,7 +13543,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${ageStr ? `<span style="font-size:9px;color:var(--muted);margin-left:auto">${ageStr}</span>` : ""}
       </div>`;
       }).join("");
-      el.innerHTML = `
+      el2.innerHTML = `
 
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
 
@@ -13031,8 +13567,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
       </div>`;
       if (extraCount > 0) {
-        const toggleBtn = el.querySelector(`#live-feed-extra-toggle-${projectId}`);
-        const extraEl = el.querySelector(`#live-feed-extra-${projectId}`);
+        const toggleBtn = el2.querySelector(`#live-feed-extra-toggle-${projectId}`);
+        const extraEl = el2.querySelector(`#live-feed-extra-${projectId}`);
         if (toggleBtn && extraEl) {
           toggleBtn.onclick = () => {
             const open = extraEl.style.display !== "none";
@@ -13041,24 +13577,24 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           };
         }
       }
-      el.style.display = "block";
+      el2.style.display = "block";
     } catch (e3) {
       panel.liveSessionId = null;
-      el.style.display = "none";
+      el2.style.display = "none";
     }
   }
   async function loadRecentSessions(projectId, sessions = null) {
-    const el = document.getElementById(`recent-sessions-${projectId}`);
-    if (!el) return;
+    const el2 = document.getElementById(`recent-sessions-${projectId}`);
+    if (!el2) return;
     try {
       const panel = getPanelState(projectId);
       const allSessions = Array.isArray(sessions) ? sessions : await api(`/projects/${projectId}/sessions?active_only=false`);
       const recent = (allSessions || []).filter((s3) => s3.id !== panel.liveSessionId && !isLiveSession(s3)).sort((a3, b2) => String(b2.last_seen || b2.created_at || "").localeCompare(String(a3.last_seen || a3.created_at || ""))).slice(0, 5);
       if (!recent.length) {
-        el.style.display = "none";
+        el2.style.display = "none";
         return;
       }
-      el.innerHTML = `
+      el2.innerHTML = `
 
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Recent Sessions</div>
 
@@ -13100,20 +13636,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
         </div>`;
       }).join("")}`;
-      el.querySelectorAll(".resume-session-btn").forEach((btn) => {
+      el2.querySelectorAll(".resume-session-btn").forEach((btn) => {
         btn.onclick = (event) => {
           event.stopPropagation();
           const cmd = btn.dataset.cmd || "";
           navigator.clipboard.writeText(cmd).then(() => toast("Copied start_session() to clipboard")).catch(() => toast("copy failed", true));
         };
       });
-      el.querySelectorAll(".recent-session-timeline-btn").forEach((btn) => {
+      el2.querySelectorAll(".recent-session-timeline-btn").forEach((btn) => {
         btn.onclick = (event) => {
           event.stopPropagation();
           openTimelineForSession(projectId, btn.dataset.sessionId);
         };
       });
-      el.querySelectorAll(".recent-session-row").forEach((row) => {
+      el2.querySelectorAll(".recent-session-row").forEach((row) => {
         row.onclick = async (evt) => {
           if (evt.target.closest(".resume-session-btn, .recent-session-timeline-btn")) return;
           const target = row.querySelector(".recent-session-tasks");
@@ -13142,14 +13678,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           if (chevron) chevron.textContent = "\u25B2";
         };
       });
-      el.style.display = "block";
+      el2.style.display = "block";
     } catch (_2) {
-      el.style.display = "none";
+      el2.style.display = "none";
     }
   }
   async function loadMilestones(projectId) {
-    const el = document.getElementById(`milestones-strip-${projectId}`);
-    if (!el) return;
+    const el2 = document.getElementById(`milestones-strip-${projectId}`);
+    if (!el2) return;
     try {
       const all = await api(`/projects/${projectId}/sprint-items`);
       const doneStatuses = /* @__PURE__ */ new Set(["done", "skipped", "failed", "pushed"]);
@@ -13161,12 +13697,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         return bTs.localeCompare(aTs);
       });
       if (!milestones.length) {
-        el.style.display = "none";
+        el2.style.display = "none";
         return;
       }
       const statusIcon = (s3) => s3 === "done" ? "\u2713" : s3 === "failed" ? "\u2717" : s3 === "pushed" ? "\u2192" : s3 === "skipped" ? "\u2014" : s3 === "in_progress" ? "\u25B6" : "\u25E6";
       const statusColor = (s3) => s3 === "done" ? "var(--accent-green,#34d399)" : s3 === "failed" ? "#e05" : s3 === "pushed" ? "var(--accent)" : s3 === "in_progress" ? "var(--accent)" : "var(--muted)";
-      el.innerHTML = `
+      el2.innerHTML = `
 
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Completed (${milestones.length})</div>
 
@@ -13190,9 +13726,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${milestones.length > 20 ? `<span style="font-size:10px;color:var(--muted);padding:3px 4px">+${milestones.length - 20} more</span>` : ""}
 
       </div>`;
-      el.style.display = "block";
+      el2.style.display = "block";
     } catch (_2) {
-      el.style.display = "none";
+      el2.style.display = "none";
     }
   }
   async function loadRecentRuns(projectId) {
@@ -13515,8 +14051,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       } else if (action === "backlog") {
         await api(`/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ status: "backlog" }) });
       }
-      document.querySelectorAll('[id^="queue-body-"]').forEach((el) => {
-        const pid = el.id.replace("queue-body-", "");
+      document.querySelectorAll('[id^="queue-body-"]').forEach((el2) => {
+        const pid = el2.id.replace("queue-body-", "");
         loadQueue(pid);
       });
     } catch (e3) {
@@ -13995,8 +14531,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         card.querySelector(".decision-title-view").style.display = "";
         card.querySelector(".decision-edit-area").style.display = "none";
       };
-      host.querySelectorAll(".decision-body-view, .decision-title-view").forEach((el) => {
-        el.onclick = () => showEdit(el.dataset.id);
+      host.querySelectorAll(".decision-body-view, .decision-title-view").forEach((el2) => {
+        el2.onclick = () => showEdit(el2.dataset.id);
       });
       const _CATS = ["TECHNICAL", "STRATEGIC", "ARCHITECTURAL", "PRODUCT", "TACTICAL", "BUSINESS", "COMPETITIVE"];
       host.querySelectorAll(".decision-cat-tag").forEach((tag) => {
@@ -15146,11 +15682,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     };
   })();
   function toggleExpand(id) {
-    const el = document.getElementById(id);
-    if (!el) return;
-    const open = el.style.display !== "none";
-    el.style.display = open ? "none" : "";
-    const trigger = el.previousElementSibling;
+    const el2 = document.getElementById(id);
+    if (!el2) return;
+    const open = el2.style.display !== "none";
+    el2.style.display = open ? "none" : "";
+    const trigger = el2.previousElementSibling;
     if (trigger) {
       const arrow = trigger.querySelector(".expand-arrow");
       if (arrow) arrow.textContent = open ? "\u25B6" : "\u25BC";

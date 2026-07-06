@@ -15,6 +15,11 @@ import "./dashboard-files";
 import "./dashboard-rewind";
 // ff8ff615 — Preact Code Intel panel (layered package DAG, replaces ECharts circles).
 import { mountCodeIntelPanel } from "./components/CodeIntelPanel";
+// ed5512b6 — standalone, decoupled codegraph visualizer (folder->file->function
+// drill-down, color by role, static metadata on click). The dashboard is ONE
+// consumer via a thin adapter; the module itself has zero Meridian coupling.
+import { buildCodeGraphModel, renderCodeGraph } from "./codegraph";
+import type { GraphNodeInput } from "./codegraph";
 import { createStore } from "zustand/vanilla";
 ﻿const TABS_KEY = 'meridian.openTabs';
 
@@ -7453,6 +7458,15 @@ async function loadCodeIntelTab(projectId: any) {
     // zoom + Generate Map into this mount point (mounted after body.innerHTML).
     html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
 
+    // ed5512b6 — the standalone codegraph visualizer (folder->file->function
+    // drill-down, color by role, static metadata on click). Mounted after
+    // body.innerHTML via the thin adapter below; the module never reaches back
+    // into the dashboard — data flows in only.
+    html += `<div style="margin-bottom:16px">
+      <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Code Tree</div>
+      <div id="${_cgId}-codegraph"></div>
+    </div>`;
+
     // Index status per repo path
     html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
     if (repoPaths.length) {
@@ -7551,6 +7565,60 @@ async function loadCodeIntelTab(projectId: any) {
           return b.image;
         },
       });
+    }
+
+    // ed5512b6 — thin adapter: the dashboard is ONE consumer of the standalone
+    // codegraph module. It fetches per-symbol graph nodes via search_graph
+    // (folder->file->function detail beyond the package-level get_architecture),
+    // shapes them with the pure buildCodeGraphModel, and hands the model + a
+    // mount element to renderCodeGraph. The module never reaches back here.
+    const _codegraphEl = document.getElementById(`${_cgId}-codegraph`);
+    if (_codegraphEl) {
+      const archArgs = repoPaths.length
+        ? { project: _repoPathToProject(typeof repoPaths[0] === 'string' ? repoPaths[0] : (repoPaths[0].cwd || '')) }
+        : {};
+      // Pull real per-symbol nodes (signature/docstring/complexity/callers-callees
+      // live on these). Best-effort: on failure we still render the package-level
+      // tree from get_architecture alone.
+      let _nodes: GraphNodeInput[] = [];
+      try {
+        const _res = await _codeMcpCall('tools/call', {
+          name: 'search_graph',
+          arguments: { ...archArgs, limit: 1000, min_degree: 0 },
+        });
+        const _txt = (_res?.content || []).map((c: any) => c.text || '').join('').trim();
+        if (_txt) {
+          const _parsed = JSON.parse(_txt);
+          const _rows = Array.isArray(_parsed)
+            ? _parsed
+            : (_parsed.results || _parsed.nodes || _parsed.data || []);
+          if (Array.isArray(_rows)) _nodes = _rows as GraphNodeInput[];
+        }
+      } catch (_) { _nodes = []; }  // package-level tree still renders
+
+      try {
+        const _model = buildCodeGraphModel({
+          architecture: _graphArch || { packages: _graphPackages },
+          nodes: _nodes,
+        });
+        renderCodeGraph(_codegraphEl, _model, {
+          // LLM summary — SEPARATE, last-resort on-click action wired to the
+          // existing code-intel get_code_snippet path. Only invoked on demand;
+          // never part of the deterministic render.
+          onRequestSummary: async (node) => {
+            const qn = node.meta.qualifiedName;
+            if (!qn) throw new Error('No qualified_name to summarize.');
+            const _snip = await _codeMcpCall('tools/call', {
+              name: 'get_code_snippet',
+              arguments: { ...archArgs, qualified_name: qn },
+            });
+            const _snipTxt = (_snip?.content || []).map((c: any) => c.text || '').join('').trim();
+            return _snipTxt || 'No snippet returned.';
+          },
+        });
+      } catch (e: any) {
+        _codegraphEl.innerHTML = `<div style="font-size:10px;color:var(--error)">Code tree failed: ${escapeHtml(String(e))}</div>`;
+      }
     }
 
     // 31d0caa6 — manual reindex button: re-run index_repository for each repo
