@@ -256,7 +256,13 @@ def main() -> int:
         from meridian.tunnel_client import run_tunnel
 
         if platform.system() == "Windows":
-            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+            # f73810d5/3ac13517 — WindowsSelectorEventLoopPolicy, NOT
+            # DefaultEventLoopPolicy() (which on Windows is the ProactorEventLoopPolicy).
+            # meridian-connect.exe is built from THIS script, so the wrong policy here
+            # is exactly what shipped the live psycopg_pool.PoolTimeout tunnel-startup
+            # failure: hand-setting one SelectorEventLoop leaves the policy on Proactor,
+            # so psycopg's later loop derivation still gets an unsupported Proactor loop.
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
             _loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
             asyncio.set_event_loop(_loop)
         else:

@@ -12,11 +12,39 @@ Fixtures:
 
 from __future__ import annotations
 
+import asyncio
 import os
+import sys
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
+
+
+@pytest.fixture
+def event_loop_policy():
+    """Event-loop policy pytest-asyncio uses to build each test's loop.
+
+    On Windows the entry-point modules (``meridian.__main__`` /
+    ``meridian.tunnel_main``) set the *global* asyncio policy to
+    ``WindowsSelectorEventLoopPolicy`` at import time — needed at runtime for async
+    psycopg, but a Windows SelectorEventLoop cannot spawn subprocesses
+    (``asyncio.create_subprocess_exec`` raises ``NotImplementedError``). The enqueue
+    worker tests spawn subprocesses, so whether an xdist worker happened to import
+    one of those entry-point modules flipped those tests between pass and fail —
+    a real, pre-existing xdist-sharding flake (f73810d5 made Selector more prevalent
+    and unmasked it).
+
+    Pin the Proactor policy for test loops on Windows so subprocess spawning is
+    deterministic. That is already the Windows asyncio *default*; the entry-point
+    modules only override it for real psycopg, which is Linux-only in CI and skipped
+    locally (``db_pg`` needs ``TEST_DATABASE_URL``), so nothing exercised locally
+    needs Selector. No-op off Windows — return the default policy and never touch
+    the Windows-only symbol there (keeps Linux CI import-safe).
+    """
+    if sys.platform == "win32":
+        return asyncio.WindowsProactorEventLoopPolicy()
+    return asyncio.DefaultEventLoopPolicy()
 
 
 @pytest_asyncio.fixture

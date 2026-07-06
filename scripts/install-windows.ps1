@@ -36,6 +36,24 @@ $url = "https://github.com/meridianmcp/Meridian/releases/latest/download/meridia
 
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 
+# 50d2664d — resolve + print the exact release tag being downloaded so users can
+# confirm they got the intended release, not a stale cached binary. The
+# releases/latest API resolves to the same tag as releases/latest/download.
+# Best-effort — never fatal if the API call fails.
+$releaseTag = $null
+try {
+    $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/meridianmcp/Meridian/releases/latest" `
+        -Headers @{ "User-Agent" = "meridian-install" } -TimeoutSec 15
+    $releaseTag = $latest.tag_name
+} catch {
+    $releaseTag = $null
+}
+if ($releaseTag) {
+    Write-Host "Installing meridian.exe $releaseTag (latest release)."
+} else {
+    Write-Host "Installing meridian.exe (latest release; could not resolve the exact version tag)."
+}
+
 Write-Host "Downloading meridian.exe..."
 $maxAttempts = 3
 $downloaded = $false

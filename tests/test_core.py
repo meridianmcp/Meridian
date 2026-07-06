@@ -13409,7 +13409,12 @@ def test_oauth_device_returns_required_fields(client):
     # user_code format: XXXX-XXXX
     uc = body["user_code"]
     assert len(uc) == 9 and uc[4] == "-"
-    assert uc[:4].isupper() and uc[5:].isupper()
+    # The code is uppercase base32 over ABCDEFGHJKMNPQRSTVWXYZ23456789. `.isupper()`
+    # is the wrong check: it returns False for an all-digit segment (e.g. "7795"),
+    # which is a perfectly valid code since the alphabet includes 2-9 — that made
+    # this assertion RNG-flaky. Assert there are no lowercase chars + charset instead.
+    assert uc == uc.upper()
+    assert set(uc) <= set("ABCDEFGHJKMNPQRSTVWXYZ23456789-")
 
 
 def test_oauth_device_dedup_codes(client):

@@ -33,10 +33,19 @@ import sys
 # subprocess pipe transports are also happier on the SelectorEventLoop, and we
 # mirror __main__.py's handling so behaviour is identical across entry points.
 # Must run before any asyncio.run()/loop call.
+#
+# f73810d5/3ac13517 — this MUST be WindowsSelectorEventLoopPolicy, not
+# DefaultEventLoopPolicy(). On Windows DefaultEventLoopPolicy() *is* the
+# ProactorEventLoopPolicy: setting it and then hand-installing one SelectorEventLoop
+# fixes only the current loop, while any loop later derived through the policy
+# (e.g. psycopg_pool's async connection machinery) is still a ProactorEventLoop —
+# which surfaced as psycopg_pool.PoolTimeout / total tunnel-startup failure in the
+# compiled binary even though the source's __main__.py was correct. The fix in
+# __main__.py was never mirrored here, so the frozen .exe shipped the bug.
 if sys.platform == "win32":
     import selectors
 
-    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     _loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
     asyncio.set_event_loop(_loop)
 
