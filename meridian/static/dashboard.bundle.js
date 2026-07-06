@@ -10118,6 +10118,20 @@ Current: ${current || "(none)"}`,
 
           <div class="live-section">
 
+            <div class="live-section-label">In progress \xB7 by session</div>
+
+            <div id="live-inprogress-by-session-${project.id}" class="live-inprogress-by-session">
+
+              <div class="live-empty">Nothing in progress right now.</div>
+
+            </div>
+
+          </div>
+
+          <hr class="live-divider">
+
+          <div class="live-section">
+
             <div class="live-section-label">Active sessions</div>
 
             <div class="live-sessions" id="live-sessions-${project.id}">
@@ -11329,6 +11343,63 @@ Current: ${current || "(none)"}`,
   var LIVE_REFRESH_MS = 3e4;
   var LIVE_THROTTLE_MS = 1e4;
   var liveRefreshState = {};
+  function renderInProgressBySession(projectId, sprintItems, sessions) {
+    const root = document.getElementById(`live-inprogress-by-session-${projectId}`);
+    if (!root) return;
+    const sessById = {};
+    for (const s3 of sessions || []) sessById[String(s3.id)] = s3;
+    const inProgress = (sprintItems || []).filter((it) => String(it.status) === "in_progress");
+    if (!inProgress.length) {
+      root.innerHTML = '<div class="live-empty">Nothing in progress right now.</div>';
+      return;
+    }
+    const byActor = {};
+    const unassigned = [];
+    for (const it of inProgress) {
+      const actor = it.actor ? String(it.actor) : "";
+      if (actor) (byActor[actor] = byActor[actor] || []).push(it);
+      else unassigned.push(it);
+    }
+    const _hue = (s3) => {
+      let h3 = 0;
+      for (let i3 = 0; i3 < s3.length; i3++) h3 = (h3 * 31 + s3.charCodeAt(i3)) % 360;
+      return h3;
+    };
+    const _elapsed = (ts) => {
+      if (!ts) return "";
+      const t3 = Date.parse(String(ts).replace(" ", "T"));
+      if (isNaN(t3)) return "";
+      const mins = Math.max(0, Math.floor((Date.now() - t3) / 6e4));
+      return mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h${mins % 60}m`;
+    };
+    const _item = (it, color) => `<div class="live-ip-item" style="display:flex;gap:6px;align-items:center;margin-top:4px">
+      <span style="width:5px;height:5px;border-radius:50%;background:${color};flex:none"></span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${escapeHtml(String(it.nickname || it.title || it.id || ""))}</span>
+      ${_elapsed(it.claimed_at) ? `<span style="font-size:9px;color:var(--muted);flex:none">${_elapsed(it.claimed_at)}</span>` : ""}
+    </div>`;
+    const actors = Object.keys(byActor).sort((a3, b2) => byActor[b2].length - byActor[a3].length);
+    let html = "";
+    for (const actor of actors) {
+      const sess = sessById[actor] || {};
+      const color = `hsl(${_hue(actor)} 70% 55%)`;
+      const name = sess.name || `${actor.slice(0, 8)}\u2026`;
+      const status = String(sess.status || "unknown");
+      html += `<div class="live-ip-owner" data-session="${escapeHtml(actor)}" style="border-left:3px solid ${color};padding:4px 0 4px 8px;margin-bottom:8px">
+      <div style="display:flex;gap:6px;align-items:center;justify-content:space-between">
+        <span style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml(String(name))}</span>
+        <span style="font-size:9px;padding:0 5px;border-radius:3px;border:1px solid ${color};color:${color}">${status === "active" ? "ACTIVE" : escapeHtml(status.toUpperCase())} \xB7 ${byActor[actor].length}</span>
+      </div>
+      ${byActor[actor].map((it) => _item(it, color)).join("")}
+    </div>`;
+    }
+    if (unassigned.length) {
+      html += `<div class="live-ip-owner" style="border-left:3px solid var(--muted);padding:4px 0 4px 8px">
+      <div style="font-size:10px;font-weight:600;color:var(--muted)">Unassigned \xB7 ${unassigned.length}</div>
+      ${unassigned.map((it) => _item(it, "var(--muted)")).join("")}
+    </div>`;
+    }
+    root.innerHTML = html;
+  }
   function scheduleLiveRefresh(projectId) {
     const s3 = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
     clearTimeout(s3.timer);
@@ -11515,6 +11586,9 @@ Current: ${current || "(none)"}`,
           sprintRoot.innerHTML = renderProjectLoadError2(projectId, "Sprint progress unavailable", sprintItemsPath, sprintItemsResult.reason);
           wireProjectLoadRetry2(sprintRoot, projectId);
         }
+      }
+      if (sprintItemsResult.status === "fulfilled" && sessionsResult.status === "fulfilled") {
+        renderInProgressBySession(projectId, sprintItemsResult.value || [], sessionsResult.value || []);
       }
       if (sessionsResult.status === "fulfilled" && tasksResult.status === "fulfilled") {
         const worktrees = worktreesResult.status === "fulfilled" ? worktreesResult.value || [] : [];
@@ -12679,15 +12753,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       body.innerHTML = `<div class="empty" style="color:var(--error)">Could not load insights: ${escapeHtml(String(e3))}</div>`;
       return;
     }
-    const HORIZON = {
-      permanent: { label: "PERMANENT", color: "var(--accent)" },
-      year: { label: "YEAR", color: "var(--warning, #d29922)" },
-      quarter: { label: "QUARTER", color: "var(--muted)" }
-    };
-    const _pill = (h3) => {
-      const m3 = HORIZON[String(h3)] || { label: String(h3 || "quarter").toUpperCase(), color: "var(--muted)" };
-      return `<span style="font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid ${m3.color};color:${m3.color};letter-spacing:.04em">${m3.label}</span>`;
-    };
+    const HORIZONS = [
+      { key: "permanent", label: "PERMANENT", color: "var(--accent)" },
+      { key: "year", label: "YEAR", color: "var(--warning, #d29922)" },
+      { key: "quarter", label: "QUARTER", color: "var(--muted)" }
+    ];
     let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
     <div style="font-size:11px;color:var(--text)"><b>${insights.length}</b> insight${insights.length === 1 ? "" : "s"}</div>
   </div>
@@ -12695,18 +12765,27 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!insights.length) {
       html += `<div class="empty" style="color:var(--muted);padding:8px 0">No insights yet. Capture accumulated understanding with <code>add_insight(project_id, title, body, horizon)</code>.</div>`;
     } else {
-      const order = { permanent: 0, year: 1, quarter: 2 };
-      const sorted = [...insights].sort((a3, b2) => (order[String(a3.horizon)] ?? 3) - (order[String(b2.horizon)] ?? 3));
-      for (const ins of sorted) {
+      const buckets = { permanent: [], year: [], quarter: [] };
+      for (const ins of insights) {
+        const h3 = String(ins.horizon || "quarter").toLowerCase();
+        (buckets[h3] || buckets.quarter).push(ins);
+      }
+      const _renderCard = (ins) => {
         const tags = String(ins.tags || "").split(",").map((t3) => t3.trim()).filter(Boolean);
-        html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
-        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
-          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(ins.title || ""))}</span>
-          ${_pill(ins.horizon)}
-        </div>
+        return `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+        <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(ins.title || ""))}</div>
         ${ins.body ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;white-space:pre-wrap">${escapeHtml(String(ins.body))}</div>` : ""}
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t3) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(t3)}</span>`).join("")}</div>` : ""}
       </div>`;
+      };
+      for (const hz of HORIZONS) {
+        const items = buckets[hz.key];
+        if (!items.length) continue;
+        html += `<div class="insights-horizon-section" data-horizon="${hz.key}" style="display:flex;align-items:center;gap:6px;margin:12px 0 6px;padding-bottom:3px;border-bottom:1px solid ${hz.color}">
+        <span style="font-size:9px;font-weight:700;letter-spacing:.05em;color:${hz.color}">${hz.label}</span>
+        <span style="font-size:9px;color:var(--muted)">${items.length}</span>
+      </div>`;
+        for (const ins of items) html += _renderCard(ins);
       }
     }
     body.innerHTML = html;
@@ -13042,11 +13121,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         <div>Documents: <b>${_docsCount}</b> ingested <span style="color:var(--muted)">(kind=document)</span></div>
       </div>
     </div>`;
-      html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
       html += `<div style="margin-bottom:16px">
       <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Code Tree</div>
       <div id="${_cgId}-codegraph"></div>
     </div>`;
+      html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
       html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
       if (repoPaths.length) {
         for (const rp of repoPaths) {

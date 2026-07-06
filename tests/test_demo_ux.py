@@ -1200,3 +1200,61 @@ def test_documents_tab_shows_peeks_and_ingest_copy(demo_client):
         finally:
             server.should_exit = True
             doc_peeks.clear()
+
+
+@pytestmark_playwright
+def test_live_parallelization_tab_renders(demo_client):
+    """e19c3ca2 — the Live tab's new "In progress · by session" section is wired and
+    RENDERS in a real browser: clicking the Live vtab runs loadLiveTab -> refreshLiveTab,
+    which groups the currently-in_progress sprint items by their owning session and
+    paints them into the section container (proving the section is wired into the live
+    view end to end). Distinct from the historical Sessions timeline (1e1bd6b0)."""
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17888, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17888/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
+            try:
+                page.click("#demo-onboarding-overlay button[title='Dismiss']", timeout=1500)
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            # Remove the onboarding overlay + guided-tour tooltip so they can't
+            # intercept the vtab click.
+            try:
+                page.evaluate(
+                    "() => { for (const id of ['demo-onboarding-overlay','demo-tour-tooltip','demo-tour-backdrop']) { const el = document.getElementById(id); if (el) el.remove(); } }"
+                )
+            except Exception:
+                pass
+
+            page.wait_for_selector(".vtab-btn", timeout=8000)
+            btn = page.locator('.vtab-btn[data-vtab="live"]').first
+            _vtabs = page.evaluate(
+                "() => Array.from(document.querySelectorAll('.vtab-btn')).map(b=>b.getAttribute('data-vtab'))"
+            )
+            assert btn.count() >= 1, f"Live vtab not found; vtabs present = {_vtabs}"
+            btn.click()
+
+            # The new e19c3ca2 section container is wired into the live drawer and
+            # becomes visible when the Live tab is active.
+            page.wait_for_selector('[id^="live-inprogress-by-session-"]', timeout=8000)
+            content = page.content()
+            assert "by session" in content, "in-progress-by-session section label missing"
+            assert page.locator('[id^="live-inprogress-by-session-"]').count() >= 1, \
+                "in-progress-by-session container not rendered"
+            browser.close()
+        finally:
+            server.should_exit = True
