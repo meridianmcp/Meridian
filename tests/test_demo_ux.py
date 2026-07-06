@@ -858,16 +858,27 @@ def test_dashboard_shows_visible_error_when_sessions_request_fails(client):
                     body=_json.dumps({"detail": "cached plan must not change result type"}),
                 ),
             )
-            page.goto(
-                f"http://127.0.0.1:17883/dashboard?project_id={pid}",
-                wait_until="domcontentloaded",
-            )
-
             alert = page.locator(f"#project-fetch-alert-{pid}")
-            # Wait for the alert to actually render rather than a fixed sleep — CI's
-            # headless chromium is slower than local, so a 2500ms wait raced the
-            # failed-fetch → alert render (this test's only CI flake).
-            alert.wait_for(state="visible", timeout=15000)
+            # The alert appears after the dashboard boots, opens the project, and its
+            # sessions fetch 500s. That boot → fetch → render chain is timing-sensitive
+            # in CI's headless chromium: a single slow boot can leave the alert
+            # container created-but-empty (observed as "resolved to hidden" for the full
+            # wait). Reload-and-retry a few times so one slow boot doesn't red the suite
+            # — the route mock is page-scoped and persists across navigations. This is
+            # the test's only CI flake; a fixed sleep and a single 15s wait both raced it.
+            _visible = False
+            for _attempt in range(4):
+                page.goto(
+                    f"http://127.0.0.1:17883/dashboard?project_id={pid}",
+                    wait_until="domcontentloaded",
+                )
+                try:
+                    alert.wait_for(state="visible", timeout=8000)
+                    _visible = True
+                    break
+                except Exception:
+                    page.wait_for_timeout(750)
+            assert _visible, "project fetch alert should be visible on sessions failure"
             assert alert.is_visible(), "project fetch alert should be visible on sessions failure"
             alert_text = alert.inner_text()
             assert "project data failed to load" in alert_text.lower()

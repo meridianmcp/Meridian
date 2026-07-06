@@ -911,6 +911,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "query": {"type": "string"},
          "limit": {"type": "integer", "description": "Max results per type fed to synthesis (default 10)."}},
          "required": ["query"]}},
+    {"name": "paper_search", "description":
+        "Search arXiv for academic papers — a REAL external lookup (keyless). Per the "
+        "research-routing protocol, use this FIRST for academic/paper questions (cite "
+        "the paper itself, not a secondary write-up), then capture_research_finding to "
+        "save what you cite. Returns {query, count, results:[{arxiv_id, title, authors, "
+        "summary, published, url, pdf_url}]}.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "Search terms (matches title / abstract / authors)."},
+         "limit": {"type": "integer", "description": "Max papers to return (default 10, max 50)."},
+         "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recently updated first)."}},
+         "required": ["query"]}},
     {"name": "get_agent_instructions", "description":
         "Read-only: Return the custom agent_instructions for a project. "
         "These are injected automatically by start_session so every session picks them up. "
@@ -1151,6 +1162,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
 _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_tasks", "search_tasks", "search_all", "search_synthesis",
+    "paper_search",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "idle_until_session_done", "generate_handoff", "load_handoff",
