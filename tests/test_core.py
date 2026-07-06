@@ -7153,6 +7153,30 @@ def test_default_agent_instructions_has_code_intel_protocol():
     assert "search_graph" in DEFAULT_AGENT_INSTRUCTIONS
 
 
+def test_default_agent_instructions_route_hitl_only_never_native(  ):
+    """d261ea2e — the rules must be unambiguous that any human-decision question
+    routes through request_hitl, never the executor's native ask UI."""
+    from meridian.agent_defaults import DEFAULT_AGENT_INSTRUCTIONS
+    text = DEFAULT_AGENT_INSTRUCTIONS
+    assert "request_hitl" in text
+    # The load-bearing prohibition: native ask is called out as forbidden.
+    lowered = text.lower()
+    assert "never the native" in lowered
+    assert "list_hitl_requests" in text  # explains WHY native is invisible
+    assert '"how should i proceed"' in lowered
+
+
+def test_default_agent_instructions_has_research_routing_protocol():
+    """f8c70f9a — the research-routing protocol section ships in the default rules."""
+    from meridian.agent_defaults import DEFAULT_AGENT_INSTRUCTIONS
+    text = DEFAULT_AGENT_INSTRUCTIONS
+    assert "RESEARCH ROUTING PROTOCOL" in text
+    # GitHub-first, paper-search-first, multi-search + primary sources.
+    assert "GitHub" in text
+    assert "paper-search" in text
+    assert "primary source" in text.lower()
+
+
 def test_cached_plan_error_is_retryable():
     """A stale prepared-plan error must be classified transient so the pool
     retries with a fresh connection.
@@ -15860,8 +15884,8 @@ def test_agent_instructions_include_reindex_at_session_start():
         AGENT_INSTRUCTIONS_STANDARD_VERSION,
     )
     assert 'index_repository(mode="fast")' in DEFAULT_AGENT_INSTRUCTIONS
-    assert AGENT_INSTRUCTIONS_STANDARD_VERSION >= 3
-    assert "meridian-executor-standard: v3" in DEFAULT_AGENT_INSTRUCTIONS
+    assert AGENT_INSTRUCTIONS_STANDARD_VERSION >= 4
+    assert "meridian-executor-standard: v4" in DEFAULT_AGENT_INSTRUCTIONS
 
 
 @pytest.mark.asyncio
