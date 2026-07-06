@@ -5700,11 +5700,39 @@ async def get_project_stats(
         for v, d in sorted(sprint_by_version.items())
     ]
 
+    # c975b6ef — activity by domain per day: GROUP BY source_type + day on the
+    # pointer primitive (which docs/web/experiment/code/citation targets were
+    # touched each day). Daily AGGREGATE totals only — no time-of-day/session detail.
+    async with db.execute(
+        "SELECT substr(created_at, 1, 10) AS day, source_type, COUNT(*) AS cnt "
+        "FROM sprint_item_pointers "
+        "WHERE project_id = ? AND created_at >= ? "
+        "GROUP BY day, source_type ORDER BY day ASC",
+        (project_id, cutoff),
+    ) as cur:
+        domain_rows = await cur.fetchall()
+    domains_by_day: dict[str, dict[str, int]] = {}
+    domain_keys: set[str] = set()
+    for r in domain_rows:
+        st = r["source_type"] or "other"
+        domains_by_day.setdefault(r["day"], {})[st] = r["cnt"]
+        domain_keys.add(st)
+    activity_by_domain = [
+        {
+            "day": d,
+            "by_domain": domains_by_day.get(d, {}),
+            "total": sum(domains_by_day.get(d, {}).values()),
+        }
+        for d in all_days
+    ]
+
     return {
         "period_days": days,
         "tasks_per_day": tasks_per_day,
         "sprint_items_per_day": sprint_items_per_day,
         "sprint_velocity": sprint_velocity,
+        "activity_by_domain": activity_by_domain,
+        "activity_domains": sorted(domain_keys),
     }
 
 

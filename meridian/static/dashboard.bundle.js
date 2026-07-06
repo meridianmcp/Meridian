@@ -6805,6 +6805,12 @@ ${n2.tags || ""}`.toLowerCase();
 
     </div>
 
+    <div style="color:var(--accent);font-weight:600;font-size:11px;margin:18px 0 8px">\u{1F5C2}\uFE0F Activity by domain / day (last ${stats.period_days}d)</div>
+
+    <canvas id="chart-activity-${escapeHtml(projectId)}" style="max-width:100%;max-height:160px"></canvas>
+
+    <div style="font-size:9px;color:var(--muted);margin-top:4px">docs/web/experiment/code/citation pointers touched each day \u2014 daily aggregate totals only.</div>
+
   </div>`;
   }
   function initRewindCharts(projectId, stats) {
@@ -6818,6 +6824,10 @@ ${n2.tags || ""}`.toLowerCase();
       if (p3._chartSprint) {
         p3._chartSprint.destroy();
         p3._chartSprint = null;
+      }
+      if (p3._chartActivity) {
+        p3._chartActivity.destroy();
+        p3._chartActivity = null;
       }
     }
     const tasksCanvas = document.getElementById(`chart-tasks-${projectId}`);
@@ -6877,6 +6887,40 @@ ${n2.tags || ""}`.toLowerCase();
         }
       });
       if (p3) p3._chartSprint = chart;
+    }
+    const activityCanvas = document.getElementById(`chart-activity-${projectId}`);
+    const abd = stats.activity_by_domain;
+    const domains = stats.activity_domains || [];
+    if (activityCanvas && abd && domains.length) {
+      const labels = abd.map((d3) => String(d3.day).slice(5));
+      const PALETTE2 = {
+        code: "rgba(96,165,250,0.75)",
+        docs: "rgba(52,211,153,0.75)",
+        web: "rgba(217,119,6,0.75)",
+        experiment: "rgba(167,139,250,0.75)",
+        citation: "rgba(244,114,182,0.75)",
+        other: "rgba(156,163,175,0.6)"
+      };
+      const datasets = domains.map((dom, i3) => ({
+        label: dom,
+        data: abd.map((d3) => (d3.by_domain || {})[dom] || 0),
+        backgroundColor: PALETTE2[dom] || `hsl(${i3 * 67 % 360} 60% 60% / 0.75)`,
+        borderRadius: 2,
+        stack: "activity"
+      }));
+      const chart = new Chart(activityCanvas, {
+        type: "bar",
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: true, position: "bottom", labels: { color: "#9ca3af", font: { size: 9 }, boxWidth: 10 } } },
+          scales: {
+            x: { stacked: true, ticks: { color: "#9ca3af", font: { size: 9 }, maxRotation: 45 }, grid: { color: "#1f2937" } },
+            y: { stacked: true, ticks: { color: "#9ca3af", font: { size: 9 }, stepSize: 1 }, grid: { color: "#1f2937" }, beginAtZero: true }
+          }
+        }
+      });
+      if (p3) p3._chartActivity = chart;
     }
   }
   function renderRewindSprint(projectId, data) {

@@ -1110,3 +1110,46 @@ def test_session_timeline_tab_renders(demo_client):
             browser.close()
         finally:
             server.should_exit = True
+
+
+@pytestmark_playwright
+def test_activity_by_domain_chart_renders(demo_client):
+    """c975b6ef — the Activity-by-domain chart is wired into the Rewind → Charts
+    subtab (alongside the existing Sprint items/day + completion charts) and its
+    canvas + heading actually render in a real browser."""
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17892, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17892/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
+            try:
+                page.click("#demo-onboarding-overlay button[title='Dismiss']", timeout=1500)
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            page.wait_for_selector('.vtab-btn[data-vtab="rewind"]', timeout=8000)
+            page.click('.vtab-btn[data-vtab="rewind"]')
+            page.wait_for_timeout(1200)
+            page.wait_for_selector('.rewind-subtab-btn[data-tab="charts"]', timeout=8000)
+            page.click('.rewind-subtab-btn[data-tab="charts"]')
+
+            page.wait_for_selector("text=Activity by domain", timeout=8000)
+            content = page.content()
+            assert "Activity by domain" in content
+            assert page.locator('[id^="chart-activity-"]').count() >= 1, \
+                "activity-by-domain chart canvas not rendered"
+            browser.close()
+        finally:
+            server.should_exit = True
