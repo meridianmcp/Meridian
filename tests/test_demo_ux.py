@@ -1059,3 +1059,54 @@ def test_demo_tour_persists_and_finishes(client):
             browser.close()
         finally:
             server.should_exit = True
+
+
+@pytestmark_playwright
+def test_session_timeline_tab_renders(demo_client):
+    """1e1bd6b0 — the Sessions vtab is wired and its view actually RENDERS in a
+    real browser: clicking it runs loadSessionTimelineTab, which fetches
+    /projects/{id}/session-timeline and paints the explanatory panel (proving the
+    button → tab-switch → loader → endpoint → DOM path end to end). Uses demo_client
+    so the seeded demo project auto-opens and the vtab strip is present."""
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17891, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17891/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)  # allow JS to boot + auto-open the seeded project
+
+            # Best-effort dismiss of the onboarding overlay so it can't intercept clicks.
+            try:
+                page.click("#demo-onboarding-overlay button[title='Dismiss']", timeout=1500)
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            page.wait_for_selector(".vtab-btn", timeout=8000)  # project panel is open
+            btn = page.locator('.vtab-btn[data-vtab="sessions"]').first
+            _vtabs = page.evaluate(
+                "() => Array.from(document.querySelectorAll('.vtab-btn')).map(b=>b.getAttribute('data-vtab'))"
+            )
+            assert btn.count() >= 1, f"Sessions vtab not found; vtabs present = {_vtabs}"
+            btn.click()
+
+            # The loader paints its explanatory header — wait for it to appear.
+            page.wait_for_selector("text=Per executor session", timeout=8000)
+            content = page.content()
+            assert "Per executor session" in content
+            # The load-bearing distinction is surfaced in the UI copy.
+            assert "still had an item claimed" in content
+
+            browser.close()
+        finally:
+            server.should_exit = True
