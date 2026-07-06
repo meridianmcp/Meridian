@@ -86,6 +86,57 @@ def test_get_document_structure_mcp_tool(tmp_path):
         asyncio.run(db.close())
 
 
+def test_get_document_structure_hosted_errors_honestly(tmp_path, monkeypatch):
+    # b43bab91 — on hosted Meridian the server can't read a caller's local path,
+    # so the tool must fail HONESTLY (explain + point to self-host/tunnel) instead
+    # of the doomed read's misleading "file not found". The file physically exists
+    # on THIS box, but hosted mode must refuse it regardless.
+    import asyncio
+    from meridian import server as mh
+    from meridian import db as db_module
+
+    monkeypatch.setattr("meridian.mcp.handler._hosted_mode", lambda: True)
+    docx_path = tmp_path / "chapter.docx"
+    docx_path.write_bytes(_synthetic_docx())
+    db = asyncio.run(db_module.init_db(":memory:"))
+    try:
+        res = asyncio.run(mh._dispatch_mcp_tool(
+            "get_document_structure", {"file_path": str(docx_path)}, db, str(tmp_path)))
+        # The honest path is distinguished by hosted=True + actionable guidance
+        # (self-host / tunnel), which the old bare "file not found: {fp}" lacked.
+        assert res.get("hosted") is True
+        assert "error" in res
+        low = res["error"].lower()
+        assert "self-host" in low or "tunnel" in low
+    finally:
+        asyncio.run(db.close())
+
+
+def test_get_latex_structure_hosted_prefers_source_over_path(tmp_path, monkeypatch):
+    # b43bab91 — get_latex_structure has the same server-side-file-path problem, but
+    # ALSO accepts inline `source` (which works hosted). On hosted: a path-only call
+    # fails honestly; an inline-source call still works.
+    import asyncio
+    from meridian import server as mh
+    from meridian import db as db_module
+
+    monkeypatch.setattr("meridian.mcp.handler._hosted_mode", lambda: True)
+    db = asyncio.run(db_module.init_db(":memory:"))
+    try:
+        err = asyncio.run(mh._dispatch_mcp_tool(
+            "get_latex_structure", {"file_path": "/home/user/thesis.tex"}, db, str(tmp_path)))
+        assert err.get("hosted") is True and "error" in err
+        assert "source" in err["error"].lower()
+        # Inline source works even on hosted — the server never touches the FS.
+        ok = asyncio.run(mh._dispatch_mcp_tool(
+            "get_latex_structure",
+            {"source": "\\section{Intro}\nhello world"}, db, str(tmp_path)))
+        assert "error" not in ok
+        assert "heading_count" in ok
+    finally:
+        asyncio.run(db.close())
+
+
 def test_document_structure_endpoint(client, tmp_path):
     """3f596f81 — GET /projects/{id}/document-structure returns the docx outline
     for the Documents panel; failures are returned inline, not as 500s."""
