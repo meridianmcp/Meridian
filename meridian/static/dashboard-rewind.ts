@@ -236,6 +236,12 @@ export function renderRewindCharts(projectId: string, stats: any) {
 
     </div>
 
+    <div style="color:var(--accent);font-weight:600;font-size:11px;margin:18px 0 8px">🗂️ Activity by domain / day (last ${stats.period_days}d)</div>
+
+    <canvas id="chart-activity-${escapeHtml(projectId)}" style="max-width:100%;max-height:160px"></canvas>
+
+    <div style="font-size:9px;color:var(--muted);margin-top:4px">docs/web/experiment/code/citation pointers touched each day — daily aggregate totals only.</div>
+
   </div>`;
 
 }
@@ -257,6 +263,8 @@ export function initRewindCharts(projectId: string, stats: any) {
     if (p._chartTasks) { p._chartTasks.destroy(); p._chartTasks = null; }
 
     if (p._chartSprint) { p._chartSprint.destroy(); p._chartSprint = null; }
+
+    if (p._chartActivity) { p._chartActivity.destroy(); p._chartActivity = null; }
 
   }
 
@@ -368,6 +376,40 @@ export function initRewindCharts(projectId: string, stats: any) {
 
     if (p) p._chartSprint = chart;
 
+  }
+
+  // c975b6ef — activity by domain / day: stacked bars, one dataset per pointer
+  // source_type, over the same last-N-days window as the tasks chart above.
+  const activityCanvas = document.getElementById(`chart-activity-${projectId}`);
+  const abd = stats.activity_by_domain;
+  const domains: string[] = stats.activity_domains || [];
+  if (activityCanvas && abd && domains.length) {
+    const labels = abd.map((d: any) => String(d.day).slice(5));  // MM-DD
+    const PALETTE: Record<string, string> = {
+      code: 'rgba(96,165,250,0.75)', docs: 'rgba(52,211,153,0.75)',
+      web: 'rgba(217,119,6,0.75)', experiment: 'rgba(167,139,250,0.75)',
+      citation: 'rgba(244,114,182,0.75)', other: 'rgba(156,163,175,0.6)',
+    };
+    const datasets = domains.map((dom: string, i: number) => ({
+      label: dom,
+      data: abd.map((d: any) => (d.by_domain || {})[dom] || 0),
+      backgroundColor: PALETTE[dom] || `hsl(${(i * 67) % 360} 60% 60% / 0.75)`,
+      borderRadius: 2,
+      stack: 'activity',
+    }));
+    const chart = new Chart(activityCanvas, {
+      type: 'bar',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: true, position: 'bottom', labels: { color: '#9ca3af', font: { size: 9 }, boxWidth: 10 } } },
+        scales: {
+          x: { stacked: true, ticks: { color: '#9ca3af', font: { size: 9 }, maxRotation: 45 }, grid: { color: '#1f2937' } },
+          y: { stacked: true, ticks: { color: '#9ca3af', font: { size: 9 }, stepSize: 1 }, grid: { color: '#1f2937' }, beginAtZero: true },
+        },
+      },
+    });
+    if (p) p._chartActivity = chart;
   }
 
 }
