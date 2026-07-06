@@ -447,6 +447,56 @@ async def test_mcp_pointer_tools_by_project_name(db):
     assert added["project_id"] == p["id"]
 
 
+@pytest.mark.asyncio
+async def test_mcp_delete_pointer_removes_and_is_idempotent(db):
+    """98c71a42 — the delete MCP tool removes a pointer and is idempotent."""
+    from meridian import server as srv
+    p = await db_module.create_project(db, "ptr-del")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    added = await srv._dispatch_mcp_tool(
+        "add_sprint_item_pointer",
+        {"project_id": p["id"], "sprint_item_id": item["id"], "source_type": "code",
+         "targets": [{"uri": "a.py", "selector": {"type": "range",
+                      "start_line": 1, "end_line": 2}}]},
+        db, "/tmp",
+    )
+    ptr_id = added["id"]
+
+    # delete the real pointer -> deleted True, and the item has no pointers left
+    deleted = await srv._dispatch_mcp_tool(
+        "delete_sprint_item_pointer", {"pointer_id": ptr_id}, db, "/tmp",
+    )
+    assert deleted == {"pointer_id": ptr_id, "deleted": True}
+    listed = await srv._dispatch_mcp_tool(
+        "get_sprint_item_pointers",
+        {"project_id": p["id"], "sprint_item_id": item["id"]},
+        db, "/tmp",
+    )
+    assert listed["pointers"] == []
+
+    # deleting again is idempotent (not an error) -> deleted False
+    again = await srv._dispatch_mcp_tool(
+        "delete_sprint_item_pointer", {"pointer_id": ptr_id}, db, "/tmp",
+    )
+    assert again == {"pointer_id": ptr_id, "deleted": False}
+
+    # a missing pointer_id is a clean error, not a crash
+    err = await srv._dispatch_mcp_tool(
+        "delete_sprint_item_pointer", {}, db, "/tmp",
+    )
+    assert "error" in err
+
+
+def test_delete_pointer_tool_registered():
+    """98c71a42 — delete_sprint_item_pointer is a registered, non-read-only,
+    destructive-hinted MCP tool (so it is callable and correctly annotated)."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST, _READ_ONLY_TOOLS, _DESTRUCTIVE_TOOLS
+    names = {t["name"] for t in _MCP_TOOLS_LIST}
+    assert "delete_sprint_item_pointer" in names
+    assert "delete_sprint_item_pointer" not in _READ_ONLY_TOOLS
+    assert "delete_sprint_item_pointer" in _DESTRUCTIVE_TOOLS
+
+
 # ---------------------------------------------------------------------------
 # MCP tool-list + schema membership
 # ---------------------------------------------------------------------------
