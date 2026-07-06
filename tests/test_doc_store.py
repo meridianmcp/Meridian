@@ -792,3 +792,98 @@ def test_lifespan_tolerates_doc_store_open_failure(tmp_path, monkeypatch):
         assert getattr(client.app.state, "doc_store", "MISSING") is None
         # Server is otherwise healthy.
         assert client.get("/health").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 2412d29d — FULL-CHAIN integration: the real docx pipeline
+# (docs_intel.document_outline -> elements_from_docx_outline -> put_document ->
+# get_structure) round-trips on real .docx bytes, plus the branches that bite in
+# production: empty document, malformed docx, upsert-by-source, missing source.
+# Derived from an ad-hoc round-trip run first (proved it works on a real docx),
+# then formalized here — not written in a vacuum.
+# ---------------------------------------------------------------------------
+
+from meridian.docs_intel import document_outline
+
+
+def _docx_from_body(inner_xml: str) -> bytes:
+    doc = (
+        '<?xml version="1.0"?><w:document '
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body>'
+        + inner_xml +
+        '</w:body></w:document>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", doc)
+    return buf.getvalue()
+
+
+def test_full_docx_chain_roundtrips_with_parent_edges(tmp_path):
+    """The whole pipeline on real .docx bytes: parse -> map -> store -> read back,
+    preserving heading order AND the structural parent edge (H2 under its H1)."""
+    async def _run():
+        outline = document_outline(_synthetic_docx())  # Intro(H1), Design(H2), Results(H1)
+        elements = doc_store.elements_from_docx_outline(outline)
+        store = await _open_store(tmp_path)
+        await store.put_document("proj", "docx", elements, source="thesis.docx", title="Thesis")
+        got = await store.get_structure("proj", "thesis.docx")
+        assert got is not None
+        texts = [e["text"] for e in got["elements"]]
+        assert texts == ["Introduction", "Design", "Results"]
+        by_text = {e["text"]: e for e in got["elements"]}
+        # Design (H2) attaches under the preceding Introduction (H1); Results (H1) is a root.
+        assert by_text["Design"]["parent_id"] == by_text["Introduction"]["id"]
+        assert by_text["Results"]["parent_id"] is None
+    asyncio.run(_run())
+
+
+def test_docx_chain_empty_document_roundtrips(tmp_path):
+    """A docx with body text but NO headings yields 0 elements; the document row
+    still stores + reads back with an empty element list (not an error)."""
+    async def _run():
+        docx = _docx_from_body('<w:p w14:paraId="B1"><w:r><w:t>plain body, no headings</w:t></w:r></w:p>')
+        outline = document_outline(docx)
+        assert outline["heading_count"] == 0
+        elements = doc_store.elements_from_docx_outline(outline)
+        assert elements == []
+        store = await _open_store(tmp_path)
+        await store.put_document("proj", "docx", elements, source="empty.docx")
+        got = await store.get_structure("proj", "empty.docx")
+        assert got is not None and got["elements"] == []
+    asyncio.run(_run())
+
+
+def test_docx_chain_malformed_docx_fails_cleanly(tmp_path):
+    """Malformed (non-zip) docx bytes make document_outline raise — the parse
+    failure surfaces to the caller (guarded at the MCP layer, b43bab91), never a
+    silent empty structure."""
+    with pytest.raises(Exception):
+        document_outline(b"this is not a zip file at all")
+
+
+def test_docx_chain_upsert_by_source_replaces_structure(tmp_path):
+    """Re-parsing the same source (a doc edited then re-ingested) upserts: stable
+    document id, structure replaced — not a duplicate row nor a silent merge."""
+    async def _run():
+        store = await _open_store(tmp_path)
+        first = doc_store.elements_from_docx_outline(document_outline(_synthetic_docx()))
+        doc1 = await store.put_document("proj", "docx", first, source="paper.docx")
+        # Re-ingest a shorter version of the same source.
+        docx2 = _docx_from_body('<w:p w14:paraId="C1"><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>OnlyOne</w:t></w:r></w:p>')
+        second = doc_store.elements_from_docx_outline(document_outline(docx2))
+        doc2 = await store.put_document("proj", "docx", second, source="paper.docx")
+        assert doc2["id"] == doc1["id"]  # stable id (upsert, not insert)
+        got = await store.get_structure("proj", "paper.docx")
+        assert [e["text"] for e in got["elements"]] == ["OnlyOne"]
+    asyncio.run(_run())
+
+
+def test_docx_chain_missing_source_returns_none(tmp_path):
+    """get_structure for a source that was never stored returns None (not a crash),
+    so a hosted/tunnel-unavailable read degrades cleanly."""
+    async def _run():
+        store = await _open_store(tmp_path)
+        assert await store.get_structure("proj", "never-ingested.docx") is None
+    asyncio.run(_run())
