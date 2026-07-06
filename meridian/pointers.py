@@ -33,6 +33,11 @@ Selector variants:
                   resolved via ``db.search_graph_entities`` to a file+line).
 * ``node_id``   — ``{id}`` (a ``meridian.doc_store`` element id, 9ee6d2ec).
 * ``zotero_key``— ``{key}`` (resolved via ``zotero_client.resolve_citation_ref``).
+* ``text_quote``— ``{exact, prefix?, suffix?, archived_url?, archived_at?}`` (W3C
+                  TextQuoteSelector for source_type "web", 1d3f6e71; resolving it
+                  re-fetches the URL and flags content drift).
+* ``finding_id``— ``{id}`` (source_type "experiment", 1f1cd4d9; a ``save_finding``
+                  artifact note resolved via ``db.get_project_note``).
 
 This module owns:
 
@@ -57,10 +62,18 @@ from typing import Any, Awaitable, Callable
 _log = logging.getLogger(__name__)
 
 
-# The four selector types the primitive dispatches on. "web"/"experiment"
-# source_types are separate pending items (1d3f6e71 / 1f1cd4d9) and are NOT
-# selector types here.
-_SELECTOR_TYPES = frozenset({"range", "symbol", "node_id", "zotero_key"})
+# The selector types the primitive dispatches on:
+#   range / symbol / node_id / zotero_key — the original four.
+#   text_quote  — W3C TextQuoteSelector for source_type "web" (1d3f6e71): the exact
+#                 cited passage on a URL, carrying the Internet-Archive snapshot
+#                 captured at citation time. Resolving it re-fetches live and flags
+#                 content drift (the passage silently changed/vanished).
+#   finding_id  — addresses a save_finding artifact (a kind='finding' note) for
+#                 source_type "experiment" (1f1cd4d9): a zero-ceremony run log
+#                 (input / output / params / timestamp), no stages, no YAML.
+_SELECTOR_TYPES = frozenset(
+    {"range", "symbol", "node_id", "zotero_key", "text_quote", "finding_id"}
+)
 
 # Integer fields an LSP Range carries. start_line/end_line are required; the char
 # offsets are optional (a whole-line span is valid) but must be ints when present.
@@ -131,6 +144,34 @@ def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]
                 f"{what} zotero_key requires a non-empty key"
             )
         out["key"] = key.strip()
+    elif stype == "text_quote":
+        # 1d3f6e71 — W3C TextQuoteSelector: the exact cited passage, optionally
+        # bracketed by prefix/suffix for disambiguation. `exact` is stored VERBATIM
+        # (not stripped) — leading/trailing whitespace is part of an exact match.
+        # archived_url / archived_at carry the Internet-Archive snapshot captured at
+        # citation time (set by add_sprint_item_pointer for source_type "web").
+        exact = selector.get("exact")
+        if not isinstance(exact, str) or not exact.strip():
+            raise PointerValidationError(
+                f"{what} text_quote requires a non-empty exact"
+            )
+        out["exact"] = exact
+        for opt in ("prefix", "suffix", "archived_url", "archived_at"):
+            if opt in selector and selector[opt] is not None:
+                val = selector[opt]
+                if not isinstance(val, str):
+                    raise PointerValidationError(
+                        f"{what} text_quote {opt!r} must be a string"
+                    )
+                out[opt] = val
+    elif stype == "finding_id":
+        # 1f1cd4d9 — addresses a save_finding artifact (a kind='finding' note) by id.
+        fid = selector.get("id")
+        if not isinstance(fid, str) or not fid.strip():
+            raise PointerValidationError(
+                f"{what} finding_id requires a non-empty id"
+            )
+        out["id"] = fid.strip()
 
     # W3C hasSubSelector — optional, recursive, validated by the same rules.
     sub = selector.get("subSelector")
@@ -248,6 +289,8 @@ def row_to_pointer(row: dict[str, Any]) -> dict[str, Any]:
 SymbolResolver = Callable[..., Awaitable[list[dict[str, Any]]]]
 NodeResolver = Callable[..., Awaitable[dict[str, Any] | None]]
 CitationResolver = Callable[..., Awaitable[dict[str, Any] | None]]
+WebFetcher = Callable[..., Awaitable[str | None]]
+FindingResolver = Callable[..., Awaitable[dict[str, Any] | None]]
 
 
 def _unresolved(reason: str, **extra: Any) -> dict[str, Any]:
@@ -351,6 +394,64 @@ async def _resolve_zotero_key(
     }
 
 
+async def _resolve_text_quote(
+    selector: dict[str, Any],
+    uri: str,
+    web_fetcher: WebFetcher | None,
+) -> dict[str, Any]:
+    """``text_quote`` — is the exact cited passage still present at ``uri``? (1d3f6e71)
+
+    Fetches the live page (injectable ``web_fetcher``) and checks whether ``exact``
+    (bracketed by ``prefix``/``suffix`` when given) is still present. A missing
+    passage is a RESOLVED result with ``drift: True`` — the URL's content changed
+    since it was cited — not an error. Echoes the ``archived_url`` snapshot captured
+    at citation time so a caller can fall back to the archived copy.
+    """
+    exact = selector.get("exact") or ""
+    base: dict[str, Any] = {"selector_type": "text_quote", "uri": uri, "exact": exact}
+    if selector.get("archived_url"):
+        base["archived_url"] = selector["archived_url"]
+    if web_fetcher is None:
+        return _unresolved("no web fetcher available", **base)
+    try:
+        text = await web_fetcher(uri)
+    except Exception:  # noqa: BLE001 — a fetch failure is just "unresolvable"
+        _log.debug("web fetch failed for %r", uri, exc_info=True)
+        return _unresolved("web fetch failed", **base)
+    if text is None:
+        return _unresolved("web fetch returned nothing", **base)
+    prefix = selector.get("prefix") or ""
+    suffix = selector.get("suffix") or ""
+    needle = f"{prefix}{exact}{suffix}" if (prefix or suffix) else exact
+    present = needle in text
+    return {"resolved": True, **base, "found": present, "drift": not present}
+
+
+async def _resolve_finding_id(
+    selector: dict[str, Any],
+    uri: str,
+    finding_resolver: FindingResolver | None,
+) -> dict[str, Any]:
+    """``finding_id`` — resolve a save_finding artifact (a note) by id (1f1cd4d9)."""
+    fid = selector.get("id")
+    if finding_resolver is None:
+        return _unresolved("no finding resolver available",
+                           selector_type="finding_id", uri=uri, id=fid)
+    try:
+        found = await finding_resolver(fid)
+    except Exception:  # noqa: BLE001 — lookup failure → unresolvable
+        _log.debug("finding_id resolve failed for %r", fid, exc_info=True)
+        return _unresolved("finding lookup failed",
+                           selector_type="finding_id", uri=uri, id=fid)
+    if not found:
+        return _unresolved("no finding artifact with that id",
+                           selector_type="finding_id", uri=uri, id=fid)
+    return {
+        "resolved": True, "selector_type": "finding_id", "uri": uri,
+        "id": fid, "artifact": found,
+    }
+
+
 async def _resolve_selector(
     db: Any,
     project_id: str,
@@ -360,6 +461,8 @@ async def _resolve_selector(
     symbol_resolver: SymbolResolver,
     node_resolver: NodeResolver | None,
     citation_resolver: CitationResolver,
+    web_fetcher: WebFetcher | None = None,
+    finding_resolver: FindingResolver | None = None,
 ) -> dict[str, Any]:
     """Dispatch ONE selector to its type-specific resolver (guarded)."""
     stype = selector.get("type")
@@ -371,6 +474,10 @@ async def _resolve_selector(
         return await _resolve_node_id(selector, uri, node_resolver)
     if stype == "zotero_key":
         return await _resolve_zotero_key(selector, uri, citation_resolver)
+    if stype == "text_quote":
+        return await _resolve_text_quote(selector, uri, web_fetcher)
+    if stype == "finding_id":
+        return await _resolve_finding_id(selector, uri, finding_resolver)
     return _unresolved(f"unknown selector.type {stype!r}", uri=uri)
 
 
@@ -382,6 +489,8 @@ async def resolve_pointer(
     symbol_resolver: SymbolResolver | None = None,
     node_resolver: NodeResolver | None = None,
     citation_resolver: CitationResolver | None = None,
+    web_fetcher: WebFetcher | None = None,
+    finding_resolver: FindingResolver | None = None,
 ) -> dict[str, Any]:
     """Resolve every target of a pointer, dispatching by ``selector.type``.
 
@@ -412,6 +521,20 @@ async def resolve_pointer(
         async def citation_resolver(_ref: str):  # type: ignore[misc]
             return await _rc(_ref)
 
+    if web_fetcher is None:
+        # 1d3f6e71 — default live fetch for text_quote drift checks (httpx, guarded).
+        from .web_archive import default_web_fetcher as _wf  # noqa: PLC0415
+
+        async def web_fetcher(_uri: str):  # type: ignore[misc]
+            return await _wf(_uri)
+
+    if finding_resolver is None:
+        # 1f1cd4d9 — a save_finding artifact IS a kind='finding' project note.
+        from .db import get_project_note as _gn  # noqa: PLC0415
+
+        async def finding_resolver(_id: str):  # type: ignore[misc]
+            return await _gn(db, _id)
+
     pid = project_id or pointer.get("project_id") or ""
     source_type = pointer.get("source_type")
     targets = pointer.get("targets") or []
@@ -434,6 +557,8 @@ async def resolve_pointer(
                 symbol_resolver=symbol_resolver,
                 node_resolver=node_resolver,
                 citation_resolver=citation_resolver,
+                web_fetcher=web_fetcher,
+                finding_resolver=finding_resolver,
             )
         except Exception:  # noqa: BLE001 — belt-and-suspenders: a target never crashes the pass
             _log.debug("resolve_pointer target failed", exc_info=True)
@@ -450,6 +575,8 @@ async def resolve_pointer(
                     symbol_resolver=symbol_resolver,
                     node_resolver=node_resolver,
                     citation_resolver=citation_resolver,
+                    web_fetcher=web_fetcher,
+                    finding_resolver=finding_resolver,
                 )
             except Exception:  # noqa: BLE001
                 sub_resolved = _unresolved("subSelector resolve error", uri=uri)

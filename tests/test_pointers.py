@@ -466,3 +466,215 @@ def test_pointer_tools_do_not_require_project_id():
         schema = by_name[name]["inputSchema"]
         assert "project_name" in schema["properties"], name
         assert "project_id" not in (schema.get("required") or []), name
+
+
+# ---------------------------------------------------------------------------
+# S4 — text_quote (web, 1d3f6e71) + finding_id (experiment, 1f1cd4d9)
+# ---------------------------------------------------------------------------
+
+def test_validate_text_quote_and_finding_id_variants():
+    ptr = validate_pointer({
+        "source_type": "web",
+        "targets": [{"uri": "https://example.com/a", "selector": {
+            "type": "text_quote", "exact": "the cited passage",
+            "prefix": "before ", "suffix": " after",
+            "archived_url": "https://web.archive.org/web/2/https://example.com/a"}}],
+    })
+    sel = ptr["targets"][0]["selector"]
+    assert sel["type"] == "text_quote"
+    assert sel["exact"] == "the cited passage"
+    assert sel["prefix"] == "before " and sel["suffix"] == " after"
+    assert sel["archived_url"].startswith("https://web.archive.org/")
+
+    ptr2 = validate_pointer({
+        "source_type": "experiment",
+        "targets": [{"uri": "finding:xyz",
+                     "selector": {"type": "finding_id", "id": "note-123"}}],
+    })
+    assert ptr2["targets"][0]["selector"] == {"type": "finding_id", "id": "note-123"}
+
+
+@pytest.mark.parametrize("bad_sel", [
+    {"type": "text_quote"},                              # missing exact
+    {"type": "text_quote", "exact": "   "},              # blank exact
+    {"type": "text_quote", "exact": "x", "prefix": 5},   # non-str prefix
+    {"type": "finding_id"},                              # missing id
+    {"type": "finding_id", "id": ""},                    # empty id
+])
+def test_validate_rejects_bad_web_experiment_selectors(bad_sel):
+    with pytest.raises(PointerValidationError):
+        validate_pointer({"source_type": "x",
+                          "targets": [{"uri": "u", "selector": bad_sel}]})
+
+
+@pytest.mark.asyncio
+async def test_resolve_text_quote_present_drift_and_guarded():
+    ptr = {"source_type": "web", "targets": [{"uri": "https://x/a", "selector": {
+        "type": "text_quote", "exact": "the cited passage",
+        "archived_url": "https://web.archive.org/web/2/https://x/a"}}]}
+
+    async def present(_uri): return "... the cited passage lives here ..."
+    hit = (await resolve_pointer(None, ptr, web_fetcher=present))["targets"][0]
+    assert hit["resolved"] is True and hit["found"] is True and hit["drift"] is False
+    assert hit["archived_url"].startswith("https://web.archive.org/")
+
+    async def changed(_uri): return "totally different content now"
+    drift = (await resolve_pointer(None, ptr, web_fetcher=changed))["targets"][0]
+    assert drift["resolved"] is True and drift["found"] is False and drift["drift"] is True
+
+    async def nothing(_uri): return None
+    n = (await resolve_pointer(None, ptr, web_fetcher=nothing))["targets"][0]
+    assert n["resolved"] is False
+
+    async def boom(_uri): raise RuntimeError("network")
+    g = (await resolve_pointer(None, ptr, web_fetcher=boom))["targets"][0]
+    assert g["resolved"] is False  # guarded — never raises
+    assert g["archived_url"].startswith("https://web.archive.org/")  # echoed even unresolved
+
+
+@pytest.mark.asyncio
+async def test_resolve_text_quote_prefix_suffix_disambiguation():
+    ptr = {"source_type": "web", "targets": [{"uri": "https://x/a", "selector": {
+        "type": "text_quote", "exact": "bank", "prefix": "river ", "suffix": " side"}}]}
+    async def right_context(_uri): return "walking along the river bank side at dusk"
+    async def wrong_context(_uri): return "i deposited cash at the bank downtown"
+    ok = (await resolve_pointer(None, ptr, web_fetcher=right_context))["targets"][0]
+    assert ok["found"] is True
+    miss = (await resolve_pointer(None, ptr, web_fetcher=wrong_context))["targets"][0]
+    assert miss["found"] is False and miss["drift"] is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_finding_id_hit_miss_and_guarded():
+    ptr = {"source_type": "experiment", "targets": [
+        {"uri": "finding:note-1", "selector": {"type": "finding_id", "id": "note-1"}},
+        {"uri": "finding:nope", "selector": {"type": "finding_id", "id": "nope"}},
+    ]}
+
+    async def finder(_id):
+        return ({"id": "note-1", "title": "Finding: exp run",
+                 "body": "input=X\noutput=Y\nparams={'lr':0.1}"} if _id == "note-1" else None)
+    hit, miss = (await resolve_pointer(None, ptr, finding_resolver=finder))["targets"]
+    assert hit["resolved"] is True and hit["artifact"]["title"].startswith("Finding:")
+    assert miss["resolved"] is False
+
+    async def boom(_id): raise RuntimeError("db down")
+    g = (await resolve_pointer(None, ptr, finding_resolver=boom))["targets"][0]
+    assert g["resolved"] is False  # guarded
+
+
+@pytest.mark.asyncio
+async def test_web_archive_save_page_now_and_fetcher():
+    from meridian import web_archive
+
+    class _Resp:
+        def __init__(self, headers=None, text=None):
+            self.headers = headers or {}
+            self.text = text
+
+    async def post_ok(_url):
+        return _Resp(headers={"Content-Location": "/web/20260706010101/https://example.com/a"})
+    res = await web_archive.save_page_now("https://example.com/a", http_post=post_ok)
+    assert res["archived_url"] == "https://web.archive.org/web/20260706010101/https://example.com/a"
+    assert res["archived_at"]
+
+    async def post_no_header(_url): return _Resp(headers={})
+    res2 = await web_archive.save_page_now("https://example.com/a", http_post=post_no_header)
+    assert res2["archived_url"] == "https://web.archive.org/web/2/https://example.com/a"
+
+    async def post_boom(_url): raise RuntimeError("net")
+    assert "error" in await web_archive.save_page_now("https://x", http_post=post_boom)
+
+    assert web_archive.wayback_latest_url("https://x/a") == "https://web.archive.org/web/2/https://x/a"
+
+    async def get_ok(_uri): return _Resp(text="page body")
+    assert await web_archive.default_web_fetcher("https://x", http_get=get_ok) == "page body"
+
+    async def get_boom(_uri): raise RuntimeError("net")
+    assert await web_archive.default_web_fetcher("https://x", http_get=get_boom) is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_web_pointer_archives_at_citation_time(db, monkeypatch):
+    """1d3f6e71 — creating a source_type='web' text_quote pointer archives the URL
+    at citation time (Save-Page-Now, stubbed) and stores the snapshot on the target."""
+    from meridian import server as srv
+    from meridian import web_archive
+
+    async def _fake_spn(url, **_kw):
+        return {"archived_url": f"https://web.archive.org/web/20260706/{url}",
+                "archived_at": "2026-07-06 00:00:00"}
+    monkeypatch.setattr(web_archive, "save_page_now", _fake_spn)
+
+    p = await db_module.create_project(db, "web-ptr")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "cite a web source")
+    added = await srv._dispatch_mcp_tool(
+        "add_sprint_item_pointer",
+        {"project_id": p["id"], "sprint_item_id": item["id"], "source_type": "web",
+         "targets": [{"uri": "https://example.com/paper",
+                      "selector": {"type": "text_quote", "exact": "a key claim"}}]},
+        db, "/tmp",
+    )
+    sel = added["targets"][0]["selector"]
+    assert sel["archived_url"] == "https://web.archive.org/web/20260706/https://example.com/paper"
+    assert sel["archived_at"] == "2026-07-06 00:00:00"
+
+
+@pytest.mark.asyncio
+async def test_mcp_web_pointer_archive_failure_falls_back(db, monkeypatch):
+    """Archiving is best-effort: an SPN failure still creates the pointer, with the
+    deterministic Wayback 'latest snapshot' URL as the archive reference."""
+    from meridian import server as srv
+    from meridian import web_archive
+
+    async def _spn_fails(url, **_kw):
+        return {"error": "archive request failed"}
+    monkeypatch.setattr(web_archive, "save_page_now", _spn_fails)
+
+    p = await db_module.create_project(db, "web-ptr-fallback")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "cite")
+    added = await srv._dispatch_mcp_tool(
+        "add_sprint_item_pointer",
+        {"project_id": p["id"], "sprint_item_id": item["id"], "source_type": "web",
+         "targets": [{"uri": "https://example.com/x",
+                      "selector": {"type": "text_quote", "exact": "claim"}}]},
+        db, "/tmp",
+    )
+    assert added["targets"][0]["selector"]["archived_url"] == \
+        "https://web.archive.org/web/2/https://example.com/x"
+
+
+@pytest.mark.asyncio
+async def test_mcp_experiment_pointer_resolves_save_finding_artifact(db):
+    """1f1cd4d9 — a save_finding artifact (a run log: input/output/params/timestamp)
+    is addressable via a source_type='experiment' finding_id pointer and resolves
+    end-to-end through the real MCP dispatch (no injected seam)."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "exp-ptr")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "log an experiment")
+    finding = await db_module.save_finding(
+        db, p["id"],
+        "experiment run 7\ninput=img_042.png\noutput=mask_042.png\nparams={'thresh':0.6}",
+        source_type="experiment",
+    )
+    note_id = finding["note"]["id"]
+
+    await srv._dispatch_mcp_tool(
+        "add_sprint_item_pointer",
+        {"project_id": p["id"], "sprint_item_id": item["id"], "source_type": "experiment",
+         "targets": [{"uri": f"finding:{note_id}",
+                      "selector": {"type": "finding_id", "id": note_id}}],
+         "label": "run 7 artifact"},
+        db, "/tmp",
+    )
+    resolved = await srv._dispatch_mcp_tool(
+        "resolve_sprint_item_pointers",
+        {"project_id": p["id"], "sprint_item_id": item["id"]},
+        db, "/tmp",
+    )
+    target = resolved["pointers"][0]["targets"][0]
+    assert target["resolved"] is True
+    assert target["selector_type"] == "finding_id"
+    assert target["artifact"]["id"] == note_id
+    assert "input=img_042.png" in target["artifact"]["body"]

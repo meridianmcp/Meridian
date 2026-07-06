@@ -3587,13 +3587,44 @@ async def _handle_sprint_tools(
         if not args.get("sprint_item_id"):
             return {"error": "sprint_item_id is required"}
         validate_input_size(args.get("label"), "pointer label", 500)
+        source_type = args.get("source_type") or ""
+        targets = args.get("targets") or []
+        if source_type == "web" and isinstance(targets, list):
+            # 1d3f6e71 — archive the exact cited passage at CITATION TIME so it
+            # survives link-rot / content-drift. Best-effort + guarded: an archiving
+            # failure must NEVER block pointer creation — the pointer still stores the
+            # live URL + exact quote, and drift is detected on resolve regardless.
+            from .. import web_archive  # noqa: PLC0415
+            for t in targets:
+                if not isinstance(t, dict):
+                    continue
+                sel = t.get("selector")
+                uri = t.get("uri")
+                if not (
+                    isinstance(sel, dict)
+                    and sel.get("type") == "text_quote"
+                    and isinstance(uri, str) and uri
+                    and not sel.get("archived_url")
+                ):
+                    continue
+                try:
+                    res = await web_archive.save_page_now(uri)
+                except Exception:  # noqa: BLE001 — belt-and-suspenders
+                    res = None
+                if isinstance(res, dict) and res.get("archived_url"):
+                    sel["archived_url"] = res["archived_url"]
+                    if res.get("archived_at"):
+                        sel["archived_at"] = res["archived_at"]
+                else:
+                    # Fallback: the deterministic Wayback "latest snapshot" URL.
+                    sel["archived_url"] = web_archive.wayback_latest_url(uri)
         try:
             return await db_module.add_sprint_item_pointer(
                 db,
                 args["project_id"],
                 args["sprint_item_id"],
-                args.get("source_type") or "",
-                args.get("targets") or [],
+                source_type,
+                targets,
                 label=args.get("label"),
             )
         except ValueError as exc:
