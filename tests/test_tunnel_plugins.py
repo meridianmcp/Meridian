@@ -32,6 +32,10 @@ def test_resolve_defaults_returns_builtins_in_order():
     assert by_name["word"]["enabled"] is False
     assert by_name["desktop-commander"]["enabled"] is False
     assert by_name["powerpoint"]["command"] == ["uvx", "powerpoint-mcp"]
+    # 5b065c2e — the word slot's default launcher is `uvx docx-mcp` (swapped from
+    # docx-mcp-server). This assertion is the unit half of that item; the live
+    # spawn is covered by tests/test_tunnel_word_docx_mcp_integration.py.
+    assert by_name["word"]["command"] == ["uvx", "docx-mcp"]
     assert by_name["word"]["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
 
 
@@ -267,6 +271,27 @@ def test_resolve_plugins_no_stale_flag_for_default_or_custom():
     cfg = {"code-extractor": {"command": ["uvx", "my-own-extractor"]}}
     ext_custom = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["extract"]
     assert "stale_override" not in ext_custom
+
+
+def test_resolve_plugins_flags_stale_word_docx_mcp_server_override():
+    """5b065c2e — the word slot default swapped docx-mcp-server -> docx-mcp. A tenant
+    who saved the OLD default as a command override is flagged stale, with the new
+    default surfaced for the dashboard badge (same machinery as the extract slot).
+    The override still runs; we warn, we don't silently swap it."""
+    for old in (["uvx", "docx-mcp-server"], ["uvx", "word-mcp-live"]):
+        word = {p["slot"]: p for p in tp.resolve_plugins({"word": {"command": old}})}["word"]
+        assert word.get("stale_override") is True, old
+        assert word["newer_default_command"] == ["uvx", "docx-mcp"], old
+        assert word.get("newer_default_label")
+        assert word["command"] == old  # the saved override still runs
+        assert "previous_defaults" not in word  # internal — never leaked to clients
+
+
+def test_office_binaries_word_launcher_is_docx_mcp():
+    # 5b065c2e — PATH auto-enable (detect_office_binaries) must look for the NEW
+    # launcher name so the word slot still self-enables when docx-mcp is installed.
+    assert tp.OFFICE_BINARIES["word"] == "docx-mcp"
+    assert tp.OFFICE_BINARIES["ppt"] == "powerpoint-mcp"
 
 
 # ---------------------------------------------------------------------------

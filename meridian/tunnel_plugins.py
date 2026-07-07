@@ -153,15 +153,21 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        # ba02a1f7 — swapped word-mcp-live -> docx-mcp-server: a single uvx-
-        # installable, cross-platform DOCX server (no Windows-only .exe entry
-        # point), for local thesis / Word authoring.
-        "command": ["uvx", "docx-mcp-server"],
+        # ba02a1f7 — swapped word-mcp-live -> docx-mcp-server. 5b065c2e —
+        # swapped docx-mcp-server -> docx-mcp: the `uvx docx-mcp` package spawns a
+        # real MCP stdio server (self-reports name "FinalCompleteDocxProcessor"
+        # v3.4.3) and is the tool Adam selected for the word slot in the Document-
+        # Intelligence arch plan. Both are uvx-installable + cross-platform; docx-mcp
+        # is python-docx-based (tradeoff vs the more-mature docx-mcp-server 0.7.4
+        # recorded in a pinned decision). A tenant who saved either OLD default as an
+        # override is flagged stale via previous_defaults below (cc904bfe badge).
+        "command": ["uvx", "docx-mcp"],
+        "previous_defaults": [["uvx", "docx-mcp-server"], ["uvx", "word-mcp-live"]],
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
-        # docx-mcp-server self-prefixes its tools — leave empty.
+        # docx-mcp exposes bare tool names (create_document, ...) — no self-prefix.
         "prefix": None,
         "session_mode": "stateless",
-        "description": "Word / DOCX authoring (docx-mcp-server)",
+        "description": "Word / DOCX authoring (docx-mcp)",
         "description_overrides": {},
     },
     {
@@ -547,7 +553,7 @@ def select_host_config(default_config: Any, by_host_raw: Any, hostname: str | No
 
 
 # Office slots auto-enable when their MCP launcher is on PATH (sprint 6c2b3562).
-OFFICE_BINARIES = {"ppt": "powerpoint-mcp", "word": "docx-mcp-server"}
+OFFICE_BINARIES = {"ppt": "powerpoint-mcp", "word": "docx-mcp"}
 
 
 def detect_office_binaries(which: Any = None) -> set[str]:
