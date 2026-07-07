@@ -1918,6 +1918,23 @@ def _display_pretty(display: str) -> str:
     return display.replace("-", " ").replace("_", " ").title()
 
 
+def _namespace_source_title(title: Any, src: str) -> "str | None":
+    """Prefix a bare tool title with its connector source (``Filesystem: Read File``).
+
+    Returns the namespaced title, or ``None`` when nothing should change (blank /
+    non-string title, or one already carrying the ``"{src}: "`` prefix). The
+    idempotency guard matches the EXACT ``"{src}: "`` prefix — not a loose
+    ``startswith(src)`` — so a legitimate title that merely begins with the source
+    word (e.g. the word slot's "Word count") is still namespaced, while a
+    re-listed already-namespaced title is left alone.
+    """
+    if not isinstance(title, str) or not title.strip():
+        return None
+    if title.startswith(f"{src}: "):
+        return None
+    return f"{src}: {title}"
+
+
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
 _tunnel_tool_routes: dict[str, dict[str, str]] = {}
 
@@ -2147,6 +2164,13 @@ async def list_tunnel_tools(
     ``reserved_names`` no longer needs to drop them — it's kept for forward
     compatibility but matched against the prefixed name (a no-op in practice).
     Slots are fetched in parallel so one slow/dead slot can't block the others.
+
+    Each surfaced tool is shaped so claude.ai's Tool Permissions screen lists it
+    as a distinct, source-labelled entry: the ``name`` is slot-prefixed (so no two
+    slots collide), and BOTH title carriers the permission UI reads —
+    ``annotations.title`` and top-level ``title`` — are namespaced with the
+    connector source so two slots exposing the same bare title (e.g. two
+    "Read File"s) don't render as indistinguishable duplicates.
     """
     aggregated: list[dict] = []
     routes: dict[str, str] = {}
@@ -2169,19 +2193,32 @@ async def list_tunnel_tools(
                 continue
             tool_copy = dict(tool)
             tool_copy["name"] = prefixed
-            # connector-source — claude.ai's tool-permission UI shows a tool's
-            # top-level ``title`` when present, else a humanized name. The prefixed
+            # connector-source — claude.ai's tool-permission UI resolves a tool's
+            # display title as ``annotations.title`` → top-level ``title`` →
+            # humanized name (per the MCP spec's title precedence). The prefixed
             # NAME already carries the source (codebase__search_graph →
             # "Codebase search graph"), but a slot whose inner server advertises a
             # bare tool title (filesystem's "Read File", serena, desktop-commander)
-            # would display WITHOUT its plugin source. Namespace the title too so
-            # every slot indicates its connector consistently. Guarded against
-            # double-prefixing; nested inputSchema param titles are left alone.
-            _title = tool.get("title")
-            if isinstance(_title, str) and _title.strip():
-                _src = _display_pretty(display)
-                if not _title.startswith(_src):
-                    tool_copy["title"] = f"{_src}: {_title}"
+            # would display WITHOUT its plugin source — and two slots exposing the
+            # same bare title (e.g. two "Read File"s) look duplicated / are hard to
+            # tell apart on the permission screen. Namespace BOTH title carriers so
+            # every slot indicates its connector consistently. Older servers put
+            # their human label in ``annotations.title`` (ToolAnnotations), so that
+            # field must be namespaced too, not just top-level ``title``. Guarded
+            # against double-prefixing; nested inputSchema param titles are untouched.
+            _src = _display_pretty(display)
+            _new_title = _namespace_source_title(tool.get("title"), _src)
+            if _new_title is not None:
+                tool_copy["title"] = _new_title
+            # ``annotations`` is shallow-shared via dict(tool); copy it before
+            # editing so we never mutate the inner server's advertised object.
+            _annot = tool.get("annotations")
+            if isinstance(_annot, dict):
+                _annot_title = _namespace_source_title(_annot.get("title"), _src)
+                if _annot_title is not None:
+                    annot_copy = dict(_annot)
+                    annot_copy["title"] = _annot_title
+                    tool_copy["annotations"] = annot_copy
             routes[prefixed] = label  # route back via the internal slot label
             aggregated.append(_rewrite_tool_description(tool_copy))
     if routes:
