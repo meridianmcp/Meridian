@@ -4301,6 +4301,182 @@ async def _handle_file_claims(
     return _MISS
 
 
+# 0fba4cb6 — MECHANICAL model-efficiency classifier.
+#
+# A zero-token, pure/deterministic heuristic that suggests the cheapest model
+# tier likely sufficient for a task, from signals already available on a sprint
+# item / task descriptor (title keywords, file count, touched-resource shape,
+# explicit size). It mirrors how the ultracode orchestration script spends ZERO
+# model tokens on routing — no LLM call, no DB, no network. A future "semantic"
+# mode (an LLM-backed second opinion) is deliberately OUT OF SCOPE here; see the
+# follow-up note in the tool schema.
+#
+# Design notes:
+#   * Purely additive scoring: cheap-leaning signals push the score down toward
+#     "haiku", expensive-leaning signals push it up toward "opus". The final tier
+#     is a threshold cut on the accumulated score, so it is stable and testable.
+#   * Every signal that fires is reported (name + human-readable detail + the
+#     delta it contributed) so the rationale is fully auditable — nothing about
+#     the suggestion is a black box.
+#   * The classifier NEVER raises on bad input: missing/oddly-typed fields simply
+#     contribute no signal. It is safe to call on a raw, partially-filled
+#     descriptor.
+
+# Keyword -> (score_delta, tier-lean label). Positive = more expensive.
+# Matched as whole words against a lowercased title/description token set.
+_TIER_CHEAP_KEYWORDS: dict[str, str] = {
+    "typo": "trivial-text-fix",
+    "typos": "trivial-text-fix",
+    "rename": "mechanical-rename",
+    "comment": "comment-only",
+    "docstring": "docs-only",
+    "readme": "docs-only",
+    "wording": "copy-edit",
+    "copy": "copy-edit",
+    "lint": "lint-cleanup",
+    "format": "formatting",
+    "formatting": "formatting",
+    "whitespace": "formatting",
+    "bump": "version-bump",
+    "changelog": "docs-only",
+}
+_TIER_EXPENSIVE_KEYWORDS: dict[str, str] = {
+    "refactor": "structural-refactor",
+    "refactoring": "structural-refactor",
+    "migration": "schema-migration",
+    "migrate": "schema-migration",
+    "architecture": "architectural",
+    "architect": "architectural",
+    "redesign": "architectural",
+    "rewrite": "large-rewrite",
+    "concurrency": "concurrency-hazard",
+    "async": "concurrency-hazard",
+    "security": "security-sensitive",
+    "auth": "auth-sensitive",
+    "authentication": "auth-sensitive",
+    "cryptography": "security-sensitive",
+    "crypto": "security-sensitive",
+    "algorithm": "algorithmic",
+    "optimize": "performance-tuning",
+    "performance": "performance-tuning",
+    "distributed": "distributed-systems",
+}
+
+
+def _classify_task_tier(descriptor: dict[str, Any]) -> dict[str, Any]:
+    """Deterministically suggest a model tier for a task/sprint-item descriptor.
+
+    Pure function — NO model call, NO DB, NO network. Given a descriptor with any
+    of the optional keys below, returns a dict:
+        {"tier": "haiku"|"sonnet"|"opus",
+         "score": <int>,
+         "signals": [{"signal", "detail", "weight"}...],
+         "rationale": "<one-line human summary>",
+         "mode": "mechanical"}
+
+    Recognised descriptor keys (all optional):
+        title / description  — text; scanned for cheap/expensive keyword signals.
+        file_count           — int; more files touched -> more expensive.
+        files                — list; used to derive file_count when absent.
+        touches_resources    — list (or int count); shape/count of touched
+                               resources (DB/schema/infra), an expensive signal.
+        size                 — one of "xs"|"s"|"m"|"l"|"xl" (case-insensitive),
+                               an explicit sprint-item size estimate.
+
+    The score starts at a neutral 0. Cheap signals subtract, expensive signals
+    add; the tier is a threshold cut on the total, so the mapping is stable.
+    """
+    if not isinstance(descriptor, dict):
+        descriptor = {}
+    signals: list[dict[str, Any]] = []
+    score = 0
+
+    def _add(signal: str, detail: str, weight: int) -> None:
+        nonlocal score
+        score += weight
+        signals.append({"signal": signal, "detail": detail, "weight": weight})
+
+    # --- Text keyword signals (title + description) ---------------------------
+    text_parts = []
+    for key in ("title", "description"):
+        val = descriptor.get(key)
+        if isinstance(val, str):
+            text_parts.append(val)
+    text = " ".join(text_parts).lower()
+    tokens = set(re.findall(r"[a-z0-9]+", text))
+    for kw, label in _TIER_CHEAP_KEYWORDS.items():
+        if kw in tokens:
+            _add("keyword:" + kw, f"cheap-leaning keyword '{kw}' ({label})", -2)
+    for kw, label in _TIER_EXPENSIVE_KEYWORDS.items():
+        if kw in tokens:
+            _add("keyword:" + kw, f"expensive-leaning keyword '{kw}' ({label})", 3)
+
+    # --- File count -----------------------------------------------------------
+    file_count = descriptor.get("file_count")
+    if not isinstance(file_count, int) or isinstance(file_count, bool):
+        files = descriptor.get("files")
+        file_count = len(files) if isinstance(files, (list, tuple)) else None
+    if isinstance(file_count, int) and not isinstance(file_count, bool):
+        if file_count <= 1:
+            _add("file_count", f"{file_count} file(s) touched — narrow blast radius", -1)
+        elif file_count <= 3:
+            _add("file_count", f"{file_count} files touched — small change", 0)
+        elif file_count <= 8:
+            _add("file_count", f"{file_count} files touched — multi-file change", 3)
+        else:
+            _add("file_count", f"{file_count} files touched — broad, cross-cutting change", 5)
+
+    # --- Touched resources (DB/schema/infra shape + count) --------------------
+    touched = descriptor.get("touches_resources")
+    touched_count: int | None = None
+    if isinstance(touched, (list, tuple)):
+        touched_count = len(touched)
+    elif isinstance(touched, int) and not isinstance(touched, bool):
+        touched_count = touched
+    if isinstance(touched_count, int):
+        if touched_count == 0:
+            _add("touches_resources", "no external resources touched", -1)
+        elif touched_count <= 2:
+            _add("touches_resources", f"{touched_count} resource(s) touched", 2)
+        else:
+            _add("touches_resources",
+                 f"{touched_count} resources touched — wide integration surface", 4)
+
+    # --- Explicit sprint-item size -------------------------------------------
+    size = descriptor.get("size")
+    if isinstance(size, str):
+        size_weights = {"xs": -2, "s": -1, "m": 0, "l": 3, "xl": 5}
+        w = size_weights.get(size.strip().lower())
+        if w is not None:
+            _add("size", f"declared size '{size.strip().lower()}'", w)
+
+    # --- Threshold cut -> tier ------------------------------------------------
+    if score <= -2:
+        tier = "haiku"
+    elif score >= 5:
+        tier = "opus"
+    else:
+        tier = "sonnet"
+
+    tier_reason = {
+        "haiku": "mechanical / low-complexity work — a cheap tier is sufficient",
+        "sonnet": "moderate complexity — a mid tier is a safe default",
+        "opus": "high complexity / broad blast radius — reserve the top tier",
+    }[tier]
+    rationale = (
+        f"Suggested tier '{tier}' (score {score:+d}): {tier_reason}. "
+        + (f"{len(signals)} signal(s) fired." if signals else
+           "No strong signals; defaulting on a neutral score.")
+    )
+    return {
+        "tier": tier,
+        "score": score,
+        "signals": signals,
+        "rationale": rationale,
+        "mode": "mechanical",
+    }
+
+
 async def _handle_planning_tools(
     name: str,
     args: dict[str, Any],
@@ -4309,7 +4485,12 @@ async def _handle_planning_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: reconcile_sprint_drift, get_planning_brief."""
+    """Dispatch group: reconcile_sprint_drift, get_planning_brief, analyze_model_efficiency."""
+    if name == "analyze_model_efficiency":
+        # 0fba4cb6 — MECHANICAL (zero-token) model-tier suggestion. Pure
+        # heuristic over signals already on the descriptor; no model call, no DB,
+        # no network. See _classify_task_tier for the scoring model.
+        return _classify_task_tier(args)
     if name == "reconcile_sprint_drift":
         from .. import handoff as handoff_module_local
         project = await db_module.get_project(db, args["project_id"])

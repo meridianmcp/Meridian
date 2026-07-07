@@ -67,6 +67,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "idle_until_session_done": 'idle_until_session_done(watching_session_id="session-uuid")',
     "get_session_log": 'get_session_log(session_id="session-uuid")',
     "set_active_repo": 'set_active_repo(repo_path="C:\\\\Users\\\\me\\\\project")',
+    "analyze_model_efficiency": 'analyze_model_efficiency(title="Refactor auth across 12 files + migration", file_count=12, touches_resources=["auth_db", "sessions_table"], size="xl")',
 }
 
 
@@ -1217,6 +1218,29 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "repo_path": {"type": "string", "description": "Absolute path to the repository to activate (e.g. /home/me/project or C:\\\\Users\\\\me\\\\project)."}},
          "required": ["repo_path"]}},
+    {"name": "analyze_model_efficiency",
+     "description":
+        "0fba4cb6 — MECHANICAL (zero-token) model-tier suggestion for a task or "
+        "sprint item. Deterministic, rule/heuristic classifier: NO model call, NO "
+        "DB, NO network — it mirrors how the ultracode orchestration script spends "
+        "zero model tokens on routing. Pass a task descriptor (any of title, "
+        "description, file_count, files, touches_resources, size) and it returns a "
+        "suggested tier: {tier: 'haiku'|'sonnet'|'opus', score, signals:[{signal, "
+        "detail, weight}...], rationale, mode:'mechanical'}. Cheap-leaning signals "
+        "(title keywords like 'typo'/'docstring'/'lint', 1 file, size 'xs'/'s') "
+        "pull toward 'haiku'; expensive-leaning signals ('refactor'/'migration'/"
+        "'auth', many files, touched resources, size 'l'/'xl') pull toward 'opus'. "
+        "Use it to route a task to the cheapest sufficient model before spawning an "
+        "executor. FOLLOW-UP (out of scope this pass): a second LLM-backed "
+        "'semantic' mode that reads the full item for a nuanced second opinion.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Task / sprint-item title. Scanned for cheap/expensive keyword signals."},
+         "description": {"type": "string", "description": "Optional longer description; also scanned for keyword signals."},
+         "file_count": {"type": "integer", "description": "Number of files the task touches. Fewer files -> cheaper tier."},
+         "files": {"type": "array", "items": {"type": "string"}, "description": "Alternative to file_count: the list of files touched; its length is used when file_count is omitted."},
+         "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Resources (DB/schema/infra/services) the task touches. May also be an integer count. More/any resources -> more expensive."},
+         "size": {"type": "string", "enum": ["xs", "s", "m", "l", "xl"], "description": "Optional explicit sprint-item size estimate (case-insensitive). Larger -> more expensive."}},
+         "required": []}},
 ]
 
 _READ_ONLY_TOOLS = {
@@ -1235,6 +1259,7 @@ _READ_ONLY_TOOLS = {
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
+    "analyze_model_efficiency",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer"}
 
@@ -1283,6 +1308,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "list_plugins": "List Plugins",
     "get_plugin_details": "Get Plugin Details",
     "set_active_repo": "Set Active Repo",
+    "analyze_model_efficiency": "Analyze Model Efficiency",
 }
 
 for _tool in _MCP_TOOLS_LIST:
