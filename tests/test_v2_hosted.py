@@ -224,11 +224,14 @@ def test_tunnel_plugins_get_returns_resolved_defaults(monkeypatch, tmp_path):
         assert r.status_code == 200
         body = r.json()
         assert [p["name"] for p in body["plugins"]] == [
-            "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
+            "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
+            "desktop-commander", "meridian-docs"
         ]
         assert body["config"] == {}
         assert body["active"] == {
             "fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False,
+            # 9665538a — meridian-docs slot
+            "docs": False,
             # 8fb69d54 — 4 pre-allocated custom slots
             "p0": False, "p1": False, "p2": False, "p3": False,
         }
@@ -324,7 +327,8 @@ def test_add_custom_plugin_persists_and_resolves(monkeypatch, tmp_path):
         assert [c["name"] for c in got["custom"]] == ["fetch"]
         assert got["custom"][0]["command"] == ["uvx", "mcp-server-fetch"]
         assert [p["name"] for p in got["plugins"]] == [
-            "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
+            "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
+            "desktop-commander", "meridian-docs"
         ]
 
 

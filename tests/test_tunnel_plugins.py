@@ -16,9 +16,10 @@ from meridian import tunnel_plugins as tp
 def test_resolve_defaults_returns_builtins_in_order():
     plugins = tp.resolve_plugins(None)
     assert [p["name"] for p in plugins] == [
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
+        "desktop-commander", "meridian-docs"
     ]
-    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word", "dc"]
+    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word", "dc", "docs"]
     # The three code/fs slots default ON with no command override; Office slots
     # and desktop-commander default OFF.
     by_name = {p["name"]: p for p in plugins}
@@ -198,7 +199,8 @@ def test_description_overrides_normalized_to_strings():
 
 def test_builtin_names_helper():
     assert tp.builtin_names() == (
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
+        "desktop-commander", "meridian-docs"
     )
 
 

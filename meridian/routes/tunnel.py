@@ -51,6 +51,8 @@ _tunnel_extract_sockets: dict[str, WebSocket] = {}
 _tunnel_ppt_sockets: dict[str, WebSocket] = {}
 _tunnel_word_sockets: dict[str, WebSocket] = {}
 _tunnel_dc_sockets: dict[str, WebSocket] = {}
+# 9665538a — meridian-docs slot (DOCX intelligence via `uvx meridian-docs`).
+_tunnel_docs_sockets: dict[str, WebSocket] = {}
 
 # 4d9ad87b — active repo per tenant, updated whenever set_active_repo is called.
 # Enables call_tunnel_tool to inject X-Meridian-Repo-Path so the SerenaDaemonPool
@@ -65,6 +67,7 @@ _pending_extract_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_ppt_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_word_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_docs_reqs: dict[str, asyncio.Future[dict]] = {}
 
 # 8fb69d54 — 4 pre-allocated custom tunnel slots (p0-p3, ports 8814-8817) so
 # custom plugins get real server routes and appear in the claude.ai connector
@@ -532,6 +535,12 @@ async def tunnel_word_ws(ws: WebSocket, tenant_id: str) -> None:
 async def tunnel_dc_ws(ws: WebSocket, tenant_id: str) -> None:
     """Hold open a WebSocket for one tenant's desktop-commander proxy."""
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
+@router.websocket("/tunnel-docs/{tenant_id}")
+async def tunnel_docs_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's meridian-docs proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_docs_sockets, _pending_docs_reqs, "docs")
 
 
 # 8fb69d54 — register the 4 custom-slot WebSocket routes (/tunnel-p0 … /tunnel-p3)
@@ -1013,6 +1022,27 @@ async def dc_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> R
                                _tunnel_dc_sockets, _pending_dc_reqs, "dc")
 
 
+@router.get("/docs/mcp/{tenant_id}")
+@router.post("/docs/mcp/{tenant_id}")
+@router.options("/docs/mcp/{tenant_id}")
+async def docs_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's meridian-docs server over the docs tunnel."""
+    prefix = f"/docs/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_docs_sockets, _pending_docs_reqs, "docs")
+
+
+@router.get("/docs/mcp/{tenant_id}/{rest:path}")
+@router.post("/docs/mcp/{tenant_id}/{rest:path}")
+@router.options("/docs/mcp/{tenant_id}/{rest:path}")
+async def docs_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Same as docs_mcp_proxy but for sub-paths."""
+    local_path = f"/{rest}" if rest else "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_docs_sockets, _pending_docs_reqs, "docs")
+
+
 # ---------------------------------------------------------------------------
 # GET /tunnel/status/{tenant_id}  — lightweight status check (no auth required)
 # ---------------------------------------------------------------------------
@@ -1028,6 +1058,7 @@ async def tunnel_status(tenant_id: str) -> dict:
         "ppt_active": tenant_id in _tunnel_ppt_sockets,
         "word_active": tenant_id in _tunnel_word_sockets,
         "dc_active": tenant_id in _tunnel_dc_sockets,
+        "docs_active": tenant_id in _tunnel_docs_sockets,
         # d71ba2e7 — slots the client reported unhealthy (pre-flight tools/list
         # failed / watchdog gave up). Absent slot ⇒ assumed healthy. Dashboard
         # renders these as a degraded status dot.
@@ -1066,7 +1097,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
     if tenant is None:
         return _json_response({
             "plugins": resolve_plugins(None), "custom": [], "config": {},
-            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False, **{s: False for s in _CUSTOM_SLOTS}},
+            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False, "docs": False, **{s: False for s in _CUSTOM_SLOTS}},
             "plan": "free",
         })
     # 8660d701 — per-machine config. ?hostname=X scopes to that machine's config
@@ -1112,6 +1143,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "ppt": tid in _tunnel_ppt_sockets,
             "word": tid in _tunnel_word_sockets,
             "dc": tid in _tunnel_dc_sockets,
+            "docs": tid in _tunnel_docs_sockets,
             **{s: tid in _tunnel_custom_sockets[s] for s in _CUSTOM_SLOTS},
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
@@ -1892,7 +1924,7 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc") + _CUSTOM_SLOTS
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc", "docs") + _CUSTOM_SLOTS
 
 # Human-readable connector prefix shown to Claude in tool names (e.g.
 # "filesystem:read_file" instead of "fs:read_file"). The routing cache still
@@ -1905,6 +1937,7 @@ SLOT_DISPLAY_NAMES = {
     "ppt": "powerpoint",
     "word": "word",
     "dc": "desktop-commander",
+    "docs": "meridian-docs",
     "p0": "custom-p0",
     "p1": "custom-p1",
     "p2": "custom-p2",
@@ -1992,6 +2025,8 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_word_sockets, _pending_word_reqs
     if label == "dc":
         return _tunnel_dc_sockets, _pending_dc_reqs
+    if label == "docs":
+        return _tunnel_docs_sockets, _pending_docs_reqs
     if label in _tunnel_custom_sockets:  # 8fb69d54 — custom slots p0-p3
         return _tunnel_custom_sockets[label], _pending_custom_reqs[label]
     return _tunnel_extract_sockets, _pending_extract_reqs
@@ -2006,6 +2041,7 @@ def has_active_tunnel(tenant_id: str) -> bool:
         or tenant_id in _tunnel_ppt_sockets
         or tenant_id in _tunnel_word_sockets
         or tenant_id in _tunnel_dc_sockets
+        or tenant_id in _tunnel_docs_sockets
         or any(tenant_id in s for s in _tunnel_custom_sockets.values())
     )
 
@@ -2025,6 +2061,7 @@ def active_tunnel_tenant_ids() -> "set[str]":
     ids.update(_tunnel_ppt_sockets)
     ids.update(_tunnel_word_sockets)
     ids.update(_tunnel_dc_sockets)
+    ids.update(_tunnel_docs_sockets)
     for s in _tunnel_custom_sockets.values():
         ids.update(s)
     return ids

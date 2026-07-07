@@ -24,7 +24,7 @@ from typing import Any
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
 # another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract", "ppt", "word", "dc")
+SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
@@ -32,6 +32,14 @@ DEFAULT_EXTRACT_PORT = 8810
 DEFAULT_PPT_PORT = 8811
 DEFAULT_WORD_PORT = 8812
 DEFAULT_DC_PORT = 8813
+# 9665538a — the meridian-docs slot: the extracted stdlib-only OOXML (DOCX)
+# parser published as its own `uvx meridian-docs` MCP server (extensions/
+# meridian-docs). Distinct from the `word` slot (docx-mcp, authoring): this is
+# fast, dependency-free document *intelligence* — outline/parse/index/search.
+# Port 8818 sits just after the dc slot (8813) and the 4 pre-allocated custom
+# slots (8814-8817), and below the custom auto-assign start (8820) — see
+# CUSTOM_SLOT_PORTS / _CUSTOM_PORT_START.
+DEFAULT_DOCS_PORT = 8818
 
 # 8fb69d54 — 4 pre-allocated custom slots (p0-p3) on ports 8814-8817 so a custom
 # plugin bound to a slot gets a real server route (/tunnel-p0 … /tunnel-p3) and
@@ -185,6 +193,28 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # process survives across requests (no --stateless, no idle-kill).
         "session_mode": "persistent",
         "description": "Desktop Commander — system tools, file access, terminal (local only)",
+        "description_overrides": {},
+    },
+    {
+        # 9665538a — meridian-docs: the extracted stdlib-only OOXML doc parser
+        # (extensions/meridian-docs), launched via `uvx meridian-docs`. Opt-in
+        # like the Office slots. Complements the `word` slot (docx-mcp authoring)
+        # with read-only document intelligence (outline / parse / index / search).
+        "name": "meridian-docs",
+        "slot": "docs",
+        "port": DEFAULT_DOCS_PORT,
+        "url_prefix": "/docs",
+        "enabled": False,
+        "builtin": True,
+        "core": False,
+        "command": ["uvx", "meridian-docs"],
+        "env": {},
+        # meridian-docs exposes bare tool names (document_outline, parse_document,
+        # …) — no self-prefix, so the server bridge namespaces them via
+        # SLOT_DISPLAY_NAMES ("docs" → "meridian-docs__document_outline").
+        "prefix": None,
+        "session_mode": "stateless",
+        "description": "Document intelligence — DOCX outline/parse/index/search (meridian-docs)",
         "description_overrides": {},
     },
 ]
@@ -442,7 +472,7 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
 # would collide with the built-in slot riding that port (see resolve_custom_plugins).
 _BUILTIN_DEFAULT_PORTS = frozenset({
     DEFAULT_FS_PORT, DEFAULT_CODE_PORT, DEFAULT_EXTRACT_PORT,
-    DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT,
+    DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT, DEFAULT_DOCS_PORT,
 })
 
 # 9811d04c — first port a freshly-added custom plugin (from the browse "Add"
