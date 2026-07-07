@@ -6934,53 +6934,16 @@ async function loadDocsTab(projectId: any) {
 
     if (!tools || !tools.length) { body.innerHTML = '<div class="empty" style="color:var(--muted)">No tools returned.</div>'; return; }
 
-    // Build lookup
+    // Render by category as collapsible <details> sections (70ac52e4): 90+
+    // tools no longer render as one flat wall. Grouping/section markup lives in
 
-    const byName: Record<string, any> = {};
+    // dashboard-mcp (_renderToolSections) so it is unit-testable; the 'other'
 
-    tools.forEach((t: any) => { byName[t.name] = t; });
+    // catch-all there keeps any uncategorized tool from being dropped.
 
-    // Render by category
+    const _catLabels = { ..._CATEGORY_LABELS, other: 'Other' };
 
-    let html = '';
-
-    // Determine category for each tool
-
-    const categorized = new Set();
-
-    for (const [cat, names] of Object.entries(_TOOL_CATEGORIES)) {
-
-      const catTools = names.map(n => byName[n]).filter(Boolean);
-
-      if (!catTools.length) continue;
-
-      html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">${_CATEGORY_LABELS[cat]}</div>`;
-
-      catTools.forEach(tool => {
-
-        categorized.add(tool.name);
-
-        html += _renderToolEntry(tool);
-
-      });
-
-      html += '</div>';
-
-    }
-
-    // Catch-all for uncategorized tools
-
-    const rest = tools.filter((t: any) => !categorized.has(t.name));
-
-    if (rest.length) {
-
-      html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Other</div>`;
-
-      rest.forEach((tool: any) => { html += _renderToolEntry(tool); });
-
-      html += '</div>';
-
-    }
+    const html = _renderToolSections(tools, _TOOL_CATEGORIES, _catLabels);
 
     const _toolSearch = `<div style="position:sticky;top:0;background:var(--surface-1,#10131a);padding:0 0 8px;margin-bottom:6px;z-index:2"><input type="text" id="docs-search-${projectId}" placeholder="Search tools by name or description…" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:5px 9px;outline:none"></div>`;
 
