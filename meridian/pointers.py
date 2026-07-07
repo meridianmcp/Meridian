@@ -292,6 +292,74 @@ CitationResolver = Callable[..., Awaitable[dict[str, Any] | None]]
 WebFetcher = Callable[..., Awaitable[str | None]]
 FindingResolver = Callable[..., Awaitable[dict[str, Any] | None]]
 
+# ---------------------------------------------------------------------------
+# e9d72d17 — pluggable reference-manager backend registry.
+#
+# The citation resolver was an injectable seam (tests could stub it) but, for real
+# use, hardcoded to Zotero — there was no way to SELECT a different backend. This
+# registry makes the reference-manager backend genuinely configurable: register a
+# resolver factory per backend name; the configured backend (explicit arg, else the
+# MERIDIAN_CITATION_BACKEND env var, else the default) picks which resolver
+# resolve_pointer uses for zotero_key/citation targets. Zotero ships registered;
+# Mendeley/EndNote/etc. register their own factory when their client is built — no
+# edit to resolve_pointer needed. The seam shape mirrors symbol_resolver/
+# node_resolver, so this is the same swappable-resolver pattern, extended to a
+# selectable *named* backend.
+# ---------------------------------------------------------------------------
+CitationResolverFactory = Callable[[], CitationResolver]
+
+DEFAULT_CITATION_BACKEND = "zotero"
+_CITATION_BACKENDS: dict[str, CitationResolverFactory] = {}
+
+
+def register_citation_backend(name: str, factory: CitationResolverFactory) -> None:
+    """Register (or replace) a reference-manager backend by name (case-insensitive).
+
+    ``factory`` is a zero-arg callable returning a :data:`CitationResolver`
+    (``async (ref: str) -> item|None``). Registering is cheap + idempotent; the
+    factory is only invoked when that backend is actually selected.
+    """
+    key = (name or "").strip().lower()
+    if not key:
+        raise ValueError("citation backend name must be non-empty")
+    _CITATION_BACKENDS[key] = factory
+
+
+def available_citation_backends() -> list[str]:
+    """Sorted names of the registered reference-manager backends (for a UI picker)."""
+    return sorted(_CITATION_BACKENDS)
+
+
+def resolve_citation_backend(name: str | None = None) -> CitationResolver:
+    """Return the citation resolver for backend ``name``.
+
+    Selection order: explicit ``name`` → ``MERIDIAN_CITATION_BACKEND`` env var →
+    :data:`DEFAULT_CITATION_BACKEND`. An unknown/absent backend falls back to the
+    default (zotero) so citation resolution never hard-fails on misconfiguration.
+    """
+    key = (name or "").strip().lower()
+    if not key:
+        import os  # noqa: PLC0415
+        key = (os.environ.get("MERIDIAN_CITATION_BACKEND") or "").strip().lower()
+    factory = _CITATION_BACKENDS.get(key) or _CITATION_BACKENDS.get(DEFAULT_CITATION_BACKEND)
+    if factory is None:  # pragma: no cover — default is always registered at import
+        raise LookupError("no citation backend registered")
+    return factory()
+
+
+def _zotero_citation_backend() -> CitationResolver:
+    """Default backend: Zotero, via zotero_client.resolve_citation_ref (lazy import
+    to avoid an import cycle / keep zotero optional)."""
+    from .zotero_client import resolve_citation_ref as _rc  # noqa: PLC0415
+
+    async def _resolver(ref: str) -> dict[str, Any] | None:
+        return await _rc(ref)
+
+    return _resolver
+
+
+register_citation_backend(DEFAULT_CITATION_BACKEND, _zotero_citation_backend)
+
 
 def _unresolved(reason: str, **extra: Any) -> dict[str, Any]:
     """Build a guarded unresolved result: ``{resolved: False, reason, ...}``."""
@@ -489,6 +557,7 @@ async def resolve_pointer(
     symbol_resolver: SymbolResolver | None = None,
     node_resolver: NodeResolver | None = None,
     citation_resolver: CitationResolver | None = None,
+    citation_backend: str | None = None,
     web_fetcher: WebFetcher | None = None,
     finding_resolver: FindingResolver | None = None,
 ) -> dict[str, Any]:
@@ -516,10 +585,10 @@ async def resolve_pointer(
             return await _sg(_db, _pid, _q, _lim)
 
     if citation_resolver is None:
-        from .zotero_client import resolve_citation_ref as _rc  # noqa: PLC0415
-
-        async def citation_resolver(_ref: str):  # type: ignore[misc]
-            return await _rc(_ref)
+        # e9d72d17 — pick the reference-manager backend by name (arg / env / default)
+        # instead of hardcoding Zotero. An explicit citation_resolver still wins
+        # (tests inject one); citation_backend selects among registered backends.
+        citation_resolver = resolve_citation_backend(citation_backend)
 
     if web_fetcher is None:
         # 1d3f6e71 — default live fetch for text_quote drift checks (httpx, guarded).

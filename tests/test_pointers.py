@@ -728,3 +728,72 @@ async def test_mcp_experiment_pointer_resolves_save_finding_artifact(db):
     assert target["selector_type"] == "finding_id"
     assert target["artifact"]["id"] == note_id
     assert "input=img_042.png" in target["artifact"]["body"]
+
+
+# ---------------------------------------------------------------------------
+# e9d72d17 — selectable (not Zotero-hardcoded) reference-manager backend
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_citation_backend_registry_select_and_fallback():
+    # Zotero ships registered as the default.
+    assert "zotero" in pointers_module.available_citation_backends()
+    assert pointers_module.DEFAULT_CITATION_BACKEND == "zotero"
+
+    async def _fake(ref):
+        return {"zotero_key": "X", "backend": "mendeley"}
+
+    pointers_module.register_citation_backend("mendeley", lambda: _fake)
+    try:
+        assert "mendeley" in pointers_module.available_citation_backends()
+        # Case-insensitive selection.
+        assert pointers_module.resolve_citation_backend("MENDELEY") is _fake
+        # Unknown backend → default (zotero) fallback, never an error.
+        assert callable(pointers_module.resolve_citation_backend("nope-not-real"))
+    finally:
+        pointers_module._CITATION_BACKENDS.pop("mendeley", None)
+
+
+def test_register_citation_backend_rejects_empty_name():
+    with pytest.raises(ValueError):
+        pointers_module.register_citation_backend("  ", lambda: None)
+
+
+def test_resolve_citation_backend_env_var(monkeypatch):
+    async def _fake(ref):
+        return None
+
+    pointers_module.register_citation_backend("acme", lambda: _fake)
+    try:
+        monkeypatch.setenv("MERIDIAN_CITATION_BACKEND", "acme")
+        # No explicit arg → env var selects the backend.
+        assert pointers_module.resolve_citation_backend(None) is _fake
+        # Explicit arg beats the env var.
+        assert pointers_module.resolve_citation_backend("zotero") is not _fake
+    finally:
+        pointers_module._CITATION_BACKENDS.pop("acme", None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_pointer_routes_through_selected_backend():
+    """resolve_pointer sends zotero_key targets through the SELECTED backend when no
+    explicit citation_resolver is injected — the product-level selection seam."""
+    async def _mendeley(ref):
+        return {"zotero_key": "M1", "title": "via mendeley"} if ref == "zotero:M1" else None
+
+    pointers_module.register_citation_backend("mendeley", lambda: _mendeley)
+    try:
+        ptr = {
+            "source_type": "citation",
+            "targets": [{"uri": "z", "selector": {"type": "zotero_key", "key": "M1"}}],
+        }
+        out = await resolve_pointer(
+            None, ptr, project_id="pid",
+            symbol_resolver=_stub_symbol_resolver,
+            citation_backend="mendeley",
+        )
+        t = out["targets"][0]
+        assert t["resolved"] is True
+        assert t["item"]["title"] == "via mendeley"
+    finally:
+        pointers_module._CITATION_BACKENDS.pop("mendeley", None)
