@@ -7,16 +7,15 @@ name: Deploy drift check
 # deploy and prod sat ~19h behind main while every workflow reported success).
 
 on:
-  # CRON DISABLED pending a git_sha-source fix. Verified 2026-07-06: prod exposes a STALE
-  # git_sha because a static Fly SECRET `MERIDIAN_GIT_SHA` (set once to an old commit)
-  # OVERRIDES the correct per-deploy `--build-arg MERIDIAN_GIT_SHA` baked into the image
-  # ENV at runtime. So _read_git_sha() reports the old secret value, and this check
-  # false-positives ("N commits behind"). Fix first (unset/rotate the MERIDIAN_GIT_SHA
-  # Fly secret so the baked per-deploy value takes effect, OR have the deploy job
-  # `flyctl secrets set MERIDIAN_GIT_SHA=<sha>` each deploy), THEN re-enable this cron.
-  # Until then it's manual-dispatch-only so it can't spam false alarms.
-  #   schedule:
-  #     - cron: '15 */2 * * *'   # every 2 hours at :15
+  # 73f81c57 (2026-07-07): RE-ENABLED. The stale-git_sha blocker is fixed. The static Fly
+  # SECRET `MERIDIAN_GIT_SHA` (set once to an old commit) that OVERRODE the correct
+  # per-deploy `--build-arg MERIDIAN_GIT_SHA` baked into the image ENV has been removed
+  # (`flyctl secrets unset MERIDIAN_GIT_SHA -a meridian-hosted`), so _read_git_sha() now
+  # reports the correct baked per-deploy SHA. Verified live immediately after the unset:
+  # prod /health git_sha == origin/main HEAD (c2a73fac0908). The check no longer
+  # false-positives, so the scheduled run is safe again.
+  schedule:
+    - cron: '15 */2 * * *'   # every 2 hours at :15
   workflow_dispatch:
     inputs:
       url:
