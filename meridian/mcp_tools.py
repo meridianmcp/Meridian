@@ -37,6 +37,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
+    "delete_sprint_item_pointer": 'delete_sprint_item_pointer(pointer_id="pointer-uuid")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -441,6 +442,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to resolve."}},
          "required": ["sprint_item_id"]}},
+    {"name": "delete_sprint_item_pointer", "description":
+        "2976e168 — delete ONE generic pointer from a sprint item by its pointer id "
+        "(the id returned by add_sprint_item_pointer / get_sprint_item_pointers). A "
+        "stored pointer is immutable, so 'editing' one is delete-then-re-add. "
+        "Idempotent: returns {pointer_id, deleted:false} when no pointer had that id, "
+        "rather than erroring.",
+     "inputSchema": {"type": "object", "properties": {
+         "pointer_id": {"type": "string", "description": "The id of the pointer to delete."}},
+         "required": ["pointer_id"]}},
     {"name": "add_insight", "description":
         "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
         "decisions. A first-class knowledge type SEPARATE from decisions (choices with a "
@@ -1176,7 +1186,7 @@ _READ_ONLY_TOOLS = {
     "get_citation_edges",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
 }
-_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
+_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer"}
 
 _TITLE_OVERRIDES: dict[str, str] = {
     "request_hitl": "Request HITL",

@@ -3750,6 +3750,16 @@ async def _handle_sprint_tools(
                 )
             )
         return {"sprint_item_id": args["sprint_item_id"], "pointers": resolved}
+    if name == "delete_sprint_item_pointer":
+        # 98c71a42 — the DELETE (edit-via-replace) half of the pointer CRUD. The DB
+        # layer (db.delete_sprint_item_pointer) has existed since 2976e168, but no
+        # MCP tool wrapped it — a pointer could be created / listed / resolved yet
+        # never removed. Idempotent: {deleted:false} when no pointer had that id,
+        # rather than an error.
+        if not args.get("pointer_id"):
+            return {"error": "pointer_id is required"}
+        removed = await db_module.delete_sprint_item_pointer(db, args["pointer_id"])
+        return {"pointer_id": args["pointer_id"], "deleted": removed}
     return _MISS
 
 
