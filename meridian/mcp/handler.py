@@ -1651,6 +1651,22 @@ async def _handle_project_tools(
     return _MISS
 
 
+def _resolve_caller_identity(tenant: "dict[str, Any] | None") -> "str | None":
+    """bdc251ec — a human_id handle for the authenticated caller, derived from the
+    tenant the auth token already resolved. Prefer an explicit name, else the email
+    local-part. Returns None on the owner / self-host path (no tenant) so the
+    handoff keeps its generic placeholder rather than inventing an identity."""
+    if not tenant:
+        return None
+    name = str(tenant.get("name") or "").strip()
+    if name:
+        return name
+    email = str(tenant.get("email") or "").strip()
+    if "@" in email:
+        return email.split("@", 1)[0] or None
+    return email or None
+
+
 async def _handle_task_tools(
     name: str,
     args: dict[str, Any],
@@ -1718,6 +1734,7 @@ async def _handle_task_tools(
                     session_id=session_id,
                     commit_messages=[c["message"] for c in _gh_commits],
                     graph_searcher=_graph_searcher,
+                    identity=_resolve_caller_identity(tenant),
                 ),
                 timeout=90.0,
             )
@@ -2600,6 +2617,7 @@ async def _handle_session_tools(
                 handoff_module_local.generate_handoff(
                     db, project_id, data_dir, mode="delta", session_id=session_id,
                     commit_messages=[c["message"] for c in _commits],
+                    identity=_resolve_caller_identity(tenant),
                 ),
                 timeout=30.0,
             )

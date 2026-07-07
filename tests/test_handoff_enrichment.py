@@ -405,3 +405,112 @@ async def test_annotate_non_code_item_without_backend_is_not_mis_prospected():
     assert out[0]["pointer_source_type"] in ("docs", "experiment", "citation")
     assert "code_pointers" not in out[0]
     assert "pointers" not in out[0]
+
+
+# ---------------------------------------------------------------------------
+# 182468a6 — deeper prospecting: touches_resources targeting, match validation,
+# re-prospecting, and a surfaced (not silent) enrichment cap.
+# ---------------------------------------------------------------------------
+
+
+def test_touches_resource_terms_strips_prefixes():
+    item = {"touches_resources": [
+        "inferred:file:meridian/mcp/handler.py",
+        "file:meridian/handoff.py:_render_starter_handoff",
+        "db:sprint_items",
+    ]}
+    terms = handoff_module._touches_resource_terms(item)
+    assert terms == [
+        "meridian/mcp/handler.py",
+        "meridian/handoff.py:_render_starter_handoff",
+        "sprint_items",
+    ]
+    # JSON-string storage shape is tolerated too.
+    import json as _json
+    item2 = {"touches_resources": _json.dumps(["inferred:file:a/b.py"])}
+    assert handoff_module._touches_resource_terms(item2) == ["a/b.py"]
+    # Garbage / empty → no terms, never raises.
+    assert handoff_module._touches_resource_terms({"touches_resources": None}) == []
+    assert handoff_module._touches_resource_terms({"touches_resources": "not json"}) == ["not json"]
+
+
+@pytest.mark.asyncio
+async def test_annotate_prospects_from_touches_resources_when_present():
+    """182468a6 — the query targets the declared touches_resources, not the title
+    keywords, when resources are present."""
+    seen: list[str] = []
+
+    def searcher(query):
+        seen.append(query)
+        return [{"file": "meridian/db/__init__.py", "function": "x", "qualified_name": "x"}]
+
+    item = {
+        "id": "i1", "status": "pending",
+        "title": "terse title with no useful keywords",
+        "touches_resources": ["inferred:file:meridian/db/__init__.py"],
+    }
+    out = await handoff_module._annotate_code_pointers([item], searcher)
+    assert seen == ["meridian/db/__init__.py"]  # queried the resource, not the title
+    assert out[0]["code_pointers"][0]["file"] == "meridian/db/__init__.py"
+    assert out[0]["prospect_status"] == "prospected"
+
+
+@pytest.mark.asyncio
+async def test_annotate_validates_matches_skips_locationless_first():
+    """182468a6 — a first match with no usable location is skipped for the first
+    match that validates, instead of yielding None from matches[0]."""
+    def searcher(query):
+        return [
+            {"score": 0.9},  # no file/function/qualified — unusable
+            {"file": "meridian/server.py", "function": "route", "qualified_name": "route"},
+        ]
+
+    item = {"id": "i1", "title": "add a route to server", "status": "pending"}
+    out = await handoff_module._annotate_code_pointers([item], searcher)
+    assert out[0]["code_pointers"][0]["file"] == "meridian/server.py"
+    assert out[0]["prospect_status"] == "prospected"
+
+
+@pytest.mark.asyncio
+async def test_annotate_no_reprospect_by_default_but_reprospect_overwrites():
+    """182468a6 — an item that already has a pointer is left alone by default
+    (status 'cached'), but reprospect=True re-runs and can correct it."""
+    item = {
+        "id": "i1", "title": "fix the widget", "status": "pending",
+        "code_pointers": [{"file": "old.py", "function": "stale", "qualified_name": "stale"}],
+    }
+
+    def searcher(query):
+        return [{"file": "new.py", "function": "fresh", "qualified_name": "fresh"}]
+
+    # Default: cached, untouched.
+    out = await handoff_module._annotate_code_pointers([dict(item)], searcher)
+    assert out[0]["code_pointers"][0]["file"] == "old.py"
+    assert out[0]["prospect_status"] == "cached"
+
+    # reprospect=True: overwritten with the fresh match.
+    out2 = await handoff_module._annotate_code_pointers([dict(item)], searcher, reprospect=True)
+    assert out2[0]["code_pointers"][0]["file"] == "new.py"
+    assert out2[0]["prospect_status"] == "prospected"
+
+
+@pytest.mark.asyncio
+async def test_annotate_surfaces_cap_beyond_limit():
+    """182468a6 — items beyond the enrichment cap are marked skipped_cap (not
+    silently ignored), so the caller can report partial coverage."""
+    cap = handoff_module._MAX_ENRICHED_ITEMS
+    items = [
+        {"id": f"i{n}", "title": f"pending item {n}", "status": "pending"}
+        for n in range(cap + 3)
+    ]
+
+    def searcher(query):
+        return [{"file": "f.py", "function": "g", "qualified_name": "g"}]
+
+    out = await handoff_module._annotate_code_pointers(items, searcher)
+    # The overflow items carry the cap signal...
+    assert all(it.get("prospect_status") == "skipped_cap" for it in out[cap:])
+    # ...and were NOT prospected.
+    assert all("code_pointers" not in it for it in out[cap:])
+    # ...while in-cap items were prospected.
+    assert out[0]["prospect_status"] == "prospected"

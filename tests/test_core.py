@@ -372,7 +372,9 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "1. [pending] First fix" in content
     assert "2. [pending] Second fix" in content
     assert f"Depends on item 1 (`{first['id']}`): First fix" in content
-    assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
+    # bdc251ec — no authenticated caller identity passed here, so the start line
+    # keeps its generic session_name placeholder and adds no human_id clause.
+    assert f'start_session(project_id="{p["id"]}", session_name="describe-what-youre-doing")' in content
     # eeee02c6 — a depends_on relationship renders the /goal as a flattened
     # dependency-ordered id list (no "Wave" headers, which invite stopping).
     assert "dependency order" in content

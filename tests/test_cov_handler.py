@@ -2825,3 +2825,22 @@ def test_start_session_no_repo_path_sends_nothing(monkeypatch):
         assert extract_sent == []
     finally:
         _run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# bdc251ec — _resolve_caller_identity: server-side identity for handoff templates
+# ---------------------------------------------------------------------------
+
+def test_resolve_caller_identity_from_tenant():
+    # No tenant (owner / self-host) → None, so the handoff keeps its placeholder.
+    assert mh._resolve_caller_identity(None) is None
+    assert mh._resolve_caller_identity({}) is None
+    # Email → local-part handle.
+    assert mh._resolve_caller_identity({"email": "ajc123@gmail.com"}) == "ajc123"
+    # Explicit name wins over email.
+    assert mh._resolve_caller_identity(
+        {"name": "Adam Camerer", "email": "ajc@x.com"}
+    ) == "Adam Camerer"
+    # Malformed email (no @) → returned as-is if non-empty, else None.
+    assert mh._resolve_caller_identity({"email": "weird"}) == "weird"
+    assert mh._resolve_caller_identity({"email": ""}) is None

@@ -1029,6 +1029,51 @@ def _code_pointer_query(title: str, kws: set[str]) -> str:
     ) or title.strip()
 
 
+def _touches_resource_terms(item: dict[str, Any]) -> list[str]:
+    """182468a6 — extract search terms from an item's declared touches_resources.
+
+    Identifiers look like ``inferred:file:meridian/handler.py`` or
+    ``file:meridian/handoff.py:_render_starter_handoff``; strip the optional
+    ``inferred:`` prefix and the type token (``file:``/``db:``/``mcp_tool:``/…)
+    and keep the path (+ any trailing symbol) as a precise search term. Tolerant
+    of the JSON-string, list, and bare-string storage shapes; never raises.
+    """
+    raw = item.get("touches_resources")
+    ids: list[Any] = []
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            ids = parsed if isinstance(parsed, list) else [raw]
+        except Exception:  # noqa: BLE001
+            ids = [raw]
+    elif isinstance(raw, list):
+        ids = raw
+    terms: list[str] = []
+    for ident in ids:
+        s = str(ident).strip()
+        if not s:
+            continue
+        if s.startswith("inferred:"):
+            s = s[len("inferred:"):]
+        # drop a single leading type token (file:/db:/mcp_tool:/route:/pypi:/github:)
+        head, sep, tail = s.partition(":")
+        term = (tail if sep and head.isalpha() else s).strip()
+        if term:
+            terms.append(term)
+    return terms
+
+
+def _prospect_query(item: dict[str, Any], title: str, kws: set[str]) -> str:
+    """182468a6 — prefer the item's declared touches_resources (real file/symbol
+    identifiers) as the search target; fall back to stopword-stripped title
+    keywords only when no resources are declared. Declared resources are far more
+    precise than title words, and let an item with a terse title still prospect."""
+    terms = _touches_resource_terms(item)
+    if terms:
+        return " ".join(terms)
+    return _code_pointer_query(title, kws)
+
+
 # 10bfe531 — handoff prospecting is source_type-aware, not code-only. Keyword
 # signals (title + tags) map an item to the pointer source_type that fits it. `code`
 # is the default and the one prospector wired in production today; docs/citation/
@@ -1082,6 +1127,7 @@ async def _annotate_code_pointers(
     searcher: Callable[[str], Any] | None,
     *,
     prospectors: dict[str, Callable[[str], Any]] | None = None,
+    reprospect: bool = False,
 ) -> list[dict[str, Any]]:
     """Prospect a pointer for each NON-MANUAL pending item, by fitting source_type.
 
@@ -1110,37 +1156,73 @@ async def _annotate_code_pointers(
         registry.setdefault("code", searcher)
     if not registry:
         return pending_items
+    # 182468a6 — surface the cap instead of silently dropping items past it: any
+    # non-manual item beyond the enrichment cap is marked skipped_cap so the caller
+    # / handoff can tell "not prospected for capacity" apart from "no match found".
+    for item in pending_items[_MAX_ENRICHED_ITEMS:]:
+        if not _is_manual_sprint_item(item):
+            item.setdefault("prospect_status", "skipped_cap")
     for item in pending_items[:_MAX_ENRICHED_ITEMS]:
-        if item.get("code_pointers") or item.get("pointers"):
-            continue
         if _is_manual_sprint_item(item):
-            continue  # 10bfe531 — never prospect MANUAL/human maintainer items
+            item["prospect_status"] = "skipped_manual"  # 10bfe531 — never prospect
+            continue
+        # 182468a6 — a prior pointer is kept by default, but reprospect=True re-runs
+        # the search so a stale/bad guess can be corrected instead of frozen forever.
+        if (item.get("code_pointers") or item.get("pointers")) and not reprospect:
+            item.setdefault("prospect_status", "cached")
+            continue
         title = item.get("title") or ""
         kws = _extract_keywords(title)
-        if not kws:
-            continue
         stype = _infer_pointer_source_type(item)
         item["pointer_source_type"] = stype
         prospector = registry.get(stype)
         if prospector is None:
-            continue  # no backend for this source_type yet — don't mis-prospect
-        query = _code_pointer_query(title, kws)
+            item["prospect_status"] = "no_backend"  # don't mis-prospect
+            continue
+        # 182468a6 — target the search at declared touches_resources when present
+        # (far more precise than stopword-stripped title keywords).
+        query = _prospect_query(item, title, kws)
+        if not query:
+            item["prospect_status"] = "no_query"
+            continue
         try:
             result = prospector(query)
             if hasattr(result, "__await__"):
                 result = await result  # type: ignore[misc]
             matches = _coerce_match_list(result)
             if not matches:
+                item["prospect_status"] = "no_match"
                 continue
+            # 182468a6 — validate matches: take the FIRST that yields a usable
+            # pointer rather than blindly trusting matches[0] (which may lack any
+            # location info while a later match has it). When reprospecting, clear
+            # any prior pointer of the other kind so the item can't carry both.
             if stype == "code":
-                pointer = _normalize_code_pointer(matches[0])
+                pointer = next(
+                    (p for p in (_normalize_code_pointer(m) for m in matches) if p),
+                    None,
+                )
                 if pointer:
                     item["code_pointers"] = [pointer]
+                    if reprospect:
+                        item.pop("pointers", None)
+                    item["prospect_status"] = "prospected"
+                else:
+                    item["prospect_status"] = "no_valid_match"
             else:
-                gp = _build_generic_pointer(stype, matches[0])
+                gp = next(
+                    (g for g in (_build_generic_pointer(stype, m) for m in matches) if g),
+                    None,
+                )
                 if gp:
                     item["pointers"] = [gp]
+                    if reprospect:
+                        item.pop("code_pointers", None)
+                    item["prospect_status"] = "prospected"
+                else:
+                    item["prospect_status"] = "no_valid_match"
         except Exception:  # noqa: BLE001 — enrichment is best-effort, never fatal
+            item["prospect_status"] = "error"
             continue
     return pending_items
 
@@ -1157,24 +1239,37 @@ def resolve_handoff_mode(
     return "full"
 
 
+def _human_id_clause(identity: str | None) -> str:
+    """bdc251ec — the ``, human_id="..."`` clause for a handoff start_session line,
+    or ``""`` when the caller identity is unknown (keeps the legacy placeholder-only
+    form). ``identity`` is the authenticated caller resolved server-side from the
+    auth token, so the pasted start_session pre-fills who the human is instead of a
+    generic placeholder."""
+    ident = (identity or "").strip()
+    return f', human_id="{ident}"' if ident else ""
+
+
 def _render_starter_handoff(
     project: dict[str, Any],
     *,
     completed_items: list[dict[str, Any]],
     pending_items: list[dict[str, Any]],
     quick_start_goal: str,
+    identity: str | None = None,
 ) -> str:
     """Return a ≤20-line starter block for pasting into a fresh session.
 
     Designed for /compact restart: gives the minimal context needed to call
-    start_session() and know what to work on next.
+    start_session() and know what to work on next. ``identity`` (bdc251ec), when
+    known, is substituted as the start_session ``human_id`` so the caller isn't
+    re-typing a generic placeholder.
     """
     pid = project["id"]
     name = project["name"]
     lines = [
         # 11a91d31 — default to project_name (the idiomatic interface per 8a449ec0);
         # project_id stays as a fallback comment.
-        f'start: start_session(project_name="{name}", session_name="describe-what-youre-doing")',
+        f'start: start_session(project_name="{name}", session_name="describe-what-youre-doing"{_human_id_clause(identity)})',
         f"project_id (fallback): {pid}",
         "",
         f"# Meridian — {name}",
@@ -1431,11 +1526,15 @@ def _render_delta_handoff(
     in_progress_items: list[dict[str, Any]],
     pending_sprint_items: list[dict[str, Any]],
     quick_start_goal: str,
+    identity: str | None = None,
 ) -> str:
-    """Return a compact handoff for back-to-back goal runs in one session."""
+    """Return a compact handoff for back-to-back goal runs in one session.
+
+    ``identity`` (bdc251ec), when known, pre-fills the start_session ``human_id``.
+    """
     # 04f03ee4 — one-liner start instruction at very top of delta output
     lines = [
-        f"To start fresh: start_session(project_name=\"{project['name']}\", session_name=\"describe-what-youre-doing\")  # project_id={project['id']}",
+        f"To start fresh: start_session(project_name=\"{project['name']}\", session_name=\"describe-what-youre-doing\"{_human_id_clause(identity)})  # project_id={project['id']}",
         "",
         f"# Session Update — {project['name']}",
         f"_Generated at {generated_at} (delta mode)_",
@@ -2139,6 +2238,7 @@ async def generate_handoff(
     commit_messages: list[str] | None = None,
     graph_searcher: Callable[[str], Any] | None = None,
     extra_narrative: str | None = None,
+    identity: str | None = None,
 ) -> tuple[str, str]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -2155,7 +2255,7 @@ async def generate_handoff(
     if mode == "planner":
         return await _generate_planner_handoff(db, project_id, output_dir)
     if mode in {"starter", "compact"}:
-        return await _generate_starter_handoff(db, project, output_dir)
+        return await _generate_starter_handoff(db, project, output_dir, identity=identity)
     if mode not in {"full", "delta"}:
         raise ValueError("mode must be 'full', 'delta', 'planner', 'starter', or 'compact'")
 
@@ -2232,6 +2332,18 @@ async def generate_handoff(
                 pending_sprint_items = await _annotate_code_pointers(
                     pending_sprint_items, searcher
                 )
+                # 182468a6 — surface the enrichment cap so a partially-prospected
+                # board reads honestly instead of looking fully covered.
+                _capped = sum(
+                    1 for it in pending_sprint_items
+                    if it.get("prospect_status") == "skipped_cap"
+                )
+                if _capped:
+                    code_pointer_skip_reason = (
+                        f"code-pointer enrichment capped at {_MAX_ENRICHED_ITEMS} "
+                        f"items — {_capped} further pending item(s) not prospected "
+                        f"this pass"
+                    )
             except Exception:  # noqa: BLE001 — enrichment is best-effort
                 code_pointer_skip_reason = (
                     "code-pointer enrichment skipped — graph searcher errored"
@@ -2318,6 +2430,7 @@ async def generate_handoff(
             in_progress_items=delta_in_progress,
             pending_sprint_items=delta_pending,
             quick_start_goal=quick_start_goal,
+            identity=identity,
         )
     else:
         # v1.1 — per-user handoff template. When workspace_settings.handoff_template
@@ -2344,6 +2457,7 @@ async def generate_handoff(
             content = template.render(
                 generated_at=generated_at,
                 project=project,
+                identity=identity,
                 goal=goal,
                 sessions=sessions,
                 active_sessions=active_sessions,
@@ -2671,6 +2785,7 @@ async def _generate_starter_handoff(
     db: object,
     project: dict[str, Any],
     output_dir: str,
+    identity: str | None = None,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -2731,6 +2846,7 @@ async def _generate_starter_handoff(
         completed_items=completed,
         pending_items=pending,
         quick_start_goal=quick_start_goal,
+        identity=identity,
     )
     if has_executor_config(executor_config):
         content = f"{build_executor_config_block(executor_config)}\n\n{content}"

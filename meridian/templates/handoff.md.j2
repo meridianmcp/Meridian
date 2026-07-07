@@ -117,7 +117,7 @@ _⚠ {{ code_pointer_skip_reason }}._
 
 Start a fresh Meridian session:
 
-`start_session(project_id="{{ project.id }}", session_name="<your-name>")`
+`start_session(project_id="{{ project.id }}", session_name="describe-what-youre-doing"{% if identity %}, human_id="{{ identity }}"{% endif %})`
 
 Claude Code `/goal` template:
 
@@ -130,7 +130,7 @@ You are resuming a Meridian-coordinated session for "{{ project.name }}".
 1. Read **L0** (Core Context) — north star + pinned decisions = the constitution
 2. Read **L1** (Current State) — sprint + recent tasks = what's in flight
 3. Read **L2** (History) only if context allows
-4. Call `start_session(project_id="{{ project.id }}", session_name="<your-name>")`
+4. Call `start_session(project_id="{{ project.id }}", session_name="describe-what-youre-doing"{% if identity %}, human_id="{{ identity }}"{% endif %})`
 5. Continue from where the L1 task log ends — don't redo done work
 
 For coordination protocol details, see the MERIDIAN.md instructions
