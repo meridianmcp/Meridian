@@ -74,6 +74,13 @@ dev = { features = ["dev"], solve-group = "default" }
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
 dev = "uvicorn meridian.server:app --reload --port 7878"
 test = "pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --timeout=60"
+# KEYSTONE 98aa7eb7 — run the SAME suite against real Postgres. The `db`/`client`
+# fixtures (tests/conftest.py) route to Postgres whenever TEST_DATABASE_URL is set,
+# so bugs SQLite :memory: hides (e.g. b7f41c73 datetime serialization) surface.
+# Set the URL first, e.g.:
+#   TEST_DATABASE_URL=postgresql://meridian:meridian@localhost:5432/meridian_test pixi run test-pg
+# Mirrors the CI `test-postgres` job in .github/workflows/test.yml.
+test-pg = "pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --timeout=60"
 test-cov = "pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80"
 test-fast = "pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_github.py tests/test_milestones.py tests/test_md_anchors.py tests/test_security.py tests/test_ui.py tests/test_executor_runs.py tests/test_error_alerting.py tests/test_v2_hosted.py -n auto -q --tb=short"
 build-exe = "pyinstaller meridian.spec --clean"
