@@ -567,6 +567,16 @@ async def lifespan(app: FastAPI):
                                 await run_overage_check(db)
                             except Exception:  # noqa: BLE001
                                 pass
+                            # 9f7bfcca — daily trial-expiration reminder pass
+                            # (14/7/1 days out). Idempotent via the tenant's
+                            # notification_prefs JSON blob; no-op without a
+                            # Resend key. Hosted-only (this block is already
+                            # gated on MERIDIAN_HOSTED above).
+                            try:
+                                from .hosted import run_trial_reminder_check
+                                await run_trial_reminder_check(db)
+                            except Exception:  # noqa: BLE001
+                                pass
                 # v2.4 — refresh the CLAUDE.md <current_state> block for
                 # every project on each cycle. Local dev only — skipped
                 # on hosted multi-tenant deployments where there is no
