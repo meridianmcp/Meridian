@@ -7739,7 +7739,7 @@ async function loadDocumentsTab(projectId: any) {
   };
 
   let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-    <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? '' : 's'} <span style="color:var(--muted)">(note_kind=document)</span></div>
+    <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? '' : 's'} <span style="color:var(--muted)">ingested</span></div>
   </div>`;
 
   // f1c7e7d1 — tunnel-free upload: pick a local .txt/.md, read it client-side,
