@@ -4514,8 +4514,19 @@ async def _handle_plugin_tools(
 
         builtin_by_slot = {p["slot"]: p for p in BUILTIN_PLUGINS}
 
-        # Fetch tunnel tool counts per slot (parallel, non-fatal)
+        # Fetch tunnel tool counts + live tool names per slot (parallel, non-fatal).
+        #
+        # 90d04961 — this is re-queried on EVERY call (never a session-start
+        # snapshot): _fetch_slot_tools hits each slot's live tools/list, so a slot
+        # that only became active MID-session (e.g. the word slot connecting after
+        # session start and now serving 42 real tools) is picked up here on the
+        # next list_plugins/tool-search call rather than being invisible until a
+        # reconnect. A slot is treated as active/invocable ONLY when it actually
+        # returns ≥1 live tool this fetch — a slot that returns 0 (never connected,
+        # dead inner server, or still starting) must NOT be flagged active, or a
+        # tool-search consumer would surface a plugin whose tools 503 on first call.
         slot_tool_counts: dict[str, int] = {}
+        slot_tool_names: dict[str, list[str]] = {}
         tenant_id = tenant.get("id") if tenant else None
         if tenant_id and _tunnel_mod.has_active_tunnel(tenant_id):
             try:
@@ -4526,7 +4537,16 @@ async def _handle_plugin_tools(
                     ]
                 )
                 for label, tools in slot_results:
-                    slot_tool_counts[label] = len(tools)
+                    # Only record slots that surfaced live tools — a bare count of
+                    # 0 means the slot is not actually serving, so it stays out of
+                    # the active/invocable set (and off the tool-search index).
+                    if tools:
+                        slot_tool_counts[label] = len(tools)
+                        slot_tool_names[label] = [
+                            str(t.get("name"))
+                            for t in tools
+                            if isinstance(t, dict) and t.get("name")
+                        ]
             except Exception:  # noqa: BLE001
                 pass
 
@@ -4571,6 +4591,14 @@ async def _handle_plugin_tools(
                 # invocable while the tunnel is live (otherwise they appear in the
                 # list but calling one returns "unknown tool").
                 "invocable": slot in slot_tool_counts,
+                # 90d04961 — surface the slot's LIVE tool names (slot-prefixed, as
+                # the connector advertises them) so a tool-search consumer can match
+                # a specific tunnel-bridged tool that only appeared after the initial
+                # session snapshot. Empty for inactive slots.
+                "tools": [
+                    f"{display_name}__{tn}"
+                    for tn in slot_tool_names.get(slot, [])
+                ],
             }
             if skill:
                 entry["skill_note"] = {
