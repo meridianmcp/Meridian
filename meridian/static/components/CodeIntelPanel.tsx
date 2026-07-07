@@ -78,6 +78,24 @@ function labelForRank(arch: Architecture | null | undefined, rank: string): stri
   return rank === "other" ? "unlayered" : `layer ${rank}`;
 }
 
+// ddde437a — the code-intel tunnel slot (codebase-memory-mcp) returns HTTP 503
+// with body {"error":"code tunnel not connected"} when nothing is bridging the
+// code slot. The host surfaces that as an `error` string ("Error: HTTP 503",
+// "code tunnel not connected", "not_connected", …). That's not a real failure —
+// it's the expected "you haven't started the tunnel yet" state — so we detect it
+// and render a friendly not-connected empty state instead of a scary red error.
+export function isNotConnectedError(error?: string): boolean {
+  if (!error) return false;
+  const e = error.toLowerCase();
+  return (
+    e.includes("503") ||
+    e.includes("not connected") ||
+    e.includes("not_connected") ||
+    e.includes("no active") ||
+    (e.includes("tunnel") && (e.includes("not") || e.includes("no ")))
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 455b7970 — Cytoscape.js compound-node model.
 //
@@ -246,6 +264,29 @@ export function CodeIntelPanel(props: CodeIntelPanelProps) {
     );
   }
   if (status === "error") {
+    // ddde437a — a 503 / "not connected" is the tunnel-not-started state, not a
+    // real error. Render a friendly, actionable empty state instead of a red
+    // "Failed to load code intelligence: Error: HTTP 503".
+    if (isNotConnectedError(error)) {
+      return (
+        <div
+          class="ci-state ci-not-connected"
+          role="status"
+          style={{ ...STATE_STYLE, color: "var(--muted)", lineHeight: "1.6" }}
+        >
+          <div style={{ fontSize: "12px", color: "var(--text)", fontWeight: 600, marginBottom: "4px" }}>
+            Code index not connected
+          </div>
+          <div>
+            The code intelligence tunnel slot isn't connected yet. Start the tunnel and
+            connect the code slot to populate the package graph:
+          </div>
+          <div style={{ marginTop: "6px" }}>
+            Run <code>meridian --tunnel</code> in your repo, then open this panel again.
+          </div>
+        </div>
+      );
+    }
     return (
       <div class="ci-state ci-error" role="alert" style={{ ...STATE_STYLE, color: "var(--error,#ef4444)" }}>
         Failed to load code intelligence: {error || "unknown error"}

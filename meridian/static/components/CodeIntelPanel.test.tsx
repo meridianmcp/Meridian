@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodeIntelPanel, buildLayers, mountCodeIntelPanel,
   buildCytoscapeElements, filterCyElements, mountCytoscapeGraph,
-  CI_EDGE_COLORS, CI_EDGE_TYPES,
+  CI_EDGE_COLORS, CI_EDGE_TYPES, isNotConnectedError,
 } from "./CodeIntelPanel";
 import type { CiEdgeType } from "./CodeIntelPanel";
 import type { Architecture } from "./types";
@@ -45,6 +45,32 @@ describe("CodeIntelPanel states", () => {
     expect(screen.getByText(/no package graph yet/i)).toBeInTheDocument();
   });
 
+  // ddde437a — a code tunnel 503 must degrade to a friendly not-connected empty
+  // state, NOT the scary red "Failed to load code intelligence: Error: HTTP 503".
+  it("renders a friendly not-connected state for an HTTP 503 error", () => {
+    render(<CodeIntelPanel status="error" error="Error: HTTP 503" />);
+    // No alert / no scary "failed to load".
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/failed to load code intelligence/i)).toBeNull();
+    // Friendly, actionable copy with how to enable it.
+    const state = screen.getByRole("status");
+    expect(state).toHaveTextContent(/code index not connected/i);
+    expect(state).toHaveTextContent(/meridian --tunnel/);
+  });
+
+  it("renders the not-connected state for an explicit 'tunnel not connected' error", () => {
+    render(<CodeIntelPanel status="error" error="code tunnel not connected" />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(/not connected/i);
+  });
+
+  it("still renders the raw error state for genuine (non-503) failures", () => {
+    render(<CodeIntelPanel status="error" error="boom: index corrupt" />);
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(/failed to load/i);
+    expect(alert).toHaveTextContent(/boom: index corrupt/);
+  });
+
   it("renders a layered DAG of packages in the ready state", () => {
     render(<CodeIntelPanel status="ready" architecture={ARCH} />);
     // Every package surfaces as a node.
@@ -69,6 +95,27 @@ describe("buildLayers ordering", () => {
   it("returns no rows for missing/empty architecture", () => {
     expect(buildLayers(null)).toEqual([]);
     expect(buildLayers({ packages: [] })).toEqual([]);
+  });
+});
+
+describe("isNotConnectedError (ddde437a)", () => {
+  it("matches the code-tunnel not-connected / 503 shapes", () => {
+    for (const e of [
+      "Error: HTTP 503",
+      "HTTP 503",
+      "code tunnel not connected",
+      '{"status":"not_connected","message":"no active code tunnel"}',
+      "no active extract tunnel — start meridian --tunnel first",
+    ]) {
+      expect(isNotConnectedError(e)).toBe(true);
+    }
+  });
+
+  it("does not match genuine failures or empty input", () => {
+    expect(isNotConnectedError(undefined)).toBe(false);
+    expect(isNotConnectedError("")).toBe(false);
+    expect(isNotConnectedError("HTTP 500")).toBe(false);
+    expect(isNotConnectedError("index corrupt")).toBe(false);
   });
 });
 
