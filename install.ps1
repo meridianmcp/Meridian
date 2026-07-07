@@ -12,6 +12,26 @@
 #              --token. That lets `irm ... | iex` complete end-to-end without a
 #              TTY to paste a token into -- the old flow dead-ended on hosted
 #              because meridian-connect's paste prompt needs an interactive stdin.
+#   5fb084fe -- COMPONENT SELECTION. The installer no longer forces the full
+#              stack on every run. -Component picks what to install:
+#                  binary  -- only download + run the meridian-connect tunnel binary
+#                  hooks   -- only install the Meridian session hooks (delegates to
+#                             hooks_install.ps1 on the target server)
+#                  both    -- binary + hooks (the default; the old behavior)
+#                  custom  -- prompt for each component interactively
+#              A summary line up front states exactly what will be installed.
+#              When piped through `iex` (no -File), pass it after the script, e.g.
+#                  & ([scriptblock]::Create((irm https://usemeridian.us/install.ps1))) -Component hooks
+#              or run the saved file directly: powershell -File install.ps1 -Component binary
+param(
+    [ValidateSet('binary', 'hooks', 'both', 'custom')]
+    [string]$Component = 'both',
+
+    # Passthrough args forwarded to meridian-connect (kept out of the named param
+    # so `-Component X <tunnel args...>` still works).
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArgs = @()
+)
 $ErrorActionPreference = "Stop"
 
 $repo = "meridianmcp/Meridian"
@@ -19,6 +39,66 @@ $arch = if ([System.Environment]::Is64BitOperatingSystem) { "x86_64" } else { "x
 $binary = "meridian-connect-${arch}-windows.exe"
 $meridianDir = "$env:APPDATA\meridian"
 $dest = "$meridianDir\meridian-connect.exe"
+
+# ---- 5fb084fe: component selection ------------------------------------------
+# Resolve the passthrough tunnel args first (the target URL is parsed from them,
+# and it drives which server the 'hooks' component's installer is fetched from).
+# Combine the ValueFromRemainingArguments capture with any bare $args so both the
+# `-File install.ps1 -Component X ...` and the `iex`/scriptblock invocation paths
+# forward the same tunnel arguments.
+$passthroughArgs = @()
+if ($RemainingArgs) { $passthroughArgs += $RemainingArgs }
+if ($args)          { $passthroughArgs += $args }
+
+# Parse the tunnel target URL out of the passthrough args (defaults to hosted).
+$targetUrl = 'https://usemeridian.us'
+for ($i = 0; $i -lt $passthroughArgs.Count; $i++) {
+    if ("$($passthroughArgs[$i])" -eq '--url' -and ($i + 1) -lt $passthroughArgs.Count) {
+        $targetUrl = "$($passthroughArgs[$i + 1])"
+    }
+}
+
+# Decide, per component, what actually gets installed.
+$installBinary = $false
+$installHooks  = $false
+switch ($Component) {
+    'binary' { $installBinary = $true }
+    'hooks'  { $installHooks  = $true }
+    'both'   { $installBinary = $true; $installHooks = $true }
+    'custom' {
+        # Interactive per-component choice. Non-interactive hosts (piped `iex`
+        # with no console) fall back to installing both so `custom` never
+        # dead-ends silently.
+        $interactive = $false
+        try { $interactive = -not [System.Console]::IsInputRedirected } catch { $interactive = $false }
+        if ($interactive) {
+            $bAns = Read-Host "Install the meridian-connect tunnel binary? [Y/n]"
+            $installBinary = ($bAns -notmatch '^(n|no)$')
+            $hAns = Read-Host "Install the Meridian session hooks? [Y/n]"
+            $installHooks = ($hAns -notmatch '^(n|no)$')
+        } else {
+            Write-Host "No interactive console for -Component custom; installing both components."
+            $installBinary = $true
+            $installHooks  = $true
+        }
+    }
+}
+
+# Nothing selected (e.g. custom with both declined) -- there is no work to do.
+if (-not $installBinary -and -not $installHooks) {
+    Write-Host "Nothing selected to install. Re-run with -Component binary|hooks|both."
+    exit 0
+}
+
+# Confirmation / summary line: state exactly what will be installed up front.
+$componentList = @()
+if ($installBinary) { $componentList += 'meridian-connect tunnel binary' }
+if ($installHooks)  { $componentList += 'Meridian session hooks' }
+Write-Host ""
+Write-Host ("Meridian install plan (-Component {0}): {1}." -f $Component, ($componentList -join ' + ')) -ForegroundColor Cyan
+Write-Host ("Target server: {0}" -f $targetUrl)
+Write-Host ""
+
 New-Item -Force -ItemType Directory $meridianDir | Out-Null
 
 # ---- RFC 8628 device flow (reused from hooks_install.ps1, item e9f18530) -----
@@ -125,6 +205,12 @@ function Get-MeridianDeviceToken {
     return $null
 }
 
+# =============================================================================
+# COMPONENT: binary -- download + run the meridian-connect tunnel binary.
+# Skipped entirely for -Component hooks (5fb084fe).
+# =============================================================================
+if ($installBinary) {
+
 # ---- Resolve + print the release version (50d2664d) --------------------------
 # releases/latest/download/... follows GitHub's "latest non-prerelease" release;
 # the releases/latest API resolves to the SAME tag, so this is exactly what we are
@@ -216,12 +302,11 @@ function Get-MeridianCachedToken {
 # Copy the passthrough args, then decide whether we need to mint a token. We skip
 # the device flow when: the caller already passed --token, a MERIDIAN_TOKEN is in
 # the environment, or the target is a local/self-hosted server (no auth needed).
-$binaryArgs = @($args)
-$targetUrl = 'https://usemeridian.us'
+$binaryArgs = @($passthroughArgs)
+# $targetUrl was already resolved from the passthrough args near the top.
 $hasToken = $false
 for ($i = 0; $i -lt $binaryArgs.Count; $i++) {
     $a = "$($binaryArgs[$i])"
-    if ($a -eq '--url'   -and ($i + 1) -lt $binaryArgs.Count) { $targetUrl = "$($binaryArgs[$i + 1])" }
     if ($a -eq '--token' -and ($i + 1) -lt $binaryArgs.Count) { $hasToken = $true }
 }
 if (-not $hasToken `
@@ -259,3 +344,26 @@ if (-not $hasToken -and -not $isLocal) {
 
 Write-Host "Running installer..."
 & $dest @binaryArgs
+
+} # end if ($installBinary)
+
+# =============================================================================
+# COMPONENT: hooks -- install the Meridian session hooks (5fb084fe).
+# Delegates to hooks_install.ps1 on the target server, which runs the same RFC
+# 8628 keyless device flow. Kept as a thin, self-contained delegation so this
+# switch stays independent of the larger installer-consolidation refactor
+# (a1ba9aa8) -- nothing here depends on that work landing first.
+# =============================================================================
+if ($installHooks) {
+    $hooksUrl = "$($targetUrl.TrimEnd('/'))/hooks_install.ps1"
+    Write-Host ""
+    Write-Host "Installing Meridian session hooks from $hooksUrl ..." -ForegroundColor Cyan
+    try {
+        $hooksScript = Invoke-RestMethod -Uri $hooksUrl -TimeoutSec 30 -ErrorAction Stop
+        Invoke-Expression $hooksScript
+        Write-Host "Meridian session hooks installed." -ForegroundColor Green
+    } catch {
+        Write-Warning ("Could not install the Meridian session hooks from {0}: {1}" -f $hooksUrl, $_.Exception.Message)
+        Write-Warning "You can retry the hooks step on its own with:  irm $hooksUrl | iex"
+    }
+}
