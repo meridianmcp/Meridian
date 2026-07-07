@@ -23,6 +23,23 @@ from .. import goal_md as goal_md_module
 from .. import md_anchors as md_anchors_module
 from .._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
 
+
+def _json_default(o: Any) -> Any:
+    """JSON fallback for MCP tool results. On Postgres the timestamp columns
+    (completed_at / added_at / claimed_at / ...) come back as real ``datetime``
+    objects, so the universal ``json.dumps(result)`` below raised "Object of type
+    datetime is not JSON serializable" — which surfaced as a -32603 error on EVERY
+    tool that returns a row carrying a timestamp (generate_handoff hit it in all
+    modes on hosted PG). Coerce date/datetime/time to ISO strings; anything else to
+    ``str`` so serialization can never hard-fail a tool call. (SQLite already returns
+    these columns as strings, so this is a no-op there.)
+    """
+    import datetime as _dt  # noqa: PLC0415
+    if isinstance(o, (_dt.datetime, _dt.date, _dt.time)):
+        return o.isoformat()
+    return str(o)
+
+
 _MCP_PROMPTS: list[dict[str, Any]] = [
     {
         "name": "start-executor",
@@ -953,7 +970,7 @@ async def _handle_mcp_request(
                         _server._mark_session_connected(_session_id)
                     except Exception:  # noqa: BLE001
                         pass
-            return _server._jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
+            return _server._jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result, default=_json_default)}]})
         except Exception as exc:
             return _server._jsonrpc_err(req_id, -32603, str(exc))
 
