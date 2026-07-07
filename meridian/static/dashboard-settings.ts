@@ -615,13 +615,22 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
+  // ── Meridian Connect panel ───────────────────────────────────────────────
+  // 4bcd9841 — Meridian Connect is a MACHINE-level install ("install once per
+  // machine"), not a project-level setting, so it lives in the Account &
+  // Workspace group (adjacent to the Account card), not under PROJECT SETTINGS.
+  // Built here (where mcpData / osExecutorHintBanner / _directBinaryDownloadsHtml
+  // are in scope) into _connectPanelHtml, then appended in the account group
+  // below. Both hosted and self-host branches are preserved verbatim.
+  let _connectPanelHtml = '';
+
   // Hosted easy-setup: hooks + mini executor shown by default; everything else in collapsible Advanced.
   if (isHostedMode()) {
     const _advKey = `meridian.settings.adv.${projectId}`;
     let _advOpen = false;
     try { _advOpen = localStorage.getItem(_advKey) === '1'; } catch(e) {}
 
-    html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+    _connectPanelHtml += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
     <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
 
@@ -986,7 +995,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  if (!isHostedMode()) html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+  if (!isHostedMode()) _connectPanelHtml += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
     <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
 
@@ -2800,6 +2809,11 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       `<span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">ACCOUNT &amp; WORKSPACE</span>` +
       `</summary><div style="padding:8px 8px 4px">`;
   }
+
+  // 4bcd9841 — Meridian Connect (machine-level install) sits adjacent to the
+  // Account card, at the top of the ACCOUNT & WORKSPACE group (a sibling of the
+  // Account accordion, not nested under it). Built earlier into _connectPanelHtml.
+  html += _connectPanelHtml;
 
   html += _secHtml('account', 'Account');
 
