@@ -946,15 +946,19 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "limit": {"type": "integer", "description": "Max results per type fed to synthesis (default 10)."}},
          "required": ["query"]}},
     {"name": "paper_search", "description":
-        "Search arXiv for academic papers — a REAL external lookup (keyless). Per the "
+        "Search academic papers — a REAL external lookup (keyless). Per the "
         "research-routing protocol, use this FIRST for academic/paper questions (cite "
         "the paper itself, not a secondary write-up), then capture_research_finding to "
-        "save what you cite. Returns {query, count, results:[{arxiv_id, title, authors, "
-        "summary, published, url, pdf_url}]}.",
+        "save what you cite. Two keyless sources via the 'source' param: 'arxiv' "
+        "(default; preprints, physics/CS/math) and 'openalex' (published journal/"
+        "conference works across every discipline). Both return the same shape: {query, "
+        "count, results:[{title, authors, summary, published, url, pdf_url, ...}]} — "
+        "arxiv rows carry arxiv_id, openalex rows carry openalex_id + doi.",
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "Search terms (matches title / abstract / authors)."},
          "limit": {"type": "integer", "description": "Max papers to return (default 10, max 50)."},
-         "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recently updated first)."}},
+         "source": {"type": "string", "enum": ["arxiv", "openalex"], "description": "Which keyless source to search (default 'arxiv'). 'openalex' covers published cross-discipline works."},
+         "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recent first)."}},
          "required": ["query"]}},
     {"name": "get_agent_instructions", "description":
         "Read-only: Return the custom agent_instructions for a project. "
