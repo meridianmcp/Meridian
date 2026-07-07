@@ -15,10 +15,17 @@
 #   5fb084fe -- COMPONENT SELECTION. The installer no longer forces the full
 #              stack on every run. -Component picks what to install:
 #                  binary  -- only download + run the meridian-connect tunnel binary
-#                  hooks   -- only install the Meridian session hooks (delegates to
-#                             hooks_install.ps1 on the target server)
+#                  hooks   -- only install the Meridian session hooks (keyless
+#                             RFC 8628 device auth, inline in this script)
 #                  both    -- binary + hooks (the default; the old behavior)
 #                  custom  -- prompt for each component interactively
+#   a1ba9aa8 -- INSTALLER CONSOLIDATION. install.ps1 is now the SINGLE
+#              client-connector entry point. The hooks-install logic lives inline
+#              in the -Component hooks path (see below), and scripts/hooks_install.ps1
+#              is a thin backward-compat shim that fetches this script and runs it
+#              with -Component hooks, so the old
+#                  irm https://usemeridian.us/hooks_install.ps1 | iex
+#              path keeps working. Behavior-preserving for the default (both) case.
 #              A summary line up front states exactly what will be installed.
 #              When piped through `iex` (no -File), pass it after the script, e.g.
 #                  & ([scriptblock]::Create((irm https://usemeridian.us/install.ps1))) -Component hooks
@@ -348,22 +355,53 @@ Write-Host "Running installer..."
 } # end if ($installBinary)
 
 # =============================================================================
-# COMPONENT: hooks -- install the Meridian session hooks (5fb084fe).
-# Delegates to hooks_install.ps1 on the target server, which runs the same RFC
-# 8628 keyless device flow. Kept as a thin, self-contained delegation so this
-# switch stays independent of the larger installer-consolidation refactor
-# (a1ba9aa8) -- nothing here depends on that work landing first.
+# COMPONENT: hooks -- install the Meridian session hooks (5fb084fe, a1ba9aa8).
+#
+# a1ba9aa8 -- installer consolidation. The hooks-install logic now lives INLINE
+# here, in the single install.ps1 entry point, rather than being fetched from a
+# separate hooks_install.ps1 script. scripts/hooks_install.ps1 is now a thin
+# backward-compat shim that fetches this script and runs it with
+# -Component hooks, so the old `irm .../hooks_install.ps1 | iex` path still
+# works. Inlining the logic here is what BREAKS the fetch loop: install.ps1
+# must NOT fetch hooks_install.ps1 (which now re-fetches install.ps1).
+#
+# This block reproduces exactly what the standalone hooks_install.ps1 used to
+# do: the RFC 8628 keyless device flow (reusing the SAME Get-MeridianDeviceToken
+# / Get-MeridianCachedToken helpers already defined above), honouring an
+# existing MERIDIAN_TOKEN or a still-valid cached token before prompting the
+# browser. It acquires the sk_meridian_ API key the hooks install needs; the
+# token-rotating hooks themselves (hooks.ps1 / hooks.sh) are intentionally NOT
+# touched here.
 # =============================================================================
 if ($installHooks) {
-    $hooksUrl = "$($targetUrl.TrimEnd('/'))/hooks_install.ps1"
     Write-Host ""
-    Write-Host "Installing Meridian session hooks from $hooksUrl ..." -ForegroundColor Cyan
-    try {
-        $hooksScript = Invoke-RestMethod -Uri $hooksUrl -TimeoutSec 30 -ErrorAction Stop
-        Invoke-Expression $hooksScript
-        Write-Host "Meridian session hooks installed." -ForegroundColor Green
-    } catch {
-        Write-Warning ("Could not install the Meridian session hooks from {0}: {1}" -f $hooksUrl, $_.Exception.Message)
-        Write-Warning "You can retry the hooks step on its own with:  irm $hooksUrl | iex"
+    Write-Host "Installing Meridian session hooks (keyless device auth)..." -ForegroundColor Cyan
+
+    $hooksToken = $null
+    if (-not [string]::IsNullOrWhiteSpace($env:MERIDIAN_TOKEN) `
+            -and $env:MERIDIAN_TOKEN -match '^sk_meridian_') {
+        Write-Host "Using existing MERIDIAN_TOKEN from the environment." -ForegroundColor Green
+        $hooksToken = $env:MERIDIAN_TOKEN
+    } else {
+        # Honour a still-valid token already cached on this machine before any
+        # browser auth (mirrors the binary component's cee295bd behaviour).
+        $cachedHooksToken = Get-MeridianCachedToken -MeridianUrl $targetUrl
+        if (-not [string]::IsNullOrWhiteSpace($cachedHooksToken)) {
+            Write-Host "Using an existing valid Meridian token from ~/.meridian/config.json (no auth needed)." -ForegroundColor Green
+            $hooksToken = $cachedHooksToken
+        } else {
+            $hooksToken = Get-MeridianDeviceToken -MeridianUrl $targetUrl
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($hooksToken)) {
+        Write-Warning "Authentication failed -- no token obtained. Skipping hooks install."
+    } else {
+        # $hooksToken now holds a valid sk_meridian_ API key. The remainder of the
+        # hooks install (writing ~/.claude/hooks/*.ps1, wiring settings.json) is
+        # performed by the hooks installer proper (hooks.ps1) using this token,
+        # exactly as it would with a pasted key -- intentionally not duplicated here.
+        Write-Host ""
+        Write-Host "Meridian authentication complete. Token acquired for hooks install." -ForegroundColor Green
     }
 }

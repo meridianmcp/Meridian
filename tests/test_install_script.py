@@ -182,7 +182,11 @@ def test_install_windows_ps1_route_serves_script(client):
 
 
 # ---------------------------------------------------------------------------
-# hooks_install.ps1 — RFC 8628 device-flow auth for the hooks installer (e9f18530)
+# hooks_install.ps1 — thin backward-compat shim to install.ps1 -Component hooks
+# (a1ba9aa8). The RFC 8628 device-flow auth that used to live standalone here
+# (e9f18530) now lives inline in install.ps1's -Component hooks path; this file
+# is kept only so the old `irm .../hooks_install.ps1 | iex` curl path resolves.
+# The device-flow assertions moved to test_w5_a1ba9aa8_installer_consolidate.py.
 # ---------------------------------------------------------------------------
 
 _HOOKS_INSTALL_PS1 = (
@@ -190,35 +194,24 @@ _HOOKS_INSTALL_PS1 = (
 )
 
 
-def test_hooks_install_ps1_uses_device_grant_not_static_key():
+def test_hooks_install_ps1_is_shim_to_install_component_hooks():
     src = _HOOKS_INSTALL_PS1.read_text(encoding="utf-8")
-    # Hits the RFC 8628 device + token endpoints...
-    assert "/oauth/device" in src
-    assert "/oauth/token" in src
-    assert "urn:ietf:params:oauth:grant-type:device_code" in src
-    # ...prints the user_code + verification URL and polls for the token.
-    assert "user_code" in src
-    assert "verification_uri" in src
-    assert "access_token" in src
-    # Honors the RFC 8628 poll-control signals.
-    assert "slow_down" in src
-    assert "access_denied" in src
-    assert "expired_token" in src
+    # Post-consolidation: fetches install.ps1 and runs it with -Component hooks
+    # rather than re-implementing the device flow.
+    assert "/install.ps1" in src
+    assert "-Component hooks" in src
+    # It must NOT re-run the device flow itself (that lives in install.ps1 now).
+    assert "/oauth/device" not in src
     # It must NOT prompt the user to paste a static API key.
     assert "Paste" not in src
 
 
-def test_hooks_install_ps1_has_existing_token_fallback():
-    src = _HOOKS_INSTALL_PS1.read_text(encoding="utf-8")
-    # Fallback/comment path when a token is already present.
-    assert "MERIDIAN_TOKEN" in src
-
-
-def test_hooks_install_ps1_route_serves_script(client):
+def test_hooks_install_ps1_route_serves_shim(client):
     r = client.get("/hooks_install.ps1")
     assert r.status_code == 200
-    assert "/oauth/device" in r.text
-    assert "device_code" in r.text
+    # The served shim points back at the consolidated installer.
+    assert "install.ps1" in r.text
+    assert "-Component hooks" in r.text
     assert r.headers["content-type"].startswith("text/plain")
 
 
