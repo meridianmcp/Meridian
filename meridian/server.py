@@ -3959,6 +3959,19 @@ async def _build_orchestration_hint(
         "eligible_count": grouping.get("eligible_count", 0),
         "groups": compact_groups,
     }
+    # 470b1f46 — executors default to running items one at a time even when the
+    # board is parallel-safe. When a group can genuinely run >1 item at once,
+    # attach an IMPERATIVE directive (not just passive group data) so the session
+    # actually fans out concurrent subagents instead of serializing the work.
+    if strategy == "parallel":
+        _multi_groups = sum(1 for g in groups if len(g) > 1)
+        hint["parallel_directive"] = (
+            f"PARALLELIZE NOW: {_multi_groups} group(s) below hold multiple "
+            "conflict-free items. Fan each such group out as CONCURRENT subagents "
+            "(one git worktree per item), then finish that group before starting "
+            "the next. Do NOT execute parallel-safe items one at a time — "
+            "serializing parallelizable work is a diagnosed anti-pattern."
+        )
     blocked = grouping.get("blocked") or []
     if blocked:
         hint["blocked_count"] = len(blocked)
