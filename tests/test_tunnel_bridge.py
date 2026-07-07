@@ -13,6 +13,7 @@ import base64
 import json
 import types
 
+import httpx
 import pytest
 from fastapi.responses import Response
 
@@ -1105,3 +1106,121 @@ def test_build_codebase_context_not_indexed_returns_none(monkeypatch):
     srv._codebase_context_cache.pop("pne", None)
     out = asyncio.run(srv._build_codebase_context("tc", "pne", compact=True))
     assert out is None
+
+
+# ---------------------------------------------------------------------------
+# 9dde426f — GET /tunnel/registry must be fully async (no blocking urlopen)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRegistryResp:
+    """Stand-in for an httpx.Response from the MCP registry."""
+
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("boom", request=None, response=None)
+
+    def json(self):
+        return self._payload
+
+
+def _fake_async_client(handler):
+    """Return a lambda producing an async-context-manager httpx stand-in whose
+    .get(...) delegates to `handler(url, params, headers)` (sync or raising)."""
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            return handler(url, params, headers)
+
+    return lambda *a, **k: _FakeClient()
+
+
+def _call_registry(qp=None):
+    req = types.SimpleNamespace(query_params=qp or {})
+    resp = asyncio.run(tn.get_mcp_registry(req))
+    return resp.status_code, json.loads(resp.body)
+
+
+def test_registry_is_async_and_parses_servers(monkeypatch):
+    """The handler awaits httpx.AsyncClient (never a blocking urlopen) and maps
+    the upstream payload into the trimmed server shape."""
+    tn._registry_cache.clear()
+    payload = {
+        "servers": [
+            {
+                "id": "io.example/foo",
+                "name": "foo",
+                "description": "d" * 400,  # trimmed to 200
+                "source_code_location": {"url": "https://example.com/foo"},
+                "packages": [{"runtime": "npm", "name": "foo-mcp", "package_arguments": []}],
+            }
+        ],
+        "nextCursor": "abc",
+    }
+
+    def handler(url, params, headers):
+        assert url == tn._REGISTRY_BASE  # params passed separately, not pre-encoded
+        assert params["limit"] == "20"
+        assert headers["Accept"] == "application/json"
+        return _FakeRegistryResp(payload)
+
+    monkeypatch.setattr(tn.httpx, "AsyncClient", _fake_async_client(handler))
+    status, body = _call_registry()
+    assert status == 200
+    assert body["next_cursor"] == "abc"
+    assert len(body["servers"]) == 1
+    s = body["servers"][0]
+    assert s["id"] == "io.example/foo"
+    assert s["homepage"] == "https://example.com/foo"
+    assert s["install_command"].startswith("npx -y foo-mcp")
+    assert len(s["description"]) == 200
+
+
+def test_registry_upstream_error_returns_503_when_uncached(monkeypatch):
+    """A slow/failing upstream must fail fast with 503 + empty list, not hang
+    the loop and not raise."""
+    tn._registry_cache.clear()
+
+    def boom(url, params, headers):
+        raise httpx.ConnectTimeout("upstream slow")
+
+    monkeypatch.setattr(tn.httpx, "AsyncClient", _fake_async_client(boom))
+    status, body = _call_registry({"limit": "5"})
+    assert status == 503
+    assert body["servers"] == []
+    assert "registry unavailable" in body["error"]
+
+
+def test_registry_serves_cache_on_later_error(monkeypatch):
+    """Once a page is cached, a subsequent upstream failure serves the cached
+    copy (cached=True) instead of a 503 — so the browse UI never blanks out."""
+    tn._registry_cache.clear()
+    good = {"servers": [{"id": "a", "name": "a"}], "nextCursor": None}
+    monkeypatch.setattr(
+        tn.httpx, "AsyncClient",
+        _fake_async_client(lambda u, p, h: _FakeRegistryResp(good)),
+    )
+    status, body = _call_registry()
+    assert status == 200 and body.get("cached") is not True
+
+    def boom(url, params, headers):
+        raise httpx.ReadTimeout("later failure")
+
+    monkeypatch.setattr(tn.httpx, "AsyncClient", _fake_async_client(boom))
+    status2, body2 = _call_registry()
+    assert status2 == 200
+    assert body2["cached"] is True
+    assert body2["servers"][0]["id"] == "a"

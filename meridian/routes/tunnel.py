@@ -29,6 +29,7 @@ import time
 import uuid
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
@@ -1489,27 +1490,28 @@ async def get_mcp_registry(request: Request) -> Response:
     homepage. Pass ?cursor=<token> for subsequent pages and ?limit=N (default 20,
     max 50). Requires no auth — the registry is public.
     """
-    import urllib.request
-    import urllib.parse
-
     limit = min(int(request.query_params.get("limit", 20)), 50)
     cursor = request.query_params.get("cursor", "")
 
     params: dict[str, str] = {"limit": str(limit)}
     if cursor:
         params["cursor"] = cursor
-    url = _REGISTRY_BASE + "?" + urllib.parse.urlencode(params)
 
     cache_key = f"{limit}:{cursor}"
 
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json", "User-Agent": "Meridian/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=_REGISTRY_TIMEOUT) as resp:  # noqa: S310
-            raw = resp.read()
-        data = json.loads(raw)
+        # 9dde426f — async HTTP so a slow upstream registry can never block the
+        # event loop (a synchronous urllib.urlopen here stalled the server for
+        # ALL tenants up to _REGISTRY_TIMEOUT seconds). Matches every other
+        # server-side outbound call, which use httpx.AsyncClient.
+        async with httpx.AsyncClient(timeout=_REGISTRY_TIMEOUT) as http:
+            resp = await http.get(
+                _REGISTRY_BASE,
+                params=params,
+                headers={"Accept": "application/json", "User-Agent": "Meridian/1.0"},
+            )
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as exc:  # noqa: BLE001
         _log.warning("MCP registry fetch failed: %s", exc)
         # Return cached data if available — prevents the browse section from
