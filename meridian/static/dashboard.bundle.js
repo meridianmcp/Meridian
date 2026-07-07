@@ -2288,6 +2288,213 @@
     _activateSettingsTab(projectId, "project");
   }
   window._organizeSettingsIntoTabs = _organizeSettingsIntoTabs;
+  function _settingsAccountCardHtml(projectId) {
+    let out = "";
+    if (window.state.tenantEmail) {
+      const plan = window.state.tenantPlan || "free";
+      const hasStripe = !!window.state.tenantHasStripe;
+      const noUpgrade = plan === "admin" || !!window.state.tenantIsInternal;
+      let billingBtn = "";
+      if (hasStripe) {
+        billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing \u2192</button>`;
+      } else if (!noUpgrade) {
+        const upgradeUrl = window.state.serverConfig?.stripe_payment_link || "/pricing";
+        billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard \u2192</a>`;
+      }
+      const days = window.state.tenantDaysRemaining;
+      const expiresAt = window.state.tenantExpiresAt;
+      const isTrialish = (plan === "free" || plan === "trial") && !window.state.tenantIsInternal;
+      let expiryLine = "";
+      let resubBtn = "";
+      if (isTrialish && (expiresAt || days != null || window.state.tenantExpired)) {
+        const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : "";
+        if (window.state.tenantExpired) {
+          expiryLine = `<div style="color:#f87171">${_PLAN_LABELS[plan] || plan} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ""}.</div>`;
+        } else {
+          const dleft = days != null ? `${days} day${days === 1 ? "" : "s"} left` : "";
+          expiryLine = `<div>${_PLAN_LABELS[plan] || plan} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ""}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ""}.</div>`;
+        }
+        const payLink = window.state.serverConfig?.stripe_payment_link || "/pricing";
+        resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
+      }
+      out += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
+
+      <div style="font-size:10px;color:var(--muted);line-height:1.7">
+
+        <div>Email: <span style="color:var(--text)">${escapeHtml(window.state.tenantEmail)}</span></div>
+
+        <div>Plan: <span style="color:var(--text)">${escapeHtml(_PLAN_LABELS[plan] || plan)}</span></div>
+
+        ${expiryLine}
+
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+
+        ${resubBtn || billingBtn}
+
+        <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
+
+        <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account\u2026</button>
+
+      </div>
+
+    </div>`;
+    }
+    return out;
+  }
+  function _settingsBrowserConnectorCardHtml(projectId) {
+    let out = "";
+    const browserConnectorAccountNote = isHostedMode() ? `
+
+    <div style="margin-top:6px;font-size:10px;color:var(--muted)">
+
+      The browser connector uses whichever Meridian account is logged in at usemeridian.us in this
+
+      browser tab. To use a different account, sign out and sign back in before reconnecting.
+
+      <a href="/auth/logout?next=/auth/login" style="color:var(--accent);text-decoration:none;white-space:nowrap">Switch Meridian account \u2192</a>
+
+    </div>` : "";
+    out += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+
+      <div>
+
+        <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
+
+        <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
+
+      </div>
+
+      <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide \u2192</a>
+
+    </div>
+
+    ${browserConnectorAccountNote}
+
+  </div>`;
+    return out;
+  }
+  function _settingsNotificationsCardHtml(projectId, ntfyResult) {
+    let out = "";
+    const ntfyData = ntfyResult.status === "fulfilled" ? ntfyResult.value : null;
+    const savedNotifyUrl = ntfyData ? ntfyData.notify_url || ntfyData.ntfy_url || "" : "";
+    const savedNotifyEmail = ntfyData ? ntfyData.notify_email || "" : "";
+    const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl);
+    let ntfyWarnAcknowledged = false;
+    try {
+      ntfyWarnAcknowledged = localStorage.getItem(STORAGE_KEY("ntfy.warn.dismissed")) === "1";
+    } catch (e3) {
+    }
+    const ntfyInputDisabled = ntfyWarnAcknowledged ? "" : "disabled";
+    const ntfyWarnDisplay = ntfyWarnAcknowledged ? "display:none" : "";
+    out += `<div data-demo-hide id="settings-notifications-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
+
+    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
+
+      Save a push/webhook target and an email target independently.
+
+      Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
+
+    </div>
+
+    <div id="ntfy-warn-${projectId}" style="margin-bottom:8px;padding:8px 10px;border:1px solid #f59e0b88;border-radius:5px;background:#f59e0b11;font-size:10px;color:#f59e0b;line-height:1.5;${ntfyWarnDisplay}">
+
+      <strong>\u26A0 Security notice:</strong> ntfy.sh topics are public \u2014 anyone who knows your topic name can subscribe and read your alerts. Use a long, random topic name (e.g. <code>my-project-a7f3k2</code>) or self-host ntfy for privacy. Slack/Discord webhooks and email are private alternatives.<br>
+
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer;color:var(--text)">
+
+        <input type="checkbox" id="ntfy-warn-ack-${projectId}" style="cursor:pointer;accent-color:#f59e0b">
+
+        I understand my ntfy topic is public
+
+      </label>
+
+    </div>
+
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+
+      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">ntfy_url:</label>
+
+      <input type="text" id="ntfy-url-${projectId}"
+
+        value="${escapeHtml(defaultNotifyUrl)}"
+
+        placeholder="${escapeHtml(suggestNtfyTopic2(projectId))}  \xB7  https://hooks.slack.com/\u2026"
+
+        ${ntfyInputDisabled}
+
+        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}">
+
+      <button class="secondary" id="ntfy-save-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}">Save</button>
+
+      <button class="secondary" id="ntfy-test-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}" title="Send a test notification to verify your URL">Test</button>
+
+      <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
+
+    </div>
+
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">
+
+      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">notify_email:</label>
+
+      <input type="email" id="notify-email-${projectId}"
+        value="${escapeHtml(savedNotifyEmail || window.state.tenantEmail || "")}"
+        placeholder="you@example.com"
+        style="flex:1;min-width:180px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+
+      <button class="secondary" id="notify-email-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
+
+      <span id="notify-email-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
+
+    </div>
+
+    <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
+
+      <strong>ntfy</strong> \u2014 install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
+
+      <strong>Email</strong> \u2014 save <code>notify_email</code> separately to get alerts by email (hosted only; fires independently from ntfy).<br>
+
+      <strong>Webhook</strong> \u2014 paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
+
+    </div>
+
+  </div>`;
+    return out;
+  }
+  function _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData) {
+    let out = "";
+    if (prefs !== null) {
+      out += `<div style="margin-bottom:12px">
+
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
+      PREFS.forEach((p3) => {
+        const checked = prefs[p3.key] ? "checked" : "";
+        out += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
+
+        <input type="checkbox" data-pref="${p3.key}" ${checked} style="cursor:pointer">
+
+        ${escapeHtml(p3.label)}
+
+      </label>`;
+      });
+      out += `<div id="settings-save-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;margin-top:6px"></div>`;
+      out += "</div>";
+    } else if (!mcpData) {
+      out += '<div style="color:var(--muted);font-size:11px;padding:8px 0">Settings are only available in hosted mode (usemeridian.us).</div>';
+    }
+    return out;
+  }
+  window._settingsAccountCardHtml = _settingsAccountCardHtml;
+  window._settingsBrowserConnectorCardHtml = _settingsBrowserConnectorCardHtml;
+  window._settingsNotificationsCardHtml = _settingsNotificationsCardHtml;
+  window._settingsNotificationPrefsHtml = _settingsNotificationPrefsHtml;
   async function loadSettingsTab2(projectId, { force = false } = {}) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
@@ -2425,59 +2632,7 @@ stop = ${JSON.stringify(stop)}`;
         }
       }
       let html = "";
-      if (window.state.tenantEmail) {
-        const plan = window.state.tenantPlan || "free";
-        const hasStripe = !!window.state.tenantHasStripe;
-        const noUpgrade = plan === "admin" || !!window.state.tenantIsInternal;
-        let billingBtn = "";
-        if (hasStripe) {
-          billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing \u2192</button>`;
-        } else if (!noUpgrade) {
-          const upgradeUrl = window.state.serverConfig?.stripe_payment_link || "/pricing";
-          billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard \u2192</a>`;
-        }
-        const days = window.state.tenantDaysRemaining;
-        const expiresAt = window.state.tenantExpiresAt;
-        const isTrialish = (plan === "free" || plan === "trial") && !window.state.tenantIsInternal;
-        let expiryLine = "";
-        let resubBtn = "";
-        if (isTrialish && (expiresAt || days != null || window.state.tenantExpired)) {
-          const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : "";
-          if (window.state.tenantExpired) {
-            expiryLine = `<div style="color:#f87171">${_PLAN_LABELS[plan] || plan} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ""}.</div>`;
-          } else {
-            const dleft = days != null ? `${days} day${days === 1 ? "" : "s"} left` : "";
-            expiryLine = `<div>${_PLAN_LABELS[plan] || plan} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ""}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ""}.</div>`;
-          }
-          const payLink = window.state.serverConfig?.stripe_payment_link || "/pricing";
-          resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
-        }
-        html += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
-
-      <div style="font-size:10px;color:var(--muted);line-height:1.7">
-
-        <div>Email: <span style="color:var(--text)">${escapeHtml(window.state.tenantEmail)}</span></div>
-
-        <div>Plan: <span style="color:var(--text)">${escapeHtml(_PLAN_LABELS[plan] || plan)}</span></div>
-
-        ${expiryLine}
-
-      </div>
-
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
-
-        ${resubBtn || billingBtn}
-
-        <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
-
-        <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account\u2026</button>
-
-      </div>
-
-    </div>`;
-      }
+      html += _settingsAccountCardHtml(projectId);
       let _connectPanelHtml = "";
       if (isHostedMode()) {
         const _advKey = `meridian.settings.adv.${projectId}`;
@@ -2627,36 +2782,7 @@ stop = ${JSON.stringify(stop)}`;
         html += `<details id="settings-grp-ps-${projectId}" ${_psOpen ? "open" : ""} style="margin-bottom:12px;border:2px solid var(--border);border-radius:8px"><summary style="cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:8px;background:var(--surface-2);border-radius:8px"><span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;${_psRot}">\u25B6</span><span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">PROJECT SETTINGS</span></summary><div style="padding:8px 8px 4px">`;
       }
       html += _secHtml("connect", "Connect Claude Code");
-      const browserConnectorAccountNote = isHostedMode() ? `
-
-    <div style="margin-top:6px;font-size:10px;color:var(--muted)">
-
-      The browser connector uses whichever Meridian account is logged in at usemeridian.us in this
-
-      browser tab. To use a different account, sign out and sign back in before reconnecting.
-
-      <a href="/auth/logout?next=/auth/login" style="color:var(--accent);text-decoration:none;white-space:nowrap">Switch Meridian account \u2192</a>
-
-    </div>` : "";
-      html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-
-      <div>
-
-        <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
-
-        <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
-
-      </div>
-
-      <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide \u2192</a>
-
-    </div>
-
-    ${browserConnectorAccountNote}
-
-  </div>`;
+      html += _settingsBrowserConnectorCardHtml(projectId);
       if (mcpData) {
         html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)" id="github-card-${projectId}">
 
@@ -4719,110 +4845,8 @@ project_id = "${displayPid}"`;
           }
         }, 0);
       }
-      const ntfyData = ntfyResult.status === "fulfilled" ? ntfyResult.value : null;
-      const savedNotifyUrl = ntfyData ? ntfyData.notify_url || ntfyData.ntfy_url || "" : "";
-      const savedNotifyEmail = ntfyData ? ntfyData.notify_email || "" : "";
-      const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl);
-      let ntfyWarnAcknowledged = false;
-      try {
-        ntfyWarnAcknowledged = localStorage.getItem(STORAGE_KEY("ntfy.warn.dismissed")) === "1";
-      } catch (e3) {
-      }
-      const ntfyInputDisabled = ntfyWarnAcknowledged ? "" : "disabled";
-      const ntfyWarnDisplay = ntfyWarnAcknowledged ? "display:none" : "";
-      html += `<div data-demo-hide id="settings-notifications-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
-
-    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
-
-      Save a push/webhook target and an email target independently.
-
-      Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
-
-    </div>
-
-    <div id="ntfy-warn-${projectId}" style="margin-bottom:8px;padding:8px 10px;border:1px solid #f59e0b88;border-radius:5px;background:#f59e0b11;font-size:10px;color:#f59e0b;line-height:1.5;${ntfyWarnDisplay}">
-
-      <strong>\u26A0 Security notice:</strong> ntfy.sh topics are public \u2014 anyone who knows your topic name can subscribe and read your alerts. Use a long, random topic name (e.g. <code>my-project-a7f3k2</code>) or self-host ntfy for privacy. Slack/Discord webhooks and email are private alternatives.<br>
-
-      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer;color:var(--text)">
-
-        <input type="checkbox" id="ntfy-warn-ack-${projectId}" style="cursor:pointer;accent-color:#f59e0b">
-
-        I understand my ntfy topic is public
-
-      </label>
-
-    </div>
-
-    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-
-      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">ntfy_url:</label>
-
-      <input type="text" id="ntfy-url-${projectId}"
-
-        value="${escapeHtml(defaultNotifyUrl)}"
-
-        placeholder="${escapeHtml(suggestNtfyTopic2(projectId))}  \xB7  https://hooks.slack.com/\u2026"
-
-        ${ntfyInputDisabled}
-
-        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}">
-
-      <button class="secondary" id="ntfy-save-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}">Save</button>
-
-      <button class="secondary" id="ntfy-test-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}" title="Send a test notification to verify your URL">Test</button>
-
-      <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
-
-    </div>
-
-    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">
-
-      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">notify_email:</label>
-
-      <input type="email" id="notify-email-${projectId}"
-        value="${escapeHtml(savedNotifyEmail || window.state.tenantEmail || "")}"
-        placeholder="you@example.com"
-        style="flex:1;min-width:180px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-
-      <button class="secondary" id="notify-email-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
-
-      <span id="notify-email-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
-
-    </div>
-
-    <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
-
-      <strong>ntfy</strong> \u2014 install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
-
-      <strong>Email</strong> \u2014 save <code>notify_email</code> separately to get alerts by email (hosted only; fires independently from ntfy).<br>
-
-      <strong>Webhook</strong> \u2014 paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
-
-    </div>
-
-  </div>`;
-      if (prefs !== null) {
-        html += `<div style="margin-bottom:12px">
-
-      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
-        PREFS.forEach((p3) => {
-          const checked = prefs[p3.key] ? "checked" : "";
-          html += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
-
-        <input type="checkbox" data-pref="${p3.key}" ${checked} style="cursor:pointer">
-
-        ${escapeHtml(p3.label)}
-
-      </label>`;
-        });
-        html += `<div id="settings-save-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;margin-top:6px"></div>`;
-        html += "</div>";
-      } else if (!mcpData) {
-        html += '<div style="color:var(--muted);font-size:11px;padding:8px 0">Settings are only available in hosted mode (usemeridian.us).</div>';
-      }
+      html += _settingsNotificationsCardHtml(projectId, ntfyResult);
+      html += _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
       html += "</div></details>";
       html += "</div></details>";
       if ((window.state.tenantPlan || "") === "admin" || !isHostedMode()) {
@@ -8625,6 +8649,166 @@ ${n2.tags || ""}`.toLowerCase();
   };
   var createStore = ((createState) => createState ? createStoreImpl(createState) : createStoreImpl);
 
+  // meridian/static/dashboard-tabgroups.ts
+  var VTAB_GROUPS = [
+    { id: "overview", label: "Overview", tabs: ["status", "live"] },
+    { id: "planning", label: "Planning", tabs: ["goal", "insights", "blog"] },
+    { id: "work", label: "Work", tabs: ["queue", "hitl", "team", "sessions"] },
+    { id: "content", label: "Content", tabs: ["files", "notes", "devlog", "documents", "docs", "codeintel"] },
+    { id: "history", label: "History", tabs: ["timeline", "rewind", "settings"] }
+  ];
+  var ALL_GROUPED_TABS = VTAB_GROUPS.flatMap((g2) => g2.tabs);
+  function groupForTab(tab) {
+    if (!tab) return null;
+    for (const g2 of VTAB_GROUPS) {
+      if (g2.tabs.includes(tab)) return g2.id;
+    }
+    return null;
+  }
+  function wireVtabGroups(stripEl) {
+    const setExpanded = (groupEl, expanded) => {
+      groupEl.classList.toggle("collapsed", !expanded);
+      const header = groupEl.querySelector(".vtab-group-header");
+      if (header) header.setAttribute("aria-expanded", String(expanded));
+      const tabs = groupEl.querySelector(".vtab-group-tabs");
+      if (tabs) tabs.style.display = expanded ? "flex" : "none";
+    };
+    stripEl.querySelectorAll(".vtab-group-header").forEach((header) => {
+      header.onclick = () => {
+        const groupEl = header.closest(".vtab-group");
+        if (!groupEl) return;
+        setExpanded(groupEl, groupEl.classList.contains("collapsed"));
+      };
+    });
+    const revealGroupForTab = (tab) => {
+      const groupId = groupForTab(tab);
+      if (!groupId) return;
+      const groupEl = stripEl.querySelector(`.vtab-group[data-vgroup="${groupId}"]`);
+      if (groupEl) setExpanded(groupEl, true);
+    };
+    return { revealGroupForTab };
+  }
+
+  // meridian/static/dashboard-folders.ts
+  var FOLDER_ASSIGN_KEY = "meridian.projectFolders";
+  var FOLDER_COLLAPSE_KEY = "meridian.projectFolderCollapsed";
+  var UNGROUPED_LABEL = "Ungrouped";
+  function normalizeFolderName(name) {
+    if (name == null) return "";
+    return String(name).trim().replace(/\s+/g, " ");
+  }
+  function loadFolderAssignments(key = FOLDER_ASSIGN_KEY, storage = safeStorage()) {
+    if (!storage) return {};
+    try {
+      const raw = storage.getItem(key);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      const out = {};
+      for (const [pid, folder] of Object.entries(parsed)) {
+        const norm = normalizeFolderName(typeof folder === "string" ? folder : "");
+        if (norm) out[pid] = norm;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+  function saveFolderAssignments(assignments, key = FOLDER_ASSIGN_KEY, storage = safeStorage()) {
+    if (!storage) return;
+    try {
+      const clean = {};
+      for (const [pid, folder] of Object.entries(assignments)) {
+        const norm = normalizeFolderName(folder);
+        if (norm) clean[pid] = norm;
+      }
+      storage.setItem(key, JSON.stringify(clean));
+    } catch {
+    }
+  }
+  function assignProjectToFolder(assignments, projectId, folder) {
+    const next = { ...assignments };
+    const norm = normalizeFolderName(folder);
+    if (norm) next[projectId] = norm;
+    else delete next[projectId];
+    return next;
+  }
+  function groupProjectsByFolder(projects, assignments) {
+    const named = /* @__PURE__ */ new Map();
+    const ungrouped = [];
+    for (const p3 of projects) {
+      const folder = normalizeFolderName(assignments[p3.id]);
+      if (!folder) {
+        ungrouped.push(p3);
+        continue;
+      }
+      let bucket = named.get(folder);
+      if (!bucket) {
+        bucket = [];
+        named.set(folder, bucket);
+      }
+      bucket.push(p3);
+    }
+    const groups = [];
+    for (const [folder, members] of named) {
+      groups.push({ folder, label: folder, key: folder, projects: members });
+    }
+    if (ungrouped.length) {
+      groups.push({ folder: null, label: UNGROUPED_LABEL, key: "", projects: ungrouped });
+    }
+    return groups;
+  }
+  function knownFolderNames(projects, assignments) {
+    const seen = /* @__PURE__ */ new Set();
+    const out = [];
+    for (const p3 of projects) {
+      const folder = normalizeFolderName(assignments[p3.id]);
+      if (folder && !seen.has(folder)) {
+        seen.add(folder);
+        out.push(folder);
+      }
+    }
+    return out;
+  }
+  function loadCollapsedFolders(key = FOLDER_COLLAPSE_KEY, storage = safeStorage()) {
+    if (!storage) return /* @__PURE__ */ new Set();
+    try {
+      const raw = storage.getItem(key);
+      if (!raw) return /* @__PURE__ */ new Set();
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return /* @__PURE__ */ new Set();
+      return new Set(parsed.filter((x2) => typeof x2 === "string"));
+    } catch {
+      return /* @__PURE__ */ new Set();
+    }
+  }
+  function saveCollapsedFolders(collapsed, key = FOLDER_COLLAPSE_KEY, storage = safeStorage()) {
+    if (!storage) return;
+    try {
+      storage.setItem(key, JSON.stringify([...collapsed]));
+    } catch {
+    }
+  }
+  function toggleFolderCollapsed(collapsed, folderKey, key = FOLDER_COLLAPSE_KEY, storage = safeStorage()) {
+    let nowCollapsed;
+    if (collapsed.has(folderKey)) {
+      collapsed.delete(folderKey);
+      nowCollapsed = false;
+    } else {
+      collapsed.add(folderKey);
+      nowCollapsed = true;
+    }
+    saveCollapsedFolders(collapsed, key, storage);
+    return nowCollapsed;
+  }
+  function safeStorage() {
+    try {
+      return typeof localStorage !== "undefined" ? localStorage : void 0;
+    } catch {
+      return void 0;
+    }
+  }
+
   // meridian/static/dashboard.ts
   var TABS_KEY = "meridian.openTabs";
   var ACTIVE_PROJECT_KEY = "meridian.activeProject";
@@ -9904,35 +10088,37 @@ ${n2.tags || ""}`.toLowerCase();
       return;
     }
     list.innerHTML = "";
-    state.projects.forEach((p3) => {
-      const div = document.createElement("div");
-      div.className = "project-item" + (state.activeTab === p3.id ? " active" : "");
-      div.dataset.projectId = p3.id;
-      div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;";
-      const nameSpan = document.createElement("span");
-      nameSpan.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
-      nameSpan.textContent = p3.name;
-      const menuBtn = document.createElement("button");
-      menuBtn.textContent = "\u22EF";
-      menuBtn.title = "Project actions";
-      menuBtn.style.cssText = "background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0";
-      menuBtn.onmouseenter = () => menuBtn.style.color = "var(--text)";
-      menuBtn.onmouseleave = () => menuBtn.style.color = "var(--muted)";
-      menuBtn.onclick = (e3) => {
-        e3.stopPropagation();
-        let t3 = state.tabs.find((tab) => tab.id === p3.id);
-        if (!t3) {
-          openTab(p3);
-          t3 = state.tabs.find((tab) => tab.id === p3.id);
-        }
-        if (t3) _openTabMenu(t3, menuBtn);
-      };
-      div.appendChild(nameSpan);
-      div.appendChild(menuBtn);
-      div.onclick = (e3) => {
-        if (e3.target !== menuBtn) openTab(p3);
-      };
-      list.appendChild(div);
+    const assignments = loadFolderAssignments(STORAGE_KEY2("projectFolders"));
+    const collapsed = loadCollapsedFolders(STORAGE_KEY2("projectFolderCollapsed"));
+    const groups = groupProjectsByFolder(state.projects, assignments);
+    const hasFolders = groups.some((g2) => g2.folder !== null);
+    groups.forEach((group) => {
+      if (hasFolders) {
+        const isCollapsed = collapsed.has(group.key);
+        const header = document.createElement("div");
+        header.className = "project-folder-header";
+        header.dataset.folderKey = group.key;
+        header.style.cssText = "display:flex;align-items:center;gap:6px;padding:4px 4px;margin-top:4px;cursor:pointer;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.04em;user-select:none;";
+        const caret = document.createElement("span");
+        caret.textContent = isCollapsed ? "\u25B8" : "\u25BE";
+        caret.style.cssText = "flex-shrink:0;font-size:9px;width:9px;";
+        const label = document.createElement("span");
+        label.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+        label.textContent = group.label;
+        const count = document.createElement("span");
+        count.style.cssText = "flex-shrink:0;opacity:0.7;";
+        count.textContent = String(group.projects.length);
+        header.appendChild(caret);
+        header.appendChild(label);
+        header.appendChild(count);
+        header.onclick = () => {
+          toggleFolderCollapsed(collapsed, group.key, STORAGE_KEY2("projectFolderCollapsed"));
+          loadProjects();
+        };
+        list.appendChild(header);
+        if (isCollapsed) return;
+      }
+      group.projects.forEach((p3) => list.appendChild(_makeProjectItem(p3)));
     });
     const switcher = document.getElementById("project-switcher");
     if (switcher) {
@@ -9948,6 +10134,54 @@ ${n2.tags || ""}`.toLowerCase();
       if (previous && state.projects.some((p3) => p3.id === previous)) switcher.value = previous;
     }
     syncSidebarActiveProject();
+  }
+  function _makeProjectItem(p3) {
+    const div = document.createElement("div");
+    div.className = "project-item" + (state.activeTab === p3.id ? " active" : "");
+    div.dataset.projectId = p3.id;
+    div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;";
+    const nameSpan = document.createElement("span");
+    nameSpan.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+    nameSpan.textContent = p3.name;
+    const menuBtn = document.createElement("button");
+    menuBtn.textContent = "\u22EF";
+    menuBtn.title = "Project actions";
+    menuBtn.style.cssText = "background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0";
+    menuBtn.onmouseenter = () => menuBtn.style.color = "var(--text)";
+    menuBtn.onmouseleave = () => menuBtn.style.color = "var(--muted)";
+    menuBtn.onclick = (e3) => {
+      e3.stopPropagation();
+      let t3 = state.tabs.find((tab) => tab.id === p3.id);
+      if (!t3) {
+        openTab(p3);
+        t3 = state.tabs.find((tab) => tab.id === p3.id);
+      }
+      if (t3) _openTabMenu(t3, menuBtn);
+    };
+    div.appendChild(nameSpan);
+    div.appendChild(menuBtn);
+    div.onclick = (e3) => {
+      if (e3.target !== menuBtn) openTab(p3);
+    };
+    return div;
+  }
+  function _moveProjectToFolder(t3) {
+    const assignments = loadFolderAssignments(STORAGE_KEY2("projectFolders"));
+    const current = assignments[t3.id] || "";
+    const existing = knownFolderNames(state.projects, assignments);
+    const hint = existing.length ? `
+
+Existing folders: ${existing.join(", ")}` : "";
+    const next = window.prompt(
+      `Move "${t3.project.name}" to a folder (leave blank for ${UNGROUPED_LABEL}).${hint}`,
+      current
+    );
+    if (next === null) return;
+    const updated = assignProjectToFolder(assignments, t3.id, next);
+    saveFolderAssignments(updated, STORAGE_KEY2("projectFolders"));
+    loadProjects();
+    const folder = (next || "").trim();
+    toast(folder ? `Moved to folder "${folder}"` : `Moved to ${UNGROUPED_LABEL}`);
   }
   function openTab(project) {
     const existing = state.tabs.find((t3) => t3.id === project.id);
@@ -10122,6 +10356,7 @@ ${n2.tags || ""}`.toLowerCase();
     menu.appendChild(uuidDiv);
     menuItem("\u270F Rename", () => _renameProject(t3));
     menuItem("\u{1F3A8} Change icon\u2026", () => _setProjectIcon(t3));
+    menuItem("\u{1F4C1} Move to folder\u2026", () => _moveProjectToFolder(t3));
     menuItem("\u2B07 Download DB", () => window.open("/admin/snapshot", "_blank"));
     menuItem("\u{1F5D1} Delete project\u2026", () => _deleteProject(t3));
     const rect = anchor.getBoundingClientRect();
@@ -10260,41 +10495,91 @@ Current: ${current || "(none)"}`,
 
     <div class="vtab-strip" id="vtab-strip-${project.id}">
 
-      <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">\u{1F4CA}</button>
+      <div class="vtab-group" data-vgroup="overview" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="live" title="Live \u2014 right-now view">\u26A1</button>
+        <button class="vtab-group-header" data-vgroup-toggle="overview" title="Overview" aria-label="Overview group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4CA}</button>
 
-      <button class="vtab-btn" data-vtab="goal" title="Goal State">\u{1F3AF}</button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      ${window.MERIDIAN_HOSTED && !(project.github_repo || project.repo) ? "" : '<button class="vtab-btn" data-vtab="files" title="Files">\u{1F4C1}</button>'}
+          <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">\u{1F4CA}</button>
 
-      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">\u{1F4D3}</button>
+          <button class="vtab-btn" data-vtab="live" title="Live \u2014 right-now view">\u26A1</button>
 
-      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">\u{1F4C5}</button>
+        </div>
 
-      <button class="vtab-btn" data-vtab="rewind" title="Rewind \u2014 Last X days">\u21BB</button>
+      </div>
 
-      <button class="vtab-btn" data-vtab="queue" title="Work Queue">\u{1F477}</button>
+      <div class="vtab-group" data-vgroup="planning" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="team" title="Team \u2014 per-human activity">\u{1F465}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="planning" title="Planning" aria-label="Planning group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F3AF}</button>
 
-      <button class="vtab-btn" data-vtab="notes" title="Notes \u2014 per-project wiki" style="position:relative">\u{1F4DD}<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="hitl" title="HITL \u2014 Human-in-the-Loop queue" style="position:relative">\u2753<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+          <button class="vtab-btn" data-vtab="goal" title="Goal State">\u{1F3AF}</button>
 
-      <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">\u{1F4D6}</button>
+          <button class="vtab-btn" data-vtab="insights" title="Insights \u2014 durable strategic understanding">\u{1F4A1}</button>
 
-      <button class="vtab-btn" data-vtab="settings" title="Notification Settings">\u2699</button>
+          <button class="vtab-btn" data-vtab="blog" title="Blog \u2014 workspace posts (draft/published/archived)">\u270D\uFE0F</button>
 
-      <button class="vtab-btn" data-vtab="codeintel" title="Code Intel \u2014 codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">\u{1F50D}</button>
+        </div>
 
-      <button class="vtab-btn" data-vtab="documents" title="Documents \u2014 ingested docs &amp; structure">\u{1F4C4}</button>
+      </div>
 
-      <button class="vtab-btn" data-vtab="insights" title="Insights \u2014 durable strategic understanding">\u{1F4A1}</button>
+      <div class="vtab-group" data-vgroup="work" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="blog" title="Blog \u2014 workspace posts (draft/published/archived)">\u270D\uFE0F</button>
+        <button class="vtab-group-header" data-vgroup-toggle="work" title="Work" aria-label="Work group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F477}</button>
 
-      <button class="vtab-btn" data-vtab="sessions" title="Sessions \u2014 executor session timeline (done / failed / stopped-ambiguously)">\u{1F552}</button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="queue" title="Work Queue">\u{1F477}</button>
+
+          <button class="vtab-btn" data-vtab="hitl" title="HITL \u2014 Human-in-the-Loop queue" style="position:relative">\u2753<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+
+          <button class="vtab-btn" data-vtab="team" title="Team \u2014 per-human activity">\u{1F465}</button>
+
+          <button class="vtab-btn" data-vtab="sessions" title="Sessions \u2014 executor session timeline (done / failed / stopped-ambiguously)">\u{1F552}</button>
+
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="content" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="content" title="Content" aria-label="Content group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4C1}</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          ${window.MERIDIAN_HOSTED && !(project.github_repo || project.repo) ? "" : '<button class="vtab-btn" data-vtab="files" title="Files">\u{1F4C1}</button>'}
+
+          <button class="vtab-btn" data-vtab="notes" title="Notes \u2014 per-project wiki" style="position:relative">\u{1F4DD}<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+
+          <button class="vtab-btn" data-vtab="devlog" title="Dev Log">\u{1F4D3}</button>
+
+          <button class="vtab-btn" data-vtab="documents" title="Documents \u2014 ingested docs &amp; structure">\u{1F4C4}</button>
+
+          <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">\u{1F4D6}</button>
+
+          <button class="vtab-btn" data-vtab="codeintel" title="Code Intel \u2014 codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">\u{1F50D}</button>
+
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="history" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="history" title="History" aria-label="History group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4C5}</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">\u{1F4C5}</button>
+
+          <button class="vtab-btn" data-vtab="rewind" title="Rewind \u2014 Last X days">\u21BB</button>
+
+          <button class="vtab-btn" data-vtab="settings" title="Notification Settings">\u2699</button>
+
+        </div>
+
+      </div>
 
     </div>
 
@@ -11281,10 +11566,12 @@ Current: ${current || "(none)"}`,
     const vtabStrip = document.getElementById(`vtab-strip-${project.id}`);
     const drawer = document.getElementById(`drawer-${project.id}`);
     if (vtabStrip && drawer) {
+      const { revealGroupForTab } = wireVtabGroups(vtabStrip);
       vtabStrip.querySelectorAll(".vtab-btn").forEach((btn) => {
         btn.onclick = () => {
           const vtab = btn.dataset.vtab;
           const p3 = state.panels[project.id];
+          revealGroupForTab(vtab);
           vtabStrip.querySelectorAll(".vtab-btn").forEach((b2) => {
             b2.classList.toggle("active", b2.dataset.vtab === vtab);
           });
@@ -11328,6 +11615,7 @@ Current: ${current || "(none)"}`,
       try {
         const saved = localStorage.getItem("meridian_last_tab_" + project.id);
         if (saved) {
+          revealGroupForTab(saved);
           const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
           if (savedBtn) savedBtn.click();
         }
