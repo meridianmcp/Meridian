@@ -244,6 +244,292 @@ function _organizeSettingsIntoTabs(projectId: any) {
 }
 window._organizeSettingsIntoTabs = _organizeSettingsIntoTabs;
 
+// ---------------------------------------------------------------------------
+// 00a1e56a - settings CARD renderers extracted from loadSettingsTab for
+// maintainability. Each returns the exact HTML string it previously appended
+// inline (same DOM ids, same structure) - strictly behavior-preserving. They
+// are window-registered below to match this modules global-script pattern.
+export function _settingsAccountCardHtml(projectId: any): string {
+  let out = '';
+  // G4.18 — Account section (hosted only). Shows email, plan, optional
+
+  // workspace memberships, plus links for Manage billing (G2.11),
+
+  // Sign out, and Delete account. Members-of and sign-out-everywhere
+
+  // ride on existing endpoints; both are no-ops outside hosted mode.
+
+  if (window.state.tenantEmail) {
+
+    const plan = window.state.tenantPlan || 'free';
+
+    const hasStripe = !!window.state.tenantHasStripe;
+
+    // Admin / internal accounts: no billing UI. Stripe customers: POST portal
+    // button (avoids GET redirect leak). Free tier: prominent upgrade link.
+
+    const noUpgrade = plan === 'admin' || !!window.state.tenantIsInternal;
+
+    let billingBtn = '';
+
+    if (hasStripe) {
+
+      billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing →</button>`;
+
+    } else if (!noUpgrade) {
+
+      const upgradeUrl = window.state.serverConfig?.stripe_payment_link || '/pricing';
+
+      billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard →</a>`;
+
+    }
+
+    // Trial / free-tier expiry line + resubscribe affordance. Only relevant to
+
+    // plans with an inactivity expiry (free / trial); admin/internal/paid skip it.
+
+    const days = window.state.tenantDaysRemaining;
+
+    const expiresAt = window.state.tenantExpiresAt;
+
+    const isTrialish = (plan === 'free' || plan === 'trial') && !window.state.tenantIsInternal;
+
+    let expiryLine = '';
+
+    let resubBtn = '';
+
+    if (isTrialish && (expiresAt || days != null || window.state.tenantExpired)) {
+
+      const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : '';
+
+      if (window.state.tenantExpired) {
+
+        expiryLine = `<div style="color:#f87171">${_PLAN_LABELS[plan] || plan} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ''}.</div>`;
+
+      } else {
+
+        const dleft = (days != null) ? `${days} day${days === 1 ? '' : 's'} left` : '';
+
+        expiryLine = `<div>${_PLAN_LABELS[plan] || plan} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ''}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ''}.</div>`;
+
+      }
+
+      const payLink = window.state.serverConfig?.stripe_payment_link || '/pricing';
+
+      resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? 'Resubscribe' : 'Upgrade to Standard'}</a>`;
+
+    }
+
+    out += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
+
+      <div style="font-size:10px;color:var(--muted);line-height:1.7">
+
+        <div>Email: <span style="color:var(--text)">${escapeHtml(window.state.tenantEmail)}</span></div>
+
+        <div>Plan: <span style="color:var(--text)">${escapeHtml(_PLAN_LABELS[plan] || plan)}</span></div>
+
+        ${expiryLine}
+
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+
+        ${resubBtn || billingBtn}
+
+        <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
+
+        <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account…</button>
+
+      </div>
+
+    </div>`;
+
+  }
+  return out;
+}
+
+export function _settingsBrowserConnectorCardHtml(projectId: any): string {
+  let out = '';
+  const browserConnectorAccountNote = isHostedMode() ? `
+
+    <div style="margin-top:6px;font-size:10px;color:var(--muted)">
+
+      The browser connector uses whichever Meridian account is logged in at usemeridian.us in this
+
+      browser tab. To use a different account, sign out and sign back in before reconnecting.
+
+      <a href="/auth/logout?next=/auth/login" style="color:var(--accent);text-decoration:none;white-space:nowrap">Switch Meridian account →</a>
+
+    </div>` : '';
+
+  out += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+
+      <div>
+
+        <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
+
+        <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
+
+      </div>
+
+      <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
+
+    </div>
+
+    ${browserConnectorAccountNote}
+
+  </div>`;
+  return out;
+}
+
+export function _settingsNotificationsCardHtml(projectId: any, ntfyResult: any): string {
+  let out = '';
+  // Notifications card — generalised: ntfy, webhook, or email
+
+  const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
+
+  // prefer notify_url key, fall back to ntfy_url for older servers
+
+  const savedNotifyUrl = ntfyData ? (ntfyData.notify_url || ntfyData.ntfy_url || '') : '';
+
+  const savedNotifyEmail = ntfyData ? (ntfyData.notify_email || '') : '';
+
+  // targets show topic-only (the https://ntfy.sh/ prefix is implied).
+
+  const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl);
+
+  // ntfy security warning: shown once until user acknowledges via localStorage.
+
+  let ntfyWarnAcknowledged = false;
+
+  try { ntfyWarnAcknowledged = localStorage.getItem(STORAGE_KEY('ntfy.warn.dismissed')) === '1'; } catch(e) {}
+
+  const ntfyInputDisabled = ntfyWarnAcknowledged ? '' : 'disabled';
+
+  const ntfyWarnDisplay = ntfyWarnAcknowledged ? 'display:none' : '';
+
+  out += `<div data-demo-hide id="settings-notifications-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
+
+    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
+
+      Save a push/webhook target and an email target independently.
+
+      Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
+
+    </div>
+
+    <div id="ntfy-warn-${projectId}" style="margin-bottom:8px;padding:8px 10px;border:1px solid #f59e0b88;border-radius:5px;background:#f59e0b11;font-size:10px;color:#f59e0b;line-height:1.5;${ntfyWarnDisplay}">
+
+      <strong>⚠ Security notice:</strong> ntfy.sh topics are public — anyone who knows your topic name can subscribe and read your alerts. Use a long, random topic name (e.g. <code>my-project-a7f3k2</code>) or self-host ntfy for privacy. Slack/Discord webhooks and email are private alternatives.<br>
+
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer;color:var(--text)">
+
+        <input type="checkbox" id="ntfy-warn-ack-${projectId}" style="cursor:pointer;accent-color:#f59e0b">
+
+        I understand my ntfy topic is public
+
+      </label>
+
+    </div>
+
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+
+      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">ntfy_url:</label>
+
+      <input type="text" id="ntfy-url-${projectId}"
+
+        value="${escapeHtml(defaultNotifyUrl)}"
+
+        placeholder="${escapeHtml(suggestNtfyTopic(projectId))}  ·  https://hooks.slack.com/…"
+
+        ${ntfyInputDisabled}
+
+        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}">
+
+      <button class="secondary" id="ntfy-save-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}">Save</button>
+
+      <button class="secondary" id="ntfy-test-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}" title="Send a test notification to verify your URL">Test</button>
+
+      <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
+
+    </div>
+
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">
+
+      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">notify_email:</label>
+
+      <input type="email" id="notify-email-${projectId}"
+        value="${escapeHtml(savedNotifyEmail || window.state.tenantEmail || '')}"
+        placeholder="you@example.com"
+        style="flex:1;min-width:180px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+
+      <button class="secondary" id="notify-email-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
+
+      <span id="notify-email-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
+
+    </div>
+
+    <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
+
+      <strong>ntfy</strong> — install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
+
+      <strong>Email</strong> — save <code>notify_email</code> separately to get alerts by email (hosted only; fires independently from ntfy).<br>
+
+      <strong>Webhook</strong> — paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
+
+    </div>
+
+  </div>`;
+  return out;
+}
+
+export function _settingsNotificationPrefsHtml(projectId: any, prefs: any, PREFS: any, mcpData: any): string {
+  let out = '';
+  // Notifications section
+
+  if (prefs !== null) {
+
+    out += `<div style="margin-bottom:12px">
+
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
+
+    PREFS.forEach((p: any) => {
+
+      const checked = prefs[p.key] ? 'checked' : '';
+
+      out += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
+
+        <input type="checkbox" data-pref="${p.key}" ${checked} style="cursor:pointer">
+
+        ${escapeHtml(p.label)}
+
+      </label>`;
+
+    });
+
+    out += `<div id="settings-save-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;margin-top:6px"></div>`;
+
+    out += '</div>';
+
+  } else if (!mcpData) {
+
+    out += '<div style="color:var(--muted);font-size:11px;padding:8px 0">Settings are only available in hosted mode (usemeridian.us).</div>';
+
+  }
+  return out;
+}
+
+window._settingsAccountCardHtml = _settingsAccountCardHtml;
+window._settingsBrowserConnectorCardHtml = _settingsBrowserConnectorCardHtml;
+window._settingsNotificationsCardHtml = _settingsNotificationsCardHtml;
+window._settingsNotificationPrefsHtml = _settingsNotificationPrefsHtml;
+
 export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
   const body = document.getElementById(`settings-body-${projectId}`);
@@ -552,102 +838,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  // G4.18 — Account section (hosted only). Shows email, plan, optional
-
-  // workspace memberships, plus links for Manage billing (G2.11),
-
-  // Sign out, and Delete account. Members-of and sign-out-everywhere
-
-  // ride on existing endpoints; both are no-ops outside hosted mode.
-
-  if (window.state.tenantEmail) {
-
-    const plan = window.state.tenantPlan || 'free';
-
-    const hasStripe = !!window.state.tenantHasStripe;
-
-    // Admin / internal accounts: no billing UI. Stripe customers: POST portal
-    // button (avoids GET redirect leak). Free tier: prominent upgrade link.
-
-    const noUpgrade = plan === 'admin' || !!window.state.tenantIsInternal;
-
-    let billingBtn = '';
-
-    if (hasStripe) {
-
-      billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing →</button>`;
-
-    } else if (!noUpgrade) {
-
-      const upgradeUrl = window.state.serverConfig?.stripe_payment_link || '/pricing';
-
-      billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard →</a>`;
-
-    }
-
-    // Trial / free-tier expiry line + resubscribe affordance. Only relevant to
-
-    // plans with an inactivity expiry (free / trial); admin/internal/paid skip it.
-
-    const days = window.state.tenantDaysRemaining;
-
-    const expiresAt = window.state.tenantExpiresAt;
-
-    const isTrialish = (plan === 'free' || plan === 'trial') && !window.state.tenantIsInternal;
-
-    let expiryLine = '';
-
-    let resubBtn = '';
-
-    if (isTrialish && (expiresAt || days != null || window.state.tenantExpired)) {
-
-      const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : '';
-
-      if (window.state.tenantExpired) {
-
-        expiryLine = `<div style="color:#f87171">${_PLAN_LABELS[plan] || plan} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ''}.</div>`;
-
-      } else {
-
-        const dleft = (days != null) ? `${days} day${days === 1 ? '' : 's'} left` : '';
-
-        expiryLine = `<div>${_PLAN_LABELS[plan] || plan} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ''}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ''}.</div>`;
-
-      }
-
-      const payLink = window.state.serverConfig?.stripe_payment_link || '/pricing';
-
-      resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? 'Resubscribe' : 'Upgrade to Standard'}</a>`;
-
-    }
-
-    html += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
-
-      <div style="font-size:10px;color:var(--muted);line-height:1.7">
-
-        <div>Email: <span style="color:var(--text)">${escapeHtml(window.state.tenantEmail)}</span></div>
-
-        <div>Plan: <span style="color:var(--text)">${escapeHtml(_PLAN_LABELS[plan] || plan)}</span></div>
-
-        ${expiryLine}
-
-      </div>
-
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
-
-        ${resubBtn || billingBtn}
-
-        <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
-
-        <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account…</button>
-
-      </div>
-
-    </div>`;
-
-  }
+  html += _settingsAccountCardHtml(projectId);
 
 
 
@@ -817,37 +1008,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
   html += _secHtml('connect', 'Connect Claude Code');
 
-  const browserConnectorAccountNote = isHostedMode() ? `
-
-    <div style="margin-top:6px;font-size:10px;color:var(--muted)">
-
-      The browser connector uses whichever Meridian account is logged in at usemeridian.us in this
-
-      browser tab. To use a different account, sign out and sign back in before reconnecting.
-
-      <a href="/auth/logout?next=/auth/login" style="color:var(--accent);text-decoration:none;white-space:nowrap">Switch Meridian account →</a>
-
-    </div>` : '';
-
-  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-
-      <div>
-
-        <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
-
-        <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
-
-      </div>
-
-      <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
-
-    </div>
-
-    ${browserConnectorAccountNote}
-
-  </div>`;
+  html += _settingsBrowserConnectorCardHtml(projectId);
 
 
 
@@ -3546,138 +3707,11 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  // Notifications card — generalised: ntfy, webhook, or email
+  html += _settingsNotificationsCardHtml(projectId, ntfyResult);
 
-  const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
 
-  // prefer notify_url key, fall back to ntfy_url for older servers
 
-  const savedNotifyUrl = ntfyData ? (ntfyData.notify_url || ntfyData.ntfy_url || '') : '';
-
-  const savedNotifyEmail = ntfyData ? (ntfyData.notify_email || '') : '';
-
-  // targets show topic-only (the https://ntfy.sh/ prefix is implied).
-
-  const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl);
-
-  // ntfy security warning: shown once until user acknowledges via localStorage.
-
-  let ntfyWarnAcknowledged = false;
-
-  try { ntfyWarnAcknowledged = localStorage.getItem(STORAGE_KEY('ntfy.warn.dismissed')) === '1'; } catch(e) {}
-
-  const ntfyInputDisabled = ntfyWarnAcknowledged ? '' : 'disabled';
-
-  const ntfyWarnDisplay = ntfyWarnAcknowledged ? 'display:none' : '';
-
-  html += `<div data-demo-hide id="settings-notifications-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
-
-    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
-
-      Save a push/webhook target and an email target independently.
-
-      Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
-
-    </div>
-
-    <div id="ntfy-warn-${projectId}" style="margin-bottom:8px;padding:8px 10px;border:1px solid #f59e0b88;border-radius:5px;background:#f59e0b11;font-size:10px;color:#f59e0b;line-height:1.5;${ntfyWarnDisplay}">
-
-      <strong>⚠ Security notice:</strong> ntfy.sh topics are public — anyone who knows your topic name can subscribe and read your alerts. Use a long, random topic name (e.g. <code>my-project-a7f3k2</code>) or self-host ntfy for privacy. Slack/Discord webhooks and email are private alternatives.<br>
-
-      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer;color:var(--text)">
-
-        <input type="checkbox" id="ntfy-warn-ack-${projectId}" style="cursor:pointer;accent-color:#f59e0b">
-
-        I understand my ntfy topic is public
-
-      </label>
-
-    </div>
-
-    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-
-      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">ntfy_url:</label>
-
-      <input type="text" id="ntfy-url-${projectId}"
-
-        value="${escapeHtml(defaultNotifyUrl)}"
-
-        placeholder="${escapeHtml(suggestNtfyTopic(projectId))}  ·  https://hooks.slack.com/…"
-
-        ${ntfyInputDisabled}
-
-        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}">
-
-      <button class="secondary" id="ntfy-save-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}">Save</button>
-
-      <button class="secondary" id="ntfy-test-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}" title="Send a test notification to verify your URL">Test</button>
-
-      <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
-
-    </div>
-
-    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">
-
-      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">notify_email:</label>
-
-      <input type="email" id="notify-email-${projectId}"
-        value="${escapeHtml(savedNotifyEmail || window.state.tenantEmail || '')}"
-        placeholder="you@example.com"
-        style="flex:1;min-width:180px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-
-      <button class="secondary" id="notify-email-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
-
-      <span id="notify-email-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
-
-    </div>
-
-    <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
-
-      <strong>ntfy</strong> — install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
-
-      <strong>Email</strong> — save <code>notify_email</code> separately to get alerts by email (hosted only; fires independently from ntfy).<br>
-
-      <strong>Webhook</strong> — paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
-
-    </div>
-
-  </div>`;
-
-
-
-  // Notifications section
-
-  if (prefs !== null) {
-
-    html += `<div style="margin-bottom:12px">
-
-      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
-
-    PREFS.forEach(p => {
-
-      const checked = prefs[p.key] ? 'checked' : '';
-
-      html += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
-
-        <input type="checkbox" data-pref="${p.key}" ${checked} style="cursor:pointer">
-
-        ${escapeHtml(p.label)}
-
-      </label>`;
-
-    });
-
-    html += `<div id="settings-save-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;margin-top:6px"></div>`;
-
-    html += '</div>';
-
-  } else if (!mcpData) {
-
-    html += '<div style="color:var(--muted);font-size:11px;padding:8px 0">Settings are only available in hosted mode (usemeridian.us).</div>';
-
-  }
+  html += _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
 
   html += '</div></details>';  // close Account section
   html += '</div></details>';  // close ACCOUNT & WORKSPACE group
