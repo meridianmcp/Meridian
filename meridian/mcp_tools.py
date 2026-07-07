@@ -418,25 +418,40 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
         "Selector composition. targets is an ARRAY of {uri, selector, subSelector?} "
         "objects (native multi-file, the LSP WorkspaceEdit pattern); the whole composite "
-        "shape is stored as JSON, not per-domain columns. Each selector.type is one of:\n"
-        "• range — a line span {start_line, start_char?, end_line, end_char?} (an LSP "
-        "Range); the pointer IS the location.\n"
-        "• symbol — {qualified_name} resolved against the cached code graph to a file+line.\n"
-        "• node_id — {id} of a doc_store element (an ingested-document structure node).\n"
-        "• zotero_key — {key} of a Zotero library item.\n"
+        "shape is stored as JSON, not per-domain columns. Every selector is an object "
+        "with an explicit \"type\" PLUS that type's own field(s):\n"
+        "• range — {\"type\":\"range\", \"start_line\":int, \"end_line\":int, "
+        "\"start_char\"?:int, \"end_char\"?:int} (an LSP Range); the pointer IS the "
+        "location.\n"
+        "• symbol — {\"type\":\"symbol\", \"qualified_name\":\"pkg.mod.func\"} resolved "
+        "against the cached code graph to a file+line.\n"
+        "• node_id — {\"type\":\"node_id\", \"id\":\"<element-id>\"} of a doc_store "
+        "element (an ingested-document structure node). NOTE: the field is \"id\", NOT "
+        "\"value\".\n"
+        "• zotero_key — {\"type\":\"zotero_key\", \"key\":\"<zotero-key>\"} of a Zotero "
+        "library item.\n"
         "An optional selector.subSelector nests finer granularity (W3C hasSubSelector) — "
-        "e.g. a symbol selector + a range subSelector = 'these lines, within this "
-        "function'. source_type names the domain (code | docs | citation | …). Malformed "
-        "pointers (bad selector.type, missing required selector fields) are rejected. "
-        "Returns the stored pointer.",
+        "e.g. {\"type\":\"symbol\", \"qualified_name\":\"a.b.f\", \"subSelector\": "
+        "{\"type\":\"range\", \"start_line\":3, \"end_line\":4}} = 'these lines, within "
+        "this function'. A subSelector is itself a FULL selector and MUST carry its OWN "
+        "explicit \"type\" (it does not inherit the parent's). source_type names the "
+        "domain (code | docs | citation | …). Malformed pointers are rejected with a "
+        "clear error: a bad/missing selector.type, a missing required selector field "
+        "(e.g. node_id without \"id\", or a subSelector with no \"type\"). Returns the "
+        "stored pointer.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
          "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | … (free text)."},
          "targets": {"type": "array", "description":
-             "Non-empty array of {uri, selector, subSelector?} targets. selector.type ∈ "
-             "range|symbol|node_id|zotero_key with its type-specific fields.",
+             "Non-empty array of {uri, selector, subSelector?} targets. Each selector is "
+             "an object carrying an explicit \"type\" plus that type's field: range "
+             "{\"type\":\"range\", start_line, end_line, start_char?, end_char?}; symbol "
+             "{\"type\":\"symbol\", qualified_name}; node_id {\"type\":\"node_id\", id} "
+             "(field is \"id\", NOT \"value\"); zotero_key {\"type\":\"zotero_key\", key}. "
+             "An optional subSelector is itself a full selector and MUST carry its own "
+             "\"type\".",
              "items": {"type": "object"}},
          "label": {"type": "string", "description": "Optional human-readable label for the pointer."}},
          "required": ["sprint_item_id", "source_type", "targets"]}},

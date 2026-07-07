@@ -11,6 +11,8 @@ item, grounded in two established models (NOT invented fresh):
   inside the ``uri`` (``range`` | ``symbol`` | ``node_id`` | ``zotero_key``), and
   an optional ``subSelector`` (W3C ``hasSubSelector``) nests finer granularity —
   e.g. ``symbol`` + a ``range`` subSelector = "these lines, within this function".
+  A ``subSelector`` is itself a FULL selector: it carries its OWN explicit
+  ``"type"`` (it does not inherit the parent's).
 
 Shape (stored as JSON on ``sprint_item_pointers.targets`` — NOT per-domain
 columns, the core requirement)::
@@ -25,14 +27,17 @@ columns, the core requirement)::
         "label": "..."?,
     }
 
-Selector variants:
+Selector variants — every selector carries an explicit ``"type"``; the field
+below is the type-specific key it also needs (443d9453):
 
-* ``range``     — a line span: ``{start_line, start_char, end_line, end_char}``
-                  (LSP Range; the pointer IS the location — resolved as-is).
-* ``symbol``    — ``{qualified_name}`` (reuses codebase-memory-mcp's field;
-                  resolved via ``db.search_graph_entities`` to a file+line).
-* ``node_id``   — ``{id}`` (a ``meridian.doc_store`` element id, 9ee6d2ec).
-* ``zotero_key``— ``{key}`` (resolved via ``zotero_client.resolve_citation_ref``).
+* ``range``     — a line span: ``{"type":"range", start_line, start_char?,
+                  end_line, end_char?}`` (LSP Range; pointer IS the location).
+* ``symbol``    — ``{"type":"symbol", qualified_name}`` (reuses codebase-memory-
+                  mcp's field; resolved via ``db.search_graph_entities``).
+* ``node_id``   — ``{"type":"node_id", id}`` — an ``id`` (NOT ``value``) of a
+                  ``meridian.doc_store`` element (9ee6d2ec).
+* ``zotero_key``— ``{"type":"zotero_key", key}`` (resolved via
+                  ``zotero_client.resolve_citation_ref``).
 * ``text_quote``— ``{exact, prefix?, suffix?, archived_url?, archived_at?}`` (W3C
                   TextQuoteSelector for source_type "web", 1d3f6e71; resolving it
                   re-fetches the URL and flags content drift).
@@ -89,6 +94,38 @@ class PointerValidationError(ValueError):
 # Validation (pure — no DB, unit-testable)
 # ---------------------------------------------------------------------------
 
+# Common WRONG keys a caller reaches for instead of the real string field, mapped
+# to the correct field name — so the validation error can say "you wrote 'value',
+# use 'id'" instead of a bare "requires a non-empty id". These are the mistakes the
+# tool schema was underspecified about (443d9453): a node_id selector needs 'id'
+# (not the generic 'value'), etc.
+_WRONG_KEY_ALIASES = ("value", "val", "node_id", "nodeId")
+
+
+def _require_str_field(
+    selector: dict[str, Any], field: str, *, what: str, stype: str
+) -> str:
+    """Require a non-empty string ``field`` on ``selector``; return it stripped.
+
+    Raises :class:`PointerValidationError` with a MESSAGE THAT NAMES THE FIELD (and,
+    when the caller used a common wrong key like ``value`` instead of ``id``, points
+    at the actual key they should have used) rather than silently mis-parsing.
+    """
+    val = selector.get(field)
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    # Point at the likely typo: a present wrong-key that should have been `field`.
+    for alias in _WRONG_KEY_ALIASES:
+        if alias != field and alias in selector and selector.get(alias) is not None:
+            raise PointerValidationError(
+                f"{what} {stype} requires a non-empty {field!r} "
+                f"(found {alias!r} — rename it to {field!r})"
+            )
+    raise PointerValidationError(
+        f"{what} {stype} requires a non-empty {field!r}"
+    )
+
+
 def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]:
     """Validate one selector (or subSelector) dict; return a normalized copy.
 
@@ -102,8 +139,18 @@ def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]
         raise PointerValidationError(f"{what} must be an object")
     stype = selector.get("type")
     if stype not in _SELECTOR_TYPES:
+        # A subSelector is itself a FULL selector (W3C hasSubSelector) — it must
+        # carry its OWN explicit "type"; it does not inherit the parent's. Missing
+        # type is the common mistake (443d9453), so say so explicitly instead of
+        # silently mis-parsing.
+        hint = (
+            " (each subSelector must carry its own explicit 'type')"
+            if is_sub and stype is None
+            else ""
+        )
         raise PointerValidationError(
-            f"{what}.type must be one of {sorted(_SELECTOR_TYPES)}, got {stype!r}"
+            f"{what}.type must be one of {sorted(_SELECTOR_TYPES)}, "
+            f"got {stype!r}{hint}"
         )
     out: dict[str, Any] = {"type": stype}
 
@@ -124,19 +171,13 @@ def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]
                     )
                 out[field] = val
     elif stype == "symbol":
-        qn = selector.get("qualified_name")
-        if not isinstance(qn, str) or not qn.strip():
-            raise PointerValidationError(
-                f"{what} symbol requires a non-empty qualified_name"
-            )
-        out["qualified_name"] = qn.strip()
+        out["qualified_name"] = _require_str_field(
+            selector, "qualified_name", what=what, stype="symbol"
+        )
     elif stype == "node_id":
-        nid = selector.get("id")
-        if not isinstance(nid, str) or not nid.strip():
-            raise PointerValidationError(
-                f"{what} node_id requires a non-empty id"
-            )
-        out["id"] = nid.strip()
+        out["id"] = _require_str_field(
+            selector, "id", what=what, stype="node_id"
+        )
     elif stype == "zotero_key":
         key = selector.get("key")
         if not isinstance(key, str) or not key.strip():
@@ -166,12 +207,9 @@ def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]
                 out[opt] = val
     elif stype == "finding_id":
         # 1f1cd4d9 — addresses a save_finding artifact (a kind='finding' note) by id.
-        fid = selector.get("id")
-        if not isinstance(fid, str) or not fid.strip():
-            raise PointerValidationError(
-                f"{what} finding_id requires a non-empty id"
-            )
-        out["id"] = fid.strip()
+        out["id"] = _require_str_field(
+            selector, "id", what=what, stype="finding_id"
+        )
 
     # W3C hasSubSelector — optional, recursive, validated by the same rules.
     sub = selector.get("subSelector")
