@@ -86,6 +86,9 @@ async def test_verify_commit_ci_guarded_on_error_and_missing_args():
 
 @pytest.mark.asyncio
 async def test_complete_sprint_item_flags_failing_ci(db, monkeypatch):
+    """427b7902 — a GENUINELY failing CI now REFUSES completion (was advisory-only
+    under b121348e). override_ci=true is the escape hatch and records the warning.
+    (Full green/unknown/pending/override matrix lives in test_w5_427b7902_ci_gate.)"""
     from meridian import server as srv
     p = await db_module.create_project(db, "ci-proj")
     await db_module.update_project_settings(db, p["id"], github_repo="meridianmcp/Meridian")
@@ -95,11 +98,24 @@ async def test_complete_sprint_item_flags_failing_ci(db, monkeypatch):
         return {"sha": sha, "repo": repo, "state": "failure", "total": 3, "failed": 1}
     monkeypatch.setattr(github_ci, "verify_commit_ci", _fake_verify)
 
-    res = await srv._dispatch_mcp_tool(
+    # Failing CI is now REFUSED, not merely flagged — the item stays open.
+    refused = await srv._dispatch_mcp_tool(
         "complete_sprint_item",
         {"project_id": p["id"], "item_id": item["id"],
          "notes": "done; committed abc1234 to main"},
         db, "/tmp")
+    assert refused["error"] == "CI_FAILING"
+    assert refused["ci_verification"]["state"] == "failure"
+    still = await db_module.get_sprint_item(db, item["id"])
+    assert still["status"] != "done"
+
+    # override_ci=true completes anyway and records the failing CI as a warning.
+    res = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"],
+         "notes": "done; committed abc1234 to main", "override_ci": True},
+        db, "/tmp")
+    assert res["status"] == "done"
     assert res["ci_verification"]["state"] == "failure"
     assert "ci_warning" in res and "FAILING" in res["ci_warning"]
 

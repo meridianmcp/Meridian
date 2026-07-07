@@ -3215,6 +3215,45 @@ async def _handle_session_tools(
     return _MISS
 
 
+async def _verify_item_ci(
+    db: Any,
+    project_id: str,
+    tenant: dict[str, Any] | None,
+    text: str,
+) -> dict[str, Any] | None:
+    """Independent GitHub Actions CI check for the commit referenced in ``text``.
+
+    Returns the ``verify_commit_ci`` result dict (``{sha, repo, state, total,
+    failed}``) or ``None`` when there is nothing to check (no commit SHA in the
+    text, no ``github_repo`` configured, or any error). Best-effort and fully
+    guarded — this NEVER raises; the caller decides whether a ``failure`` state
+    hard-blocks or is merely advisory. Shared by ``complete_sprint_item`` so the
+    pre-completion hard-block and the post-completion advisory reuse one lookup.
+    """
+    try:
+        from .. import github_ci  # noqa: PLC0415
+
+        _ci_sha = github_ci.extract_commit_sha(text)
+        if not _ci_sha:
+            return None
+        _ci_project = await db_module.get_project(db, project_id)
+        _ci_repo = ((_ci_project or {}).get("github_repo") or "").strip()
+        if not _ci_repo:
+            return None
+        _ci_token = None
+        _ci_tid = (tenant or {}).get("id") if tenant else None
+        if _ci_tid:
+            try:
+                _ci_token, _ = await db_module.get_github_token_for_project(
+                    db, _ci_tid, project_id
+                )
+            except Exception:  # noqa: BLE001
+                _ci_token = None
+        return await github_ci.verify_commit_ci(_ci_repo, _ci_sha, token=_ci_token)
+    except Exception:  # noqa: BLE001 — advisory/best-effort; never raise
+        return None
+
+
 async def _handle_sprint_tools(
     name: str,
     args: dict[str, Any],
@@ -3766,6 +3805,49 @@ async def _handle_sprint_tools(
             except Exception:  # noqa: BLE001
                 pass
 
+        # 427b7902 — HARD CI GATE: refuse to complete when GitHub Actions CI for the
+        # commit named in the notes is GENUINELY FAILING. This upgrades the b121348e
+        # advisory (which only WARNED post-completion) to a real gate, mirroring the
+        # EVIDENCE_REQUIRED refusal: computed BEFORE marking done, returns a clean
+        # error, and does NOT flip the item to done. Guardrails:
+        #   * ONLY a real "failure" state blocks. "unknown" (no repo configured, no
+        #     check-runs yet, self-hosted / no-GitHub) and "pending" (CI still
+        #     running — the normal push-then-complete race) are ALWAYS allowed
+        #     through, so this never blocks on absent/unknown CI.
+        #   * Escape hatch consistent with existing force= patterns: pass
+        #     override_ci=true to complete anyway (records that the failing CI was
+        #     acknowledged). The result is cached so the advisory block below reuses
+        #     it without a second GitHub round-trip.
+        _ci_pre: dict[str, Any] | None = None
+        _ci_checked = False
+        _override_ci = bool(args.get("override_ci"))
+        try:
+            _pre_item = await db_module.get_sprint_item(db, args["item_id"])
+        except Exception:  # noqa: BLE001
+            _pre_item = None
+        if _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
+            _ci_text = f"{args.get('notes') or ''} {(_pre_item.get('notes') or '')}"
+            _ci_pre = await _verify_item_ci(db, args["project_id"], tenant, _ci_text)
+            _ci_checked = True
+            if (
+                not _override_ci
+                and _ci_pre is not None
+                and _ci_pre.get("state") == "failure"
+            ):
+                return {
+                    "error": "CI_FAILING",
+                    "item_id": args["item_id"],
+                    "ci_verification": _ci_pre,
+                    "message": (
+                        f"Refusing to complete {args['item_id']}: GitHub Actions CI "
+                        f"is FAILING for commit {_ci_pre.get('sha')} "
+                        f"({_ci_pre.get('failed')}/{_ci_pre.get('total')} checks failed). "
+                        "Fix CI and re-push, or pass override_ci=true to acknowledge "
+                        "and complete anyway. (Unknown/pending CI is never blocked — "
+                        "only a real failing status.)"
+                    ),
+                }
+
         # 5823db0b — quality gate + actor attribution. Pass evidence notes and
         # the completing actor; surface the required_notes gate as a clean error.
         _complete_actor = args.get("actor") or _complete_session_id or None
@@ -3807,41 +3889,28 @@ async def _handle_sprint_tools(
         if _bc_complete:
             item = dict(item)
             item["board_change"] = _bc_complete
-        # b121348e — INDEPENDENT CI verification: cross-reference the ACTUAL GitHub
-        # Actions result for the commit named in the completion notes, so a "tests
-        # pass" claim is checked against real CI. Advisory + fully guarded: CI is
-        # usually still running at completion time (push, then complete), and self-
-        # hosted / no-GitHub setups have nothing to check — so this attaches
-        # ci_verification and, when CI is genuinely FAILING, a ci_warning, but never
-        # blocks the completion or raises.
+        # b121348e / 427b7902 — INDEPENDENT CI verification. The 427b7902 hard gate
+        # above already looked this up (and REFUSED completion on a real failing
+        # state unless override_ci=true), so reuse that result — no second GitHub
+        # round-trip. Attach ``ci_verification`` for transparency, and when CI is
+        # genuinely FAILING (i.e. this was an acknowledged override_ci completion),
+        # attach a ``ci_warning`` so the closed-on-red item stays visible.
         try:
-            from .. import github_ci  # noqa: PLC0415
-            _ci_sha = github_ci.extract_commit_sha(
-                f"{args.get('notes') or ''} {item.get('notes') or ''}"
+            _ci = _ci_pre if _ci_checked else await _verify_item_ci(
+                db, args["project_id"], tenant,
+                f"{args.get('notes') or ''} {item.get('notes') or ''}",
             )
-            if _ci_sha:
-                _ci_project = await db_module.get_project(db, args["project_id"])
-                _ci_repo = ((_ci_project or {}).get("github_repo") or "").strip()
-                if _ci_repo:
-                    _ci_token = None
-                    _ci_tid = (tenant or {}).get("id") if tenant else None
-                    if _ci_tid:
-                        try:
-                            _ci_token, _ = await db_module.get_github_token_for_project(
-                                db, _ci_tid, args["project_id"]
-                            )
-                        except Exception:  # noqa: BLE001
-                            _ci_token = None
-                    _ci = await github_ci.verify_commit_ci(_ci_repo, _ci_sha, token=_ci_token)
-                    item = dict(item)
-                    item["ci_verification"] = _ci
-                    if _ci.get("state") == "failure":
-                        item["ci_warning"] = (
-                            f"⚠ GitHub Actions CI is FAILING for commit {_ci_sha} "
-                            f"({_ci.get('failed')}/{_ci.get('total')} checks) — this item "
-                            f"was closed on a commit whose CI did not pass. Verify before "
-                            f"trusting 'done'."
-                        )
+            if _ci is not None:
+                item = dict(item)
+                item["ci_verification"] = _ci
+                if _ci.get("state") == "failure":
+                    item["ci_warning"] = (
+                        f"⚠ GitHub Actions CI is FAILING for commit {_ci.get('sha')} "
+                        f"({_ci.get('failed')}/{_ci.get('total')} checks) — this item "
+                        f"was closed on a commit whose CI did not pass"
+                        + (" (override_ci=true)." if _override_ci else ".")
+                        + " Verify before trusting 'done'."
+                    )
         except Exception:  # noqa: BLE001 — advisory only; completion already succeeded
             pass
         # bb29a06f — ADVISORY completion sanity-check. Extends the required_notes

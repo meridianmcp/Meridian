@@ -1321,7 +1321,11 @@ def build_mcp_server():
                 description=(
                     "Mark a sprint item done. Pass task_id to link the "
                     "task that shipped it; the timeline correlates them. "
-                    "Returns the updated item or null if the id is unknown."
+                    "Returns the updated item or null if the id is unknown. "
+                    "If the notes reference a commit whose GitHub Actions CI is "
+                    "genuinely FAILING, completion is REFUSED (error CI_FAILING); "
+                    "pass override_ci=true to acknowledge and complete anyway. "
+                    "Unknown/pending CI never blocks."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1330,6 +1334,7 @@ def build_mcp_server():
                         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "item_id": {"type": "string"},
                         "task_id": {"type": "string"},
+                        "override_ci": {"type": "boolean", "description": "Set true to complete even when GitHub Actions CI for the referenced commit is failing (escape hatch — the failing CI is recorded on the item)."},
                     },
                     "required": ["item_id"],
                 },

@@ -11,6 +11,20 @@ on:
   push:
     branches: [dev, main]
     tags: ['v*.*.*']
+  # 427b7902 — AUTO-PROMOTE dev -> main on green CI. When the dev-branch CI
+  # workflow ("Test (dev branch)" = test.yml) finishes, this deploy workflow
+  # re-runs on the `workflow_run` event; the `auto-promote` job below fires the
+  # dev->main merge ONLY when that run concluded `success` on the `dev` branch.
+  # No operator `promote=yes` dispatch is needed for the routine green path.
+  # Loop-safety: the merge pushes to `main` with the default GITHUB_TOKEN, whose
+  # pushes do NOT trigger new workflow runs (GitHub's built-in anti-recursion) —
+  # so the merge cannot re-fire test.yml or this workflow. Prod is deployed by an
+  # explicit `gh workflow run deploy.yml --ref main` dispatch (workflow_dispatch
+  # DOES fire under GITHUB_TOKEN), exactly as the operator-gated promote path does,
+  # leaving exactly ONE prod deploy per promote (the main-ref dispatch).
+  workflow_run:
+    workflows: ["Test (dev branch)"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       promote:
@@ -37,7 +51,9 @@ jobs:
   # ─── 1. Tests (skipped entirely for hotfix) ────────────────────────────────
   test:
     runs-on: ubuntu-latest
-    if: inputs.hotfix != 'yes'
+    # Skip on the workflow_run auto-promote event — test.yml already ran the full
+    # suite; re-running it here would be wasteful and pointless. (427b7902)
+    if: inputs.hotfix != 'yes' && github.event_name != 'workflow_run'
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.9.3
@@ -67,6 +83,8 @@ jobs:
   playwright-tests:
     runs-on: ubuntu-latest
     continue-on-error: true
+    # Skip on the workflow_run auto-promote event (test.yml already covers UX). (427b7902)
+    if: github.event_name != 'workflow_run'
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.9.3
@@ -166,6 +184,67 @@ jobs:
 
       - name: Trigger production deploy
         run: |
+          gh workflow run deploy.yml --ref main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─── 4a. AUTO-PROMOTE dev → main on green CI (427b7902) ────────────────────
+  # Fires on the `workflow_run` completion of test.yml ("Test (dev branch)").
+  # Promotes ONLY when that CI run concluded `success` on the `dev` branch — no
+  # operator `promote=yes` dispatch needed for the routine green path. This is the
+  # exact same merge + trigger as `merge-to-main`, driven by green CI instead of a
+  # manual dispatch. It merges the SPECIFIC commit that passed CI
+  # (`workflow_run.head_sha`) — never a newer, untested dev tip.
+  #
+  # Loop-safety (respects the existing GITHUB_TOKEN anti-recursion design):
+  #   * The merge pushes to `main` with the default GITHUB_TOKEN. GitHub does NOT
+  #     trigger new workflow runs from GITHUB_TOKEN pushes, so this push cannot
+  #     re-fire test.yml (which triggers on push-to-dev anyway, not main) or this
+  #     workflow. No recursion.
+  #   * Prod is deployed by an explicit `gh workflow run deploy.yml --ref main`
+  #     dispatch (workflow_dispatch DOES fire under GITHUB_TOKEN) — the identical
+  #     mechanism the operator-gated promote uses. The dev-ref auto-promote run
+  #     NEVER self-deploys prod: the `deploy` job's `if` only deploys on a main-ref
+  #     push/dispatch, hotfix, or tag — a `workflow_run` event matches none of
+  #     those. Exactly ONE prod deploy per promote: the main-ref dispatch.
+  auto-promote:
+    if: >
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge the CI-green dev commit into main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin
+          # Merge the EXACT commit that passed CI, not a floating origin/dev tip
+          # that may have advanced to an untested commit since CI started.
+          GREEN_SHA="${{ github.event.workflow_run.head_sha }}"
+          echo "Promoting CI-green dev commit $GREEN_SHA -> main"
+          git checkout main
+          # Idempotent: if main already contains this commit (e.g. a re-run of the
+          # same workflow_run), the merge is a no-op and we skip the push.
+          if git merge-base --is-ancestor "$GREEN_SHA" HEAD; then
+            echo "main already contains $GREEN_SHA — nothing to promote."
+            exit 0
+          fi
+          git merge --no-ff --no-edit "$GREEN_SHA" -m "ci: merge dev → main (auto-promote on green CI)"
+          git push origin main
+      - name: Trigger production deploy
+        run: |
+          # Dispatch the main-ref deploy that actually rolls prod (same mechanism
+          # as the operator-gated promote). If the merge step above short-circuited
+          # because main already had the commit, a redundant main-ref deploy of the
+          # same SHA is harmless — a canary redeploy of identical code.
           gh workflow run deploy.yml --ref main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
