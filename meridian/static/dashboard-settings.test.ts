@@ -2,13 +2,18 @@
 //
 // 2ff2ff1f — the Handoff Format textarea (id="ws-handoff-template") must default
 // to a tall height (rows="16") and stay vertically resizable.
-// f2157803 — the executor-config "checkpoint after N turns" (context_threshold)
-// and "stop after N turns" (max_turns) controls are number inputs (exact value
-// always visible + directly editable), not range sliders.
+// f2157803 — the executor-config context_threshold / max_turns controls are
+// number inputs (exact value always visible + directly editable), not sliders.
+// ca8c0d56 — the Claude Code (rc-watcher) and Codex CLI setup blurbs are terse
+// single-liners leading with the copy-paste config.
 import { describe, it, expect, beforeAll } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { _execTurnsNumberInputHtml } from "./dashboard-settings";
+import {
+  _execTurnsNumberInputHtml,
+  claudeRcWatcherBlurb,
+  codexSetupBlurb,
+} from "./dashboard-settings";
 
 // Vitest runs with cwd = repo root, so resolve the source module from there.
 const source = readFileSync(
@@ -20,13 +25,14 @@ const source = readFileSync(
 const textareaTag =
   source.match(/<textarea id="ws-handoff-template"[^>]*>/)?.[0] ?? "";
 
+// Minimal stand-in for the ambient escapeHtml used at runtime.
+const esc = (s: unknown) =>
+  String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string),
+  );
+
 beforeAll(() => {
-  // The helper prefers window.escapeHtml (defined at runtime by dashboard-utils);
-  // provide a minimal stand-in so the value is HTML-escaped in the unit test.
-  (window as any).escapeHtml = (s: unknown) =>
-    String(s).replace(/[&<>"']/g, (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string),
-    );
+  (window as any).escapeHtml = esc;
 });
 
 function parse(html: string): HTMLInputElement {
@@ -36,6 +42,9 @@ function parse(html: string): HTMLInputElement {
   if (!input) throw new Error("no input rendered");
   return input as HTMLInputElement;
 }
+
+// Strip inline tags so length/word checks measure the visible copy.
+const visible = (html: string) => html.replace(/<[^>]+>/g, "");
 
 describe("ws-handoff-template textarea", () => {
   it("exists in the settings source", () => {
@@ -97,5 +106,44 @@ describe("_execTurnsNumberInputHtml", () => {
 
   it("is registered on window for the settings template to call", () => {
     expect(typeof (window as any)._execTurnsNumberInputHtml).toBe("function");
+  });
+});
+
+describe("claudeRcWatcherBlurb", () => {
+  const html = claudeRcWatcherBlurb();
+
+  it("still explains the claude --rc / headless hook gap", () => {
+    expect(html).toContain("claude --rc");
+    expect(html.toLowerCase()).toContain("hook");
+  });
+
+  it("is a single terse line, not a multi-sentence paragraph", () => {
+    expect(html).not.toContain("\n");
+    expect(html).not.toContain("<p");
+    expect(visible(html).length).toBeLessThan(180);
+    expect((visible(html).match(/\.(\s|$)/g) || []).length).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("codexSetupBlurb", () => {
+  const url = "https://usemeridian.us/mcp";
+  const html = codexSetupBlurb(url, esc);
+
+  it("keeps the essential config-file + one-command instruction intact", () => {
+    expect(html).toContain("~/.codex/config.toml");
+    expect(html).toContain("codex mcp add meridian");
+    expect(html).toContain(url);
+  });
+
+  it("routes the url through the provided escaper (no unescaped injection)", () => {
+    const out = codexSetupBlurb('x"><script>', esc);
+    expect(out).not.toContain("<script>");
+    expect(out).toContain("&lt;script&gt;");
+  });
+
+  it("is a single terse line, not a multi-sentence paragraph", () => {
+    expect(html).not.toContain("\n");
+    expect(visible(html).length).toBeLessThan(120);
+    expect((visible(html).match(/\.(\s|$)/g) || []).length).toBeLessThanOrEqual(1);
   });
 });

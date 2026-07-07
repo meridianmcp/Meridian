@@ -34,6 +34,23 @@ export function _execTurnsNumberInputHtml(
   return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
 }
 window._execTurnsNumberInputHtml = _execTurnsNumberInputHtml;
+// ca8c0d56 — condensed one-line blurbs for the Claude Code (rc-watcher) and
+// Codex CLI setup sections. These replaced multi-sentence prose paragraphs so the
+// sections lead with the copy-paste config, not a wall of text. Exported as pure
+// functions so the vitest suite can assert the copy stays a single terse line and
+// still names the right tool/command. `esc` is the ambient escapeHtml at runtime;
+// passed in so the helpers stay dependency-free and unit-testable.
+type EscFn = (s: unknown) => string;
+
+export function claudeRcWatcherBlurb(): string {
+  // Was a 4-line paragraph; the config commands below make the "what" obvious.
+  return 'For <code>claude --rc</code> (headless) mode, where SessionStart hooks don\'t fire — installs a background watcher that fires the hook per session.';
+}
+
+export function codexSetupBlurb(mcpHttpUrl: string, esc: EscFn): string {
+  // Single line: what to run. The config blocks below carry the rest.
+  return `Add to <code>~/.codex/config.toml</code>, or run <code>codex mcp add meridian ${esc(mcpHttpUrl)}</code>.`;
+}
 
 // 9b8261e4 — hide owner-only settings cards from invited viewers/members. The
 // real gate is server-side (393eed0a); this keeps the guest UI honest and clean.
@@ -1539,10 +1556,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         <span style="font-size:12px">⚡</span> Install rc watcher <span style="color:var(--muted);font-weight:400;margin-left:4px">(for <code>claude --rc</code> server mode)</span>
       </summary>
       <div style="padding:10px 12px;font-size:10px;color:var(--muted);line-height:1.8">
-        <p style="margin:0 0 8px">When Claude runs in <code>claude --rc</code> (headless server mode) the
-        standard SessionStart hooks do not fire. The rc watcher is a lightweight OS-native background service
-        (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) that watches
-        <code>~/.claude/projects/</code> for new session files and fires the hook automatically.</p>
+        <p style="margin:0 0 8px">${claudeRcWatcherBlurb()}</p>
         <div style="margin-bottom:6px;font-size:10px;color:var(--text);font-weight:600">Windows</div>
         <div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">
           <code id="rc-watcher-win-cmd-${escapeHtml(projectId)}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:10px;word-break:break-all">irm ${escapeHtml(hooksBaseUrl)}/install_watcher.ps1 | iex</code>
@@ -1564,7 +1578,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Codex CLI setup</div>
 
       ${isHostedMode() ? '' : `
-      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Add to <code>~/.codex/config.toml</code> — or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">${codexSetupBlurb(mcpHttpUrl, escapeHtml)}</div>
 
       ${!isHosted ? `<div style="margin-bottom:12px">
         <label style="font-size:10px;color:var(--muted)">Your Meridian path<br>
@@ -1607,7 +1621,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;overflow:hidden">
         <summary style="cursor:pointer;list-style:none;padding:6px 10px;background:var(--surface-2);font-size:10px;color:var(--muted)">Advanced — HTTP config (Codex / custom)</summary>
         <div style="padding:10px 12px">
-          <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Add to <code>~/.codex/config.toml</code> — or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px">${codexSetupBlurb(mcpHttpUrl, escapeHtml)}</div>
           <pre id="codex-http-${escapeHtml(projectId)}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
           <button class="secondary" id="codex-copy-http-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy</button>
         </div>
