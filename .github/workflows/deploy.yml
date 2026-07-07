@@ -181,13 +181,25 @@ jobs:
     # main deploys, still fully gated on the test job passing. The promote=yes dispatch
     # remains the preferred path (it adds preview + smoke first), but a direct main push
     # can no longer masquerade as a successful deploy.
+    #
+    # NOTE (9a7972a9 exactly-once fix): the workflow_dispatch term below used to be
+    # UNGUARDED by ref. On a `promote=yes` dispatch (which runs on the `dev` ref), that
+    # made THIS job deploy prod from the dev checkout — while `merge-to-main` ALSO fired
+    # a separate `gh workflow run deploy.yml --ref main` dispatch whose own deploy job ran
+    # too. Result: a single promote produced TWO prod deploys (a bogus dev-ref one + the
+    # real main-ref one). The promote (dev-ref) run's ONLY job is to merge dev→main and
+    # trigger the main-ref run; it must NOT self-deploy prod. So a workflow_dispatch now
+    # only deploys prod when it is on `main` (the run merge-to-main triggers) OR it is an
+    # emergency `hotfix=yes` straight-to-prod dispatch. This leaves exactly one prod deploy
+    # per promote: the main-ref dispatch. (Direct main push and tag pushes are unchanged.)
     if: >
       always() &&
       (needs.test.result == 'success' || needs.test.result == 'skipped') &&
       (needs.merge-to-main.result == 'success' || needs.merge-to-main.result == 'skipped') &&
       ((github.ref == 'refs/heads/main' &&
         github.event_name == 'push') ||
-       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.ref == 'refs/heads/main' || inputs.hotfix == 'yes')) ||
        startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     outputs:
