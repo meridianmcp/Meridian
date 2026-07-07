@@ -7259,6 +7259,95 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
+  // meridian/static/dashboard-blog.ts
+  var _BLOG_STATUSES = ["draft", "published", "archived"];
+  function blogEditorFormHtml(projectId, post) {
+    const p3 = post || {};
+    const id = String(p3.id || "");
+    const title = String(p3.title || "");
+    const body = String(p3.body_md || "");
+    const status = _BLOG_STATUSES.includes(String(p3.status)) ? String(p3.status) : "draft";
+    const editing = !!id;
+    const pid = escapeHtml(String(projectId));
+    const opts = _BLOG_STATUSES.map((s3) => `<option value="${s3}"${s3 === status ? " selected" : ""}>${s3}</option>`).join("");
+    return `<div id="blog-editor-${pid}" style="border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:14px;background:var(--surface-1)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <span id="blog-editor-title-${pid}" style="font-size:10px;color:var(--accent);letter-spacing:.06em">${editing ? "EDIT POST" : "NEW POST"}</span>
+      <button id="blog-editor-reset-${pid}" class="secondary" style="font-size:9px;padding:2px 8px;${editing ? "" : "display:none"}">New / clear</button>
+    </div>
+    <input type="hidden" id="blog-editor-id-${pid}" value="${escapeHtml(id)}" />
+    <input type="text" id="blog-editor-title-input-${pid}" placeholder="Title" value="${escapeHtml(title)}" style="width:100%;box-sizing:border-box;font-size:11px;padding:5px 7px;margin-bottom:6px;background:var(--surface-0,var(--bg));color:var(--text);border:1px solid var(--border);border-radius:3px" />
+    <textarea id="blog-editor-body-${pid}" placeholder="Body (markdown)" rows="6" style="width:100%;box-sizing:border-box;font-size:11px;font-family:var(--font-mono);padding:5px 7px;margin-bottom:6px;background:var(--surface-0,var(--bg));color:var(--text);border:1px solid var(--border);border-radius:3px;resize:vertical">${escapeHtml(body)}</textarea>
+    <div style="display:flex;gap:6px;align-items:center">
+      <select id="blog-editor-status-${pid}" style="font-size:10px;padding:3px 6px;background:var(--surface-0,var(--bg));color:var(--text);border:1px solid var(--border);border-radius:3px">${opts}</select>
+      <button id="blog-editor-save-${pid}" style="font-size:10px;padding:4px 12px">${editing ? "Update post" : "Save post"}</button>
+      <span id="blog-editor-status-msg-${pid}" style="font-size:9px;color:var(--muted)"></span>
+    </div>
+  </div>`;
+  }
+  function blogPostCardHtml(post) {
+    const id = String(post.id || "");
+    const slug = String(post.slug || "");
+    const url = String(post.url || (slug ? `/blog/${slug}` : ""));
+    const title = String(post.title || "Untitled");
+    return `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+      <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(title)}</div>
+      <button class="blog-edit-btn secondary" data-blog-id="${escapeHtml(id)}" style="font-size:9px;padding:2px 8px;flex:0 0 auto">Edit</button>
+    </div>
+    <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px">${escapeHtml(slug)}</div>
+    ${url ? `<div style="margin-top:4px"><a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="font-size:10px;color:var(--accent)">${escapeHtml(url)}</a></div>` : ""}
+  </div>`;
+  }
+  function populateBlogEditor(projectId, post) {
+    const pid = String(projectId);
+    const idEl = document.getElementById(`blog-editor-id-${pid}`);
+    const titleEl = document.getElementById(`blog-editor-title-input-${pid}`);
+    const bodyEl = document.getElementById(`blog-editor-body-${pid}`);
+    const statusEl = document.getElementById(`blog-editor-status-${pid}`);
+    const labelEl = document.getElementById(`blog-editor-title-${pid}`);
+    const saveEl = document.getElementById(`blog-editor-save-${pid}`);
+    const resetEl = document.getElementById(`blog-editor-reset-${pid}`);
+    if (!idEl || !titleEl || !bodyEl) return false;
+    idEl.value = String(post.id || "");
+    titleEl.value = String(post.title || "");
+    bodyEl.value = String(post.body_md || "");
+    if (statusEl) {
+      const st = _BLOG_STATUSES.includes(String(post.status)) ? String(post.status) : "draft";
+      statusEl.value = st;
+    }
+    if (labelEl) labelEl.textContent = "EDIT POST";
+    if (saveEl) saveEl.textContent = "Update post";
+    if (resetEl) resetEl.style.display = "";
+    return true;
+  }
+  function resetBlogEditor(projectId) {
+    const pid = String(projectId);
+    const idEl = document.getElementById(`blog-editor-id-${pid}`);
+    const titleEl = document.getElementById(`blog-editor-title-input-${pid}`);
+    const bodyEl = document.getElementById(`blog-editor-body-${pid}`);
+    const statusEl = document.getElementById(`blog-editor-status-${pid}`);
+    const labelEl = document.getElementById(`blog-editor-title-${pid}`);
+    const saveEl = document.getElementById(`blog-editor-save-${pid}`);
+    const resetEl = document.getElementById(`blog-editor-reset-${pid}`);
+    if (idEl) idEl.value = "";
+    if (titleEl) titleEl.value = "";
+    if (bodyEl) bodyEl.value = "";
+    if (statusEl) statusEl.value = "draft";
+    if (labelEl) labelEl.textContent = "NEW POST";
+    if (saveEl) saveEl.textContent = "Save post";
+    if (resetEl) resetEl.style.display = "none";
+  }
+  try {
+    Object.assign(window, {
+      blogEditorFormHtml,
+      blogPostCardHtml,
+      populateBlogEditor,
+      resetBlogEditor
+    });
+  } catch (e3) {
+  }
+
   // node_modules/preact/dist/preact.module.js
   var n;
   var l;
@@ -10287,13 +10376,17 @@ Current: ${current || "(none)"}`,
 
           <div class="live-section">
 
-            <div class="live-section-label">Active sessions</div>
+            <details class="live-section-collapse" open>
 
-            <div class="live-sessions" id="live-sessions-${project.id}">
+              <summary class="live-section-label" style="cursor:pointer;list-style:none">Active sessions</summary>
 
-              <div class="live-empty">No active sessions.</div>
+              <div class="live-sessions" id="live-sessions-${project.id}">
 
-            </div>
+                <div class="live-empty">No active sessions.</div>
+
+              </div>
+
+            </details>
 
           </div>
 
@@ -13029,29 +13122,70 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       { key: "published", label: "PUBLISHED", color: "var(--accent)" },
       { key: "archived", label: "ARCHIVED", color: "var(--warning, #d29922)" }
     ];
+    const pid = String(projectId);
     let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
     <div style="font-size:11px;color:var(--text)"><b>${posts.length}</b> post${posts.length === 1 ? "" : "s"}</div>
   </div>
-  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Author via the <code>save_blog_post</code> MCP tool; published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Edit a draft below (or author via the <code>save_blog_post</code> MCP tool); published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+    html += blogEditorFormHtml(pid, null);
     if (!posts.length) {
-      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one with <code>save_blog_post(title, body, status="published")</code>.</div>`;
+      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one above, or with <code>save_blog_post(title, body, status="published")</code>.</div>`;
     } else {
       for (const g2 of GROUPS) {
         const inGroup = posts.filter((p3) => String(p3.status || "draft") === g2.key);
         if (!inGroup.length) continue;
         html += `<div style="font-size:9px;color:${g2.color};letter-spacing:.06em;margin:12px 0 6px">${g2.label} \xB7 ${inGroup.length}</div>`;
         for (const p3 of inGroup) {
-          const slug = String(p3.slug || "");
-          const url = String(p3.url || (slug ? `/blog/${slug}` : ""));
-          html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
-          <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(p3.title || "Untitled"))}</div>
-          <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px">${escapeHtml(slug)}</div>
-          ${url ? `<div style="margin-top:4px"><a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="font-size:10px;color:var(--accent)">${escapeHtml(url)}</a></div>` : ""}
-        </div>`;
+          html += blogPostCardHtml(p3);
         }
       }
     }
     body.innerHTML = html;
+    const byId = (suffix) => document.getElementById(`blog-editor-${suffix}-${pid}`);
+    const saveBtn = byId("save");
+    const resetBtn = byId("reset");
+    const msgEl = document.getElementById(`blog-editor-status-msg-${pid}`);
+    const doSave = async () => {
+      const idEl = document.getElementById(`blog-editor-id-${pid}`);
+      const titleEl = document.getElementById(`blog-editor-title-input-${pid}`);
+      const bodyEl = document.getElementById(`blog-editor-body-${pid}`);
+      const statusEl = document.getElementById(`blog-editor-status-${pid}`);
+      const title = (titleEl?.value || "").trim();
+      if (!title) {
+        if (msgEl) msgEl.textContent = "Title required";
+        return;
+      }
+      if (saveBtn) saveBtn.disabled = true;
+      if (msgEl) msgEl.textContent = "Saving\u2026";
+      try {
+        await api("/workspace/blog", {
+          method: "POST",
+          body: JSON.stringify({
+            id: idEl?.value || void 0,
+            // present ⇒ update in place (upsert by id)
+            title,
+            body: bodyEl?.value || "",
+            status: statusEl?.value || "draft"
+          })
+        });
+        loadBlogTab(projectId);
+      } catch (e3) {
+        if (saveBtn) saveBtn.disabled = false;
+        if (msgEl) msgEl.textContent = `Error: ${escapeHtml(String(e3))}`;
+      }
+    };
+    if (saveBtn) saveBtn.onclick = doSave;
+    if (resetBtn) resetBtn.onclick = () => resetBlogEditor(pid);
+    body.querySelectorAll(".blog-edit-btn").forEach((btn) => {
+      btn.onclick = () => {
+        const bid = btn.getAttribute("data-blog-id") || "";
+        const post = posts.find((p3) => String(p3.id || "") === bid);
+        if (!post) return;
+        populateBlogEditor(pid, post);
+        document.getElementById(`blog-editor-${pid}`)?.scrollIntoView({ block: "nearest" });
+        document.getElementById(`blog-editor-title-input-${pid}`)?.focus();
+      };
+    });
   }
   async function loadDocumentsTab(projectId) {
     const body = document.getElementById(`documents-body-${projectId}`);
