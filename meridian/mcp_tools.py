@@ -812,7 +812,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "deferred_until": {"type": "string",
                             "description": "dec69708 — ISO timestamp before which the item CANNOT be claimed. claim_sprint_item hard-refuses it until this time passes (enforced deferral, e.g. 'defer the paper-track until 2026-09-01'). Omit for an immediately-claimable item."},
          "track": {"type": "string",
-                   "description": "dec69708 — named lane for the item (e.g. 'paper'). Buckets items so a whole track can be deferred/skipped."}},
+                   "description": "dec69708 — named lane for the item (e.g. 'paper'). Buckets items so a whole track can be deferred/skipped."},
+         "priority": {"type": "string", "enum": ["urgent", "high", "normal", "low"],
+                      "description": "e08fee30 — item priority (default 'normal'). Higher-priority PENDING items are surfaced, claimed, and grouped FIRST: get_sprint_items and get_parallelizable_groups order urgent-first within their existing ordering, so an executor picks up higher-priority work before lower. Ordering-only for now; a running-session preemption/interrupt mechanism is deferred."},
+         "blocker_kind": {"type": "string", "enum": ["manual"],
+                          "description": "2282a636 — omit for an ordinary item; 'manual' marks the item as blocked on a REAL-WORLD action OUTSIDE Meridian (publish something, obtain an API key, talk to an advisor). DISTINCT from milestone_type='human' (which is about WHO executes): a manual-blocker item is surfaced distinctly and is EXCLUDED from executor 'just claim the next pending' scoping, so an executor never treats it as claimable work."}},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -858,7 +862,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                                "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged. SYMBOL-LEVEL: append ':symbol_name' to a file id ('file:path.py:func') so items editing different symbols in the same file are non-overlapping and co-batch in parallel."},
          "required_notes": {"type": "boolean", "description": "Quality gate (5823db0b): when true, complete_sprint_item is blocked until the item has evidence (existing notes, a linked task, or a notes= argument on completion)."},
          "deferred_until": {"type": "string", "description": "dec69708 — ISO timestamp before which the item CANNOT be claimed (enforced deferral). Pass an empty string to CLEAR the deferral and make the item claimable now. Omit to leave unchanged."},
-         "track": {"type": "string", "description": "dec69708 — named lane (e.g. 'paper'). Pass an empty string to clear; omit to leave unchanged."}},
+         "track": {"type": "string", "description": "dec69708 — named lane (e.g. 'paper'). Pass an empty string to clear; omit to leave unchanged."},
+         "priority": {"type": "string", "enum": ["urgent", "high", "normal", "low"],
+                      "description": "e08fee30 — set the item's priority (urgent|high|normal|low). Higher-priority pending items are surfaced/claimed/grouped first. Omit to leave unchanged."},
+         "blocker_kind": {"type": "string", "enum": ["manual"],
+                          "description": "2282a636 — 'manual' marks the item as blocked on a real-world action OUTSIDE Meridian (distinct from milestone_type='human'; excluded from executor scoping). Pass an empty string to CLEAR it (ordinary item); omit to leave unchanged."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "

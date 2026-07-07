@@ -3589,9 +3589,12 @@ async def _handle_sprint_tools(
                 force=bool(args.get("force", False)),
                 deferred_until=args.get("deferred_until"),
                 track=args.get("track"),
+                priority=args.get("priority"),
+                blocker_kind=args.get("blocker_kind"),
             )
         except ValueError as exc:
-            # 501ec93f — malformed touches_resources identifier; surface, don't crash.
+            # 501ec93f — malformed touches_resources identifier; also e08fee30 /
+            # 2282a636 bad priority / blocker_kind. Surface, don't crash.
             return {"error": str(exc)}
         # b0d42ef6 — duplicate guard blocked the insert: surface the error as-is
         # (no item was created, so the warnings below don't apply).
@@ -3705,6 +3708,15 @@ async def _handle_sprint_tools(
             _patch_kwargs["deferred_until"] = args.get("deferred_until")
         if "track" in args:
             _patch_kwargs["track"] = args.get("track")
+        # e08fee30 — set the priority enum. Only forward when supplied (None leaves
+        # the stored value untouched in patch_sprint_item).
+        if args.get("priority") is not None:
+            _patch_kwargs["priority"] = args.get("priority")
+        # 2282a636 — set/clear blocker_kind. Only forward when the caller supplied
+        # the key, so omitting it leaves the stored value untouched (_UNSET
+        # sentinel); pass "" / null to clear (ordinary item), or 'manual' to set.
+        if "blocker_kind" in args:
+            _patch_kwargs["blocker_kind"] = args.get("blocker_kind")
         try:
             item = await db_module.patch_sprint_item(
                 db, args["project_id"], args["item_id"], **_patch_kwargs
