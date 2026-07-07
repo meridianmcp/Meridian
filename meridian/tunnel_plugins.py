@@ -24,7 +24,7 @@ from typing import Any
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
 # another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs")
+SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
@@ -40,6 +40,11 @@ DEFAULT_DC_PORT = 8813
 # slots (8814-8817), and below the custom auto-assign start (8820) — see
 # CUSTOM_SLOT_PORTS / _CUSTOM_PORT_START.
 DEFAULT_DOCS_PORT = 8818
+# 39c117b1 — zotero-mcp slot: citation/reference-manager resolution against the
+# user's LOCAL Zotero API (`uvx zotero-mcp`, env ZOTERO_LOCAL=true), bridged the
+# same automatic way as docx-mcp/meridian-docs. Port 8819 sits between docs
+# (8818) and the custom auto-assign start (8820).
+DEFAULT_ZOTERO_PORT = 8819
 
 # 8fb69d54 — 4 pre-allocated custom slots (p0-p3) on ports 8814-8817 so a custom
 # plugin bound to a slot gets a real server route (/tunnel-p0 … /tunnel-p3) and
@@ -217,6 +222,29 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "description": "Document intelligence — DOCX outline/parse/index/search (meridian-docs)",
         "description_overrides": {},
     },
+    {
+        # 39c117b1 — zotero-mcp: citation / reference-manager resolution against
+        # the user's LOCAL Zotero API, launched via `uvx zotero-mcp` with
+        # ZOTERO_LOCAL=true. A core/default bundled slot (same tier as docx-mcp /
+        # meridian-docs), NOT tunnel-proxying Meridian's own hand-rolled
+        # zotero_client — so a thesis in a .docx gets real Zotero resolution the
+        # same automatic way as the other Office slots.
+        "name": "zotero-mcp",
+        "slot": "zotero",
+        "port": DEFAULT_ZOTERO_PORT,
+        "url_prefix": "/zotero",
+        "enabled": False,
+        "builtin": True,
+        "core": False,
+        "command": ["uvx", "zotero-mcp"],
+        "env": {"ZOTERO_LOCAL": "true"},
+        # zotero-mcp exposes bare tool names — no self-prefix, so the server
+        # bridge namespaces them via SLOT_DISPLAY_NAMES ("zotero" → "zotero-mcp__…").
+        "prefix": None,
+        "session_mode": "stateless",
+        "description": "Citation / reference-manager resolution against the local Zotero API (zotero-mcp)",
+        "description_overrides": {},
+    },
 ]
 
 # Editable per-slot fields that a tenant override may set.
@@ -332,11 +360,11 @@ KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
         "name": "zotero-mcp",
         "package": "zotero-mcp",
         "runtime": "uvx",
-        # No server route exists for a citation slot; hosted mode also cannot
-        # reach the user's local Zotero API without proxying (item 39c117b1).
-        "slot": None,
-        "bundled": False,
-        "owner_item": "39c117b1",
+        # 39c117b1 SHIPPED this as a first-class built-in on its own `zotero` slot
+        # (server route + WS relay in routes/tunnel.py), env ZOTERO_LOCAL=true.
+        "slot": "zotero",
+        "bundled": True,
+        "owner_item": None,
         "description": (
             "Citation / reference-manager resolution against the local Zotero API."
         ),
@@ -474,6 +502,7 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
 _BUILTIN_DEFAULT_PORTS = frozenset({
     DEFAULT_FS_PORT, DEFAULT_CODE_PORT, DEFAULT_EXTRACT_PORT,
     DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT, DEFAULT_DOCS_PORT,
+    DEFAULT_ZOTERO_PORT,
 })
 
 # 9811d04c — first port a freshly-added custom plugin (from the browse "Add"
