@@ -354,12 +354,27 @@ async function loadTunnelPluginsSection(projectId: string, hostname: any) {
         </div>`;
     };
     // Split the slots into always-on Core Tools and opt-in Plugins. (b2a60de7)
-    const coreRows = plugins.filter((p: any) => p.core).map(renderRow).join('');
-    const pluginRows = plugins.filter((p: any) => !p.core).map(renderRow).join('');
+    // f5e1ed49 — the bundled `zotero` reference-manager slot (39c117b1) is
+    // pulled out of the generic loop and rendered by _renderZoteroStatusRow so
+    // it reads as a "Reference manager" status row; excluding it here avoids a
+    // duplicate generic slot row.
+    const coreRows = plugins.filter((p: any) => p.core && p.slot !== 'zotero').map(renderRow).join('');
+    const pluginRows = plugins.filter((p: any) => !p.core && p.slot !== 'zotero').map(renderRow).join('');
+    // f5e1ed49 — dedicated reference-manager (Zotero) status row. Feed it the
+    // /tunnel/status-shaped payload it expects (zotero_active + slot_status)
+    // from this section's already-fetched active map + per-slot health, so its
+    // dot mirrors the other bundled slots without a second round-trip.
+    const zoteroRow = plugins.some((p: any) => p.slot === 'zotero')
+      ? _renderZoteroStatusRow({
+          zotero_active: !!active.zotero,
+          slot_status: slotStatus.zotero ? { zotero: slotStatus.zotero } : {},
+        })
+      : '';
     const _sectionLabel = (text: any, note: any) =>
       `<div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:2px 0 6px">${text} <span style="font-weight:400;text-transform:none">${note}</span></div>`;
     const rows = `
       ${coreRows ? _sectionLabel('Core Tools', '— always on') + coreRows : ''}
+      ${zoteroRow ? _sectionLabel('Reference manager', '— citation resolution (Zotero)') + zoteroRow : ''}
       ${_sectionLabel('Plugins', '— opt-in, toggle to enable')}
       ${pluginRows || '<div style="color:var(--muted);font-size:10px">No plugins.</div>'}`;
 
@@ -989,3 +1004,58 @@ function _wireLifecycleInstallButtons(container: any) {
   });
 }
 window._wireLifecycleInstallButtons = _wireLifecycleInstallButtons;
+
+// ---------------------------------------------------------------------------
+// Reference-manager (Zotero) status row — sprint item f5e1ed49
+//
+// 39c117b1 made `zotero` a first-class bundled tunnel slot (`uvx zotero-mcp`,
+// ZOTERO_LOCAL=true). The tunnel therefore reports the reference manager's live
+// state exactly like the other slots: GET /tunnel/status now returns
+// `zotero_active` (socket connected) plus an optional `slot_status.zotero`
+// diagnostic when the client marked the slot unhealthy.
+//
+// This row surfaces that state in the same visual language the per-slot plugin
+// rows use — it reuses `_pluginLifecycleState` + `_renderLifecycleBadge` rather
+// than inventing a parallel mapping, so a connected reference manager shows the
+// green "active" dot, an unhealthy one the red "unhealthy" dot, and a
+// not-detected one the amber "inactive" dot with the "start tunnel to activate"
+// hint. Pure + exposed on `window` (the module's legacy convention) so the
+// vitest suite can assert the status mapping without a live DOM or fetch.
+// ---------------------------------------------------------------------------
+function _renderZoteroStatusRow(status: any): string {
+  const st = status || {};
+  const active = { zotero: !!st.zotero_active };
+  // /tunnel/status returns slot_status keyed by slot; pull just this slot's
+  // diagnostic so `_pluginLifecycleState` treats a connected-but-unhealthy
+  // socket as 'unhealthy' (matching the plugin rows), and so
+  // `_renderSlotHealthWarning` can render the actionable reason/detail badge.
+  const slotStatus = (st.slot_status && st.slot_status.zotero)
+    ? { zotero: st.slot_status.zotero } : {};
+  const lifecycleState = _pluginLifecycleState({ slot: 'zotero' }, active, slotStatus);
+  // Bundled slot: the install command mirrors the built-in default so a
+  // not-detected reference manager offers the same copy-command affordance the
+  // other bundled slots do. `_renderLifecycleBadge` only surfaces it in the
+  // not_installed state, which a bundled slot never reaches (it degrades to
+  // 'installed_inactive'), so this stays inert here but keeps the call shape
+  // identical to the plugin rows.
+  const installCmd = 'uvx zotero-mcp';
+  const badge = _renderLifecycleBadge({ slot: 'zotero' }, lifecycleState, installCmd);
+  const warnHtml = _renderSlotHealthWarning('zotero', slotStatus);
+  return `
+    <div data-zotero-status="${escapeHtml(lifecycleState)}"
+      style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text);font-weight:600">
+          Reference manager
+          <span style="font-size:9px;color:var(--muted);font-weight:400">/zotero</span>
+        </label>
+        ${badge}
+      </div>
+      <div style="margin-top:4px;font-size:9px;color:var(--muted);line-height:1.6">
+        Citation / reference-manager resolution against your local Zotero library
+        (<code style="font-family:var(--font-mono)">zotero-mcp</code>).
+      </div>
+      ${warnHtml}
+    </div>`;
+}
+window._renderZoteroStatusRow = _renderZoteroStatusRow;
