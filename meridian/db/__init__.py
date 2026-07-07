@@ -9929,6 +9929,14 @@ async def get_project_notes_page(
     # isn't lost to that function's own 500-row clamp at the limit==500 boundary.
     where, params = _project_notes_where(db, project_id, tag, query)
     cols = _project_notes_cols(bodies)
+    # 7000554a — a real total for the page envelope, so the dashboard can show the
+    # ACTUAL remaining count (and a per-subtab total) instead of a hardcoded page
+    # size. One cheap COUNT with the same filter; PG-safe row access.
+    async with db.execute(
+        f"SELECT COUNT(*) AS c FROM project_notes WHERE {where}", list(params),
+    ) as ccur:
+        crow = await ccur.fetchone()
+    total_count = int(crow["c"] if isinstance(crow, dict) else crow[0]) if crow else 0
     async with db.execute(
         f"SELECT {cols} FROM project_notes WHERE {where} "
         "ORDER BY created_at DESC LIMIT ? OFFSET ?",
@@ -9939,7 +9947,12 @@ async def get_project_notes_page(
     has_more = len(rows) > limit
     notes = rows[:limit]
     next_cursor = cursor + len(notes) if has_more else None
-    return {"notes": notes, "has_more": has_more, "next_cursor": next_cursor}
+    # remaining = notes not yet loaded after this page (>=0). Drives "Load N more".
+    remaining = max(0, total_count - (cursor + len(notes)))
+    return {
+        "notes": notes, "has_more": has_more, "next_cursor": next_cursor,
+        "total_count": total_count, "remaining": remaining,
+    }
 
 
 async def get_project_note_by_slug(

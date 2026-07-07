@@ -67,6 +67,10 @@ export async function loadNotesTab(projectId: string) {
   const NOTES_PAGE = 100;
   let nextCursor = 0;
   let hasMore = false;
+  // 7000554a — real totals from the page envelope so "Load More" shows the ACTUAL
+  // remaining count (not a hardcoded page size) and the count reflects a true total.
+  let totalCount = 0;
+  let remaining = 0;
 
   // Render (or remove) the "Load More" button below the notes list based on the
   // current hasMore flag — appended after the filtered list each render.
@@ -78,7 +82,10 @@ export async function loadNotesTab(projectId: string) {
     btn.id = `notes-load-more-${projectId}`;
     btn.className = 'secondary';
     btn.style = 'width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)';
-    btn.textContent = `Load ${NOTES_PAGE} more ↓`;
+    // 7000554a — real remaining count, not a hardcoded page size.
+    const n = remaining > 0 ? Math.min(NOTES_PAGE, remaining) : NOTES_PAGE;
+    const total = totalCount || allNotes.length;
+    btn.textContent = `Load ${n} more ↓  (${allNotes.length} of ${total})`;
     btn.onclick = () => loadMore(btn);
     body.appendChild(btn);
   };
@@ -184,6 +191,8 @@ export async function loadNotesTab(projectId: string) {
       allNotes = [...allNotes, ...(page.notes || [])];
       hasMore = !!page.has_more;
       nextCursor = page.next_cursor != null ? page.next_cursor : nextCursor;
+      if (page.total_count != null) totalCount = page.total_count;
+      if (page.remaining != null) remaining = page.remaining;
       refreshTagOptions();
       applyFilters();
     } catch (e: any) {
@@ -204,6 +213,8 @@ export async function loadNotesTab(projectId: string) {
       allNotes = page.notes || [];
       hasMore = !!page.has_more;
       nextCursor = page.next_cursor != null ? page.next_cursor : 0;
+      totalCount = page.total_count != null ? page.total_count : allNotes.length;
+      remaining = page.remaining != null ? page.remaining : 0;
       refreshTagOptions();
       applyFilters();
     } catch (e) {

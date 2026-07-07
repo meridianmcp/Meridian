@@ -6400,6 +6400,8 @@ project_id = "${displayPid}"`;
     const NOTES_PAGE = 100;
     let nextCursor = 0;
     let hasMore = false;
+    let totalCount = 0;
+    let remaining = 0;
     const renderLoadMore = () => {
       const existing = document.getElementById(`notes-load-more-${projectId}`);
       if (existing) existing.remove();
@@ -6408,7 +6410,9 @@ project_id = "${displayPid}"`;
       btn.id = `notes-load-more-${projectId}`;
       btn.className = "secondary";
       btn.style = "width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)";
-      btn.textContent = `Load ${NOTES_PAGE} more \u2193`;
+      const n2 = remaining > 0 ? Math.min(NOTES_PAGE, remaining) : NOTES_PAGE;
+      const total = totalCount || allNotes.length;
+      btn.textContent = `Load ${n2} more \u2193  (${allNotes.length} of ${total})`;
       btn.onclick = () => loadMore(btn);
       body.appendChild(btn);
     };
@@ -6504,6 +6508,8 @@ ${n2.tags || ""}`.toLowerCase();
         allNotes = [...allNotes, ...page.notes || []];
         hasMore = !!page.has_more;
         nextCursor = page.next_cursor != null ? page.next_cursor : nextCursor;
+        if (page.total_count != null) totalCount = page.total_count;
+        if (page.remaining != null) remaining = page.remaining;
         refreshTagOptions();
         applyFilters();
       } catch (e3) {
@@ -6524,6 +6530,8 @@ ${n2.tags || ""}`.toLowerCase();
         allNotes = page.notes || [];
         hasMore = !!page.has_more;
         nextCursor = page.next_cursor != null ? page.next_cursor : 0;
+        totalCount = page.total_count != null ? page.total_count : allNotes.length;
+        remaining = page.remaining != null ? page.remaining : 0;
         refreshTagOptions();
         applyFilters();
       } catch (e3) {

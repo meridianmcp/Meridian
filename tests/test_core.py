@@ -10943,6 +10943,12 @@ async def test_get_project_notes_page_cursor_walk(db):
     # Walking the cursor visited every note exactly once (no overlap/gap).
     seen = [n["id"] for pg in (first, second, third) for n in pg["notes"]]
     assert len(seen) == 5 and len(set(seen)) == 5
+    # 7000554a — the envelope carries a real total + a per-page remaining count, so
+    # the dashboard can render "Load N more (loaded of total)" instead of a
+    # hardcoded page size. total is constant; remaining shrinks to 0 on the last page.
+    assert first["total_count"] == 5 and first["remaining"] == 3   # 5 - (0+2)
+    assert second["total_count"] == 5 and second["remaining"] == 1  # 5 - (2+2)
+    assert third["total_count"] == 5 and third["remaining"] == 0    # 5 - (4+1)
 
 
 @pytest.mark.asyncio
