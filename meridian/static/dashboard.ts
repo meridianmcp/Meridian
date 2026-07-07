@@ -5841,11 +5841,7 @@ function cacheMostRecentSession(projectId: any, sessions: any) {
 
   if (!panel) return;
 
-  const sorted = sessions.slice().sort((a: any, b: any) =>
-
-    (b.last_seen || '').localeCompare(a.last_seen || '')
-
-  );
+  const sorted = sortSessionsMostRecentFirst(sessions);
 
   const top = sorted.find((s: any) => isLiveSession(s)) || sorted.find((s: any) => s.status !== 'closed') || sorted[0];
 
@@ -6742,11 +6738,7 @@ function populateSessionDropdown(projectId: any, sessions: any) {
 
   if (!sel) return;
 
-  const sorted = (sessions || []).slice().sort((a: any, b: any) =>
-
-    (b.last_seen || '').localeCompare(a.last_seen || '')
-
-  ).slice(0, 5);
+  const sorted = sortSessionsMostRecentFirst(sessions).slice(0, 5);
 
   if (!sorted.length) {
 
@@ -8906,13 +8898,9 @@ async function loadRecentSessions(projectId: any, sessions = null) {
 
       : await api(`/projects/${projectId}/sessions?active_only=false`);
 
-    const recent = (allSessions || [])
-
-      .filter((s: any) => s.id !== panel.liveSessionId && !isLiveSession(s))
-
-      .sort((a: any, b: any) => String(b.last_seen || b.created_at || '').localeCompare(String(a.last_seen || a.created_at || '')))
-
-      .slice(0, 5);
+    const recent = sortSessionsMostRecentFirst(
+      (allSessions || []).filter((s: any) => s.id !== panel.liveSessionId && !isLiveSession(s)),
+    ).slice(0, 5);
 
     if (!recent.length) { el.style.display = 'none'; return; }
 
@@ -11554,9 +11542,9 @@ async function refreshSessions(projectId: any) {
 
     }
 
-    for (const g of Object.values(groups)) {
+    for (const h of order) {
 
-      g.sort((a: any, b: any) => (b.last_seen || '').localeCompare(a.last_seen || ''));
+      groups[h] = sortSessionsMostRecentFirst(groups[h]);
 
     }
 

@@ -51,6 +51,8 @@ declare global {
   const formatRelativeTime: any;
   const sessionAgeMs: any;
   const isLiveSession: any;
+  const sessionRecencyKey: any;
+  const sortSessionsMostRecentFirst: any;
   const getPanelState: any;
   const toast: any;
   const _colorForHuman: any;
