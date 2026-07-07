@@ -34,6 +34,18 @@ import { createStore } from "zustand/vanilla";
 // the source-scanning UI tests keep matching); this module owns the grouping
 // model + the collapse/reveal wiring.
 import { wireVtabGroups } from "./dashboard-tabgroups";
+// d6b7da48 — client-side sidebar "folders/spheres" (localStorage-only grouping).
+import {
+  loadFolderAssignments,
+  saveFolderAssignments,
+  assignProjectToFolder,
+  groupProjectsByFolder,
+  knownFolderNames,
+  loadCollapsedFolders,
+  toggleFolderCollapsed,
+  UNGROUPED_LABEL,
+  type FolderProject,
+} from "./dashboard-folders";
 ﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
@@ -2559,57 +2571,79 @@ async function loadProjects() {
 
   list!.innerHTML = '';
 
-  state.projects.forEach(p => {
+  // d6b7da48 — group the flat project list into client-side "folders/spheres".
+  // Membership + collapse state are localStorage-only (no backend/schema). When
+  // no project is assigned to any folder, groupProjectsByFolder yields a single
+  // ungrouped catch-all and rendering is behavior-identical to the old flat list
+  // (the catch-all header is suppressed — see below).
 
-    const div = document.createElement('div');
+  const assignments = loadFolderAssignments(STORAGE_KEY('projectFolders'));
 
-    div.className = 'project-item' + (state.activeTab === p.id ? ' active' : '');
+  const collapsed = loadCollapsedFolders(STORAGE_KEY('projectFolderCollapsed'));
 
-    div.dataset.projectId = p.id;
+  const groups = groupProjectsByFolder<FolderProject>(state.projects as FolderProject[], assignments);
 
-    div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:4px;';
+  // Only decorate with folder chrome when at least one named folder exists.
 
-    const nameSpan = document.createElement('span');
+  const hasFolders = groups.some(g => g.folder !== null);
 
-    nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+  groups.forEach(group => {
 
-    nameSpan.textContent = p.name;
+    // Suppress the "Ungrouped" header entirely when nothing is foldered — the
 
-    // id shown in kebab menu instead
+    // list then looks exactly like the pre-folders flat list.
 
-    const menuBtn = document.createElement('button');
+    if (hasFolders) {
 
-    menuBtn.textContent = '⋯';
+      const isCollapsed = collapsed.has(group.key);
 
-    menuBtn.title = 'Project actions';
+      const header = document.createElement('div');
 
-    menuBtn.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0';
+      header.className = 'project-folder-header';
 
-    menuBtn.onmouseenter = () => menuBtn.style.color = 'var(--text)';
+      header.dataset.folderKey = group.key;
 
-    menuBtn.onmouseleave = () => menuBtn.style.color = 'var(--muted)';
+      header.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 4px;margin-top:4px;cursor:pointer;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.04em;user-select:none;';
 
-    menuBtn.onclick = (e) => {
+      const caret = document.createElement('span');
 
-      e.stopPropagation();
+      caret.textContent = isCollapsed ? '▸' : '▾';
 
-      // Find or create a fake tab object for _openTabMenu
+      caret.style.cssText = 'flex-shrink:0;font-size:9px;width:9px;';
 
-      let t = state.tabs.find(tab => tab.id === p.id);
+      const label = document.createElement('span');
 
-      if (!t) { openTab(p); t = state.tabs.find(tab => tab.id === p.id); }
+      label.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
 
-      if (t) _openTabMenu(t, menuBtn);
+      label.textContent = group.label;
 
-    };
+      const count = document.createElement('span');
 
-    div.appendChild(nameSpan);
+      count.style.cssText = 'flex-shrink:0;opacity:0.7;';
 
-    div.appendChild(menuBtn);
+      count.textContent = String(group.projects.length);
 
-    div.onclick = (e) => { if (e.target !== menuBtn) openTab(p); };
+      header.appendChild(caret);
 
-    list!.appendChild(div);
+      header.appendChild(label);
+
+      header.appendChild(count);
+
+      header.onclick = () => {
+
+        toggleFolderCollapsed(collapsed, group.key, STORAGE_KEY('projectFolderCollapsed'));
+
+        loadProjects();
+
+      };
+
+      list!.appendChild(header);
+
+      if (isCollapsed) return; // don't render members of a collapsed folder
+
+    }
+
+    group.projects.forEach(p => list!.appendChild(_makeProjectItem(p as any)));
 
   });
 
@@ -2640,6 +2674,102 @@ async function loadProjects() {
   }
 
   syncSidebarActiveProject();
+
+}
+
+
+
+// d6b7da48 — one sidebar project row. Extracted verbatim from loadProjects so the
+// same row markup/behavior renders whether the list is flat or grouped by folder.
+
+function _makeProjectItem(p: any) {
+
+  const div = document.createElement('div');
+
+  div.className = 'project-item' + (state.activeTab === p.id ? ' active' : '');
+
+  div.dataset.projectId = p.id;
+
+  div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:4px;';
+
+  const nameSpan = document.createElement('span');
+
+  nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+
+  nameSpan.textContent = p.name;
+
+  // id shown in kebab menu instead
+
+  const menuBtn = document.createElement('button');
+
+  menuBtn.textContent = '⋯';
+
+  menuBtn.title = 'Project actions';
+
+  menuBtn.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0';
+
+  menuBtn.onmouseenter = () => menuBtn.style.color = 'var(--text)';
+
+  menuBtn.onmouseleave = () => menuBtn.style.color = 'var(--muted)';
+
+  menuBtn.onclick = (e) => {
+
+    e.stopPropagation();
+
+    // Find or create a fake tab object for _openTabMenu
+
+    let t = state.tabs.find(tab => tab.id === p.id);
+
+    if (!t) { openTab(p); t = state.tabs.find(tab => tab.id === p.id); }
+
+    if (t) _openTabMenu(t, menuBtn);
+
+  };
+
+  div.appendChild(nameSpan);
+
+  div.appendChild(menuBtn);
+
+  div.onclick = (e) => { if (e.target !== menuBtn) openTab(p); };
+
+  return div;
+
+}
+
+
+
+// d6b7da48 — kebab-menu action: assign a project to a named folder (or clear it).
+// Prompt-based like _setProjectIcon/_renameProject; membership is localStorage-only.
+
+function _moveProjectToFolder(t: any) {
+
+  const assignments = loadFolderAssignments(STORAGE_KEY('projectFolders'));
+
+  const current = assignments[t.id] || '';
+
+  const existing = knownFolderNames(state.projects as FolderProject[], assignments);
+
+  const hint = existing.length ? `\n\nExisting folders: ${existing.join(', ')}` : '';
+
+  const next = window.prompt(
+
+    `Move "${t.project.name}" to a folder (leave blank for ${UNGROUPED_LABEL}).${hint}`,
+
+    current,
+
+  );
+
+  if (next === null) return; // cancelled
+
+  const updated = assignProjectToFolder(assignments, t.id, next);
+
+  saveFolderAssignments(updated, STORAGE_KEY('projectFolders'));
+
+  loadProjects();
+
+  const folder = (next || '').trim();
+
+  toast(folder ? `Moved to folder "${folder}"` : `Moved to ${UNGROUPED_LABEL}`);
 
 }
 
@@ -2987,6 +3117,8 @@ function _openTabMenu(t: any, anchor: any) {
   menuItem('\u270f Rename', () => _renameProject(t));
 
   menuItem('\ud83c\udfa8 Change icon\u2026', () => _setProjectIcon(t));
+
+  menuItem('\ud83d\udcc1 Move to folder\u2026', () => _moveProjectToFolder(t));
 
   menuItem('\u2b07 Download DB', () => window.open('/admin/snapshot', '_blank'));
 
