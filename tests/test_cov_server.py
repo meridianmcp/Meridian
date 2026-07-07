@@ -1530,3 +1530,30 @@ def test_wall_clock_now_named_zone_and_bad_zone_fallback():
     bad = server_module._wall_clock_now("Not/AZone")
     assert bad["tz"] == "UTC"
     assert bad["iso"].endswith("+00:00") or bad["iso"].endswith("Z")
+
+
+def test_executor_config_tz_reads_json_blob_and_defaults():
+    import meridian.server as server_module
+
+    assert server_module._executor_config_tz({"executor_config": {"timezone": "America/Denver"}}) == "America/Denver"
+    # JSON-string blob is parsed.
+    assert server_module._executor_config_tz({"executor_config": '{"timezone": "Europe/London"}'}) == "Europe/London"
+    # Missing / blank / bad → None (so _wall_clock_now falls back to UTC).
+    assert server_module._executor_config_tz({"executor_config": {}}) is None
+    assert server_module._executor_config_tz({"executor_config": {"timezone": "   "}}) is None
+    assert server_module._executor_config_tz(None) is None
+    assert server_module._executor_config_tz({"executor_config": "not json"}) is None
+
+
+def test_session_elapsed_human_and_none():
+    import meridian.server as server_module
+
+    assert server_module._session_elapsed({}) is None
+    assert server_module._session_elapsed({"created_at": "not-a-date"}) is None
+    # A created_at ~2h ago yields a positive elapsed with an "Nh Mm" label.
+    from datetime import datetime, timedelta, timezone
+    two_h_ago = (datetime.now(timezone.utc) - timedelta(hours=2, minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    el = server_module._session_elapsed({"created_at": two_h_ago})
+    assert el is not None
+    assert el["seconds"] >= 7200
+    assert el["human"].startswith("2h")

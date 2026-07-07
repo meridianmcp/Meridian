@@ -1095,6 +1095,9 @@ async def _build_context_refresh(db: Any, project_id: str) -> dict[str, Any] | N
         "high_priority_decisions": high_priority_decisions,
         "unvalidated_assumptions": unvalidated_assumptions,
         "key_note_slugs": key_note_slugs,
+        # 3d7b7aca — re-inject a timezone-aware time signal so a long session that
+        # refreshes after compaction re-anchors to the real wall-clock date/time.
+        "current_time": _server._wall_clock_now(_server._executor_config_tz(project)),
     }
 
 

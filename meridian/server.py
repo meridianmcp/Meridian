@@ -4159,6 +4159,41 @@ def _wall_clock_now(tz_name: str | None = None) -> dict[str, Any]:
     }
 
 
+def _executor_config_tz(project: dict[str, Any] | None) -> str | None:
+    """3d7b7aca — read a per-project IANA timezone from executor_config (a JSON
+    blob, so no schema change). Returns None when unset/blank so _wall_clock_now
+    defaults to UTC."""
+    cfg: Any = (project or {}).get("executor_config") or {}
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg) or {}
+        except Exception:  # noqa: BLE001
+            cfg = {}
+    tz = cfg.get("timezone") if isinstance(cfg, dict) else None
+    return tz.strip() if isinstance(tz, str) and tz.strip() else None
+
+
+def _session_elapsed(session: dict[str, Any] | None) -> dict[str, Any] | None:
+    """3d7b7aca — seconds + human label since a session's created_at. ~0 for a
+    fresh session; meaningful when start_session(mode='continue') resumes an
+    existing one. Returns None if created_at is missing/unparseable."""
+    created = (session or {}).get("created_at")
+    if not created:
+        return None
+    from datetime import datetime as _dt, timezone as _tz
+    try:
+        started = _dt.fromisoformat(str(created).replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=_tz.utc)
+        secs = max(0, int((_dt.now(_tz.utc) - started).total_seconds()))
+    except Exception:  # noqa: BLE001
+        return None
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    human = f"{h}h {m}m" if h else (f"{m}m {s}s" if m else f"{s}s")
+    return {"seconds": secs, "human": human}
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4383,8 +4418,10 @@ async def _start_session_composite(
             # spanning multiple calendar days doesn't drift on "today".
             "current_timestamp": _c_now,
             # 3d7b7aca — timezone-aware wall-clock block (offset, weekday, epoch)
-            # so the executor has an unambiguous, parseable time signal.
-            "current_time": _wall_clock_now(),
+            # so the executor has an unambiguous, parseable time signal. Honors a
+            # per-project executor_config.timezone; falls back to UTC.
+            "current_time": _wall_clock_now(_executor_config_tz(_c_project)),
+            "session_elapsed": _session_elapsed(session),
             "execution_mode": _c_mode,  # ecf69de8 — structured posture field
             "execution_mode_directive": _c_mode_directive,
             "execute_immediately": _c_execute_now,
@@ -4572,9 +4609,11 @@ async def _start_session_composite(
     payload: dict[str, Any] = {
         "session_id": session["id"],
         # 3d7b7aca — timezone-aware wall-clock so the full orientation carries a
-        # direct, unambiguous time signal (the compact path already does).
-        "current_timestamp": _wall_clock_now()["iso"],
-        "current_time": _wall_clock_now(),
+        # direct, unambiguous time signal (the compact path already does). Honors
+        # a per-project executor_config.timezone; falls back to UTC.
+        "current_timestamp": _wall_clock_now(_executor_config_tz(project))["iso"],
+        "current_time": _wall_clock_now(_executor_config_tz(project)),
+        "session_elapsed": _session_elapsed(session),
         "execution_mode": execution_mode,  # ecf69de8 — structured posture field
         "execution_mode_directive": mode_directive,
         "execute_immediately": _exec_now,
