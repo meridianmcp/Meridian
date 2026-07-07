@@ -13,6 +13,13 @@ import "./dashboard-plugins";
 import "./dashboard-notes";
 import "./dashboard-files";
 import "./dashboard-rewind";
+// e553fa7a — workspace Blog tab editor/card builders (edit-in-place for drafts).
+import {
+  blogEditorFormHtml,
+  blogPostCardHtml,
+  populateBlogEditor,
+  resetBlogEditor,
+} from "./dashboard-blog";
 // ff8ff615 — Preact Code Intel panel (layered package DAG, replaces ECharts circles).
 import { mountCodeIntelPanel } from "./components/CodeIntelPanel";
 // ed5512b6 — standalone, decoupled codegraph visualizer (folder->file->function
@@ -7432,30 +7439,75 @@ async function loadBlogTab(projectId: any) {
     { key: 'archived', label: 'ARCHIVED', color: 'var(--warning, #d29922)' },
   ];
 
+  const pid = String(projectId);
+  // e553fa7a — editable blog: an inline editor form (create + edit-in-place) at
+  // the top, and an "Edit" affordance on every post that repopulates the form
+  // from that post so a draft's title/body can be changed and re-saved.
   let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
     <div style="font-size:11px;color:var(--text)"><b>${posts.length}</b> post${posts.length === 1 ? '' : 's'}</div>
   </div>
-  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Author via the <code>save_blog_post</code> MCP tool; published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Edit a draft below (or author via the <code>save_blog_post</code> MCP tool); published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+
+  html += blogEditorFormHtml(pid, null);
 
   if (!posts.length) {
-    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one with <code>save_blog_post(title, body, status="published")</code>.</div>`;
+    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one above, or with <code>save_blog_post(title, body, status="published")</code>.</div>`;
   } else {
     for (const g of GROUPS) {
       const inGroup = posts.filter(p => String(p.status || 'draft') === g.key);
       if (!inGroup.length) continue;
       html += `<div style="font-size:9px;color:${g.color};letter-spacing:.06em;margin:12px 0 6px">${g.label} · ${inGroup.length}</div>`;
       for (const p of inGroup) {
-        const slug = String(p.slug || '');
-        const url = String(p.url || (slug ? `/blog/${slug}` : ''));
-        html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
-          <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(p.title || 'Untitled'))}</div>
-          <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px">${escapeHtml(slug)}</div>
-          ${url ? `<div style="margin-top:4px"><a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="font-size:10px;color:var(--accent)">${escapeHtml(url)}</a></div>` : ''}
-        </div>`;
+        html += blogPostCardHtml(p);
       }
     }
   }
   body.innerHTML = html;
+
+  // --- Wire the editor form + per-post Edit buttons. ------------------------
+  const byId = (suffix: string) => document.getElementById(`blog-editor-${suffix}-${pid}`);
+  const saveBtn = byId('save') as HTMLButtonElement | null;
+  const resetBtn = byId('reset') as HTMLButtonElement | null;
+  const msgEl = document.getElementById(`blog-editor-status-msg-${pid}`);
+
+  const doSave = async () => {
+    const idEl = document.getElementById(`blog-editor-id-${pid}`) as HTMLInputElement | null;
+    const titleEl = document.getElementById(`blog-editor-title-input-${pid}`) as HTMLInputElement | null;
+    const bodyEl = document.getElementById(`blog-editor-body-${pid}`) as HTMLTextAreaElement | null;
+    const statusEl = document.getElementById(`blog-editor-status-${pid}`) as HTMLSelectElement | null;
+    const title = (titleEl?.value || '').trim();
+    if (!title) { if (msgEl) msgEl.textContent = 'Title required'; return; }
+    if (saveBtn) saveBtn.disabled = true;
+    if (msgEl) msgEl.textContent = 'Saving…';
+    try {
+      await api('/workspace/blog', {
+        method: 'POST',
+        body: JSON.stringify({
+          id: idEl?.value || undefined,          // present ⇒ update in place (upsert by id)
+          title,
+          body: bodyEl?.value || '',
+          status: statusEl?.value || 'draft',
+        }),
+      });
+      loadBlogTab(projectId);                      // re-render (also resets the form)
+    } catch (e: any) {
+      if (saveBtn) saveBtn.disabled = false;
+      if (msgEl) msgEl.textContent = `Error: ${escapeHtml(String(e))}`;
+    }
+  };
+  if (saveBtn) saveBtn.onclick = doSave;
+  if (resetBtn) resetBtn.onclick = () => resetBlogEditor(pid);
+
+  body.querySelectorAll('.blog-edit-btn').forEach((btn) => {
+    (btn as HTMLElement).onclick = () => {
+      const bid = (btn as HTMLElement).getAttribute('data-blog-id') || '';
+      const post = posts.find(p => String(p.id || '') === bid);
+      if (!post) return;
+      populateBlogEditor(pid, post);
+      document.getElementById(`blog-editor-${pid}`)?.scrollIntoView({ block: 'nearest' });
+      (document.getElementById(`blog-editor-title-input-${pid}`) as HTMLInputElement | null)?.focus();
+    };
+  });
 }
 
 
