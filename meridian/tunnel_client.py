@@ -206,6 +206,41 @@ def _perform_self_update() -> bool:
 # SlotProxy — lazy-spawn subprocess manager (3649a61a)
 # ---------------------------------------------------------------------------
 
+def _port_is_open(port: int, host: str = "127.0.0.1", timeout: float = 0.25) -> bool:
+    """Return True iff a TCP connection to ``host:port`` succeeds right now.
+
+    A quick, blocking-but-brief socket connect used as a liveness signal for a
+    slot whose *launcher* process handle has exited but whose real server child
+    is still listening (c8e6b61c). The classic case is Windows Desktop Commander:
+    the tracked ``cmd /c npx …`` Popen returns as soon as ``cmd`` finishes, while
+    ``npx`` has already handed off to a detached MCP-server grandchild that keeps
+    the port bound. A dead launcher handle then makes ``poll()`` report
+    not-running, so the slot respawns on every single request ("spawning proxy …
+    on port 8813" repeating). Checking the port breaks that loop.
+
+    Pure + fail-safe: never raises. A refused connection (server down) or any
+    socket error returns False; only a completed connect returns True. The short
+    default timeout keeps this cheap enough to call on the request hot path — a
+    loopback connect to an open OR refused port returns effectively instantly;
+    the timeout only bounds the rare case of a filtered/hung port.
+    """
+    import socket  # noqa: PLC0415 — stdlib, local import keeps module import light
+
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    if port <= 0:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+    except Exception:  # noqa: BLE001 — liveness probe must never raise
+        return False
+
+
 class SlotProxy:
     """Manages one tunnel slot's mcp-proxy subprocess with lazy spawning.
 
@@ -250,8 +285,38 @@ class SlotProxy:
 
     @property
     def is_running(self) -> bool:
-        """True if the subprocess is alive."""
-        return self._proc is not None and self._proc.poll() is None
+        """True if this slot is serving — its launcher process OR its port is live.
+
+        c8e6b61c — a slot is considered running when EITHER:
+
+        * the tracked launcher ``Popen`` is still alive (``poll()`` is None), OR
+        * the launcher handle has exited but the server it started is still
+          listening on ``self.port`` (a quick loopback socket connect succeeds).
+
+        The second clause fixes the Desktop-Commander respawn storm on Windows:
+        DC is launched as ``cmd /c npx -y @wonderwhy-er/desktop-commander@latest``,
+        and ``cmd /c`` returns the instant npx hands the real MCP server off to a
+        detached grandchild. Relying on the launcher ``poll()`` alone then reports
+        not-running while the server is very much up, so ``ensure_running`` respawns
+        it on every request. Falling back to a port check keeps a live-but-detached
+        slot counted as running. Cross-platform: on POSIX (and the direct-spawn
+        path) the launcher handle is normally the server itself, so the first
+        clause matches and the port check is never reached.
+
+        The port check is only consulted when the launcher handle is gone/dead, so
+        the healthy hot path (proc alive) stays a cheap ``poll()`` with no socket
+        call.
+        """
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+        # Launcher handle absent or exited — the real server may still be
+        # listening (Windows cmd/c + detached npx grandchild). Only probe the
+        # port once we've actually attempted a spawn, so a never-started slot
+        # (or one that was explicitly killed) doesn't get falsely revived by an
+        # unrelated process that happens to hold the port.
+        if self._proc is None:
+            return False
+        return _port_is_open(self.port)
 
     def touch(self) -> None:
         """Record the current time as the last-used timestamp."""
