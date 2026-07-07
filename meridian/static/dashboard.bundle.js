@@ -115,6 +115,15 @@
   var DEFAULT_MAX_PINNED_DECISIONS2 = 20;
   var DEFAULT_CONTEXT_THRESHOLD2 = 40;
   var DEFAULT_MAX_TURNS2 = 200;
+  function sessionRecencyKey(session) {
+    if (!session) return "";
+    return String(session.last_seen || session.created_at || "");
+  }
+  function sortSessionsMostRecentFirst2(sessions) {
+    return (sessions ? sessions.slice() : []).sort(
+      (a3, b2) => sessionRecencyKey(b2).localeCompare(sessionRecencyKey(a3))
+    );
+  }
   function getPanelState2(projectId) {
     window.state.panels[projectId] = window.state.panels[projectId] || {};
     return window.state.panels[projectId];
@@ -191,6 +200,8 @@
       formatRelativeTime: formatRelativeTime2,
       sessionAgeMs: sessionAgeMs2,
       isLiveSession: isLiveSession2,
+      sessionRecencyKey,
+      sortSessionsMostRecentFirst: sortSessionsMostRecentFirst2,
       _colorForHuman: _colorForHuman2,
       _PLAN_LABELS: _PLAN_LABELS2,
       QUEUE_DONE_PAGE_SIZE: QUEUE_DONE_PAGE_SIZE2,
@@ -1248,7 +1259,7 @@
   }
 
   // meridian/static/dashboard-mcp.ts
-  function _renderToolEntry2(tool) {
+  function _renderToolEntry(tool) {
     const props = tool.inputSchema && tool.inputSchema.properties ? tool.inputSchema.properties : {};
     const required = new Set(tool.inputSchema && tool.inputSchema.required || []);
     const params = Object.entries(props).map(([name, schema]) => {
@@ -1260,8 +1271,34 @@
     const signature = Object.keys(props).map((n2) => required.has(n2) ? n2 : `${n2}?`).join(", ");
     return `<div class="tool-entry" data-search="${escapeHtml((tool.name || "") + " " + (tool.description || ""))}" style="margin-bottom:14px"><div style="color:var(--text);font-weight:600;font-size:13px">${escapeHtml(tool.name)}(<span style="color:var(--muted);font-weight:400">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 5px 0;font-size:12px;line-height:1.45">${escapeHtml(tool.description || "")}</div>${params ? `<table style="font-size:11px;border-collapse:collapse;width:100%">${params}</table>` : ""}</div>`;
   }
+  function _groupToolsByCategory(tools, categories) {
+    const byName = {};
+    (tools || []).forEach((t3) => {
+      if (t3 && t3.name) byName[t3.name] = t3;
+    });
+    const groups = [];
+    const claimed = /* @__PURE__ */ new Set();
+    for (const [key, names] of Object.entries(categories || {})) {
+      const catTools = (names || []).map((n2) => byName[n2]).filter(Boolean);
+      if (!catTools.length) continue;
+      catTools.forEach((t3) => claimed.add(t3.name));
+      groups.push({ key, tools: catTools });
+    }
+    const rest = (tools || []).filter((t3) => t3 && t3.name && !claimed.has(t3.name));
+    if (rest.length) groups.push({ key: "other", tools: rest });
+    return groups;
+  }
+  function _renderToolSections2(tools, categories, labels) {
+    const groups = _groupToolsByCategory(tools, categories);
+    return groups.map(({ key, tools: catTools }) => {
+      const label = labels && labels[key] || "Other";
+      const summary = `<summary style="cursor:pointer;list-style:none;color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border);user-select:none">${escapeHtml(label)} <span style="color:var(--muted)">(${catTools.length})</span></summary>`;
+      const body = catTools.map(_renderToolEntry).join("");
+      return `<details open class="tool-category" data-category="${escapeHtml(key)}" style="margin-bottom:18px">${summary}${body}</details>`;
+    }).join("");
+  }
   try {
-    Object.assign(window, { _renderToolEntry: _renderToolEntry2 });
+    Object.assign(window, { _renderToolEntry, _groupToolsByCategory, _renderToolSections: _renderToolSections2 });
   } catch (e3) {
   }
 
@@ -5669,11 +5706,23 @@ project_id = "${displayPid}"`;
     return `
         <div data-slot-stale="${escapeHtml(p3.slot)}" style="margin-top:6px;padding:6px 8px;border:1px solid #3b82f6;border-radius:4px;background:rgba(59,130,246,0.10);font-size:9px;line-height:1.6;color:#7dd3fc">
           <span style="font-weight:700">&#9888; newer default available</span> \u2014 your saved command is an old built-in default. Current default: <b>${label}</b>${newer ? ` (<code style="font-family:var(--font-mono)">${escapeHtml(newer)}</code>)` : ""}.
-          <button type="button" class="tp-reset-default" style="margin-left:6px;background:none;border:1px solid #3b82f6;border-radius:3px;color:#7dd3fc;font-size:8px;padding:1px 6px;cursor:pointer"
-            onclick="var r=this.closest('[data-lifecycle]'); if(r){var c=r.querySelector('.tp-command'); if(c){c.value=''; c.dispatchEvent(new Event('input',{bubbles:true}));}}">Use new default</button>
+          <button type="button" class="tp-reset-default" data-newer="${escapeHtml(newer)}" style="margin-left:6px;background:none;border:1px solid #3b82f6;border-radius:3px;color:#7dd3fc;font-size:8px;padding:1px 6px;cursor:pointer"
+            onclick="window._applyStaleOverrideDefault && window._applyStaleOverrideDefault(this)">Use new default</button>
         </div>`;
   }
   window._renderStaleOverrideWarning = _renderStaleOverrideWarning;
+  function _applyStaleOverrideDefault(btn) {
+    if (!btn || typeof btn.closest !== "function") return;
+    const row = btn.closest("[data-lifecycle]");
+    if (!row) return;
+    const cmd = row.querySelector(".tp-command");
+    if (!cmd) return;
+    const newer = btn.getAttribute ? btn.getAttribute("data-newer") || "" : "";
+    if (!newer) return;
+    cmd.value = newer;
+    cmd.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  window._applyStaleOverrideDefault = _applyStaleOverrideDefault;
   function _fsAttr(v3) {
     return escapeHtml(String(v3 == null ? "" : v3));
   }
@@ -7654,6 +7703,11 @@ ${n2.tags || ""}`.toLowerCase();
     if (named && named.name) return `${named.name} \xB7 layer ${rank}`;
     return rank === "other" ? "unlayered" : `layer ${rank}`;
   }
+  function isNotConnectedError(error) {
+    if (!error) return false;
+    const e3 = error.toLowerCase();
+    return e3.includes("503") || e3.includes("not connected") || e3.includes("not_connected") || e3.includes("no active") || e3.includes("tunnel") && (e3.includes("not") || e3.includes("no "));
+  }
   var CI_EDGE_TYPES = ["contains", "imports", "inherits", "invokes"];
   var CI_EDGE_COLORS = {
     contains: "#64748b",
@@ -7776,6 +7830,25 @@ ${n2.tags || ""}`.toLowerCase();
       return /* @__PURE__ */ u3("div", { class: "ci-state ci-loading", role: "status", style: STATE_STYLE, children: "Loading code intelligence\u2026" });
     }
     if (status === "error") {
+      if (isNotConnectedError(error)) {
+        return /* @__PURE__ */ u3(
+          "div",
+          {
+            class: "ci-state ci-not-connected",
+            role: "status",
+            style: { ...STATE_STYLE, color: "var(--muted)", lineHeight: "1.6" },
+            children: [
+              /* @__PURE__ */ u3("div", { style: { fontSize: "12px", color: "var(--text)", fontWeight: 600, marginBottom: "4px" }, children: "Code index not connected" }),
+              /* @__PURE__ */ u3("div", { children: "The code intelligence tunnel slot isn't connected yet. Start the tunnel and connect the code slot to populate the package graph:" }),
+              /* @__PURE__ */ u3("div", { style: { marginTop: "6px" }, children: [
+                "Run ",
+                /* @__PURE__ */ u3("code", { children: "meridian --tunnel" }),
+                " in your repo, then open this panel again."
+              ] })
+            ]
+          }
+        );
+      }
       return /* @__PURE__ */ u3("div", { class: "ci-state ci-error", role: "alert", style: { ...STATE_STYLE, color: "var(--error,#ef4444)" }, children: [
         "Failed to load code intelligence: ",
         error || "unknown error"
@@ -11918,9 +11991,7 @@ Current: ${current || "(none)"}`,
   function cacheMostRecentSession(projectId, sessions) {
     const panel = state.panels[projectId];
     if (!panel) return;
-    const sorted = sessions.slice().sort(
-      (a3, b2) => (b2.last_seen || "").localeCompare(a3.last_seen || "")
-    );
+    const sorted = sortSessionsMostRecentFirst(sessions);
     const top = sorted.find((s3) => isLiveSession(s3)) || sorted.find((s3) => s3.status !== "closed") || sorted[0];
     if (top) panel.liveLastSessionId = top.id;
   }
@@ -12460,9 +12531,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   function populateSessionDropdown(projectId, sessions) {
     const sel = document.getElementById(`continue-session-${projectId}`);
     if (!sel) return;
-    const sorted = (sessions || []).slice().sort(
-      (a3, b2) => (b2.last_seen || "").localeCompare(a3.last_seen || "")
-    ).slice(0, 5);
+    const sorted = sortSessionsMostRecentFirst(sessions).slice(0, 5);
     if (!sorted.length) {
       sel.innerHTML = '<option value="">(no sessions yet)</option>';
       return;
@@ -12566,30 +12635,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         body.innerHTML = '<div class="empty" style="color:var(--muted)">No tools returned.</div>';
         return;
       }
-      const byName = {};
-      tools.forEach((t3) => {
-        byName[t3.name] = t3;
-      });
-      let html = "";
-      const categorized = /* @__PURE__ */ new Set();
-      for (const [cat, names] of Object.entries(_TOOL_CATEGORIES)) {
-        const catTools = names.map((n2) => byName[n2]).filter(Boolean);
-        if (!catTools.length) continue;
-        html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">${_CATEGORY_LABELS[cat]}</div>`;
-        catTools.forEach((tool) => {
-          categorized.add(tool.name);
-          html += _renderToolEntry(tool);
-        });
-        html += "</div>";
-      }
-      const rest = tools.filter((t3) => !categorized.has(t3.name));
-      if (rest.length) {
-        html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Other</div>`;
-        rest.forEach((tool) => {
-          html += _renderToolEntry(tool);
-        });
-        html += "</div>";
-      }
+      const _catLabels = { ..._CATEGORY_LABELS, other: "Other" };
+      const html = _renderToolSections(tools, _TOOL_CATEGORIES, _catLabels);
       const _toolSearch = `<div style="position:sticky;top:0;background:var(--surface-1,#10131a);padding:0 0 8px;margin-bottom:6px;z-index:2"><input type="text" id="docs-search-${projectId}" placeholder="Search tools by name or description\u2026" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:5px 9px;outline:none"></div>`;
       body.innerHTML = _toolSearch + html;
       _wireTabSearch(`docs-search-${projectId}`, `docs-body-${projectId}`, ".tool-entry");
@@ -13947,7 +13994,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     try {
       const panel = getPanelState(projectId);
       const allSessions = Array.isArray(sessions) ? sessions : await api(`/projects/${projectId}/sessions?active_only=false`);
-      const recent = (allSessions || []).filter((s3) => s3.id !== panel.liveSessionId && !isLiveSession(s3)).sort((a3, b2) => String(b2.last_seen || b2.created_at || "").localeCompare(String(a3.last_seen || a3.created_at || ""))).slice(0, 5);
+      const recent = sortSessionsMostRecentFirst(
+        (allSessions || []).filter((s3) => s3.id !== panel.liveSessionId && !isLiveSession(s3))
+      ).slice(0, 5);
       if (!recent.length) {
         el2.style.display = "none";
         return;
@@ -15383,8 +15432,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         }
         groups[h3].push(s3);
       }
-      for (const g2 of Object.values(groups)) {
-        g2.sort((a3, b2) => (b2.last_seen || "").localeCompare(a3.last_seen || ""));
+      for (const h3 of order) {
+        groups[h3] = sortSessionsMostRecentFirst(groups[h3]);
       }
       const rows = order.map((h3) => {
         const humanSessions = groups[h3];
