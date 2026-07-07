@@ -1267,6 +1267,19 @@ def test_mcp_get_json(client):
     assert r.json()["name"] == "meridian"
 
 
+def test_mcp_get_sse_accept_redirects(client):
+    """736d300e — GET /mcp with an SSE Accept header must redirect to /mcp/sse.
+    Regression for the F821 bug where it called an undefined `_RR` and raised
+    NameError (500) for every event-stream client instead of redirecting."""
+    r = client.get(
+        "/mcp",
+        headers={"accept": "text/event-stream"},
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 303, 307, 308)
+    assert r.headers["location"] == "/mcp/sse"
+
+
 def test_mcp_sse_options(client):
     r = client.options("/mcp/sse")
     assert r.status_code == 204

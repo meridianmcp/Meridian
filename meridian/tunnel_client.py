@@ -20,6 +20,8 @@ mirrors the protocol documented there.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import asyncio
 import base64
 import json

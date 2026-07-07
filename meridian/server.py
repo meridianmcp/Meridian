@@ -5913,7 +5913,10 @@ _SSE_SESSIONS: dict[str, dict[str, Any]] = {}  # session_id → {db, queue}
 async def _mcp_get(request: Request):
     accept = request.headers.get("accept", "")
     if "text/event-stream" in accept:
-        return _RR("/mcp/sse")
+        # 736d300e — was `_RR(...)`, an undefined name (ruff F821): this endpoint
+        # raised NameError for any SSE client instead of redirecting. Real fix:
+        # RedirectResponse (imported at module top) to the SSE transport route.
+        return RedirectResponse("/mcp/sse")
     return JSONResponse(
         {"name": "meridian", "version": "1.0", "transport": "http+sse"},
         headers={"Cache-Control": "no-store, no-cache"},
