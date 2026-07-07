@@ -1385,6 +1385,67 @@ def _prospecting_result(
     return None, "no_targets"
 
 
+def _prospected_pointer_targets(item: "dict[str, Any]") -> list[dict[str, Any]]:
+    """691f4e1c — DURABLE, resolvable ``symbol`` pointer targets from an item's declared
+    ``touches_resources``, so add/update prospecting can persist a real, queryable
+    pointer instead of leaving only a one-shot ``code_context`` hint.
+
+    Delegates to :func:`handoff.build_declared_symbol_targets` — the shared source of
+    truth (reused, not duplicated: handoff.py already owns the touches_resources parse
+    and the graph-match ``symbol`` shape). The server can't reach the code index
+    (04a15d3f — behind the executor's tunnel), so an exact line ``range`` can't be
+    resolved at write time; a ``symbol`` selector carrying the declared
+    ``qualified_name`` is the tunnel-free equivalent, best-matched against the graph
+    LATER by ``resolve_sprint_item_pointers``. Never raises.
+    """
+    try:
+        from .. import handoff as _handoff  # noqa: PLC0415 — avoid import cycle
+        return _handoff.build_declared_symbol_targets(item)
+    except Exception:  # noqa: BLE001 — best-effort; never break add/update
+        return []
+
+
+async def _persist_prospected_pointer(
+    db: Any,
+    project_id: str,
+    item: "dict[str, Any] | None",
+    status: str,
+) -> "dict[str, Any] | None":
+    """691f4e1c — at add/update time, PERSIST the prospected code context as a real
+    ``symbol``-source sprint-item pointer (durable + queryable), not just the inline
+    ``code_context`` hint. Returns the stored pointer, or ``None`` when nothing durable
+    could be persisted (no declared symbol / non-code item / not prospected / error).
+
+    Idempotent-ish for update: skips creation when the item already carries a code /
+    symbol pointer, so a re-run of update_sprint_item doesn't stack duplicate pointers.
+    Best-effort + fully guarded — a pointer-persist failure must NEVER break the hot
+    add/update path (the item is already written; the inline hint still ships).
+    """
+    if status != "prospected" or not isinstance(item, dict):
+        return None
+    item_id = item.get("id")
+    if not item_id or not project_id:
+        return None
+    targets = _prospected_pointer_targets(item)
+    if not targets:
+        return None
+    try:
+        # Don't stack duplicates: if a durable code/symbol pointer already exists on
+        # this item, leave it (update re-runs prospecting but shouldn't pile pointers).
+        existing = await db_module.get_sprint_item_pointers(db, item_id)
+        if any(
+            isinstance(p, dict) and p.get("source_type") in ("code", "symbol")
+            for p in (existing or [])
+        ):
+            return None
+        return await db_module.add_sprint_item_pointer(
+            db, project_id, item_id, "symbol", targets,
+            label="auto-prospected (add/update-time)",
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never break add/update
+        return None
+
+
 async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
     """fd86aacc — names of executor sessions seen active in the last 10 minutes.
 
@@ -3560,6 +3621,15 @@ async def _handle_sprint_tools(
         _extra["prospecting_status"] = _pc_status
         if _pc_ctx:
             _extra["code_context"] = _pc_ctx
+        # 691f4e1c — persist a DURABLE symbol pointer (not just the inline hint) when
+        # the item declares real symbols, so prospecting is queryable later via
+        # get_sprint_item_pointers / resolvable through the tunnel, instead of a
+        # one-shot code_context the caller has to act on manually. Fully guarded.
+        _ptr = await _persist_prospected_pointer(
+            db, args["project_id"], _new_item, _pc_status
+        )
+        if _ptr:
+            _extra["prospected_pointer"] = _ptr
         if _extra:
             _new_item = {**_new_item, **_extra}
         return _new_item
@@ -3651,6 +3721,14 @@ async def _handle_sprint_tools(
         item = {**item, "prospecting_status": _u_status}
         if _u_ctx:
             item["code_context"] = _u_ctx
+        # 691f4e1c — persist the durable symbol pointer on update too (skips if the
+        # item already carries a code/symbol pointer, so re-editing doesn't stack
+        # duplicates). Guarded; a persist failure never breaks the update.
+        _u_ptr = await _persist_prospected_pointer(
+            db, args["project_id"], item, _u_status
+        )
+        if _u_ptr:
+            item["prospected_pointer"] = _u_ptr
         return item
     if name == "set_sprint":
         # 62d321dd — guard: warn if pending items were never started before rolling sprint

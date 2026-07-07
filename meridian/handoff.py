@@ -1063,6 +1063,78 @@ def _touches_resource_terms(item: dict[str, Any]) -> list[str]:
     return terms
 
 
+def build_declared_symbol_targets(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """691f4e1c — build DURABLE ``symbol`` pointer targets from an item's DECLARED
+    ``touches_resources`` (no code index required), so add/update-time prospecting can
+    persist a real, retrievable pointer rather than a one-shot ``code_context`` hint.
+
+    Shared source of truth reused by the handler's add/update prospecting path so the
+    ``symbol``-selector shape isn't duplicated across modules (this file already owns
+    the touches_resources parsing + the graph-match ``_normalize_code_pointer`` shape).
+
+    The server can't reach the code graph (04a15d3f — it's behind the executor's
+    tunnel), so an exact line ``range`` can't be resolved at write time. A W3C
+    ``symbol`` selector carrying the declared ``qualified_name`` is the tunnel-free
+    equivalent: stored verbatim now, best-matched against the graph LATER at resolve
+    time by ``pointers._resolve_symbol`` once the tunnel is up. Only ``symbol:<qn>``
+    entries yield a target — a bare ``file:``/``inferred:file:`` touch has no exact
+    symbol location tunnel-free, and fabricating one would attach a misleading,
+    unresolvable pointer. Symbols are paired with the first declared file as the
+    target ``uri`` when present, else a ``symbol:`` URI. Never raises.
+    """
+    raw = item.get("touches_resources")
+    ids: list[Any] = []
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            ids = parsed if isinstance(parsed, list) else [raw]
+        except Exception:  # noqa: BLE001
+            ids = [raw]
+    elif isinstance(raw, list):
+        ids = raw
+    files: list[str] = []
+    # Each symbol carries its own file scope: a ``symbol:<path>::<name>`` id (63b030a6)
+    # names both the file (uri) and the symbol (qualified_name).
+    symbols: list[tuple[str, str | None]] = []
+    for ident in ids:
+        s = str(ident or "").strip()
+        if not s:
+            continue
+        if s.startswith("inferred:"):
+            s = s[len("inferred:"):].strip()
+        if s.startswith("symbol:"):
+            # ``symbol:<path>::<name>`` — split off the ``::<name>`` symbol scope; the
+            # bare symbol name is the query the code-graph resolver best-matches on.
+            body = s[len("symbol:"):].strip()
+            if not body:
+                continue
+            path, sep, name = body.partition("::")
+            if sep and name.strip():
+                symbols.append((name.strip(), path.strip() or None))
+            elif body:
+                # No ``::`` scope — treat the whole tail as the qualified_name.
+                symbols.append((body, None))
+        elif s.startswith("file:"):
+            fp = s[len("file:"):].strip()
+            if fp:
+                files.append(fp)
+    if not symbols:
+        return []
+    default_file = files[0] if files else None
+    targets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for qn, sym_file in symbols:
+        if qn in seen:
+            continue
+        seen.add(qn)
+        file_for_uri = sym_file or default_file
+        targets.append({
+            "uri": f"file:{file_for_uri}" if file_for_uri else f"symbol:{qn}",
+            "selector": {"type": "symbol", "qualified_name": qn},
+        })
+    return targets
+
+
 def _prospect_query(item: dict[str, Any], title: str, kws: set[str]) -> str:
     """182468a6 — prefer the item's declared touches_resources (real file/symbol
     identifiers) as the search target; fall back to stopword-stripped title
