@@ -28,6 +28,12 @@ import { mountCodeIntelPanel } from "./components/CodeIntelPanel";
 import { buildCodeGraphModel, renderCodeGraph } from "./codegraph";
 import type { GraphNodeInput } from "./codegraph";
 import { createStore } from "zustand/vanilla";
+// 2d3b8424 — group the ~18 flat vtabs into logical groups (Overview/Planning/
+// Work/Content/History). Pure IA: every data-vtab still renders, unchanged.
+// The grouped button markup lives inline in buildTabBody (literal buttons, so
+// the source-scanning UI tests keep matching); this module owns the grouping
+// model + the collapse/reveal wiring.
+import { wireVtabGroups } from "./dashboard-tabgroups";
 ﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
@@ -3193,41 +3199,91 @@ function buildTabBody(project: any) {
 
     <div class="vtab-strip" id="vtab-strip-${project.id}">
 
-      <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">📊</button>
+      <div class="vtab-group" data-vgroup="overview" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="live" title="Live — right-now view">⚡</button>
+        <button class="vtab-group-header" data-vgroup-toggle="overview" title="Overview" aria-label="Overview group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">📊</button>
 
-      <button class="vtab-btn" data-vtab="goal" title="Goal State">🎯</button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      ${(window.MERIDIAN_HOSTED && !(project.github_repo || project.repo)) ? '' : '<button class="vtab-btn" data-vtab="files" title="Files">📁</button>'}
+          <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">📊</button>
 
-      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
+          <button class="vtab-btn" data-vtab="live" title="Live — right-now view">⚡</button>
 
-      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">📅</button>
+        </div>
 
-      <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
+      </div>
 
-      <button class="vtab-btn" data-vtab="queue" title="Work Queue">👷</button>
+      <div class="vtab-group" data-vgroup="planning" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
+        <button class="vtab-group-header" data-vgroup-toggle="planning" title="Planning" aria-label="Planning group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">🎯</button>
 
-      <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki" style="position:relative">📝<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+          <button class="vtab-btn" data-vtab="goal" title="Goal State">🎯</button>
 
-      <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
+          <button class="vtab-btn" data-vtab="insights" title="Insights — durable strategic understanding">💡</button>
 
-      <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
+          <button class="vtab-btn" data-vtab="blog" title="Blog — workspace posts (draft/published/archived)">✍️</button>
 
-      <button class="vtab-btn" data-vtab="codeintel" title="Code Intel — codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">🔍</button>
+        </div>
 
-      <button class="vtab-btn" data-vtab="documents" title="Documents — ingested docs &amp; structure">📄</button>
+      </div>
 
-      <button class="vtab-btn" data-vtab="insights" title="Insights — durable strategic understanding">💡</button>
+      <div class="vtab-group" data-vgroup="work" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="blog" title="Blog — workspace posts (draft/published/archived)">✍️</button>
+        <button class="vtab-group-header" data-vgroup-toggle="work" title="Work" aria-label="Work group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">👷</button>
 
-      <button class="vtab-btn" data-vtab="sessions" title="Sessions — executor session timeline (done / failed / stopped-ambiguously)">🕒</button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="queue" title="Work Queue">👷</button>
+
+          <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+
+          <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
+
+          <button class="vtab-btn" data-vtab="sessions" title="Sessions — executor session timeline (done / failed / stopped-ambiguously)">🕒</button>
+
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="content" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="content" title="Content" aria-label="Content group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">📁</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          ${(window.MERIDIAN_HOSTED && !(project.github_repo || project.repo)) ? '' : '<button class="vtab-btn" data-vtab="files" title="Files">📁</button>'}
+
+          <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki" style="position:relative">📝<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+
+          <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
+
+          <button class="vtab-btn" data-vtab="documents" title="Documents — ingested docs &amp; structure">📄</button>
+
+          <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
+
+          <button class="vtab-btn" data-vtab="codeintel" title="Code Intel — codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">🔍</button>
+
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="history" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="history" title="History" aria-label="History group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">📅</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">📅</button>
+
+          <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
+
+          <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
+
+        </div>
+
+      </div>
 
     </div>
 
@@ -4229,6 +4285,11 @@ function buildTabBody(project: any) {
 
   if (vtabStrip && drawer) {
 
+    // 2d3b8424 — wire the collapsible group headers; revealGroupForTab re-expands
+    // a (possibly user-collapsed) group before we activate one of its tabs, so no
+    // navigation path can land on a hidden button.
+    const { revealGroupForTab } = wireVtabGroups(vtabStrip);
+
     vtabStrip.querySelectorAll('.vtab-btn').forEach(btn => {
 
       btn.onclick = () => {
@@ -4236,6 +4297,9 @@ function buildTabBody(project: any) {
         const vtab = btn.dataset.vtab;
 
         const p = state.panels[project.id];
+
+        // Keep the clicked tab's group expanded so it stays visible/measurable.
+        revealGroupForTab(vtab);
 
         // v1.4.0: drawer is always visible — just switch active panel.
 
@@ -4319,6 +4383,7 @@ function buildTabBody(project: any) {
     try {
       const saved = localStorage.getItem('meridian_last_tab_' + project.id);
       if (saved) {
+        revealGroupForTab(saved);
         const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
         if (savedBtn) savedBtn.click();
       }
