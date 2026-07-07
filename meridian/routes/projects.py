@@ -793,20 +793,24 @@ async def get_timeline_endpoint(
 ) -> dict[str, Any]:
     """v1.1.1 — return the data needed to render the Activity Timeline.
 
-    v1.6.x — filtered to only meaningful history: completed/failed tasks
-    plus goal-change events. Session idle/active events were noise and
-    have been dropped (the LIVE vtab covers active sessions instead).
-    Pending/in_progress tasks belong on the LIVE tab, not in history.
+    b8c79a8a — surface *every* logged task, not just done/failed. An earlier
+    v1.6.x filter narrowed ``tasks`` to ``done``/``failed`` on the theory that
+    pending/in_progress rows were LIVE-tab noise. But ``get_timeline`` only
+    reads ``task_log`` (never session lifecycle events), so that filter dropped
+    genuine ``log_task`` activity — the same activity that the standup digest
+    and heatmap ``daily_counts`` still count. A project whose recent work was
+    logged as ``in_progress``/``pending`` therefore returned an empty ``tasks``
+    list, and the frontend's ``!tasks.length`` gate rendered "no activity yet"
+    even though ``daily_counts`` was populated. Return all task_log rows so the
+    timeline matches the standup and the heatmap; the LIVE vtab still owns
+    real-time session presence separately.
     """
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     timeline = await db_module.get_timeline(await _db(request), project_id)
     return {
-        "tasks": [
-            t for t in timeline.get("tasks", [])
-            if t.get("status") in ("done", "failed")
-        ],
+        "tasks": timeline.get("tasks", []),
         "sessions": [],
         "goal_events": timeline.get("goal_events", []),
         "daily_counts": timeline.get("daily_counts", []),
