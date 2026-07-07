@@ -60,15 +60,20 @@ _SLOT_REPROBE_INTERVAL = 60.0
 # for slots whose launcher is already on disk.
 _PREFLIGHT_BUDGET_DEFAULT: "tuple[int, float]" = (2, 3.0)
 # 089a936a — a LARGER first-spawn budget for "cold-fetch" slots whose very first
-# spawn triggers an npx cold download (e.g. Desktop Commander:
-# `npx -y @wonderwhy-er/desktop-commander@latest`) that can exceed the default
-# ~23s. attempts=4 × delay=5s with the 10s per-attempt timeout ≈ up to ~55s.
+# spawn triggers a network cold download (e.g. Desktop Commander:
+# `npx -y @wonderwhy-er/desktop-commander@latest`, or the office slots'
+# `uvx docx-mcp` / `uvx powerpoint-mcp`) that can exceed the default ~23s.
+# attempts=4 × delay=5s with the 10s per-attempt timeout ≈ up to ~55s.
 # This applies ONLY to the first-spawn pre-flight, NOT the 60s background reprobe
 # (which stays attempts=1).
 _PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
-# 089a936a — slots that npx-download their inner server on first launch. These
-# get the larger cold-fetch pre-flight budget above. (dc = Desktop Commander.)
-_COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc"})
+# 089a936a / 24b6cb5d — slots that download their inner server on first launch and
+# so need the larger cold-fetch pre-flight budget above. dc = Desktop Commander
+# (npx). ppt/word = the Office slots (`uvx powerpoint-mcp` / `uvx docx-mcp`): their
+# first spawn triggers a uvx download of the same order as DC's npx fetch, so they
+# were failing the standard ~23s budget on a cold cache (live symptom:
+# "tunnel:ppt: pre-flight health check FAILED"). Give them the same extended budget.
+_COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc", "ppt", "word"})
 
 
 # ---------------------------------------------------------------------------

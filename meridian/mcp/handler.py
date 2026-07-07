@@ -814,6 +814,14 @@ async def _handle_mcp_request(
         tools = list(_server._MCP_TOOLS_LIST)
         if tenant:
             tools = tools + _server._github_tools_for_tenant(tenant)
+        # 7033c8e2 — when a tunnel is connected but its tools don't load, DON'T fail
+        # silently (the old behaviour: user's filesystem/code/office tools vanish
+        # with zero explanation, confirmed live across claude.ai + Claude Desktop).
+        # Attach a machine-readable degraded/error signal to the result `_meta` so
+        # a client or the dashboard can surface "connected but tools unavailable"
+        # instead of an unexplained short list. The native tools/list itself is
+        # never broken by a tunnel hiccup.
+        tunnel_health = None
         # Single-connector bridge: when this tenant has a live `meridian --tunnel`,
         # surface its filesystem / code-intel / extractor tools here so the user's
         # existing Meridian connector gains them with zero extra config. Reserve
@@ -827,12 +835,43 @@ async def _handle_mcp_request(
                     # dispatch when a tenant is set, so the tunnel must not advertise
                     # them here or list/call would disagree.
                     reserved = {t.get("name") for t in tools} | set(_server._GITHUB_TOOL_NAMES)
-                    tools = tools + await _tunnel_mod.list_tunnel_tools(
+                    tunnel_tools = await _tunnel_mod.list_tunnel_tools(
                         tenant["id"], reserved,
                     )
-                except Exception:  # noqa: BLE001
-                    pass  # tunnel hiccup must never break native tools/list
-        return _server._jsonrpc_ok(req_id, {"tools": tools})
+                    tools = tools + tunnel_tools
+                    if not tunnel_tools:
+                        # Tunnel is up but advertised nothing — a slot is still
+                        # starting or failed its pre-flight health check.
+                        tunnel_health = {
+                            "status": "degraded",
+                            "message": (
+                                "Meridian tunnel is connected but returned 0 plugin tools "
+                                "(filesystem / code-intel / office). A slot may still be "
+                                "starting or failed its pre-flight health check — retry "
+                                "shortly or check the `meridian --tunnel` process."
+                            ),
+                        }
+                except Exception as exc:  # noqa: BLE001
+                    # tunnel hiccup must never break native tools/list — but signal it.
+                    import sys as _sys  # noqa: PLC0415
+                    print(
+                        f"tools/list: tunnel tool fetch failed for tenant "
+                        f"{tenant.get('id')}: {exc!r}",
+                        file=_sys.stderr, flush=True,
+                    )
+                    tunnel_health = {
+                        "status": "error",
+                        "message": (
+                            "Meridian tunnel is connected but its plugin tools could not "
+                            "be loaded this request; only native tools are listed. Retry, "
+                            "or check the tunnel process."
+                        ),
+                        "detail": str(exc)[:200],
+                    }
+        result: dict = {"tools": tools}
+        if tunnel_health is not None:
+            result["_meta"] = {"meridian/tunnelHealth": tunnel_health}
+        return _server._jsonrpc_ok(req_id, result)
 
     if method == "prompts/list":
         return _server._jsonrpc_ok(req_id, {"prompts": _MCP_PROMPTS})
