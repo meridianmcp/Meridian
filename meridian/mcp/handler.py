@@ -1780,20 +1780,97 @@ async def _handle_project_tools(
     return _MISS
 
 
+# e726810d — identity alias collapsing. bdc251ec derived a human_id handle from
+# whichever tenant field was populated (explicit name → else email local-part), so
+# the SAME person surfaced under two different handles depending on the field used:
+# e.g. the email local-part "ajc123private" from one auth path and the display name
+# "adam" from another. The dashboard active-sessions / standup aggregation
+# (get_team_summary) buckets sessions by their raw human_id, so those two handles
+# split one human into two people. We collapse a known alias set to a single
+# canonical display identity BEFORE it becomes a human_id.
+#
+# The alias map is data-driven (no schema column): the default seeds the one known
+# alias set (ajc123private / adam → Adam), and the whole map is overridable via the
+# MERIDIAN_IDENTITY_ALIASES env var (JSON object of {alias: canonical}). Matching is
+# case-insensitive on the trimmed handle; unknown handles pass through unchanged, so
+# this never invents or merges identities it wasn't told about.
+# Seed only the concrete alias set from the bug report (the email local-part
+# "ajc123private" and the display name "adam" for the same person). Deliberately
+# NARROW: we do not fold in near-miss handles like "ajc123" or "Adam Camerer",
+# because those are distinct handles the caller may legitimately use as-is (and the
+# existing bdc251ec contract tests assert they pass through unchanged). Add more
+# people / aliases via the MERIDIAN_IDENTITY_ALIASES override rather than widening
+# this seed.
+_DEFAULT_IDENTITY_ALIASES: "dict[str, str]" = {
+    "ajc123private": "Adam",
+    "adam": "Adam",
+}
+
+
+def _load_identity_alias_map() -> "dict[str, str]":
+    """Return the effective ``{alias_lower: canonical}`` identity alias map.
+
+    Starts from :data:`_DEFAULT_IDENTITY_ALIASES` (the one seeded, known alias set)
+    and overlays any ``MERIDIAN_IDENTITY_ALIASES`` env override — a JSON object whose
+    keys are aliases and whose values are the canonical display identity. The
+    override can extend the map with new people or re-point an existing alias; it is
+    additive, never destructive of the seed (so the default keeps working when the
+    env var only adds a second person). Keys are lowercased+trimmed for
+    case-insensitive lookup. A malformed / non-object env value is ignored so a bad
+    config can never break identity resolution."""
+    aliases: dict[str, str] = {
+        str(k).strip().lower(): str(v).strip()
+        for k, v in _DEFAULT_IDENTITY_ALIASES.items()
+        if str(k).strip() and str(v).strip()
+    }
+    raw = os.environ.get("MERIDIAN_IDENTITY_ALIASES", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                key = str(k).strip().lower()
+                val = str(v).strip()
+                if key and val:
+                    aliases[key] = val
+    return aliases
+
+
+def _canonicalize_identity(identity: "str | None") -> "str | None":
+    """Collapse a raw human handle to its canonical display identity (e726810d).
+
+    Looks the trimmed, case-insensitive handle up in :func:`_load_identity_alias_map`;
+    returns the canonical form when the handle is a known alias, otherwise the
+    original handle unchanged. ``None``/empty passes through as ``None`` so the
+    handoff keeps its generic placeholder for an unknown caller."""
+    ident = (identity or "").strip()
+    if not ident:
+        return None
+    return _load_identity_alias_map().get(ident.lower(), ident)
+
+
 def _resolve_caller_identity(tenant: "dict[str, Any] | None") -> "str | None":
     """bdc251ec — a human_id handle for the authenticated caller, derived from the
     tenant the auth token already resolved. Prefer an explicit name, else the email
     local-part. Returns None on the owner / self-host path (no tenant) so the
-    handoff keeps its generic placeholder rather than inventing an identity."""
+    handoff keeps its generic placeholder rather than inventing an identity.
+
+    e726810d — the derived handle is then run through :func:`_canonicalize_identity`
+    so a person's known aliases (e.g. email local-part ``ajc123private`` and display
+    name ``adam``) collapse to ONE canonical identity. Without this, the dashboard
+    active-sessions / standup aggregation (which buckets by human_id) shows the same
+    human twice."""
     if not tenant:
         return None
     name = str(tenant.get("name") or "").strip()
     if name:
-        return name
+        return _canonicalize_identity(name)
     email = str(tenant.get("email") or "").strip()
     if "@" in email:
-        return email.split("@", 1)[0] or None
-    return email or None
+        return _canonicalize_identity(email.split("@", 1)[0] or None)
+    return _canonicalize_identity(email or None)
 
 
 async def _handle_task_tools(
