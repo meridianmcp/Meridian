@@ -696,26 +696,30 @@ def test_known_locations_has_manual_path_entry(js):
 
 
 def test_max_turns_slider_supports_megasprints():
-    """47af402c / 76cf8bda — Executor Config exposes a max_turns slider (ceiling
-    500) with escalating warnings at 200+/350+, an Auto-continue (/loop) dropdown,
-    and the checkpoint (context_threshold) slider ceiling raised to 200."""
+    """47af402c / 76cf8bda — Executor Config exposes max_turns (ceiling 500) with
+    escalating warnings at 200+/350+, an Auto-continue (/loop) dropdown, and the
+    checkpoint (context_threshold) ceiling raised to 200. f2157803 — these two
+    controls are now number inputs (via _execTurnsNumberInputHtml) instead of
+    range sliders so the exact value is always visible and directly editable; the
+    ids/bounds/clamps are unchanged."""
     from pathlib import Path
     static = Path(__file__).parent.parent / "meridian" / "static"
     settings_src = (static / "dashboard-settings.ts").read_text(encoding="utf-8")
-    # max_turns slider present with a 500 ceiling (76cf8bda raised 400 -> 500).
-    assert "exec-max_turns-" in settings_src, "max_turns slider missing"
-    assert 'type="range" min="40" max="500"' in settings_src, "max_turns ceiling must be 500"
-    # Escalating inline warnings at 200+/350+ (color bands green/amber/red).
+    # max_turns present with a 500 ceiling — rendered as a number input (f2157803),
+    # not a range slider (the shared helper emits type="number").
+    assert "exec-max_turns-" in settings_src, "max_turns control missing"
+    assert 'type="number"' in settings_src, "turns controls must be number inputs"
+    assert 'type="range" min="40" max="500"' not in settings_src, "max_turns slider must be gone"
+    assert "_execTurnsNumberInputHtml('max_turns', projectId, execCfg.max_turns || DEFAULT_MAX_TURNS, 40, 500, 20)" in settings_src, "max_turns number input must keep [40,500] bounds"
+    # Escalating inline warnings at 200+/350+ (color bands green/amber/red) — kept.
     assert "Very long sprint (350+" in settings_src, "350+ warning missing"
     assert "Long sprint (200+" in settings_src, "200+ warning missing"
     # Saved value is clamped to [40, 500].
     assert "Math.min(500, Math.max(40, mtRaw))" in settings_src, "max_turns must clamp to [40,500]"
     # 76cf8bda — Auto-continue (/loop) dropdown persists loop_enabled per project.
     assert "exec-loop_enabled-" in settings_src, "Auto-continue dropdown missing"
-    # Checkpoint slider ceiling raised 100 -> 200 to match.
-    assert 'id="exec-context_threshold-${projectId}" type="range" min="10" max="200"' in settings_src, (
-        "checkpoint slider ceiling must be raised to 200"
-    )
+    # Checkpoint (context_threshold) ceiling 200 — also a number input now.
+    assert "_execTurnsNumberInputHtml('context_threshold', projectId, execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD, 10, 200, 5)" in settings_src, "checkpoint number input must keep [10,200] bounds"
     assert "Math.min(200, Math.max(10, ctxRaw))" in settings_src, "checkpoint clamp must be raised to 200"
 
 
