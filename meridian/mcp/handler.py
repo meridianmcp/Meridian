@@ -2155,6 +2155,87 @@ async def _persist_ingest_structure(
         )
 
 
+# --- 22c274bd — workspace-scope leak heuristic ------------------------------
+# Workspace notes/decisions are meant to be tenant-global (cross-project). In
+# practice they accumulate PROJECT-specific content: a thesis post-mortem, one
+# project's CI patterns, a personal absolute filesystem path, a commit sha. This
+# is a *soft* nudge only — we never block the write, we just attach a
+# `scope_warning` to the result so the caller is reminded the content may belong
+# in a project note instead. Pure heuristic; no schema change, no DB touch.
+
+# Absolute filesystem paths — POSIX (/home/…, /Users/…, /mnt/…) and Windows
+# (C:\Users\…). A bare "/" or a leading "/mcp"-style route would over-fire, so we
+# require at least one more path segment after a recognised root-ish prefix.
+_WS_ABS_PATH_RE = re.compile(
+    r"""(?:
+          [A-Za-z]:[\\/]                    # Windows drive:  C:\  or  C:/
+        | /(?:home|Users|mnt|opt|srv|var|tmp|root|etc|usr|repository)/  # POSIX root dirs
+        | ~/[\w.\-]                          # home-relative:  ~/something
+    )""",
+    re.VERBOSE,
+)
+# A 7–40 char lowercase hex run that looks like a git commit sha. Bounded by
+# non-hex/word edges so it doesn't fire inside a longer hex/base token.
+_WS_COMMIT_SHA_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{7,40}(?![0-9a-fA-F])")
+# Project-anaphora phrasing that only makes sense scoped to one project.
+_WS_PROJECT_PHRASE_RE = re.compile(
+    r"\b(?:this project|the project|our project|this repo(?:sitory)?|"
+    r"the thesis|my thesis|this codebase|the codebase|this sprint)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_commit_sha(token: str) -> bool:
+    """A hex token is only sha-ish if it's got both a letter and a digit — pure
+    words ('deface', 'facade') and pure numbers ('1234567', a year, a port) are
+    common false positives that shouldn't trip the nudge."""
+    has_alpha = any(c in "abcdef" for c in token)
+    has_digit = any(c.isdigit() for c in token)
+    return has_alpha and has_digit
+
+
+def _workspace_scope_warning(
+    title: str | None, body: str | None
+) -> str | None:
+    """Return a soft warning if *title*/*body* look PROJECT-specific, else None.
+
+    Heuristic signals (any one trips it):
+      * an absolute filesystem path (personal/machine-local),
+      * a git commit sha,
+      * project-anaphora phrasing ("this project", "the thesis", …).
+
+    Deliberately conservative and never authoritative — the write always
+    proceeds; this only populates a ``scope_warning`` hint on the result.
+    """
+    text = f"{title or ''}\n{body or ''}"
+    if not text.strip():
+        return None
+
+    signals: list[str] = []
+    if _WS_ABS_PATH_RE.search(text):
+        signals.append("an absolute filesystem path")
+    if any(
+        _looks_like_commit_sha(m.group(0))
+        for m in _WS_COMMIT_SHA_RE.finditer(text)
+    ):
+        signals.append("a commit sha")
+    if _WS_PROJECT_PHRASE_RE.search(text):
+        signals.append("project-specific phrasing")
+
+    if not signals:
+        return None
+
+    joined = signals[0] if len(signals) == 1 else (
+        ", ".join(signals[:-1]) + " and " + signals[-1]
+    )
+    return (
+        f"This looks project-specific (detected {joined}). Workspace "
+        "notes/decisions are meant to be tenant-global and cross-project — "
+        "consider recording this as a project note/decision instead. "
+        "(Saved anyway.)"
+    )
+
+
 async def _handle_notes_decisions(
     name: str,
     args: dict[str, Any],
@@ -2565,10 +2646,15 @@ async def _handle_notes_decisions(
     if name == "add_workspace_note":
         validate_input_size(args.get("title"), "note title", 500)
         validate_input_size(args.get("body"), "note body", 10_000_000)
-        return await db_module.add_workspace_note(
+        result = await db_module.add_workspace_note(
             db, args["title"], args["body"], args.get("tags"),
             tenant_id=_mcp_tenant_id,
         )
+        # 22c274bd — soft scope nudge; never blocks the write.
+        warning = _workspace_scope_warning(args.get("title"), args.get("body"))
+        if warning and isinstance(result, dict):
+            result["scope_warning"] = warning
+        return result
     if name == "get_workspace_notes":
         return await db_module.get_workspace_notes(
             db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
@@ -2576,11 +2662,16 @@ async def _handle_notes_decisions(
     if name == "pin_workspace_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
-        return await db_module.pin_workspace_decision(
+        result = await db_module.pin_workspace_decision(
             db, args["title"], args["body"],
             category=args.get("category", "TECHNICAL"),
             tenant_id=_mcp_tenant_id,
         )
+        # 22c274bd — soft scope nudge; never blocks the write.
+        warning = _workspace_scope_warning(args.get("title"), args.get("body"))
+        if warning and isinstance(result, dict):
+            result["scope_warning"] = warning
+        return result
     if name == "get_workspace_decisions":
         return await db_module.get_workspace_decisions(
             db, include_superseded=args.get("include_superseded", False),
