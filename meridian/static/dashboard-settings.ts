@@ -16,6 +16,25 @@ export function suggestNtfyTopic(projectId: any) {
 
 }
 
+// f2157803 — the executor-config "checkpoint after N turns" (context_threshold)
+// and "stop after N turns" (max_turns) inputs were range sliders: a slider hides
+// the exact value and is fiddly to land on a specific number. Render a number
+// input instead so the exact value is always visible AND directly editable, while
+// keeping the same element id / value bounds so the existing input listeners and
+// save-read logic keep working unchanged. Exported for the vitest unit test.
+export function _execTurnsNumberInputHtml(
+  field: string,
+  projectId: any,
+  value: any,
+  min: number,
+  max: number,
+  step: number,
+): string {
+  const esc = (window as any).escapeHtml || String;
+  return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
+}
+window._execTurnsNumberInputHtml = _execTurnsNumberInputHtml;
+
 // 9b8261e4 — hide owner-only settings cards from invited viewers/members. The
 // real gate is server-side (393eed0a); this keeps the guest UI honest and clean.
 function _applySettingsRoleVisibility(projectId: any, guest: any) {
@@ -2092,9 +2111,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
     <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
 
-      Checkpoint after <span id="exec-context_threshold-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}</span> turns
+      Checkpoint after <span style="color:var(--text)">N</span> turns <span style="font-size:9px;color:var(--muted)">(10–200)</span>
 
-      <input id="exec-context_threshold-${projectId}" type="range" min="10" max="200" step="5" value="${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      ${_execTurnsNumberInputHtml('context_threshold', projectId, execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD, 10, 200, 5)}
 
       <span style="font-size:9px;color:var(--muted)">When a session passes this many turns, <code>get_context_block</code> nudges it to checkpoint.</span>
 
@@ -2102,9 +2121,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
     <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
 
-      Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns
+      Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns <span style="font-size:9px;color:var(--muted)">(40–500)</span>
 
-      <input id="exec-max_turns-${projectId}" type="range" min="40" max="500" step="20" value="${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      ${_execTurnsNumberInputHtml('max_turns', projectId, execCfg.max_turns || DEFAULT_MAX_TURNS, 40, 500, 20)}
 
       <span id="exec-max_turns-warn-${projectId}" style="font-size:9px;color:var(--muted)"></span>
 
@@ -2148,8 +2167,12 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
     if (!saveBtn) return;
 
-    // Live-update the slider's value label as the user drags.
-
+    // f2157803 — context_threshold / max_turns are now number inputs (not range
+    // sliders): the exact value is visible and directly editable. The var names
+    // keep the historical *Slider suffix so the save-read logic below is unchanged;
+    // `.value` reads identically off a number input. The legacy -val label span was
+    // dropped for context_threshold (the input shows its own value), so this guard
+    // no-ops there; it still fires for max_turns whose -val chip drives the warning.
     const ctxSlider = document.getElementById(`exec-context_threshold-${projectId}`);
 
     const ctxVal = document.getElementById(`exec-context_threshold-val-${projectId}`);
@@ -2160,9 +2183,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
     }
 
-    // 47af402c — max_turns slider (ceiling 400) with escalating warnings so
-    // megasprints are supported without an artificial cap, but the cost/context
-    // risk of very long runs is surfaced inline.
+    // 47af402c — max_turns (ceiling 500) with escalating warnings so megasprints
+    // are supported without an artificial cap, but the cost/context risk of very
+    // long runs is surfaced inline as the user types.
     const mtSlider = document.getElementById(`exec-max_turns-${projectId}`);
     const mtVal = document.getElementById(`exec-max_turns-val-${projectId}`);
     const mtWarn = document.getElementById(`exec-max_turns-warn-${projectId}`);

@@ -1,18 +1,16 @@
-// Unit tests for dashboard-settings markup (2ff2ff1f).
+// Unit tests for dashboard-settings markup + helpers.
 //
-// The Handoff Format textarea (id="ws-handoff-template") is authored inline in
-// the large, side-effectful loadSettingsTab() render function. Rather than drive
-// that whole DOM/fetch path, we assert directly on the module source for the
-// one element this item owns: it must default to a tall height (rows="16", up
-// from the old too-small rows="6") and stay vertically resizable so a full
-// 7-placeholder custom template is usable without scrolling.
-import { describe, it, expect } from "vitest";
+// 2ff2ff1f — the Handoff Format textarea (id="ws-handoff-template") must default
+// to a tall height (rows="16") and stay vertically resizable.
+// f2157803 — the executor-config "checkpoint after N turns" (context_threshold)
+// and "stop after N turns" (max_turns) controls are number inputs (exact value
+// always visible + directly editable), not range sliders.
+import { describe, it, expect, beforeAll } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { _execTurnsNumberInputHtml } from "./dashboard-settings";
 
-// Vitest runs with cwd = repo root (config include path is repo-relative), so
-// resolve the source module from there rather than import.meta.url — the latter
-// is not guaranteed to be a file: URL under the jsdom transform.
+// Vitest runs with cwd = repo root, so resolve the source module from there.
 const source = readFileSync(
   resolve(process.cwd(), "meridian/static/dashboard-settings.ts"),
   "utf8",
@@ -21,6 +19,23 @@ const source = readFileSync(
 // Isolate the exact <textarea id="ws-handoff-template" ...> opening tag.
 const textareaTag =
   source.match(/<textarea id="ws-handoff-template"[^>]*>/)?.[0] ?? "";
+
+beforeAll(() => {
+  // The helper prefers window.escapeHtml (defined at runtime by dashboard-utils);
+  // provide a minimal stand-in so the value is HTML-escaped in the unit test.
+  (window as any).escapeHtml = (s: unknown) =>
+    String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string),
+    );
+});
+
+function parse(html: string): HTMLInputElement {
+  const el = document.createElement("div");
+  el.innerHTML = html;
+  const input = el.querySelector("input");
+  if (!input) throw new Error("no input rendered");
+  return input as HTMLInputElement;
+}
 
 describe("ws-handoff-template textarea", () => {
   it("exists in the settings source", () => {
@@ -34,5 +49,53 @@ describe("ws-handoff-template textarea", () => {
 
   it("stays vertically resizable", () => {
     expect(textareaTag).toContain("resize:vertical");
+  });
+});
+
+describe("_execTurnsNumberInputHtml", () => {
+  it("renders a number input (not a range slider) so the value is directly editable", () => {
+    const input = parse(_execTurnsNumberInputHtml("context_threshold", "p1", 60, 10, 200, 5));
+    expect(input.getAttribute("type")).toBe("number");
+    expect(input.getAttribute("type")).not.toBe("range");
+  });
+
+  it("preserves the exact setting key in the element id (state binding unchanged)", () => {
+    const ctx = parse(_execTurnsNumberInputHtml("context_threshold", "proj-42", 60, 10, 200, 5));
+    const mt = parse(_execTurnsNumberInputHtml("max_turns", "proj-42", 120, 40, 500, 20));
+    expect(ctx.id).toBe("exec-context_threshold-proj-42");
+    expect(mt.id).toBe("exec-max_turns-proj-42");
+  });
+
+  it("shows the exact current value in the input so it is always visible", () => {
+    const input = parse(_execTurnsNumberInputHtml("context_threshold", "p1", 85, 10, 200, 5));
+    expect(input.getAttribute("value")).toBe("85");
+    expect(input.value).toBe("85");
+  });
+
+  it("carries sensible min/max/step bounds matching the clamp on save", () => {
+    const ctx = parse(_execTurnsNumberInputHtml("context_threshold", "p1", 60, 10, 200, 5));
+    expect(ctx.getAttribute("min")).toBe("10");
+    expect(ctx.getAttribute("max")).toBe("200");
+    expect(ctx.getAttribute("step")).toBe("5");
+
+    const mt = parse(_execTurnsNumberInputHtml("max_turns", "p1", 120, 40, 500, 20));
+    expect(mt.getAttribute("min")).toBe("40");
+    expect(mt.getAttribute("max")).toBe("500");
+    expect(mt.getAttribute("step")).toBe("20");
+  });
+
+  it("advertises a numeric mobile keyboard via inputmode", () => {
+    const input = parse(_execTurnsNumberInputHtml("max_turns", "p1", 120, 40, 500, 20));
+    expect(input.getAttribute("inputmode")).toBe("numeric");
+  });
+
+  it("HTML-escapes the rendered value to avoid attribute injection", () => {
+    const html = _execTurnsNumberInputHtml("context_threshold", "p1", '"><img>', 10, 200, 5);
+    expect(html).not.toContain('"><img>');
+    expect(html).toContain("&quot;&gt;&lt;img&gt;");
+  });
+
+  it("is registered on window for the settings template to call", () => {
+    expect(typeof (window as any)._execTurnsNumberInputHtml).toBe("function");
   });
 });
