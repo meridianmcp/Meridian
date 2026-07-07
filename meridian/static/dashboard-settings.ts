@@ -2050,6 +2050,14 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
     </div>
 
+    <!-- 3248f35d — auto-prospecting (handoff code-pointer enrichment) toggle. ON
+         by default (matches _code_pointers_enabled: absent/unset => True). -->
+    <div style="margin-bottom:10px">
+
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:var(--muted)"><input type="checkbox" id="exec-enrich_prospect-${projectId}" ${execCfg.enrich_handoffs_with_code_pointers !== false ? 'checked' : ''} style="cursor:pointer"> Auto-prospect code pointers on handoff <span style="font-size:9px">(attaches file/symbol pointers to sprint items; ON by default)</span></label>
+
+    </div>
+
     <!-- b970fe07 — code-intel auto-index dirs (code slot). Add/remove list,
          mirroring Filesystem Roots. Used only when --code-dir is not passed. -->
     <div style="margin-bottom:10px">
@@ -2337,6 +2345,12 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       const loopSel = document.getElementById(`exec-loop_enabled-${projectId}`) as HTMLSelectElement | null;
 
       if (loopSel) cfg.loop_enabled = loopSel.value === 'true' ? true : (loopSel.value === 'false' ? false : 'workspace');
+
+      // 3248f35d — auto-prospecting toggle. Persist explicit true/false so the
+      // backend default (True when absent) can be turned OFF and stay off.
+      const enrichEl = document.getElementById(`exec-enrich_prospect-${projectId}`) as HTMLInputElement | null;
+
+      if (enrichEl) cfg.enrich_handoffs_with_code_pointers = !!enrichEl.checked;
 
       try {
 

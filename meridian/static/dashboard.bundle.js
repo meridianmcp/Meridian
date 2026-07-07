@@ -3560,6 +3560,14 @@ project_id = "${displayPid}"`;
 
     </div>
 
+    <!-- 3248f35d \u2014 auto-prospecting (handoff code-pointer enrichment) toggle. ON
+         by default (matches _code_pointers_enabled: absent/unset => True). -->
+    <div style="margin-bottom:10px">
+
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:var(--muted)"><input type="checkbox" id="exec-enrich_prospect-${projectId}" ${execCfg.enrich_handoffs_with_code_pointers !== false ? "checked" : ""} style="cursor:pointer"> Auto-prospect code pointers on handoff <span style="font-size:9px">(attaches file/symbol pointers to sprint items; ON by default)</span></label>
+
+    </div>
+
     <!-- b970fe07 \u2014 code-intel auto-index dirs (code slot). Add/remove list,
          mirroring Filesystem Roots. Used only when --code-dir is not passed. -->
     <div style="margin-bottom:10px">
@@ -3828,6 +3836,8 @@ project_id = "${displayPid}"`;
           if (!isNaN(mtRaw)) cfg.max_turns = Math.min(500, Math.max(40, mtRaw));
           const loopSel = document.getElementById(`exec-loop_enabled-${projectId}`);
           if (loopSel) cfg.loop_enabled = loopSel.value === "true" ? true : loopSel.value === "false" ? false : "workspace";
+          const enrichEl = document.getElementById(`exec-enrich_prospect-${projectId}`);
+          if (enrichEl) cfg.enrich_handoffs_with_code_pointers = !!enrichEl.checked;
           try {
             await saveProjectSettings(projectId, { executor_config: cfg });
             if (statusEl) statusEl.textContent = "Saved.";
