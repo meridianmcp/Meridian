@@ -1495,3 +1495,38 @@ def test_is_demo_request_env(monkeypatch, tmp_path):
     scope = {"type": "http", "headers": [], "method": "GET", "path": "/"}
     req = Request(scope)
     assert server_module._is_demo_request(req) is True
+
+
+# ---------------------------------------------------------------------------
+# 3d7b7aca — timezone-aware wall-clock block for session context
+# ---------------------------------------------------------------------------
+
+def test_wall_clock_now_utc_is_timezone_aware():
+    import meridian.server as server_module
+
+    wc = server_module._wall_clock_now()
+    assert wc["tz"] == "UTC"
+    # ISO string must carry an explicit offset (aware, not naive).
+    assert wc["iso"].endswith("+00:00") or wc["iso"].endswith("Z")
+    assert isinstance(wc["unix"], int) and wc["unix"] > 1_700_000_000
+    assert wc["weekday"] in {
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    }
+    # Round-trips back to an aware datetime.
+    from datetime import datetime
+    parsed = datetime.fromisoformat(wc["iso"])
+    assert parsed.tzinfo is not None
+
+
+def test_wall_clock_now_named_zone_and_bad_zone_fallback():
+    import meridian.server as server_module
+
+    denver = server_module._wall_clock_now("America/Denver")
+    assert denver["tz"] == "America/Denver"
+    # Denver is UTC-6/-7 — offset must be negative, never +00:00.
+    assert "+00:00" not in denver["iso"]
+
+    # An unknown zone falls back to UTC rather than raising.
+    bad = server_module._wall_clock_now("Not/AZone")
+    assert bad["tz"] == "UTC"
+    assert bad["iso"].endswith("+00:00") or bad["iso"].endswith("Z")

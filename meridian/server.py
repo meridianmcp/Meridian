@@ -4129,6 +4129,36 @@ async def _build_codebase_context(
     return block
 
 
+def _wall_clock_now(tz_name: str | None = None) -> dict[str, Any]:
+    """3d7b7aca — a timezone-aware wall-clock snapshot for session context.
+
+    The bare ``current_timestamp`` string was UTC but carried no offset, so an
+    executor (or a downstream planner spanning calendar days) couldn't tell the
+    zone or the weekday from it. This returns an unambiguous, timezone-aware
+    block: an ISO-8601 string WITH the offset, epoch seconds, the weekday, and a
+    human-readable label. Server time is UTC; pass an IANA ``tz_name`` (e.g.
+    ``"America/Denver"``) to render in that zone instead — a bad/unknown name
+    falls back to UTC rather than raising."""
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    label = "UTC"
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            now = now.astimezone(ZoneInfo(tz_name))
+            label = tz_name
+        except Exception:  # noqa: BLE001 — unknown zone → keep UTC
+            now = _dt.now(_tz.utc)
+            label = "UTC"
+    return {
+        "iso": now.isoformat(timespec="seconds"),
+        "unix": int(now.timestamp()),
+        "weekday": now.strftime("%A"),
+        "human": now.strftime("%A, %d %b %Y %H:%M:%S %z") or now.strftime("%A, %d %b %Y %H:%M:%S"),
+        "tz": label,
+    }
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4352,6 +4382,9 @@ async def _start_session_composite(
             # de193a81 — anchor the executor to the real date/time so a session
             # spanning multiple calendar days doesn't drift on "today".
             "current_timestamp": _c_now,
+            # 3d7b7aca — timezone-aware wall-clock block (offset, weekday, epoch)
+            # so the executor has an unambiguous, parseable time signal.
+            "current_time": _wall_clock_now(),
             "execution_mode": _c_mode,  # ecf69de8 — structured posture field
             "execution_mode_directive": _c_mode_directive,
             "execute_immediately": _c_execute_now,
@@ -4538,6 +4571,10 @@ async def _start_session_composite(
         )
     payload: dict[str, Any] = {
         "session_id": session["id"],
+        # 3d7b7aca — timezone-aware wall-clock so the full orientation carries a
+        # direct, unambiguous time signal (the compact path already does).
+        "current_timestamp": _wall_clock_now()["iso"],
+        "current_time": _wall_clock_now(),
         "execution_mode": execution_mode,  # ecf69de8 — structured posture field
         "execution_mode_directive": mode_directive,
         "execute_immediately": _exec_now,
