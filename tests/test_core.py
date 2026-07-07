@@ -3224,16 +3224,17 @@ async def test_dispatch_unresolvable_project_name_on_write_tool_raises(db):
 
 @pytest.mark.asyncio
 async def test_dispatch_project_scoped_tool_with_neither_fails_cleanly(db):
-    """Neither project_id nor project_name → deterministic error, never a hang
-    or silent success. The resolver's args.get(...,"") defaults keep it from
-    KeyError-ing; the handler then surfaces a clean exception the transport
-    layers turn into an {"error": ...} payload."""
+    """Neither project_id nor project_name → deterministic clean error, never a
+    hang, a raw KeyError, or silent success. 8f01cdfe: add_sprint_item now
+    RETURNS a descriptive {"error": ...} dict (it previously raised a bare
+    KeyError('project_id') that leaked as a cryptic -32603 "'project_id'")."""
     from meridian import server as srv
 
-    with pytest.raises((KeyError, ValueError)):
-        await srv._dispatch_mcp_tool(
-            "add_sprint_item", {"version": "v1", "title": "orphan"}, db, "/tmp"
-        )
+    result = await srv._dispatch_mcp_tool(
+        "add_sprint_item", {"version": "v1", "title": "orphan"}, db, "/tmp"
+    )
+    assert isinstance(result, dict) and result.get("error")
+    assert "project_id" in result["error"]
 
 
 # ---------------------------------------------------------------------------
