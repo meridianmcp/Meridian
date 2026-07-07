@@ -1012,6 +1012,53 @@ def _dc_default_command() -> list[str]:
     return base
 
 
+def _office_slot_command(slot: str, plugin: "dict | None") -> "list[str] | None":
+    """Resolve the runnable inner command for an office slot (ppt/word/dc).
+
+    Returns the command token list, or ``None`` when the slot has no runnable
+    command. ``dc`` falls back to :func:`_dc_default_command` when its plugin
+    leaves ``command`` unset (its launcher is spawned via npx, not a stored
+    command); ``ppt``/``word`` have no such fallback, so a missing/empty command
+    yields ``None``. Pure — no I/O — so both :func:`run_tunnel` and the unit
+    tests share one source of truth. (0dfb107e)
+    """
+    cmd = (plugin or {}).get("command")
+    if cmd is None and slot == "dc":
+        cmd = _dc_default_command()
+    return cmd or None
+
+
+def _office_slot_warning(slot: str, human: str, plugin: "dict | None") -> "str | None":
+    """Return a startup WARNING line iff an office slot is misconfigured (0dfb107e).
+
+    The bug this closes: an office slot that is ENABLED but has no runnable
+    command (a stored override that coerced to empty) was silently ``continue``-d
+    in :func:`run_tunnel`, so the slot vanished from the entire startup log with
+    ZERO warning — leaving the operator no way to see WHY an expected slot was
+    absent. The filesystem slot already warns on an analogous
+    "configured-but-won't-be-served" case (``_unservable_roots``); this mirrors
+    that pattern for the office slots.
+
+    Returns:
+      * ``None`` when the slot is DISABLED (off-by-default, opt-in — silence is
+        correct: it is not an "expected" slot) OR when it is enabled AND has a
+        runnable command (healthy — no warning).
+      * a one-line WARNING string (destined for stderr) when the slot is enabled
+        but has no runnable command.
+
+    Pure — no I/O — so it is unit-testable with no server/port/network.
+    """
+    plugin = plugin or {}
+    if not plugin.get("enabled", False):
+        return None
+    if _office_slot_command(slot, plugin):
+        return None
+    return (
+        f"  {human.lower():<16}WARNING enabled but no command configured "
+        "— slot will NOT be served (check its tunnel_plugins command)."
+    )
+
+
 def _force_utf8_io() -> None:
     """Make stdio UTF-8 so the tunnel's Unicode status output can't crash.
 
@@ -2921,10 +2968,17 @@ async def run_tunnel(
                                 ("dc", dc_plugin, "Desktop Commander")):
         if not plugin.get("enabled", False):
             continue
-        cmd = plugin.get("command")
-        if cmd is None and slot == "dc":
-            cmd = _dc_default_command()
+        cmd = _office_slot_command(slot, plugin)
         if not cmd:
+            # 0dfb107e — the slot is ENABLED but has no runnable command (a
+            # misconfigured override that coerced to empty). Previously we
+            # `continue`d silently, so the slot vanished from the whole startup
+            # log with ZERO warning — undiagnosable. Mirror the filesystem
+            # missing-root WARNING and the code-intel "not available" line so an
+            # operator can see WHY an expected slot is absent.
+            _warn = _office_slot_warning(slot, human, plugin)
+            if _warn:
+                print(_warn, flush=True, file=sys.stderr)
             continue
         oport = office_ports[slot]
         spawn_env = _plugin_spawn_env(plugin.get("env"))
