@@ -90,6 +90,55 @@ if sys.platform == "win32":
     asyncio.set_event_loop(loop)
 
 
+def _is_frozen() -> bool:
+    """True when running inside a PyInstaller (or similar) frozen binary.
+
+    PyInstaller sets ``sys.frozen = True`` (and ``sys._MEIPASS``) on the
+    bootstrapped interpreter. Matches the ``getattr(sys, "frozen", False)``
+    convention already used in ``meridian/_deps.py`` / ``__main__entry.py``.
+    """
+    return bool(getattr(sys, "frozen", False))
+
+
+def _frozen_default_to_tunnel(
+    args: "argparse.Namespace", raw_argv: list[str]
+) -> None:
+    """Frozen-aware routing: the downloadable binary IS the tunnel client.
+
+    The standalone ``meridian`` / ``meridian-connect`` binary is only ever used
+    as the Pro filesystem tunnel client (``meridian --tunnel --repo .``). A
+    frozen build that reaches ``main()`` with no explicit mode flag must NOT
+    fall through to the dashboard HTTP server (the old ``__main__entry.py``
+    default of uvicorn on port 7700 — the v0.1.9 "starts a dashboard, never
+    spawns slots" bug). So when frozen and no mode was requested, default to
+    the tunnel path.
+
+    Explicit intent always wins and is never overridden here:
+      * ``--tunnel`` / ``--mcp`` on the command line,
+      * an explicit ``--host`` / ``--port`` (someone deliberately wants the
+        HTTP server out of a frozen build),
+      * ``MERIDIAN_FROZEN_MODE=server`` as a deliberate escape hatch for a
+        full desktop/server binary.
+    This is a no-op when not frozen, so ``python -m meridian`` from source is
+    completely unchanged. ``raw_argv`` is the exact argv main() parsed (not
+    ``sys.argv``) so the host/port check is correct under tests and embedding.
+    """
+    if not _is_frozen():
+        return
+    if args.tunnel or args.mcp:
+        return  # explicit mode requested — respect it
+    if os.environ.get("MERIDIAN_FROZEN_MODE", "").strip().lower() == "server":
+        return  # deliberate desktop/server binary escape hatch
+    # An explicit host/port means the user deliberately wants the HTTP server.
+    if any(
+        tok == "--host" or tok == "--port"
+        or tok.startswith("--host=") or tok.startswith("--port=")
+        for tok in raw_argv
+    ):
+        return
+    args.tunnel = True
+
+
 def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
     """Return the thread's event loop, creating one if none is set or it's closed.
 
@@ -113,7 +162,15 @@ def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI dispatch: HTTP server by default, MCP stdio with ``--mcp``."""
+    """CLI dispatch: HTTP server by default, MCP stdio with ``--mcp``.
+
+    Frozen-aware: when running as the downloadable binary (``sys.frozen``) with
+    no explicit mode flag, dispatch defaults to the tunnel client rather than
+    the dashboard HTTP server (see ``_frozen_default_to_tunnel``).
+    """
+    # Capture the exact argv we're dispatching on (not sys.argv) so the
+    # frozen host/port heuristic is correct under tests and embedding.
+    raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
     parser = argparse.ArgumentParser(
         prog="meridian",
         description="Multi-session Claude coordinator.",
@@ -181,6 +238,10 @@ def main(argv: list[str] | None = None) -> int:
         help="HTTP port (default 7878, override with MERIDIAN_PORT).",
     )
     args = parser.parse_args(argv)
+
+    # Frozen-aware routing: a downloadable binary with no explicit mode flag is
+    # the tunnel client, not the dashboard server. No-op from source. (e5e20464)
+    _frozen_default_to_tunnel(args, raw_argv)
 
     if args.tunnel:
         # path-quote-strip — de-quote pasted path args (e.g. '"C:\\My Docs"')
