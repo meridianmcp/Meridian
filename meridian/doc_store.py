@@ -203,22 +203,40 @@ def elements_from_docx_outline(outline: dict[str, Any]) -> list[dict[str, Any]]:
     """Map :func:`docs_intel.document_outline` output to store elements.
 
     ``outline`` is ``{paragraph_count, heading_count, headings:[{level, text,
-    para_id}]}``. Each heading becomes a ``kind='heading'`` element carrying its
-    ``level``, ``text`` and ``ref`` (the docx ``w14:paraId``). Parent edges are
-    inferred by heading-level nesting: a heading attaches under the nearest
-    preceding heading of a strictly smaller level (``parent_ordinal``), else it
-    is a root. Ordinals are assigned in document order.
+    para_id}], citations:[{source, marker_text, keys, para_id, section_ordinal}],
+    ...}``. Emission order (so parent/citation edges resolve on store):
+
+    1. **Headings** — each becomes a ``kind='heading'`` element carrying its
+       ``level``, ``text`` and ``ref`` (the docx ``w14:paraId``). Parent edges
+       are inferred by heading-level nesting: a heading attaches under the
+       nearest preceding heading of a strictly smaller level (``parent_ordinal``),
+       else it is a root. Ordinals are assigned in document order.
+    2. **Citations** (75d2196d) — one ``kind='citation'`` element per citation
+       key (a Zotero group cite ``{a,b}`` expands to two, exactly like the LaTeX
+       ``\\cite{a,b}`` path). ``text`` = the raw marker, ``ref`` = the citation
+       key, ``level=None``, ``parent_ordinal`` = the ordinal of the enclosing
+       section's heading element (mapped from the marker's ``section_ordinal``;
+       ``None`` before the first heading). A marker with no resolvable keys still
+       emits one element (``ref=None``) so it is never silently dropped. These
+       elements feed the same intra-document citation->bibliography edge
+       materialisation the LaTeX path uses.
     """
     headings = (outline or {}).get("headings") or []
     elements: list[dict[str, Any]] = []
     # stack of (ordinal, level) for the open ancestor chain.
     stack: list[tuple[int, int]] = []
+    # A heading's document-order index (the ``section_ordinal`` the citation
+    # parser reports) maps to the ordinal we assign that heading element here.
+    # They are identical today (headings are appended first, in order), but the
+    # explicit map keeps citation parent resolution correct if that changes.
+    section_ordinal_to_element_ordinal: dict[int, int] = {}
     for ordinal, h in enumerate(headings):
         level = h.get("level")
         lvl = int(level) if isinstance(level, (int, float)) else 1
         while stack and stack[-1][1] >= lvl:
             stack.pop()
         parent_ordinal = stack[-1][0] if stack else None
+        section_ordinal_to_element_ordinal[ordinal] = ordinal
         elements.append(
             {
                 "ordinal": ordinal,
@@ -230,6 +248,32 @@ def elements_from_docx_outline(outline: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
         stack.append((ordinal, lvl))
+
+    ordinal = len(headings)
+    citations = (outline or {}).get("citations") or []
+    for cite in citations:
+        section_ordinal = cite.get("section_ordinal")
+        parent_ordinal = (
+            section_ordinal_to_element_ordinal.get(section_ordinal)
+            if isinstance(section_ordinal, int)
+            else None
+        )
+        marker_text = cite.get("marker_text", "")
+        keys = cite.get("keys") or []
+        # One element per citation key (mirrors the LaTeX one-per-key expansion);
+        # a keyless marker still yields one element so it is not dropped.
+        for key in keys or [None]:
+            elements.append(
+                {
+                    "ordinal": ordinal,
+                    "level": None,
+                    "kind": "citation",
+                    "text": marker_text,
+                    "ref": key,
+                    "parent_ordinal": parent_ordinal,
+                }
+            )
+            ordinal += 1
     return elements
 
 

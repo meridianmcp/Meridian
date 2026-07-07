@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import io
 import re
+import json
 import sqlite3
 import zipfile
 import xml.etree.ElementTree as ET
@@ -76,6 +77,308 @@ def _field_type(instruction: str | None) -> str | None:
 def _field_needs_refresh(field_type: str | None) -> bool:
     """A field is refreshable when Word recomputes it (TOC/SEQ/PAGEREF/...)."""
     return field_type in _REFRESHABLE_FIELDS
+
+
+# --- Citation markers (75d2196d) -------------------------------------------
+#
+# LaTeX surfaces in-text citations from ``\cite``-family macros (latex_intel).
+# A .docx has no ``\cite`` — reference managers embed citations two ways, both
+# of which this parser recognises:
+#
+# 1. **Reference-manager field codes** — Zotero and Mendeley write a *complex*
+#    Word field whose ``ADDIN`` instruction carries a ``CSL_CITATION`` JSON
+#    payload::
+#
+#        ADDIN ZOTERO_ITEM CSL_CITATION {"citationItems":[{"itemData":{...}}]}
+#        ADDIN CSL_CITATION {"citationItems":[...]}            (Mendeley)
+#
+#    The JSON's ``citationItems`` each identify a source; we lift a stable key
+#    per item (a DOI / ISBN / Zotero URI / id) so the marker is addressable and
+#    can be matched against a bibliography, mirroring the LaTeX citation key.
+#
+# 2. **Footnote / endnote references** — ``<w:footnoteReference w:id="N"/>`` and
+#    ``<w:endnoteReference w:id="N"/>`` in the body point at note content in
+#    ``word/footnotes.xml`` / ``word/endnotes.xml``. Academic .docx authored
+#    without a reference manager cite this way, so they are citation markers too.
+#
+# A citation instruction is one whose ADDIN payload is a CSL citation. EndNote
+# and other managers also use ``ADDIN`` for non-citation content, so we key off
+# the ``CSL_CITATION`` token specifically rather than the bare ``ADDIN`` prefix.
+_CSL_CITATION_TOKEN = "CSL_CITATION"
+# Managers we name explicitly for the marker's ``source`` field; anything else
+# carrying a CSL_CITATION payload is reported with source ``"csl"``.
+_ADDIN_SOURCES: tuple[tuple[str, str], ...] = (
+    ("ZOTERO_ITEM", "zotero"),
+    ("MENDELEY_CITATION", "mendeley"),
+)
+
+
+def _is_citation_instruction(instruction: str | None) -> bool:
+    """True when a Word field instruction embeds a CSL citation payload.
+
+    Zotero (``ADDIN ZOTERO_ITEM CSL_CITATION {..}``) and Mendeley
+    (``ADDIN CSL_CITATION {..}`` / ``ADDIN MENDELEY_CITATION {..}``) both mark
+    the payload with the ``CSL_CITATION`` token; that token is the reliable
+    discriminator from the other ``ADDIN`` fields Word uses.
+    """
+    return bool(instruction) and _CSL_CITATION_TOKEN in instruction
+
+
+def _citation_source(instruction: str) -> str:
+    """Classify a CSL citation field by its reference manager."""
+    upper = instruction.upper()
+    for token, name in _ADDIN_SOURCES:
+        if token in upper:
+            return name
+    if "MENDELEY" in upper:
+        return "mendeley"
+    return "csl"
+
+
+def _csl_json(instruction: str) -> dict[str, Any] | None:
+    """Extract and parse the JSON object embedded in a CSL citation instruction.
+
+    The instruction is ``ADDIN ... CSL_CITATION {json}`` — the JSON begins at the
+    first ``{`` after the token. Word occasionally trails switches after the
+    payload, so we take the balanced ``{...}`` span rather than to end-of-string.
+    Returns the decoded object, or ``None`` when no valid JSON is present.
+    """
+    start = instruction.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    end = -1
+    for i in range(start, len(instruction)):
+        ch = instruction[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end == -1:
+        return None
+    try:
+        parsed = json.loads(instruction[start:end])
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _citation_keys_from_csl(instruction: str) -> list[str]:
+    """Best-effort list of citation keys from a CSL_CITATION field instruction.
+
+    Walks the ``citationItems`` array and derives one stable key per item,
+    preferring (in order): DOI, ISBN, a Zotero item URI, the CSL ``id``, then the
+    author/year of ``itemData``. Returns ``[]`` when the JSON is absent/malformed
+    or carries no items (the marker is still surfaced with an empty key list by
+    the caller, so a citation is never silently dropped).
+    """
+    data = _csl_json(instruction)
+    if not data:
+        return []
+    items = data.get("citationItems")
+    if not isinstance(items, list):
+        return []
+    keys: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = _key_for_citation_item(item)
+        if key:
+            keys.append(key)
+    return keys
+
+
+def _key_for_citation_item(item: dict[str, Any]) -> str | None:
+    """Derive one stable key for a single CSL ``citationItems`` entry."""
+    item_data = item.get("itemData") if isinstance(item.get("itemData"), dict) else {}
+    doi = item_data.get("DOI")
+    if isinstance(doi, str) and doi.strip():
+        return doi.strip()
+    isbn = item_data.get("ISBN")
+    if isinstance(isbn, str) and isbn.strip():
+        return isbn.strip()
+    for uri in item.get("uris", []) or []:
+        if isinstance(uri, str) and uri.strip():
+            return uri.strip()
+    for candidate in (item_data.get("id"), item.get("id")):
+        if isinstance(candidate, (str, int)) and str(candidate).strip():
+            return str(candidate).strip()
+    # Fall back to author-year so a payload with only bibliographic fields still
+    # yields an addressable key.
+    return _author_year_key(item_data)
+
+
+def _author_year_key(item_data: dict[str, Any]) -> str | None:
+    """Compose a ``family:year`` key from CSL ``author`` + ``issued`` fields."""
+    if not isinstance(item_data, dict):
+        return None
+    family = None
+    authors = item_data.get("author")
+    if isinstance(authors, list) and authors and isinstance(authors[0], dict):
+        family = authors[0].get("family") or authors[0].get("literal")
+    year = None
+    issued = item_data.get("issued")
+    if isinstance(issued, dict):
+        parts = issued.get("date-parts")
+        if isinstance(parts, list) and parts and isinstance(parts[0], list) and parts[0]:
+            year = str(parts[0][0])
+    if family and year:
+        return f"{family}:{year}"
+    if family:
+        return str(family)
+    return None
+
+
+def _citations_in_paragraph(p: ET.Element) -> list[dict[str, Any]]:
+    """Extract every citation marker embedded in one ``<w:p>``, in order.
+
+    Two marker families are surfaced (see the module-level notes):
+
+    * **CSL citation fields** — a complex Word field whose ADDIN instruction
+      carries a ``CSL_CITATION`` payload (Zotero / Mendeley). Reuses the same
+      begin/instrText/end complex-field machinery as :func:`_fields_in_paragraph`
+      (fields nest, and Word splits a long instruction across ``instrText`` runs,
+      so instruction buffers are concatenated per open field). A ``fldSimple``
+      form is handled too for completeness.
+    * **Footnote / endnote references** — ``<w:footnoteReference w:id="N"/>`` /
+      ``<w:endnoteReference w:id="N"/>``, keyed on the note id so a consumer can
+      resolve them against ``word/footnotes.xml`` / ``word/endnotes.xml``.
+
+    Each CSL record is ``{kind: "citation", source, marker_text, keys,
+    instruction}``; each note record is ``{kind: "citation", source, note_id,
+    marker_text, keys}``. Markers appear in document order.
+    """
+    citations: list[dict[str, Any]] = []
+    open_fields: list[list[str]] = []
+    fld_simple = _q(_W, "fldSimple")
+    fld_char = _q(_W, "fldChar")
+    instr_text = _q(_W, "instrText")
+    char_type_attr = _q(_W, "fldCharType")
+    instr_attr = _q(_W, "instr")
+    fn_ref = _q(_W, "footnoteReference")
+    en_ref = _q(_W, "endnoteReference")
+    id_attr = _q(_W, "id")
+
+    def _emit_field(instruction: str) -> None:
+        if not _is_citation_instruction(instruction):
+            return
+        instruction = instruction.strip()
+        citations.append(
+            {
+                "kind": "citation",
+                "source": _citation_source(instruction),
+                "marker_text": instruction,
+                "keys": _citation_keys_from_csl(instruction),
+                "instruction": instruction,
+            }
+        )
+
+    def _emit_note(el: ET.Element, note_kind: str) -> None:
+        note_id = el.get(id_attr)
+        citations.append(
+            {
+                "kind": "citation",
+                "source": note_kind,
+                "note_id": note_id,
+                "marker_text": f"[{note_kind} {note_id}]"
+                if note_id is not None
+                else f"[{note_kind}]",
+                "keys": [note_id] if note_id is not None else [],
+            }
+        )
+
+    for el in p.iter():
+        tag = el.tag
+        if tag == fld_simple:
+            _emit_field(el.get(instr_attr) or "")
+        elif tag == fld_char:
+            char_type = el.get(char_type_attr)
+            if char_type == "begin":
+                open_fields.append([])
+            elif char_type == "end" and open_fields:
+                _emit_field("".join(open_fields.pop()))
+        elif tag == instr_text and open_fields:
+            open_fields[-1].append(el.text or "")
+        elif tag == fn_ref:
+            _emit_note(el, "footnote")
+        elif tag == en_ref:
+            _emit_note(el, "endnote")
+    # A citation field left open (no matching end) is still surfaced.
+    for pending in open_fields:
+        _emit_field("".join(pending))
+    return citations
+
+
+def parse_docx_citations(source: str | bytes | bytearray) -> list[dict[str, Any]]:
+    """Parse in-text citation markers from a .docx (path or raw bytes).
+
+    The DOCX counterpart to :func:`docparse.latex_intel.parse_latex_citations`.
+    Returns a document-ordered list of citation-marker dicts, each carrying:
+
+    * ``source`` — ``"zotero"`` / ``"mendeley"`` / ``"csl"`` (reference-manager
+      field codes) or ``"footnote"`` / ``"endnote"`` (note references).
+    * ``marker_text`` — the raw field instruction (CSL fields) or a compact
+      ``[footnote N]`` label (note references).
+    * ``keys`` — the citation keys the marker resolves to (DOI / ISBN / URI /
+      CSL id / author-year for CSL fields; the note id for note references). May
+      be empty when a payload is malformed — the marker is still surfaced.
+    * ``para_id`` — the ``w14:paraId`` of the enclosing paragraph (stable anchor).
+    * ``section_ordinal`` — the document-order index (into the heading list) of
+      the nearest preceding heading, or ``None`` before the first heading. This
+      matches the ordinal :func:`elements_from_docx_outline` assigns that heading
+      element, so a consumer can resolve each citation's parent section — exactly
+      the contract the LaTeX citation parser honours.
+
+    Never raises: a malformed / non-docx source degrades to ``[]``.
+    """
+    try:
+        if isinstance(source, (bytes, bytearray)):
+            zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
+        else:
+            zf = zipfile.ZipFile(source)
+        try:
+            with zf.open("word/document.xml") as handle:
+                xml = handle.read()
+        finally:
+            zf.close()
+        root = ET.fromstring(xml)
+    except Exception:  # noqa: BLE001 — not a docx / unreadable -> empty, never crash
+        return []
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return []
+    citations: list[dict[str, Any]] = []
+    heading_ordinal = -1  # index of the nearest preceding heading (-1 => none yet)
+    for index, p in enumerate(body.findall(_q(_W, "p"))):
+        style = _paragraph_style(p)
+        if _is_heading(style):
+            heading_ordinal += 1
+        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        section_ordinal = heading_ordinal if heading_ordinal >= 0 else None
+        for marker in _citations_in_paragraph(p):
+            citations.append(
+                {
+                    **marker,
+                    "para_id": para_id,
+                    "section_ordinal": section_ordinal,
+                }
+            )
+    return citations
 
 
 def _fields_in_paragraph(p: ET.Element) -> list[dict[str, Any]]:
@@ -188,7 +491,13 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
     a62e5b4f — also surfaces every Word field code (TOC / SEQ / PAGEREF ...) in
     an ordered ``fields`` list (``para_id``, ``field_type``, ``instruction``,
     ``needs_refresh``) plus a ``field_count``. Purely additive: the existing
-    ``headings`` shape is unchanged so all callers keep working."""
+    ``headings`` shape is unchanged so all callers keep working.
+
+    75d2196d — additionally surfaces in-text citation markers (Zotero / Mendeley
+    ``CSL_CITATION`` field codes and footnote / endnote references) in an ordered
+    ``citations`` list plus a ``citation_count`` (mirroring how ``latex_intel``
+    surfaces LaTeX ``\\cite`` markers). Each entry is ``{source, marker_text,
+    keys, para_id, section_ordinal}``. Still purely additive."""
     paras = parse_docx(source)
     headings = [
         {
@@ -209,12 +518,15 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
         for p in paras
         for f in p.get("fields", [])
     ]
+    citations = parse_docx_citations(source)
     return {
         "paragraph_count": len(paras),
         "heading_count": len(headings),
         "headings": headings,
         "field_count": len(fields),
         "fields": fields,
+        "citation_count": len(citations),
+        "citations": citations,
     }
 
 
