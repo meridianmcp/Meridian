@@ -2897,3 +2897,27 @@ def test_update_sprint_item_auto_prospects_on_update():
     }, db, "/tmp"))
     assert out.get("prospecting_status") == "prospected"
     assert "meridian/db/__init__.py" in out.get("code_context", {}).get("files", [])
+
+
+# ---------------------------------------------------------------------------
+# generate_handoff (and every tool) must survive PG datetime columns in results:
+# the universal json.dumps(result) needs a datetime-safe default (was a -32603 on
+# hosted Postgres for all handoff modes).
+# ---------------------------------------------------------------------------
+
+def test_json_default_coerces_datetimes():
+    import datetime as _dt
+    import json as _json
+    d = _dt.datetime(2026, 7, 7, 7, 51, 2)
+    assert mh._json_default(d) == d.isoformat()
+    assert mh._json_default(_dt.date(2026, 7, 7)) == "2026-07-07"
+    # The exact failure mode: a result dict carrying a PG datetime (e.g. a note's
+    # completed_at) must serialize cleanly WITH the default instead of raising
+    # "Object of type datetime is not JSON serializable".
+    payload = {"notes": [{"completed_at": _dt.datetime(2026, 7, 7, 1, 2, 3)}], "n": 1}
+    out = _json.dumps(payload, default=mh._json_default)
+    assert "2026-07-07T01:02:03" in out
+    # Without the default this raises — prove the default is what fixes it.
+    import pytest as _pytest
+    with _pytest.raises(TypeError):
+        _json.dumps(payload)
