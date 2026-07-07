@@ -1651,3 +1651,205 @@ async def test_generate_handoff_no_session_id_skips_compliance(db, tmp_path):
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert path
+
+
+# ---------------------------------------------------------------------------
+# b7f41c73 — datetime-safe delta path (Postgres returns real datetime objects
+# for completed_at/added_at/claimed_at where SQLite returns ISO strings).
+# ---------------------------------------------------------------------------
+
+
+def test_iso_ts_coerces_datetime_str_and_none():
+    from datetime import datetime as _dt
+
+    # datetime (Postgres) → ISO string.
+    out = handoff_module._iso_ts(_dt(2026, 7, 6, 11, 58, 0))
+    assert out == "2026-07-06T11:58:00"
+    # str (SQLite) passes through.
+    assert handoff_module._iso_ts("2026-07-06 11:58:00") == "2026-07-06 11:58:00"
+    # None / empty → None.
+    assert handoff_module._iso_ts(None) is None
+    assert handoff_module._iso_ts("") is None
+
+
+def test_completed_after_accepts_datetime_operands():
+    """b7f41c73 — on Postgres both operands arrive as datetime objects; the old
+    str-only .strip() path raised AttributeError. Both str and datetime must work,
+    and the two shapes must compare identically."""
+    from datetime import datetime as _dt
+
+    later = _dt(2026, 2, 1, 0, 0, 0)
+    earlier = _dt(2026, 1, 1, 0, 0, 0)
+    # datetime vs datetime
+    assert handoff_module._completed_after(later, earlier) is True
+    assert handoff_module._completed_after(earlier, later) is False
+    # datetime completed_at vs str since_ts (mixed, as PG delta path can hit)
+    assert handoff_module._completed_after(later, "2026-01-01 00:00:00") is True
+    # str completed_at vs datetime since_ts
+    assert handoff_module._completed_after("2026-02-01 00:00:00", earlier) is True
+    # None datetime completed_at → False (never after)
+    assert handoff_module._completed_after(None, earlier) is False
+
+
+def test_ts_safe_items_coerces_datetime_fields_and_json_dumps():
+    """b7f41c73 — _ts_safe_items must turn datetime timestamp fields into ISO
+    strings so json.dumps of the sanitized item never raises 'Object of type
+    datetime is not JSON serializable'. Original dicts are left untouched."""
+    from datetime import datetime as _dt
+
+    original = {
+        "id": "abc",
+        "title": "item",
+        "completed_at": _dt(2026, 7, 6, 11, 58, 0),
+        "added_at": _dt(2026, 7, 5, 9, 0, 0),
+        "claimed_at": _dt(2026, 7, 6, 10, 0, 0),
+        "status": "done",
+    }
+    safe = handoff_module._ts_safe_items([original])
+    item = safe[0]
+    assert isinstance(item["completed_at"], str)
+    assert isinstance(item["added_at"], str)
+    assert isinstance(item["claimed_at"], str)
+    # Sanitized dict is JSON-serializable without a custom default.
+    json.dumps(item)
+    # Original dict is not mutated (shallow copy).
+    assert isinstance(original["completed_at"], _dt)
+    # Non-dict entries pass through unharmed.
+    assert handoff_module._ts_safe_items(["not-a-dict"]) == ["not-a-dict"]
+
+
+def test_json_default_serializes_datetime():
+    from datetime import datetime as _dt
+
+    payload = {"completed_at": _dt(2026, 7, 6, 11, 58, 0)}
+    # Without the default this raises; with it, we get a clean ISO string.
+    dumped = json.dumps(payload, default=handoff_module._json_default)
+    assert "2026-07-06T11:58:00" in dumped
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_delta_with_datetime_completed_at(db, tmp_path, monkeypatch):
+    """b7f41c73 — regression: simulate Postgres by making get_sprint_items return
+    items whose completed_at is a real datetime object, then run the delta path.
+    It must not raise (the old code crashed on .strip()/json.dumps of a datetime)
+    and must still surface the completed item."""
+    from datetime import datetime as _dt
+
+    p = await db_module.create_project(db, "alpha-delta-pg")
+    await db_module.set_goal(db, p["id"], "delta pg work")
+    done = await db_module.add_sprint_item(db, p["id"], "v1", "Shipped PG item")
+    await db_module.patch_sprint_item(db, p["id"], done["id"], status="done")
+
+    real_get = db_module.get_sprint_items
+
+    async def _pg_get_sprint_items(conn, project_id, *args, **kwargs):
+        rows = await real_get(conn, project_id, *args, **kwargs)
+        # Rewrite string timestamps to datetime objects, as psycopg3 would.
+        for row in rows:
+            for field in ("completed_at", "added_at", "claimed_at"):
+                val = row.get(field)
+                if isinstance(val, str) and val:
+                    try:
+                        row[field] = _dt.fromisoformat(val.replace("Z", ""))
+                    except ValueError:
+                        row[field] = _dt(2026, 7, 6, 11, 58, 0)
+            # Guarantee at least completed_at is a datetime on the done item.
+            if row.get("status") == "done" and not isinstance(
+                row.get("completed_at"), _dt
+            ):
+                row["completed_at"] = _dt(2026, 7, 6, 11, 58, 0)
+        return rows
+
+    monkeypatch.setattr(db_module, "get_sprint_items", _pg_get_sprint_items)
+    monkeypatch.setattr(handoff_module.db_module, "get_sprint_items", _pg_get_sprint_items)
+
+    # No prior handoff state → since_ts is None → the done item is "completed after".
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id="sess-delta-pg",
+    )
+    assert "Completed since last handoff:" in content
+    assert "Shipped PG item" in content
+
+
+# ---------------------------------------------------------------------------
+# 302db181 — computed session span (first/last activity, distinct days, elapsed).
+# ---------------------------------------------------------------------------
+
+
+def test_compute_session_span_mixed_datetime_and_str():
+    """302db181 — the helper must handle a mix of datetime (Postgres) and str
+    (SQLite) timestamps, skip None/unparseable entries, and report the correct
+    first/last, distinct calendar days, and elapsed span."""
+    from datetime import datetime as _dt
+
+    span = handoff_module.compute_session_span([
+        "2026-07-05 09:00:00",              # str, day 1
+        _dt(2026, 7, 6, 11, 0, 0),          # datetime, day 2
+        "2026-07-06T13:30:00Z",             # ISO T+Z, day 2
+        None,                               # skipped
+        "not a timestamp",                  # skipped (unparseable)
+    ])
+    assert span["count"] == 3
+    assert span["distinct_days"] == 2
+    assert span["first"].startswith("2026-07-05T09:00:00")
+    assert span["last"].startswith("2026-07-06T13:30:00")
+    # 2026-07-05 09:00 → 2026-07-06 13:30 = 1 day 4h 30m.
+    assert span["elapsed_seconds"] == (28 * 3600 + 30 * 60)
+    assert span["elapsed_human"] == "1d 4h"
+
+
+def test_compute_session_span_empty_is_zeroed():
+    span = handoff_module.compute_session_span([])
+    assert span == {
+        "first": None,
+        "last": None,
+        "distinct_days": 0,
+        "elapsed_seconds": 0,
+        "elapsed_human": "0s",
+        "count": 0,
+    }
+    # All-unparseable / all-None input is also a clean zero, never a raise.
+    assert handoff_module.compute_session_span([None, "", "xyz"])["count"] == 0
+
+
+def test_humanize_span_units():
+    h = handoff_module._humanize_span
+    assert h(0) == "0s"
+    assert h(30) == "30s"
+    assert h(90) == "1m 30s"
+    assert h(3600) == "1h"
+    assert h(3661) == "1h 1m"          # only the two most-significant units
+    assert h(90000) == "1d 1h"          # 25h → 1d 1h
+
+
+def test_render_session_span_block_empty_and_populated():
+    assert handoff_module._render_session_span_block(
+        {"count": 0, "elapsed_human": "0s"}
+    ) == ""
+    block = handoff_module._render_session_span_block({
+        "count": 3,
+        "first": "2026-07-05T09:00:00",
+        "last": "2026-07-06T13:30:00",
+        "distinct_days": 2,
+        "elapsed_human": "1d 4h",
+    })
+    assert "## Session span" in block
+    assert "2026-07-05 09:00:00" in block
+    assert "1d 4h" in block
+    assert "2 calendar days" in block
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_full_renders_session_span(db, tmp_path):
+    """302db181 — a full handoff with logged activity carries the computed span
+    block built from real task_log/session timestamps."""
+    p = await db_module.create_project(db, "span-full")
+    s = await db_module.register_session(db, p["id"], "span-sess")
+    sid = s["id"] if isinstance(s, dict) else s
+    await db_module.log_task(db, sid, p["id"], "did some work")
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=sid
+    )
+    assert "## Session span" in content
+    assert "calendar day" in content

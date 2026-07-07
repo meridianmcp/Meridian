@@ -1,4 +1,4 @@
-"""811881c6 — real arXiv paper search.
+"""811881c6 — real arXiv paper search.  f65f6111 — plus keyless OpenAlex.
 
 The RESEARCH ROUTING PROTOCOL (agent_defaults.py) tells agents to "use the paper-search
 MCP first when it is in your tool list (arXiv / Semantic Scholar-style lookup)" — but no
@@ -8,8 +8,15 @@ Atom feed, which we parse into structured paper records. Web search + GitHub sea
 follow the same template later; arXiv is first because it's the keyless, specifically-
 needed piece.
 
-Pure parsing (:func:`parse_arxiv_atom`) is separated from the network call
-(:func:`arxiv_search`) so it can be unit-tested deterministically without hitting arXiv.
+f65f6111 adds OpenAlex as a SECOND keyless source (https://api.openalex.org/works) so the
+tool isn't preprint-only — OpenAlex indexes published journal/conference works across every
+discipline. Its ``/works?search=`` endpoint returns JSON, which we normalize to the SAME
+result shape ``arxiv_search`` returns so a caller (and capture_research_finding) can treat
+both sources uniformly.
+
+Pure parsing (:func:`parse_arxiv_atom`, :func:`parse_openalex_works`) is separated from the
+network calls (:func:`arxiv_search`, :func:`openalex_search`) so both can be unit-tested
+deterministically without hitting the network.
 """
 from __future__ import annotations
 
@@ -18,6 +25,7 @@ from typing import Any
 
 _ARXIV_API = "http://export.arxiv.org/api/query"
 _ATOM = "{http://www.w3.org/2005/Atom}"
+_OPENALEX_API = "https://api.openalex.org/works"
 
 
 def parse_arxiv_atom(xml_text: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -93,4 +101,117 @@ async def arxiv_search(
             results = parse_arxiv_atom(resp.text, n)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
         return {"error": f"arxiv search failed: {exc}", "query": q}
+    return {"query": q, "count": len(results), "results": results}
+
+
+def _openalex_abstract(inverted_index: Any) -> str:
+    """Reconstruct an abstract from OpenAlex's ``abstract_inverted_index``.
+
+    OpenAlex stores abstracts as ``{word: [positions...]}`` (an inverted index) rather
+    than plain text. We invert it back into a linear string. Never raises — anything
+    unexpected (missing/None/malformed) degrades to ``""``.
+    """
+    if not isinstance(inverted_index, dict):
+        return ""
+    try:
+        positioned: list[tuple[int, str]] = []
+        for word, positions in inverted_index.items():
+            if not isinstance(positions, (list, tuple)):
+                continue
+            for pos in positions:
+                if isinstance(pos, int):
+                    positioned.append((pos, str(word)))
+        positioned.sort(key=lambda pw: pw[0])
+        return " ".join(word for _, word in positioned)
+    except Exception:  # noqa: BLE001 — a bad abstract must never crash a tool call
+        return ""
+
+
+def parse_openalex_works(payload: Any, limit: int = 10) -> list[dict[str, Any]]:
+    """Parse an OpenAlex ``/works`` JSON payload into a list of paper dicts, normalized to
+    the SAME shape ``parse_arxiv_atom`` returns. Never raises — a malformed or empty
+    payload degrades to ``[]``. Each result:
+    ``{openalex_id, title, authors, summary, published, updated, url, pdf_url, doi}``.
+
+    ``payload`` is the decoded JSON object (``{"results": [...]}``); passing the raw list
+    of works is also accepted.
+    """
+    if isinstance(payload, dict):
+        works = payload.get("results")
+    else:
+        works = payload
+    if not isinstance(works, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for work in works:
+        if not isinstance(work, dict):
+            continue
+        authors = []
+        for authorship in work.get("authorships") or []:
+            if not isinstance(authorship, dict):
+                continue
+            author = authorship.get("author")
+            name = (author.get("display_name") if isinstance(author, dict) else "") or ""
+            name = name.strip()
+            if name:
+                authors.append(name)
+        primary = work.get("primary_location")
+        primary = primary if isinstance(primary, dict) else {}
+        landing = (primary.get("landing_page_url") or "").strip()
+        pdf_url = (primary.get("pdf_url") or "").strip()
+        raw_id = (work.get("id") or "").strip()  # e.g. https://openalex.org/W2741809807
+        doi = (work.get("doi") or "").strip()  # e.g. https://doi.org/10.7717/peerj.4375
+        title = " ".join(str(work.get("title") or work.get("display_name") or "").split())
+        published = (work.get("publication_date") or "").strip()
+        updated = (work.get("updated_date") or "").strip()
+        out.append({
+            "openalex_id": raw_id.rsplit("/", 1)[-1] if raw_id else "",
+            "title": title,
+            "authors": authors,
+            "summary": _openalex_abstract(work.get("abstract_inverted_index")),
+            "published": published,
+            "updated": updated,
+            "url": landing or doi or raw_id,
+            "pdf_url": pdf_url,
+            "doi": doi,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def openalex_search(
+    query: str, limit: int = 10, sort_by: str = "relevance"
+) -> dict[str, Any]:
+    """Search OpenAlex and return ``{query, count, results:[...]}`` in the SAME shape as
+    :func:`arxiv_search`.
+
+    ``sort_by``: ``'relevance'`` (default) or ``'date'`` (most-recent publication first).
+    Never raises — an empty query returns ``{error}`` and any network/parse failure
+    degrades to ``{error, query}`` so a research call can't crash the MCP handler. Mirrors
+    ``arxiv_search`` exactly (keyless, best-effort, non-raising).
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"error": "query is required"}
+    n = max(1, min(int(limit or 10), 50))
+    params = {
+        "search": q,
+        "per-page": str(n),
+        # A mailto puts the request in OpenAlex's faster "polite pool" (keyless still).
+        "mailto": "research@usemeridian.us",
+    }
+    if str(sort_by).lower() in ("date", "recent", "newest"):
+        params["sort"] = "publication_date:desc"
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    try:
+        async with _httpx.AsyncClient(timeout=15.0) as http:
+            resp = await http.get(
+                _OPENALEX_API, params=params,
+                headers={"User-Agent": "Meridian/paper_search (research routing)"},
+            )
+            resp.raise_for_status()
+            results = parse_openalex_works(resp.json(), n)
+    except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
+        return {"error": f"openalex search failed: {exc}", "query": q}
     return {"query": q, "count": len(results), "results": results}

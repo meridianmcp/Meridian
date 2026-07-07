@@ -2802,8 +2802,12 @@ async def _handle_session_tools(
         # "use the paper-search MCP first" finally points at a tool that exists (it was
         # instruction-only before). Keyless external lookup; degrades to {error}, never
         # raises. No project scope needed — it's an external search.
-        from ..paper_search import arxiv_search  # noqa: PLC0415
-        return await arxiv_search(
+        # f65f6111 — 'source' routes between two keyless sources: arxiv (default) and
+        # openalex. Both return the same {query, count, results} shape.
+        from ..paper_search import arxiv_search, openalex_search  # noqa: PLC0415
+        source = str(args.get("source", "arxiv") or "arxiv").strip().lower()
+        search = openalex_search if source == "openalex" else arxiv_search
+        return await search(
             args.get("query", ""),
             limit=args.get("limit", 10),
             sort_by=args.get("sort_by", "relevance"),

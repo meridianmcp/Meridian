@@ -1226,10 +1226,186 @@ def _select_strategic_notes(
     return selected
 
 
+# b7f41c73 — Postgres returns real ``datetime`` objects for timestamp columns
+# (completed_at, added_at, claimed_at, created_at, last_seen) while SQLite returns
+# ISO strings. Any delta-path code that ``.strip()``s or ``json.dumps``es those
+# fields crashed on prod ("Object of type datetime is not JSON serializable" /
+# AttributeError on .strip). These helpers make both paths datetime-safe.
+def _iso_ts(value: Any) -> str | None:
+    """Coerce a timestamp (``datetime`` OR str OR None) to an ISO-ish string.
+
+    ``datetime`` objects (Postgres) are rendered via ``isoformat``; strings
+    (SQLite) pass through unchanged; anything else stringifies. ``None`` /empty
+    return ``None`` so callers can distinguish "no timestamp" from a value.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        return value or None
+    return str(value)
+
+
+# Timestamp fields on sprint-item / task / session dicts that Postgres returns as
+# real ``datetime`` objects — coerced to strings before any JSON serialization so
+# a delta handoff never trips ``json.dumps`` on a naive datetime.
+_TS_FIELDS = (
+    "completed_at",
+    "added_at",
+    "claimed_at",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "last_seen",
+)
+
+
+def _json_default(obj: Any) -> str:
+    """``json.dumps(default=...)`` hook: serialize ``datetime`` (and any other
+    non-JSON object) as its string form so a Postgres timestamp never raises
+    "Object of type datetime is not JSON serializable" (b7f41c73)."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    return str(obj)
+
+
+def _ts_safe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return shallow copies of ``items`` with every known timestamp field coerced
+    to an ISO string (b7f41c73). Non-dict entries pass through untouched. This is
+    the single choke-point that makes the delta path datetime-safe before render
+    and any downstream serialization."""
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        copy = dict(item)
+        for field in _TS_FIELDS:
+            if field in copy and isinstance(copy[field], datetime):
+                copy[field] = _iso_ts(copy[field])
+        out.append(copy)
+    return out
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """Parse a timestamp (``datetime`` OR ISO-ish str) into a naive ``datetime``.
+
+    Accepts the same shapes as :func:`_iso_ts` — Postgres ``datetime`` objects and
+    SQLite strings — and normalizes away the ``T`` separator, a trailing ``Z``, a
+    ``+HH:MM`` offset, and optional fractional seconds. Returns ``None`` on empty
+    or unparseable input so callers can skip bad rows instead of crashing (302db181).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        # Drop tz so mixed aware/naive rows compare without raising.
+        return value.replace(tzinfo=None)
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace("T", " ")
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1]
+    if "+" in normalized:
+        normalized = normalized.split("+", 1)[0].strip()
+    # A bare "-" offset (…:00-05:00) — split on the offset colon-group, keeping the
+    # date's own hyphens. Only trim a trailing "-HH:MM" style suffix.
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def compute_session_span(timestamps: list[Any]) -> dict[str, Any]:
+    """Summarize a span of activity from a list of timestamps (302db181).
+
+    ``timestamps`` may mix ``datetime`` objects (Postgres) and ISO strings
+    (SQLite); ``None``/empty/unparseable entries are skipped. Returns a dict:
+
+    * ``first`` / ``last`` — ISO strings of the earliest / latest activity (or None)
+    * ``distinct_days`` — count of distinct calendar days touched
+    * ``elapsed_seconds`` — total wall-clock span first→last, in seconds
+    * ``elapsed_human`` — a compact "2d 3h"/"45m"/"30s" rendering of that span
+    * ``count`` — number of usable timestamps
+
+    A pure function — no I/O — so it is trivially unit-testable and safe to call
+    from any handoff path. An empty / all-unparseable input yields a zeroed span
+    rather than raising.
+    """
+    parsed = [dt for dt in (_parse_ts(t) for t in (timestamps or [])) if dt is not None]
+    if not parsed:
+        return {
+            "first": None,
+            "last": None,
+            "distinct_days": 0,
+            "elapsed_seconds": 0,
+            "elapsed_human": "0s",
+            "count": 0,
+        }
+    first = min(parsed)
+    last = max(parsed)
+    distinct_days = len({dt.date() for dt in parsed})
+    elapsed = int((last - first).total_seconds())
+    return {
+        "first": first.isoformat(),
+        "last": last.isoformat(),
+        "distinct_days": distinct_days,
+        "elapsed_seconds": elapsed,
+        "elapsed_human": _humanize_span(elapsed),
+        "count": len(parsed),
+    }
+
+
+def _humanize_span(seconds: int) -> str:
+    """Render an elapsed second-count as a compact "2d 3h" / "45m" / "30s" string
+    (302db181). Shows the two most-significant non-zero units; 0 → "0s"."""
+    seconds = max(0, int(seconds))
+    if seconds == 0:
+        return "0s"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = [
+        (days, "d"),
+        (hours, "h"),
+        (minutes, "m"),
+        (secs, "s"),
+    ]
+    nonzero = [f"{val}{unit}" for val, unit in parts if val]
+    return " ".join(nonzero[:2])
+
+
+def _render_session_span_block(span: dict[str, Any]) -> str:
+    """Render the computed :func:`compute_session_span` dict as a one-block markdown
+    footer for the handoff (302db181). Returns "" when there is no activity so an
+    empty-state handoff carries no misleading span line."""
+    if not span or not span.get("count"):
+        return ""
+    first = (span.get("first") or "").replace("T", " ")[:19]
+    last = (span.get("last") or "").replace("T", " ")[:19]
+    days = span.get("distinct_days", 0)
+    day_word = "day" if days == 1 else "days"
+    return (
+        "## Session span\n"
+        f"- First activity: {first}\n"
+        f"- Last activity: {last}\n"
+        f"- Elapsed: {span.get('elapsed_human', '0s')} "
+        f"across {days} calendar {day_word}"
+    )
+
+
 def _completed_after(
-    completed_at: str | None,
-    since_ts: str | None,
+    completed_at: Any,
+    since_ts: Any,
 ) -> bool:
+    # b7f41c73 — accept datetime OR str for BOTH operands. On Postgres these
+    # arrive as datetime objects; the old str-only ``.strip()`` path raised
+    # AttributeError. Coerce to ISO strings first, then compare.
+    completed_at = _iso_ts(completed_at)
+    since_ts = _iso_ts(since_ts)
     if not completed_at:
         return False
     if not since_ts:
@@ -2128,12 +2304,19 @@ async def generate_handoff(
             if item.get("status") in {"done", "skipped", "failed", "pushed"}
             and _completed_after(item.get("completed_at"), since_ts)
         ]
+        # b7f41c73 — on Postgres the timestamp columns (completed_at/added_at/
+        # claimed_at) are real datetime objects; coerce them to ISO strings before
+        # render + any downstream serialization so json.dumps never raises
+        # "Object of type datetime is not JSON serializable".
+        completed_items = _ts_safe_items(completed_items)
+        delta_in_progress = _ts_safe_items(in_progress_items)
+        delta_pending = _ts_safe_items(pending_sprint_items)
         content = _render_delta_handoff(
             project,
             generated_at=generated_at,
             completed_items=completed_items,
-            in_progress_items=in_progress_items,
-            pending_sprint_items=pending_sprint_items,
+            in_progress_items=delta_in_progress,
+            pending_sprint_items=delta_pending,
             quick_start_goal=quick_start_goal,
         )
     else:
@@ -2177,6 +2360,18 @@ async def generate_handoff(
                 ai_summary=ai_summary,
                 quick_start_goal=quick_start_goal,
             )
+
+    # 302db181 — computed session span: first + last activity, distinct calendar
+    # days touched, total elapsed wall-clock. Built server-side from the real
+    # task_log + session timestamps (handles both datetime (PG) and str (SQLite)).
+    session_span = compute_session_span(
+        [t.get("created_at") for t in tasks]
+        + [s.get("created_at") for s in sessions]
+        + [s.get("last_seen") for s in sessions]
+    )
+    span_block = _render_session_span_block(session_span)
+    if span_block:
+        content = f"{content}\n\n{span_block}"
 
     ws_block = _render_workspace_handoff_block(
         workspace_decisions, workspace_notes
@@ -2427,10 +2622,18 @@ async def _generate_planner_handoff(
     if tasks:
         lines += ["## Recent activity (last 10 tasks)", ""]
         for t in tasks[:10]:
-            ts = (t.get("created_at") or "")[:10]
+            # b7f41c73 — created_at may be a datetime (PG) or str (SQLite); coerce.
+            ts = (_iso_ts(t.get("created_at")) or "")[:10]
             status = t.get("status", "?")
             lines.append(f"- [{status.upper()}] {ts} — {(t.get('description') or '')[:100]}")
         lines.append("")
+
+    # 302db181 — computed session span from real task timestamps (datetime or str),
+    # so the planner sees how long / how many days this project has been active.
+    span = compute_session_span([t.get("created_at") for t in tasks])
+    span_block = _render_session_span_block(span)
+    if span_block:
+        lines += [span_block, ""]
 
     # Thinking scaffold — empty labelled sections for the planner to fill in.
     lines += [
