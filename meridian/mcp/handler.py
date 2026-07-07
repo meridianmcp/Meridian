@@ -3302,6 +3302,14 @@ async def _handle_sprint_tools(
             db, args["session_id"], note_kind=args.get("note_kind")
         )
     if name == "add_sprint_item":
+        # 8f01cdfe — project_name is an accepted alternative to project_id (the
+        # dispatcher resolver at _dispatch_mcp_tool resolves a present, resolvable
+        # project_name → project_id before we get here). If neither a project_id
+        # nor a resolvable project_name reached us, return a clean, descriptive
+        # error instead of letting the direct args["project_id"] reads below raise
+        # a raw KeyError that leaks as a cryptic JSON-RPC -32603.
+        if not args.get("project_id"):
+            return {"error": "project_id is required (or pass project_name)"}
         validate_input_size(args.get("title"), "sprint item title", 500)
         # 7e212375 — codebase drift check: if the title looks already-implemented
         # (3+ keyword overlap with a specific migration or a recent commit),
