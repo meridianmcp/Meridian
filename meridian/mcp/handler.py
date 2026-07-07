@@ -1460,7 +1460,34 @@ async def _unclaimed_file_warnings(
         return []
 
 
+# ab2ba5fe — cache recent commits per project for a short TTL. add_sprint_item's
+# drift check calls _fetch_recent_commits on every add; a burst of adds (Adam saw
+# 30+ in a night) previously hit the GitHub API (or a `git log` subprocess) each
+# time — the dominant per-call cost. One fetch is now shared for the TTL window.
+_RECENT_COMMITS_TTL = 60.0  # seconds
+_recent_commits_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+
+
 async def _fetch_recent_commits(
+    project: dict[str, Any],
+    tenant: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """ab2ba5fe — thin TTL cache over :func:`_fetch_recent_commits_uncached`,
+    keyed by project id, so a burst of add_sprint_item drift checks shares a
+    single fetch instead of a GitHub round-trip / subprocess per call."""
+    import time as _time  # noqa: PLC0415
+    pid = (project or {}).get("id") or ""
+    if pid:
+        cached = _recent_commits_cache.get(pid)
+        if cached and (_time.monotonic() - cached[0]) < _RECENT_COMMITS_TTL:
+            return cached[1]
+    commits = await _fetch_recent_commits_uncached(project, tenant)
+    if pid:
+        _recent_commits_cache[pid] = (_time.monotonic(), commits)
+    return commits
+
+
+async def _fetch_recent_commits_uncached(
     project: dict[str, Any],
     tenant: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
