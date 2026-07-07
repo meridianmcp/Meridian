@@ -3302,13 +3302,17 @@ function buildTabBody(project: any) {
 
           <div class="live-section">
 
-            <div class="live-section-label">Active sessions</div>
+            <details class="live-section-collapse" open>
 
-            <div class="live-sessions" id="live-sessions-${project.id}">
+              <summary class="live-section-label" style="cursor:pointer;list-style:none">Active sessions</summary>
 
-              <div class="live-empty">No active sessions.</div>
+              <div class="live-sessions" id="live-sessions-${project.id}">
 
-            </div>
+                <div class="live-empty">No active sessions.</div>
+
+              </div>
+
+            </details>
 
           </div>
 
