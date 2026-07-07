@@ -116,25 +116,27 @@ def test_all_six_known_editors_are_already_bundled():
 # The remaining gap is precisely the two related items (no duplication)
 # ---------------------------------------------------------------------------
 
-def test_unbundled_tools_are_exactly_meridian_docs_and_zotero():
-    # The remaining "not yet first-class" plugin tools are exactly the two owned
-    # by the related open items — so this catalog reports the gap without
-    # implementing (duplicating) their wiring.
+def test_unbundled_tools_are_exactly_zotero():
+    # After 9665538a shipped the meridian-docs `docs` slot, the only remaining
+    # "not yet first-class" plugin tool is zotero-mcp (owned by 39c117b1) — the
+    # catalog reports that one residual gap without duplicating its wiring.
     by_name = {t["name"]: t for t in tp.unbundled_plugin_tools()}
-    assert set(by_name) == {"meridian-docs", "zotero-mcp"}
-    assert by_name["meridian-docs"]["owner_item"] == "9665538a"
+    assert set(by_name) == {"zotero-mcp"}
     assert by_name["zotero-mcp"]["owner_item"] == "39c117b1"
 
 
 def test_meridian_docs_is_distinct_from_the_docx_editor():
-    # meridian-docs (the parser) is a DIFFERENT tool than docx-mcp (the editor on
-    # the word slot). Confirm the catalog does not conflate them: they have
-    # different package names and only docx-mcp is bundled.
+    # meridian-docs (the parser, on the `docs` slot) is a DIFFERENT tool than
+    # docx-mcp (the editor on the `word` slot). Both are bundled now (9665538a
+    # shipped docs); confirm the catalog keeps them distinct — different packages
+    # and different slots, never conflated.
     by_name = {t["name"]: t for t in tp.known_plugin_tools()}
     assert by_name["meridian-docs"]["package"] == "meridian-docs"
     assert by_name["word"]["package"] == "docx-mcp"
     assert by_name["word"]["bundled"] is True
-    assert by_name["meridian-docs"]["bundled"] is False
+    assert by_name["meridian-docs"]["bundled"] is True
+    assert by_name["meridian-docs"]["slot"] == "docs"
+    assert by_name["word"]["slot"] == "word"
 
 
 def test_owner_items_only_on_unbundled_entries():
@@ -156,6 +158,6 @@ def test_catalog_addition_does_not_change_resolve_plugins_defaults():
     # 3-slot / 6-slot model).
     resolved = tp.resolve_plugins(None)
     assert [p["name"] for p in resolved] == list(tp.builtin_names())
-    # And no catalog-only name leaked into the runnable built-ins.
-    assert "meridian-docs" not in tp.builtin_names()
+    # The one still-catalog-only name (zotero-mcp, no slot) must never leak into
+    # the runnable built-ins. (meridian-docs IS a built-in now — 9665538a.)
     assert "zotero-mcp" not in tp.builtin_names()

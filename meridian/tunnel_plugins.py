@@ -317,11 +317,12 @@ KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
         "name": "meridian-docs",
         "package": "meridian-docs",
         "runtime": "uvx",
-        # No first-class slot yet: it would ride the word slot as a second command
-        # or a new slot with its own server route (item 9665538a's scope).
-        "slot": None,
-        "bundled": False,
-        "owner_item": "9665538a",
+        # 9665538a SHIPPED this as a first-class built-in on its own `docs` slot
+        # (server route + WS relay in routes/tunnel.py). Now bundled — distinct
+        # from docx-mcp (the editor on the word slot); this is the read layer.
+        "slot": "docs",
+        "bundled": True,
+        "owner_item": None,
         "description": (
             "Standalone OOXML/DOCX fast parser (the read layer extracted from "
             "Meridian) — distinct from docx-mcp, which is the editor."
