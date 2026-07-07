@@ -3125,6 +3125,8 @@ async def _handle_sprint_tools(
                 milestone_type=args.get("milestone_type", "task"),
                 touches_resources=_touches,
                 force=bool(args.get("force", False)),
+                deferred_until=args.get("deferred_until"),
+                track=args.get("track"),
             )
         except ValueError as exc:
             # 501ec93f — malformed touches_resources identifier; surface, don't crash.
@@ -3216,6 +3218,13 @@ async def _handle_sprint_tools(
         # 5823db0b — allow flagging an item as requiring completion evidence.
         if "required_notes" in args:
             _patch_kwargs["required_notes"] = args.get("required_notes")
+        # dec69708 — set/clear the enforced deferral + track. Only forward when the
+        # caller supplied the key, so omitting it leaves the stored value untouched
+        # (patch_sprint_item uses the _UNSET sentinel); pass "" / null to clear.
+        if "deferred_until" in args:
+            _patch_kwargs["deferred_until"] = args.get("deferred_until")
+        if "track" in args:
+            _patch_kwargs["track"] = args.get("track")
         try:
             item = await db_module.patch_sprint_item(
                 db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -3459,6 +3468,12 @@ async def _handle_sprint_tools(
                     )
                 ),
             }
+        # dec69708 — ENFORCED deferral: claim_sprint_item returns a blocked dict
+        # (not a real item) when deferred_until is in the future. Surface it as-is
+        # and stop; the item was NOT claimed, so the worktree plumbing below (which
+        # assumes a real item row) must be skipped.
+        if isinstance(item, dict) and item.get("blocked"):
+            return item
         if item is None:
             raise ValueError("sprint item not found")
 

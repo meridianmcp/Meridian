@@ -522,7 +522,9 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     feedback_note TEXT,
     milestone_type TEXT NOT NULL DEFAULT 'task',
     slug TEXT,
-    nickname TEXT
+    nickname TEXT,
+    deferred_until TEXT,
+    track TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -2506,6 +2508,22 @@ async def _migrate_pg_sprint_item_pointers(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_deferral(conn: PostgresConnection) -> None:
+    """dec69708 — ENFORCED deferral for sprint items (mirrors SQLite).
+
+    Adds nullable ``deferred_until`` (ISO timestamp) and ``track`` columns to
+    ``sprint_items``. While ``deferred_until`` is in the future,
+    claim_sprint_item REFUSES the item — a structural block, not a text-only
+    pinned decision. CREATE_TABLES_CORE covers fresh DBs; this is the upgrade
+    path. ADD COLUMN IF NOT EXISTS → idempotent. Mirrors
+    db._migrate_sprint_item_deferral.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS deferred_until TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS track TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2562,4 +2580,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_project_parent_id,
     _migrate_pg_session_goal_compliance,
     _migrate_pg_sprint_item_pointers,
+    _migrate_pg_sprint_item_deferral,
 )

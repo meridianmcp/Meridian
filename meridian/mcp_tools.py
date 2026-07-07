@@ -792,7 +792,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "touches_resources": {"type": "array", "items": {"type": "string"},
                                "description": "Typed resource identifiers this item touches, for parallel conflict detection: 'file:path.py', 'db:migrations', 'mcp_tool:name', 'route:METHOD:/path', 'pypi:publish', 'github:tag'. Used by get_parallelizable_groups to cluster non-overlapping items."},
          "force": {"type": "boolean",
-                   "description": "Override the duplicate guard AND the codebase drift check (7e212375) and add the item even if its title matches an existing open item or looks already-shipped. Default false."}},
+                   "description": "Override the duplicate guard AND the codebase drift check (7e212375) and add the item even if its title matches an existing open item or looks already-shipped. Default false."},
+         "deferred_until": {"type": "string",
+                            "description": "dec69708 — ISO timestamp before which the item CANNOT be claimed. claim_sprint_item hard-refuses it until this time passes (enforced deferral, e.g. 'defer the paper-track until 2026-09-01'). Omit for an immediately-claimable item."},
+         "track": {"type": "string",
+                   "description": "dec69708 — named lane for the item (e.g. 'paper'). Buckets items so a whole track can be deferred/skipped."}},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -822,9 +826,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["items"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "
-        "or group. Only the fields you pass are changed; omitted fields are left untouched. "
-        "Pass an empty string for human_id or group to clear it. Returns the updated item, "
-        "or an error if the id is unknown.",
+        "group, deferred_until (enforced deferral), or track. Only the fields you pass are "
+        "changed; omitted fields are left untouched. Pass an empty string for human_id, group, "
+        "deferred_until, or track to clear it. Returns the updated item, or an error if the id "
+        "is unknown.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -835,7 +840,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "group": {"type": "string", "description": "Objective name to group the item under (item_group); empty string clears it."},
          "touches_resources": {"type": "array", "items": {"type": "string"},
                                "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged."},
-         "required_notes": {"type": "boolean", "description": "Quality gate (5823db0b): when true, complete_sprint_item is blocked until the item has evidence (existing notes, a linked task, or a notes= argument on completion)."}},
+         "required_notes": {"type": "boolean", "description": "Quality gate (5823db0b): when true, complete_sprint_item is blocked until the item has evidence (existing notes, a linked task, or a notes= argument on completion)."},
+         "deferred_until": {"type": "string", "description": "dec69708 — ISO timestamp before which the item CANNOT be claimed (enforced deferral). Pass an empty string to CLEAR the deferral and make the item claimable now. Omit to leave unchanged."},
+         "track": {"type": "string", "description": "dec69708 — named lane (e.g. 'paper'). Pass an empty string to clear; omit to leave unchanged."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "
