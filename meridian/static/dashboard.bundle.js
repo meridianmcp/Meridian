@@ -2087,6 +2087,17 @@
     const slug = (proj?.name || "meridian").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "meridian";
     return slug;
   }
+  function _execTurnsNumberInputHtml(field, projectId, value, min, max, step) {
+    const esc = window.escapeHtml || String;
+    return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
+  }
+  window._execTurnsNumberInputHtml = _execTurnsNumberInputHtml;
+  function claudeRcWatcherBlurb() {
+    return "For <code>claude --rc</code> (headless) mode, where SessionStart hooks don't fire \u2014 installs a background watcher that fires the hook per session.";
+  }
+  function codexSetupBlurb(mcpHttpUrl, esc) {
+    return `Add to <code>~/.codex/config.toml</code>, or run <code>codex mcp add meridian ${esc(mcpHttpUrl)}</code>.`;
+  }
   function _applySettingsRoleVisibility(projectId, guest) {
     if (!guest) return;
     const body = document.getElementById(`settings-body-${projectId}`);
@@ -3145,10 +3156,7 @@ project_id = "${displayPid}"`;
         <span style="font-size:12px">\u26A1</span> Install rc watcher <span style="color:var(--muted);font-weight:400;margin-left:4px">(for <code>claude --rc</code> server mode)</span>
       </summary>
       <div style="padding:10px 12px;font-size:10px;color:var(--muted);line-height:1.8">
-        <p style="margin:0 0 8px">When Claude runs in <code>claude --rc</code> (headless server mode) the
-        standard SessionStart hooks do not fire. The rc watcher is a lightweight OS-native background service
-        (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) that watches
-        <code>~/.claude/projects/</code> for new session files and fires the hook automatically.</p>
+        <p style="margin:0 0 8px">${claudeRcWatcherBlurb()}</p>
         <div style="margin-bottom:6px;font-size:10px;color:var(--text);font-weight:600">Windows</div>
         <div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">
           <code id="rc-watcher-win-cmd-${escapeHtml(projectId)}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:10px;word-break:break-all">irm ${escapeHtml(hooksBaseUrl)}/install_watcher.ps1 | iex</code>
@@ -3168,7 +3176,7 @@ project_id = "${displayPid}"`;
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Codex CLI setup</div>
 
       ${isHostedMode() ? "" : `
-      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Add to <code>~/.codex/config.toml</code> \u2014 or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">${codexSetupBlurb(mcpHttpUrl, escapeHtml)}</div>
 
       ${!isHosted ? `<div style="margin-bottom:12px">
         <label style="font-size:10px;color:var(--muted)">Your Meridian path<br>
@@ -3211,7 +3219,7 @@ project_id = "${displayPid}"`;
       <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;overflow:hidden">
         <summary style="cursor:pointer;list-style:none;padding:6px 10px;background:var(--surface-2);font-size:10px;color:var(--muted)">Advanced \u2014 HTTP config (Codex / custom)</summary>
         <div style="padding:10px 12px">
-          <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Add to <code>~/.codex/config.toml</code> \u2014 or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px">${codexSetupBlurb(mcpHttpUrl, escapeHtml)}</div>
           <pre id="codex-http-${escapeHtml(projectId)}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
           <button class="secondary" id="codex-copy-http-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy</button>
         </div>
@@ -3602,9 +3610,9 @@ project_id = "${displayPid}"`;
 
     <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
 
-      Checkpoint after <span id="exec-context_threshold-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}</span> turns
+      Checkpoint after <span style="color:var(--text)">N</span> turns <span style="font-size:9px;color:var(--muted)">(10\u2013200)</span>
 
-      <input id="exec-context_threshold-${projectId}" type="range" min="10" max="200" step="5" value="${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      ${_execTurnsNumberInputHtml("context_threshold", projectId, execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD, 10, 200, 5)}
 
       <span style="font-size:9px;color:var(--muted)">When a session passes this many turns, <code>get_context_block</code> nudges it to checkpoint.</span>
 
@@ -3612,9 +3620,9 @@ project_id = "${displayPid}"`;
 
     <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
 
-      Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns
+      Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns <span style="font-size:9px;color:var(--muted)">(40\u2013500)</span>
 
-      <input id="exec-max_turns-${projectId}" type="range" min="40" max="500" step="20" value="${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      ${_execTurnsNumberInputHtml("max_turns", projectId, execCfg.max_turns || DEFAULT_MAX_TURNS, 40, 500, 20)}
 
       <span id="exec-max_turns-warn-${projectId}" style="font-size:9px;color:var(--muted)"></span>
 
@@ -4258,7 +4266,7 @@ project_id = "${displayPid}"`;
       </label>
       <div style="font-size:10px;color:var(--text);margin:12px 0 4px">Handoff Format</div>
       <label style="font-size:10px;color:var(--muted);display:block">Custom full-mode handoff template (leave blank for default)<br>
-        <textarea id="ws-handoff-template" rows="6" placeholder="# Handoff&#10;Sprint: {{sprint}}&#10;&#10;## Recent Tasks&#10;{{recent_tasks}}&#10;&#10;## Pending&#10;{{pending_items}}" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:6px 8px;margin-top:2px;resize:vertical"></textarea>
+        <textarea id="ws-handoff-template" rows="16" placeholder="# Handoff&#10;Sprint: {{sprint}}&#10;&#10;## Recent Tasks&#10;{{recent_tasks}}&#10;&#10;## Pending&#10;{{pending_items}}" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:6px 8px;margin-top:2px;resize:vertical"></textarea>
         <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Placeholders: {{sprint}}, {{recent_tasks}}, {{decisions}}, {{north_star}}, {{version_goal}}, {{pending_items}}, {{notes}}. Blank = default handoff.</span>
       </label>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
@@ -5850,11 +5858,16 @@ project_id = "${displayPid}"`;
           </details>
         </div>`;
       };
-      const coreRows = plugins.filter((p3) => p3.core).map(renderRow).join("");
-      const pluginRows = plugins.filter((p3) => !p3.core).map(renderRow).join("");
+      const coreRows = plugins.filter((p3) => p3.core && p3.slot !== "zotero").map(renderRow).join("");
+      const pluginRows = plugins.filter((p3) => !p3.core && p3.slot !== "zotero").map(renderRow).join("");
+      const zoteroRow = plugins.some((p3) => p3.slot === "zotero") ? _renderZoteroStatusRow({
+        zotero_active: !!active.zotero,
+        slot_status: slotStatus.zotero ? { zotero: slotStatus.zotero } : {}
+      }) : "";
       const _sectionLabel = (text, note) => `<div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:2px 0 6px">${text} <span style="font-weight:400;text-transform:none">${note}</span></div>`;
       const rows = `
       ${coreRows ? _sectionLabel("Core Tools", "\u2014 always on") + coreRows : ""}
+      ${zoteroRow ? _sectionLabel("Reference manager", "\u2014 citation resolution (Zotero)") + zoteroRow : ""}
       ${_sectionLabel("Plugins", "\u2014 opt-in, toggle to enable")}
       ${pluginRows || '<div style="color:var(--muted);font-size:10px">No plugins.</div>'}`;
       const detectedOs = _detectTunnelOs();
@@ -6372,6 +6385,32 @@ project_id = "${displayPid}"`;
     });
   }
   window._wireLifecycleInstallButtons = _wireLifecycleInstallButtons;
+  function _renderZoteroStatusRow(status) {
+    const st = status || {};
+    const active = { zotero: !!st.zotero_active };
+    const slotStatus = st.slot_status && st.slot_status.zotero ? { zotero: st.slot_status.zotero } : {};
+    const lifecycleState = _pluginLifecycleState({ slot: "zotero" }, active, slotStatus);
+    const installCmd = "uvx zotero-mcp";
+    const badge = _renderLifecycleBadge({ slot: "zotero" }, lifecycleState, installCmd);
+    const warnHtml = _renderSlotHealthWarning("zotero", slotStatus);
+    return `
+    <div data-zotero-status="${escapeHtml(lifecycleState)}"
+      style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text);font-weight:600">
+          Reference manager
+          <span style="font-size:9px;color:var(--muted);font-weight:400">/zotero</span>
+        </label>
+        ${badge}
+      </div>
+      <div style="margin-top:4px;font-size:9px;color:var(--muted);line-height:1.6">
+        Citation / reference-manager resolution against your local Zotero library
+        (<code style="font-family:var(--font-mono)">zotero-mcp</code>).
+      </div>
+      ${warnHtml}
+    </div>`;
+  }
+  window._renderZoteroStatusRow = _renderZoteroStatusRow;
 
   // meridian/static/dashboard-notes.ts
   async function loadNotesTab2(projectId) {
