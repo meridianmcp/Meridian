@@ -7,6 +7,8 @@ from typing import Any
 
 _TOOL_EXAMPLES: dict[str, str] = {
     "create_project": 'create_project(name="my-app")',
+    "set_parent_project": 'set_parent_project(project_name="ms-thesis", parent_project_name="Camerer_MS_Graduation_2026")',
+    "rename_project": 'rename_project(project_name="old-name", new_name="new-name")',
     "start_session": 'start_session(project_name="my-project", session_name="feature-x", human_id="alice", role="executor")',
     "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
     "log_task": 'log_task(session_id="session-uuid", project_id="abc-123", description="Fixed auth bug", status="done")',
@@ -75,6 +77,28 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "execution_mode": {"type": "string", "enum": ["autonomous", "interactive"], "description": "Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings."},
          "parent_project_id": {"type": "string", "description": "Optional parent project id — makes this a subproject that inherits the parent's north_star when it has none of its own. Subprojects are one level deep: the parent must exist and must not itself be a subproject."}},
          "required": ["name"]}},
+    {"name": "set_parent_project", "description":
+        "7acb8563 — set, change, or clear a project's parent AFTER creation "
+        "(create_project only accepted parent_project_id at creation time). Use this "
+        "to retroactively nest a project under another, or to detach it. Enforces the "
+        "one-level-deep invariant (3b6ff466): the parent must exist and be top-level, "
+        "a project can't be its own parent, and a project that already has subprojects "
+        "can't become one. Omit parent (or pass empty) to DETACH — make it top-level. "
+        "Returns the updated project; {error} on an invariant violation.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "parent_project_id": {"type": "string", "description": "The parent project's id. Omit or leave empty to DETACH (make the project top-level)."},
+         "parent_project_name": {"type": "string", "description": "The parent project's name — an alternative to parent_project_id; resolved to an id internally."}},
+         "required": []}},
+    {"name": "rename_project", "description":
+        "7acb8563 — rename a project. Returns the updated project, or {error} if it "
+        "does not exist.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "new_name": {"type": "string", "description": "The new project name."}},
+         "required": ["new_name"]}},
     {"name": "register_session", "description": "Low-level: register this session without loading goal context. Use start_session instead for executor/human sessions — it registers AND returns goal + tasks in one call. Use register_session when you only need a session ID and will fetch context separately.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "session_name": {"type": "string"},
