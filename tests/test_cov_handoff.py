@@ -1473,6 +1473,44 @@ def test_handoff_start_session_lines_prefer_project_name():
     assert "project_id=abc-123-uuid" in delta  # inline fallback comment
 
 
+def test_handoff_start_session_substitutes_caller_identity():
+    """bdc251ec — when the authenticated caller identity is known, the starter and
+    delta start_session lines pre-fill human_id="<identity>" instead of leaving a
+    generic placeholder; when it's unknown, no human_id clause is emitted."""
+    proj = {"id": "abc-123-uuid", "name": "meridian-build"}
+
+    starter = handoff_module._render_starter_handoff(
+        proj, completed_items=[], pending_items=[], quick_start_goal="/goal x",
+        identity="alice",
+    )
+    assert 'human_id="alice"' in starter
+    delta = handoff_module._render_delta_handoff(
+        proj, generated_at="2026-06-30", completed_items=[],
+        in_progress_items=[], pending_sprint_items=[], quick_start_goal="/goal x",
+        identity="alice",
+    )
+    assert 'human_id="alice"' in delta
+
+    # No identity → no human_id clause (backwards compatible placeholder form).
+    starter_none = handoff_module._render_starter_handoff(
+        proj, completed_items=[], pending_items=[], quick_start_goal="/goal x",
+    )
+    assert "human_id=" not in starter_none
+    delta_none = handoff_module._render_delta_handoff(
+        proj, generated_at="2026-06-30", completed_items=[],
+        in_progress_items=[], pending_sprint_items=[], quick_start_goal="/goal x",
+    )
+    assert "human_id=" not in delta_none
+
+
+def test_human_id_clause_helper_trims_and_guards():
+    """bdc251ec — the shared clause builder only emits when there's a real handle."""
+    assert handoff_module._human_id_clause("adam") == ', human_id="adam"'
+    assert handoff_module._human_id_clause("  bob  ") == ', human_id="bob"'
+    assert handoff_module._human_id_clause("") == ""
+    assert handoff_module._human_id_clause(None) == ""
+
+
 def test_start_session_agent_instructions_includes_hitl_directive(client):
     """start_session agent_instructions leads with both execution-mode and HITL directives."""
     import json as _json

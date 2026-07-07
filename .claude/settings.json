@@ -1,5 +1,17 @@
 {
     "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "AskUserQuestion",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\hitl_guard.ps1\""
+                    }
+                ]
+            }
+        ],
         "Stop": [
             {
                 "matcher": "",

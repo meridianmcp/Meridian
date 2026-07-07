@@ -1,16 +1,16 @@
-# install.ps1 — download + run the Meridian Connect tunnel binary (meridian-connect.exe).
+# install.ps1 -- download + run the Meridian Connect tunnel binary (meridian-connect.exe).
 #
 #   irm https://usemeridian.us/install.ps1 | iex
 #
 # Beyond a bare download this installer now:
-#   50d2664d — resolves and prints the exact release version being installed
+#   50d2664d -- resolves and prints the exact release version being installed
 #              (the GitHub "latest" tag) up front, so a user can confirm they got
 #              the intended release and not a stale cached binary.
-#   73b65117 — acquires an sk_meridian_ API token via the RFC 8628 device
+#   73b65117 -- acquires an sk_meridian_ API token via the RFC 8628 device
 #              authorization grant (reusing the SAME /oauth/device + /oauth/token
 #              infra as hooks_install.ps1) and passes it to the binary with
 #              --token. That lets `irm ... | iex` complete end-to-end without a
-#              TTY to paste a token into — the old flow dead-ended on hosted
+#              TTY to paste a token into -- the old flow dead-ended on hosted
 #              because meridian-connect's paste prompt needs an interactive stdin.
 $ErrorActionPreference = "Stop"
 
@@ -128,7 +128,7 @@ function Get-MeridianDeviceToken {
 # ---- Resolve + print the release version (50d2664d) --------------------------
 # releases/latest/download/... follows GitHub's "latest non-prerelease" release;
 # the releases/latest API resolves to the SAME tag, so this is exactly what we are
-# about to download. Best-effort — never fatal if the API call fails.
+# about to download. Best-effort -- never fatal if the API call fails.
 $releaseTag = $null
 try {
     $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" `
@@ -184,6 +184,34 @@ if ($userPath -notlike "*$meridianDir*") {
     Write-Host "Added $meridianDir to user PATH (restart terminal to take effect)"
 }
 
+# ---- cee295bd: reuse an existing valid local token before ANY auth flow ------
+function Get-MeridianCachedToken {
+    <#
+      .SYNOPSIS
+      Return a still-valid sk_meridian_ token already cached on this machine for
+      $MeridianUrl, or $null. Mirrors the client's own ~/.meridian/config.json
+      cache (_read_cached_token in tunnel_client.py): base_url must match and the
+      30-day expiry must not have passed. This lets the installer SKIP the browser
+      device flow when the machine is already authorized, instead of forcing a
+      fresh auth round-trip on every run.
+    #>
+    param([Parameter(Mandatory)][string]$MeridianUrl)
+    $cfg = Join-Path (Join-Path $HOME '.meridian') 'config.json'
+    if (-not (Test-Path -LiteralPath $cfg)) { return $null }
+    try {
+        $data = Get-Content -Raw -LiteralPath $cfg -ErrorAction Stop | ConvertFrom-Json
+    } catch { return $null }
+    $entry = $data.tunnel_token
+    if (-not $entry) { return $null }
+    if ("$($entry.base_url)" -ne "$MeridianUrl") { return $null }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    try { $exp = [int64]$entry.expires_at } catch { return $null }
+    if ($exp -le $now) { return $null }
+    $tok = "$($entry.token)"
+    if ($tok -notmatch '^sk_meridian_') { return $null }
+    return $tok
+}
+
 # ---- Keyless auth: acquire a token via the device flow (73b65117) ------------
 # Copy the passthrough args, then decide whether we need to mint a token. We skip
 # the device flow when: the caller already passed --token, a MERIDIAN_TOKEN is in
@@ -205,9 +233,22 @@ if (-not $hasToken `
 }
 
 $isLocal = $targetUrl -match '^https?://(localhost|127\.0\.0\.1)(:\d+)?(/|$)'
+
+# cee295bd -- before any browser auth, honour a still-valid token already cached on
+# this machine. Previously the installer forced the device flow on every run when
+# no --token / MERIDIAN_TOKEN was present, even if a valid token was already on disk.
+if (-not $hasToken -and -not $isLocal) {
+    $cachedToken = Get-MeridianCachedToken -MeridianUrl $targetUrl
+    if (-not [string]::IsNullOrWhiteSpace($cachedToken)) {
+        Write-Host "Using an existing valid Meridian token from ~/.meridian/config.json (no auth needed)."
+        $binaryArgs += @('--token', $cachedToken)
+        $hasToken = $true
+    }
+}
+
 if (-not $hasToken -and -not $isLocal) {
     Write-Host ""
-    Write-Host "Authenticating with Meridian (no token to paste — approve in your browser)..."
+    Write-Host "Authenticating with Meridian (no token to paste -- approve in your browser)..."
     $deviceToken = Get-MeridianDeviceToken -MeridianUrl $targetUrl
     if (-not [string]::IsNullOrWhiteSpace($deviceToken)) {
         $binaryArgs += @('--token', $deviceToken)

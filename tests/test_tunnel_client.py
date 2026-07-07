@@ -1457,6 +1457,34 @@ def test_preflight_slot_dc_uses_larger_cold_fetch_budget(monkeypatch):
     assert (calls[1]["attempts"], calls[1]["delay"]) == tc._PREFLIGHT_BUDGET_DEFAULT
 
 
+def test_preflight_slot_office_slots_use_cold_fetch_budget(monkeypatch):
+    """24b6cb5d — the Office slots (ppt/word) uvx-download their inner server on
+    first spawn, exactly like DC's npx fetch, so they must get the SAME larger
+    cold-fetch pre-flight budget. Before this fix only dc did, and ppt failed the
+    standard ~23s budget on a cold cache ('tunnel:ppt: pre-flight ... FAILED')."""
+    # Both office slots are declared cold-fetch alongside dc.
+    assert tc._COLD_FETCH_SLOTS == frozenset({"dc", "ppt", "word"})
+
+    calls: list[dict] = []
+
+    async def fake_probe(port, *, attempts=2, delay=3.0):
+        calls.append({"port": port, "attempts": attempts, "delay": delay})
+        return True
+
+    monkeypatch.setattr(tc, "_probe_slot_health", fake_probe)
+    monkeypatch.setattr(tc, "_report_slot_health", AsyncMock())
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(tc._preflight_slot(object(), 8811, "ppt"))
+        loop.run_until_complete(tc._preflight_slot(object(), 8812, "word"))
+    finally:
+        loop.close()
+
+    for c in calls:
+        assert (c["attempts"], c["delay"]) == tc._PREFLIGHT_BUDGET_COLD_FETCH
+
+
 def test_preflight_slot_explicit_budget_overrides_default(monkeypatch):
     """089a936a — explicit attempts/delay override the label-derived default, so
     callers keep full control and the background reprobe (attempts=1) is

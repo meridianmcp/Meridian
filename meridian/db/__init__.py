@@ -275,7 +275,15 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- "search-synthesis" / "brisk-otter"), distinct from the long title slug.
     -- Deduped per project. Plain column — no inline index here (guarded-migration
     -- rule); nickname lookups scan the small per-project item set.
-    nickname TEXT
+    nickname TEXT,
+    -- dec69708: ENFORCED deferral. deferred_until is an ISO timestamp; while it is
+    -- in the future, claim_sprint_item REFUSES the item (a structural block, not a
+    -- text-only "we decided to defer this"). track buckets an item into a named
+    -- lane (e.g. 'paper') so a whole track can be skipped by executors. Both
+    -- nullable; NULL = immediately claimable / no track. Plain columns — no inline
+    -- index here (guarded-migration rule).
+    deferred_until TEXT,
+    track TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -919,6 +927,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_project_parent_id(db)
     await _migrate_session_goal_compliance(db)
     await _migrate_sprint_item_pointers(db)
+    await _migrate_sprint_item_deferral(db)
     return db
 
 
@@ -3940,6 +3949,8 @@ async def add_sprint_item(
     touches_resources: Any = None,
     force: bool = False,
     slug: str | None = None,
+    deferred_until: str | None = None,
+    track: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -3952,6 +3963,10 @@ async def add_sprint_item(
     this item to proceed; 'stop' blocks it.
     ``milestone_type`` is 'task' (default) or 'milestone' — milestones
     render as vertical timeline markers in the sprint swimlane.
+    ``deferred_until`` (dec69708) is an ISO timestamp; while it is in the
+    future ``claim_sprint_item`` REFUSES the item (enforced deferral, not a
+    text-only note). ``track`` buckets the item into a named lane (e.g.
+    'paper') so a whole track can be skipped.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
     is compared (word-set overlap, see ``_title_word_overlap``) against every
@@ -4010,11 +4025,12 @@ async def add_sprint_item(
     await db.execute(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
-        "failure_mode, milestone_type, touches_resources, slug, nickname) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "failure_mode, milestone_type, touches_resources, slug, nickname, "
+        "deferred_until, track) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
-         _item_slug, _item_nickname),
+         _item_slug, _item_nickname, deferred_until or None, track or None),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -4255,6 +4271,44 @@ async def start_sprint_item(
     )
 
 
+def _parse_deferral_ts(value: Any) -> "datetime | None":  # noqa: F821
+    """Parse a ``deferred_until`` value into a naive-UTC ``datetime``.
+
+    dec69708 — accepts a ``datetime`` (returned as naive UTC) OR a string in
+    either the DB's space-separated ``YYYY-MM-DD HH:MM:SS`` form or ISO-8601
+    (``T`` separator, optional trailing ``Z`` / offset / fractional seconds).
+    Returns ``None`` when the value is empty or unparseable, so a malformed
+    stored deferral never hard-blocks a claim (fail-open on garbage).
+    """
+    from datetime import datetime, timezone
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        s = s.replace("Z", "+00:00")
+        dt = None
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    break
+                except ValueError:
+                    continue
+        if dt is None:
+            return None
+    # Normalise to naive UTC so comparison against a naive utcnow() is sound.
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 async def claim_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4266,12 +4320,39 @@ async def claim_sprint_item(
     Rejects (raises ValueError) if already in_progress, done, failed, or skipped.
     Returns None if the item doesn't exist. ``actor`` (5823db0b) records which
     executor claimed the item.
+
+    dec69708 — ENFORCED deferral: if the item's ``deferred_until`` is in the
+    future, the claim is REFUSED and a structured blocked dict is returned
+    (``{"blocked": True, "reason": ..., "deferred_until": ...}``) rather than
+    flipping the item to in_progress. This turns a "we decided to defer this"
+    intent into a real, structural guard nothing can bypass by simply claiming
+    the item anyway.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
         return None
     if item.get("project_id") != project_id:
         return None
+    # dec69708 — refuse a future-deferred item. Compare a parsed deferred_until
+    # (datetime OR str) against now(); fail-open if unparseable so a garbage
+    # value never wedges the board.
+    _deferred_raw = item.get("deferred_until")
+    if _deferred_raw:
+        from datetime import datetime as _dt_cls
+        _deferred_dt = _parse_deferral_ts(_deferred_raw)
+        if _deferred_dt is not None and _deferred_dt > _dt_cls.utcnow():
+            return {
+                "blocked": True,
+                "error": "DEFERRED",
+                "reason": (
+                    f"Sprint item is deferred until {_deferred_raw} — it cannot be "
+                    "claimed before then. Clear deferred_until via update_sprint_item "
+                    "to make it claimable now."
+                ),
+                "deferred_until": _deferred_raw,
+                "track": item.get("track"),
+                "item_id": item_id,
+            }
     blocked = {"in_progress", "done", "failed", "skipped"}
     if (item.get("status") or "pending") in blocked:
         raise ValueError(
@@ -4338,16 +4419,22 @@ async def patch_sprint_item(
     item_group: str | None = None,
     touches_resources: Any = _UNSET,
     required_notes: bool | int | None = None,
+    deferred_until: Any = _UNSET,
+    track: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
-    item_group, touches_resources, required_notes. Only fields passed as
-    non-None are changed;
+    item_group, touches_resources, required_notes, deferred_until, track. Only
+    fields passed as non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
     so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
     / JSON string / comma-separated string of typed ids to set it.
+    ``deferred_until`` / ``track`` (dec69708) also use the ``_UNSET`` sentinel:
+    omit to leave unchanged, pass an empty string / ``None`` to CLEAR the
+    deferral (making the item immediately claimable again), or an ISO timestamp
+    / track name to set it.
     """
     fields: list[str] = []
     values: list[Any] = []
@@ -4383,6 +4470,13 @@ async def patch_sprint_item(
     if required_notes is not None:
         fields.append("required_notes = ?")
         values.append(1 if required_notes else 0)
+    if deferred_until is not _UNSET:
+        # Empty string / None CLEARS the deferral (item becomes claimable).
+        fields.append("deferred_until = ?")
+        values.append(deferred_until or None)
+    if track is not _UNSET:
+        fields.append("track = ?")
+        values.append(track or None)
     if not fields:
         return await get_sprint_item(db, item_id)
     values.extend([item_id, project_id])

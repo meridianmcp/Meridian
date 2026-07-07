@@ -2825,3 +2825,75 @@ def test_start_session_no_repo_path_sends_nothing(monkeypatch):
         assert extract_sent == []
     finally:
         _run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# bdc251ec — _resolve_caller_identity: server-side identity for handoff templates
+# ---------------------------------------------------------------------------
+
+def test_resolve_caller_identity_from_tenant():
+    # No tenant (owner / self-host) → None, so the handoff keeps its placeholder.
+    assert mh._resolve_caller_identity(None) is None
+    assert mh._resolve_caller_identity({}) is None
+    # Email → local-part handle.
+    assert mh._resolve_caller_identity({"email": "ajc123@gmail.com"}) == "ajc123"
+    # Explicit name wins over email.
+    assert mh._resolve_caller_identity(
+        {"name": "Adam Camerer", "email": "ajc@x.com"}
+    ) == "Adam Camerer"
+    # Malformed email (no @) → returned as-is if non-empty, else None.
+    assert mh._resolve_caller_identity({"email": "weird"}) == "weird"
+    assert mh._resolve_caller_identity({"email": ""}) is None
+
+
+# ---------------------------------------------------------------------------
+# 926bf221 / a8550238 — add/update-time code prospecting + explicit status
+# ---------------------------------------------------------------------------
+
+def test_prospecting_result_status_variants():
+    # Declared touches_resources → prospected + code_context naming the file.
+    ctx, status = mh._prospecting_result(
+        {"title": "anything", "touches_resources": ["file:meridian/server.py"]}
+    )
+    assert status == "prospected"
+    assert ctx and "meridian/server.py" in ctx.get("files", [])
+    # MANUAL/human item → skipped_manual, no context (never prospect a maintainer todo).
+    _, mstatus = mh._prospecting_result(
+        {"title": "MANUAL (Adam): form an LLC", "milestone_type": "human"}
+    )
+    assert mstatus == "skipped_manual"
+    # Nothing to prospect (no resources, no inferable files) → no_targets.
+    assert mh._prospecting_result({"title": ""}) == (None, "no_targets")
+    # Non-dict → no_item (defensive).
+    assert mh._prospecting_result(None) == (None, "no_item")
+
+
+def test_add_sprint_item_surfaces_prospecting_status_and_context():
+    """a8550238 — the planner sees code context inline at add time; 926bf221 — an
+    explicit prospecting_status is always returned."""
+    db = _make_db()
+    import meridian.db as db_module
+    proj = _run(db_module.create_project(db, "prospect-add"))
+    out = _run(mh._dispatch_mcp_tool("add_sprint_item", {
+        "project_id": proj["id"], "version": "v1",
+        "title": "Refactor the tools/list handler",
+        "touches_resources": ["file:meridian/mcp/handler.py"],
+        "force": True,  # skip the drift guard so the test is deterministic
+    }, db, "/tmp"))
+    assert out.get("prospecting_status") == "prospected"
+    assert "meridian/mcp/handler.py" in out.get("code_context", {}).get("files", [])
+
+
+def test_update_sprint_item_auto_prospects_on_update():
+    """926bf221 — update_sprint_item now prospects too (previously only add/claim),
+    so a substantive edit naming a real file re-derives code context + status."""
+    db = _make_db()
+    import meridian.db as db_module
+    proj = _run(db_module.create_project(db, "prospect-upd"))
+    item = _run(db_module.add_sprint_item(db, proj["id"], "v1", "Some item"))
+    out = _run(mh._dispatch_mcp_tool("update_sprint_item", {
+        "project_id": proj["id"], "item_id": item["id"],
+        "touches_resources": ["file:meridian/db/__init__.py"],
+    }, db, "/tmp"))
+    assert out.get("prospecting_status") == "prospected"
+    assert "meridian/db/__init__.py" in out.get("code_context", {}).get("files", [])

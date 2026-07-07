@@ -257,6 +257,7 @@ async def test_post_login_redirect_invited_user_gets_workspace_redirect(
 
 
 @pytest.mark.asyncio
+@pytest.mark.sqlite_only  # asserts against sqlite_master (no Postgres analog)
 async def test_neon_pool_projects_table_exists(db):
     """neon_pool_projects table must exist after init_db."""
     async with db.execute(

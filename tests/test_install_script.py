@@ -220,3 +220,24 @@ def test_hooks_install_ps1_route_serves_script(client):
     assert "/oauth/device" in r.text
     assert "device_code" in r.text
     assert r.headers["content-type"].startswith("text/plain")
+
+
+# ---------------------------------------------------------------------------
+# cee295bd — reuse an existing valid local token before any auth flow
+# ---------------------------------------------------------------------------
+
+def test_install_ps1_reuses_cached_token_before_device_flow():
+    src = _src()
+    # A dedicated cached-token reader exists and mirrors the client cache shape
+    # (~/.meridian/config.json -> tunnel_token, base_url match + expiry + prefix).
+    assert "function Get-MeridianCachedToken" in src
+    assert "config.json" in src and "tunnel_token" in src
+    assert "expires_at" in src
+    assert "sk_meridian_" in src
+    # The cached-token check must run BEFORE the browser device flow, and skip it
+    # when a valid token is found.
+    cache_call = src.index("Get-MeridianCachedToken -MeridianUrl $targetUrl")
+    device_call = src.index("Get-MeridianDeviceToken -MeridianUrl $targetUrl")
+    assert cache_call < device_call, "cached-token check must precede the device flow"
+    # Using a cached token sets $hasToken so the device-flow block is skipped.
+    assert "$hasToken = $true" in src[cache_call:device_call]

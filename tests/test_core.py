@@ -372,7 +372,9 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "1. [pending] First fix" in content
     assert "2. [pending] Second fix" in content
     assert f"Depends on item 1 (`{first['id']}`): First fix" in content
-    assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
+    # bdc251ec — no authenticated caller identity passed here, so the start line
+    # keeps its generic session_name placeholder and adds no human_id clause.
+    assert f'start_session(project_id="{p["id"]}", session_name="describe-what-youre-doing")' in content
     # eeee02c6 — a depends_on relationship renders the /goal as a flattened
     # dependency-ordered id list (no "Wave" headers, which invite stopping).
     assert "dependency order" in content
@@ -4904,6 +4906,7 @@ async def test_workspace_settings_single_row_fallback(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.sqlite_only  # asserts against sqlite_master (no Postgres analog)
 async def test_migrate_workspace_sprint_board_idempotent(db):
     """The migration creates workspace_sprint_items and re-running is a no-op."""
     from meridian.db.migrations import _migrate_workspace_sprint_board
@@ -7002,10 +7005,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_project_parent_id",
         "_migrate_pg_session_goal_compliance",
         "_migrate_pg_sprint_item_pointers",
+        "_migrate_pg_sprint_item_deferral",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 87
+    assert len(allnames) == len(set(allnames)) == 88
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -7529,6 +7533,7 @@ def test_dashboard_html_has_git_banner(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.sqlite_only  # sqlite_master + PRAGMA table_info (SQLite-specific)
 async def test_schema_all_tables_exist(db):
     """After init_db() every expected table must be present with key columns."""
     expected = {
@@ -8700,6 +8705,7 @@ def test_demo_read_returns_200_without_demo_db(client):
     assert r.status_code == 200
 
 
+@pytest.mark.sqlite_only  # asserts against sqlite_master (no Postgres analog)
 async def test_dark_tables_exist(db):
     """workspace_members and tenant_environments tables must be created by init_db."""
     async with db.execute(

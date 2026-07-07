@@ -790,9 +790,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "milestone_type": {"type": "string", "enum": ["task", "milestone", "human"],
                             "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions)."},
          "touches_resources": {"type": "array", "items": {"type": "string"},
-                               "description": "Typed resource identifiers this item touches, for parallel conflict detection: 'file:path.py', 'db:migrations', 'mcp_tool:name', 'route:METHOD:/path', 'pypi:publish', 'github:tag'. Used by get_parallelizable_groups to cluster non-overlapping items."},
+                               "description": "Typed resource identifiers this item touches, for parallel conflict detection: 'file:path.py', 'db:migrations', 'mcp_tool:name', 'route:METHOD:/path', 'pypi:publish', 'github:tag'. Used by get_parallelizable_groups to cluster non-overlapping items. SYMBOL-LEVEL: append ':symbol_name' to a file id — 'file:path.py:function_name' — so two items editing DIFFERENT symbols in the SAME file are treated as non-overlapping and co-batched in parallel (line ranges resolve via real AST/tree-sitter parsing). Prefer symbol-level ids when two items touch the same file but different functions/classes."},
          "force": {"type": "boolean",
-                   "description": "Override the duplicate guard AND the codebase drift check (7e212375) and add the item even if its title matches an existing open item or looks already-shipped. Default false."}},
+                   "description": "Override the duplicate guard AND the codebase drift check (7e212375) and add the item even if its title matches an existing open item or looks already-shipped. Default false."},
+         "deferred_until": {"type": "string",
+                            "description": "dec69708 — ISO timestamp before which the item CANNOT be claimed. claim_sprint_item hard-refuses it until this time passes (enforced deferral, e.g. 'defer the paper-track until 2026-09-01'). Omit for an immediately-claimable item."},
+         "track": {"type": "string",
+                   "description": "dec69708 — named lane for the item (e.g. 'paper'). Buckets items so a whole track can be deferred/skipped."}},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -814,7 +818,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                      "description": {"type": "string", "description": "Optional notes / detail for the item."},
                      "group": {"type": "string", "description": "Optional objective group name."},
                      "version": {"type": "string", "description": "Optional sprint-version bucket; defaults to empty string."},
-                     "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Optional typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:) for parallel conflict detection."},
+                     "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Optional typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:) for parallel conflict detection. For SYMBOL-LEVEL granularity append ':symbol_name' to a file id ('file:path.py:func') so items editing different symbols in the same file co-batch in parallel."},
                  },
                  "required": ["title"],
              },
@@ -822,9 +826,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["items"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "
-        "or group. Only the fields you pass are changed; omitted fields are left untouched. "
-        "Pass an empty string for human_id or group to clear it. Returns the updated item, "
-        "or an error if the id is unknown.",
+        "group, deferred_until (enforced deferral), or track. Only the fields you pass are "
+        "changed; omitted fields are left untouched. Pass an empty string for human_id, group, "
+        "deferred_until, or track to clear it. Returns the updated item, or an error if the id "
+        "is unknown.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -834,8 +839,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "human_id": {"type": "string", "description": "Reassign to a person (assignee); empty string clears it."},
          "group": {"type": "string", "description": "Objective name to group the item under (item_group); empty string clears it."},
          "touches_resources": {"type": "array", "items": {"type": "string"},
-                               "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged."},
-         "required_notes": {"type": "boolean", "description": "Quality gate (5823db0b): when true, complete_sprint_item is blocked until the item has evidence (existing notes, a linked task, or a notes= argument on completion)."}},
+                               "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged. SYMBOL-LEVEL: append ':symbol_name' to a file id ('file:path.py:func') so items editing different symbols in the same file are non-overlapping and co-batch in parallel."},
+         "required_notes": {"type": "boolean", "description": "Quality gate (5823db0b): when true, complete_sprint_item is blocked until the item has evidence (existing notes, a linked task, or a notes= argument on completion)."},
+         "deferred_until": {"type": "string", "description": "dec69708 — ISO timestamp before which the item CANNOT be claimed (enforced deferral). Pass an empty string to CLEAR the deferral and make the item claimable now. Omit to leave unchanged."},
+         "track": {"type": "string", "description": "dec69708 — named lane (e.g. 'paper'). Pass an empty string to clear; omit to leave unchanged."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "

@@ -442,6 +442,63 @@ def test_handler_tools_list_skips_bridge_without_tunnel(monkeypatch):
     assert called["list"] is False  # no tunnel → never queried
 
 
+def test_handler_tools_list_signals_error_when_tunnel_fetch_fails(monkeypatch):
+    """7033c8e2 — a tunnel that is CONNECTED but whose tool fetch throws must not
+    silently drop to the short native list. The native tools still serve, but the
+    result carries a machine-readable degraded/error signal so the failure is
+    visible instead of silent."""
+    tenant = {"id": "t1", "plan": "pro"}
+    monkeypatch.setattr(tn, "has_active_tunnel", lambda tid: True)
+
+    async def boom(tid, reserved):
+        raise RuntimeError("socket reset")
+
+    monkeypatch.setattr(tn, "list_tunnel_tools", boom)
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    resp = asyncio.run(mh._handle_mcp_request(body, db=None, data_dir="/tmp", tenant=tenant))
+    # native tools still present — the hiccup never breaks tools/list
+    names = {t["name"] for t in resp["result"]["tools"]}
+    assert "log_task" in names
+    # ...but the failure is SIGNALLED, not swallowed
+    health = resp["result"].get("_meta", {}).get("meridian/tunnelHealth")
+    assert health and health["status"] == "error"
+    assert "socket reset" in health.get("detail", "")
+
+
+def test_handler_tools_list_signals_degraded_when_tunnel_returns_zero(monkeypatch):
+    """7033c8e2 — a connected tunnel that advertises ZERO tools (slot still
+    starting / failed pre-flight) is flagged 'degraded', not shown as an
+    unexplained short list."""
+    tenant = {"id": "t1", "plan": "pro"}
+    monkeypatch.setattr(tn, "has_active_tunnel", lambda tid: True)
+
+    async def empty(tid, reserved):
+        return []
+
+    monkeypatch.setattr(tn, "list_tunnel_tools", empty)
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    resp = asyncio.run(mh._handle_mcp_request(body, db=None, data_dir="/tmp", tenant=tenant))
+    health = resp["result"].get("_meta", {}).get("meridian/tunnelHealth")
+    assert health and health["status"] == "degraded"
+
+
+def test_handler_tools_list_no_health_meta_when_tunnel_healthy(monkeypatch):
+    """7033c8e2 — on the happy path (tunnel returns tools) NO health _meta is
+    attached, so the signal only ever appears on a real problem."""
+    tenant = {"id": "t1", "plan": "pro"}
+    monkeypatch.setattr(tn, "has_active_tunnel", lambda tid: True)
+
+    async def ok(tid, reserved):
+        return [{"name": "trace_path", "description": "graph"}]
+
+    monkeypatch.setattr(tn, "list_tunnel_tools", ok)
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    resp = asyncio.run(mh._handle_mcp_request(body, db=None, data_dir="/tmp", tenant=tenant))
+    assert "trace_path" in {t["name"] for t in resp["result"]["tools"]}
+    meta = resp["result"].get("_meta") or {}
+    assert "meridian/tunnelHealth" not in meta
+
+
 def test_handler_tools_call_routes_to_tunnel(monkeypatch):
     tenant = {"id": "t1", "plan": "pro"}
     monkeypatch.setattr(tn, "has_active_tunnel", lambda tid: True)

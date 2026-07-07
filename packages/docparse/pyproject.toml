@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meridian-docparse"
+version = "0.1.0"
+description = "Deterministic OOXML (.docx) + LaTeX structural parsing — Meridian's detachable, standalone-installable doc-intelligence sub-package."
+readme = "README.md"
+requires-python = ">=3.11"
+# Governed by the parent Meridian repo LICENSE (MSL-1.0); this sub-package is NOT a
+# separately-published product — it just ships detachably from packages/docparse/.
+license = { text = "MSL-1.0" }
+authors = [{ name = "Meridian" }]
+keywords = ["docx", "ooxml", "latex", "document-structure", "parser", "meridian"]
+# Pure stdlib — no third-party runtime dependencies (xml.etree / sqlite3 only).
+dependencies = []
+
+[project.urls]
+Homepage = "https://usemeridian.us"
+
+[tool.hatch.build.targets.wheel]
+packages = ["docparse"]

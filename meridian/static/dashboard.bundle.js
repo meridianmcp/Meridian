@@ -2430,6 +2430,7 @@ stop = ${JSON.stringify(stop)}`;
 
     </div>`;
       }
+      let _connectPanelHtml = "";
       if (isHostedMode()) {
         const _advKey = `meridian.settings.adv.${projectId}`;
         let _advOpen = false;
@@ -2437,7 +2438,7 @@ stop = ${JSON.stringify(stop)}`;
           _advOpen = localStorage.getItem(_advKey) === "1";
         } catch (e3) {
         }
-        html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+        _connectPanelHtml += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
     <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
 
@@ -2763,7 +2764,7 @@ stop = ${JSON.stringify(stop)}`;
       </div>
     </div>`;
       }
-      if (!isHostedMode()) html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+      if (!isHostedMode()) _connectPanelHtml += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
     <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
 
@@ -4165,6 +4166,7 @@ project_id = "${displayPid}"`;
         const _awRot = _awOpen ? "transform:rotate(90deg)" : "";
         html += `<details id="settings-grp-aw-${projectId}" ${_awOpen ? "open" : ""} style="margin-bottom:12px;border:2px solid var(--border);border-radius:8px"><summary style="cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:8px;background:var(--surface-2);border-radius:8px"><span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;${_awRot}">\u25B6</span><span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">ACCOUNT &amp; WORKSPACE</span></summary><div style="padding:8px 8px 4px">`;
       }
+      html += _connectPanelHtml;
       html += _secHtml("account", "Account");
       html += `<div style="margin-bottom:16px" id="workspace-section-${projectId}">
     <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Workspace</div>
@@ -5570,7 +5572,7 @@ project_id = "${displayPid}"`;
   // meridian/static/dashboard-plugins.ts
   var _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812, dc: 8813 };
   var _OPTIN_SLOT_HINTS = {
-    word: { pkg: "uvx docx-mcp-server", note: "Word / DOCX editing \u2014 needs uv (uvx)." },
+    word: { pkg: "uvx docx-mcp", note: "Word / DOCX editing \u2014 needs uv (uvx)." },
     ppt: { pkg: "uvx powerpoint-mcp", note: "PowerPoint authoring \u2014 needs uv (uvx)." },
     dc: { pkg: "npx -y @wonderwhy-er/desktop-commander@latest", note: "Desktop Commander, local only \u2014 needs Node (npx)." }
   };
@@ -9873,8 +9875,31 @@ ${n2.tags || ""}`.toLowerCase();
       menu.appendChild(item);
     }
     const uuidDiv = document.createElement("div");
-    uuidDiv.style.cssText = "padding:6px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);user-select:all;cursor:text";
+    uuidDiv.style.cssText = "padding:6px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);user-select:all;cursor:pointer";
+    uuidDiv.title = "Click to copy project ID";
     uuidDiv.textContent = t3.id;
+    uuidDiv.addEventListener("click", (e3) => {
+      e3.stopPropagation();
+      const _restore = () => setTimeout(() => {
+        uuidDiv.textContent = t3.id;
+      }, 1200);
+      const _cb = navigator.clipboard;
+      if (_cb && _cb.writeText) {
+        _cb.writeText(t3.id).then(
+          () => {
+            uuidDiv.textContent = "\u2713 Copied project ID";
+            _restore();
+          },
+          () => {
+            uuidDiv.textContent = "Copy failed \u2014 select manually";
+            _restore();
+          }
+        );
+      } else {
+        uuidDiv.textContent = "Copy failed \u2014 select manually";
+        _restore();
+      }
+    });
     menu.appendChild(uuidDiv);
     menuItem("\u270F Rename", () => _renameProject(t3));
     menuItem("\u{1F3A8} Change icon\u2026", () => _setProjectIcon(t3));

@@ -814,6 +814,14 @@ async def _handle_mcp_request(
         tools = list(_server._MCP_TOOLS_LIST)
         if tenant:
             tools = tools + _server._github_tools_for_tenant(tenant)
+        # 7033c8e2 — when a tunnel is connected but its tools don't load, DON'T fail
+        # silently (the old behaviour: user's filesystem/code/office tools vanish
+        # with zero explanation, confirmed live across claude.ai + Claude Desktop).
+        # Attach a machine-readable degraded/error signal to the result `_meta` so
+        # a client or the dashboard can surface "connected but tools unavailable"
+        # instead of an unexplained short list. The native tools/list itself is
+        # never broken by a tunnel hiccup.
+        tunnel_health = None
         # Single-connector bridge: when this tenant has a live `meridian --tunnel`,
         # surface its filesystem / code-intel / extractor tools here so the user's
         # existing Meridian connector gains them with zero extra config. Reserve
@@ -827,12 +835,43 @@ async def _handle_mcp_request(
                     # dispatch when a tenant is set, so the tunnel must not advertise
                     # them here or list/call would disagree.
                     reserved = {t.get("name") for t in tools} | set(_server._GITHUB_TOOL_NAMES)
-                    tools = tools + await _tunnel_mod.list_tunnel_tools(
+                    tunnel_tools = await _tunnel_mod.list_tunnel_tools(
                         tenant["id"], reserved,
                     )
-                except Exception:  # noqa: BLE001
-                    pass  # tunnel hiccup must never break native tools/list
-        return _server._jsonrpc_ok(req_id, {"tools": tools})
+                    tools = tools + tunnel_tools
+                    if not tunnel_tools:
+                        # Tunnel is up but advertised nothing — a slot is still
+                        # starting or failed its pre-flight health check.
+                        tunnel_health = {
+                            "status": "degraded",
+                            "message": (
+                                "Meridian tunnel is connected but returned 0 plugin tools "
+                                "(filesystem / code-intel / office). A slot may still be "
+                                "starting or failed its pre-flight health check — retry "
+                                "shortly or check the `meridian --tunnel` process."
+                            ),
+                        }
+                except Exception as exc:  # noqa: BLE001
+                    # tunnel hiccup must never break native tools/list — but signal it.
+                    import sys as _sys  # noqa: PLC0415
+                    print(
+                        f"tools/list: tunnel tool fetch failed for tenant "
+                        f"{tenant.get('id')}: {exc!r}",
+                        file=_sys.stderr, flush=True,
+                    )
+                    tunnel_health = {
+                        "status": "error",
+                        "message": (
+                            "Meridian tunnel is connected but its plugin tools could not "
+                            "be loaded this request; only native tools are listed. Retry, "
+                            "or check the tunnel process."
+                        ),
+                        "detail": str(exc)[:200],
+                    }
+        result: dict = {"tools": tools}
+        if tunnel_health is not None:
+            result["_meta"] = {"meridian/tunnelHealth": tunnel_health}
+        return _server._jsonrpc_ok(req_id, result)
 
     if method == "prompts/list":
         return _server._jsonrpc_ok(req_id, {"prompts": _MCP_PROMPTS})
@@ -1244,6 +1283,37 @@ def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _prospecting_result(
+    item: "dict[str, Any] | None",
+) -> "tuple[dict[str, Any] | None, str]":
+    """926bf221 / a8550238 — run add/update-time code prospecting and return an
+    EXPLICIT status alongside the context, so a caller can tell "prospected" from
+    "nothing to prospect" from "never attempted / errored". Previously only
+    claim_sprint_item prospected, and no status field existed, so success,
+    silent-failure, and never-attempted were indistinguishable to the caller.
+
+    Never raises — _prospect_code_context is non-fatal by construction, but the
+    manual-item check and the guard keep this safe for the hot add/update path.
+    """
+    if not isinstance(item, dict):
+        return None, "no_item"
+    # MANUAL/human maintainer items get no code prospecting (prospecting "form an
+    # LLC" only attaches noise) — matches the handoff enrichment policy.
+    try:
+        from .. import handoff as _handoff_manual  # noqa: PLC0415
+        if _handoff_manual._is_manual_sprint_item(item):
+            return None, "skipped_manual"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ctx = _prospect_code_context(item)
+    except Exception:  # noqa: BLE001 — best-effort; never break add/update
+        return None, "error"
+    if ctx:
+        return ctx, "prospected"
+    return None, "no_targets"
+
+
 async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
     """fd86aacc — names of executor sessions seen active in the last 10 minutes.
 
@@ -1612,6 +1682,22 @@ async def _handle_project_tools(
     return _MISS
 
 
+def _resolve_caller_identity(tenant: "dict[str, Any] | None") -> "str | None":
+    """bdc251ec — a human_id handle for the authenticated caller, derived from the
+    tenant the auth token already resolved. Prefer an explicit name, else the email
+    local-part. Returns None on the owner / self-host path (no tenant) so the
+    handoff keeps its generic placeholder rather than inventing an identity."""
+    if not tenant:
+        return None
+    name = str(tenant.get("name") or "").strip()
+    if name:
+        return name
+    email = str(tenant.get("email") or "").strip()
+    if "@" in email:
+        return email.split("@", 1)[0] or None
+    return email or None
+
+
 async def _handle_task_tools(
     name: str,
     args: dict[str, Any],
@@ -1679,6 +1765,7 @@ async def _handle_task_tools(
                     session_id=session_id,
                     commit_messages=[c["message"] for c in _gh_commits],
                     graph_searcher=_graph_searcher,
+                    identity=_resolve_caller_identity(tenant),
                 ),
                 timeout=90.0,
             )
@@ -2561,6 +2648,7 @@ async def _handle_session_tools(
                 handoff_module_local.generate_handoff(
                     db, project_id, data_dir, mode="delta", session_id=session_id,
                     commit_messages=[c["message"] for c in _commits],
+                    identity=_resolve_caller_identity(tenant),
                 ),
                 timeout=30.0,
             )
@@ -3125,6 +3213,8 @@ async def _handle_sprint_tools(
                 milestone_type=args.get("milestone_type", "task"),
                 touches_resources=_touches,
                 force=bool(args.get("force", False)),
+                deferred_until=args.get("deferred_until"),
+                track=args.get("track"),
             )
         except ValueError as exc:
             # 501ec93f — malformed touches_resources identifier; surface, don't crash.
@@ -3148,6 +3238,15 @@ async def _handle_sprint_tools(
                 f"The wording ('{_ins_sig}') looks like a decision/insight — consider "
                 "add_insight() or pin_decision() so it isn't lost at session end."
             )
+        # a8550238 — surface code-prospecting context INLINE at add time, so the
+        # planner sees which real files/symbols the item touches (and can prospect
+        # them) while the sprint is still being shaped — not only later at claim
+        # time. 926bf221 — always report an explicit prospecting_status so the
+        # caller can distinguish prospected / no-targets / skipped / errored.
+        _pc_ctx, _pc_status = _prospecting_result(_new_item)
+        _extra["prospecting_status"] = _pc_status
+        if _pc_ctx:
+            _extra["code_context"] = _pc_ctx
         if _extra:
             _new_item = {**_new_item, **_extra}
         return _new_item
@@ -3216,13 +3315,30 @@ async def _handle_sprint_tools(
         # 5823db0b — allow flagging an item as requiring completion evidence.
         if "required_notes" in args:
             _patch_kwargs["required_notes"] = args.get("required_notes")
+        # dec69708 — set/clear the enforced deferral + track. Only forward when the
+        # caller supplied the key, so omitting it leaves the stored value untouched
+        # (patch_sprint_item uses the _UNSET sentinel); pass "" / null to clear.
+        if "deferred_until" in args:
+            _patch_kwargs["deferred_until"] = args.get("deferred_until")
+        if "track" in args:
+            _patch_kwargs["track"] = args.get("track")
         try:
             item = await db_module.patch_sprint_item(
                 db, args["project_id"], args["item_id"], **_patch_kwargs
             )
         except ValueError as exc:
             return {"error": str(exc)}
-        return item or {"error": "sprint item not found"}
+        if not item:
+            return {"error": "sprint item not found"}
+        # 926bf221 — update_sprint_item now auto-prospects too (previously only
+        # add/claim did), so a substantive edit that names real files re-derives
+        # code context instead of staying null. Explicit prospecting_status keeps
+        # success / no-targets / skipped distinguishable to the caller.
+        _u_ctx, _u_status = _prospecting_result(item)
+        item = {**item, "prospecting_status": _u_status}
+        if _u_ctx:
+            item["code_context"] = _u_ctx
+        return item
     if name == "set_sprint":
         # 62d321dd — guard: warn if pending items were never started before rolling sprint
         if not args.get("force"):
@@ -3459,6 +3575,12 @@ async def _handle_sprint_tools(
                     )
                 ),
             }
+        # dec69708 — ENFORCED deferral: claim_sprint_item returns a blocked dict
+        # (not a real item) when deferred_until is in the future. Surface it as-is
+        # and stop; the item was NOT claimed, so the worktree plumbing below (which
+        # assumes a real item row) must be skipped.
+        if isinstance(item, dict) and item.get("blocked"):
+            return item
         if item is None:
             raise ValueError("sprint item not found")
 
