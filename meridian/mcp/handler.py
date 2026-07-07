@@ -1428,6 +1428,47 @@ async def _handle_project_tools(
             )
         except ValueError as exc:
             return {"error": str(exc)}
+    if name == "set_parent_project":
+        # 7acb8563 — set / change / clear parent_project_id on an EXISTING project
+        # (create_project only accepted it at creation time). Resolve the project and
+        # parent by id or name; an invalid / nested / self / has-children parent
+        # raises ValueError in the db layer -> surfaced as {error}. Omitting the
+        # parent (or passing empty) DETACHES the project (makes it top-level).
+        _pid = (args.get("project_id") or "").strip()
+        if not _pid and args.get("project_name"):
+            _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+            _pid = (_p or {}).get("id", "") if _p else ""
+        if not _pid:
+            return {"error": "project_id (or project_name) is required"}
+        _parent = args.get("parent_project_id")
+        if not _parent and args.get("parent_project_name"):
+            _pp = await db_module.get_project_by_name(db, str(args["parent_project_name"]))
+            _parent = (_pp or {}).get("id") if _pp else None
+        if not _parent:  # "" / missing -> detach
+            _parent = None
+        try:
+            updated = await db_module.set_parent_project(db, _pid, _parent)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        if updated is None:
+            return {"error": f"project '{_pid}' not found"}
+        return updated
+    if name == "rename_project":
+        # 7acb8563 — MCP wrapper over the existing db.rename_project (previously only
+        # reachable through the HTTP route, so an agent had to use raw SQL).
+        _pid = (args.get("project_id") or "").strip()
+        if not _pid and args.get("project_name"):
+            _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+            _pid = (_p or {}).get("id", "") if _p else ""
+        if not _pid:
+            return {"error": "project_id (or project_name) is required"}
+        _new = (args.get("new_name") or "").strip()
+        if not _new:
+            return {"error": "new_name is required"}
+        updated = await db_module.rename_project(db, _pid, _new)
+        if updated is None:
+            return {"error": f"project '{_pid}' not found"}
+        return updated
     if name == "register_session":
         hid = args.get("human_id")
         if not hid and not _hosted_mode():

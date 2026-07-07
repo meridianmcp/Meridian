@@ -1150,6 +1150,59 @@ async def rename_project(
     return await get_project(db, project_id)
 
 
+async def set_parent_project(
+    db: aiosqlite.Connection,
+    project_id: str,
+    parent_project_id: str | None,
+) -> dict[str, Any] | None:
+    """7acb8563 — set / change / clear a project's parent AFTER creation.
+
+    ``create_project`` only accepted ``parent_project_id`` at creation time; this
+    makes the same relationship editable so retroactively fixing a phantom-duplicate
+    (e.g. ms-thesis under Camerer_MS_Graduation) no longer needs a raw DB write.
+
+    Enforces the SAME one-level-deep invariant as ``create_project`` (3b6ff466):
+    the parent must exist and itself be top-level, a project cannot be its own
+    parent, and a project that already HAS subprojects cannot become a subproject
+    (that would create a two-level chain). Pass ``parent_project_id=None`` to
+    detach (make it top-level again). Validates BEFORE any write; raises
+    ``ValueError`` on any violation. Returns the updated project, or ``None`` if
+    ``project_id`` does not exist.
+    """
+    project = await get_project(db, project_id)
+    if project is None:
+        return None
+    if parent_project_id is not None:
+        if parent_project_id == project_id:
+            raise ValueError("a project cannot be its own parent")
+        parent = await get_project(db, parent_project_id)
+        if parent is None:
+            raise ValueError(
+                f"parent project '{parent_project_id}' does not exist"
+            )
+        if parent.get("parent_project_id"):
+            raise ValueError(
+                "subprojects are one level deep — cannot nest under a project "
+                f"that is itself a subproject ('{parent_project_id}' has a parent)"
+            )
+        async with db.execute(
+            "SELECT 1 FROM projects WHERE parent_project_id = ? LIMIT 1",
+            (project_id,),
+        ) as cur:
+            has_children = await cur.fetchone() is not None
+        if has_children:
+            raise ValueError(
+                f"project '{project_id}' has subprojects of its own — cannot make "
+                "it a subproject (subprojects are one level deep)"
+            )
+    await db.execute(
+        "UPDATE projects SET parent_project_id = ? WHERE id = ?",
+        (parent_project_id, project_id),
+    )
+    await db.commit()
+    return await get_project(db, project_id)
+
+
 async def get_project_settings(
     db: aiosqlite.Connection, project_id: str
 ) -> dict[str, Any] | None:
