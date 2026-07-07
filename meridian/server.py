@@ -4290,6 +4290,26 @@ async def _start_session_composite(
         sprint_version=scoped_version,
     )
     _mark_session_connected(session["id"])
+    # 9dad83fd — recover answers to blocking HITLs whose originating (now-dead)
+    # session was the only poller, so a resuming session doesn't lose them.
+    # Best-effort + once-delivery (marks each delivered); never breaks orientation.
+    recovered_hitls: list[dict[str, Any]] = []
+    try:
+        _active_sess = await db_module.get_sessions(db, project_id, active_only=True)
+        _active_ids = {s.get("id") for s in _active_sess if s.get("id")}
+        for _h in await db_module.get_recoverable_hitl_answers(
+            db, project_id, active_session_ids=_active_ids
+        ):
+            recovered_hitls.append({
+                "id": _h.get("id"),
+                "question": (_h.get("question") or "")[:160],
+                "answer": _h.get("answer"),
+                "answered_by": _h.get("answered_by"),
+                "answered_at": _h.get("answered_at"),
+            })
+            await db_module.mark_hitl_recovery_delivered(db, _h.get("id"))
+    except Exception:  # noqa: BLE001 — recovery is best-effort
+        recovered_hitls = []
     # G9.x - If start_session is called with an explicit project_id, any pending
     # hook_project_select HITL for this project is redundant -- dismiss it silently.
     # The executor already chose this project by calling start_session.
@@ -4486,6 +4506,8 @@ async def _start_session_composite(
                     _c_payload["orchestration"] = _c_orch
             except Exception:
                 pass
+        if recovered_hitls:  # 9dad83fd — only when there's something to recover
+            _c_payload["recovered_hitl_answers"] = recovered_hitls
         return _c_payload
 
     await _expire_and_generate_handoffs(db, data_dir)
@@ -4665,6 +4687,8 @@ async def _start_session_composite(
         payload["executor_config"] = executor_config
         payload["executor_context"] = executor_context
         payload["role"] = "executor"
+    if recovered_hitls:  # 9dad83fd — surface recovered blocking-HITL answers
+        payload["recovered_hitl_answers"] = recovered_hitls
     return payload
 
 

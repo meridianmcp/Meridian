@@ -16632,3 +16632,56 @@ def test_self_host_defaults_env_over_toml_over_default(monkeypatch, tmp_path):
     assert d["loop_enabled_default"] is True
     assert d["max_turns_default"] == 7
     assert d["filesystem_roots"] == ["/a", "/b", "/c"]
+
+
+# ---------------------------------------------------------------------------
+# 9dad83fd — recovery for answered blocking HITLs whose session died
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recoverable_blocking_hitl_once_delivery(db):
+    p = await db_module.create_project(db, "alpha")
+    dead = await db_module.register_session(db, p["id"], "dead-sess")
+    live = await db_module.register_session(db, p["id"], "live-sess")
+    # Blocking HITL filed by the (soon-dead) session, then answered by a human.
+    h = await db_module.request_hitl(
+        db, p["id"], "Merge phantom project?", session_id=dead["id"],
+        urgency="blocking", require_human=True,
+    )
+    await db_module.answer_hitl_request(db, h["id"], "no, keep separate", answered_by="adam")
+    # A non-blocking answered HITL must NOT be recovered.
+    h2 = await db_module.request_hitl(
+        db, p["id"], "fyi", session_id=dead["id"], urgency="normal", require_human=True,
+    )
+    await db_module.answer_hitl_request(db, h2["id"], "ok", answered_by="adam")
+
+    # Originating session dead (not in the active set) → the blocking answer is recovered.
+    rec = await db_module.get_recoverable_hitl_answers(
+        db, p["id"], active_session_ids={live["id"]}
+    )
+    assert [r["id"] for r in rec] == [h["id"]]
+    assert rec[0]["answer"] == "no, keep separate"
+    assert rec[0]["answered_by"] == "adam"
+
+    # Marked delivered → not returned again (idempotent once-delivery).
+    await db_module.mark_hitl_recovery_delivered(db, h["id"])
+    rec2 = await db_module.get_recoverable_hitl_answers(
+        db, p["id"], active_session_ids={live["id"]}
+    )
+    assert rec2 == []
+
+
+@pytest.mark.asyncio
+async def test_recoverable_hitl_skips_live_originating_session(db):
+    p = await db_module.create_project(db, "beta")
+    s = await db_module.register_session(db, p["id"], "still-alive")
+    h = await db_module.request_hitl(
+        db, p["id"], "q", session_id=s["id"], urgency="blocking", require_human=True,
+    )
+    await db_module.answer_hitl_request(db, h["id"], "a", answered_by="adam")
+    # Originating session still active → NOT recovered (it consumes its own answer).
+    rec = await db_module.get_recoverable_hitl_answers(
+        db, p["id"], active_session_ids={s["id"]}
+    )
+    assert rec == []

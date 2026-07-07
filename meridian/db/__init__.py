@@ -9248,6 +9248,81 @@ async def dismiss_hitl_request(
     return await get_hitl_request(db, request_id)
 
 
+def _hitl_payload_flag(payload: Any, key: str) -> bool:
+    """True if the HITL payload JSON has a truthy ``key``. Tolerant of a
+    None/non-JSON/non-dict payload (returns False)."""
+    try:
+        pl = json.loads(payload) if isinstance(payload, str) else (payload or {})
+    except (TypeError, ValueError):
+        return False
+    return bool(isinstance(pl, dict) and pl.get(key))
+
+
+async def get_recoverable_hitl_answers(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    active_session_ids: "set[str] | None" = None,
+    within_hours: int = 48,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """9dad83fd — answered **blocking** HITLs whose originating session is no
+    longer live, so a resuming session can pick up an answer that would otherwise
+    be lost (the dead session was the only poller). Excludes ones already handed
+    to a recovery surface (a ``recovered_delivered`` JSON-payload flag — no schema
+    change) and anything answered more than ``within_hours`` ago."""
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=within_hours)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    async with db.execute(
+        "SELECT * FROM hitl_requests WHERE project_id = ? AND urgency = 'blocking' "
+        "AND status = 'answered' AND COALESCE(answered_at, created_at) >= ? "
+        "ORDER BY COALESCE(answered_at, created_at) DESC LIMIT ?",
+        (project_id, cutoff, limit * 4),
+    ) as cur:
+        rows = await cur.fetchall()
+    active = active_session_ids or set()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        row = _row_to_dict(r)
+        if row is None:
+            continue
+        sid = row.get("session_id")
+        # A still-live originating session will consume its own answer.
+        if sid and sid in active:
+            continue
+        if _hitl_payload_flag(row.get("payload"), "recovered_delivered"):
+            continue
+        out.append(row)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def mark_hitl_recovery_delivered(
+    db: aiosqlite.Connection, request_id: str
+) -> None:
+    """9dad83fd — set a ``recovered_delivered`` payload flag so a recovered
+    blocking-HITL answer is surfaced to a resuming session exactly once
+    (idempotent; JSON payload, no schema change)."""
+    row = await get_hitl_request(db, request_id)
+    if not row:
+        return
+    try:
+        pl = json.loads(row.get("payload")) if row.get("payload") else {}
+        if not isinstance(pl, dict):
+            pl = {}
+    except (TypeError, ValueError):
+        pl = {}
+    pl["recovered_delivered"] = True
+    await db.execute(
+        "UPDATE hitl_requests SET payload = ? WHERE id = ?",
+        (json.dumps(pl), request_id),
+    )
+    await db.commit()
+
+
 # ---------------------------------------------------------------------------
 # v2.4 — Project token for webhook intake (framework integrations)
 # ---------------------------------------------------------------------------
