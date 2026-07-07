@@ -67,5 +67,47 @@ packages = ["meridian"]
 [tool.ruff]
 line-length = 120
 
+# 736d300e — CI now runs ruff in TWO passes (see .github/workflows/test.yml `lint`):
+#   1. BLOCKING: `ruff check .` uses the `lint.select` set below — a curated subset of
+#      correctness-critical pyflakes rules that are ALREADY fully clean today (0 violations),
+#      so enforcing them cannot red-wall CI while it stays clean. This is real linting: an
+#      undefined name (F821), a broken %-format string (F50x), a bare `return`/`break`
+#      outside a function/loop (F70x), or a `==` on a literal type (F632) now FAILS the build.
+#   2. WARN-ONLY: a second step runs the broad default rule set with `|| true` so the noisy
+#      style/import backlog (F401 x80, F405 x113, F841, F541, E4xx/E7xx, …) stays VISIBLE in
+#      logs without blocking. Graduating those into `select` is tracked follow-up work:
+#        - F401 (unused-import, 80): mostly `ruff --fix`-able, but interacts with __init__
+#          re-exports and the F405 star-imports; needs a careful per-file pass.
+#        - F811 (redefined-while-unused, 6): 6 REAL latent bugs (e.g. a shadowed duplicate
+#          `test_sprint_item_delete` in tests, `_is_demo_request` imported AND redefined in
+#          server.py) — each needs a deliberate fix, not a blanket rule flip.
+#      Once a rule's count hits 0, move its code from the warn-only pass into `select` below.
 [tool.ruff.lint]
+# Correctness-critical rules enforced as BLOCKING. Every code here is at 0 violations as of
+# 736d300e; adding a violation of any of them fails CI. Explicit codes (not whole `F`) so the
+# blocking gate can't silently absorb a future noisy rule.
+select = [
+    # pyflakes — undefined names / unresolved locals (runtime NameError territory).
+    "F821", # undefined-name
+    "F822", # undefined-name-in-__all__
+    "F823", # undefined-local (used before assignment)
+    # pyflakes — malformed %-style / .format() string calls.
+    "F501", "F502", "F503", "F504", "F505", "F506", "F507", "F508", "F509",
+    "F521", "F522", "F523", "F524", "F525",
+    # pyflakes — nonsensical comparisons / assertions.
+    "F601", # `x is y` with str/bytes/int literal (== intended)
+    "F602", # `x is not y` with literal
+    "F631", # assert on a (non-empty) tuple — always true
+    "F632", # use of == / != with a constant type (str/bytes/int) literal via `is`
+    "F633", # invalid `print` with `>>` in py3
+    "F634", # if-tuple — always true
+    # pyflakes — statements in an illegal position (real syntax-level bugs).
+    "F701", # break outside loop
+    "F702", # continue outside loop
+    "F704", # yield outside function
+    "F706", # return outside function
+    "F707", # except after bare except (unreachable handler)
+]
+# Non-blocking style backlog — kept out of `select` above. E501 (line-length) / E203 stay
+# ignored outright so even the warn-only broad pass doesn't spam on them.
 ignore = ["E501", "E203"]
