@@ -2932,9 +2932,42 @@ function _openTabMenu(t: any, anchor: any) {
 
   const uuidDiv = document.createElement('div');
 
-  uuidDiv.style.cssText = 'padding:6px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);user-select:all;cursor:text';
+  uuidDiv.style.cssText = 'padding:6px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);user-select:all;cursor:pointer';
+
+  uuidDiv.title = 'Click to copy project ID';
 
   uuidDiv.textContent = t.id;
+
+  // c1a2c6ee — click-to-copy the project id. Previously the id was select-only
+  // (no copy affordance), and any click bubbled to the menu's click-outside
+  // handler and closed the popup before a manual copy finished. stopPropagation
+  // keeps the menu open; brief inline feedback confirms the copy.
+
+  uuidDiv.addEventListener('click', (e) => {
+
+    e.stopPropagation();
+
+    const _restore = () => setTimeout(() => { uuidDiv.textContent = t.id; }, 1200);
+
+    const _cb = (navigator as any).clipboard;
+
+    if (_cb && _cb.writeText) {
+
+      _cb.writeText(t.id).then(
+
+        () => { uuidDiv.textContent = '✓ Copied project ID'; _restore(); },
+
+        () => { uuidDiv.textContent = 'Copy failed — select manually'; _restore(); },
+
+      );
+
+    } else {
+
+      uuidDiv.textContent = 'Copy failed — select manually'; _restore();
+
+    }
+
+  });
 
   menu.appendChild(uuidDiv);
 

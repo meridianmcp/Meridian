@@ -9875,8 +9875,31 @@ ${n2.tags || ""}`.toLowerCase();
       menu.appendChild(item);
     }
     const uuidDiv = document.createElement("div");
-    uuidDiv.style.cssText = "padding:6px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);user-select:all;cursor:text";
+    uuidDiv.style.cssText = "padding:6px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);user-select:all;cursor:pointer";
+    uuidDiv.title = "Click to copy project ID";
     uuidDiv.textContent = t3.id;
+    uuidDiv.addEventListener("click", (e3) => {
+      e3.stopPropagation();
+      const _restore = () => setTimeout(() => {
+        uuidDiv.textContent = t3.id;
+      }, 1200);
+      const _cb = navigator.clipboard;
+      if (_cb && _cb.writeText) {
+        _cb.writeText(t3.id).then(
+          () => {
+            uuidDiv.textContent = "\u2713 Copied project ID";
+            _restore();
+          },
+          () => {
+            uuidDiv.textContent = "Copy failed \u2014 select manually";
+            _restore();
+          }
+        );
+      } else {
+        uuidDiv.textContent = "Copy failed \u2014 select manually";
+        _restore();
+      }
+    });
     menu.appendChild(uuidDiv);
     menuItem("\u270F Rename", () => _renameProject(t3));
     menuItem("\u{1F3A8} Change icon\u2026", () => _setProjectIcon(t3));
