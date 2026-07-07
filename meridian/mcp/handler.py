@@ -1283,6 +1283,37 @@ def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _prospecting_result(
+    item: "dict[str, Any] | None",
+) -> "tuple[dict[str, Any] | None, str]":
+    """926bf221 / a8550238 — run add/update-time code prospecting and return an
+    EXPLICIT status alongside the context, so a caller can tell "prospected" from
+    "nothing to prospect" from "never attempted / errored". Previously only
+    claim_sprint_item prospected, and no status field existed, so success,
+    silent-failure, and never-attempted were indistinguishable to the caller.
+
+    Never raises — _prospect_code_context is non-fatal by construction, but the
+    manual-item check and the guard keep this safe for the hot add/update path.
+    """
+    if not isinstance(item, dict):
+        return None, "no_item"
+    # MANUAL/human maintainer items get no code prospecting (prospecting "form an
+    # LLC" only attaches noise) — matches the handoff enrichment policy.
+    try:
+        from .. import handoff as _handoff_manual  # noqa: PLC0415
+        if _handoff_manual._is_manual_sprint_item(item):
+            return None, "skipped_manual"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ctx = _prospect_code_context(item)
+    except Exception:  # noqa: BLE001 — best-effort; never break add/update
+        return None, "error"
+    if ctx:
+        return ctx, "prospected"
+    return None, "no_targets"
+
+
 async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
     """fd86aacc — names of executor sessions seen active in the last 10 minutes.
 
@@ -3207,6 +3238,15 @@ async def _handle_sprint_tools(
                 f"The wording ('{_ins_sig}') looks like a decision/insight — consider "
                 "add_insight() or pin_decision() so it isn't lost at session end."
             )
+        # a8550238 — surface code-prospecting context INLINE at add time, so the
+        # planner sees which real files/symbols the item touches (and can prospect
+        # them) while the sprint is still being shaped — not only later at claim
+        # time. 926bf221 — always report an explicit prospecting_status so the
+        # caller can distinguish prospected / no-targets / skipped / errored.
+        _pc_ctx, _pc_status = _prospecting_result(_new_item)
+        _extra["prospecting_status"] = _pc_status
+        if _pc_ctx:
+            _extra["code_context"] = _pc_ctx
         if _extra:
             _new_item = {**_new_item, **_extra}
         return _new_item
@@ -3288,7 +3328,17 @@ async def _handle_sprint_tools(
             )
         except ValueError as exc:
             return {"error": str(exc)}
-        return item or {"error": "sprint item not found"}
+        if not item:
+            return {"error": "sprint item not found"}
+        # 926bf221 — update_sprint_item now auto-prospects too (previously only
+        # add/claim did), so a substantive edit that names real files re-derives
+        # code context instead of staying null. Explicit prospecting_status keeps
+        # success / no-targets / skipped distinguishable to the caller.
+        _u_ctx, _u_status = _prospecting_result(item)
+        item = {**item, "prospecting_status": _u_status}
+        if _u_ctx:
+            item["code_context"] = _u_ctx
+        return item
     if name == "set_sprint":
         # 62d321dd — guard: warn if pending items were never started before rolling sprint
         if not args.get("force"):
