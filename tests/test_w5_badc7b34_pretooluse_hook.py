@@ -193,3 +193,40 @@ def test_symbol_write_ignores_malformed_symbol_rows():
     }
     r = evaluate_claim_guard(claims, "s1", mode="write", symbol="AuthRouter")
     assert r["allow"] is True and r["reason"] == "clear"
+
+
+# ---------------------------------------------------------------------------
+# badc7b34 (actual item ask) — nudge bare Read/Grep toward code intel when a
+# project has a live code index. Advisory only; never blocks.
+# ---------------------------------------------------------------------------
+
+from meridian.claim_guard import evaluate_readtool_nudge
+
+
+def test_readtool_nudge_fires_for_read_grep_glob_when_index_active():
+    r = evaluate_readtool_nudge("Read", code_index_active=True, target="server.app")
+    assert r["nudge"] is True
+    assert r["suggest"] == "find_symbol"
+    assert "server.app" in r["message"] and "find_symbol" in r["message"]
+
+    g = evaluate_readtool_nudge("Grep", code_index_active=True)
+    assert g["nudge"] is True and g["suggest"] == "search_graph"
+
+    gl = evaluate_readtool_nudge("Glob", code_index_active=True)
+    assert gl["nudge"] is True and gl["suggest"] == "search_graph"
+
+
+def test_readtool_nudge_silent_without_index_or_for_other_tools():
+    # No live index → never nudge (fail-open).
+    assert evaluate_readtool_nudge("Read", code_index_active=False)["nudge"] is False
+    # A tool that isn't a bare text-search read → no nudge.
+    assert evaluate_readtool_nudge("Edit", code_index_active=True)["nudge"] is False
+    assert evaluate_readtool_nudge(None, code_index_active=True)["nudge"] is False
+
+
+def test_readtool_nudge_is_advisory_never_blocks():
+    # Advisory contract: it carries a hint but no allow/block decision, so a hook
+    # can only surface the message — it can never wedge a legitimate read.
+    r = evaluate_readtool_nudge("Grep", code_index_active=True)
+    assert "allow" not in r
+    assert set(r) == {"nudge", "tool", "suggest", "message"}

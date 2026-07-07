@@ -127,3 +127,50 @@ def evaluate_claim_guard(
                 return _verdict(False, "read_locked", owner)
 
     return _verdict(True, "clear", None)
+
+
+# badc7b34 — read-tool nudge toward code intelligence. Same structural principle
+# as the claim guard: a vendor-neutral PreToolUse *decision core* each vendor's
+# hook shim calls. When a project has a LIVE code index, a bare Read/Grep/Glob
+# loses to search_graph/find_symbol (structural beats text). A written
+# INSTRUCTION to prefer them (CODEBASE_INDEX_DIRECTIVE in agent_instructions)
+# decays with Lost-in-the-Middle and loses to Claude Code's trained preference
+# for native Read/Grep — so, exactly like file-claim enforcement, the durable
+# form is a structural per-call signal, not a one-time instruction.
+_NUDGE_TOOLS = {
+    "read": "find_symbol",
+    "grep": "search_graph",
+    "glob": "search_graph",
+}
+
+
+def evaluate_readtool_nudge(
+    tool_name: str | None,
+    *,
+    code_index_active: bool,
+    target: str | None = None,
+) -> dict[str, Any]:
+    """Decide whether to nudge a bare Read/Grep/Glob toward the code index.
+
+    Returns ``{"nudge": bool, "tool": str, "suggest": str | None, "message":
+    str}``. ADVISORY ONLY — unlike :func:`evaluate_claim_guard` this NEVER blocks
+    (there is no ``allow`` key): a hook surfaces ``message`` as a hint and lets
+    the call proceed, so it can't wedge a legitimate read. Fail-open: no active
+    index, an unknown/None tool, or an already-structural tool → ``nudge=False``.
+    """
+    name = (tool_name or "").strip().lower()
+    suggest = _NUDGE_TOOLS.get(name)
+    if not code_index_active or suggest is None:
+        return {"nudge": False, "tool": name, "suggest": None, "message": ""}
+    _for = f" for '{target}'" if target else ""
+    return {
+        "nudge": True,
+        "tool": name,
+        "suggest": suggest,
+        "message": (
+            f"This project has a live code index — prefer {suggest}(){_for} over "
+            f"a bare {name} call. Structural code-intel is faster and more precise "
+            f"than text search; read a specific file directly only when you "
+            f"already know its exact path."
+        ),
+    }
