@@ -95,6 +95,60 @@ _slot_health: dict[str, dict[str, bool]] = {}
 # dead dot. Cleared when the slot recovers or the WS disconnects.
 _slot_status_detail: dict[str, dict[str, dict[str, str]]] = {}
 
+# 54ddd609 — tenants whose tunnel tool set changed (a slot recovered
+# unhealthy->healthy) since the last time a `tools/list` was served. The MCP
+# `/mcp` endpoint is a STATELESS HTTP request/response transport (see
+# meridian/mcp/handler.py) — the server holds NO persistent push channel to a
+# connected claude.ai / Claude Desktop MCP session, so it cannot itself emit an
+# unsolicited `notifications/tools/list_changed` frame to that session. The
+# smallest correct thing is therefore two-fold:
+#   1. Invalidate the per-tenant routing cache so the NEXT tools/list (or a cold
+#      tools/call) re-discovers the recovered slot's tools instead of serving a
+#      stale set that omits them (list_tunnel_tools skips unhealthy slots).
+#   2. Record a pending "list_changed" marker per tenant. Any surface that DOES
+#      hold a live channel to the session (the tunnel WS relay, the dashboard's
+#      status poll) can drain this to emit / trigger a re-query. `list_tunnel_tools`
+#      itself clears the marker once it re-aggregates, so a client that re-lists
+#      after the marker was set observes the recovered tools.
+# This is the standard MCP mechanism for "the tool set changed" reduced to what a
+# stateless transport can actually guarantee: the recovered tools become visible
+# on the very next tools/list rather than staying invisible until a full reconnect.
+_tools_list_changed_pending: set[str] = set()
+
+
+def notify_tools_list_changed(tenant_id: str) -> None:
+    """Signal that a tenant's aggregated tunnel tool set changed (54ddd609).
+
+    Called on a slot RECOVERY (unhealthy->healthy) so the recovered slot's tools
+    stop being invisible to an already-connected MCP session that cached the old
+    (failed / empty) tools/list. Because the `/mcp` transport is stateless (no
+    server->session push channel), this does the smallest correct thing:
+
+      * drops the cached ``_tunnel_tool_routes`` for the tenant, forcing the next
+        ``tools/list`` / cold ``tools/call`` to re-discover the recovered slot; and
+      * marks the tenant pending in ``_tools_list_changed_pending`` — the MCP
+        ``notifications/tools/list_changed`` signal, held until a surface that can
+        reach the session drains it (or the next ``tools/list`` re-aggregates).
+
+    Idempotent and cheap; safe to call on every healthy report (a no-op transition
+    that wasn't actually a recovery simply re-marks a tenant that will re-list to
+    the same tool set).
+    """
+    _tunnel_tool_routes.pop(tenant_id, None)
+    _tools_list_changed_pending.add(tenant_id)
+
+
+def consume_tools_list_changed(tenant_id: str) -> bool:
+    """Return + clear the pending tools/list_changed marker for a tenant (54ddd609).
+
+    True means a slot recovered since this was last consumed, so the caller should
+    (re)advertise / re-query tools. Draining here is what lets a re-list observe the
+    recovery exactly once."""
+    if tenant_id in _tools_list_changed_pending:
+        _tools_list_changed_pending.discard(tenant_id)
+        return True
+    return False
+
 
 def _record_slot_health(
     tenant_id: str, slot: str, healthy: bool,
@@ -102,12 +156,24 @@ def _record_slot_health(
 ) -> None:
     """Record a core slot's health for a tenant (from a plugin_status message).
     9a8645c1 — when unhealthy, also stash an optional reason/detail; healthy
-    clears any prior diagnostic."""
+    clears any prior diagnostic.
+
+    54ddd609 — detect a RECOVERY (unhealthy->healthy transition) and fire
+    :func:`notify_tools_list_changed` so the recovered slot's tools become visible
+    to an already-connected MCP session (which cached the old tools/list) on its
+    next tools/list, instead of staying hidden until a full tunnel reconnect. The
+    prior state MUST be read before we overwrite it below."""
     if not slot:
         return
+    was_unhealthy = not _slot_is_healthy(tenant_id, slot)
     _slot_health.setdefault(tenant_id, {})[slot] = bool(healthy)
     if healthy:
         _slot_status_detail.get(tenant_id, {}).pop(slot, None)
+        # RECOVERY: this slot was suppressed and is now serving again. Its tools
+        # were dropped from the last aggregation (list_tunnel_tools skips unhealthy
+        # slots), so trigger the tools/list_changed path to un-hide them.
+        if was_unhealthy:
+            notify_tools_list_changed(tenant_id)
     elif reason or detail:
         _slot_status_detail.setdefault(tenant_id, {})[slot] = {
             "reason": reason or "unhealthy",
@@ -126,6 +192,7 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
     if slot is None:
         _slot_health.pop(tenant_id, None)
         _slot_status_detail.pop(tenant_id, None)
+        _tools_list_changed_pending.discard(tenant_id)  # 54ddd609
         return
     slots = _slot_health.get(tenant_id)
     if slots is not None:
@@ -2300,6 +2367,10 @@ async def list_tunnel_tools(
         _tunnel_tool_routes[tenant_id] = routes
     elif not has_active_tunnel(tenant_id):
         _tunnel_tool_routes.pop(tenant_id, None)
+    # 54ddd609 — this (re)aggregation reflects the current live slot health, so a
+    # pending tools/list_changed marker (set on a slot recovery) is now satisfied:
+    # the caller is observing the recovered tools. Drain it so it fires only once.
+    _tools_list_changed_pending.discard(tenant_id)
     return aggregated
 
 
