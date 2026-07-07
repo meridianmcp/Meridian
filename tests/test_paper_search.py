@@ -171,3 +171,45 @@ def test_research_protocol_names_the_real_tool():
     # the protocol now points at the real callable tool, not just a vague "paper-search"
     assert "paper_search" in DEFAULT_AGENT_INSTRUCTIONS
     assert "paper-search" in DEFAULT_AGENT_INSTRUCTIONS  # legacy phrasing preserved
+
+
+# ---------------------------------------------------------------------------
+# 995e27a5 — arXiv http->https 301: request https + follow redirects
+# ---------------------------------------------------------------------------
+
+def test_arxiv_api_url_is_https():
+    """Regression: arXiv's export API 301-redirects http->https; the endpoint must
+    be requested over https directly so the redirect never drops results."""
+    import meridian.paper_search as ps
+    assert ps._ARXIV_API.startswith("https://"), ps._ARXIV_API
+
+
+async def test_arxiv_search_follows_redirects_and_parses(monkeypatch):
+    """arxiv_search must pass follow_redirects=True and hit the https endpoint, then
+    parse the atom body into results. Mocks httpx so CI never touches the network."""
+    import httpx
+    import meridian.paper_search as ps
+
+    seen = {}
+
+    class _FakeResp:
+        text = _SAMPLE_ATOM
+        def raise_for_status(self):  # 3xx already followed by the client
+            return None
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def get(self, url, params=None, headers=None):
+            seen["url"] = url
+            return _FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    out = await ps.arxiv_search("transformers", limit=2)
+    assert out["count"] == 2 and out["results"][0]["arxiv_id"] == "2401.01234v1"
+    assert seen["kwargs"].get("follow_redirects") is True
+    assert seen["url"].startswith("https://")

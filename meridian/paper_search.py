@@ -23,7 +23,11 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from typing import Any
 
-_ARXIV_API = "http://export.arxiv.org/api/query"
+# 995e27a5 — arXiv's export API now 301-redirects http -> https. httpx does NOT
+# follow redirects by default and raise_for_status() ignores 3xx, so the redirect
+# body parsed to zero results and every arXiv query silently failed. Request https
+# directly (and follow redirects defensively, below).
+_ARXIV_API = "https://export.arxiv.org/api/query"
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _OPENALEX_API = "https://api.openalex.org/works"
 
@@ -92,7 +96,9 @@ async def arxiv_search(
     }
     import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
     try:
-        async with _httpx.AsyncClient(timeout=15.0) as http:
+        # 995e27a5 — follow_redirects so a future http->https (or mirror) 301 is
+        # honoured instead of silently parsing a redirect body to zero results.
+        async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
             resp = await http.get(
                 _ARXIV_API, params=params,
                 headers={"User-Agent": "Meridian/paper_search (research routing)"},

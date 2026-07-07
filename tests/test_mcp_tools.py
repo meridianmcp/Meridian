@@ -68,3 +68,33 @@ def test_every_tool_has_name_description_and_annotations():
         assert tool.get("description"), tool["name"]
         ann = tool.get("annotations")
         assert isinstance(ann, dict) and "readOnlyHint" in ann, tool["name"]
+
+
+# ---------------------------------------------------------------------------
+# 514d1fc2 — the touches_resources schema must TEACH the symbol-level format,
+# so a session with no prior context can discover file:path.py:symbol_name and
+# parallelize non-overlapping edits in the same file.
+# ---------------------------------------------------------------------------
+
+def _touches_resources_descriptions() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for tool in _MCP_TOOLS_LIST:
+        props = (tool.get("inputSchema") or {}).get("properties") or {}
+        tr = props.get("touches_resources")
+        if isinstance(tr, dict) and tr.get("description"):
+            out[tool["name"]] = tr["description"]
+    return out
+
+
+def test_touches_resources_schema_documents_symbol_level_format():
+    descs = _touches_resources_descriptions()
+    # add_sprint_item + update_sprint_item both expose a top-level touches_resources
+    # (514d1fc2's named targets; fan_out's is nested under its items array).
+    assert "add_sprint_item" in descs and "update_sprint_item" in descs, list(descs)
+    for name in ("add_sprint_item", "update_sprint_item"):
+        d = descs[name]
+        # Each must TEACH the symbol-suffix format with a concrete example, so a
+        # cold session can discover that same-file/different-symbol edits parallelize.
+        assert "file:path.py:" in d, (name, d)
+        assert "symbol" in d.lower(), (name, d)
+        assert "same file" in d.lower(), (name, d)
