@@ -1247,6 +1247,54 @@ def _infer_touches_resources(title: str) -> list[str]:
     return [f"inferred:file:{path}" for path in _suggest_files_for_title(title or "")]
 
 
+# 84d255af — tokens stripped before keyword extraction: sprint-item labels,
+# punctuation-glue, and generic filler that would produce useless search queries.
+_PROSPECT_STOPWORDS = frozenset({
+    "feat", "bug", "gap", "ux", "fix", "refactor", "urgent", "confirmed", "product",
+    "feature", "confirm", "high", "urgency", "likely", "corrected", "investigate",
+    "the", "a", "an", "to", "of", "in", "on", "for", "and", "or", "is", "are", "not",
+    "no", "it", "its", "with", "without", "via", "real", "code", "tonight", "adam",
+    "should", "need", "needs", "add", "added", "from", "into", "that", "this", "when",
+    "where", "which", "only", "still", "just", "does", "doesn", "here", "there",
+    "currently", "actually", "instead", "already", "would", "could", "than", "then",
+})
+
+
+def _keyword_prospect_fallback(title: str) -> dict[str, Any] | None:
+    """84d255af — an index-free prospecting fallback for items with neither a
+    declared ``touches_resources`` nor a hotspot-keyword match (the common shape
+    of planning-chat-authored items, whose auto-prospect otherwise dead-ends at
+    ``no_targets``). Extracts salient keywords from the title and emits
+    server-side ``search_code`` queries: unlike ``codebase__search_graph`` these
+    hit the connected GitHub repo and need no executor tunnel / code index, so
+    they actually work from a planning chat. Returns None only when the title has
+    no usable keyword (e.g. empty), preserving the old ``no_targets`` for that."""
+    import re as _re
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for tok in _re.findall(r"[A-Za-z_][A-Za-z0-9_./]{2,}", title or ""):
+        low = tok.lower().strip(":._/")
+        if not low or low in _PROSPECT_STOPWORDS or low in seen:
+            continue
+        seen.add(low)
+        keywords.append(tok)
+        if len(keywords) >= 5:
+            break
+    if not keywords:
+        return None
+    return {
+        "source": "keyword_fallback",
+        "keywords": keywords,
+        "search_code_calls": [f'search_code(query="{k}")' for k in keywords[:3]],
+        "hint": (
+            "No declared resources and no hotspot match. These keywords were "
+            "extracted from the item title; run search_code (GitHub-backed — needs "
+            "no code tunnel/index, so it works from a planning chat) to locate the "
+            "relevant files before editing."
+        ),
+    }
+
+
 def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
     """04a15d3f — best-effort code-prospecting context for a freshly-claimed item.
 
@@ -1300,7 +1348,10 @@ def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
                 "the item title. Prospect before editing."
             ),
         }
-    return None
+    # 84d255af — last resort: an index-free keyword search hint so planning-chat
+    # items (no resources, no hotspot match) still get an actionable pointer
+    # instead of dead-ending at no_targets.
+    return _keyword_prospect_fallback(item.get("title") or "")
 
 
 def _prospecting_result(
