@@ -797,3 +797,101 @@ async def test_resolve_pointer_routes_through_selected_backend():
         assert t["item"]["title"] == "via mendeley"
     finally:
         pointers_module._CITATION_BACKENDS.pop("mendeley", None)
+
+
+# ---------------------------------------------------------------------------
+# 06df6ab3 — text_quote extended to anchor docx paragraph text (one selector
+# mechanism across code/docs/web, not a new selector type).
+# ---------------------------------------------------------------------------
+
+def _docx_bytes(paragraphs: list[str]) -> bytes:
+    """A minimal real .docx ZIP with one <w:p> per paragraph string."""
+    import io
+    import zipfile
+
+    body = "".join(
+        f'<w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+        for text in paragraphs
+    )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{body}</w:body></w:document>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    return buf.getvalue()
+
+
+def test_looks_like_local_docx_and_docx_paragraph_text(tmp_path):
+    from meridian import web_archive
+
+    assert web_archive._looks_like_local_docx("thesis/chapter1.docx") is True
+    assert web_archive._looks_like_local_docx("https://x/a.docx") is False
+    assert web_archive._looks_like_local_docx("https://x/a") is False
+    assert web_archive._looks_like_local_docx("") is False
+    assert web_archive._looks_like_local_docx(None) is False
+
+    path = tmp_path / "sample.docx"
+    path.write_bytes(_docx_bytes(["Intro paragraph.", "The cited passage lives here."]))
+    text = web_archive._docx_paragraph_text(str(path))
+    assert text == "Intro paragraph.\nThe cited passage lives here."
+
+    # A missing/unreadable file degrades to None, never raises.
+    assert web_archive._docx_paragraph_text(str(tmp_path / "missing.docx")) is None
+
+
+@pytest.mark.asyncio
+async def test_default_web_fetcher_routes_local_docx_to_paragraph_text(tmp_path):
+    from meridian import web_archive
+
+    path = tmp_path / "chapter1.docx"
+    path.write_bytes(_docx_bytes(["Para one.", "Para two with the key claim."]))
+
+    # No http_get involved for a local .docx path — it never touches the network.
+    async def boom_if_called(_uri):
+        raise AssertionError("HTTP fetch must not be used for a local .docx uri")
+
+    text = await web_archive.default_web_fetcher(str(path), http_get=boom_if_called)
+    assert text == "Para one.\nPara two with the key claim."
+
+    # A plain http(s) URL still goes through the HTTP branch as before.
+    class _Resp:
+        def __init__(self, text):
+            self.text = text
+
+    async def get_ok(_uri):
+        return _Resp("page body")
+
+    assert await web_archive.default_web_fetcher("https://x/a.docx", http_get=get_ok) == "page body"
+
+
+@pytest.mark.asyncio
+async def test_resolve_text_quote_anchors_docx_paragraph_and_flags_drift(tmp_path):
+    """End-to-end: a source_type='docs' text_quote pointer whose uri is a local
+    .docx resolves via the SAME resolver as web text_quote — just fed docx
+    paragraph text instead of a fetched page body — including drift detection
+    when the passage no longer matches."""
+    path = tmp_path / "chapter1.docx"
+    path.write_bytes(_docx_bytes(["Intro.", "As shown by the key result in this section."]))
+
+    ptr = {"source_type": "docs", "targets": [{"uri": str(path), "selector": {
+        "type": "text_quote", "exact": "the key result"}}]}
+
+    # No web_fetcher injected — resolve_pointer's default seam (web_archive's
+    # default_web_fetcher) must route the local .docx path itself.
+    out = await resolve_pointer(None, ptr)
+    hit = out["targets"][0]
+    assert hit["resolved"] is True
+    assert hit["found"] is True
+    assert hit["drift"] is False
+
+    # A quote that no longer appears in the docx is a resolved drift, not an error.
+    ptr2 = {"source_type": "docs", "targets": [{"uri": str(path), "selector": {
+        "type": "text_quote", "exact": "a passage that was removed"}}]}
+    out2 = await resolve_pointer(None, ptr2)
+    miss = out2["targets"][0]
+    assert miss["resolved"] is True
+    assert miss["found"] is False
+    assert miss["drift"] is True

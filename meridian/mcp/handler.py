@@ -2305,7 +2305,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -2617,6 +2617,85 @@ async def _handle_notes_decisions(
         except Exception as exc:  # noqa: BLE001 — the pass is best-effort
             return {"error": f"could not resolve citations: {exc}"}
         return {"project_id": args["project_id"], **summary}
+    if name == "index_equation":
+        # 06df6ab3 — index ONE Word equation (OMML) against a document already
+        # stored in the doc-structure store. Mirrors get_citation_edges' shape
+        # (resolve the store, then look up the document by its stored source).
+        validate_input_size(args.get("doc"), "equation doc", 2_000)
+        validate_input_size(args.get("omml_or_latex"), "omml_or_latex", 100_000)
+        validate_input_size(args.get("semantic_label"), "semantic_label", 500)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        omml_or_latex = args.get("omml_or_latex")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not omml_or_latex:
+            return {"error": "omml_or_latex is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for doc={doc_source!r} — ingest_document "
+                    "or reindex_document it first"
+                ),
+            }
+        try:
+            result = await store.add_equation(
+                doc_row["id"], omml_or_latex,
+                semantic_label=args.get("semantic_label"),
+            )
+        except Exception as exc:  # noqa: BLE001 — indexing is best-effort
+            return {"error": f"could not index equation: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            **result,
+        }
+    if name == "find_similar_equation":
+        # 06df6ab3 — fuzzy-match a LaTeX string against a document's already-
+        # stored equations (read-only counterpart of index_equation).
+        validate_input_size(args.get("doc"), "equation doc", 2_000)
+        validate_input_size(args.get("latex"), "latex", 100_000)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        latex = args.get("latex")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not latex:
+            return {"error": "latex is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        _limit = args.get("limit")
+        try:
+            _limit = int(_limit) if _limit is not None else 5
+        except (TypeError, ValueError):
+            _limit = 5
+        try:
+            matches = await store.find_similar_equations(
+                doc_row["id"], latex, limit=_limit,
+            )
+        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+            return {"error": f"could not find similar equations: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            "matches": matches,
+        }
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)

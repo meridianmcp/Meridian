@@ -40,7 +40,11 @@ below is the type-specific key it also needs (443d9453):
                   ``zotero_client.resolve_citation_ref``).
 * ``text_quote``— ``{exact, prefix?, suffix?, archived_url?, archived_at?}`` (W3C
                   TextQuoteSelector for source_type "web", 1d3f6e71; resolving it
-                  re-fetches the URL and flags content drift).
+                  re-fetches the URL and flags content drift). 06df6ab3 — the SAME
+                  selector also anchors against docx paragraph text: a ``uri``
+                  that is a local ``.docx`` path resolves via
+                  ``web_archive.default_web_fetcher``'s docx branch instead of an
+                  HTTP GET, so one mechanism covers web AND docs.
 * ``finding_id``— ``{id}`` (source_type "experiment", 1f1cd4d9; a ``save_finding``
                   artifact note resolved via ``db.get_project_note``).
 
@@ -72,7 +76,9 @@ _log = logging.getLogger(__name__)
 #   text_quote  — W3C TextQuoteSelector for source_type "web" (1d3f6e71): the exact
 #                 cited passage on a URL, carrying the Internet-Archive snapshot
 #                 captured at citation time. Resolving it re-fetches live and flags
-#                 content drift (the passage silently changed/vanished).
+#                 content drift (the passage silently changed/vanished). 06df6ab3
+#                 extends the SAME selector to anchor a docx paragraph (uri = a
+#                 local .docx path) — one selector mechanism across code/docs/web.
 #   finding_id  — addresses a save_finding artifact (a kind='finding' note) for
 #                 source_type "experiment" (1f1cd4d9): a zero-ceremony run log
 #                 (input / output / params / timestamp), no stages, no YAML.

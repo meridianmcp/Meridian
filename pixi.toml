@@ -23,6 +23,16 @@ pytest-cov = ">=4.0"
 pytest-timeout = ">=2.1"
 beautifulsoup4 = ">=4.12"
 git-cliff = ">=2.13.1,<3"
+# 06df6ab3 — Word equation (OMML) indexing needs real XML/XSLT tooling (never a
+# PDF round-trip); the recursive outputs indexer needs duckdb (unified CSV/JSON
+# glob index) + numpy (.npy metadata only, mmap'd — never full-array content) +
+# watchdog (filesystem events). NOTE: watchdog, NOT watchfiles — watchfiles
+# deadlocks the Windows ProactorEventLoop; watchdog uses ReadDirectoryChangesW on
+# Windows and is fine.
+lxml = ">=5.0"
+duckdb = ">=1.0"
+numpy = ">=1.26"
+watchdog = ">=4.0"
 
 [pypi-dependencies]
 # d45c2cc8 — detachable doc-intelligence sub-package (docs_intel + latex_intel).
@@ -55,6 +65,10 @@ tree-sitter-rust = ">=0.21"
 tree-sitter-java = ">=0.21"
 tree-sitter-c-sharp = ">=0.21"
 pylatexenc = ">=2.10, <3"
+# 06df6ab3 — pure-Python LaTeX -> MathML (piped through doc_store's own hand-
+# written MathML -> OOXML <m:oMath> mapper; see meridian/doc_store.py for why
+# this does NOT use Microsoft's MML2OMML.XSL stylesheet).
+latex2mathml = ">=3.77"
 
 # Dev/build-only deps — not installed on Fly (Dockerfile uses pyproject.toml via uv).
 # Use `pixi run -e dev <task>` for docs, exe builds, and media scripts.

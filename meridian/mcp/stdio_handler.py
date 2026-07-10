@@ -878,6 +878,57 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="index_equation",
+                description=(
+                    "06df6ab3 — index ONE Word equation (OMML) against a "
+                    "document already stored in the doc-structure store (via "
+                    "ingest_document or a prior reindex — pass the SAME "
+                    "source/path as `doc`). omml_or_latex is auto-detected: a "
+                    "string starting with '<' is raw OMML XML (stored as-is); "
+                    "anything else is LaTeX (real OMML generated best-effort — "
+                    "latex2mathml piped through a hand-written MathML->OOXML "
+                    "mapper; null omml on an unsupported construct, never an "
+                    "error). Before inserting, the normalized LaTeX is "
+                    "fuzzy-matched against equations already stored for this "
+                    "document — a near-duplicate is still inserted but surfaced "
+                    "via near_duplicates so it isn't silently missed. Returns "
+                    "{equation, near_duplicates}."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "omml_or_latex": {"type": "string", "description": "Raw OMML XML (starts with '<') OR a LaTeX source string."},
+                        "semantic_label": {"type": "string", "description": "Optional human label for the equation."},
+                    },
+                    "required": ["doc", "omml_or_latex"],
+                },
+            ),
+            Tool(
+                name="find_similar_equation",
+                description=(
+                    "06df6ab3 — fuzzy-match a LaTeX string against every "
+                    "equation already indexed for one stored document, best "
+                    "match first (difflib similarity score 0..1 against each "
+                    "stored latex_normalized). Returns {document_id, matches} — "
+                    "an empty list (never an error) when the document has no "
+                    "stored equations, or doc doesn't resolve."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "latex": {"type": "string", "description": "LaTeX source to fuzzy-match against this document's stored equations."},
+                        "limit": {"type": "integer", "description": "Max matches to return (default 5)."},
+                    },
+                    "required": ["doc", "latex"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1833,6 +1884,7 @@ def build_mcp_server():
                 "list_sessions",
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
                 "get_citation_edges", "resolve_citations",
+                "index_equation", "find_similar_equation",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",

@@ -38,6 +38,21 @@ dependencies = [
     # latexwalker parser (no PDF intermediary); ships in the Fly image so the
     # get_latex_structure MCP tool works server-side.
     "pylatexenc>=2.10,<3",
+    # 06df6ab3 — Word equation (OMML) indexing: lxml for real XML/XSLT-capable
+    # parsing of <m:oMath> straight out of word/document.xml (never a PDF
+    # round-trip), latex2mathml for pure-Python LaTeX -> MathML (piped through
+    # doc_store's own hand-written MathML -> OOXML mapper — see
+    # meridian/doc_store.py for why this isn't Microsoft's MML2OMML.XSL).
+    "lxml>=5.0",
+    "latex2mathml>=3.77",
+    # 06df6ab3 — recursive outputs indexer (meridian/outputs_indexer.py): duckdb
+    # for the unified CSV/JSON glob index, numpy for .npy metadata (mmap'd —
+    # never full-array content), watchdog for filesystem events. NOTE: watchdog,
+    # NOT watchfiles — watchfiles deadlocks the Windows ProactorEventLoop;
+    # watchdog uses ReadDirectoryChangesW on Windows and is fine.
+    "duckdb>=1.0",
+    "numpy>=1.26",
+    "watchdog>=4.0",
 ]
 
 [project.optional-dependencies]

@@ -36,6 +36,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_latex_structure": 'get_latex_structure(file_path="thesis/chapter1.tex")',
     "get_citation_edges": 'get_citation_edges(project_id="abc-123", source="thesis/chapter1.tex")',
     "resolve_citations": 'resolve_citations(project_id="abc-123")',
+    "index_equation": 'index_equation(project_id="abc-123", doc="thesis/chapter1.docx", omml_or_latex="E=mc^2", semantic_label="mass-energy equivalence")',
+    "find_similar_equation": 'find_similar_equation(project_id="abc-123", doc="thesis/chapter1.docx", latex="E=mc^2")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -414,6 +416,44 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally."},
          "max_items": {"type": "integer", "description": "Cap how many unresolved markers to attempt this pass. Omit to attempt all."}},
          "required": []}},
+    {"name": "index_equation", "description":
+        "06df6ab3 — index ONE Word equation (OMML) against a document already "
+        "stored in the doc-structure store (via ingest_document or a prior "
+        "reindex, so pass the SAME source/path used there as `doc`). "
+        "omml_or_latex is auto-detected: a string starting with '<' is treated "
+        "as raw OMML XML (stored as-is); anything else is treated as LaTeX "
+        "source (real OMML is generated best-effort — pure-Python latex2mathml "
+        "piped through a hand-written MathML->OOXML mapper; returns null omml "
+        "on an unsupported construct, never an error). Before inserting, the "
+        "normalized LaTeX is fuzzy-matched against every equation already "
+        "stored for this document — a near-duplicate is NOT silently dropped "
+        "(the equation is still inserted) but IS surfaced via "
+        "near_duplicates:[{equation_id, matched_id, matched_latex, score}] so "
+        "you can spot accidental re-derivations. Returns {equation, "
+        "near_duplicates}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "omml_or_latex": {"type": "string", "description": "Raw OMML XML (starts with '<') OR a LaTeX source string."},
+         "semantic_label": {"type": "string", "description": "Optional human label for the equation (e.g. 'mass-energy equivalence')."}},
+         "required": ["doc", "omml_or_latex"]}},
+    {"name": "find_similar_equation", "description":
+        "06df6ab3 — fuzzy-match a LaTeX string against every equation already "
+        "indexed (index_equation / reindex_document) for one stored document, "
+        "best match first. Each result carries the stored equation row PLUS a "
+        "difflib similarity score (0..1) against its latex_normalized. Useful "
+        "before index_equation to check whether an equation is already present "
+        "under a slightly different LaTeX spelling. Returns {document_id, "
+        "matches:[...]} — an empty list (never an error) when the document has "
+        "no stored equations, or doc doesn't resolve to a stored document.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "latex": {"type": "string", "description": "LaTeX source to fuzzy-match against this document's stored equations."},
+         "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
+         "required": ["doc", "latex"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
@@ -1266,6 +1306,7 @@ _READ_ONLY_TOOLS = {
     "list_plugins", "get_plugin_details",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
+    "find_similar_equation",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
 }
@@ -1317,6 +1358,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "get_plugin_details": "Get Plugin Details",
     "set_active_repo": "Set Active Repo",
     "analyze_model_efficiency": "Analyze Model Efficiency",
+    "index_equation": "Index Equation",
+    "find_similar_equation": "Find Similar Equation",
 }
 
 for _tool in _MCP_TOOLS_LIST:
