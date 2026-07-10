@@ -33,50 +33,144 @@ def _session_of(row: Any) -> str:
     return str(row.get("session_id")) if isinstance(row, dict) and row.get("session_id") else ""
 
 
+def _symbol_name_of(row: Any) -> str:
+    """Name of the symbol a symbol-claim row targets.
+
+    ``get_file_claims`` rows come from ``get_symbol_claims`` (``SELECT fsc.*``), so
+    the canonical column is ``symbol_name``; accept a bare ``symbol`` alias too for
+    payloads built by other vendors' shims. Stripped; ``""`` when absent.
+    """
+    if not isinstance(row, dict):
+        return ""
+    return str(row.get("symbol_name") or row.get("symbol") or "").strip()
+
+
 def evaluate_claim_guard(
     claims: dict[str, Any] | None,
     session_id: str,
     *,
     mode: str = "write",
+    symbol: str | None = None,
 ) -> dict[str, Any]:
     """Decide whether ``session_id`` may edit a file, from a ``get_file_claims`` payload.
 
-    Rules mirror the server-side ``claim_file`` semantics (ffa03655 / 63b030a6):
+    Rules mirror the server-side ``claim_file`` / ``claim_symbol`` semantics
+    (ffa03655 / 63b030a6):
 
-    * a whole-file WRITE lock held by ANOTHER session blocks everything (read + write);
-    * for a WRITE claim, another session's live SYMBOL claim on the file blocks it
-      (file ⊃ symbol hierarchy), and another session's READ claim blocks it
-      (an exclusive write waits for readers);
+    * a whole-file WRITE lock held by ANOTHER session blocks everything
+      (read + write + symbol-scoped write) — the file owner may touch any symbol;
+    * for a **whole-file** WRITE claim (``symbol=None``), another session's live
+      SYMBOL claim on the file blocks it (file ⊃ symbol hierarchy), and another
+      session's READ claim blocks it (an exclusive write waits for readers);
+    * for a **symbol-scoped** WRITE claim (``symbol="Foo"`` — badc7b34), only
+      another session's claim on the *same* symbol blocks it. A claim on a
+      *different* symbol does not (two sessions safely own different symbols in one
+      file), and shared read claims do not block a narrow symbol write — matching
+      ``claim_symbol``, which checks whole-file locks and symbol overlap only;
     * shared reads never block another read; your own claims never block you.
 
-    Returns ``{"allow": bool, "reason": str, "holder": str | None, "mode": str}``.
-    Never raises — a malformed/None payload degrades to allow (fail-open).
+    ``symbol`` is ignored for ``mode="read"`` (a read claim is shared and file-wide).
+
+    Returns ``{"allow": bool, "reason": str, "holder": str | None, "mode": str,
+    "symbol": str | None}``. Never raises — a malformed/None payload degrades to
+    allow (fail-open).
     """
     _mode = "read" if str(mode or "write").lower() == "read" else "write"
+    _symbol = (symbol or "").strip() or None
+    # A symbol scope only refines a WRITE claim; a read claim is inherently file-wide.
+    if _mode != "write":
+        _symbol = None
+
+    def _verdict(allow: bool, reason: str, holder: str | None) -> dict[str, Any]:
+        return {
+            "allow": allow,
+            "reason": reason,
+            "holder": holder,
+            "mode": _mode,
+            "symbol": _symbol,
+        }
+
     if not isinstance(claims, dict):
-        return {"allow": True, "reason": "no-claim-data", "holder": None, "mode": _mode}
+        return _verdict(True, "no-claim-data", None)
 
     def _rows(key: str) -> list[Any]:
         val = claims.get(key)
         return val if isinstance(val, list) else []
 
-    # (1) A whole-file write lock by another session blocks both read and write claims.
+    # (1) A whole-file write lock by another session blocks EVERYTHING — read,
+    # whole-file write, and symbol-scoped write (the lock owner owns every symbol).
     lock = claims.get("file_lock")
     lock_owner = _session_of(lock)
     if lock_owner and lock_owner != session_id:
-        return {"allow": False, "reason": "write_locked", "holder": lock_owner, "mode": _mode}
+        return _verdict(False, "write_locked", lock_owner)
 
     # A shared read claim is only blocked by the write lock above; nothing else.
     if _mode == "write":
-        # (2) Another session's live symbol claim blocks a whole-file write.
+        if _symbol is not None:
+            # (2s) Symbol-scoped write: only another session's claim on the SAME
+            # symbol blocks. Different symbols coexist; read claims don't block a
+            # narrow symbol write (mirrors claim_symbol, which ignores read claims).
+            for sc in _rows("symbol_claims"):
+                owner = _session_of(sc)
+                if owner and owner != session_id and _symbol_name_of(sc) == _symbol:
+                    return _verdict(False, "symbol_locked", owner)
+            return _verdict(True, "clear", None)
+        # (2) Whole-file write: another session's live symbol claim (any symbol) blocks.
         for sc in _rows("symbol_claims"):
             owner = _session_of(sc)
             if owner and owner != session_id:
-                return {"allow": False, "reason": "symbol_locked", "holder": owner, "mode": _mode}
+                return _verdict(False, "symbol_locked", owner)
         # (3) Another session's read claim blocks a write (exclusive write waits for readers).
         for rc in _rows("read_claims"):
             owner = _session_of(rc)
             if owner and owner != session_id:
-                return {"allow": False, "reason": "read_locked", "holder": owner, "mode": _mode}
+                return _verdict(False, "read_locked", owner)
 
-    return {"allow": True, "reason": "clear", "holder": None, "mode": _mode}
+    return _verdict(True, "clear", None)
+
+
+# badc7b34 — read-tool nudge toward code intelligence. Same structural principle
+# as the claim guard: a vendor-neutral PreToolUse *decision core* each vendor's
+# hook shim calls. When a project has a LIVE code index, a bare Read/Grep/Glob
+# loses to search_graph/find_symbol (structural beats text). A written
+# INSTRUCTION to prefer them (CODEBASE_INDEX_DIRECTIVE in agent_instructions)
+# decays with Lost-in-the-Middle and loses to Claude Code's trained preference
+# for native Read/Grep — so, exactly like file-claim enforcement, the durable
+# form is a structural per-call signal, not a one-time instruction.
+_NUDGE_TOOLS = {
+    "read": "find_symbol",
+    "grep": "search_graph",
+    "glob": "search_graph",
+}
+
+
+def evaluate_readtool_nudge(
+    tool_name: str | None,
+    *,
+    code_index_active: bool,
+    target: str | None = None,
+) -> dict[str, Any]:
+    """Decide whether to nudge a bare Read/Grep/Glob toward the code index.
+
+    Returns ``{"nudge": bool, "tool": str, "suggest": str | None, "message":
+    str}``. ADVISORY ONLY — unlike :func:`evaluate_claim_guard` this NEVER blocks
+    (there is no ``allow`` key): a hook surfaces ``message`` as a hint and lets
+    the call proceed, so it can't wedge a legitimate read. Fail-open: no active
+    index, an unknown/None tool, or an already-structural tool → ``nudge=False``.
+    """
+    name = (tool_name or "").strip().lower()
+    suggest = _NUDGE_TOOLS.get(name)
+    if not code_index_active or suggest is None:
+        return {"nudge": False, "tool": name, "suggest": None, "message": ""}
+    _for = f" for '{target}'" if target else ""
+    return {
+        "nudge": True,
+        "tool": name,
+        "suggest": suggest,
+        "message": (
+            f"This project has a live code index — prefer {suggest}(){_for} over "
+            f"a bare {name} call. Structural code-intel is faster and more precise "
+            f"than text search; read a specific file directly only when you "
+            f"already know its exact path."
+        ),
+    }

@@ -1095,6 +1095,9 @@ async def _build_context_refresh(db: Any, project_id: str) -> dict[str, Any] | N
         "high_priority_decisions": high_priority_decisions,
         "unvalidated_assumptions": unvalidated_assumptions,
         "key_note_slugs": key_note_slugs,
+        # 3d7b7aca — re-inject a timezone-aware time signal so a long session that
+        # refreshes after compaction re-anchors to the real wall-clock date/time.
+        "current_time": _server._wall_clock_now(_server._executor_config_tz(project)),
     }
 
 
@@ -1244,6 +1247,54 @@ def _infer_touches_resources(title: str) -> list[str]:
     return [f"inferred:file:{path}" for path in _suggest_files_for_title(title or "")]
 
 
+# 84d255af — tokens stripped before keyword extraction: sprint-item labels,
+# punctuation-glue, and generic filler that would produce useless search queries.
+_PROSPECT_STOPWORDS = frozenset({
+    "feat", "bug", "gap", "ux", "fix", "refactor", "urgent", "confirmed", "product",
+    "feature", "confirm", "high", "urgency", "likely", "corrected", "investigate",
+    "the", "a", "an", "to", "of", "in", "on", "for", "and", "or", "is", "are", "not",
+    "no", "it", "its", "with", "without", "via", "real", "code", "tonight", "adam",
+    "should", "need", "needs", "add", "added", "from", "into", "that", "this", "when",
+    "where", "which", "only", "still", "just", "does", "doesn", "here", "there",
+    "currently", "actually", "instead", "already", "would", "could", "than", "then",
+})
+
+
+def _keyword_prospect_fallback(title: str) -> dict[str, Any] | None:
+    """84d255af — an index-free prospecting fallback for items with neither a
+    declared ``touches_resources`` nor a hotspot-keyword match (the common shape
+    of planning-chat-authored items, whose auto-prospect otherwise dead-ends at
+    ``no_targets``). Extracts salient keywords from the title and emits
+    server-side ``search_code`` queries: unlike ``codebase__search_graph`` these
+    hit the connected GitHub repo and need no executor tunnel / code index, so
+    they actually work from a planning chat. Returns None only when the title has
+    no usable keyword (e.g. empty), preserving the old ``no_targets`` for that."""
+    import re as _re
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for tok in _re.findall(r"[A-Za-z_][A-Za-z0-9_./]{2,}", title or ""):
+        low = tok.lower().strip(":._/")
+        if not low or low in _PROSPECT_STOPWORDS or low in seen:
+            continue
+        seen.add(low)
+        keywords.append(tok)
+        if len(keywords) >= 5:
+            break
+    if not keywords:
+        return None
+    return {
+        "source": "keyword_fallback",
+        "keywords": keywords,
+        "search_code_calls": [f'search_code(query="{k}")' for k in keywords[:3]],
+        "hint": (
+            "No declared resources and no hotspot match. These keywords were "
+            "extracted from the item title; run search_code (GitHub-backed — needs "
+            "no code tunnel/index, so it works from a planning chat) to locate the "
+            "relevant files before editing."
+        ),
+    }
+
+
 def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
     """04a15d3f — best-effort code-prospecting context for a freshly-claimed item.
 
@@ -1297,7 +1348,10 @@ def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
                 "the item title. Prospect before editing."
             ),
         }
-    return None
+    # 84d255af — last resort: an index-free keyword search hint so planning-chat
+    # items (no resources, no hotspot match) still get an actionable pointer
+    # instead of dead-ending at no_targets.
+    return _keyword_prospect_fallback(item.get("title") or "")
 
 
 def _prospecting_result(
@@ -1329,6 +1383,67 @@ def _prospecting_result(
     if ctx:
         return ctx, "prospected"
     return None, "no_targets"
+
+
+def _prospected_pointer_targets(item: "dict[str, Any]") -> list[dict[str, Any]]:
+    """691f4e1c — DURABLE, resolvable ``symbol`` pointer targets from an item's declared
+    ``touches_resources``, so add/update prospecting can persist a real, queryable
+    pointer instead of leaving only a one-shot ``code_context`` hint.
+
+    Delegates to :func:`handoff.build_declared_symbol_targets` — the shared source of
+    truth (reused, not duplicated: handoff.py already owns the touches_resources parse
+    and the graph-match ``symbol`` shape). The server can't reach the code index
+    (04a15d3f — behind the executor's tunnel), so an exact line ``range`` can't be
+    resolved at write time; a ``symbol`` selector carrying the declared
+    ``qualified_name`` is the tunnel-free equivalent, best-matched against the graph
+    LATER by ``resolve_sprint_item_pointers``. Never raises.
+    """
+    try:
+        from .. import handoff as _handoff  # noqa: PLC0415 — avoid import cycle
+        return _handoff.build_declared_symbol_targets(item)
+    except Exception:  # noqa: BLE001 — best-effort; never break add/update
+        return []
+
+
+async def _persist_prospected_pointer(
+    db: Any,
+    project_id: str,
+    item: "dict[str, Any] | None",
+    status: str,
+) -> "dict[str, Any] | None":
+    """691f4e1c — at add/update time, PERSIST the prospected code context as a real
+    ``symbol``-source sprint-item pointer (durable + queryable), not just the inline
+    ``code_context`` hint. Returns the stored pointer, or ``None`` when nothing durable
+    could be persisted (no declared symbol / non-code item / not prospected / error).
+
+    Idempotent-ish for update: skips creation when the item already carries a code /
+    symbol pointer, so a re-run of update_sprint_item doesn't stack duplicate pointers.
+    Best-effort + fully guarded — a pointer-persist failure must NEVER break the hot
+    add/update path (the item is already written; the inline hint still ships).
+    """
+    if status != "prospected" or not isinstance(item, dict):
+        return None
+    item_id = item.get("id")
+    if not item_id or not project_id:
+        return None
+    targets = _prospected_pointer_targets(item)
+    if not targets:
+        return None
+    try:
+        # Don't stack duplicates: if a durable code/symbol pointer already exists on
+        # this item, leave it (update re-runs prospecting but shouldn't pile pointers).
+        existing = await db_module.get_sprint_item_pointers(db, item_id)
+        if any(
+            isinstance(p, dict) and p.get("source_type") in ("code", "symbol")
+            for p in (existing or [])
+        ):
+            return None
+        return await db_module.add_sprint_item_pointer(
+            db, project_id, item_id, "symbol", targets,
+            label="auto-prospected (add/update-time)",
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never break add/update
+        return None
 
 
 async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
@@ -1406,7 +1521,34 @@ async def _unclaimed_file_warnings(
         return []
 
 
+# ab2ba5fe — cache recent commits per project for a short TTL. add_sprint_item's
+# drift check calls _fetch_recent_commits on every add; a burst of adds (Adam saw
+# 30+ in a night) previously hit the GitHub API (or a `git log` subprocess) each
+# time — the dominant per-call cost. One fetch is now shared for the TTL window.
+_RECENT_COMMITS_TTL = 60.0  # seconds
+_recent_commits_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+
+
 async def _fetch_recent_commits(
+    project: dict[str, Any],
+    tenant: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """ab2ba5fe — thin TTL cache over :func:`_fetch_recent_commits_uncached`,
+    keyed by project id, so a burst of add_sprint_item drift checks shares a
+    single fetch instead of a GitHub round-trip / subprocess per call."""
+    import time as _time  # noqa: PLC0415
+    pid = (project or {}).get("id") or ""
+    if pid:
+        cached = _recent_commits_cache.get(pid)
+        if cached and (_time.monotonic() - cached[0]) < _RECENT_COMMITS_TTL:
+            return cached[1]
+    commits = await _fetch_recent_commits_uncached(project, tenant)
+    if pid:
+        _recent_commits_cache[pid] = (_time.monotonic(), commits)
+    return commits
+
+
+async def _fetch_recent_commits_uncached(
     project: dict[str, Any],
     tenant: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
@@ -1699,20 +1841,97 @@ async def _handle_project_tools(
     return _MISS
 
 
+# e726810d — identity alias collapsing. bdc251ec derived a human_id handle from
+# whichever tenant field was populated (explicit name → else email local-part), so
+# the SAME person surfaced under two different handles depending on the field used:
+# e.g. the email local-part "ajc123private" from one auth path and the display name
+# "adam" from another. The dashboard active-sessions / standup aggregation
+# (get_team_summary) buckets sessions by their raw human_id, so those two handles
+# split one human into two people. We collapse a known alias set to a single
+# canonical display identity BEFORE it becomes a human_id.
+#
+# The alias map is data-driven (no schema column): the default seeds the one known
+# alias set (ajc123private / adam → Adam), and the whole map is overridable via the
+# MERIDIAN_IDENTITY_ALIASES env var (JSON object of {alias: canonical}). Matching is
+# case-insensitive on the trimmed handle; unknown handles pass through unchanged, so
+# this never invents or merges identities it wasn't told about.
+# Seed only the concrete alias set from the bug report (the email local-part
+# "ajc123private" and the display name "adam" for the same person). Deliberately
+# NARROW: we do not fold in near-miss handles like "ajc123" or "Adam Camerer",
+# because those are distinct handles the caller may legitimately use as-is (and the
+# existing bdc251ec contract tests assert they pass through unchanged). Add more
+# people / aliases via the MERIDIAN_IDENTITY_ALIASES override rather than widening
+# this seed.
+_DEFAULT_IDENTITY_ALIASES: "dict[str, str]" = {
+    "ajc123private": "Adam",
+    "adam": "Adam",
+}
+
+
+def _load_identity_alias_map() -> "dict[str, str]":
+    """Return the effective ``{alias_lower: canonical}`` identity alias map.
+
+    Starts from :data:`_DEFAULT_IDENTITY_ALIASES` (the one seeded, known alias set)
+    and overlays any ``MERIDIAN_IDENTITY_ALIASES`` env override — a JSON object whose
+    keys are aliases and whose values are the canonical display identity. The
+    override can extend the map with new people or re-point an existing alias; it is
+    additive, never destructive of the seed (so the default keeps working when the
+    env var only adds a second person). Keys are lowercased+trimmed for
+    case-insensitive lookup. A malformed / non-object env value is ignored so a bad
+    config can never break identity resolution."""
+    aliases: dict[str, str] = {
+        str(k).strip().lower(): str(v).strip()
+        for k, v in _DEFAULT_IDENTITY_ALIASES.items()
+        if str(k).strip() and str(v).strip()
+    }
+    raw = os.environ.get("MERIDIAN_IDENTITY_ALIASES", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                key = str(k).strip().lower()
+                val = str(v).strip()
+                if key and val:
+                    aliases[key] = val
+    return aliases
+
+
+def _canonicalize_identity(identity: "str | None") -> "str | None":
+    """Collapse a raw human handle to its canonical display identity (e726810d).
+
+    Looks the trimmed, case-insensitive handle up in :func:`_load_identity_alias_map`;
+    returns the canonical form when the handle is a known alias, otherwise the
+    original handle unchanged. ``None``/empty passes through as ``None`` so the
+    handoff keeps its generic placeholder for an unknown caller."""
+    ident = (identity or "").strip()
+    if not ident:
+        return None
+    return _load_identity_alias_map().get(ident.lower(), ident)
+
+
 def _resolve_caller_identity(tenant: "dict[str, Any] | None") -> "str | None":
     """bdc251ec — a human_id handle for the authenticated caller, derived from the
     tenant the auth token already resolved. Prefer an explicit name, else the email
     local-part. Returns None on the owner / self-host path (no tenant) so the
-    handoff keeps its generic placeholder rather than inventing an identity."""
+    handoff keeps its generic placeholder rather than inventing an identity.
+
+    e726810d — the derived handle is then run through :func:`_canonicalize_identity`
+    so a person's known aliases (e.g. email local-part ``ajc123private`` and display
+    name ``adam``) collapse to ONE canonical identity. Without this, the dashboard
+    active-sessions / standup aggregation (which buckets by human_id) shows the same
+    human twice."""
     if not tenant:
         return None
     name = str(tenant.get("name") or "").strip()
     if name:
-        return name
+        return _canonicalize_identity(name)
     email = str(tenant.get("email") or "").strip()
     if "@" in email:
-        return email.split("@", 1)[0] or None
-    return email or None
+        return _canonicalize_identity(email.split("@", 1)[0] or None)
+    return _canonicalize_identity(email or None)
 
 
 async def _handle_task_tools(
@@ -1997,6 +2216,87 @@ async def _persist_ingest_structure(
         )
 
 
+# --- 22c274bd — workspace-scope leak heuristic ------------------------------
+# Workspace notes/decisions are meant to be tenant-global (cross-project). In
+# practice they accumulate PROJECT-specific content: a thesis post-mortem, one
+# project's CI patterns, a personal absolute filesystem path, a commit sha. This
+# is a *soft* nudge only — we never block the write, we just attach a
+# `scope_warning` to the result so the caller is reminded the content may belong
+# in a project note instead. Pure heuristic; no schema change, no DB touch.
+
+# Absolute filesystem paths — POSIX (/home/…, /Users/…, /mnt/…) and Windows
+# (C:\Users\…). A bare "/" or a leading "/mcp"-style route would over-fire, so we
+# require at least one more path segment after a recognised root-ish prefix.
+_WS_ABS_PATH_RE = re.compile(
+    r"""(?:
+          [A-Za-z]:[\\/]                    # Windows drive:  C:\  or  C:/
+        | /(?:home|Users|mnt|opt|srv|var|tmp|root|etc|usr|repository)/  # POSIX root dirs
+        | ~/[\w.\-]                          # home-relative:  ~/something
+    )""",
+    re.VERBOSE,
+)
+# A 7–40 char lowercase hex run that looks like a git commit sha. Bounded by
+# non-hex/word edges so it doesn't fire inside a longer hex/base token.
+_WS_COMMIT_SHA_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{7,40}(?![0-9a-fA-F])")
+# Project-anaphora phrasing that only makes sense scoped to one project.
+_WS_PROJECT_PHRASE_RE = re.compile(
+    r"\b(?:this project|the project|our project|this repo(?:sitory)?|"
+    r"the thesis|my thesis|this codebase|the codebase|this sprint)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_commit_sha(token: str) -> bool:
+    """A hex token is only sha-ish if it's got both a letter and a digit — pure
+    words ('deface', 'facade') and pure numbers ('1234567', a year, a port) are
+    common false positives that shouldn't trip the nudge."""
+    has_alpha = any(c in "abcdef" for c in token)
+    has_digit = any(c.isdigit() for c in token)
+    return has_alpha and has_digit
+
+
+def _workspace_scope_warning(
+    title: str | None, body: str | None
+) -> str | None:
+    """Return a soft warning if *title*/*body* look PROJECT-specific, else None.
+
+    Heuristic signals (any one trips it):
+      * an absolute filesystem path (personal/machine-local),
+      * a git commit sha,
+      * project-anaphora phrasing ("this project", "the thesis", …).
+
+    Deliberately conservative and never authoritative — the write always
+    proceeds; this only populates a ``scope_warning`` hint on the result.
+    """
+    text = f"{title or ''}\n{body or ''}"
+    if not text.strip():
+        return None
+
+    signals: list[str] = []
+    if _WS_ABS_PATH_RE.search(text):
+        signals.append("an absolute filesystem path")
+    if any(
+        _looks_like_commit_sha(m.group(0))
+        for m in _WS_COMMIT_SHA_RE.finditer(text)
+    ):
+        signals.append("a commit sha")
+    if _WS_PROJECT_PHRASE_RE.search(text):
+        signals.append("project-specific phrasing")
+
+    if not signals:
+        return None
+
+    joined = signals[0] if len(signals) == 1 else (
+        ", ".join(signals[:-1]) + " and " + signals[-1]
+    )
+    return (
+        f"This looks project-specific (detected {joined}). Workspace "
+        "notes/decisions are meant to be tenant-global and cross-project — "
+        "consider recording this as a project note/decision instead. "
+        "(Saved anyway.)"
+    )
+
+
 async def _handle_notes_decisions(
     name: str,
     args: dict[str, Any],
@@ -2005,7 +2305,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -2317,6 +2617,85 @@ async def _handle_notes_decisions(
         except Exception as exc:  # noqa: BLE001 — the pass is best-effort
             return {"error": f"could not resolve citations: {exc}"}
         return {"project_id": args["project_id"], **summary}
+    if name == "index_equation":
+        # 06df6ab3 — index ONE Word equation (OMML) against a document already
+        # stored in the doc-structure store. Mirrors get_citation_edges' shape
+        # (resolve the store, then look up the document by its stored source).
+        validate_input_size(args.get("doc"), "equation doc", 2_000)
+        validate_input_size(args.get("omml_or_latex"), "omml_or_latex", 100_000)
+        validate_input_size(args.get("semantic_label"), "semantic_label", 500)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        omml_or_latex = args.get("omml_or_latex")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not omml_or_latex:
+            return {"error": "omml_or_latex is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for doc={doc_source!r} — ingest_document "
+                    "or reindex_document it first"
+                ),
+            }
+        try:
+            result = await store.add_equation(
+                doc_row["id"], omml_or_latex,
+                semantic_label=args.get("semantic_label"),
+            )
+        except Exception as exc:  # noqa: BLE001 — indexing is best-effort
+            return {"error": f"could not index equation: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            **result,
+        }
+    if name == "find_similar_equation":
+        # 06df6ab3 — fuzzy-match a LaTeX string against a document's already-
+        # stored equations (read-only counterpart of index_equation).
+        validate_input_size(args.get("doc"), "equation doc", 2_000)
+        validate_input_size(args.get("latex"), "latex", 100_000)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        latex = args.get("latex")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not latex:
+            return {"error": "latex is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        _limit = args.get("limit")
+        try:
+            _limit = int(_limit) if _limit is not None else 5
+        except (TypeError, ValueError):
+            _limit = 5
+        try:
+            matches = await store.find_similar_equations(
+                doc_row["id"], latex, limit=_limit,
+            )
+        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+            return {"error": f"could not find similar equations: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            "matches": matches,
+        }
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)
@@ -2407,10 +2786,15 @@ async def _handle_notes_decisions(
     if name == "add_workspace_note":
         validate_input_size(args.get("title"), "note title", 500)
         validate_input_size(args.get("body"), "note body", 10_000_000)
-        return await db_module.add_workspace_note(
+        result = await db_module.add_workspace_note(
             db, args["title"], args["body"], args.get("tags"),
             tenant_id=_mcp_tenant_id,
         )
+        # 22c274bd — soft scope nudge; never blocks the write.
+        warning = _workspace_scope_warning(args.get("title"), args.get("body"))
+        if warning and isinstance(result, dict):
+            result["scope_warning"] = warning
+        return result
     if name == "get_workspace_notes":
         return await db_module.get_workspace_notes(
             db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
@@ -2418,11 +2802,16 @@ async def _handle_notes_decisions(
     if name == "pin_workspace_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
-        return await db_module.pin_workspace_decision(
+        result = await db_module.pin_workspace_decision(
             db, args["title"], args["body"],
             category=args.get("category", "TECHNICAL"),
             tenant_id=_mcp_tenant_id,
         )
+        # 22c274bd — soft scope nudge; never blocks the write.
+        warning = _workspace_scope_warning(args.get("title"), args.get("body"))
+        if warning and isinstance(result, dict):
+            result["scope_warning"] = warning
+        return result
     if name == "get_workspace_decisions":
         return await db_module.get_workspace_decisions(
             db, include_superseded=args.get("include_superseded", False),
@@ -3161,6 +3550,45 @@ async def _handle_session_tools(
     return _MISS
 
 
+async def _verify_item_ci(
+    db: Any,
+    project_id: str,
+    tenant: dict[str, Any] | None,
+    text: str,
+) -> dict[str, Any] | None:
+    """Independent GitHub Actions CI check for the commit referenced in ``text``.
+
+    Returns the ``verify_commit_ci`` result dict (``{sha, repo, state, total,
+    failed}``) or ``None`` when there is nothing to check (no commit SHA in the
+    text, no ``github_repo`` configured, or any error). Best-effort and fully
+    guarded — this NEVER raises; the caller decides whether a ``failure`` state
+    hard-blocks or is merely advisory. Shared by ``complete_sprint_item`` so the
+    pre-completion hard-block and the post-completion advisory reuse one lookup.
+    """
+    try:
+        from .. import github_ci  # noqa: PLC0415
+
+        _ci_sha = github_ci.extract_commit_sha(text)
+        if not _ci_sha:
+            return None
+        _ci_project = await db_module.get_project(db, project_id)
+        _ci_repo = ((_ci_project or {}).get("github_repo") or "").strip()
+        if not _ci_repo:
+            return None
+        _ci_token = None
+        _ci_tid = (tenant or {}).get("id") if tenant else None
+        if _ci_tid:
+            try:
+                _ci_token, _ = await db_module.get_github_token_for_project(
+                    db, _ci_tid, project_id
+                )
+            except Exception:  # noqa: BLE001
+                _ci_token = None
+        return await github_ci.verify_commit_ci(_ci_repo, _ci_sha, token=_ci_token)
+    except Exception:  # noqa: BLE001 — advisory/best-effort; never raise
+        return None
+
+
 async def _handle_sprint_tools(
     name: str,
     args: dict[str, Any],
@@ -3182,6 +3610,14 @@ async def _handle_sprint_tools(
             db, args["session_id"], note_kind=args.get("note_kind")
         )
     if name == "add_sprint_item":
+        # 8f01cdfe — project_name is an accepted alternative to project_id (the
+        # dispatcher resolver at _dispatch_mcp_tool resolves a present, resolvable
+        # project_name → project_id before we get here). If neither a project_id
+        # nor a resolvable project_name reached us, return a clean, descriptive
+        # error instead of letting the direct args["project_id"] reads below raise
+        # a raw KeyError that leaks as a cryptic JSON-RPC -32603.
+        if not args.get("project_id"):
+            return {"error": "project_id is required (or pass project_name)"}
         validate_input_size(args.get("title"), "sprint item title", 500)
         # 7e212375 — codebase drift check: if the title looks already-implemented
         # (3+ keyword overlap with a specific migration or a recent commit),
@@ -3232,9 +3668,12 @@ async def _handle_sprint_tools(
                 force=bool(args.get("force", False)),
                 deferred_until=args.get("deferred_until"),
                 track=args.get("track"),
+                priority=args.get("priority"),
+                blocker_kind=args.get("blocker_kind"),
             )
         except ValueError as exc:
-            # 501ec93f — malformed touches_resources identifier; surface, don't crash.
+            # 501ec93f — malformed touches_resources identifier; also e08fee30 /
+            # 2282a636 bad priority / blocker_kind. Surface, don't crash.
             return {"error": str(exc)}
         # b0d42ef6 — duplicate guard blocked the insert: surface the error as-is
         # (no item was created, so the warnings below don't apply).
@@ -3264,6 +3703,15 @@ async def _handle_sprint_tools(
         _extra["prospecting_status"] = _pc_status
         if _pc_ctx:
             _extra["code_context"] = _pc_ctx
+        # 691f4e1c — persist a DURABLE symbol pointer (not just the inline hint) when
+        # the item declares real symbols, so prospecting is queryable later via
+        # get_sprint_item_pointers / resolvable through the tunnel, instead of a
+        # one-shot code_context the caller has to act on manually. Fully guarded.
+        _ptr = await _persist_prospected_pointer(
+            db, args["project_id"], _new_item, _pc_status
+        )
+        if _ptr:
+            _extra["prospected_pointer"] = _ptr
         if _extra:
             _new_item = {**_new_item, **_extra}
         return _new_item
@@ -3339,6 +3787,15 @@ async def _handle_sprint_tools(
             _patch_kwargs["deferred_until"] = args.get("deferred_until")
         if "track" in args:
             _patch_kwargs["track"] = args.get("track")
+        # e08fee30 — set the priority enum. Only forward when supplied (None leaves
+        # the stored value untouched in patch_sprint_item).
+        if args.get("priority") is not None:
+            _patch_kwargs["priority"] = args.get("priority")
+        # 2282a636 — set/clear blocker_kind. Only forward when the caller supplied
+        # the key, so omitting it leaves the stored value untouched (_UNSET
+        # sentinel); pass "" / null to clear (ordinary item), or 'manual' to set.
+        if "blocker_kind" in args:
+            _patch_kwargs["blocker_kind"] = args.get("blocker_kind")
         try:
             item = await db_module.patch_sprint_item(
                 db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -3355,6 +3812,14 @@ async def _handle_sprint_tools(
         item = {**item, "prospecting_status": _u_status}
         if _u_ctx:
             item["code_context"] = _u_ctx
+        # 691f4e1c — persist the durable symbol pointer on update too (skips if the
+        # item already carries a code/symbol pointer, so re-editing doesn't stack
+        # duplicates). Guarded; a persist failure never breaks the update.
+        _u_ptr = await _persist_prospected_pointer(
+            db, args["project_id"], item, _u_status
+        )
+        if _u_ptr:
+            item["prospected_pointer"] = _u_ptr
         return item
     if name == "set_sprint":
         # 62d321dd — guard: warn if pending items were never started before rolling sprint
@@ -3712,6 +4177,49 @@ async def _handle_sprint_tools(
             except Exception:  # noqa: BLE001
                 pass
 
+        # 427b7902 — HARD CI GATE: refuse to complete when GitHub Actions CI for the
+        # commit named in the notes is GENUINELY FAILING. This upgrades the b121348e
+        # advisory (which only WARNED post-completion) to a real gate, mirroring the
+        # EVIDENCE_REQUIRED refusal: computed BEFORE marking done, returns a clean
+        # error, and does NOT flip the item to done. Guardrails:
+        #   * ONLY a real "failure" state blocks. "unknown" (no repo configured, no
+        #     check-runs yet, self-hosted / no-GitHub) and "pending" (CI still
+        #     running — the normal push-then-complete race) are ALWAYS allowed
+        #     through, so this never blocks on absent/unknown CI.
+        #   * Escape hatch consistent with existing force= patterns: pass
+        #     override_ci=true to complete anyway (records that the failing CI was
+        #     acknowledged). The result is cached so the advisory block below reuses
+        #     it without a second GitHub round-trip.
+        _ci_pre: dict[str, Any] | None = None
+        _ci_checked = False
+        _override_ci = bool(args.get("override_ci"))
+        try:
+            _pre_item = await db_module.get_sprint_item(db, args["item_id"])
+        except Exception:  # noqa: BLE001
+            _pre_item = None
+        if _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
+            _ci_text = f"{args.get('notes') or ''} {(_pre_item.get('notes') or '')}"
+            _ci_pre = await _verify_item_ci(db, args["project_id"], tenant, _ci_text)
+            _ci_checked = True
+            if (
+                not _override_ci
+                and _ci_pre is not None
+                and _ci_pre.get("state") == "failure"
+            ):
+                return {
+                    "error": "CI_FAILING",
+                    "item_id": args["item_id"],
+                    "ci_verification": _ci_pre,
+                    "message": (
+                        f"Refusing to complete {args['item_id']}: GitHub Actions CI "
+                        f"is FAILING for commit {_ci_pre.get('sha')} "
+                        f"({_ci_pre.get('failed')}/{_ci_pre.get('total')} checks failed). "
+                        "Fix CI and re-push, or pass override_ci=true to acknowledge "
+                        "and complete anyway. (Unknown/pending CI is never blocked — "
+                        "only a real failing status.)"
+                    ),
+                }
+
         # 5823db0b — quality gate + actor attribution. Pass evidence notes and
         # the completing actor; surface the required_notes gate as a clean error.
         _complete_actor = args.get("actor") or _complete_session_id or None
@@ -3753,41 +4261,28 @@ async def _handle_sprint_tools(
         if _bc_complete:
             item = dict(item)
             item["board_change"] = _bc_complete
-        # b121348e — INDEPENDENT CI verification: cross-reference the ACTUAL GitHub
-        # Actions result for the commit named in the completion notes, so a "tests
-        # pass" claim is checked against real CI. Advisory + fully guarded: CI is
-        # usually still running at completion time (push, then complete), and self-
-        # hosted / no-GitHub setups have nothing to check — so this attaches
-        # ci_verification and, when CI is genuinely FAILING, a ci_warning, but never
-        # blocks the completion or raises.
+        # b121348e / 427b7902 — INDEPENDENT CI verification. The 427b7902 hard gate
+        # above already looked this up (and REFUSED completion on a real failing
+        # state unless override_ci=true), so reuse that result — no second GitHub
+        # round-trip. Attach ``ci_verification`` for transparency, and when CI is
+        # genuinely FAILING (i.e. this was an acknowledged override_ci completion),
+        # attach a ``ci_warning`` so the closed-on-red item stays visible.
         try:
-            from .. import github_ci  # noqa: PLC0415
-            _ci_sha = github_ci.extract_commit_sha(
-                f"{args.get('notes') or ''} {item.get('notes') or ''}"
+            _ci = _ci_pre if _ci_checked else await _verify_item_ci(
+                db, args["project_id"], tenant,
+                f"{args.get('notes') or ''} {item.get('notes') or ''}",
             )
-            if _ci_sha:
-                _ci_project = await db_module.get_project(db, args["project_id"])
-                _ci_repo = ((_ci_project or {}).get("github_repo") or "").strip()
-                if _ci_repo:
-                    _ci_token = None
-                    _ci_tid = (tenant or {}).get("id") if tenant else None
-                    if _ci_tid:
-                        try:
-                            _ci_token, _ = await db_module.get_github_token_for_project(
-                                db, _ci_tid, args["project_id"]
-                            )
-                        except Exception:  # noqa: BLE001
-                            _ci_token = None
-                    _ci = await github_ci.verify_commit_ci(_ci_repo, _ci_sha, token=_ci_token)
-                    item = dict(item)
-                    item["ci_verification"] = _ci
-                    if _ci.get("state") == "failure":
-                        item["ci_warning"] = (
-                            f"⚠ GitHub Actions CI is FAILING for commit {_ci_sha} "
-                            f"({_ci.get('failed')}/{_ci.get('total')} checks) — this item "
-                            f"was closed on a commit whose CI did not pass. Verify before "
-                            f"trusting 'done'."
-                        )
+            if _ci is not None:
+                item = dict(item)
+                item["ci_verification"] = _ci
+                if _ci.get("state") == "failure":
+                    item["ci_warning"] = (
+                        f"⚠ GitHub Actions CI is FAILING for commit {_ci.get('sha')} "
+                        f"({_ci.get('failed')}/{_ci.get('total')} checks) — this item "
+                        f"was closed on a commit whose CI did not pass"
+                        + (" (override_ci=true)." if _override_ci else ".")
+                        + " Verify before trusting 'done'."
+                    )
         except Exception:  # noqa: BLE001 — advisory only; completion already succeeded
             pass
         # bb29a06f — ADVISORY completion sanity-check. Extends the required_notes
@@ -4066,6 +4561,182 @@ async def _handle_file_claims(
     return _MISS
 
 
+# 0fba4cb6 — MECHANICAL model-efficiency classifier.
+#
+# A zero-token, pure/deterministic heuristic that suggests the cheapest model
+# tier likely sufficient for a task, from signals already available on a sprint
+# item / task descriptor (title keywords, file count, touched-resource shape,
+# explicit size). It mirrors how the ultracode orchestration script spends ZERO
+# model tokens on routing — no LLM call, no DB, no network. A future "semantic"
+# mode (an LLM-backed second opinion) is deliberately OUT OF SCOPE here; see the
+# follow-up note in the tool schema.
+#
+# Design notes:
+#   * Purely additive scoring: cheap-leaning signals push the score down toward
+#     "haiku", expensive-leaning signals push it up toward "opus". The final tier
+#     is a threshold cut on the accumulated score, so it is stable and testable.
+#   * Every signal that fires is reported (name + human-readable detail + the
+#     delta it contributed) so the rationale is fully auditable — nothing about
+#     the suggestion is a black box.
+#   * The classifier NEVER raises on bad input: missing/oddly-typed fields simply
+#     contribute no signal. It is safe to call on a raw, partially-filled
+#     descriptor.
+
+# Keyword -> (score_delta, tier-lean label). Positive = more expensive.
+# Matched as whole words against a lowercased title/description token set.
+_TIER_CHEAP_KEYWORDS: dict[str, str] = {
+    "typo": "trivial-text-fix",
+    "typos": "trivial-text-fix",
+    "rename": "mechanical-rename",
+    "comment": "comment-only",
+    "docstring": "docs-only",
+    "readme": "docs-only",
+    "wording": "copy-edit",
+    "copy": "copy-edit",
+    "lint": "lint-cleanup",
+    "format": "formatting",
+    "formatting": "formatting",
+    "whitespace": "formatting",
+    "bump": "version-bump",
+    "changelog": "docs-only",
+}
+_TIER_EXPENSIVE_KEYWORDS: dict[str, str] = {
+    "refactor": "structural-refactor",
+    "refactoring": "structural-refactor",
+    "migration": "schema-migration",
+    "migrate": "schema-migration",
+    "architecture": "architectural",
+    "architect": "architectural",
+    "redesign": "architectural",
+    "rewrite": "large-rewrite",
+    "concurrency": "concurrency-hazard",
+    "async": "concurrency-hazard",
+    "security": "security-sensitive",
+    "auth": "auth-sensitive",
+    "authentication": "auth-sensitive",
+    "cryptography": "security-sensitive",
+    "crypto": "security-sensitive",
+    "algorithm": "algorithmic",
+    "optimize": "performance-tuning",
+    "performance": "performance-tuning",
+    "distributed": "distributed-systems",
+}
+
+
+def _classify_task_tier(descriptor: dict[str, Any]) -> dict[str, Any]:
+    """Deterministically suggest a model tier for a task/sprint-item descriptor.
+
+    Pure function — NO model call, NO DB, NO network. Given a descriptor with any
+    of the optional keys below, returns a dict:
+        {"tier": "haiku"|"sonnet"|"opus",
+         "score": <int>,
+         "signals": [{"signal", "detail", "weight"}...],
+         "rationale": "<one-line human summary>",
+         "mode": "mechanical"}
+
+    Recognised descriptor keys (all optional):
+        title / description  — text; scanned for cheap/expensive keyword signals.
+        file_count           — int; more files touched -> more expensive.
+        files                — list; used to derive file_count when absent.
+        touches_resources    — list (or int count); shape/count of touched
+                               resources (DB/schema/infra), an expensive signal.
+        size                 — one of "xs"|"s"|"m"|"l"|"xl" (case-insensitive),
+                               an explicit sprint-item size estimate.
+
+    The score starts at a neutral 0. Cheap signals subtract, expensive signals
+    add; the tier is a threshold cut on the total, so the mapping is stable.
+    """
+    if not isinstance(descriptor, dict):
+        descriptor = {}
+    signals: list[dict[str, Any]] = []
+    score = 0
+
+    def _add(signal: str, detail: str, weight: int) -> None:
+        nonlocal score
+        score += weight
+        signals.append({"signal": signal, "detail": detail, "weight": weight})
+
+    # --- Text keyword signals (title + description) ---------------------------
+    text_parts = []
+    for key in ("title", "description"):
+        val = descriptor.get(key)
+        if isinstance(val, str):
+            text_parts.append(val)
+    text = " ".join(text_parts).lower()
+    tokens = set(re.findall(r"[a-z0-9]+", text))
+    for kw, label in _TIER_CHEAP_KEYWORDS.items():
+        if kw in tokens:
+            _add("keyword:" + kw, f"cheap-leaning keyword '{kw}' ({label})", -2)
+    for kw, label in _TIER_EXPENSIVE_KEYWORDS.items():
+        if kw in tokens:
+            _add("keyword:" + kw, f"expensive-leaning keyword '{kw}' ({label})", 3)
+
+    # --- File count -----------------------------------------------------------
+    file_count = descriptor.get("file_count")
+    if not isinstance(file_count, int) or isinstance(file_count, bool):
+        files = descriptor.get("files")
+        file_count = len(files) if isinstance(files, (list, tuple)) else None
+    if isinstance(file_count, int) and not isinstance(file_count, bool):
+        if file_count <= 1:
+            _add("file_count", f"{file_count} file(s) touched — narrow blast radius", -1)
+        elif file_count <= 3:
+            _add("file_count", f"{file_count} files touched — small change", 0)
+        elif file_count <= 8:
+            _add("file_count", f"{file_count} files touched — multi-file change", 3)
+        else:
+            _add("file_count", f"{file_count} files touched — broad, cross-cutting change", 5)
+
+    # --- Touched resources (DB/schema/infra shape + count) --------------------
+    touched = descriptor.get("touches_resources")
+    touched_count: int | None = None
+    if isinstance(touched, (list, tuple)):
+        touched_count = len(touched)
+    elif isinstance(touched, int) and not isinstance(touched, bool):
+        touched_count = touched
+    if isinstance(touched_count, int):
+        if touched_count == 0:
+            _add("touches_resources", "no external resources touched", -1)
+        elif touched_count <= 2:
+            _add("touches_resources", f"{touched_count} resource(s) touched", 2)
+        else:
+            _add("touches_resources",
+                 f"{touched_count} resources touched — wide integration surface", 4)
+
+    # --- Explicit sprint-item size -------------------------------------------
+    size = descriptor.get("size")
+    if isinstance(size, str):
+        size_weights = {"xs": -2, "s": -1, "m": 0, "l": 3, "xl": 5}
+        w = size_weights.get(size.strip().lower())
+        if w is not None:
+            _add("size", f"declared size '{size.strip().lower()}'", w)
+
+    # --- Threshold cut -> tier ------------------------------------------------
+    if score <= -2:
+        tier = "haiku"
+    elif score >= 5:
+        tier = "opus"
+    else:
+        tier = "sonnet"
+
+    tier_reason = {
+        "haiku": "mechanical / low-complexity work — a cheap tier is sufficient",
+        "sonnet": "moderate complexity — a mid tier is a safe default",
+        "opus": "high complexity / broad blast radius — reserve the top tier",
+    }[tier]
+    rationale = (
+        f"Suggested tier '{tier}' (score {score:+d}): {tier_reason}. "
+        + (f"{len(signals)} signal(s) fired." if signals else
+           "No strong signals; defaulting on a neutral score.")
+    )
+    return {
+        "tier": tier,
+        "score": score,
+        "signals": signals,
+        "rationale": rationale,
+        "mode": "mechanical",
+    }
+
+
 async def _handle_planning_tools(
     name: str,
     args: dict[str, Any],
@@ -4074,7 +4745,12 @@ async def _handle_planning_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: reconcile_sprint_drift, get_planning_brief."""
+    """Dispatch group: reconcile_sprint_drift, get_planning_brief, analyze_model_efficiency."""
+    if name == "analyze_model_efficiency":
+        # 0fba4cb6 — MECHANICAL (zero-token) model-tier suggestion. Pure
+        # heuristic over signals already on the descriptor; no model call, no DB,
+        # no network. See _classify_task_tier for the scoring model.
+        return _classify_task_tier(args)
     if name == "reconcile_sprint_drift":
         from .. import handoff as handoff_module_local
         project = await db_module.get_project(db, args["project_id"])
@@ -4279,8 +4955,19 @@ async def _handle_plugin_tools(
 
         builtin_by_slot = {p["slot"]: p for p in BUILTIN_PLUGINS}
 
-        # Fetch tunnel tool counts per slot (parallel, non-fatal)
+        # Fetch tunnel tool counts + live tool names per slot (parallel, non-fatal).
+        #
+        # 90d04961 — this is re-queried on EVERY call (never a session-start
+        # snapshot): _fetch_slot_tools hits each slot's live tools/list, so a slot
+        # that only became active MID-session (e.g. the word slot connecting after
+        # session start and now serving 42 real tools) is picked up here on the
+        # next list_plugins/tool-search call rather than being invisible until a
+        # reconnect. A slot is treated as active/invocable ONLY when it actually
+        # returns ≥1 live tool this fetch — a slot that returns 0 (never connected,
+        # dead inner server, or still starting) must NOT be flagged active, or a
+        # tool-search consumer would surface a plugin whose tools 503 on first call.
         slot_tool_counts: dict[str, int] = {}
+        slot_tool_names: dict[str, list[str]] = {}
         tenant_id = tenant.get("id") if tenant else None
         if tenant_id and _tunnel_mod.has_active_tunnel(tenant_id):
             try:
@@ -4291,7 +4978,16 @@ async def _handle_plugin_tools(
                     ]
                 )
                 for label, tools in slot_results:
-                    slot_tool_counts[label] = len(tools)
+                    # Only record slots that surfaced live tools — a bare count of
+                    # 0 means the slot is not actually serving, so it stays out of
+                    # the active/invocable set (and off the tool-search index).
+                    if tools:
+                        slot_tool_counts[label] = len(tools)
+                        slot_tool_names[label] = [
+                            str(t.get("name"))
+                            for t in tools
+                            if isinstance(t, dict) and t.get("name")
+                        ]
             except Exception:  # noqa: BLE001
                 pass
 
@@ -4336,6 +5032,14 @@ async def _handle_plugin_tools(
                 # invocable while the tunnel is live (otherwise they appear in the
                 # list but calling one returns "unknown tool").
                 "invocable": slot in slot_tool_counts,
+                # 90d04961 — surface the slot's LIVE tool names (slot-prefixed, as
+                # the connector advertises them) so a tool-search consumer can match
+                # a specific tunnel-bridged tool that only appeared after the initial
+                # session snapshot. Empty for inactive slots.
+                "tools": [
+                    f"{display_name}__{tn}"
+                    for tn in slot_tool_names.get(slot, [])
+                ],
             }
             if skill:
                 entry["skill_note"] = {

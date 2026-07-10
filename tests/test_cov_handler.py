@@ -2921,3 +2921,30 @@ def test_json_default_coerces_datetimes():
     import pytest as _pytest
     with _pytest.raises(TypeError):
         _json.dumps(payload)
+
+
+def test_keyword_prospect_fallback_for_planning_chat_items():
+    """84d255af — an item with no touches_resources and no hotspot-keyword match
+    (the planning-chat shape) now prospects via the index-free keyword fallback
+    instead of dead-ending at no_targets."""
+    item = {
+        "title": "GAP: auto-prospecting is near-useless from planning-chat sessions",
+    }
+    ctx, status = mh._prospecting_result(item)
+    assert status == "prospected"
+    assert ctx["source"] == "keyword_fallback"
+    # search_code (GitHub-backed, tunnel-free), not codebase__search_graph.
+    assert ctx["search_code_calls"]
+    assert all(c.startswith("search_code(") for c in ctx["search_code_calls"])
+    # Stopwords/labels ("GAP", "is", "from") are excluded from keywords.
+    low = {k.lower() for k in ctx["keywords"]}
+    assert "gap" not in low and "is" not in low and "from" not in low
+    # A salient term survives.
+    assert any("prospect" in k.lower() or "planning" in k.lower() for k in ctx["keywords"])
+
+
+def test_keyword_prospect_fallback_empty_title_still_no_targets():
+    """Preserve the old no_targets contract for a title with no usable keyword."""
+    assert mh._keyword_prospect_fallback("") is None
+    assert mh._keyword_prospect_fallback("the a of to") is None  # pure stopwords
+    assert mh._prospecting_result({"title": ""}) == (None, "no_targets")

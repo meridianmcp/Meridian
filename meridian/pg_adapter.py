@@ -524,7 +524,15 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     slug TEXT,
     nickname TEXT,
     deferred_until TEXT,
-    track TEXT
+    track TEXT,
+    -- e08fee30: app-layer priority enum urgent|high|normal|low. Urgent-first
+    -- ordering in get_sprint_items / get_parallelizable_groups. Enum enforced at
+    -- the app layer (no CHECK, so the ADD COLUMN migration stays plain).
+    -- (NB: this literal is an f-string; keep curly braces out of these comments.)
+    priority TEXT NOT NULL DEFAULT 'normal',
+    -- 2282a636: NULL = ordinary, 'manual' = blocked on a real-world action outside
+    -- Meridian. Distinct from milestone_type='human'; excluded from executor scoping.
+    blocker_kind TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -2524,6 +2532,24 @@ async def _migrate_pg_sprint_item_deferral(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_priority_blocker(conn: PostgresConnection) -> None:
+    """e08fee30 + 2282a636 — priority + blocker_kind on sprint_items (mirrors SQLite).
+
+    ``priority`` — app-layer enum {urgent, high, normal, low}, NOT NULL DEFAULT
+    'normal'; higher-priority pending items are surfaced/claimed/grouped first.
+    ``blocker_kind`` — nullable; NULL = ordinary, 'manual' = blocked on a
+    real-world action outside Meridian (distinct from milestone_type='human', and
+    excluded from executor scoping the same way). Enums enforced at the app layer.
+    CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path.
+    ADD COLUMN IF NOT EXISTS → idempotent. Mirrors
+    db._migrate_sprint_item_priority_blocker.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal';"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS blocker_kind TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2581,4 +2607,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_session_goal_compliance,
     _migrate_pg_sprint_item_pointers,
     _migrate_pg_sprint_item_deferral,
+    _migrate_pg_sprint_item_priority_blocker,
 )

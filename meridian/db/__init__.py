@@ -283,7 +283,22 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- nullable; NULL = immediately claimable / no track. Plain columns — no inline
     -- index here (guarded-migration rule).
     deferred_until TEXT,
-    track TEXT
+    track TEXT,
+    -- e08fee30: app-layer priority enum {urgent, high, normal, low}. Higher-
+    -- priority PENDING items are surfaced (claimed/grouped) first — get_sprint_items
+    -- and get_parallelizable_groups order urgent-first within their existing
+    -- ordering. NOT NULL DEFAULT 'normal' so legacy rows read as 'normal'. Enum is
+    -- enforced at the app layer (add/patch raise on a bad value); no CHECK here so
+    -- the migration ADD COLUMN stays a plain, safe alter. Plain column — no inline
+    -- index (guarded-migration rule).
+    priority TEXT NOT NULL DEFAULT 'normal',
+    -- 2282a636: NULL = ordinary item; 'manual' = blocked on a real-world action
+    -- OUTSIDE Meridian (publish something, get an API key, talk to an advisor).
+    -- DISTINCT from milestone_type='human' (that is about WHO executes). A manual-
+    -- blocker item is surfaced distinctly and excluded from executor "just claim
+    -- the next pending" scoping, mirroring milestone_type='human'. Nullable plain
+    -- column — no inline index (guarded-migration rule).
+    blocker_kind TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -928,6 +943,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_session_goal_compliance(db)
     await _migrate_sprint_item_pointers(db)
     await _migrate_sprint_item_deferral(db)
+    await _migrate_sprint_item_priority_blocker(db)
     return db
 
 
@@ -3782,6 +3798,37 @@ _ACTIVE_SPRINT_STATUSES = {
 # default for freshly-added items and is pending-equivalent here.
 _DUP_BLOCKING_SPRINT_STATUSES = {"pending", "todo", "in_progress"}
 
+# e08fee30 — app-layer priority enum for sprint items. Higher-priority PENDING
+# items are surfaced (claimed / grouped) first. The DB column has no CHECK (so the
+# ADD COLUMN migration stays a plain alter); add_sprint_item / patch_sprint_item
+# enforce membership and raise ValueError on a bad value, like milestone_type.
+_VALID_SPRINT_PRIORITIES = ("urgent", "high", "normal", "low")
+# Rank used to order urgent-first (lower rank sorts earlier). Rendered into a
+# portable CASE expression so both SQLite and Postgres order identically without a
+# separate lookup table; an unknown/NULL priority falls back to 'normal's rank.
+_SPRINT_PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
+_SPRINT_PRIORITY_DEFAULT_RANK = _SPRINT_PRIORITY_RANK["normal"]
+
+# 2282a636 — blocker_kind values. NULL = ordinary item; 'manual' = blocked on a
+# real-world action OUTSIDE Meridian (publish something, obtain an API key, talk
+# to an advisor). DISTINCT from milestone_type='human' (WHO executes) — a
+# manual-blocker is excluded from executor "just claim the next pending" scoping.
+_VALID_SPRINT_BLOCKER_KINDS = ("manual",)
+
+
+def _sprint_priority_order_sql(column: str = "priority") -> str:
+    """Return a portable ``CASE`` expression ranking ``column`` urgent-first.
+
+    Renders the app-layer priority enum into an integer rank inside SQL so
+    ``ORDER BY`` can put higher-priority items first on both SQLite and Postgres
+    (neither has a native enum ordering here). NULL / unknown values fall back to
+    'normal's rank, so legacy rows sort as normal rather than first-or-last.
+    """
+    whens = " ".join(
+        f"WHEN '{p}' THEN {r}" for p, r in _SPRINT_PRIORITY_RANK.items()
+    )
+    return f"CASE {column} {whens} ELSE {_SPRINT_PRIORITY_DEFAULT_RANK} END"
+
 # b0d42ef6 — fuzzy-duplicate threshold for add_sprint_item. Two titles are
 # treated as duplicates when their word-set overlap is >= 60%.
 _SPRINT_DUP_OVERLAP_THRESHOLD = 0.60
@@ -3951,6 +3998,8 @@ async def add_sprint_item(
     slug: str | None = None,
     deferred_until: str | None = None,
     track: str | None = None,
+    priority: str | None = None,
+    blocker_kind: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -3967,6 +4016,11 @@ async def add_sprint_item(
     future ``claim_sprint_item`` REFUSES the item (enforced deferral, not a
     text-only note). ``track`` buckets the item into a named lane (e.g.
     'paper') so a whole track can be skipped.
+    ``priority`` (e08fee30) is one of {urgent, high, normal, low} (default
+    'normal'); higher-priority pending items are surfaced/claimed/grouped first.
+    ``blocker_kind`` (2282a636) is None (ordinary) or 'manual' (blocked on a
+    real-world action outside Meridian) — a manual-blocker is surfaced distinctly
+    and excluded from executor scoping, like milestone_type='human'.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
     is compared (word-set overlap, see ``_title_word_overlap``) against every
@@ -3985,6 +4039,20 @@ async def add_sprint_item(
         raise ValueError("failure_mode must be 'continue' or 'stop'")
     if milestone_type not in ("task", "milestone", "human"):
         raise ValueError("milestone_type must be 'task', 'milestone', or 'human'")
+    # e08fee30 — validate the priority enum (default 'normal'), mirroring how
+    # milestone_type raises on a bad value.
+    if priority is None:
+        priority = "normal"
+    if priority not in _VALID_SPRINT_PRIORITIES:
+        raise ValueError(
+            f"priority must be one of {_VALID_SPRINT_PRIORITIES}, got {priority!r}"
+        )
+    # 2282a636 — validate blocker_kind. None = ordinary; only 'manual' is defined.
+    if blocker_kind is not None and blocker_kind not in _VALID_SPRINT_BLOCKER_KINDS:
+        raise ValueError(
+            f"blocker_kind must be None or one of {_VALID_SPRINT_BLOCKER_KINDS}, "
+            f"got {blocker_kind!r}"
+        )
     # b0d42ef6 — block near-duplicate titles against open items unless forced.
     if not force:
         _new_words = _title_word_set(title)
@@ -4026,11 +4094,12 @@ async def add_sprint_item(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
-        "deferred_until, track) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "deferred_until, track, priority, blocker_kind) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
-         _item_slug, _item_nickname, deferred_until or None, track or None),
+         _item_slug, _item_nickname, deferred_until or None, track or None,
+         priority, blocker_kind or None),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -4421,11 +4490,14 @@ async def patch_sprint_item(
     required_notes: bool | int | None = None,
     deferred_until: Any = _UNSET,
     track: Any = _UNSET,
+    priority: str | None = None,
+    blocker_kind: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
-    item_group, touches_resources, required_notes, deferred_until, track. Only
+    item_group, touches_resources, required_notes, deferred_until, track,
+    priority, blocker_kind. Only
     fields passed as non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
@@ -4435,6 +4507,11 @@ async def patch_sprint_item(
     omit to leave unchanged, pass an empty string / ``None`` to CLEAR the
     deferral (making the item immediately claimable again), or an ISO timestamp
     / track name to set it.
+    ``priority`` (e08fee30) is left unchanged when ``None``; pass one of
+    {urgent, high, normal, low} to set it (a bad value raises ValueError, like
+    milestone_type). ``blocker_kind`` (2282a636) uses the ``_UNSET`` sentinel:
+    omit to leave unchanged, pass an empty string / ``None`` to CLEAR it (ordinary
+    item), or 'manual' to mark it blocked on a real-world action outside Meridian.
     """
     fields: list[str] = []
     values: list[Any] = []
@@ -4477,6 +4554,25 @@ async def patch_sprint_item(
     if track is not _UNSET:
         fields.append("track = ?")
         values.append(track or None)
+    if priority is not None:
+        # e08fee30 — validate the enum; raise on a bad value like milestone_type.
+        if priority not in _VALID_SPRINT_PRIORITIES:
+            raise ValueError(
+                f"priority must be one of {_VALID_SPRINT_PRIORITIES}, got {priority!r}"
+            )
+        fields.append("priority = ?")
+        values.append(priority)
+    if blocker_kind is not _UNSET:
+        # 2282a636 — empty string / None CLEARS it (ordinary item); otherwise
+        # validate the enum (only 'manual' is defined).
+        _bk = blocker_kind or None
+        if _bk is not None and _bk not in _VALID_SPRINT_BLOCKER_KINDS:
+            raise ValueError(
+                f"blocker_kind must be None or one of {_VALID_SPRINT_BLOCKER_KINDS}, "
+                f"got {blocker_kind!r}"
+            )
+        fields.append("blocker_kind = ?")
+        values.append(_bk)
     if not fields:
         return await get_sprint_item(db, item_id)
     values.extend([item_id, project_id])
@@ -4842,8 +4938,9 @@ async def get_sprint_items(
     show_blocked: bool = True,
     include_human: bool = True,
     version: str | None = None,
+    include_manual_blocker: bool | None = None,
 ) -> list[dict[str, Any]]:
-    """List sprint items for a project, oldest first.
+    """List sprint items for a project, highest-priority first then oldest.
 
     ``status`` filter is optional. ``None`` returns everything so the
     dashboard can render the full timeline.
@@ -4855,10 +4952,27 @@ async def get_sprint_items(
     ``include_human=False`` excludes items with milestone_type='human'
     (used for executor sessions that should not see human-assigned tasks).
 
+    ``include_manual_blocker`` (2282a636) controls whether items with
+    ``blocker_kind='manual'`` (blocked on a real-world action OUTSIDE Meridian —
+    distinct from milestone_type='human', which is about WHO executes) are
+    returned. ``None`` (default) FOLLOWS ``include_human``: an executor-scoped
+    call (``include_human=False``) also hides manual-blocker items so an executor
+    never treats a real-world blocker as a claimable "just claim it" pending; a
+    full-board call (``include_human=True``) still surfaces them (the dashboard
+    renders them distinctly). Pass an explicit ``True``/``False`` to override.
+
     ``version`` (a76cb7c0) filters to a single sprint-version bucket. ``None``
     returns every version. Used by version-scoped sessions so an executor sees
     only the items in its bucket.
+
+    Ordering (e08fee30): items are returned highest-priority first
+    (urgent > high > normal > low), then oldest-first within a priority, so an
+    executor reading the pending bucket claims higher-priority work first. The
+    priority rank is a portable CASE expression (identical on SQLite/Postgres).
     """
+    # 2282a636 — resolve the manual-blocker visibility: None follows include_human.
+    if include_manual_blocker is None:
+        include_manual_blocker = include_human
     clauses = ["project_id = ?"]
     params_list: list = [project_id]
     if status is not None:
@@ -4874,9 +4988,11 @@ async def get_sprint_items(
         params_list.append(version)
     if not include_human:
         clauses.append("(milestone_type IS NULL OR milestone_type != 'human')")
+    if not include_manual_blocker:
+        clauses.append("(blocker_kind IS NULL OR blocker_kind != 'manual')")
     query = (
         f"SELECT * FROM sprint_items WHERE {' AND '.join(clauses)} "
-        "ORDER BY added_at ASC, rowid ASC"
+        f"ORDER BY {_sprint_priority_order_sql()} ASC, added_at ASC, rowid ASC"
     )
     params: tuple = tuple(params_list)
     async with db.execute(query, params) as cur:
@@ -7689,8 +7805,16 @@ async def get_parallelizable_groups(
     Returns ``{"version", "groups": [[item, ...], ...], "group_count",
     "eligible_count", "blocked": [...], "undeclared_count"}``. ``groups`` items
     are full sprint-item dicts with a derived ``resources`` list attached.
+
+    2282a636 — items with ``blocker_kind='manual'`` (blocked on a real-world
+    action outside Meridian) are excluded here: they are not executor-claimable,
+    so they never join a parallel batch.
+    e08fee30 — within the safe-parallel ordering, higher-priority eligible items
+    are placed first so urgent work colors into the earliest groups.
     """
-    items = await get_sprint_items(db, project_id)
+    # include_manual_blocker=False: a manual-blocker item is not claimable work,
+    # so it must not be offered as a parallelizable batch member.
+    items = await get_sprint_items(db, project_id, include_manual_blocker=False)
     if version is not None:
         items = [it for it in items if it.get("version") == version]
     claimable_statuses = {"pending", "todo"}
@@ -7731,8 +7855,17 @@ async def get_parallelizable_groups(
                 continue
         enriched = {**it, "resources": parse_touches_resources(it.get("touches_resources"))}
         eligible.append(enriched)
-    # Stable order: oldest first, then id, so coloring is deterministic.
-    eligible.sort(key=lambda it: (str(it.get("added_at") or ""), it["id"]))
+    # Stable order: highest-priority first (e08fee30), then oldest, then id, so
+    # coloring is deterministic AND urgent work colors into the earliest groups.
+    eligible.sort(
+        key=lambda it: (
+            _SPRINT_PRIORITY_RANK.get(
+                it.get("priority") or "normal", _SPRINT_PRIORITY_DEFAULT_RANK
+            ),
+            str(it.get("added_at") or ""),
+            it["id"],
+        )
+    )
     # de730a25 — separate declared from undeclared items. An item with no
     # touches_resources is disjoint with everything, so the old single-pass
     # coloring dropped it into group 0 next to declared items and they fanned
@@ -9246,6 +9379,81 @@ async def dismiss_hitl_request(
     )
     await db.commit()
     return await get_hitl_request(db, request_id)
+
+
+def _hitl_payload_flag(payload: Any, key: str) -> bool:
+    """True if the HITL payload JSON has a truthy ``key``. Tolerant of a
+    None/non-JSON/non-dict payload (returns False)."""
+    try:
+        pl = json.loads(payload) if isinstance(payload, str) else (payload or {})
+    except (TypeError, ValueError):
+        return False
+    return bool(isinstance(pl, dict) and pl.get(key))
+
+
+async def get_recoverable_hitl_answers(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    active_session_ids: "set[str] | None" = None,
+    within_hours: int = 48,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """9dad83fd — answered **blocking** HITLs whose originating session is no
+    longer live, so a resuming session can pick up an answer that would otherwise
+    be lost (the dead session was the only poller). Excludes ones already handed
+    to a recovery surface (a ``recovered_delivered`` JSON-payload flag — no schema
+    change) and anything answered more than ``within_hours`` ago."""
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=within_hours)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    async with db.execute(
+        "SELECT * FROM hitl_requests WHERE project_id = ? AND urgency = 'blocking' "
+        "AND status = 'answered' AND COALESCE(answered_at, created_at) >= ? "
+        "ORDER BY COALESCE(answered_at, created_at) DESC LIMIT ?",
+        (project_id, cutoff, limit * 4),
+    ) as cur:
+        rows = await cur.fetchall()
+    active = active_session_ids or set()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        row = _row_to_dict(r)
+        if row is None:
+            continue
+        sid = row.get("session_id")
+        # A still-live originating session will consume its own answer.
+        if sid and sid in active:
+            continue
+        if _hitl_payload_flag(row.get("payload"), "recovered_delivered"):
+            continue
+        out.append(row)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def mark_hitl_recovery_delivered(
+    db: aiosqlite.Connection, request_id: str
+) -> None:
+    """9dad83fd — set a ``recovered_delivered`` payload flag so a recovered
+    blocking-HITL answer is surfaced to a resuming session exactly once
+    (idempotent; JSON payload, no schema change)."""
+    row = await get_hitl_request(db, request_id)
+    if not row:
+        return
+    try:
+        pl = json.loads(row.get("payload")) if row.get("payload") else {}
+        if not isinstance(pl, dict):
+            pl = {}
+    except (TypeError, ValueError):
+        pl = {}
+    pl["recovered_delivered"] = True
+    await db.execute(
+        "UPDATE hitl_requests SET payload = ? WHERE id = ?",
+        (json.dumps(pl), request_id),
+    )
+    await db.commit()
 
 
 # ---------------------------------------------------------------------------

@@ -115,6 +115,15 @@
   var DEFAULT_MAX_PINNED_DECISIONS2 = 20;
   var DEFAULT_CONTEXT_THRESHOLD2 = 40;
   var DEFAULT_MAX_TURNS2 = 200;
+  function sessionRecencyKey(session) {
+    if (!session) return "";
+    return String(session.last_seen || session.created_at || "");
+  }
+  function sortSessionsMostRecentFirst2(sessions) {
+    return (sessions ? sessions.slice() : []).sort(
+      (a3, b2) => sessionRecencyKey(b2).localeCompare(sessionRecencyKey(a3))
+    );
+  }
   function getPanelState2(projectId) {
     window.state.panels[projectId] = window.state.panels[projectId] || {};
     return window.state.panels[projectId];
@@ -191,6 +200,8 @@
       formatRelativeTime: formatRelativeTime2,
       sessionAgeMs: sessionAgeMs2,
       isLiveSession: isLiveSession2,
+      sessionRecencyKey,
+      sortSessionsMostRecentFirst: sortSessionsMostRecentFirst2,
       _colorForHuman: _colorForHuman2,
       _PLAN_LABELS: _PLAN_LABELS2,
       QUEUE_DONE_PAGE_SIZE: QUEUE_DONE_PAGE_SIZE2,
@@ -1248,7 +1259,7 @@
   }
 
   // meridian/static/dashboard-mcp.ts
-  function _renderToolEntry2(tool) {
+  function _renderToolEntry(tool) {
     const props = tool.inputSchema && tool.inputSchema.properties ? tool.inputSchema.properties : {};
     const required = new Set(tool.inputSchema && tool.inputSchema.required || []);
     const params = Object.entries(props).map(([name, schema]) => {
@@ -1260,8 +1271,34 @@
     const signature = Object.keys(props).map((n2) => required.has(n2) ? n2 : `${n2}?`).join(", ");
     return `<div class="tool-entry" data-search="${escapeHtml((tool.name || "") + " " + (tool.description || ""))}" style="margin-bottom:14px"><div style="color:var(--text);font-weight:600;font-size:13px">${escapeHtml(tool.name)}(<span style="color:var(--muted);font-weight:400">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 5px 0;font-size:12px;line-height:1.45">${escapeHtml(tool.description || "")}</div>${params ? `<table style="font-size:11px;border-collapse:collapse;width:100%">${params}</table>` : ""}</div>`;
   }
+  function _groupToolsByCategory(tools, categories) {
+    const byName = {};
+    (tools || []).forEach((t3) => {
+      if (t3 && t3.name) byName[t3.name] = t3;
+    });
+    const groups = [];
+    const claimed = /* @__PURE__ */ new Set();
+    for (const [key, names] of Object.entries(categories || {})) {
+      const catTools = (names || []).map((n2) => byName[n2]).filter(Boolean);
+      if (!catTools.length) continue;
+      catTools.forEach((t3) => claimed.add(t3.name));
+      groups.push({ key, tools: catTools });
+    }
+    const rest = (tools || []).filter((t3) => t3 && t3.name && !claimed.has(t3.name));
+    if (rest.length) groups.push({ key: "other", tools: rest });
+    return groups;
+  }
+  function _renderToolSections2(tools, categories, labels) {
+    const groups = _groupToolsByCategory(tools, categories);
+    return groups.map(({ key, tools: catTools }) => {
+      const label = labels && labels[key] || "Other";
+      const summary = `<summary style="cursor:pointer;list-style:none;color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border);user-select:none">${escapeHtml(label)} <span style="color:var(--muted)">(${catTools.length})</span></summary>`;
+      const body = catTools.map(_renderToolEntry).join("");
+      return `<details open class="tool-category" data-category="${escapeHtml(key)}" style="margin-bottom:18px">${summary}${body}</details>`;
+    }).join("");
+  }
   try {
-    Object.assign(window, { _renderToolEntry: _renderToolEntry2 });
+    Object.assign(window, { _renderToolEntry, _groupToolsByCategory, _renderToolSections: _renderToolSections2 });
   } catch (e3) {
   }
 
@@ -2087,6 +2124,17 @@
     const slug = (proj?.name || "meridian").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "meridian";
     return slug;
   }
+  function _execTurnsNumberInputHtml(field, projectId, value, min, max, step) {
+    const esc = window.escapeHtml || String;
+    return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
+  }
+  window._execTurnsNumberInputHtml = _execTurnsNumberInputHtml;
+  function claudeRcWatcherBlurb() {
+    return "For <code>claude --rc</code> (headless) mode, where SessionStart hooks don't fire \u2014 installs a background watcher that fires the hook per session.";
+  }
+  function codexSetupBlurb(mcpHttpUrl, esc) {
+    return `Add to <code>~/.codex/config.toml</code>, or run <code>codex mcp add meridian ${esc(mcpHttpUrl)}</code>.`;
+  }
   function _applySettingsRoleVisibility(projectId, guest) {
     if (!guest) return;
     const body = document.getElementById(`settings-body-${projectId}`);
@@ -2240,6 +2288,213 @@
     _activateSettingsTab(projectId, "project");
   }
   window._organizeSettingsIntoTabs = _organizeSettingsIntoTabs;
+  function _settingsAccountCardHtml(projectId) {
+    let out = "";
+    if (window.state.tenantEmail) {
+      const plan = window.state.tenantPlan || "free";
+      const hasStripe = !!window.state.tenantHasStripe;
+      const noUpgrade = plan === "admin" || !!window.state.tenantIsInternal;
+      let billingBtn = "";
+      if (hasStripe) {
+        billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing \u2192</button>`;
+      } else if (!noUpgrade) {
+        const upgradeUrl = window.state.serverConfig?.stripe_payment_link || "/pricing";
+        billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard \u2192</a>`;
+      }
+      const days = window.state.tenantDaysRemaining;
+      const expiresAt = window.state.tenantExpiresAt;
+      const isTrialish = (plan === "free" || plan === "trial") && !window.state.tenantIsInternal;
+      let expiryLine = "";
+      let resubBtn = "";
+      if (isTrialish && (expiresAt || days != null || window.state.tenantExpired)) {
+        const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : "";
+        if (window.state.tenantExpired) {
+          expiryLine = `<div style="color:#f87171">${_PLAN_LABELS[plan] || plan} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ""}.</div>`;
+        } else {
+          const dleft = days != null ? `${days} day${days === 1 ? "" : "s"} left` : "";
+          expiryLine = `<div>${_PLAN_LABELS[plan] || plan} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ""}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ""}.</div>`;
+        }
+        const payLink = window.state.serverConfig?.stripe_payment_link || "/pricing";
+        resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
+      }
+      out += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
+
+      <div style="font-size:10px;color:var(--muted);line-height:1.7">
+
+        <div>Email: <span style="color:var(--text)">${escapeHtml(window.state.tenantEmail)}</span></div>
+
+        <div>Plan: <span style="color:var(--text)">${escapeHtml(_PLAN_LABELS[plan] || plan)}</span></div>
+
+        ${expiryLine}
+
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+
+        ${resubBtn || billingBtn}
+
+        <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
+
+        <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account\u2026</button>
+
+      </div>
+
+    </div>`;
+    }
+    return out;
+  }
+  function _settingsBrowserConnectorCardHtml(projectId) {
+    let out = "";
+    const browserConnectorAccountNote = isHostedMode() ? `
+
+    <div style="margin-top:6px;font-size:10px;color:var(--muted)">
+
+      The browser connector uses whichever Meridian account is logged in at usemeridian.us in this
+
+      browser tab. To use a different account, sign out and sign back in before reconnecting.
+
+      <a href="/auth/logout?next=/auth/login" style="color:var(--accent);text-decoration:none;white-space:nowrap">Switch Meridian account \u2192</a>
+
+    </div>` : "";
+    out += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+
+      <div>
+
+        <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
+
+        <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
+
+      </div>
+
+      <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide \u2192</a>
+
+    </div>
+
+    ${browserConnectorAccountNote}
+
+  </div>`;
+    return out;
+  }
+  function _settingsNotificationsCardHtml(projectId, ntfyResult) {
+    let out = "";
+    const ntfyData = ntfyResult.status === "fulfilled" ? ntfyResult.value : null;
+    const savedNotifyUrl = ntfyData ? ntfyData.notify_url || ntfyData.ntfy_url || "" : "";
+    const savedNotifyEmail = ntfyData ? ntfyData.notify_email || "" : "";
+    const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl);
+    let ntfyWarnAcknowledged = false;
+    try {
+      ntfyWarnAcknowledged = localStorage.getItem(STORAGE_KEY("ntfy.warn.dismissed")) === "1";
+    } catch (e3) {
+    }
+    const ntfyInputDisabled = ntfyWarnAcknowledged ? "" : "disabled";
+    const ntfyWarnDisplay = ntfyWarnAcknowledged ? "display:none" : "";
+    out += `<div data-demo-hide id="settings-notifications-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
+
+    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
+
+      Save a push/webhook target and an email target independently.
+
+      Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
+
+    </div>
+
+    <div id="ntfy-warn-${projectId}" style="margin-bottom:8px;padding:8px 10px;border:1px solid #f59e0b88;border-radius:5px;background:#f59e0b11;font-size:10px;color:#f59e0b;line-height:1.5;${ntfyWarnDisplay}">
+
+      <strong>\u26A0 Security notice:</strong> ntfy.sh topics are public \u2014 anyone who knows your topic name can subscribe and read your alerts. Use a long, random topic name (e.g. <code>my-project-a7f3k2</code>) or self-host ntfy for privacy. Slack/Discord webhooks and email are private alternatives.<br>
+
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer;color:var(--text)">
+
+        <input type="checkbox" id="ntfy-warn-ack-${projectId}" style="cursor:pointer;accent-color:#f59e0b">
+
+        I understand my ntfy topic is public
+
+      </label>
+
+    </div>
+
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+
+      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">ntfy_url:</label>
+
+      <input type="text" id="ntfy-url-${projectId}"
+
+        value="${escapeHtml(defaultNotifyUrl)}"
+
+        placeholder="${escapeHtml(suggestNtfyTopic2(projectId))}  \xB7  https://hooks.slack.com/\u2026"
+
+        ${ntfyInputDisabled}
+
+        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}">
+
+      <button class="secondary" id="ntfy-save-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}">Save</button>
+
+      <button class="secondary" id="ntfy-test-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}" title="Send a test notification to verify your URL">Test</button>
+
+      <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
+
+    </div>
+
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">
+
+      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">notify_email:</label>
+
+      <input type="email" id="notify-email-${projectId}"
+        value="${escapeHtml(savedNotifyEmail || window.state.tenantEmail || "")}"
+        placeholder="you@example.com"
+        style="flex:1;min-width:180px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+
+      <button class="secondary" id="notify-email-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
+
+      <span id="notify-email-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
+
+    </div>
+
+    <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
+
+      <strong>ntfy</strong> \u2014 install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
+
+      <strong>Email</strong> \u2014 save <code>notify_email</code> separately to get alerts by email (hosted only; fires independently from ntfy).<br>
+
+      <strong>Webhook</strong> \u2014 paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
+
+    </div>
+
+  </div>`;
+    return out;
+  }
+  function _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData) {
+    let out = "";
+    if (prefs !== null) {
+      out += `<div style="margin-bottom:12px">
+
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
+      PREFS.forEach((p3) => {
+        const checked = prefs[p3.key] ? "checked" : "";
+        out += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
+
+        <input type="checkbox" data-pref="${p3.key}" ${checked} style="cursor:pointer">
+
+        ${escapeHtml(p3.label)}
+
+      </label>`;
+      });
+      out += `<div id="settings-save-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;margin-top:6px"></div>`;
+      out += "</div>";
+    } else if (!mcpData) {
+      out += '<div style="color:var(--muted);font-size:11px;padding:8px 0">Settings are only available in hosted mode (usemeridian.us).</div>';
+    }
+    return out;
+  }
+  window._settingsAccountCardHtml = _settingsAccountCardHtml;
+  window._settingsBrowserConnectorCardHtml = _settingsBrowserConnectorCardHtml;
+  window._settingsNotificationsCardHtml = _settingsNotificationsCardHtml;
+  window._settingsNotificationPrefsHtml = _settingsNotificationPrefsHtml;
   async function loadSettingsTab2(projectId, { force = false } = {}) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
@@ -2377,59 +2632,7 @@ stop = ${JSON.stringify(stop)}`;
         }
       }
       let html = "";
-      if (window.state.tenantEmail) {
-        const plan = window.state.tenantPlan || "free";
-        const hasStripe = !!window.state.tenantHasStripe;
-        const noUpgrade = plan === "admin" || !!window.state.tenantIsInternal;
-        let billingBtn = "";
-        if (hasStripe) {
-          billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing \u2192</button>`;
-        } else if (!noUpgrade) {
-          const upgradeUrl = window.state.serverConfig?.stripe_payment_link || "/pricing";
-          billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard \u2192</a>`;
-        }
-        const days = window.state.tenantDaysRemaining;
-        const expiresAt = window.state.tenantExpiresAt;
-        const isTrialish = (plan === "free" || plan === "trial") && !window.state.tenantIsInternal;
-        let expiryLine = "";
-        let resubBtn = "";
-        if (isTrialish && (expiresAt || days != null || window.state.tenantExpired)) {
-          const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : "";
-          if (window.state.tenantExpired) {
-            expiryLine = `<div style="color:#f87171">${_PLAN_LABELS[plan] || plan} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ""}.</div>`;
-          } else {
-            const dleft = days != null ? `${days} day${days === 1 ? "" : "s"} left` : "";
-            expiryLine = `<div>${_PLAN_LABELS[plan] || plan} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ""}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ""}.</div>`;
-          }
-          const payLink = window.state.serverConfig?.stripe_payment_link || "/pricing";
-          resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
-        }
-        html += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
-
-      <div style="font-size:10px;color:var(--muted);line-height:1.7">
-
-        <div>Email: <span style="color:var(--text)">${escapeHtml(window.state.tenantEmail)}</span></div>
-
-        <div>Plan: <span style="color:var(--text)">${escapeHtml(_PLAN_LABELS[plan] || plan)}</span></div>
-
-        ${expiryLine}
-
-      </div>
-
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
-
-        ${resubBtn || billingBtn}
-
-        <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
-
-        <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account\u2026</button>
-
-      </div>
-
-    </div>`;
-      }
+      html += _settingsAccountCardHtml(projectId);
       let _connectPanelHtml = "";
       if (isHostedMode()) {
         const _advKey = `meridian.settings.adv.${projectId}`;
@@ -2579,36 +2782,7 @@ stop = ${JSON.stringify(stop)}`;
         html += `<details id="settings-grp-ps-${projectId}" ${_psOpen ? "open" : ""} style="margin-bottom:12px;border:2px solid var(--border);border-radius:8px"><summary style="cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:8px;background:var(--surface-2);border-radius:8px"><span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;${_psRot}">\u25B6</span><span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">PROJECT SETTINGS</span></summary><div style="padding:8px 8px 4px">`;
       }
       html += _secHtml("connect", "Connect Claude Code");
-      const browserConnectorAccountNote = isHostedMode() ? `
-
-    <div style="margin-top:6px;font-size:10px;color:var(--muted)">
-
-      The browser connector uses whichever Meridian account is logged in at usemeridian.us in this
-
-      browser tab. To use a different account, sign out and sign back in before reconnecting.
-
-      <a href="/auth/logout?next=/auth/login" style="color:var(--accent);text-decoration:none;white-space:nowrap">Switch Meridian account \u2192</a>
-
-    </div>` : "";
-      html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-
-      <div>
-
-        <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
-
-        <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
-
-      </div>
-
-      <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide \u2192</a>
-
-    </div>
-
-    ${browserConnectorAccountNote}
-
-  </div>`;
+      html += _settingsBrowserConnectorCardHtml(projectId);
       if (mcpData) {
         html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)" id="github-card-${projectId}">
 
@@ -3145,10 +3319,7 @@ project_id = "${displayPid}"`;
         <span style="font-size:12px">\u26A1</span> Install rc watcher <span style="color:var(--muted);font-weight:400;margin-left:4px">(for <code>claude --rc</code> server mode)</span>
       </summary>
       <div style="padding:10px 12px;font-size:10px;color:var(--muted);line-height:1.8">
-        <p style="margin:0 0 8px">When Claude runs in <code>claude --rc</code> (headless server mode) the
-        standard SessionStart hooks do not fire. The rc watcher is a lightweight OS-native background service
-        (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) that watches
-        <code>~/.claude/projects/</code> for new session files and fires the hook automatically.</p>
+        <p style="margin:0 0 8px">${claudeRcWatcherBlurb()}</p>
         <div style="margin-bottom:6px;font-size:10px;color:var(--text);font-weight:600">Windows</div>
         <div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">
           <code id="rc-watcher-win-cmd-${escapeHtml(projectId)}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:10px;word-break:break-all">irm ${escapeHtml(hooksBaseUrl)}/install_watcher.ps1 | iex</code>
@@ -3168,7 +3339,7 @@ project_id = "${displayPid}"`;
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Codex CLI setup</div>
 
       ${isHostedMode() ? "" : `
-      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Add to <code>~/.codex/config.toml</code> \u2014 or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">${codexSetupBlurb(mcpHttpUrl, escapeHtml)}</div>
 
       ${!isHosted ? `<div style="margin-bottom:12px">
         <label style="font-size:10px;color:var(--muted)">Your Meridian path<br>
@@ -3211,7 +3382,7 @@ project_id = "${displayPid}"`;
       <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;overflow:hidden">
         <summary style="cursor:pointer;list-style:none;padding:6px 10px;background:var(--surface-2);font-size:10px;color:var(--muted)">Advanced \u2014 HTTP config (Codex / custom)</summary>
         <div style="padding:10px 12px">
-          <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Add to <code>~/.codex/config.toml</code> \u2014 or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px">${codexSetupBlurb(mcpHttpUrl, escapeHtml)}</div>
           <pre id="codex-http-${escapeHtml(projectId)}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
           <button class="secondary" id="codex-copy-http-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy</button>
         </div>
@@ -3602,9 +3773,9 @@ project_id = "${displayPid}"`;
 
     <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
 
-      Checkpoint after <span id="exec-context_threshold-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}</span> turns
+      Checkpoint after <span style="color:var(--text)">N</span> turns <span style="font-size:9px;color:var(--muted)">(10\u2013200)</span>
 
-      <input id="exec-context_threshold-${projectId}" type="range" min="10" max="200" step="5" value="${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      ${_execTurnsNumberInputHtml("context_threshold", projectId, execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD, 10, 200, 5)}
 
       <span style="font-size:9px;color:var(--muted)">When a session passes this many turns, <code>get_context_block</code> nudges it to checkpoint.</span>
 
@@ -3612,9 +3783,9 @@ project_id = "${displayPid}"`;
 
     <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
 
-      Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns
+      Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns <span style="font-size:9px;color:var(--muted)">(40\u2013500)</span>
 
-      <input id="exec-max_turns-${projectId}" type="range" min="40" max="500" step="20" value="${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      ${_execTurnsNumberInputHtml("max_turns", projectId, execCfg.max_turns || DEFAULT_MAX_TURNS, 40, 500, 20)}
 
       <span id="exec-max_turns-warn-${projectId}" style="font-size:9px;color:var(--muted)"></span>
 
@@ -4258,7 +4429,7 @@ project_id = "${displayPid}"`;
       </label>
       <div style="font-size:10px;color:var(--text);margin:12px 0 4px">Handoff Format</div>
       <label style="font-size:10px;color:var(--muted);display:block">Custom full-mode handoff template (leave blank for default)<br>
-        <textarea id="ws-handoff-template" rows="6" placeholder="# Handoff&#10;Sprint: {{sprint}}&#10;&#10;## Recent Tasks&#10;{{recent_tasks}}&#10;&#10;## Pending&#10;{{pending_items}}" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:6px 8px;margin-top:2px;resize:vertical"></textarea>
+        <textarea id="ws-handoff-template" rows="16" placeholder="# Handoff&#10;Sprint: {{sprint}}&#10;&#10;## Recent Tasks&#10;{{recent_tasks}}&#10;&#10;## Pending&#10;{{pending_items}}" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:6px 8px;margin-top:2px;resize:vertical"></textarea>
         <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Placeholders: {{sprint}}, {{recent_tasks}}, {{decisions}}, {{north_star}}, {{version_goal}}, {{pending_items}}, {{notes}}. Blank = default handoff.</span>
       </label>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
@@ -4674,110 +4845,8 @@ project_id = "${displayPid}"`;
           }
         }, 0);
       }
-      const ntfyData = ntfyResult.status === "fulfilled" ? ntfyResult.value : null;
-      const savedNotifyUrl = ntfyData ? ntfyData.notify_url || ntfyData.ntfy_url || "" : "";
-      const savedNotifyEmail = ntfyData ? ntfyData.notify_email || "" : "";
-      const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl);
-      let ntfyWarnAcknowledged = false;
-      try {
-        ntfyWarnAcknowledged = localStorage.getItem(STORAGE_KEY("ntfy.warn.dismissed")) === "1";
-      } catch (e3) {
-      }
-      const ntfyInputDisabled = ntfyWarnAcknowledged ? "" : "disabled";
-      const ntfyWarnDisplay = ntfyWarnAcknowledged ? "display:none" : "";
-      html += `<div data-demo-hide id="settings-notifications-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
-
-    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
-
-      Save a push/webhook target and an email target independently.
-
-      Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
-
-    </div>
-
-    <div id="ntfy-warn-${projectId}" style="margin-bottom:8px;padding:8px 10px;border:1px solid #f59e0b88;border-radius:5px;background:#f59e0b11;font-size:10px;color:#f59e0b;line-height:1.5;${ntfyWarnDisplay}">
-
-      <strong>\u26A0 Security notice:</strong> ntfy.sh topics are public \u2014 anyone who knows your topic name can subscribe and read your alerts. Use a long, random topic name (e.g. <code>my-project-a7f3k2</code>) or self-host ntfy for privacy. Slack/Discord webhooks and email are private alternatives.<br>
-
-      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer;color:var(--text)">
-
-        <input type="checkbox" id="ntfy-warn-ack-${projectId}" style="cursor:pointer;accent-color:#f59e0b">
-
-        I understand my ntfy topic is public
-
-      </label>
-
-    </div>
-
-    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-
-      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">ntfy_url:</label>
-
-      <input type="text" id="ntfy-url-${projectId}"
-
-        value="${escapeHtml(defaultNotifyUrl)}"
-
-        placeholder="${escapeHtml(suggestNtfyTopic2(projectId))}  \xB7  https://hooks.slack.com/\u2026"
-
-        ${ntfyInputDisabled}
-
-        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}">
-
-      <button class="secondary" id="ntfy-save-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}">Save</button>
-
-      <button class="secondary" id="ntfy-test-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? "1" : "0.4"}" title="Send a test notification to verify your URL">Test</button>
-
-      <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
-
-    </div>
-
-    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">
-
-      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">notify_email:</label>
-
-      <input type="email" id="notify-email-${projectId}"
-        value="${escapeHtml(savedNotifyEmail || window.state.tenantEmail || "")}"
-        placeholder="you@example.com"
-        style="flex:1;min-width:180px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-
-      <button class="secondary" id="notify-email-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
-
-      <span id="notify-email-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
-
-    </div>
-
-    <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
-
-      <strong>ntfy</strong> \u2014 install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
-
-      <strong>Email</strong> \u2014 save <code>notify_email</code> separately to get alerts by email (hosted only; fires independently from ntfy).<br>
-
-      <strong>Webhook</strong> \u2014 paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
-
-    </div>
-
-  </div>`;
-      if (prefs !== null) {
-        html += `<div style="margin-bottom:12px">
-
-      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
-        PREFS.forEach((p3) => {
-          const checked = prefs[p3.key] ? "checked" : "";
-          html += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
-
-        <input type="checkbox" data-pref="${p3.key}" ${checked} style="cursor:pointer">
-
-        ${escapeHtml(p3.label)}
-
-      </label>`;
-        });
-        html += `<div id="settings-save-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;margin-top:6px"></div>`;
-        html += "</div>";
-      } else if (!mcpData) {
-        html += '<div style="color:var(--muted);font-size:11px;padding:8px 0">Settings are only available in hosted mode (usemeridian.us).</div>';
-      }
+      html += _settingsNotificationsCardHtml(projectId, ntfyResult);
+      html += _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
       html += "</div></details>";
       html += "</div></details>";
       if ((window.state.tenantPlan || "") === "admin" || !isHostedMode()) {
@@ -5661,11 +5730,23 @@ project_id = "${displayPid}"`;
     return `
         <div data-slot-stale="${escapeHtml(p3.slot)}" style="margin-top:6px;padding:6px 8px;border:1px solid #3b82f6;border-radius:4px;background:rgba(59,130,246,0.10);font-size:9px;line-height:1.6;color:#7dd3fc">
           <span style="font-weight:700">&#9888; newer default available</span> \u2014 your saved command is an old built-in default. Current default: <b>${label}</b>${newer ? ` (<code style="font-family:var(--font-mono)">${escapeHtml(newer)}</code>)` : ""}.
-          <button type="button" class="tp-reset-default" style="margin-left:6px;background:none;border:1px solid #3b82f6;border-radius:3px;color:#7dd3fc;font-size:8px;padding:1px 6px;cursor:pointer"
-            onclick="var r=this.closest('[data-lifecycle]'); if(r){var c=r.querySelector('.tp-command'); if(c){c.value=''; c.dispatchEvent(new Event('input',{bubbles:true}));}}">Use new default</button>
+          <button type="button" class="tp-reset-default" data-newer="${escapeHtml(newer)}" style="margin-left:6px;background:none;border:1px solid #3b82f6;border-radius:3px;color:#7dd3fc;font-size:8px;padding:1px 6px;cursor:pointer"
+            onclick="window._applyStaleOverrideDefault && window._applyStaleOverrideDefault(this)">Use new default</button>
         </div>`;
   }
   window._renderStaleOverrideWarning = _renderStaleOverrideWarning;
+  function _applyStaleOverrideDefault(btn) {
+    if (!btn || typeof btn.closest !== "function") return;
+    const row = btn.closest("[data-lifecycle]");
+    if (!row) return;
+    const cmd = row.querySelector(".tp-command");
+    if (!cmd) return;
+    const newer = btn.getAttribute ? btn.getAttribute("data-newer") || "" : "";
+    if (!newer) return;
+    cmd.value = newer;
+    cmd.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  window._applyStaleOverrideDefault = _applyStaleOverrideDefault;
   function _fsAttr(v3) {
     return escapeHtml(String(v3 == null ? "" : v3));
   }
@@ -5850,11 +5931,16 @@ project_id = "${displayPid}"`;
           </details>
         </div>`;
       };
-      const coreRows = plugins.filter((p3) => p3.core).map(renderRow).join("");
-      const pluginRows = plugins.filter((p3) => !p3.core).map(renderRow).join("");
+      const coreRows = plugins.filter((p3) => p3.core && p3.slot !== "zotero").map(renderRow).join("");
+      const pluginRows = plugins.filter((p3) => !p3.core && p3.slot !== "zotero").map(renderRow).join("");
+      const zoteroRow = plugins.some((p3) => p3.slot === "zotero") ? _renderZoteroStatusRow({
+        zotero_active: !!active.zotero,
+        slot_status: slotStatus.zotero ? { zotero: slotStatus.zotero } : {}
+      }) : "";
       const _sectionLabel = (text, note) => `<div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:2px 0 6px">${text} <span style="font-weight:400;text-transform:none">${note}</span></div>`;
       const rows = `
       ${coreRows ? _sectionLabel("Core Tools", "\u2014 always on") + coreRows : ""}
+      ${zoteroRow ? _sectionLabel("Reference manager", "\u2014 citation resolution (Zotero)") + zoteroRow : ""}
       ${_sectionLabel("Plugins", "\u2014 opt-in, toggle to enable")}
       ${pluginRows || '<div style="color:var(--muted);font-size:10px">No plugins.</div>'}`;
       const detectedOs = _detectTunnelOs();
@@ -6372,6 +6458,32 @@ project_id = "${displayPid}"`;
     });
   }
   window._wireLifecycleInstallButtons = _wireLifecycleInstallButtons;
+  function _renderZoteroStatusRow(status) {
+    const st = status || {};
+    const active = { zotero: !!st.zotero_active };
+    const slotStatus = st.slot_status && st.slot_status.zotero ? { zotero: st.slot_status.zotero } : {};
+    const lifecycleState = _pluginLifecycleState({ slot: "zotero" }, active, slotStatus);
+    const installCmd = "uvx zotero-mcp";
+    const badge = _renderLifecycleBadge({ slot: "zotero" }, lifecycleState, installCmd);
+    const warnHtml = _renderSlotHealthWarning("zotero", slotStatus);
+    return `
+    <div data-zotero-status="${escapeHtml(lifecycleState)}"
+      style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text);font-weight:600">
+          Reference manager
+          <span style="font-size:9px;color:var(--muted);font-weight:400">/zotero</span>
+        </label>
+        ${badge}
+      </div>
+      <div style="margin-top:4px;font-size:9px;color:var(--muted);line-height:1.6">
+        Citation / reference-manager resolution against your local Zotero library
+        (<code style="font-family:var(--font-mono)">zotero-mcp</code>).
+      </div>
+      ${warnHtml}
+    </div>`;
+  }
+  window._renderZoteroStatusRow = _renderZoteroStatusRow;
 
   // meridian/static/dashboard-notes.ts
   async function loadNotesTab2(projectId) {
@@ -7171,6 +7283,95 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
+  // meridian/static/dashboard-blog.ts
+  var _BLOG_STATUSES = ["draft", "published", "archived"];
+  function blogEditorFormHtml(projectId, post) {
+    const p3 = post || {};
+    const id = String(p3.id || "");
+    const title = String(p3.title || "");
+    const body = String(p3.body_md || "");
+    const status = _BLOG_STATUSES.includes(String(p3.status)) ? String(p3.status) : "draft";
+    const editing = !!id;
+    const pid = escapeHtml(String(projectId));
+    const opts = _BLOG_STATUSES.map((s3) => `<option value="${s3}"${s3 === status ? " selected" : ""}>${s3}</option>`).join("");
+    return `<div id="blog-editor-${pid}" style="border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:14px;background:var(--surface-1)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <span id="blog-editor-title-${pid}" style="font-size:10px;color:var(--accent);letter-spacing:.06em">${editing ? "EDIT POST" : "NEW POST"}</span>
+      <button id="blog-editor-reset-${pid}" class="secondary" style="font-size:9px;padding:2px 8px;${editing ? "" : "display:none"}">New / clear</button>
+    </div>
+    <input type="hidden" id="blog-editor-id-${pid}" value="${escapeHtml(id)}" />
+    <input type="text" id="blog-editor-title-input-${pid}" placeholder="Title" value="${escapeHtml(title)}" style="width:100%;box-sizing:border-box;font-size:11px;padding:5px 7px;margin-bottom:6px;background:var(--surface-0,var(--bg));color:var(--text);border:1px solid var(--border);border-radius:3px" />
+    <textarea id="blog-editor-body-${pid}" placeholder="Body (markdown)" rows="6" style="width:100%;box-sizing:border-box;font-size:11px;font-family:var(--font-mono);padding:5px 7px;margin-bottom:6px;background:var(--surface-0,var(--bg));color:var(--text);border:1px solid var(--border);border-radius:3px;resize:vertical">${escapeHtml(body)}</textarea>
+    <div style="display:flex;gap:6px;align-items:center">
+      <select id="blog-editor-status-${pid}" style="font-size:10px;padding:3px 6px;background:var(--surface-0,var(--bg));color:var(--text);border:1px solid var(--border);border-radius:3px">${opts}</select>
+      <button id="blog-editor-save-${pid}" style="font-size:10px;padding:4px 12px">${editing ? "Update post" : "Save post"}</button>
+      <span id="blog-editor-status-msg-${pid}" style="font-size:9px;color:var(--muted)"></span>
+    </div>
+  </div>`;
+  }
+  function blogPostCardHtml(post) {
+    const id = String(post.id || "");
+    const slug = String(post.slug || "");
+    const url = String(post.url || (slug ? `/blog/${slug}` : ""));
+    const title = String(post.title || "Untitled");
+    return `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+      <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(title)}</div>
+      <button class="blog-edit-btn secondary" data-blog-id="${escapeHtml(id)}" style="font-size:9px;padding:2px 8px;flex:0 0 auto">Edit</button>
+    </div>
+    <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px">${escapeHtml(slug)}</div>
+    ${url ? `<div style="margin-top:4px"><a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="font-size:10px;color:var(--accent)">${escapeHtml(url)}</a></div>` : ""}
+  </div>`;
+  }
+  function populateBlogEditor(projectId, post) {
+    const pid = String(projectId);
+    const idEl = document.getElementById(`blog-editor-id-${pid}`);
+    const titleEl = document.getElementById(`blog-editor-title-input-${pid}`);
+    const bodyEl = document.getElementById(`blog-editor-body-${pid}`);
+    const statusEl = document.getElementById(`blog-editor-status-${pid}`);
+    const labelEl = document.getElementById(`blog-editor-title-${pid}`);
+    const saveEl = document.getElementById(`blog-editor-save-${pid}`);
+    const resetEl = document.getElementById(`blog-editor-reset-${pid}`);
+    if (!idEl || !titleEl || !bodyEl) return false;
+    idEl.value = String(post.id || "");
+    titleEl.value = String(post.title || "");
+    bodyEl.value = String(post.body_md || "");
+    if (statusEl) {
+      const st = _BLOG_STATUSES.includes(String(post.status)) ? String(post.status) : "draft";
+      statusEl.value = st;
+    }
+    if (labelEl) labelEl.textContent = "EDIT POST";
+    if (saveEl) saveEl.textContent = "Update post";
+    if (resetEl) resetEl.style.display = "";
+    return true;
+  }
+  function resetBlogEditor(projectId) {
+    const pid = String(projectId);
+    const idEl = document.getElementById(`blog-editor-id-${pid}`);
+    const titleEl = document.getElementById(`blog-editor-title-input-${pid}`);
+    const bodyEl = document.getElementById(`blog-editor-body-${pid}`);
+    const statusEl = document.getElementById(`blog-editor-status-${pid}`);
+    const labelEl = document.getElementById(`blog-editor-title-${pid}`);
+    const saveEl = document.getElementById(`blog-editor-save-${pid}`);
+    const resetEl = document.getElementById(`blog-editor-reset-${pid}`);
+    if (idEl) idEl.value = "";
+    if (titleEl) titleEl.value = "";
+    if (bodyEl) bodyEl.value = "";
+    if (statusEl) statusEl.value = "draft";
+    if (labelEl) labelEl.textContent = "NEW POST";
+    if (saveEl) saveEl.textContent = "Save post";
+    if (resetEl) resetEl.style.display = "none";
+  }
+  try {
+    Object.assign(window, {
+      blogEditorFormHtml,
+      blogPostCardHtml,
+      populateBlogEditor,
+      resetBlogEditor
+    });
+  } catch (e3) {
+  }
+
   // node_modules/preact/dist/preact.module.js
   var n;
   var l;
@@ -7615,6 +7816,11 @@ ${n2.tags || ""}`.toLowerCase();
     if (named && named.name) return `${named.name} \xB7 layer ${rank}`;
     return rank === "other" ? "unlayered" : `layer ${rank}`;
   }
+  function isNotConnectedError(error) {
+    if (!error) return false;
+    const e3 = error.toLowerCase();
+    return e3.includes("503") || e3.includes("not connected") || e3.includes("not_connected") || e3.includes("no active") || e3.includes("tunnel") && (e3.includes("not") || e3.includes("no "));
+  }
   var CI_EDGE_TYPES = ["contains", "imports", "inherits", "invokes"];
   var CI_EDGE_COLORS = {
     contains: "#64748b",
@@ -7737,6 +7943,25 @@ ${n2.tags || ""}`.toLowerCase();
       return /* @__PURE__ */ u3("div", { class: "ci-state ci-loading", role: "status", style: STATE_STYLE, children: "Loading code intelligence\u2026" });
     }
     if (status === "error") {
+      if (isNotConnectedError(error)) {
+        return /* @__PURE__ */ u3(
+          "div",
+          {
+            class: "ci-state ci-not-connected",
+            role: "status",
+            style: { ...STATE_STYLE, color: "var(--muted)", lineHeight: "1.6" },
+            children: [
+              /* @__PURE__ */ u3("div", { style: { fontSize: "12px", color: "var(--text)", fontWeight: 600, marginBottom: "4px" }, children: "Code index not connected" }),
+              /* @__PURE__ */ u3("div", { children: "The code intelligence tunnel slot isn't connected yet. Start the tunnel and connect the code slot to populate the package graph:" }),
+              /* @__PURE__ */ u3("div", { style: { marginTop: "6px" }, children: [
+                "Run ",
+                /* @__PURE__ */ u3("code", { children: "meridian --tunnel" }),
+                " in your repo, then open this panel again."
+              ] })
+            ]
+          }
+        );
+      }
       return /* @__PURE__ */ u3("div", { class: "ci-state ci-error", role: "alert", style: { ...STATE_STYLE, color: "var(--error,#ef4444)" }, children: [
         "Failed to load code intelligence: ",
         error || "unknown error"
@@ -8423,6 +8648,166 @@ ${n2.tags || ""}`.toLowerCase();
     return api3;
   };
   var createStore = ((createState) => createState ? createStoreImpl(createState) : createStoreImpl);
+
+  // meridian/static/dashboard-tabgroups.ts
+  var VTAB_GROUPS = [
+    { id: "overview", label: "Overview", tabs: ["status", "live"] },
+    { id: "planning", label: "Planning", tabs: ["goal", "insights", "blog"] },
+    { id: "work", label: "Work", tabs: ["queue", "hitl", "team", "sessions"] },
+    { id: "content", label: "Content", tabs: ["files", "notes", "devlog", "documents", "docs", "codeintel"] },
+    { id: "history", label: "History", tabs: ["timeline", "rewind", "settings"] }
+  ];
+  var ALL_GROUPED_TABS = VTAB_GROUPS.flatMap((g2) => g2.tabs);
+  function groupForTab(tab) {
+    if (!tab) return null;
+    for (const g2 of VTAB_GROUPS) {
+      if (g2.tabs.includes(tab)) return g2.id;
+    }
+    return null;
+  }
+  function wireVtabGroups(stripEl) {
+    const setExpanded = (groupEl, expanded) => {
+      groupEl.classList.toggle("collapsed", !expanded);
+      const header = groupEl.querySelector(".vtab-group-header");
+      if (header) header.setAttribute("aria-expanded", String(expanded));
+      const tabs = groupEl.querySelector(".vtab-group-tabs");
+      if (tabs) tabs.style.display = expanded ? "flex" : "none";
+    };
+    stripEl.querySelectorAll(".vtab-group-header").forEach((header) => {
+      header.onclick = () => {
+        const groupEl = header.closest(".vtab-group");
+        if (!groupEl) return;
+        setExpanded(groupEl, groupEl.classList.contains("collapsed"));
+      };
+    });
+    const revealGroupForTab = (tab) => {
+      const groupId = groupForTab(tab);
+      if (!groupId) return;
+      const groupEl = stripEl.querySelector(`.vtab-group[data-vgroup="${groupId}"]`);
+      if (groupEl) setExpanded(groupEl, true);
+    };
+    return { revealGroupForTab };
+  }
+
+  // meridian/static/dashboard-folders.ts
+  var FOLDER_ASSIGN_KEY = "meridian.projectFolders";
+  var FOLDER_COLLAPSE_KEY = "meridian.projectFolderCollapsed";
+  var UNGROUPED_LABEL = "Ungrouped";
+  function normalizeFolderName(name) {
+    if (name == null) return "";
+    return String(name).trim().replace(/\s+/g, " ");
+  }
+  function loadFolderAssignments(key = FOLDER_ASSIGN_KEY, storage = safeStorage()) {
+    if (!storage) return {};
+    try {
+      const raw = storage.getItem(key);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      const out = {};
+      for (const [pid, folder] of Object.entries(parsed)) {
+        const norm = normalizeFolderName(typeof folder === "string" ? folder : "");
+        if (norm) out[pid] = norm;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+  function saveFolderAssignments(assignments, key = FOLDER_ASSIGN_KEY, storage = safeStorage()) {
+    if (!storage) return;
+    try {
+      const clean = {};
+      for (const [pid, folder] of Object.entries(assignments)) {
+        const norm = normalizeFolderName(folder);
+        if (norm) clean[pid] = norm;
+      }
+      storage.setItem(key, JSON.stringify(clean));
+    } catch {
+    }
+  }
+  function assignProjectToFolder(assignments, projectId, folder) {
+    const next = { ...assignments };
+    const norm = normalizeFolderName(folder);
+    if (norm) next[projectId] = norm;
+    else delete next[projectId];
+    return next;
+  }
+  function groupProjectsByFolder(projects, assignments) {
+    const named = /* @__PURE__ */ new Map();
+    const ungrouped = [];
+    for (const p3 of projects) {
+      const folder = normalizeFolderName(assignments[p3.id]);
+      if (!folder) {
+        ungrouped.push(p3);
+        continue;
+      }
+      let bucket = named.get(folder);
+      if (!bucket) {
+        bucket = [];
+        named.set(folder, bucket);
+      }
+      bucket.push(p3);
+    }
+    const groups = [];
+    for (const [folder, members] of named) {
+      groups.push({ folder, label: folder, key: folder, projects: members });
+    }
+    if (ungrouped.length) {
+      groups.push({ folder: null, label: UNGROUPED_LABEL, key: "", projects: ungrouped });
+    }
+    return groups;
+  }
+  function knownFolderNames(projects, assignments) {
+    const seen = /* @__PURE__ */ new Set();
+    const out = [];
+    for (const p3 of projects) {
+      const folder = normalizeFolderName(assignments[p3.id]);
+      if (folder && !seen.has(folder)) {
+        seen.add(folder);
+        out.push(folder);
+      }
+    }
+    return out;
+  }
+  function loadCollapsedFolders(key = FOLDER_COLLAPSE_KEY, storage = safeStorage()) {
+    if (!storage) return /* @__PURE__ */ new Set();
+    try {
+      const raw = storage.getItem(key);
+      if (!raw) return /* @__PURE__ */ new Set();
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return /* @__PURE__ */ new Set();
+      return new Set(parsed.filter((x2) => typeof x2 === "string"));
+    } catch {
+      return /* @__PURE__ */ new Set();
+    }
+  }
+  function saveCollapsedFolders(collapsed, key = FOLDER_COLLAPSE_KEY, storage = safeStorage()) {
+    if (!storage) return;
+    try {
+      storage.setItem(key, JSON.stringify([...collapsed]));
+    } catch {
+    }
+  }
+  function toggleFolderCollapsed(collapsed, folderKey, key = FOLDER_COLLAPSE_KEY, storage = safeStorage()) {
+    let nowCollapsed;
+    if (collapsed.has(folderKey)) {
+      collapsed.delete(folderKey);
+      nowCollapsed = false;
+    } else {
+      collapsed.add(folderKey);
+      nowCollapsed = true;
+    }
+    saveCollapsedFolders(collapsed, key, storage);
+    return nowCollapsed;
+  }
+  function safeStorage() {
+    try {
+      return typeof localStorage !== "undefined" ? localStorage : void 0;
+    } catch {
+      return void 0;
+    }
+  }
 
   // meridian/static/dashboard.ts
   var TABS_KEY = "meridian.openTabs";
@@ -9703,35 +10088,37 @@ ${n2.tags || ""}`.toLowerCase();
       return;
     }
     list.innerHTML = "";
-    state.projects.forEach((p3) => {
-      const div = document.createElement("div");
-      div.className = "project-item" + (state.activeTab === p3.id ? " active" : "");
-      div.dataset.projectId = p3.id;
-      div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;";
-      const nameSpan = document.createElement("span");
-      nameSpan.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
-      nameSpan.textContent = p3.name;
-      const menuBtn = document.createElement("button");
-      menuBtn.textContent = "\u22EF";
-      menuBtn.title = "Project actions";
-      menuBtn.style.cssText = "background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0";
-      menuBtn.onmouseenter = () => menuBtn.style.color = "var(--text)";
-      menuBtn.onmouseleave = () => menuBtn.style.color = "var(--muted)";
-      menuBtn.onclick = (e3) => {
-        e3.stopPropagation();
-        let t3 = state.tabs.find((tab) => tab.id === p3.id);
-        if (!t3) {
-          openTab(p3);
-          t3 = state.tabs.find((tab) => tab.id === p3.id);
-        }
-        if (t3) _openTabMenu(t3, menuBtn);
-      };
-      div.appendChild(nameSpan);
-      div.appendChild(menuBtn);
-      div.onclick = (e3) => {
-        if (e3.target !== menuBtn) openTab(p3);
-      };
-      list.appendChild(div);
+    const assignments = loadFolderAssignments(STORAGE_KEY2("projectFolders"));
+    const collapsed = loadCollapsedFolders(STORAGE_KEY2("projectFolderCollapsed"));
+    const groups = groupProjectsByFolder(state.projects, assignments);
+    const hasFolders = groups.some((g2) => g2.folder !== null);
+    groups.forEach((group) => {
+      if (hasFolders) {
+        const isCollapsed = collapsed.has(group.key);
+        const header = document.createElement("div");
+        header.className = "project-folder-header";
+        header.dataset.folderKey = group.key;
+        header.style.cssText = "display:flex;align-items:center;gap:6px;padding:4px 4px;margin-top:4px;cursor:pointer;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.04em;user-select:none;";
+        const caret = document.createElement("span");
+        caret.textContent = isCollapsed ? "\u25B8" : "\u25BE";
+        caret.style.cssText = "flex-shrink:0;font-size:9px;width:9px;";
+        const label = document.createElement("span");
+        label.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+        label.textContent = group.label;
+        const count = document.createElement("span");
+        count.style.cssText = "flex-shrink:0;opacity:0.7;";
+        count.textContent = String(group.projects.length);
+        header.appendChild(caret);
+        header.appendChild(label);
+        header.appendChild(count);
+        header.onclick = () => {
+          toggleFolderCollapsed(collapsed, group.key, STORAGE_KEY2("projectFolderCollapsed"));
+          loadProjects();
+        };
+        list.appendChild(header);
+        if (isCollapsed) return;
+      }
+      group.projects.forEach((p3) => list.appendChild(_makeProjectItem(p3)));
     });
     const switcher = document.getElementById("project-switcher");
     if (switcher) {
@@ -9747,6 +10134,54 @@ ${n2.tags || ""}`.toLowerCase();
       if (previous && state.projects.some((p3) => p3.id === previous)) switcher.value = previous;
     }
     syncSidebarActiveProject();
+  }
+  function _makeProjectItem(p3) {
+    const div = document.createElement("div");
+    div.className = "project-item" + (state.activeTab === p3.id ? " active" : "");
+    div.dataset.projectId = p3.id;
+    div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;";
+    const nameSpan = document.createElement("span");
+    nameSpan.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+    nameSpan.textContent = p3.name;
+    const menuBtn = document.createElement("button");
+    menuBtn.textContent = "\u22EF";
+    menuBtn.title = "Project actions";
+    menuBtn.style.cssText = "background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0";
+    menuBtn.onmouseenter = () => menuBtn.style.color = "var(--text)";
+    menuBtn.onmouseleave = () => menuBtn.style.color = "var(--muted)";
+    menuBtn.onclick = (e3) => {
+      e3.stopPropagation();
+      let t3 = state.tabs.find((tab) => tab.id === p3.id);
+      if (!t3) {
+        openTab(p3);
+        t3 = state.tabs.find((tab) => tab.id === p3.id);
+      }
+      if (t3) _openTabMenu(t3, menuBtn);
+    };
+    div.appendChild(nameSpan);
+    div.appendChild(menuBtn);
+    div.onclick = (e3) => {
+      if (e3.target !== menuBtn) openTab(p3);
+    };
+    return div;
+  }
+  function _moveProjectToFolder(t3) {
+    const assignments = loadFolderAssignments(STORAGE_KEY2("projectFolders"));
+    const current = assignments[t3.id] || "";
+    const existing = knownFolderNames(state.projects, assignments);
+    const hint = existing.length ? `
+
+Existing folders: ${existing.join(", ")}` : "";
+    const next = window.prompt(
+      `Move "${t3.project.name}" to a folder (leave blank for ${UNGROUPED_LABEL}).${hint}`,
+      current
+    );
+    if (next === null) return;
+    const updated = assignProjectToFolder(assignments, t3.id, next);
+    saveFolderAssignments(updated, STORAGE_KEY2("projectFolders"));
+    loadProjects();
+    const folder = (next || "").trim();
+    toast(folder ? `Moved to folder "${folder}"` : `Moved to ${UNGROUPED_LABEL}`);
   }
   function openTab(project) {
     const existing = state.tabs.find((t3) => t3.id === project.id);
@@ -9921,6 +10356,7 @@ ${n2.tags || ""}`.toLowerCase();
     menu.appendChild(uuidDiv);
     menuItem("\u270F Rename", () => _renameProject(t3));
     menuItem("\u{1F3A8} Change icon\u2026", () => _setProjectIcon(t3));
+    menuItem("\u{1F4C1} Move to folder\u2026", () => _moveProjectToFolder(t3));
     menuItem("\u2B07 Download DB", () => window.open("/admin/snapshot", "_blank"));
     menuItem("\u{1F5D1} Delete project\u2026", () => _deleteProject(t3));
     const rect = anchor.getBoundingClientRect();
@@ -10059,41 +10495,91 @@ Current: ${current || "(none)"}`,
 
     <div class="vtab-strip" id="vtab-strip-${project.id}">
 
-      <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">\u{1F4CA}</button>
+      <div class="vtab-group" data-vgroup="overview" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="live" title="Live \u2014 right-now view">\u26A1</button>
+        <button class="vtab-group-header" data-vgroup-toggle="overview" title="Overview" aria-label="Overview group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4CA}</button>
 
-      <button class="vtab-btn" data-vtab="goal" title="Goal State">\u{1F3AF}</button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      ${window.MERIDIAN_HOSTED && !(project.github_repo || project.repo) ? "" : '<button class="vtab-btn" data-vtab="files" title="Files">\u{1F4C1}</button>'}
+          <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">\u{1F4CA}</button>
 
-      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">\u{1F4D3}</button>
+          <button class="vtab-btn" data-vtab="live" title="Live \u2014 right-now view">\u26A1</button>
 
-      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">\u{1F4C5}</button>
+        </div>
 
-      <button class="vtab-btn" data-vtab="rewind" title="Rewind \u2014 Last X days">\u21BB</button>
+      </div>
 
-      <button class="vtab-btn" data-vtab="queue" title="Work Queue">\u{1F477}</button>
+      <div class="vtab-group" data-vgroup="planning" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="team" title="Team \u2014 per-human activity">\u{1F465}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="planning" title="Planning" aria-label="Planning group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F3AF}</button>
 
-      <button class="vtab-btn" data-vtab="notes" title="Notes \u2014 per-project wiki" style="position:relative">\u{1F4DD}<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="hitl" title="HITL \u2014 Human-in-the-Loop queue" style="position:relative">\u2753<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+          <button class="vtab-btn" data-vtab="goal" title="Goal State">\u{1F3AF}</button>
 
-      <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">\u{1F4D6}</button>
+          <button class="vtab-btn" data-vtab="insights" title="Insights \u2014 durable strategic understanding">\u{1F4A1}</button>
 
-      <button class="vtab-btn" data-vtab="settings" title="Notification Settings">\u2699</button>
+          <button class="vtab-btn" data-vtab="blog" title="Blog \u2014 workspace posts (draft/published/archived)">\u270D\uFE0F</button>
 
-      <button class="vtab-btn" data-vtab="codeintel" title="Code Intel \u2014 codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">\u{1F50D}</button>
+        </div>
 
-      <button class="vtab-btn" data-vtab="documents" title="Documents \u2014 ingested docs &amp; structure">\u{1F4C4}</button>
+      </div>
 
-      <button class="vtab-btn" data-vtab="insights" title="Insights \u2014 durable strategic understanding">\u{1F4A1}</button>
+      <div class="vtab-group" data-vgroup="work" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="blog" title="Blog \u2014 workspace posts (draft/published/archived)">\u270D\uFE0F</button>
+        <button class="vtab-group-header" data-vgroup-toggle="work" title="Work" aria-label="Work group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F477}</button>
 
-      <button class="vtab-btn" data-vtab="sessions" title="Sessions \u2014 executor session timeline (done / failed / stopped-ambiguously)">\u{1F552}</button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="queue" title="Work Queue">\u{1F477}</button>
+
+          <button class="vtab-btn" data-vtab="hitl" title="HITL \u2014 Human-in-the-Loop queue" style="position:relative">\u2753<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+
+          <button class="vtab-btn" data-vtab="team" title="Team \u2014 per-human activity">\u{1F465}</button>
+
+          <button class="vtab-btn" data-vtab="sessions" title="Sessions \u2014 executor session timeline (done / failed / stopped-ambiguously)">\u{1F552}</button>
+
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="content" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="content" title="Content" aria-label="Content group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4C1}</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          ${window.MERIDIAN_HOSTED && !(project.github_repo || project.repo) ? "" : '<button class="vtab-btn" data-vtab="files" title="Files">\u{1F4C1}</button>'}
+
+          <button class="vtab-btn" data-vtab="notes" title="Notes \u2014 per-project wiki" style="position:relative">\u{1F4DD}<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+
+          <button class="vtab-btn" data-vtab="devlog" title="Dev Log">\u{1F4D3}</button>
+
+          <button class="vtab-btn" data-vtab="documents" title="Documents \u2014 ingested docs &amp; structure">\u{1F4C4}</button>
+
+          <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">\u{1F4D6}</button>
+
+          <button class="vtab-btn" data-vtab="codeintel" title="Code Intel \u2014 codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">\u{1F50D}</button>
+
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="history" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="history" title="History" aria-label="History group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4C5}</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">\u{1F4C5}</button>
+
+          <button class="vtab-btn" data-vtab="rewind" title="Rewind \u2014 Last X days">\u21BB</button>
+
+          <button class="vtab-btn" data-vtab="settings" title="Notification Settings">\u2699</button>
+
+        </div>
+
+      </div>
 
     </div>
 
@@ -10175,13 +10661,17 @@ Current: ${current || "(none)"}`,
 
           <div class="live-section">
 
-            <div class="live-section-label">Active sessions</div>
+            <details class="live-section-collapse" open>
 
-            <div class="live-sessions" id="live-sessions-${project.id}">
+              <summary class="live-section-label" style="cursor:pointer;list-style:none">Active sessions</summary>
 
-              <div class="live-empty">No active sessions.</div>
+              <div class="live-sessions" id="live-sessions-${project.id}">
 
-            </div>
+                <div class="live-empty">No active sessions.</div>
+
+              </div>
+
+            </details>
 
           </div>
 
@@ -11076,10 +11566,12 @@ Current: ${current || "(none)"}`,
     const vtabStrip = document.getElementById(`vtab-strip-${project.id}`);
     const drawer = document.getElementById(`drawer-${project.id}`);
     if (vtabStrip && drawer) {
+      const { revealGroupForTab } = wireVtabGroups(vtabStrip);
       vtabStrip.querySelectorAll(".vtab-btn").forEach((btn) => {
         btn.onclick = () => {
           const vtab = btn.dataset.vtab;
           const p3 = state.panels[project.id];
+          revealGroupForTab(vtab);
           vtabStrip.querySelectorAll(".vtab-btn").forEach((b2) => {
             b2.classList.toggle("active", b2.dataset.vtab === vtab);
           });
@@ -11123,6 +11615,7 @@ Current: ${current || "(none)"}`,
       try {
         const saved = localStorage.getItem("meridian_last_tab_" + project.id);
         if (saved) {
+          revealGroupForTab(saved);
           const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
           if (savedBtn) savedBtn.click();
         }
@@ -11879,9 +12372,7 @@ Current: ${current || "(none)"}`,
   function cacheMostRecentSession(projectId, sessions) {
     const panel = state.panels[projectId];
     if (!panel) return;
-    const sorted = sessions.slice().sort(
-      (a3, b2) => (b2.last_seen || "").localeCompare(a3.last_seen || "")
-    );
+    const sorted = sortSessionsMostRecentFirst(sessions);
     const top = sorted.find((s3) => isLiveSession(s3)) || sorted.find((s3) => s3.status !== "closed") || sorted[0];
     if (top) panel.liveLastSessionId = top.id;
   }
@@ -12421,9 +12912,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   function populateSessionDropdown(projectId, sessions) {
     const sel = document.getElementById(`continue-session-${projectId}`);
     if (!sel) return;
-    const sorted = (sessions || []).slice().sort(
-      (a3, b2) => (b2.last_seen || "").localeCompare(a3.last_seen || "")
-    ).slice(0, 5);
+    const sorted = sortSessionsMostRecentFirst(sessions).slice(0, 5);
     if (!sorted.length) {
       sel.innerHTML = '<option value="">(no sessions yet)</option>';
       return;
@@ -12527,30 +13016,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         body.innerHTML = '<div class="empty" style="color:var(--muted)">No tools returned.</div>';
         return;
       }
-      const byName = {};
-      tools.forEach((t3) => {
-        byName[t3.name] = t3;
-      });
-      let html = "";
-      const categorized = /* @__PURE__ */ new Set();
-      for (const [cat, names] of Object.entries(_TOOL_CATEGORIES)) {
-        const catTools = names.map((n2) => byName[n2]).filter(Boolean);
-        if (!catTools.length) continue;
-        html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">${_CATEGORY_LABELS[cat]}</div>`;
-        catTools.forEach((tool) => {
-          categorized.add(tool.name);
-          html += _renderToolEntry(tool);
-        });
-        html += "</div>";
-      }
-      const rest = tools.filter((t3) => !categorized.has(t3.name));
-      if (rest.length) {
-        html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Other</div>`;
-        rest.forEach((tool) => {
-          html += _renderToolEntry(tool);
-        });
-        html += "</div>";
-      }
+      const _catLabels = { ..._CATEGORY_LABELS, other: "Other" };
+      const html = _renderToolSections(tools, _TOOL_CATEGORIES, _catLabels);
       const _toolSearch = `<div style="position:sticky;top:0;background:var(--surface-1,#10131a);padding:0 0 8px;margin-bottom:6px;z-index:2"><input type="text" id="docs-search-${projectId}" placeholder="Search tools by name or description\u2026" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:5px 9px;outline:none"></div>`;
       body.innerHTML = _toolSearch + html;
       _wireTabSearch(`docs-search-${projectId}`, `docs-body-${projectId}`, ".tool-entry");
@@ -12943,29 +13410,70 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       { key: "published", label: "PUBLISHED", color: "var(--accent)" },
       { key: "archived", label: "ARCHIVED", color: "var(--warning, #d29922)" }
     ];
+    const pid = String(projectId);
     let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
     <div style="font-size:11px;color:var(--text)"><b>${posts.length}</b> post${posts.length === 1 ? "" : "s"}</div>
   </div>
-  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Author via the <code>save_blog_post</code> MCP tool; published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Edit a draft below (or author via the <code>save_blog_post</code> MCP tool); published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+    html += blogEditorFormHtml(pid, null);
     if (!posts.length) {
-      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one with <code>save_blog_post(title, body, status="published")</code>.</div>`;
+      html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one above, or with <code>save_blog_post(title, body, status="published")</code>.</div>`;
     } else {
       for (const g2 of GROUPS) {
         const inGroup = posts.filter((p3) => String(p3.status || "draft") === g2.key);
         if (!inGroup.length) continue;
         html += `<div style="font-size:9px;color:${g2.color};letter-spacing:.06em;margin:12px 0 6px">${g2.label} \xB7 ${inGroup.length}</div>`;
         for (const p3 of inGroup) {
-          const slug = String(p3.slug || "");
-          const url = String(p3.url || (slug ? `/blog/${slug}` : ""));
-          html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
-          <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(p3.title || "Untitled"))}</div>
-          <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px">${escapeHtml(slug)}</div>
-          ${url ? `<div style="margin-top:4px"><a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="font-size:10px;color:var(--accent)">${escapeHtml(url)}</a></div>` : ""}
-        </div>`;
+          html += blogPostCardHtml(p3);
         }
       }
     }
     body.innerHTML = html;
+    const byId = (suffix) => document.getElementById(`blog-editor-${suffix}-${pid}`);
+    const saveBtn = byId("save");
+    const resetBtn = byId("reset");
+    const msgEl = document.getElementById(`blog-editor-status-msg-${pid}`);
+    const doSave = async () => {
+      const idEl = document.getElementById(`blog-editor-id-${pid}`);
+      const titleEl = document.getElementById(`blog-editor-title-input-${pid}`);
+      const bodyEl = document.getElementById(`blog-editor-body-${pid}`);
+      const statusEl = document.getElementById(`blog-editor-status-${pid}`);
+      const title = (titleEl?.value || "").trim();
+      if (!title) {
+        if (msgEl) msgEl.textContent = "Title required";
+        return;
+      }
+      if (saveBtn) saveBtn.disabled = true;
+      if (msgEl) msgEl.textContent = "Saving\u2026";
+      try {
+        await api("/workspace/blog", {
+          method: "POST",
+          body: JSON.stringify({
+            id: idEl?.value || void 0,
+            // present ⇒ update in place (upsert by id)
+            title,
+            body: bodyEl?.value || "",
+            status: statusEl?.value || "draft"
+          })
+        });
+        loadBlogTab(projectId);
+      } catch (e3) {
+        if (saveBtn) saveBtn.disabled = false;
+        if (msgEl) msgEl.textContent = `Error: ${escapeHtml(String(e3))}`;
+      }
+    };
+    if (saveBtn) saveBtn.onclick = doSave;
+    if (resetBtn) resetBtn.onclick = () => resetBlogEditor(pid);
+    body.querySelectorAll(".blog-edit-btn").forEach((btn) => {
+      btn.onclick = () => {
+        const bid = btn.getAttribute("data-blog-id") || "";
+        const post = posts.find((p3) => String(p3.id || "") === bid);
+        if (!post) return;
+        populateBlogEditor(pid, post);
+        document.getElementById(`blog-editor-${pid}`)?.scrollIntoView({ block: "nearest" });
+        document.getElementById(`blog-editor-title-input-${pid}`)?.focus();
+      };
+    });
   }
   async function loadDocumentsTab(projectId) {
     const body = document.getElementById(`documents-body-${projectId}`);
@@ -12992,7 +13500,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       return `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">${escapeHtml(String(label))}</span>`;
     };
     let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-    <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? "" : "s"} <span style="color:var(--muted)">(note_kind=document)</span></div>
+    <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? "" : "s"} <span style="color:var(--muted)">ingested</span></div>
   </div>`;
     html += `<div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;padding:8px 10px;border:1px dashed var(--border);border-radius:4px;background:var(--surface-1)">
     <input type="file" id="doc-upload-input-${escapeHtml(String(projectId))}" accept=".txt,.md" style="font-size:10px;flex:1;min-width:0" />
@@ -13908,7 +14416,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     try {
       const panel = getPanelState(projectId);
       const allSessions = Array.isArray(sessions) ? sessions : await api(`/projects/${projectId}/sessions?active_only=false`);
-      const recent = (allSessions || []).filter((s3) => s3.id !== panel.liveSessionId && !isLiveSession(s3)).sort((a3, b2) => String(b2.last_seen || b2.created_at || "").localeCompare(String(a3.last_seen || a3.created_at || ""))).slice(0, 5);
+      const recent = sortSessionsMostRecentFirst(
+        (allSessions || []).filter((s3) => s3.id !== panel.liveSessionId && !isLiveSession(s3))
+      ).slice(0, 5);
       if (!recent.length) {
         el2.style.display = "none";
         return;
@@ -15344,8 +15854,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         }
         groups[h3].push(s3);
       }
-      for (const g2 of Object.values(groups)) {
-        g2.sort((a3, b2) => (b2.last_seen || "").localeCompare(a3.last_seen || ""));
+      for (const h3 of order) {
+        groups[h3] = sortSessionsMostRecentFirst(groups[h3]);
       }
       const rows = order.map((h3) => {
         const humanSessions = groups[h3];

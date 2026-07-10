@@ -22,6 +22,7 @@ EXECUTOR_CONFIG_KEYS = (
     "checkpoint_turns",  # 76cf8bda — checkpoint() cadence hint (ceiling matches max_turns)
     "serena_repo_path",  # b970fe07 — dashboard-configurable Serena default --project (extract slot)
     "codebase_code_dirs",  # b970fe07 — dashboard-configurable code-intel index dirs (code slot)
+    "timezone",  # 3d7b7aca — IANA zone (e.g. "America/Denver") for the session current_time block
 )
 
 EXECUTOR_CREDENTIALS_RULE = (

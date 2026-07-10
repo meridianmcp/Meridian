@@ -41,15 +41,38 @@ Tiered backend selection (:func:`resolve_doc_store_target` /
 Pure library where it can be: :func:`resolve_doc_store_target`,
 :func:`elements_from_docx_outline`, and :func:`elements_from_latex_analysis` are
 synchronous and unit-testable without opening a database.
+
+06df6ab3 additionally adds:
+
+* A FOURTH self-contained table, ``doc_equations`` (same outside-migrations
+  pattern as the three above) — one row per parsed/authored Word equation
+  (OMML), with fuzzy-dedup on a normalized LaTeX key (:func:`normalize_latex`,
+  :meth:`DocStructureStore.put_equations`). Reading parses ``<m:oMath>`` straight
+  out of a .docx's ``word/document.xml`` via lxml (:func:`parse_docx_equations`
+  — never a PDF round-trip); writing pipes ``latex2mathml`` through a
+  hand-written MathML -> OOXML mapper (:func:`latex_to_omml`) — see that
+  function's docstring for why this isn't Microsoft's MML2OMML.XSL stylesheet.
+* ``kind='figure'`` / ``kind='table'`` values on the EXISTING ``doc_elements``
+  table (NOT a new table) via :func:`elements_from_docx_content_tree`, nested "by
+  section" through the same heading-stack mechanism as headings.
+* :meth:`DocStructureStore.reindex_document` — the one orchestrator entry point
+  tying the outline+figures/tables (`put_document`) and equations
+  (`put_equations`) passes together for a single .docx.
 """
 from __future__ import annotations
 
+import difflib
+import io
 import os
+import re
 import uuid
 import hashlib
 import logging
+import zipfile
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable
+
+from lxml import etree as _LET
 
 from .zotero_client import resolve_citation_ref
 
@@ -112,6 +135,27 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at TEXT NOT NULL
     )
     """,
+    # Fourth self-contained table (06df6ab3): parsed Word/OMML equations, one row
+    # per <m:oMath> — either read straight out of a .docx (element_id = the
+    # containing paragraph's w14:paraId) or written via the index_equation MCP
+    # tool (element_id NULL when there is no anchoring paragraph). Deliberately
+    # NOT a doc_elements kind — equations carry OMML/LaTeX payload columns that
+    # don't fit the generic element shape, and dedup needs its own
+    # latex_normalized index. Same self-contained pattern as the three tables
+    # above — created here by ``ensure_schema``, OUTSIDE the main migration
+    # machinery.
+    """
+    CREATE TABLE IF NOT EXISTS doc_equations (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        element_id TEXT,
+        ordinal INTEGER NOT NULL,
+        omml_raw TEXT,
+        latex_normalized TEXT,
+        semantic_label TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_doc_documents_project_source "
     "ON doc_documents (project_id, source)",
     "CREATE INDEX IF NOT EXISTS idx_doc_elements_document_ordinal "
@@ -120,6 +164,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON doc_edges (project_id, edge_kind)",
     "CREATE INDEX IF NOT EXISTS idx_doc_edges_source_element "
     "ON doc_edges (source_element_id)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_equations_document_ordinal "
+    "ON doc_equations (document_id, ordinal)",
 )
 
 
@@ -157,6 +203,14 @@ _EDGE_COLUMNS = (
     "target_ref", "target_element_id", "target_document_id", "resolved_at",
     "created_at",
 )
+_EQUATION_COLUMNS = (
+    "id", "document_id", "element_id", "ordinal", "omml_raw",
+    "latex_normalized", "semantic_label", "created_at",
+)
+
+# Fuzzy-match ratio (difflib) at/above which two equations' latex_normalized
+# values count as a "near-duplicate" for put_equations' advisory dedup surface.
+_EQUATION_DEDUP_THRESHOLD = 0.85
 
 # Sentinel level for a heading dict that carries no usable level. Deliberately
 # large so a level-less heading nests as a deep leaf rather than colliding with a
@@ -203,22 +257,40 @@ def elements_from_docx_outline(outline: dict[str, Any]) -> list[dict[str, Any]]:
     """Map :func:`docs_intel.document_outline` output to store elements.
 
     ``outline`` is ``{paragraph_count, heading_count, headings:[{level, text,
-    para_id}]}``. Each heading becomes a ``kind='heading'`` element carrying its
-    ``level``, ``text`` and ``ref`` (the docx ``w14:paraId``). Parent edges are
-    inferred by heading-level nesting: a heading attaches under the nearest
-    preceding heading of a strictly smaller level (``parent_ordinal``), else it
-    is a root. Ordinals are assigned in document order.
+    para_id}], citations:[{source, marker_text, keys, para_id, section_ordinal}],
+    ...}``. Emission order (so parent/citation edges resolve on store):
+
+    1. **Headings** — each becomes a ``kind='heading'`` element carrying its
+       ``level``, ``text`` and ``ref`` (the docx ``w14:paraId``). Parent edges
+       are inferred by heading-level nesting: a heading attaches under the
+       nearest preceding heading of a strictly smaller level (``parent_ordinal``),
+       else it is a root. Ordinals are assigned in document order.
+    2. **Citations** (75d2196d) — one ``kind='citation'`` element per citation
+       key (a Zotero group cite ``{a,b}`` expands to two, exactly like the LaTeX
+       ``\\cite{a,b}`` path). ``text`` = the raw marker, ``ref`` = the citation
+       key, ``level=None``, ``parent_ordinal`` = the ordinal of the enclosing
+       section's heading element (mapped from the marker's ``section_ordinal``;
+       ``None`` before the first heading). A marker with no resolvable keys still
+       emits one element (``ref=None``) so it is never silently dropped. These
+       elements feed the same intra-document citation->bibliography edge
+       materialisation the LaTeX path uses.
     """
     headings = (outline or {}).get("headings") or []
     elements: list[dict[str, Any]] = []
     # stack of (ordinal, level) for the open ancestor chain.
     stack: list[tuple[int, int]] = []
+    # A heading's document-order index (the ``section_ordinal`` the citation
+    # parser reports) maps to the ordinal we assign that heading element here.
+    # They are identical today (headings are appended first, in order), but the
+    # explicit map keeps citation parent resolution correct if that changes.
+    section_ordinal_to_element_ordinal: dict[int, int] = {}
     for ordinal, h in enumerate(headings):
         level = h.get("level")
         lvl = int(level) if isinstance(level, (int, float)) else 1
         while stack and stack[-1][1] >= lvl:
             stack.pop()
         parent_ordinal = stack[-1][0] if stack else None
+        section_ordinal_to_element_ordinal[ordinal] = ordinal
         elements.append(
             {
                 "ordinal": ordinal,
@@ -230,6 +302,32 @@ def elements_from_docx_outline(outline: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
         stack.append((ordinal, lvl))
+
+    ordinal = len(headings)
+    citations = (outline or {}).get("citations") or []
+    for cite in citations:
+        section_ordinal = cite.get("section_ordinal")
+        parent_ordinal = (
+            section_ordinal_to_element_ordinal.get(section_ordinal)
+            if isinstance(section_ordinal, int)
+            else None
+        )
+        marker_text = cite.get("marker_text", "")
+        keys = cite.get("keys") or []
+        # One element per citation key (mirrors the LaTeX one-per-key expansion);
+        # a keyless marker still yields one element so it is not dropped.
+        for key in keys or [None]:
+            elements.append(
+                {
+                    "ordinal": ordinal,
+                    "level": None,
+                    "kind": "citation",
+                    "text": marker_text,
+                    "ref": key,
+                    "parent_ordinal": parent_ordinal,
+                }
+            )
+            ordinal += 1
     return elements
 
 
@@ -338,6 +436,396 @@ def compute_content_hash(elements: list[dict[str, Any]]) -> str:
         hasher.update("\x1f".join(parts).encode("utf-8"))
         hasher.update(b"\x1e")
     return hasher.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Figures/tables (06df6ab3) — NOT a new table: new kind='figure'/'table' values
+# on the EXISTING doc_elements table, nested "by section" via the same
+# heading-stack mechanism elements_from_docx_outline already uses.
+# ---------------------------------------------------------------------------
+
+def _seq_field_caption(block: dict[str, Any], label: str) -> str | None:
+    """The block's text IF one of its fields is a ``SEQ <label> ...`` field.
+
+    Word captions a figure/table with a paragraph like "Figure 1: ..." carrying a
+    ``SEQ Figure \\* ARABIC`` field (docs_intel already extracts these per-block
+    fields, a62e5b4f) — this is the real, already-parsed signal used to recognize
+    a caption paragraph, rather than guessing from paragraph style names.
+    """
+    for field in block.get("fields") or []:
+        if field.get("field_type") != "SEQ":
+            continue
+        instruction = (field.get("instruction") or "").strip()
+        parts = instruction.split(maxsplit=1)
+        arg = parts[1] if len(parts) > 1 else (parts[0] if parts else "")
+        if arg.strip().lower().startswith(label.lower()):
+            return block.get("text") or ""
+    return None
+
+
+def elements_from_docx_content_tree(tree: dict[str, Any]) -> list[dict[str, Any]]:
+    """Map :func:`docs_intel.document_content_tree` output to heading + figure/
+    table ``doc_elements`` (06df6ab3), in ONE shared ordinal + heading-nesting
+    pass so figures/tables parent to their enclosing section exactly like a
+    heading does in :func:`elements_from_docx_outline`.
+
+    * ``kind='heading'`` — identical shape/nesting to ``elements_from_docx_outline``.
+    * ``kind='table'`` — one element per real ``<w:tbl>`` block (docs_intel's
+      ``_table_node``, reused via ``document_content_tree``); ``text`` is the
+      joined row/cell text, ``ref`` is the caption (a neighboring paragraph's
+      ``SEQ Table ...`` field, if present, else ``None``).
+    * ``kind='figure'`` — a paragraph carrying a ``SEQ Figure ...`` field (Word's
+      real captioning mechanism); ``text``/``ref`` are both the caption text (ref
+      is the label/caption per the sprint spec). A captionless embedded image has
+      no stable OOXML "this is a figure" marker without parsing drawing/blip XML
+      (a much bigger scope increase) — out of scope for this pass.
+
+    Plain body paragraphs (non-heading, non-caption) are NOT persisted as
+    elements — unchanged scope from ``elements_from_docx_outline``.
+    """
+    blocks = (tree or {}).get("blocks") or []
+    elements: list[dict[str, Any]] = []
+    stack: list[tuple[int, int]] = []
+    ordinal = 0
+    n = len(blocks)
+
+    for i, block in enumerate(blocks):
+        kind = block.get("kind")
+        if kind == "heading":
+            level = block.get("level")
+            lvl = int(level) if isinstance(level, (int, float)) else 1
+            while stack and stack[-1][1] >= lvl:
+                stack.pop()
+            parent_ordinal = stack[-1][0] if stack else None
+            elements.append({
+                "ordinal": ordinal,
+                "level": lvl,
+                "kind": "heading",
+                "text": block.get("text", ""),
+                "ref": block.get("para_id"),
+                "parent_ordinal": parent_ordinal,
+            })
+            stack.append((ordinal, lvl))
+            ordinal += 1
+        elif kind == "table":
+            parent_ordinal = stack[-1][0] if stack else None
+            rows = block.get("rows") or []
+            text = "\n".join(" | ".join(row) for row in rows)
+            caption = None
+            if i > 0:
+                caption = _seq_field_caption(blocks[i - 1], "table")
+            if caption is None and i + 1 < n:
+                caption = _seq_field_caption(blocks[i + 1], "table")
+            elements.append({
+                "ordinal": ordinal,
+                "level": None,
+                "kind": "table",
+                "text": text,
+                "ref": caption,
+                "parent_ordinal": parent_ordinal,
+            })
+            ordinal += 1
+        elif kind == "paragraph":
+            caption = _seq_field_caption(block, "figure")
+            if caption is not None:
+                parent_ordinal = stack[-1][0] if stack else None
+                elements.append({
+                    "ordinal": ordinal,
+                    "level": None,
+                    "kind": "figure",
+                    "text": block.get("text", "") or caption,
+                    "ref": caption,
+                    "parent_ordinal": parent_ordinal,
+                })
+                ordinal += 1
+    return elements
+
+
+# ---------------------------------------------------------------------------
+# Word equations (OMML) — 06df6ab3.
+#
+# READING parses <m:oMath> directly out of word/document.xml inside the .docx
+# ZIP via lxml — never a PDF round-trip (PDF conversion rasterizes/destroys OMML
+# structure; see HKUDS/RAG-Anything#259 for the confirmed real-world gap this
+# avoids).
+#
+# WRITING pipes latex2mathml (pure-Python LaTeX -> standard MathML) through a
+# small HAND-WRITTEN MathML -> OOXML <m:oMath> element mapper
+# (``_mathml_to_omml`` below), rather than Microsoft's own MML2OMML.XSL
+# stylesheet. That stylesheet ships ONLY inside a licensed Microsoft Office
+# install (there is no legitimate standalone/redistributable copy) and this
+# environment has neither Office installed nor network access to a legitimate
+# source for it — a genuine external blocker, not a shortcut. The sprint spec's
+# suggested fallback, the PyPI package ``tex2word``, was evaluated and
+# deliberately NOT added: it is an obscure, low-adoption third-party dependency
+# whose PyPI summary reads as an unusually exact match for this very sprint
+# item's wording ("native OMML + auto-renumbering cross-ref fields") — enough of
+# a supply-chain red flag for a production dependency that it warranted human
+# review rather than an autonomous `pip install`. See the sprint report for the
+# full rationale. Instead, ``_mathml_to_omml`` hand-implements the common OMML
+# subset (runs, fractions, super/subscripts, radicals, delimited groups) —a
+# real, working, tested conversion for everyday equations, not a stub; anything
+# outside that subset (matrices, stacked/aligned systems, ...) degrades to a
+# flattened literal text run rather than raising, so the rest of the expression
+# still converts.
+# ---------------------------------------------------------------------------
+
+_DOCX_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_DOCX_W14_NS = "http://schemas.microsoft.com/office/word/2010/wordml"
+_OMML_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+_MATHML_NS = "http://www.w3.org/1998/Math/MathML"
+_OMML_NSMAP = {"m": _OMML_NS}
+
+# MathML tags that are pure grouping/sequencing — descend into children directly
+# (OMML has no "row" wrapper element; a sequence is just sibling m:r/m:... nodes).
+_MATHML_ROW_TAGS = frozenset({"math", "mrow", "mstyle", "mpadded", "semantics", "mphantom"})
+# MathML leaf text tags -> a single OMML text run (m:r/m:t).
+_MATHML_TEXT_TAGS = frozenset({"mi", "mn", "mo", "mtext"})
+
+
+def _om(tag: str) -> str:
+    return f"{{{_OMML_NS}}}{tag}"
+
+
+def _mm(tag: str) -> str:
+    return f"{{{_MATHML_NS}}}{tag}"
+
+
+def _local_tag(el: Any) -> str:
+    """The unqualified (no-namespace) tag name of an lxml element."""
+    tag = el.tag
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _node_text(node: Any) -> str:
+    return "".join(node.itertext())
+
+
+def _append_run(parent: Any, text: str) -> None:
+    if not text:
+        return
+    run = _LET.SubElement(parent, _om("r"))
+    t = _LET.SubElement(run, _om("t"))
+    t.text = text
+
+
+def _append_mathml(node: Any, parent: Any) -> None:
+    """Append ``node`` (a MathML element) onto ``parent`` (an OMML container),
+    recursively converting the common subset. See module docstring for scope."""
+    tag = _local_tag(node)
+    if tag in _MATHML_ROW_TAGS:
+        for child in node:
+            _append_mathml(child, parent)
+        return
+    if tag in _MATHML_TEXT_TAGS:
+        _append_run(parent, node.text or "")
+        return
+    if tag == "msup":
+        kids = list(node)
+        base = kids[0] if len(kids) > 0 else None
+        exp = kids[1] if len(kids) > 1 else None
+        sup = _LET.SubElement(parent, _om("sSup"))
+        e = _LET.SubElement(sup, _om("e"))
+        if base is not None:
+            _append_mathml(base, e)
+        sup_el = _LET.SubElement(sup, _om("sup"))
+        if exp is not None:
+            _append_mathml(exp, sup_el)
+        return
+    if tag == "msub":
+        kids = list(node)
+        base = kids[0] if len(kids) > 0 else None
+        sub = kids[1] if len(kids) > 1 else None
+        s = _LET.SubElement(parent, _om("sSub"))
+        e = _LET.SubElement(s, _om("e"))
+        if base is not None:
+            _append_mathml(base, e)
+        sub_el = _LET.SubElement(s, _om("sub"))
+        if sub is not None:
+            _append_mathml(sub, sub_el)
+        return
+    if tag == "msubsup":
+        kids = list(node)
+        base = kids[0] if len(kids) > 0 else None
+        sub = kids[1] if len(kids) > 1 else None
+        sup = kids[2] if len(kids) > 2 else None
+        ss = _LET.SubElement(parent, _om("sSubSup"))
+        e = _LET.SubElement(ss, _om("e"))
+        if base is not None:
+            _append_mathml(base, e)
+        sub_el = _LET.SubElement(ss, _om("sub"))
+        if sub is not None:
+            _append_mathml(sub, sub_el)
+        sup_el = _LET.SubElement(ss, _om("sup"))
+        if sup is not None:
+            _append_mathml(sup, sup_el)
+        return
+    if tag == "mfrac":
+        kids = list(node)
+        num = kids[0] if len(kids) > 0 else None
+        den = kids[1] if len(kids) > 1 else None
+        f = _LET.SubElement(parent, _om("f"))
+        n_el = _LET.SubElement(f, _om("num"))
+        if num is not None:
+            _append_mathml(num, n_el)
+        d_el = _LET.SubElement(f, _om("den"))
+        if den is not None:
+            _append_mathml(den, d_el)
+        return
+    if tag == "msqrt":
+        rad = _LET.SubElement(parent, _om("rad"))
+        rad_pr = _LET.SubElement(rad, _om("radPr"))
+        deg_hide = _LET.SubElement(rad_pr, _om("degHide"))
+        deg_hide.set(_om("val"), "1")
+        _LET.SubElement(rad, _om("deg"))
+        e = _LET.SubElement(rad, _om("e"))
+        for child in node:
+            _append_mathml(child, e)
+        return
+    if tag == "mroot":
+        kids = list(node)
+        base = kids[0] if len(kids) > 0 else None
+        index = kids[1] if len(kids) > 1 else None
+        rad = _LET.SubElement(parent, _om("rad"))
+        deg_el = _LET.SubElement(rad, _om("deg"))
+        if index is not None:
+            _append_mathml(index, deg_el)
+        e = _LET.SubElement(rad, _om("e"))
+        if base is not None:
+            _append_mathml(base, e)
+        return
+    if tag == "mfenced":
+        d = _LET.SubElement(parent, _om("d"))
+        for child in node:
+            _append_mathml(child, d)
+        return
+    # Unrecognized construct (mtable/mmultiscripts/menclose/...) — degrade to a
+    # literal flattened text run so the rest of the expression still converts.
+    _append_run(parent, _node_text(node))
+
+
+def _mathml_to_omml(mathml_root: Any) -> Any:
+    """Convert a parsed MathML ``<math>`` (lxml) element into a real ``<m:oMath>``."""
+    omath = _LET.Element(_om("oMath"), nsmap=_OMML_NSMAP)
+    _append_mathml(mathml_root, omath)
+    return omath
+
+
+def latex_to_omml(latex: str | None) -> str | None:
+    """Best-effort LaTeX -> real OOXML ``<m:oMath>`` XML string, or ``None``.
+
+    Pipeline: ``latex2mathml`` (pure Python) -> standard MathML -> the
+    hand-written ``_mathml_to_omml`` mapper above (see the module docstring for
+    why this doesn't use Microsoft's MML2OMML.XSL). Never raises: any failure
+    (missing dependency, unparsable LaTeX, malformed MathML) returns ``None``.
+    """
+    if not isinstance(latex, str) or not latex.strip():
+        return None
+    try:
+        import latex2mathml.converter as _l2m  # noqa: PLC0415 — optional/lazy
+    except Exception:  # noqa: BLE001 — dependency genuinely missing
+        _log.debug("latex2mathml unavailable; cannot convert %r", latex)
+        return None
+    try:
+        mathml = _l2m.convert(latex)
+        mathml_root = _LET.fromstring(mathml.encode("utf-8"))
+        omath = _mathml_to_omml(mathml_root)
+        return _LET.tostring(omath, encoding="unicode")
+    except Exception:  # noqa: BLE001 — conversion is best-effort, never raises
+        _log.debug("latex_to_omml failed for %r", latex, exc_info=True)
+        return None
+
+
+def _omml_flatten_text(omml_raw: str | None) -> str:
+    """Concatenate every ``<m:t>`` run inside a raw OMML string (best-effort).
+
+    NOT a real OMML -> LaTeX reverse conversion (that is a much bigger
+    undertaking, out of scope here) — this is a flattened literal-text surrogate
+    used purely as the fuzzy-dedup key for equations that only carry OMML (no
+    LaTeX source), e.g. ones parsed straight out of a .docx. Returns ``""`` (never
+    raises) for blank/malformed input.
+    """
+    if not omml_raw:
+        return ""
+    try:
+        raw_bytes = omml_raw.encode("utf-8") if isinstance(omml_raw, str) else bytes(omml_raw)
+        el = _LET.fromstring(raw_bytes)
+    except Exception:  # noqa: BLE001
+        return ""
+    return "".join(t.text or "" for t in el.iter(_om("t")))
+
+
+def parse_docx_equations(source: str | bytes | bytearray) -> list[dict[str, Any]]:
+    """Parse every ``<m:oMath>`` in ``word/document.xml`` via lxml (06df6ab3).
+
+    Reads the real OOXML tree directly out of the .docx ZIP — NEVER a PDF
+    round-trip (PDF conversion rasterizes/destroys OMML structure). Returns an
+    ordered list of ``{ordinal, element_id, omml_raw}`` — ``element_id`` is the
+    containing paragraph's stable ``w14:paraId`` (synthesized ``p{index}`` when
+    absent, matching :func:`docs_intel.parse_docx`'s convention); ``omml_raw`` is
+    the equation's exact serialized ``<m:oMath>...</m:oMath>`` XML. A document
+    with no equations (or no body) returns ``[]``.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
+    else:
+        zf = zipfile.ZipFile(source)
+    try:
+        with zf.open("word/document.xml") as handle:
+            xml_bytes = handle.read()
+    finally:
+        zf.close()
+    root = _LET.fromstring(xml_bytes)
+    w_p = f"{{{_DOCX_W_NS}}}p"
+    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
+    m_omath = _om("oMath")
+    equations: list[dict[str, Any]] = []
+    ordinal = 0
+    for idx, p in enumerate(root.iter(w_p)):
+        para_id = p.get(w14_para_id) or f"p{idx}"
+        for math_el in p.iter(m_omath):
+            equations.append({
+                "ordinal": ordinal,
+                "element_id": para_id,
+                "omml_raw": _LET.tostring(math_el, encoding="unicode"),
+            })
+            ordinal += 1
+    return equations
+
+
+# Delimiter pairs normalize_latex strips when they wrap the WHOLE string (an
+# author pasting "$x^2$" or "\(x^2\)" should dedup-match a bare "x^2").
+_MATH_DELIM_PAIRS: tuple[tuple[str, str], ...] = (
+    ("$$", "$$"), ("\\[", "\\]"), ("\\(", "\\)"), ("$", "$"),
+)
+
+
+def normalize_latex(latex: str | None) -> str:
+    """Canonicalize a LaTeX source string for the fuzzy-dedup key (06df6ab3).
+
+    Strips whole-string math delimiters (``$...$``, ``$$...$$``, ``\\(...\\)``,
+    ``\\[...\\]``) and removes ALL whitespace — LaTeX whitespace is
+    semantically insignificant (``E=mc^2`` and ``E = m c^2`` are the same
+    equation), and a difflib char-ratio comparison is otherwise dominated by
+    incidental spacing differences rather than real content differences.
+    Deterministic and pure — never raises, ``None``/blank input yields ``""``.
+    """
+    s = (latex or "").strip()
+    if not s:
+        return ""
+    for open_d, close_d in _MATH_DELIM_PAIRS:
+        if s.startswith(open_d) and s.endswith(close_d) and len(s) >= len(open_d) + len(close_d):
+            s = s[len(open_d): len(s) - len(close_d)].strip()
+            break
+    return re.sub(r"\s+", "", s)
+
+
+def _equation_similarity(a: str, b: str) -> float:
+    """difflib fuzzy-match ratio (same approach already used for note-dedup in
+    ``mcp/handler.py``'s ``add_note`` near-duplicate warning, 6e4e2371)."""
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1501,196 @@ class DocStructureStore:
         )
         await self._db.commit()
         return True
+
+    # -- equations (OMML) — 06df6ab3 -----------------------------------------
+
+    async def get_equations(self, document_id: str) -> list[dict[str, Any]]:
+        """Return every stored equation for a document, ordered by ``ordinal``."""
+        async with self._db.execute(
+            "SELECT * FROM doc_equations WHERE document_id = ? ORDER BY ordinal ASC",
+            (document_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_dict(r, _EQUATION_COLUMNS) for r in rows]
+
+    async def find_similar_equations(
+        self, document_id: str, latex: str, *, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Fuzzy-match ``latex`` (normalized) against this document's stored
+        equations; returns every stored equation carrying a ``score`` (difflib
+        ratio against its ``latex_normalized``), best match first, capped at
+        ``limit``. Never raises; an empty/unknown document yields ``[]``."""
+        norm = normalize_latex(latex)
+        existing = await self.get_equations(document_id)
+        scored = [
+            {**eq, "score": round(_equation_similarity(norm, eq.get("latex_normalized") or ""), 4)}
+            for eq in existing
+        ]
+        scored.sort(key=lambda e: e["score"], reverse=True)
+        lim = limit if isinstance(limit, int) and limit > 0 else 5
+        return scored[:lim]
+
+    async def put_equations(
+        self,
+        document_id: str,
+        equations: list[dict[str, Any]],
+        *,
+        dedup_threshold: float = _EQUATION_DEDUP_THRESHOLD,
+    ) -> dict[str, Any]:
+        """Insert a batch of equations for ``document_id``.
+
+        Every equation is inserted — dedup here is ADVISORY, not blocking,
+        mirroring the existing ``add_note`` near-duplicate pattern in
+        ``mcp/handler.py`` (6e4e2371): a fuzzy-matched near-duplicate is
+        *surfaced* to the caller rather than silently vanishing (skipped) or
+        silently piling up unnoticed (the sprint spec's "surface near-matches
+        instead of silently duplicating").
+
+        Each ``equations`` item is ``{omml_raw?, latex?, semantic_label?,
+        element_id?, ordinal?}`` — provide ``omml_raw`` (real OMML XML, e.g. from
+        :func:`parse_docx_equations`) OR ``latex`` (a source string; OMML is
+        generated best-effort via :func:`latex_to_omml` when ``omml_raw`` is
+        absent — ``None`` on an unsupported/unparsable construct, never raises).
+        ``latex_normalized`` is derived from ``latex`` when given, else from a
+        flattened read of ``omml_raw`` (:func:`_omml_flatten_text`) — a
+        surrogate dedup key when only OMML is available (no real OMML->LaTeX
+        reverse conversion; see module docstring).
+
+        Returns ``{"inserted": [...], "near_duplicates": [...]}``; a
+        ``near_duplicates`` entry is ``{equation_id, matched_id, matched_latex,
+        score}`` for every inserted equation whose best fuzzy match (against
+        already-stored equations AND earlier equations in this same batch)
+        scores ``>= dedup_threshold``.
+        """
+        existing = await self.get_equations(document_id)
+        next_ordinal = (max((e.get("ordinal") or 0) for e in existing) + 1) if existing else 0
+        inserted: list[dict[str, Any]] = []
+        near_duplicates: list[dict[str, Any]] = []
+        pool = list(existing)
+
+        for eq in equations or []:
+            omml_raw = eq.get("omml_raw")
+            latex_raw = eq.get("latex")
+            if not omml_raw and latex_raw:
+                omml_raw = latex_to_omml(latex_raw)
+            latex_normalized = (
+                normalize_latex(latex_raw) if latex_raw else _omml_flatten_text(omml_raw)
+            )
+
+            best_score = 0.0
+            best_match: dict[str, Any] | None = None
+            if latex_normalized:
+                for cand in pool:
+                    score = _equation_similarity(
+                        latex_normalized, cand.get("latex_normalized") or ""
+                    )
+                    if score > best_score:
+                        best_score, best_match = score, cand
+
+            eq_id = eq.get("id") or uuid.uuid4().hex
+            ordinal = eq.get("ordinal") if isinstance(eq.get("ordinal"), int) else next_ordinal
+            next_ordinal = max(next_ordinal, ordinal + 1)
+            now = _now_iso()
+            semantic_label = eq.get("semantic_label")
+            element_id = eq.get("element_id")
+
+            await self._db.execute(
+                "INSERT INTO doc_equations "
+                "(id, document_id, element_id, ordinal, omml_raw, "
+                "latex_normalized, semantic_label, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (eq_id, document_id, element_id, ordinal, omml_raw,
+                 latex_normalized, semantic_label, now),
+            )
+            row = {
+                "id": eq_id, "document_id": document_id, "element_id": element_id,
+                "ordinal": ordinal, "omml_raw": omml_raw,
+                "latex_normalized": latex_normalized, "semantic_label": semantic_label,
+                "created_at": now,
+            }
+            inserted.append(row)
+            pool.append(row)
+
+            if best_match is not None and best_score >= dedup_threshold:
+                near_duplicates.append({
+                    "equation_id": eq_id,
+                    "matched_id": best_match.get("id"),
+                    "matched_latex": best_match.get("latex_normalized"),
+                    "score": round(best_score, 4),
+                })
+
+        if inserted:
+            await self._db.commit()
+        return {"inserted": inserted, "near_duplicates": near_duplicates}
+
+    async def add_equation(
+        self,
+        document_id: str,
+        omml_or_latex: str,
+        *,
+        semantic_label: str | None = None,
+        element_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Index ONE equation — the ``index_equation`` MCP tool's primitive.
+
+        ``omml_or_latex`` is auto-detected: a string starting with ``<`` is
+        treated as raw OMML XML (stored as-is); anything else is treated as a
+        LaTeX source (OMML is generated best-effort via :func:`latex_to_omml`).
+        Returns ``{"equation": <inserted row, or None if not inserted>,
+        "near_duplicates": [...]}`` (see :meth:`put_equations`).
+        """
+        raw = (omml_or_latex or "").strip()
+        eq: dict[str, Any] = {"semantic_label": semantic_label, "element_id": element_id}
+        if raw.startswith("<"):
+            eq["omml_raw"] = raw
+        else:
+            eq["latex"] = raw
+        result = await self.put_equations(document_id, [eq])
+        return {
+            "equation": result["inserted"][0] if result["inserted"] else None,
+            "near_duplicates": result["near_duplicates"],
+        }
+
+    # -- orchestrator — 06df6ab3 ---------------------------------------------
+
+    async def reindex_document(
+        self,
+        project_id: str,
+        file_path: str | bytes | bytearray,
+        *,
+        source: str | None = None,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        """One entry point tying the docx outline, figure/table, and equation
+        passes together: outline+figures/tables -> ONE :meth:`put_document` call,
+        equations -> a separate :meth:`put_equations` walk (06df6ab3).
+        """
+        from .docs_intel import document_content_tree  # noqa: PLC0415 — lazy, optional
+
+        tree = document_content_tree(file_path)
+        elements = elements_from_docx_content_tree(tree)
+        stored_source = source
+        if stored_source is None and isinstance(file_path, str):
+            stored_source = file_path
+        doc = await self.put_document(
+            project_id, "docx", elements, source=stored_source, title=title,
+        )
+        raw_equations = parse_docx_equations(file_path)
+        eq_batch = [
+            {
+                "element_id": eq.get("element_id"),
+                "ordinal": eq.get("ordinal"),
+                "omml_raw": eq.get("omml_raw"),
+                "latex_normalized": _omml_flatten_text(eq.get("omml_raw")),
+            }
+            for eq in raw_equations
+        ]
+        equations = await self.put_equations(doc["id"], eq_batch)
+        return {
+            "document": doc,
+            "elements_count": len(elements),
+            "equations": equations,
+        }
 
     async def close(self) -> None:
         """Close the underlying connection (best-effort)."""

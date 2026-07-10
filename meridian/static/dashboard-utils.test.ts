@@ -5,6 +5,8 @@ import {
   formatRelativeTime,
   sessionAgeMs,
   isLiveSession,
+  sessionRecencyKey,
+  sortSessionsMostRecentFirst,
   _colorForHuman,
   _HUMAN_COLORS,
   getPanelState,
@@ -95,6 +97,59 @@ describe("Recent Runs live fallback (59ab2f9f)", () => {
   it("is NOT live when the session status is missing", () => {
     const recent = new Date(Date.now() - 1_000).toISOString();
     expect(runIsLive({ session_status: null, started_at: recent })).toBe(false);
+  });
+});
+
+// 241b0d3b — active/recent sessions must render consistently MOST-RECENT-FIRST.
+// Every session-list render funnels through sortSessionsMostRecentFirst so the
+// ordering (last_seen, fallback created_at, descending) is identical everywhere.
+describe("sessionRecencyKey / sortSessionsMostRecentFirst (241b0d3b)", () => {
+  it("keys on last_seen, falling back to created_at then ''", () => {
+    expect(sessionRecencyKey({ last_seen: "2026-07-05 10:00:00" })).toBe("2026-07-05 10:00:00");
+    expect(sessionRecencyKey({ created_at: "2026-07-01 09:00:00" })).toBe("2026-07-01 09:00:00");
+    expect(sessionRecencyKey({ last_seen: "2026-07-05", created_at: "2026-07-01" })).toBe("2026-07-05");
+    expect(sessionRecencyKey({})).toBe("");
+    expect(sessionRecencyKey(null)).toBe("");
+  });
+
+  it("orders sessions most-recent-first by last_seen", () => {
+    const sessions = [
+      { id: "old", last_seen: "2026-07-01 08:00:00" },
+      { id: "new", last_seen: "2026-07-07 12:00:00" },
+      { id: "mid", last_seen: "2026-07-04 10:00:00" },
+    ];
+    expect(sortSessionsMostRecentFirst(sessions).map((s) => s.id)).toEqual(["new", "mid", "old"]);
+  });
+
+  it("falls back to created_at when last_seen is missing", () => {
+    const sessions = [
+      { id: "a", created_at: "2026-07-02 00:00:00" },
+      { id: "b", last_seen: "2026-07-06 00:00:00" },
+      { id: "c", created_at: "2026-07-09 00:00:00" },
+    ];
+    // c (created 07-09) > b (seen 07-06) > a (created 07-02)
+    expect(sortSessionsMostRecentFirst(sessions).map((s) => s.id)).toEqual(["c", "b", "a"]);
+  });
+
+  it("sinks sessions with no timestamp to the bottom", () => {
+    const sessions = [
+      { id: "none" },
+      { id: "seen", last_seen: "2026-07-05 00:00:00" },
+    ];
+    expect(sortSessionsMostRecentFirst(sessions).map((s) => s.id)).toEqual(["seen", "none"]);
+  });
+
+  it("does not mutate the caller's array and is null-safe", () => {
+    const input = [
+      { id: "x", last_seen: "2026-07-01 00:00:00" },
+      { id: "y", last_seen: "2026-07-08 00:00:00" },
+    ];
+    const out = sortSessionsMostRecentFirst(input);
+    expect(input.map((s) => s.id)).toEqual(["x", "y"]); // original order preserved
+    expect(out).not.toBe(input);
+    expect(out.map((s) => s.id)).toEqual(["y", "x"]);
+    expect(sortSessionsMostRecentFirst(null)).toEqual([]);
+    expect(sortSessionsMostRecentFirst(undefined)).toEqual([]);
   });
 });
 

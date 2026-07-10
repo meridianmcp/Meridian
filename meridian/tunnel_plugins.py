@@ -24,7 +24,7 @@ from typing import Any
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
 # another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract", "ppt", "word", "dc")
+SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
@@ -32,6 +32,19 @@ DEFAULT_EXTRACT_PORT = 8810
 DEFAULT_PPT_PORT = 8811
 DEFAULT_WORD_PORT = 8812
 DEFAULT_DC_PORT = 8813
+# 9665538a — the meridian-docs slot: the extracted stdlib-only OOXML (DOCX)
+# parser published as its own `uvx meridian-docs` MCP server (extensions/
+# meridian-docs). Distinct from the `word` slot (docx-mcp, authoring): this is
+# fast, dependency-free document *intelligence* — outline/parse/index/search.
+# Port 8818 sits just after the dc slot (8813) and the 4 pre-allocated custom
+# slots (8814-8817), and below the custom auto-assign start (8820) — see
+# CUSTOM_SLOT_PORTS / _CUSTOM_PORT_START.
+DEFAULT_DOCS_PORT = 8818
+# 39c117b1 — zotero-mcp slot: citation/reference-manager resolution against the
+# user's LOCAL Zotero API (`uvx zotero-mcp`, env ZOTERO_LOCAL=true), bridged the
+# same automatic way as docx-mcp/meridian-docs. Port 8819 sits between docs
+# (8818) and the custom auto-assign start (8820).
+DEFAULT_ZOTERO_PORT = 8819
 
 # 8fb69d54 — 4 pre-allocated custom slots (p0-p3) on ports 8814-8817 so a custom
 # plugin bound to a slot gets a real server route (/tunnel-p0 … /tunnel-p3) and
@@ -187,6 +200,51 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "description": "Desktop Commander — system tools, file access, terminal (local only)",
         "description_overrides": {},
     },
+    {
+        # 9665538a — meridian-docs: the extracted stdlib-only OOXML doc parser
+        # (extensions/meridian-docs), launched via `uvx meridian-docs`. Opt-in
+        # like the Office slots. Complements the `word` slot (docx-mcp authoring)
+        # with read-only document intelligence (outline / parse / index / search).
+        "name": "meridian-docs",
+        "slot": "docs",
+        "port": DEFAULT_DOCS_PORT,
+        "url_prefix": "/docs",
+        "enabled": False,
+        "builtin": True,
+        "core": False,
+        "command": ["uvx", "meridian-docs"],
+        "env": {},
+        # meridian-docs exposes bare tool names (document_outline, parse_document,
+        # …) — no self-prefix, so the server bridge namespaces them via
+        # SLOT_DISPLAY_NAMES ("docs" → "meridian-docs__document_outline").
+        "prefix": None,
+        "session_mode": "stateless",
+        "description": "Document intelligence — DOCX outline/parse/index/search (meridian-docs)",
+        "description_overrides": {},
+    },
+    {
+        # 39c117b1 — zotero-mcp: citation / reference-manager resolution against
+        # the user's LOCAL Zotero API, launched via `uvx zotero-mcp` with
+        # ZOTERO_LOCAL=true. A core/default bundled slot (same tier as docx-mcp /
+        # meridian-docs), NOT tunnel-proxying Meridian's own hand-rolled
+        # zotero_client — so a thesis in a .docx gets real Zotero resolution the
+        # same automatic way as the other Office slots.
+        "name": "zotero-mcp",
+        "slot": "zotero",
+        "port": DEFAULT_ZOTERO_PORT,
+        "url_prefix": "/zotero",
+        "enabled": False,
+        "builtin": True,
+        "core": False,
+        "command": ["uvx", "zotero-mcp"],
+        "env": {"ZOTERO_LOCAL": "true"},
+        # zotero-mcp exposes bare tool names — no self-prefix, so the server
+        # bridge namespaces them via SLOT_DISPLAY_NAMES ("zotero" → "zotero-mcp__…").
+        "prefix": None,
+        "session_mode": "stateless",
+        "description": "Citation / reference-manager resolution against the local Zotero API (zotero-mcp)",
+        "description_overrides": {},
+    },
 ]
 
 # Editable per-slot fields that a tenant override may set.
@@ -196,6 +254,156 @@ _OVERRIDABLE = ("enabled", "command", "port", "description", "description_overri
 def builtin_names() -> tuple[str, ...]:
     """Names of the three built-in plugins, in display order."""
     return tuple(p["name"] for p in BUILTIN_PLUGINS)
+
+
+# a8a54fe9 — the general "bundle the known plugin tools as first-class built-ins"
+# catalog: a single declarative source of truth naming every MCP plugin tool
+# Meridian knows how to run, its install runtime, the built-in slot it rides (or
+# None if it is not yet a first-class built-in), and whether it is bundled today.
+#
+# Why a catalog and not more slots? The server exposes a FIXED set of transport
+# slots (fs/code/extract/ppt/word/dc + the 4 pre-allocated custom p0-p3 — see
+# routes/tunnel.py). A built-in plugin can only exist for a slot that already has
+# a dedicated server route; adding a brand-new built-in slot is a cross-file
+# server change, deliberately out of scope for this pure registry module (see the
+# module docstring: "It does NOT add new server routes per arbitrary plugin").
+#
+# So this catalog's job is to make the bundling *state* explicit and machine-
+# readable — the dashboard / docs can enumerate "every known plugin tool and
+# which are first-class built-ins vs. still pending" — without pretending to wire
+# a slot that has no server route. Each not-yet-bundled entry carries the sprint
+# item that owns its wiring, so this catalog documents the gap rather than
+# duplicating those items' implementation:
+#
+#   - ``meridian-docs`` (the extracted stdlib-only OOXML fast parser) → owned by
+#     item 9665538a (wire it as its own command alongside docx-mcp on the word
+#     slot, or its own slot). It is NOT the same tool as ``docx-mcp`` (the editor
+#     that already rides the word slot); it is the read/parse layer.
+#   - ``zotero-mcp`` (citation / reference-manager resolution against the local
+#     Zotero API) → owned by item 39c117b1 (needs tunnel-proxying like the other
+#     slots, or an honest hosted-mode error). No server route exists for it yet.
+#
+# ``runtime`` names the launcher a bundling would use (``uvx`` for PyPI tools,
+# ``npx`` for npm tools, ``binary`` for the auto-downloaded native code-intel
+# binary), so a future bundling item and the dashboard agree on prereqs.
+KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "filesystem",
+        "package": "@modelcontextprotocol/server-filesystem",
+        "runtime": "npx",
+        "slot": "fs",
+        "bundled": True,
+        "owner_item": None,
+        "description": "Filesystem MCP (read/write files in the served repo).",
+    },
+    {
+        "name": "code-intel",
+        "package": "codebase-memory-mcp",
+        "runtime": "binary",
+        "slot": "code",
+        "bundled": True,
+        "owner_item": None,
+        "description": "Code-intelligence graph (codebase-memory-mcp).",
+    },
+    {
+        "name": "code-extractor",
+        "package": "serena-agent",
+        "runtime": "uvx",
+        "slot": "extract",
+        "bundled": True,
+        "owner_item": None,
+        "description": "Symbol-level code intelligence (Serena LSP).",
+    },
+    {
+        "name": "powerpoint",
+        "package": "powerpoint-mcp",
+        "runtime": "uvx",
+        "slot": "ppt",
+        "bundled": True,
+        "owner_item": None,
+        "description": "PowerPoint authoring (powerpoint-mcp).",
+    },
+    {
+        "name": "word",
+        "package": "docx-mcp",
+        "runtime": "uvx",
+        "slot": "word",
+        "bundled": True,
+        "owner_item": None,
+        "description": "Word / DOCX authoring/editing (docx-mcp).",
+    },
+    {
+        "name": "desktop-commander",
+        "package": "@wonderwhy-er/desktop-commander",
+        "runtime": "npx",
+        "slot": "dc",
+        "bundled": True,
+        "owner_item": None,
+        "description": "Desktop Commander — system tools, terminal (local only).",
+    },
+    {
+        "name": "meridian-docs",
+        "package": "meridian-docs",
+        "runtime": "uvx",
+        # 9665538a SHIPPED this as a first-class built-in on its own `docs` slot
+        # (server route + WS relay in routes/tunnel.py). Now bundled — distinct
+        # from docx-mcp (the editor on the word slot); this is the read layer.
+        "slot": "docs",
+        "bundled": True,
+        "owner_item": None,
+        "description": (
+            "Standalone OOXML/DOCX fast parser (the read layer extracted from "
+            "Meridian) — distinct from docx-mcp, which is the editor."
+        ),
+    },
+    {
+        "name": "zotero-mcp",
+        "package": "zotero-mcp",
+        "runtime": "uvx",
+        # 39c117b1 SHIPPED this as a first-class built-in on its own `zotero` slot
+        # (server route + WS relay in routes/tunnel.py), env ZOTERO_LOCAL=true.
+        "slot": "zotero",
+        "bundled": True,
+        "owner_item": None,
+        "description": (
+            "Citation / reference-manager resolution against the local Zotero API."
+        ),
+    },
+]
+
+
+def known_plugin_tools() -> list[dict[str, Any]]:
+    """a8a54fe9 — the known-plugin-tools catalog (fresh copies, safe to mutate).
+
+    A stable, ordered list of every MCP plugin tool Meridian knows how to run,
+    each tagged with its ``slot`` (or ``None``), ``bundled`` state, and — for the
+    not-yet-bundled ones — the ``owner_item`` sprint id that owns its wiring.
+    Returns shallow copies so callers can annotate entries without mutating the
+    module-level catalog.
+    """
+    return [dict(t) for t in KNOWN_PLUGIN_TOOLS]
+
+
+def bundled_plugin_tools() -> list[dict[str, Any]]:
+    """The subset of :func:`known_plugin_tools` already shipped as built-in slots.
+
+    Invariant (enforced by tests): a tool is ``bundled`` iff it rides a real
+    built-in slot — i.e. its ``slot`` is one of :data:`SLOTS` and its ``name``
+    matches a :func:`builtin_names` entry. So this is exactly the set of plugin
+    tools a user gets for free, no manual MCP wiring.
+    """
+    return [t for t in known_plugin_tools() if t["bundled"]]
+
+
+def unbundled_plugin_tools() -> list[dict[str, Any]]:
+    """Known plugin tools NOT yet first-class built-ins (the remaining gap).
+
+    Each carries a non-null ``owner_item`` naming the sprint item that owns its
+    bundling, so this method reports precisely which parts of the general
+    "bundle everything" gap still belong to a dedicated item (meridian-docs →
+    9665538a, zotero-mcp → 39c117b1) rather than silently pretending they ship.
+    """
+    return [t for t in known_plugin_tools() if not t["bundled"]]
 
 
 def _coerce_command(value: Any) -> list[str] | None:
@@ -293,7 +501,8 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
 # would collide with the built-in slot riding that port (see resolve_custom_plugins).
 _BUILTIN_DEFAULT_PORTS = frozenset({
     DEFAULT_FS_PORT, DEFAULT_CODE_PORT, DEFAULT_EXTRACT_PORT,
-    DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT,
+    DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT, DEFAULT_DOCS_PORT,
+    DEFAULT_ZOTERO_PORT,
 })
 
 # 9811d04c — first port a freshly-added custom plugin (from the browse "Add"

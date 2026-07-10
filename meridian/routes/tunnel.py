@@ -29,6 +29,7 @@ import time
 import uuid
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
@@ -50,6 +51,11 @@ _tunnel_extract_sockets: dict[str, WebSocket] = {}
 _tunnel_ppt_sockets: dict[str, WebSocket] = {}
 _tunnel_word_sockets: dict[str, WebSocket] = {}
 _tunnel_dc_sockets: dict[str, WebSocket] = {}
+# 9665538a — meridian-docs slot (DOCX intelligence via `uvx meridian-docs`).
+_tunnel_docs_sockets: dict[str, WebSocket] = {}
+
+# 39c117b1 — zotero-mcp slot (citation resolution via `uvx zotero-mcp`).
+_tunnel_zotero_sockets: dict[str, WebSocket] = {}
 
 # 4d9ad87b — active repo per tenant, updated whenever set_active_repo is called.
 # Enables call_tunnel_tool to inject X-Meridian-Repo-Path so the SerenaDaemonPool
@@ -64,6 +70,8 @@ _pending_extract_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_ppt_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_word_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_docs_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_zotero_reqs: dict[str, asyncio.Future[dict]] = {}
 
 # 8fb69d54 — 4 pre-allocated custom tunnel slots (p0-p3, ports 8814-8817) so
 # custom plugins get real server routes and appear in the claude.ai connector
@@ -87,6 +95,60 @@ _slot_health: dict[str, dict[str, bool]] = {}
 # dead dot. Cleared when the slot recovers or the WS disconnects.
 _slot_status_detail: dict[str, dict[str, dict[str, str]]] = {}
 
+# 54ddd609 — tenants whose tunnel tool set changed (a slot recovered
+# unhealthy->healthy) since the last time a `tools/list` was served. The MCP
+# `/mcp` endpoint is a STATELESS HTTP request/response transport (see
+# meridian/mcp/handler.py) — the server holds NO persistent push channel to a
+# connected claude.ai / Claude Desktop MCP session, so it cannot itself emit an
+# unsolicited `notifications/tools/list_changed` frame to that session. The
+# smallest correct thing is therefore two-fold:
+#   1. Invalidate the per-tenant routing cache so the NEXT tools/list (or a cold
+#      tools/call) re-discovers the recovered slot's tools instead of serving a
+#      stale set that omits them (list_tunnel_tools skips unhealthy slots).
+#   2. Record a pending "list_changed" marker per tenant. Any surface that DOES
+#      hold a live channel to the session (the tunnel WS relay, the dashboard's
+#      status poll) can drain this to emit / trigger a re-query. `list_tunnel_tools`
+#      itself clears the marker once it re-aggregates, so a client that re-lists
+#      after the marker was set observes the recovered tools.
+# This is the standard MCP mechanism for "the tool set changed" reduced to what a
+# stateless transport can actually guarantee: the recovered tools become visible
+# on the very next tools/list rather than staying invisible until a full reconnect.
+_tools_list_changed_pending: set[str] = set()
+
+
+def notify_tools_list_changed(tenant_id: str) -> None:
+    """Signal that a tenant's aggregated tunnel tool set changed (54ddd609).
+
+    Called on a slot RECOVERY (unhealthy->healthy) so the recovered slot's tools
+    stop being invisible to an already-connected MCP session that cached the old
+    (failed / empty) tools/list. Because the `/mcp` transport is stateless (no
+    server->session push channel), this does the smallest correct thing:
+
+      * drops the cached ``_tunnel_tool_routes`` for the tenant, forcing the next
+        ``tools/list`` / cold ``tools/call`` to re-discover the recovered slot; and
+      * marks the tenant pending in ``_tools_list_changed_pending`` — the MCP
+        ``notifications/tools/list_changed`` signal, held until a surface that can
+        reach the session drains it (or the next ``tools/list`` re-aggregates).
+
+    Idempotent and cheap; safe to call on every healthy report (a no-op transition
+    that wasn't actually a recovery simply re-marks a tenant that will re-list to
+    the same tool set).
+    """
+    _tunnel_tool_routes.pop(tenant_id, None)
+    _tools_list_changed_pending.add(tenant_id)
+
+
+def consume_tools_list_changed(tenant_id: str) -> bool:
+    """Return + clear the pending tools/list_changed marker for a tenant (54ddd609).
+
+    True means a slot recovered since this was last consumed, so the caller should
+    (re)advertise / re-query tools. Draining here is what lets a re-list observe the
+    recovery exactly once."""
+    if tenant_id in _tools_list_changed_pending:
+        _tools_list_changed_pending.discard(tenant_id)
+        return True
+    return False
+
 
 def _record_slot_health(
     tenant_id: str, slot: str, healthy: bool,
@@ -94,12 +156,24 @@ def _record_slot_health(
 ) -> None:
     """Record a core slot's health for a tenant (from a plugin_status message).
     9a8645c1 — when unhealthy, also stash an optional reason/detail; healthy
-    clears any prior diagnostic."""
+    clears any prior diagnostic.
+
+    54ddd609 — detect a RECOVERY (unhealthy->healthy transition) and fire
+    :func:`notify_tools_list_changed` so the recovered slot's tools become visible
+    to an already-connected MCP session (which cached the old tools/list) on its
+    next tools/list, instead of staying hidden until a full tunnel reconnect. The
+    prior state MUST be read before we overwrite it below."""
     if not slot:
         return
+    was_unhealthy = not _slot_is_healthy(tenant_id, slot)
     _slot_health.setdefault(tenant_id, {})[slot] = bool(healthy)
     if healthy:
         _slot_status_detail.get(tenant_id, {}).pop(slot, None)
+        # RECOVERY: this slot was suppressed and is now serving again. Its tools
+        # were dropped from the last aggregation (list_tunnel_tools skips unhealthy
+        # slots), so trigger the tools/list_changed path to un-hide them.
+        if was_unhealthy:
+            notify_tools_list_changed(tenant_id)
     elif reason or detail:
         _slot_status_detail.setdefault(tenant_id, {})[slot] = {
             "reason": reason or "unhealthy",
@@ -118,6 +192,7 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
     if slot is None:
         _slot_health.pop(tenant_id, None)
         _slot_status_detail.pop(tenant_id, None)
+        _tools_list_changed_pending.discard(tenant_id)  # 54ddd609
         return
     slots = _slot_health.get(tenant_id)
     if slots is not None:
@@ -531,6 +606,18 @@ async def tunnel_word_ws(ws: WebSocket, tenant_id: str) -> None:
 async def tunnel_dc_ws(ws: WebSocket, tenant_id: str) -> None:
     """Hold open a WebSocket for one tenant's desktop-commander proxy."""
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
+@router.websocket("/tunnel-docs/{tenant_id}")
+async def tunnel_docs_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's meridian-docs proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_docs_sockets, _pending_docs_reqs, "docs")
+
+
+@router.websocket("/tunnel-zotero/{tenant_id}")
+async def tunnel_zotero_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's zotero-mcp proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_zotero_sockets, _pending_zotero_reqs, "zotero")
 
 
 # 8fb69d54 — register the 4 custom-slot WebSocket routes (/tunnel-p0 … /tunnel-p3)
@@ -1012,6 +1099,48 @@ async def dc_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> R
                                _tunnel_dc_sockets, _pending_dc_reqs, "dc")
 
 
+@router.get("/docs/mcp/{tenant_id}")
+@router.post("/docs/mcp/{tenant_id}")
+@router.options("/docs/mcp/{tenant_id}")
+async def docs_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's meridian-docs server over the docs tunnel."""
+    prefix = f"/docs/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_docs_sockets, _pending_docs_reqs, "docs")
+
+
+@router.get("/docs/mcp/{tenant_id}/{rest:path}")
+@router.post("/docs/mcp/{tenant_id}/{rest:path}")
+@router.options("/docs/mcp/{tenant_id}/{rest:path}")
+async def docs_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Same as docs_mcp_proxy but for sub-paths."""
+    local_path = f"/{rest}" if rest else "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_docs_sockets, _pending_docs_reqs, "docs")
+
+
+@router.get("/zotero/mcp/{tenant_id}")
+@router.post("/zotero/mcp/{tenant_id}")
+@router.options("/zotero/mcp/{tenant_id}")
+async def zotero_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's zotero-mcp server over the zotero tunnel."""
+    prefix = f"/zotero/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_zotero_sockets, _pending_zotero_reqs, "zotero")
+
+
+@router.get("/zotero/mcp/{tenant_id}/{rest:path}")
+@router.post("/zotero/mcp/{tenant_id}/{rest:path}")
+@router.options("/zotero/mcp/{tenant_id}/{rest:path}")
+async def zotero_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Same as zotero_mcp_proxy but for sub-paths."""
+    local_path = f"/{rest}" if rest else "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_zotero_sockets, _pending_zotero_reqs, "zotero")
+
+
 # ---------------------------------------------------------------------------
 # GET /tunnel/status/{tenant_id}  — lightweight status check (no auth required)
 # ---------------------------------------------------------------------------
@@ -1027,6 +1156,8 @@ async def tunnel_status(tenant_id: str) -> dict:
         "ppt_active": tenant_id in _tunnel_ppt_sockets,
         "word_active": tenant_id in _tunnel_word_sockets,
         "dc_active": tenant_id in _tunnel_dc_sockets,
+        "docs_active": tenant_id in _tunnel_docs_sockets,
+        "zotero_active": tenant_id in _tunnel_zotero_sockets,
         # d71ba2e7 — slots the client reported unhealthy (pre-flight tools/list
         # failed / watchdog gave up). Absent slot ⇒ assumed healthy. Dashboard
         # renders these as a degraded status dot.
@@ -1065,7 +1196,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
     if tenant is None:
         return _json_response({
             "plugins": resolve_plugins(None), "custom": [], "config": {},
-            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False, **{s: False for s in _CUSTOM_SLOTS}},
+            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False, "docs": False, "zotero": False, **{s: False for s in _CUSTOM_SLOTS}},
             "plan": "free",
         })
     # 8660d701 — per-machine config. ?hostname=X scopes to that machine's config
@@ -1111,6 +1242,8 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "ppt": tid in _tunnel_ppt_sockets,
             "word": tid in _tunnel_word_sockets,
             "dc": tid in _tunnel_dc_sockets,
+            "docs": tid in _tunnel_docs_sockets,
+            "zotero": tid in _tunnel_zotero_sockets,
             **{s: tid in _tunnel_custom_sockets[s] for s in _CUSTOM_SLOTS},
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
@@ -1489,27 +1622,28 @@ async def get_mcp_registry(request: Request) -> Response:
     homepage. Pass ?cursor=<token> for subsequent pages and ?limit=N (default 20,
     max 50). Requires no auth — the registry is public.
     """
-    import urllib.request
-    import urllib.parse
-
     limit = min(int(request.query_params.get("limit", 20)), 50)
     cursor = request.query_params.get("cursor", "")
 
     params: dict[str, str] = {"limit": str(limit)}
     if cursor:
         params["cursor"] = cursor
-    url = _REGISTRY_BASE + "?" + urllib.parse.urlencode(params)
 
     cache_key = f"{limit}:{cursor}"
 
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json", "User-Agent": "Meridian/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=_REGISTRY_TIMEOUT) as resp:  # noqa: S310
-            raw = resp.read()
-        data = json.loads(raw)
+        # 9dde426f — async HTTP so a slow upstream registry can never block the
+        # event loop (a synchronous urllib.urlopen here stalled the server for
+        # ALL tenants up to _REGISTRY_TIMEOUT seconds). Matches every other
+        # server-side outbound call, which use httpx.AsyncClient.
+        async with httpx.AsyncClient(timeout=_REGISTRY_TIMEOUT) as http:
+            resp = await http.get(
+                _REGISTRY_BASE,
+                params=params,
+                headers={"Accept": "application/json", "User-Agent": "Meridian/1.0"},
+            )
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as exc:  # noqa: BLE001
         _log.warning("MCP registry fetch failed: %s", exc)
         # Return cached data if available — prevents the browse section from
@@ -1890,7 +2024,7 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc") + _CUSTOM_SLOTS
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero") + _CUSTOM_SLOTS
 
 # Human-readable connector prefix shown to Claude in tool names (e.g.
 # "filesystem:read_file" instead of "fs:read_file"). The routing cache still
@@ -1903,6 +2037,8 @@ SLOT_DISPLAY_NAMES = {
     "ppt": "powerpoint",
     "word": "word",
     "dc": "desktop-commander",
+    "docs": "meridian-docs",
+    "zotero": "zotero-mcp",
     "p0": "custom-p0",
     "p1": "custom-p1",
     "p2": "custom-p2",
@@ -1914,6 +2050,23 @@ def _display_pretty(display: str) -> str:
     """Human label for a slot display name shown in tool titles:
     ``desktop-commander`` → ``Desktop Commander``, ``filesystem`` → ``Filesystem``."""
     return display.replace("-", " ").replace("_", " ").title()
+
+
+def _namespace_source_title(title: Any, src: str) -> "str | None":
+    """Prefix a bare tool title with its connector source (``Filesystem: Read File``).
+
+    Returns the namespaced title, or ``None`` when nothing should change (blank /
+    non-string title, or one already carrying the ``"{src}: "`` prefix). The
+    idempotency guard matches the EXACT ``"{src}: "`` prefix — not a loose
+    ``startswith(src)`` — so a legitimate title that merely begins with the source
+    word (e.g. the word slot's "Word count") is still namespaced, while a
+    re-listed already-namespaced title is left alone.
+    """
+    if not isinstance(title, str) or not title.strip():
+        return None
+    if title.startswith(f"{src}: "):
+        return None
+    return f"{src}: {title}"
 
 
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
@@ -1973,6 +2126,10 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_word_sockets, _pending_word_reqs
     if label == "dc":
         return _tunnel_dc_sockets, _pending_dc_reqs
+    if label == "docs":
+        return _tunnel_docs_sockets, _pending_docs_reqs
+    if label == "zotero":
+        return _tunnel_zotero_sockets, _pending_zotero_reqs
     if label in _tunnel_custom_sockets:  # 8fb69d54 — custom slots p0-p3
         return _tunnel_custom_sockets[label], _pending_custom_reqs[label]
     return _tunnel_extract_sockets, _pending_extract_reqs
@@ -1987,6 +2144,8 @@ def has_active_tunnel(tenant_id: str) -> bool:
         or tenant_id in _tunnel_ppt_sockets
         or tenant_id in _tunnel_word_sockets
         or tenant_id in _tunnel_dc_sockets
+        or tenant_id in _tunnel_docs_sockets
+        or tenant_id in _tunnel_zotero_sockets
         or any(tenant_id in s for s in _tunnel_custom_sockets.values())
     )
 
@@ -2006,6 +2165,8 @@ def active_tunnel_tenant_ids() -> "set[str]":
     ids.update(_tunnel_ppt_sockets)
     ids.update(_tunnel_word_sockets)
     ids.update(_tunnel_dc_sockets)
+    ids.update(_tunnel_docs_sockets)
+    ids.update(_tunnel_zotero_sockets)
     for s in _tunnel_custom_sockets.values():
         ids.update(s)
     return ids
@@ -2145,6 +2306,13 @@ async def list_tunnel_tools(
     ``reserved_names`` no longer needs to drop them — it's kept for forward
     compatibility but matched against the prefixed name (a no-op in practice).
     Slots are fetched in parallel so one slow/dead slot can't block the others.
+
+    Each surfaced tool is shaped so claude.ai's Tool Permissions screen lists it
+    as a distinct, source-labelled entry: the ``name`` is slot-prefixed (so no two
+    slots collide), and BOTH title carriers the permission UI reads —
+    ``annotations.title`` and top-level ``title`` — are namespaced with the
+    connector source so two slots exposing the same bare title (e.g. two
+    "Read File"s) don't render as indistinguishable duplicates.
     """
     aggregated: list[dict] = []
     routes: dict[str, str] = {}
@@ -2167,25 +2335,42 @@ async def list_tunnel_tools(
                 continue
             tool_copy = dict(tool)
             tool_copy["name"] = prefixed
-            # connector-source — claude.ai's tool-permission UI shows a tool's
-            # top-level ``title`` when present, else a humanized name. The prefixed
+            # connector-source — claude.ai's tool-permission UI resolves a tool's
+            # display title as ``annotations.title`` → top-level ``title`` →
+            # humanized name (per the MCP spec's title precedence). The prefixed
             # NAME already carries the source (codebase__search_graph →
             # "Codebase search graph"), but a slot whose inner server advertises a
             # bare tool title (filesystem's "Read File", serena, desktop-commander)
-            # would display WITHOUT its plugin source. Namespace the title too so
-            # every slot indicates its connector consistently. Guarded against
-            # double-prefixing; nested inputSchema param titles are left alone.
-            _title = tool.get("title")
-            if isinstance(_title, str) and _title.strip():
-                _src = _display_pretty(display)
-                if not _title.startswith(_src):
-                    tool_copy["title"] = f"{_src}: {_title}"
+            # would display WITHOUT its plugin source — and two slots exposing the
+            # same bare title (e.g. two "Read File"s) look duplicated / are hard to
+            # tell apart on the permission screen. Namespace BOTH title carriers so
+            # every slot indicates its connector consistently. Older servers put
+            # their human label in ``annotations.title`` (ToolAnnotations), so that
+            # field must be namespaced too, not just top-level ``title``. Guarded
+            # against double-prefixing; nested inputSchema param titles are untouched.
+            _src = _display_pretty(display)
+            _new_title = _namespace_source_title(tool.get("title"), _src)
+            if _new_title is not None:
+                tool_copy["title"] = _new_title
+            # ``annotations`` is shallow-shared via dict(tool); copy it before
+            # editing so we never mutate the inner server's advertised object.
+            _annot = tool.get("annotations")
+            if isinstance(_annot, dict):
+                _annot_title = _namespace_source_title(_annot.get("title"), _src)
+                if _annot_title is not None:
+                    annot_copy = dict(_annot)
+                    annot_copy["title"] = _annot_title
+                    tool_copy["annotations"] = annot_copy
             routes[prefixed] = label  # route back via the internal slot label
             aggregated.append(_rewrite_tool_description(tool_copy))
     if routes:
         _tunnel_tool_routes[tenant_id] = routes
     elif not has_active_tunnel(tenant_id):
         _tunnel_tool_routes.pop(tenant_id, None)
+    # 54ddd609 — this (re)aggregation reflects the current live slot health, so a
+    # pending tools/list_changed marker (set on a slot recovery) is now satisfied:
+    # the caller is observing the recovered tools. Drain it so it fires only once.
+    _tools_list_changed_pending.discard(tenant_id)
     return aggregated
 
 

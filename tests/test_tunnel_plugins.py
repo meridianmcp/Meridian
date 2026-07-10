@@ -16,9 +16,10 @@ from meridian import tunnel_plugins as tp
 def test_resolve_defaults_returns_builtins_in_order():
     plugins = tp.resolve_plugins(None)
     assert [p["name"] for p in plugins] == [
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
+        "desktop-commander", "meridian-docs", "zotero-mcp"
     ]
-    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word", "dc"]
+    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero"]
     # The three code/fs slots default ON with no command override; Office slots
     # and desktop-commander default OFF.
     by_name = {p["name"]: p for p in plugins}
@@ -198,7 +199,8 @@ def test_description_overrides_normalized_to_strings():
 
 def test_builtin_names_helper():
     assert tp.builtin_names() == (
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
+        "desktop-commander", "meridian-docs", "zotero-mcp"
     )
 
 
@@ -407,8 +409,10 @@ def test_custom_plugin_empty_and_garbage_config():
 
 
 def test_custom_plugin_carries_env_dict():
-    # 194a7776 — a local Zotero MCP needs ZOTERO_LOCAL=true passed at spawn.
-    cfg = [{"name": "zotero-mcp", "command": "uvx zotero-mcp", "port": 8814,
+    # 194a7776 — a custom MCP can pass spawn env (e.g. a local Zotero needs
+    # ZOTERO_LOCAL=true). NB: since 39c117b1, zotero-mcp is a first-class BUILTIN
+    # slot, so it is a reserved name; this generic env check uses a custom name.
+    cfg = [{"name": "my-local-mcp", "command": "uvx my-local-mcp", "port": 8814,
             "env": {"ZOTERO_LOCAL": "true"}}]
     custom = tp.resolve_custom_plugins(cfg)
     assert len(custom) == 1
@@ -493,8 +497,10 @@ def test_validate_custom_plugin_rejects_bad_and_colliding_ports():
 
 
 def test_validate_custom_plugin_attaches_env_when_present():
+    # zotero-mcp is a reserved builtin name since 39c117b1 — use a custom name
+    # for this generic env-attach check.
     entry, err = tp.validate_custom_plugin(
-        "zotero-mcp", "uvx zotero-mcp", 8901, env={"ZOTERO_LOCAL": "true", "": "drop"})
+        "my-local-mcp", "uvx my-local-mcp", 8901, env={"ZOTERO_LOCAL": "true", "": "drop"})
     assert err is None and entry["env"] == {"ZOTERO_LOCAL": "true"}
     # Envless entry keeps the historical shape (no "env" key).
     entry2, _ = tp.validate_custom_plugin("p", "uvx p", 8902)

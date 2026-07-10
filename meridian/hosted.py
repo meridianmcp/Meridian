@@ -2391,6 +2391,246 @@ async def run_churn_cleanup(db: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Trial-expiration reminder emails (9f7bfcca)
+# ---------------------------------------------------------------------------
+
+# Days-remaining thresholds at which a trial tenant is reminded, once each.
+TRIAL_REMINDER_THRESHOLDS: tuple[int, ...] = (14, 7, 1)
+
+# Only these plans are on a free trial that can expire. Paying plans
+# (standard/pro) renew via Stripe and never receive a trial-expiry reminder.
+_TRIAL_PLANS: frozenset[str] = frozenset({"free", "trial"})
+
+
+def _parse_tenant_ts(raw: Any) -> "datetime | None":
+    """Parse a tenant timestamp column into an aware UTC datetime, or None.
+
+    Tolerates the two formats Meridian writes: the ``"%Y-%m-%d %H:%M:%S"``
+    form used for ``inactivity_expires_at`` and ISO-8601 (``created_at`` via
+    ``datetime('now')`` / explicit isoformat writes). Naive values are treated
+    as UTC.
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    for parser in (
+        lambda v: datetime.strptime(v[:19], "%Y-%m-%d %H:%M:%S"),
+        lambda v: datetime.fromisoformat(v.replace("Z", "+00:00")),
+    ):
+        try:
+            dt = parser(s)
+        except (ValueError, TypeError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+def compute_trial_reminder(
+    tenant: dict[str, Any],
+    now: "datetime",
+) -> "int | None":
+    """Pure decision: which single reminder threshold should fire *now* for
+    this tenant, or ``None`` if no email should be sent.
+
+    This function does no I/O — it is the unit-testable core of the daily
+    trial-reminder pass. It:
+
+    * skips non-trial plans (``standard``/``pro``/``admin`` — only ``free``/
+      ``trial`` are eligible),
+    * skips internal tenants,
+    * requires a resolvable trial expiry (``inactivity_expires_at``, falling
+      back to a 30-day window from ``trial_started_at`` — mirroring the
+      dashboard banner in ``server.py``),
+    * skips already-expired trials (nothing to remind about),
+    * reads which thresholds were already sent from the existing
+      ``notification_prefs`` JSON blob (key ``trial_reminders_sent``), so no
+      schema column is needed for idempotency,
+    * buckets the tenant into the *tightest* threshold they currently fall in
+      — the smallest threshold ``>= days_remaining`` — so the email always
+      states an accurate "ends in N days" (at 10 days out you get the 14-day
+      notice, at 7 the 7-day notice, at 1 the 1-day notice), and returns that
+      threshold only if it has not already been sent. Once sent, that bucket
+      is skipped forever; the next (smaller) bucket fires on a later pass,
+      giving exactly one email per threshold.
+    """
+    if tenant.get("is_internal"):
+        return None
+    plan = (tenant.get("plan") or "").lower()
+    if plan not in _TRIAL_PLANS:
+        return None
+
+    expires_at = _parse_tenant_ts(tenant.get("inactivity_expires_at"))
+    if expires_at is None:
+        anchor = _parse_tenant_ts(
+            tenant.get("trial_started_at") or tenant.get("created_at")
+        )
+        if anchor is not None:
+            expires_at = anchor + timedelta(days=30)
+    if expires_at is None:
+        return None
+
+    remaining = expires_at - now
+    # Already expired (or expiring this instant) — the dunning/expiry flow
+    # handles those; a "your trial ends soon" nudge would be wrong.
+    if remaining.total_seconds() <= 0:
+        return None
+    days_remaining = remaining.days  # floor; 1.9 days -> 1
+
+    # Tightest bucket the tenant currently falls in: the smallest configured
+    # threshold that is still >= days_remaining. Beyond the largest threshold
+    # (too far out) there is no bucket yet.
+    buckets = sorted(TRIAL_REMINDER_THRESHOLDS)
+    bucket = next((th for th in buckets if days_remaining <= th), None)
+    if bucket is None:
+        return None
+
+    if bucket in _trial_reminders_sent(tenant):
+        return None
+    return bucket
+
+
+def _trial_reminders_sent(tenant: dict[str, Any]) -> set[int]:
+    """Return the set of trial-reminder thresholds already emailed to this
+    tenant, read from the ``notification_prefs`` JSON blob. Tolerant of a
+    missing / malformed blob (treated as none sent)."""
+    import json as _json
+
+    raw = tenant.get("notification_prefs")
+    if not raw:
+        return set()
+    try:
+        prefs = raw if isinstance(raw, dict) else _json.loads(raw)
+    except (ValueError, TypeError):
+        return set()
+    sent = prefs.get("trial_reminders_sent") if isinstance(prefs, dict) else None
+    if not isinstance(sent, (list, tuple, set)):
+        return set()
+    out: set[int] = set()
+    for v in sent:
+        try:
+            out.add(int(v))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _with_reminder_recorded(
+    tenant: dict[str, Any], threshold: int
+) -> str:
+    """Return the tenant's ``notification_prefs`` JSON with ``threshold`` added
+    to ``trial_reminders_sent`` — the value to persist after a send. Preserves
+    every other key already in the blob."""
+    import json as _json
+
+    raw = tenant.get("notification_prefs")
+    try:
+        prefs = (
+            dict(raw)
+            if isinstance(raw, dict)
+            else (_json.loads(raw) if raw else {})
+        )
+    except (ValueError, TypeError):
+        prefs = {}
+    if not isinstance(prefs, dict):
+        prefs = {}
+    sent = sorted(_trial_reminders_sent(tenant) | {int(threshold)})
+    prefs["trial_reminders_sent"] = sent
+    return _json.dumps(prefs)
+
+
+def _trial_reminder_email(threshold: int, base: str) -> tuple[str, str]:
+    """Return ``(subject, html)`` for the given days-remaining threshold."""
+    if threshold == 1:
+        when = "tomorrow"
+    else:
+        when = f"in {threshold} days"
+    subject = f"Your Meridian free trial ends {when}"
+    html = (
+        f"<h2>Your Meridian trial ends {when}</h2>"
+        f"<p>Your free trial is almost over. Upgrade now to keep your "
+        f"projects, session memory, and coordination data.</p>"
+        f"<p><a href='{base}/pricing'>Choose a plan &rarr;</a></p>"
+        f"<p>Nothing is deleted the moment your trial ends — but upgrading "
+        f"now avoids any interruption to your AI coding sessions.</p>"
+        f"<p>Questions? Reply to this email or contact "
+        f"<a href='mailto:hello@usemeridian.us'>hello@usemeridian.us</a>.</p>"
+    )
+    return subject, html
+
+
+async def run_trial_reminder_check(db: Any, *, now: "datetime | None" = None) -> None:
+    """Daily pass: email each trialing tenant once per {14, 7, 1}-day threshold
+    before their free trial ends.
+
+    Idempotent without a schema change — which thresholds were sent is stored
+    in the existing ``tenants.notification_prefs`` JSON blob (see
+    ``compute_trial_reminder``). Guarded to hosted mode by the caller (the
+    background loop only invokes this when ``MERIDIAN_HOSTED`` is set).
+
+    ``now`` is injectable purely for testing; production calls pass nothing and
+    get ``datetime.now(timezone.utc)``.
+    """
+    import httpx
+
+    from . import db as db_module
+
+    now = now or datetime.now(timezone.utc)
+    resend_key = _cfg("RESEND_API_KEY")
+    if not resend_key:
+        return  # dev mode — no email transport configured
+    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+
+    async with db.execute(
+        "SELECT * FROM tenants WHERE plan IN ('free', 'trial')"
+    ) as cur:
+        rows = await cur.fetchall()
+
+    def _to_d(r: Any) -> dict:
+        return r if isinstance(r, dict) else {k: r[k] for k in r.keys()}
+
+    for row in rows or []:
+        tenant = _to_d(row)
+        threshold = compute_trial_reminder(tenant, now)
+        if threshold is None:
+            continue
+        email = tenant.get("email")
+        if not email:
+            continue
+        subject, html = _trial_reminder_email(threshold, base)
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                resp = await http.post(
+                    "https://api.resend.com/emails",
+                    headers={
+                        "Authorization": f"Bearer {resend_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "from": from_addr,
+                        "to": [email],
+                        "subject": subject,
+                        "html": html,
+                    },
+                )
+                resp.raise_for_status()
+        except Exception:  # noqa: BLE001 — one bad send must not stall the pass
+            continue
+        # Persist idempotency marker only after a successful send, so a
+        # transient Resend failure retries on the next daily pass.
+        try:
+            await db_module.update_tenant(
+                db,
+                tenant["id"],
+                notification_prefs=_with_reminder_recorded(tenant, threshold),
+            )
+        except Exception:  # noqa: BLE001
+            continue
+
+
+# ---------------------------------------------------------------------------
 # Dunning flow — payment failure → warnings → hard delete
 # ---------------------------------------------------------------------------
 

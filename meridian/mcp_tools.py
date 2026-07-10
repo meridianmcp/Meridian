@@ -36,6 +36,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_latex_structure": 'get_latex_structure(file_path="thesis/chapter1.tex")',
     "get_citation_edges": 'get_citation_edges(project_id="abc-123", source="thesis/chapter1.tex")',
     "resolve_citations": 'resolve_citations(project_id="abc-123")',
+    "index_equation": 'index_equation(project_id="abc-123", doc="thesis/chapter1.docx", omml_or_latex="E=mc^2", semantic_label="mass-energy equivalence")',
+    "find_similar_equation": 'find_similar_equation(project_id="abc-123", doc="thesis/chapter1.docx", latex="E=mc^2")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -67,6 +69,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "idle_until_session_done": 'idle_until_session_done(watching_session_id="session-uuid")',
     "get_session_log": 'get_session_log(session_id="session-uuid")',
     "set_active_repo": 'set_active_repo(repo_path="C:\\\\Users\\\\me\\\\project")',
+    "analyze_model_efficiency": 'analyze_model_efficiency(title="Refactor auth across 12 files + migration", file_count=12, touches_resources=["auth_db", "sessions_table"], size="xl")',
 }
 
 
@@ -413,30 +416,83 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally."},
          "max_items": {"type": "integer", "description": "Cap how many unresolved markers to attempt this pass. Omit to attempt all."}},
          "required": []}},
+    {"name": "index_equation", "description":
+        "06df6ab3 — index ONE Word equation (OMML) against a document already "
+        "stored in the doc-structure store (via ingest_document or a prior "
+        "reindex, so pass the SAME source/path used there as `doc`). "
+        "omml_or_latex is auto-detected: a string starting with '<' is treated "
+        "as raw OMML XML (stored as-is); anything else is treated as LaTeX "
+        "source (real OMML is generated best-effort — pure-Python latex2mathml "
+        "piped through a hand-written MathML->OOXML mapper; returns null omml "
+        "on an unsupported construct, never an error). Before inserting, the "
+        "normalized LaTeX is fuzzy-matched against every equation already "
+        "stored for this document — a near-duplicate is NOT silently dropped "
+        "(the equation is still inserted) but IS surfaced via "
+        "near_duplicates:[{equation_id, matched_id, matched_latex, score}] so "
+        "you can spot accidental re-derivations. Returns {equation, "
+        "near_duplicates}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "omml_or_latex": {"type": "string", "description": "Raw OMML XML (starts with '<') OR a LaTeX source string."},
+         "semantic_label": {"type": "string", "description": "Optional human label for the equation (e.g. 'mass-energy equivalence')."}},
+         "required": ["doc", "omml_or_latex"]}},
+    {"name": "find_similar_equation", "description":
+        "06df6ab3 — fuzzy-match a LaTeX string against every equation already "
+        "indexed (index_equation / reindex_document) for one stored document, "
+        "best match first. Each result carries the stored equation row PLUS a "
+        "difflib similarity score (0..1) against its latex_normalized. Useful "
+        "before index_equation to check whether an equation is already present "
+        "under a slightly different LaTeX spelling. Returns {document_id, "
+        "matches:[...]} — an empty list (never an error) when the document has "
+        "no stored equations, or doc doesn't resolve to a stored document.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "latex": {"type": "string", "description": "LaTeX source to fuzzy-match against this document's stored equations."},
+         "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
+         "required": ["doc", "latex"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
         "Selector composition. targets is an ARRAY of {uri, selector, subSelector?} "
         "objects (native multi-file, the LSP WorkspaceEdit pattern); the whole composite "
-        "shape is stored as JSON, not per-domain columns. Each selector.type is one of:\n"
-        "• range — a line span {start_line, start_char?, end_line, end_char?} (an LSP "
-        "Range); the pointer IS the location.\n"
-        "• symbol — {qualified_name} resolved against the cached code graph to a file+line.\n"
-        "• node_id — {id} of a doc_store element (an ingested-document structure node).\n"
-        "• zotero_key — {key} of a Zotero library item.\n"
+        "shape is stored as JSON, not per-domain columns. Every selector is an object "
+        "with an explicit \"type\" PLUS that type's own field(s):\n"
+        "• range — {\"type\":\"range\", \"start_line\":int, \"end_line\":int, "
+        "\"start_char\"?:int, \"end_char\"?:int} (an LSP Range); the pointer IS the "
+        "location.\n"
+        "• symbol — {\"type\":\"symbol\", \"qualified_name\":\"pkg.mod.func\"} resolved "
+        "against the cached code graph to a file+line.\n"
+        "• node_id — {\"type\":\"node_id\", \"id\":\"<element-id>\"} of a doc_store "
+        "element (an ingested-document structure node). NOTE: the field is \"id\", NOT "
+        "\"value\".\n"
+        "• zotero_key — {\"type\":\"zotero_key\", \"key\":\"<zotero-key>\"} of a Zotero "
+        "library item.\n"
         "An optional selector.subSelector nests finer granularity (W3C hasSubSelector) — "
-        "e.g. a symbol selector + a range subSelector = 'these lines, within this "
-        "function'. source_type names the domain (code | docs | citation | …). Malformed "
-        "pointers (bad selector.type, missing required selector fields) are rejected. "
-        "Returns the stored pointer.",
+        "e.g. {\"type\":\"symbol\", \"qualified_name\":\"a.b.f\", \"subSelector\": "
+        "{\"type\":\"range\", \"start_line\":3, \"end_line\":4}} = 'these lines, within "
+        "this function'. A subSelector is itself a FULL selector and MUST carry its OWN "
+        "explicit \"type\" (it does not inherit the parent's). source_type names the "
+        "domain (code | docs | citation | …). Malformed pointers are rejected with a "
+        "clear error: a bad/missing selector.type, a missing required selector field "
+        "(e.g. node_id without \"id\", or a subSelector with no \"type\"). Returns the "
+        "stored pointer.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
          "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | … (free text)."},
          "targets": {"type": "array", "description":
-             "Non-empty array of {uri, selector, subSelector?} targets. selector.type ∈ "
-             "range|symbol|node_id|zotero_key with its type-specific fields.",
+             "Non-empty array of {uri, selector, subSelector?} targets. Each selector is "
+             "an object carrying an explicit \"type\" plus that type's field: range "
+             "{\"type\":\"range\", start_line, end_line, start_char?, end_char?}; symbol "
+             "{\"type\":\"symbol\", qualified_name}; node_id {\"type\":\"node_id\", id} "
+             "(field is \"id\", NOT \"value\"); zotero_key {\"type\":\"zotero_key\", key}. "
+             "An optional subSelector is itself a full selector and MUST carry its own "
+             "\"type\".",
              "items": {"type": "object"}},
          "label": {"type": "string", "description": "Optional human-readable label for the pointer."}},
          "required": ["sprint_item_id", "source_type", "targets"]}},
@@ -796,7 +852,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "deferred_until": {"type": "string",
                             "description": "dec69708 — ISO timestamp before which the item CANNOT be claimed. claim_sprint_item hard-refuses it until this time passes (enforced deferral, e.g. 'defer the paper-track until 2026-09-01'). Omit for an immediately-claimable item."},
          "track": {"type": "string",
-                   "description": "dec69708 — named lane for the item (e.g. 'paper'). Buckets items so a whole track can be deferred/skipped."}},
+                   "description": "dec69708 — named lane for the item (e.g. 'paper'). Buckets items so a whole track can be deferred/skipped."},
+         "priority": {"type": "string", "enum": ["urgent", "high", "normal", "low"],
+                      "description": "e08fee30 — item priority (default 'normal'). Higher-priority PENDING items are surfaced, claimed, and grouped FIRST: get_sprint_items and get_parallelizable_groups order urgent-first within their existing ordering, so an executor picks up higher-priority work before lower. Ordering-only for now; a running-session preemption/interrupt mechanism is deferred."},
+         "blocker_kind": {"type": "string", "enum": ["manual"],
+                          "description": "2282a636 — omit for an ordinary item; 'manual' marks the item as blocked on a REAL-WORLD action OUTSIDE Meridian (publish something, obtain an API key, talk to an advisor). DISTINCT from milestone_type='human' (which is about WHO executes): a manual-blocker item is surfaced distinctly and is EXCLUDED from executor 'just claim the next pending' scoping, so an executor never treats it as claimable work."}},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -842,7 +902,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                                "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged. SYMBOL-LEVEL: append ':symbol_name' to a file id ('file:path.py:func') so items editing different symbols in the same file are non-overlapping and co-batch in parallel."},
          "required_notes": {"type": "boolean", "description": "Quality gate (5823db0b): when true, complete_sprint_item is blocked until the item has evidence (existing notes, a linked task, or a notes= argument on completion)."},
          "deferred_until": {"type": "string", "description": "dec69708 — ISO timestamp before which the item CANNOT be claimed (enforced deferral). Pass an empty string to CLEAR the deferral and make the item claimable now. Omit to leave unchanged."},
-         "track": {"type": "string", "description": "dec69708 — named lane (e.g. 'paper'). Pass an empty string to clear; omit to leave unchanged."}},
+         "track": {"type": "string", "description": "dec69708 — named lane (e.g. 'paper'). Pass an empty string to clear; omit to leave unchanged."},
+         "priority": {"type": "string", "enum": ["urgent", "high", "normal", "low"],
+                      "description": "e08fee30 — set the item's priority (urgent|high|normal|low). Higher-priority pending items are surfaced/claimed/grouped first. Omit to leave unchanged."},
+         "blocker_kind": {"type": "string", "enum": ["manual"],
+                          "description": "2282a636 — 'manual' marks the item as blocked on a real-world action OUTSIDE Meridian (distinct from milestone_type='human'; excluded from executor scoping). Pass an empty string to CLEAR it (ordinary item); omit to leave unchanged."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "
@@ -1202,6 +1266,29 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "repo_path": {"type": "string", "description": "Absolute path to the repository to activate (e.g. /home/me/project or C:\\\\Users\\\\me\\\\project)."}},
          "required": ["repo_path"]}},
+    {"name": "analyze_model_efficiency",
+     "description":
+        "0fba4cb6 — MECHANICAL (zero-token) model-tier suggestion for a task or "
+        "sprint item. Deterministic, rule/heuristic classifier: NO model call, NO "
+        "DB, NO network — it mirrors how the ultracode orchestration script spends "
+        "zero model tokens on routing. Pass a task descriptor (any of title, "
+        "description, file_count, files, touches_resources, size) and it returns a "
+        "suggested tier: {tier: 'haiku'|'sonnet'|'opus', score, signals:[{signal, "
+        "detail, weight}...], rationale, mode:'mechanical'}. Cheap-leaning signals "
+        "(title keywords like 'typo'/'docstring'/'lint', 1 file, size 'xs'/'s') "
+        "pull toward 'haiku'; expensive-leaning signals ('refactor'/'migration'/"
+        "'auth', many files, touched resources, size 'l'/'xl') pull toward 'opus'. "
+        "Use it to route a task to the cheapest sufficient model before spawning an "
+        "executor. FOLLOW-UP (out of scope this pass): a second LLM-backed "
+        "'semantic' mode that reads the full item for a nuanced second opinion.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Task / sprint-item title. Scanned for cheap/expensive keyword signals."},
+         "description": {"type": "string", "description": "Optional longer description; also scanned for keyword signals."},
+         "file_count": {"type": "integer", "description": "Number of files the task touches. Fewer files -> cheaper tier."},
+         "files": {"type": "array", "items": {"type": "string"}, "description": "Alternative to file_count: the list of files touched; its length is used when file_count is omitted."},
+         "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Resources (DB/schema/infra/services) the task touches. May also be an integer count. More/any resources -> more expensive."},
+         "size": {"type": "string", "enum": ["xs", "s", "m", "l", "xl"], "description": "Optional explicit sprint-item size estimate (case-insensitive). Larger -> more expensive."}},
+         "required": []}},
 ]
 
 _READ_ONLY_TOOLS = {
@@ -1219,7 +1306,9 @@ _READ_ONLY_TOOLS = {
     "list_plugins", "get_plugin_details",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
+    "find_similar_equation",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
+    "analyze_model_efficiency",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer"}
 
@@ -1268,6 +1357,9 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "list_plugins": "List Plugins",
     "get_plugin_details": "Get Plugin Details",
     "set_active_repo": "Set Active Repo",
+    "analyze_model_efficiency": "Analyze Model Efficiency",
+    "index_equation": "Index Equation",
+    "find_similar_equation": "Find Similar Equation",
 }
 
 for _tool in _MCP_TOOLS_LIST:

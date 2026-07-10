@@ -1054,7 +1054,7 @@ def test_websocket_receives_task_event(client):
 def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
     r = client.get("/tunnel/status/no-such-tenant")
     assert r.status_code == 200
-    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "slot_health": {}, "slot_status": {}}
+    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "zotero_active": False, "slot_health": {}, "slot_status": {}}
 
 
 def test_fs_mcp_proxy_returns_503_when_not_hosted(client):
@@ -3224,16 +3224,17 @@ async def test_dispatch_unresolvable_project_name_on_write_tool_raises(db):
 
 @pytest.mark.asyncio
 async def test_dispatch_project_scoped_tool_with_neither_fails_cleanly(db):
-    """Neither project_id nor project_name → deterministic error, never a hang
-    or silent success. The resolver's args.get(...,"") defaults keep it from
-    KeyError-ing; the handler then surfaces a clean exception the transport
-    layers turn into an {"error": ...} payload."""
+    """Neither project_id nor project_name → deterministic clean error, never a
+    hang, a raw KeyError, or silent success. 8f01cdfe: add_sprint_item now
+    RETURNS a descriptive {"error": ...} dict (it previously raised a bare
+    KeyError('project_id') that leaked as a cryptic -32603 "'project_id'")."""
     from meridian import server as srv
 
-    with pytest.raises((KeyError, ValueError)):
-        await srv._dispatch_mcp_tool(
-            "add_sprint_item", {"version": "v1", "title": "orphan"}, db, "/tmp"
-        )
+    result = await srv._dispatch_mcp_tool(
+        "add_sprint_item", {"version": "v1", "title": "orphan"}, db, "/tmp"
+    )
+    assert isinstance(result, dict) and result.get("error")
+    assert "project_id" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -7006,10 +7007,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_session_goal_compliance",
         "_migrate_pg_sprint_item_pointers",
         "_migrate_pg_sprint_item_deferral",
+        "_migrate_pg_sprint_item_priority_blocker",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 88
+    assert len(allnames) == len(set(allnames)) == 89
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -16632,3 +16634,56 @@ def test_self_host_defaults_env_over_toml_over_default(monkeypatch, tmp_path):
     assert d["loop_enabled_default"] is True
     assert d["max_turns_default"] == 7
     assert d["filesystem_roots"] == ["/a", "/b", "/c"]
+
+
+# ---------------------------------------------------------------------------
+# 9dad83fd — recovery for answered blocking HITLs whose session died
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recoverable_blocking_hitl_once_delivery(db):
+    p = await db_module.create_project(db, "alpha")
+    dead = await db_module.register_session(db, p["id"], "dead-sess")
+    live = await db_module.register_session(db, p["id"], "live-sess")
+    # Blocking HITL filed by the (soon-dead) session, then answered by a human.
+    h = await db_module.request_hitl(
+        db, p["id"], "Merge phantom project?", session_id=dead["id"],
+        urgency="blocking", require_human=True,
+    )
+    await db_module.answer_hitl_request(db, h["id"], "no, keep separate", answered_by="adam")
+    # A non-blocking answered HITL must NOT be recovered.
+    h2 = await db_module.request_hitl(
+        db, p["id"], "fyi", session_id=dead["id"], urgency="normal", require_human=True,
+    )
+    await db_module.answer_hitl_request(db, h2["id"], "ok", answered_by="adam")
+
+    # Originating session dead (not in the active set) → the blocking answer is recovered.
+    rec = await db_module.get_recoverable_hitl_answers(
+        db, p["id"], active_session_ids={live["id"]}
+    )
+    assert [r["id"] for r in rec] == [h["id"]]
+    assert rec[0]["answer"] == "no, keep separate"
+    assert rec[0]["answered_by"] == "adam"
+
+    # Marked delivered → not returned again (idempotent once-delivery).
+    await db_module.mark_hitl_recovery_delivered(db, h["id"])
+    rec2 = await db_module.get_recoverable_hitl_answers(
+        db, p["id"], active_session_ids={live["id"]}
+    )
+    assert rec2 == []
+
+
+@pytest.mark.asyncio
+async def test_recoverable_hitl_skips_live_originating_session(db):
+    p = await db_module.create_project(db, "beta")
+    s = await db_module.register_session(db, p["id"], "still-alive")
+    h = await db_module.request_hitl(
+        db, p["id"], "q", session_id=s["id"], urgency="blocking", require_human=True,
+    )
+    await db_module.answer_hitl_request(db, h["id"], "a", answered_by="adam")
+    # Originating session still active → NOT recovered (it consumes its own answer).
+    rec = await db_module.get_recoverable_hitl_answers(
+        db, p["id"], active_session_ids={s["id"]}
+    )
+    assert rec == []

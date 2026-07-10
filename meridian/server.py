@@ -567,6 +567,16 @@ async def lifespan(app: FastAPI):
                                 await run_overage_check(db)
                             except Exception:  # noqa: BLE001
                                 pass
+                            # 9f7bfcca — daily trial-expiration reminder pass
+                            # (14/7/1 days out). Idempotent via the tenant's
+                            # notification_prefs JSON blob; no-op without a
+                            # Resend key. Hosted-only (this block is already
+                            # gated on MERIDIAN_HOSTED above).
+                            try:
+                                from .hosted import run_trial_reminder_check
+                                await run_trial_reminder_check(db)
+                            except Exception:  # noqa: BLE001
+                                pass
                 # v2.4 — refresh the CLAUDE.md <current_state> block for
                 # every project on each cycle. Local dev only — skipped
                 # on hosted multi-tenant deployments where there is no
@@ -3959,6 +3969,19 @@ async def _build_orchestration_hint(
         "eligible_count": grouping.get("eligible_count", 0),
         "groups": compact_groups,
     }
+    # 470b1f46 — executors default to running items one at a time even when the
+    # board is parallel-safe. When a group can genuinely run >1 item at once,
+    # attach an IMPERATIVE directive (not just passive group data) so the session
+    # actually fans out concurrent subagents instead of serializing the work.
+    if strategy == "parallel":
+        _multi_groups = sum(1 for g in groups if len(g) > 1)
+        hint["parallel_directive"] = (
+            f"PARALLELIZE NOW: {_multi_groups} group(s) below hold multiple "
+            "conflict-free items. Fan each such group out as CONCURRENT subagents "
+            "(one git worktree per item), then finish that group before starting "
+            "the next. Do NOT execute parallel-safe items one at a time — "
+            "serializing parallelizable work is a diagnosed anti-pattern."
+        )
     blocked = grouping.get("blocked") or []
     if blocked:
         hint["blocked_count"] = len(blocked)
@@ -4129,6 +4152,71 @@ async def _build_codebase_context(
     return block
 
 
+def _wall_clock_now(tz_name: str | None = None) -> dict[str, Any]:
+    """3d7b7aca — a timezone-aware wall-clock snapshot for session context.
+
+    The bare ``current_timestamp`` string was UTC but carried no offset, so an
+    executor (or a downstream planner spanning calendar days) couldn't tell the
+    zone or the weekday from it. This returns an unambiguous, timezone-aware
+    block: an ISO-8601 string WITH the offset, epoch seconds, the weekday, and a
+    human-readable label. Server time is UTC; pass an IANA ``tz_name`` (e.g.
+    ``"America/Denver"``) to render in that zone instead — a bad/unknown name
+    falls back to UTC rather than raising."""
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    label = "UTC"
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            now = now.astimezone(ZoneInfo(tz_name))
+            label = tz_name
+        except Exception:  # noqa: BLE001 — unknown zone → keep UTC
+            now = _dt.now(_tz.utc)
+            label = "UTC"
+    return {
+        "iso": now.isoformat(timespec="seconds"),
+        "unix": int(now.timestamp()),
+        "weekday": now.strftime("%A"),
+        "human": now.strftime("%A, %d %b %Y %H:%M:%S %z") or now.strftime("%A, %d %b %Y %H:%M:%S"),
+        "tz": label,
+    }
+
+
+def _executor_config_tz(project: dict[str, Any] | None) -> str | None:
+    """3d7b7aca — read a per-project IANA timezone from executor_config (a JSON
+    blob, so no schema change). Returns None when unset/blank so _wall_clock_now
+    defaults to UTC."""
+    cfg: Any = (project or {}).get("executor_config") or {}
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg) or {}
+        except Exception:  # noqa: BLE001
+            cfg = {}
+    tz = cfg.get("timezone") if isinstance(cfg, dict) else None
+    return tz.strip() if isinstance(tz, str) and tz.strip() else None
+
+
+def _session_elapsed(session: dict[str, Any] | None) -> dict[str, Any] | None:
+    """3d7b7aca — seconds + human label since a session's created_at. ~0 for a
+    fresh session; meaningful when start_session(mode='continue') resumes an
+    existing one. Returns None if created_at is missing/unparseable."""
+    created = (session or {}).get("created_at")
+    if not created:
+        return None
+    from datetime import datetime as _dt, timezone as _tz
+    try:
+        started = _dt.fromisoformat(str(created).replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=_tz.utc)
+        secs = max(0, int((_dt.now(_tz.utc) - started).total_seconds()))
+    except Exception:  # noqa: BLE001
+        return None
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    human = f"{h}h {m}m" if h else (f"{m}m {s}s" if m else f"{s}s")
+    return {"seconds": secs, "human": human}
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4225,6 +4313,26 @@ async def _start_session_composite(
         sprint_version=scoped_version,
     )
     _mark_session_connected(session["id"])
+    # 9dad83fd — recover answers to blocking HITLs whose originating (now-dead)
+    # session was the only poller, so a resuming session doesn't lose them.
+    # Best-effort + once-delivery (marks each delivered); never breaks orientation.
+    recovered_hitls: list[dict[str, Any]] = []
+    try:
+        _active_sess = await db_module.get_sessions(db, project_id, active_only=True)
+        _active_ids = {s.get("id") for s in _active_sess if s.get("id")}
+        for _h in await db_module.get_recoverable_hitl_answers(
+            db, project_id, active_session_ids=_active_ids
+        ):
+            recovered_hitls.append({
+                "id": _h.get("id"),
+                "question": (_h.get("question") or "")[:160],
+                "answer": _h.get("answer"),
+                "answered_by": _h.get("answered_by"),
+                "answered_at": _h.get("answered_at"),
+            })
+            await db_module.mark_hitl_recovery_delivered(db, _h.get("id"))
+    except Exception:  # noqa: BLE001 — recovery is best-effort
+        recovered_hitls = []
     # G9.x - If start_session is called with an explicit project_id, any pending
     # hook_project_select HITL for this project is redundant -- dismiss it silently.
     # The executor already chose this project by calling start_session.
@@ -4352,6 +4460,11 @@ async def _start_session_composite(
             # de193a81 — anchor the executor to the real date/time so a session
             # spanning multiple calendar days doesn't drift on "today".
             "current_timestamp": _c_now,
+            # 3d7b7aca — timezone-aware wall-clock block (offset, weekday, epoch)
+            # so the executor has an unambiguous, parseable time signal. Honors a
+            # per-project executor_config.timezone; falls back to UTC.
+            "current_time": _wall_clock_now(_executor_config_tz(_c_project)),
+            "session_elapsed": _session_elapsed(session),
             "execution_mode": _c_mode,  # ecf69de8 — structured posture field
             "execution_mode_directive": _c_mode_directive,
             "execute_immediately": _c_execute_now,
@@ -4416,6 +4529,8 @@ async def _start_session_composite(
                     _c_payload["orchestration"] = _c_orch
             except Exception:
                 pass
+        if recovered_hitls:  # 9dad83fd — only when there's something to recover
+            _c_payload["recovered_hitl_answers"] = recovered_hitls
         return _c_payload
 
     await _expire_and_generate_handoffs(db, data_dir)
@@ -4538,6 +4653,12 @@ async def _start_session_composite(
         )
     payload: dict[str, Any] = {
         "session_id": session["id"],
+        # 3d7b7aca — timezone-aware wall-clock so the full orientation carries a
+        # direct, unambiguous time signal (the compact path already does). Honors
+        # a per-project executor_config.timezone; falls back to UTC.
+        "current_timestamp": _wall_clock_now(_executor_config_tz(project))["iso"],
+        "current_time": _wall_clock_now(_executor_config_tz(project)),
+        "session_elapsed": _session_elapsed(session),
         "execution_mode": execution_mode,  # ecf69de8 — structured posture field
         "execution_mode_directive": mode_directive,
         "execute_immediately": _exec_now,
@@ -4589,6 +4710,8 @@ async def _start_session_composite(
         payload["executor_config"] = executor_config
         payload["executor_context"] = executor_context
         payload["role"] = "executor"
+    if recovered_hitls:  # 9dad83fd — surface recovered blocking-HITL answers
+        payload["recovered_hitl_answers"] = recovered_hitls
     return payload
 
 

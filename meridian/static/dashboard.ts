@@ -13,6 +13,13 @@ import "./dashboard-plugins";
 import "./dashboard-notes";
 import "./dashboard-files";
 import "./dashboard-rewind";
+// e553fa7a — workspace Blog tab editor/card builders (edit-in-place for drafts).
+import {
+  blogEditorFormHtml,
+  blogPostCardHtml,
+  populateBlogEditor,
+  resetBlogEditor,
+} from "./dashboard-blog";
 // ff8ff615 — Preact Code Intel panel (layered package DAG, replaces ECharts circles).
 import { mountCodeIntelPanel } from "./components/CodeIntelPanel";
 // ed5512b6 — standalone, decoupled codegraph visualizer (folder->file->function
@@ -21,6 +28,24 @@ import { mountCodeIntelPanel } from "./components/CodeIntelPanel";
 import { buildCodeGraphModel, renderCodeGraph } from "./codegraph";
 import type { GraphNodeInput } from "./codegraph";
 import { createStore } from "zustand/vanilla";
+// 2d3b8424 — group the ~18 flat vtabs into logical groups (Overview/Planning/
+// Work/Content/History). Pure IA: every data-vtab still renders, unchanged.
+// The grouped button markup lives inline in buildTabBody (literal buttons, so
+// the source-scanning UI tests keep matching); this module owns the grouping
+// model + the collapse/reveal wiring.
+import { wireVtabGroups } from "./dashboard-tabgroups";
+// d6b7da48 — client-side sidebar "folders/spheres" (localStorage-only grouping).
+import {
+  loadFolderAssignments,
+  saveFolderAssignments,
+  assignProjectToFolder,
+  groupProjectsByFolder,
+  knownFolderNames,
+  loadCollapsedFolders,
+  toggleFolderCollapsed,
+  UNGROUPED_LABEL,
+  type FolderProject,
+} from "./dashboard-folders";
 ﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
@@ -2546,57 +2571,79 @@ async function loadProjects() {
 
   list!.innerHTML = '';
 
-  state.projects.forEach(p => {
+  // d6b7da48 — group the flat project list into client-side "folders/spheres".
+  // Membership + collapse state are localStorage-only (no backend/schema). When
+  // no project is assigned to any folder, groupProjectsByFolder yields a single
+  // ungrouped catch-all and rendering is behavior-identical to the old flat list
+  // (the catch-all header is suppressed — see below).
 
-    const div = document.createElement('div');
+  const assignments = loadFolderAssignments(STORAGE_KEY('projectFolders'));
 
-    div.className = 'project-item' + (state.activeTab === p.id ? ' active' : '');
+  const collapsed = loadCollapsedFolders(STORAGE_KEY('projectFolderCollapsed'));
 
-    div.dataset.projectId = p.id;
+  const groups = groupProjectsByFolder<FolderProject>(state.projects as FolderProject[], assignments);
 
-    div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:4px;';
+  // Only decorate with folder chrome when at least one named folder exists.
 
-    const nameSpan = document.createElement('span');
+  const hasFolders = groups.some(g => g.folder !== null);
 
-    nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+  groups.forEach(group => {
 
-    nameSpan.textContent = p.name;
+    // Suppress the "Ungrouped" header entirely when nothing is foldered — the
 
-    // id shown in kebab menu instead
+    // list then looks exactly like the pre-folders flat list.
 
-    const menuBtn = document.createElement('button');
+    if (hasFolders) {
 
-    menuBtn.textContent = '⋯';
+      const isCollapsed = collapsed.has(group.key);
 
-    menuBtn.title = 'Project actions';
+      const header = document.createElement('div');
 
-    menuBtn.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0';
+      header.className = 'project-folder-header';
 
-    menuBtn.onmouseenter = () => menuBtn.style.color = 'var(--text)';
+      header.dataset.folderKey = group.key;
 
-    menuBtn.onmouseleave = () => menuBtn.style.color = 'var(--muted)';
+      header.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 4px;margin-top:4px;cursor:pointer;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.04em;user-select:none;';
 
-    menuBtn.onclick = (e) => {
+      const caret = document.createElement('span');
 
-      e.stopPropagation();
+      caret.textContent = isCollapsed ? '▸' : '▾';
 
-      // Find or create a fake tab object for _openTabMenu
+      caret.style.cssText = 'flex-shrink:0;font-size:9px;width:9px;';
 
-      let t = state.tabs.find(tab => tab.id === p.id);
+      const label = document.createElement('span');
 
-      if (!t) { openTab(p); t = state.tabs.find(tab => tab.id === p.id); }
+      label.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
 
-      if (t) _openTabMenu(t, menuBtn);
+      label.textContent = group.label;
 
-    };
+      const count = document.createElement('span');
 
-    div.appendChild(nameSpan);
+      count.style.cssText = 'flex-shrink:0;opacity:0.7;';
 
-    div.appendChild(menuBtn);
+      count.textContent = String(group.projects.length);
 
-    div.onclick = (e) => { if (e.target !== menuBtn) openTab(p); };
+      header.appendChild(caret);
 
-    list!.appendChild(div);
+      header.appendChild(label);
+
+      header.appendChild(count);
+
+      header.onclick = () => {
+
+        toggleFolderCollapsed(collapsed, group.key, STORAGE_KEY('projectFolderCollapsed'));
+
+        loadProjects();
+
+      };
+
+      list!.appendChild(header);
+
+      if (isCollapsed) return; // don't render members of a collapsed folder
+
+    }
+
+    group.projects.forEach(p => list!.appendChild(_makeProjectItem(p as any)));
 
   });
 
@@ -2627,6 +2674,102 @@ async function loadProjects() {
   }
 
   syncSidebarActiveProject();
+
+}
+
+
+
+// d6b7da48 — one sidebar project row. Extracted verbatim from loadProjects so the
+// same row markup/behavior renders whether the list is flat or grouped by folder.
+
+function _makeProjectItem(p: any) {
+
+  const div = document.createElement('div');
+
+  div.className = 'project-item' + (state.activeTab === p.id ? ' active' : '');
+
+  div.dataset.projectId = p.id;
+
+  div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:4px;';
+
+  const nameSpan = document.createElement('span');
+
+  nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+
+  nameSpan.textContent = p.name;
+
+  // id shown in kebab menu instead
+
+  const menuBtn = document.createElement('button');
+
+  menuBtn.textContent = '⋯';
+
+  menuBtn.title = 'Project actions';
+
+  menuBtn.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0';
+
+  menuBtn.onmouseenter = () => menuBtn.style.color = 'var(--text)';
+
+  menuBtn.onmouseleave = () => menuBtn.style.color = 'var(--muted)';
+
+  menuBtn.onclick = (e) => {
+
+    e.stopPropagation();
+
+    // Find or create a fake tab object for _openTabMenu
+
+    let t = state.tabs.find(tab => tab.id === p.id);
+
+    if (!t) { openTab(p); t = state.tabs.find(tab => tab.id === p.id); }
+
+    if (t) _openTabMenu(t, menuBtn);
+
+  };
+
+  div.appendChild(nameSpan);
+
+  div.appendChild(menuBtn);
+
+  div.onclick = (e) => { if (e.target !== menuBtn) openTab(p); };
+
+  return div;
+
+}
+
+
+
+// d6b7da48 — kebab-menu action: assign a project to a named folder (or clear it).
+// Prompt-based like _setProjectIcon/_renameProject; membership is localStorage-only.
+
+function _moveProjectToFolder(t: any) {
+
+  const assignments = loadFolderAssignments(STORAGE_KEY('projectFolders'));
+
+  const current = assignments[t.id] || '';
+
+  const existing = knownFolderNames(state.projects as FolderProject[], assignments);
+
+  const hint = existing.length ? `\n\nExisting folders: ${existing.join(', ')}` : '';
+
+  const next = window.prompt(
+
+    `Move "${t.project.name}" to a folder (leave blank for ${UNGROUPED_LABEL}).${hint}`,
+
+    current,
+
+  );
+
+  if (next === null) return; // cancelled
+
+  const updated = assignProjectToFolder(assignments, t.id, next);
+
+  saveFolderAssignments(updated, STORAGE_KEY('projectFolders'));
+
+  loadProjects();
+
+  const folder = (next || '').trim();
+
+  toast(folder ? `Moved to folder "${folder}"` : `Moved to ${UNGROUPED_LABEL}`);
 
 }
 
@@ -2975,6 +3118,8 @@ function _openTabMenu(t: any, anchor: any) {
 
   menuItem('\ud83c\udfa8 Change icon\u2026', () => _setProjectIcon(t));
 
+  menuItem('\ud83d\udcc1 Move to folder\u2026', () => _moveProjectToFolder(t));
+
   menuItem('\u2b07 Download DB', () => window.open('/admin/snapshot', '_blank'));
 
   menuItem('🗑 Delete project…', () => _deleteProject(t));
@@ -3186,41 +3331,91 @@ function buildTabBody(project: any) {
 
     <div class="vtab-strip" id="vtab-strip-${project.id}">
 
-      <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">📊</button>
+      <div class="vtab-group" data-vgroup="overview" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="live" title="Live — right-now view">⚡</button>
+        <button class="vtab-group-header" data-vgroup-toggle="overview" title="Overview" aria-label="Overview group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">📊</button>
 
-      <button class="vtab-btn" data-vtab="goal" title="Goal State">🎯</button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      ${(window.MERIDIAN_HOSTED && !(project.github_repo || project.repo)) ? '' : '<button class="vtab-btn" data-vtab="files" title="Files">📁</button>'}
+          <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">📊</button>
 
-      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
+          <button class="vtab-btn" data-vtab="live" title="Live — right-now view">⚡</button>
 
-      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">📅</button>
+        </div>
 
-      <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
+      </div>
 
-      <button class="vtab-btn" data-vtab="queue" title="Work Queue">👷</button>
+      <div class="vtab-group" data-vgroup="planning" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
+        <button class="vtab-group-header" data-vgroup-toggle="planning" title="Planning" aria-label="Planning group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">🎯</button>
 
-      <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki" style="position:relative">📝<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+          <button class="vtab-btn" data-vtab="goal" title="Goal State">🎯</button>
 
-      <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
+          <button class="vtab-btn" data-vtab="insights" title="Insights — durable strategic understanding">💡</button>
 
-      <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
+          <button class="vtab-btn" data-vtab="blog" title="Blog — workspace posts (draft/published/archived)">✍️</button>
 
-      <button class="vtab-btn" data-vtab="codeintel" title="Code Intel — codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">🔍</button>
+        </div>
 
-      <button class="vtab-btn" data-vtab="documents" title="Documents — ingested docs &amp; structure">📄</button>
+      </div>
 
-      <button class="vtab-btn" data-vtab="insights" title="Insights — durable strategic understanding">💡</button>
+      <div class="vtab-group" data-vgroup="work" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-      <button class="vtab-btn" data-vtab="blog" title="Blog — workspace posts (draft/published/archived)">✍️</button>
+        <button class="vtab-group-header" data-vgroup-toggle="work" title="Work" aria-label="Work group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">👷</button>
 
-      <button class="vtab-btn" data-vtab="sessions" title="Sessions — executor session timeline (done / failed / stopped-ambiguously)">🕒</button>
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="queue" title="Work Queue">👷</button>
+
+          <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+
+          <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
+
+          <button class="vtab-btn" data-vtab="sessions" title="Sessions — executor session timeline (done / failed / stopped-ambiguously)">🕒</button>
+
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="content" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="content" title="Content" aria-label="Content group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">📁</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          ${(window.MERIDIAN_HOSTED && !(project.github_repo || project.repo)) ? '' : '<button class="vtab-btn" data-vtab="files" title="Files">📁</button>'}
+
+          <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki" style="position:relative">📝<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+
+          <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
+
+          <button class="vtab-btn" data-vtab="documents" title="Documents — ingested docs &amp; structure">📄</button>
+
+          <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
+
+          <button class="vtab-btn" data-vtab="codeintel" title="Code Intel — codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">🔍</button>
+
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="history" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="history" title="History" aria-label="History group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">📅</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">📅</button>
+
+          <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
+
+          <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
+
+        </div>
+
+      </div>
 
     </div>
 
@@ -3302,13 +3497,17 @@ function buildTabBody(project: any) {
 
           <div class="live-section">
 
-            <div class="live-section-label">Active sessions</div>
+            <details class="live-section-collapse" open>
 
-            <div class="live-sessions" id="live-sessions-${project.id}">
+              <summary class="live-section-label" style="cursor:pointer;list-style:none">Active sessions</summary>
 
-              <div class="live-empty">No active sessions.</div>
+              <div class="live-sessions" id="live-sessions-${project.id}">
 
-            </div>
+                <div class="live-empty">No active sessions.</div>
+
+              </div>
+
+            </details>
 
           </div>
 
@@ -4218,6 +4417,11 @@ function buildTabBody(project: any) {
 
   if (vtabStrip && drawer) {
 
+    // 2d3b8424 — wire the collapsible group headers; revealGroupForTab re-expands
+    // a (possibly user-collapsed) group before we activate one of its tabs, so no
+    // navigation path can land on a hidden button.
+    const { revealGroupForTab } = wireVtabGroups(vtabStrip);
+
     vtabStrip.querySelectorAll('.vtab-btn').forEach(btn => {
 
       btn.onclick = () => {
@@ -4225,6 +4429,9 @@ function buildTabBody(project: any) {
         const vtab = btn.dataset.vtab;
 
         const p = state.panels[project.id];
+
+        // Keep the clicked tab's group expanded so it stays visible/measurable.
+        revealGroupForTab(vtab);
 
         // v1.4.0: drawer is always visible — just switch active panel.
 
@@ -4308,6 +4515,7 @@ function buildTabBody(project: any) {
     try {
       const saved = localStorage.getItem('meridian_last_tab_' + project.id);
       if (saved) {
+        revealGroupForTab(saved);
         const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
         if (savedBtn) savedBtn.click();
       }
@@ -5841,11 +6049,7 @@ function cacheMostRecentSession(projectId: any, sessions: any) {
 
   if (!panel) return;
 
-  const sorted = sessions.slice().sort((a: any, b: any) =>
-
-    (b.last_seen || '').localeCompare(a.last_seen || '')
-
-  );
+  const sorted = sortSessionsMostRecentFirst(sessions);
 
   const top = sorted.find((s: any) => isLiveSession(s)) || sorted.find((s: any) => s.status !== 'closed') || sorted[0];
 
@@ -6742,11 +6946,7 @@ function populateSessionDropdown(projectId: any, sessions: any) {
 
   if (!sel) return;
 
-  const sorted = (sessions || []).slice().sort((a: any, b: any) =>
-
-    (b.last_seen || '').localeCompare(a.last_seen || '')
-
-  ).slice(0, 5);
+  const sorted = sortSessionsMostRecentFirst(sessions).slice(0, 5);
 
   if (!sorted.length) {
 
@@ -6942,53 +7142,16 @@ async function loadDocsTab(projectId: any) {
 
     if (!tools || !tools.length) { body.innerHTML = '<div class="empty" style="color:var(--muted)">No tools returned.</div>'; return; }
 
-    // Build lookup
+    // Render by category as collapsible <details> sections (70ac52e4): 90+
+    // tools no longer render as one flat wall. Grouping/section markup lives in
 
-    const byName: Record<string, any> = {};
+    // dashboard-mcp (_renderToolSections) so it is unit-testable; the 'other'
 
-    tools.forEach((t: any) => { byName[t.name] = t; });
+    // catch-all there keeps any uncategorized tool from being dropped.
 
-    // Render by category
+    const _catLabels = { ..._CATEGORY_LABELS, other: 'Other' };
 
-    let html = '';
-
-    // Determine category for each tool
-
-    const categorized = new Set();
-
-    for (const [cat, names] of Object.entries(_TOOL_CATEGORIES)) {
-
-      const catTools = names.map(n => byName[n]).filter(Boolean);
-
-      if (!catTools.length) continue;
-
-      html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">${_CATEGORY_LABELS[cat]}</div>`;
-
-      catTools.forEach(tool => {
-
-        categorized.add(tool.name);
-
-        html += _renderToolEntry(tool);
-
-      });
-
-      html += '</div>';
-
-    }
-
-    // Catch-all for uncategorized tools
-
-    const rest = tools.filter((t: any) => !categorized.has(t.name));
-
-    if (rest.length) {
-
-      html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Other</div>`;
-
-      rest.forEach((tool: any) => { html += _renderToolEntry(tool); });
-
-      html += '</div>';
-
-    }
+    const html = _renderToolSections(tools, _TOOL_CATEGORIES, _catLabels);
 
     const _toolSearch = `<div style="position:sticky;top:0;background:var(--surface-1,#10131a);padding:0 0 8px;margin-bottom:6px;z-index:2"><input type="text" id="docs-search-${projectId}" placeholder="Search tools by name or description…" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:5px 9px;outline:none"></div>`;
 
@@ -7473,30 +7636,75 @@ async function loadBlogTab(projectId: any) {
     { key: 'archived', label: 'ARCHIVED', color: 'var(--warning, #d29922)' },
   ];
 
+  const pid = String(projectId);
+  // e553fa7a — editable blog: an inline editor form (create + edit-in-place) at
+  // the top, and an "Edit" affordance on every post that repopulates the form
+  // from that post so a draft's title/body can be changed and re-saved.
   let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
     <div style="font-size:11px;color:var(--text)"><b>${posts.length}</b> post${posts.length === 1 ? '' : 's'}</div>
   </div>
-  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Author via the <code>save_blog_post</code> MCP tool; published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+  <div style="font-size:9px;color:var(--muted);margin-bottom:10px">Workspace-scoped blog. Edit a draft below (or author via the <code>save_blog_post</code> MCP tool); published posts are live at <code>/blog/&lt;slug&gt;</code>.</div>`;
+
+  html += blogEditorFormHtml(pid, null);
 
   if (!posts.length) {
-    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one with <code>save_blog_post(title, body, status="published")</code>.</div>`;
+    html += `<div class="empty" style="color:var(--muted);padding:8px 0">No posts yet. Create one above, or with <code>save_blog_post(title, body, status="published")</code>.</div>`;
   } else {
     for (const g of GROUPS) {
       const inGroup = posts.filter(p => String(p.status || 'draft') === g.key);
       if (!inGroup.length) continue;
       html += `<div style="font-size:9px;color:${g.color};letter-spacing:.06em;margin:12px 0 6px">${g.label} · ${inGroup.length}</div>`;
       for (const p of inGroup) {
-        const slug = String(p.slug || '');
-        const url = String(p.url || (slug ? `/blog/${slug}` : ''));
-        html += `<div style="border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px;background:var(--surface-1)">
-          <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(String(p.title || 'Untitled'))}</div>
-          <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px">${escapeHtml(slug)}</div>
-          ${url ? `<div style="margin-top:4px"><a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="font-size:10px;color:var(--accent)">${escapeHtml(url)}</a></div>` : ''}
-        </div>`;
+        html += blogPostCardHtml(p);
       }
     }
   }
   body.innerHTML = html;
+
+  // --- Wire the editor form + per-post Edit buttons. ------------------------
+  const byId = (suffix: string) => document.getElementById(`blog-editor-${suffix}-${pid}`);
+  const saveBtn = byId('save') as HTMLButtonElement | null;
+  const resetBtn = byId('reset') as HTMLButtonElement | null;
+  const msgEl = document.getElementById(`blog-editor-status-msg-${pid}`);
+
+  const doSave = async () => {
+    const idEl = document.getElementById(`blog-editor-id-${pid}`) as HTMLInputElement | null;
+    const titleEl = document.getElementById(`blog-editor-title-input-${pid}`) as HTMLInputElement | null;
+    const bodyEl = document.getElementById(`blog-editor-body-${pid}`) as HTMLTextAreaElement | null;
+    const statusEl = document.getElementById(`blog-editor-status-${pid}`) as HTMLSelectElement | null;
+    const title = (titleEl?.value || '').trim();
+    if (!title) { if (msgEl) msgEl.textContent = 'Title required'; return; }
+    if (saveBtn) saveBtn.disabled = true;
+    if (msgEl) msgEl.textContent = 'Saving…';
+    try {
+      await api('/workspace/blog', {
+        method: 'POST',
+        body: JSON.stringify({
+          id: idEl?.value || undefined,          // present ⇒ update in place (upsert by id)
+          title,
+          body: bodyEl?.value || '',
+          status: statusEl?.value || 'draft',
+        }),
+      });
+      loadBlogTab(projectId);                      // re-render (also resets the form)
+    } catch (e: any) {
+      if (saveBtn) saveBtn.disabled = false;
+      if (msgEl) msgEl.textContent = `Error: ${escapeHtml(String(e))}`;
+    }
+  };
+  if (saveBtn) saveBtn.onclick = doSave;
+  if (resetBtn) resetBtn.onclick = () => resetBlogEditor(pid);
+
+  body.querySelectorAll('.blog-edit-btn').forEach((btn) => {
+    (btn as HTMLElement).onclick = () => {
+      const bid = (btn as HTMLElement).getAttribute('data-blog-id') || '';
+      const post = posts.find(p => String(p.id || '') === bid);
+      if (!post) return;
+      populateBlogEditor(pid, post);
+      document.getElementById(`blog-editor-${pid}`)?.scrollIntoView({ block: 'nearest' });
+      (document.getElementById(`blog-editor-title-input-${pid}`) as HTMLInputElement | null)?.focus();
+    };
+  });
 }
 
 
@@ -7531,7 +7739,7 @@ async function loadDocumentsTab(projectId: any) {
   };
 
   let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-    <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? '' : 's'} <span style="color:var(--muted)">(note_kind=document)</span></div>
+    <div style="font-size:11px;color:var(--text)"><b>${docs.length}</b> document${docs.length === 1 ? '' : 's'} <span style="color:var(--muted)">ingested</span></div>
   </div>`;
 
   // f1c7e7d1 — tunnel-free upload: pick a local .txt/.md, read it client-side,
@@ -8906,13 +9114,9 @@ async function loadRecentSessions(projectId: any, sessions = null) {
 
       : await api(`/projects/${projectId}/sessions?active_only=false`);
 
-    const recent = (allSessions || [])
-
-      .filter((s: any) => s.id !== panel.liveSessionId && !isLiveSession(s))
-
-      .sort((a: any, b: any) => String(b.last_seen || b.created_at || '').localeCompare(String(a.last_seen || a.created_at || '')))
-
-      .slice(0, 5);
+    const recent = sortSessionsMostRecentFirst(
+      (allSessions || []).filter((s: any) => s.id !== panel.liveSessionId && !isLiveSession(s)),
+    ).slice(0, 5);
 
     if (!recent.length) { el.style.display = 'none'; return; }
 
@@ -11554,9 +11758,9 @@ async function refreshSessions(projectId: any) {
 
     }
 
-    for (const g of Object.values(groups)) {
+    for (const h of order) {
 
-      g.sort((a: any, b: any) => (b.last_seen || '').localeCompare(a.last_seen || ''));
+      groups[h] = sortSessionsMostRecentFirst(groups[h]);
 
     }
 

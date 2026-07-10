@@ -21,7 +21,33 @@ export const DEFAULT_MAX_TURNS = 200;
 /** Minimal shape of a session row used by the age/live helpers. */
 export interface SessionLike {
   last_seen?: string | null;
+  created_at?: string | null;
   status?: string | null;
+}
+
+/**
+ * Recency key for a session: its last_seen, falling back to created_at (a session
+ * that has never heartbeat still sorts by when it was created), then ''. Timestamps
+ * are ISO-ish strings that sort lexicographically in chronological order, so callers
+ * compare these keys directly. Kept as a tiny helper so every session-list render
+ * agrees on the fallback chain (241b0d3b).
+ */
+export function sessionRecencyKey(session: SessionLike | null | undefined): string {
+  if (!session) return '';
+  return String(session.last_seen || session.created_at || '');
+}
+
+/**
+ * Sort sessions MOST-RECENT-FIRST by last_seen (fallback created_at), descending.
+ * Returns a new array — never mutates the caller's list. This is the single sort
+ * used by every active/recent-sessions render so the ordering is consistent
+ * everywhere the list appears (241b0d3b). Sessions with no timestamp at all sink
+ * to the bottom.
+ */
+export function sortSessionsMostRecentFirst<T extends SessionLike>(sessions: readonly T[] | null | undefined): T[] {
+  return (sessions ? sessions.slice() : []).sort(
+    (a, b) => sessionRecencyKey(b).localeCompare(sessionRecencyKey(a)),
+  );
 }
 
 export function getPanelState(projectId: string): Record<string, any> {
@@ -117,6 +143,7 @@ export function suggestedFsRoots(execCfg: any, currentRoots: any): string[] {
 try {
   Object.assign(window, {
     getPanelState, toast, escapeHtml, formatRelativeTime, sessionAgeMs, isLiveSession,
+    sessionRecencyKey, sortSessionsMostRecentFirst,
     _colorForHuman, _PLAN_LABELS, QUEUE_DONE_PAGE_SIZE, SESSION_LIVE_WINDOW_MS,
     _HUMAN_COLORS, DEFAULT_MAX_PINNED_DECISIONS, DEFAULT_CONTEXT_THRESHOLD,
     DEFAULT_MAX_TURNS, suggestedFsRoots,
