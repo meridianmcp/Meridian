@@ -8289,6 +8289,25 @@ function showFailoverBannerIfNeeded() {
 
 
 
+function _removeHitlCard(id: any) {
+
+  // 83b517d1 — optimistic UI: instantly drop a HITL card from the DOM the
+  // moment its answer/dismiss/approve/reject PATCH succeeds, instead of
+  // waiting on the follow-up render()/refreshHitl() background refresh to
+  // reflect it — that's a real server re-fetch, and read-after-write lag can
+  // still show the just-answered item as "pending" for 30-60s. Handles both
+  // HITL card markups in this file: the per-project tab's `.hitl-row`
+  // wrapper (the id lives on its nested buttons, not the row itself) and the
+  // global hitl bar's `#hitl-list` card (the id lives on the wrapper itself).
+  document.querySelectorAll(`[data-hitl-id="${id}"]`).forEach(el => {
+
+    (el.closest('.hitl-row') || el).remove();
+
+  });
+
+}
+window._removeHitlCard = _removeHitlCard;
+
 async function loadHitlTab(projectId: any) {
 
   const body = document.getElementById(`hitl-body-${projectId}`);
@@ -8512,6 +8531,11 @@ async function loadHitlTab(projectId: any) {
 
             toast('answered ✓');
 
+            // 83b517d1 — remove the card immediately; don't wait on the
+            // background render() below to reflect a state that already
+            // succeeded (read-after-write lag can leave it "pending" 30-60s).
+            _removeHitlCard(id);
+
             render();
 
           } catch (e: any) { toast('failed: ' + e.message, true); }
@@ -8533,6 +8557,9 @@ async function loadHitlTab(projectId: any) {
             await api(`/hitl/${id}`, { method: 'PATCH', body: JSON.stringify({ action: 'answer', answer }) });
 
             toast('answered ✓');
+
+            // 83b517d1 — optimistic removal; see .hitl-answer-btn above.
+            _removeHitlCard(id);
 
             render();
 
@@ -8583,6 +8610,9 @@ async function loadHitlTab(projectId: any) {
 
             toast('dismissed');
 
+            // 83b517d1 — optimistic removal; see .hitl-answer-btn above.
+            _removeHitlCard(btn.dataset.hitlId);
+
             render();
 
           } catch (e: any) { toast('failed: ' + e.message, true); }
@@ -8605,6 +8635,9 @@ async function loadHitlTab(projectId: any) {
 
             else toast('approved ✓ — section written, staged for checkpoint');
 
+            // 83b517d1 — optimistic removal; see .hitl-answer-btn above.
+            _removeHitlCard(btn.dataset.hitlId);
+
             render();
 
           } catch (e: any) { toast('failed: ' + e.message, true); }
@@ -8624,6 +8657,9 @@ async function loadHitlTab(projectId: any) {
             await api(`/hitl/${btn.dataset.hitlId}`, { method: 'PATCH', body: JSON.stringify({ action: 'dismiss' }) });
 
             toast('rejected');
+
+            // 83b517d1 — optimistic removal; see .hitl-answer-btn above.
+            _removeHitlCard(btn.dataset.hitlId);
 
             render();
 
@@ -10762,6 +10798,11 @@ async function _hitlAnswer(id: any) {
 
     toast('HITL answered');
 
+    // 83b517d1 — remove the card immediately; the follow-up refreshHitl()
+    // below is a reconciling background refresh, not the source of truth
+    // for "did this disappear" (server read-after-write can lag 30-60s).
+    _removeHitlCard(id);
+
     refreshHitl();
 
   } catch (e: any) { toast('answer failed: ' + e.message, true); }
@@ -10783,6 +10824,9 @@ async function _hitlDismiss(id: any) {
       body: JSON.stringify({ action: 'dismiss' }),
 
     });
+
+    // 83b517d1 — optimistic removal; see _hitlAnswer above.
+    _removeHitlCard(id);
 
     refreshHitl();
 

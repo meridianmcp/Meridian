@@ -13934,6 +13934,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }).catch(() => {
     });
   }
+  function _removeHitlCard(id) {
+    document.querySelectorAll(`[data-hitl-id="${id}"]`).forEach((el2) => {
+      (el2.closest(".hitl-row") || el2).remove();
+    });
+  }
+  window._removeHitlCard = _removeHitlCard;
   async function loadHitlTab(projectId) {
     const body = document.getElementById(`hitl-body-${projectId}`);
     const statusFilter = document.getElementById(`hitl-status-filter-${projectId}`);
@@ -14086,6 +14092,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             try {
               await api(`/hitl/${id}`, { method: "PATCH", body: JSON.stringify({ action: "answer", answer }) });
               toast("answered \u2713");
+              _removeHitlCard(id);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -14099,6 +14106,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             try {
               await api(`/hitl/${id}`, { method: "PATCH", body: JSON.stringify({ action: "answer", answer }) });
               toast("answered \u2713");
+              _removeHitlCard(id);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -14131,6 +14139,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             try {
               await api(`/hitl/${btn.dataset.hitlId}`, { method: "PATCH", body: JSON.stringify({ action: "dismiss" }) });
               toast("dismissed");
+              _removeHitlCard(btn.dataset.hitlId);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -14144,6 +14153,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               const res = await api(`/hitl/${btn.dataset.hitlId}`, { method: "PATCH", body: JSON.stringify({ action: "answer", answer: "approved" }) });
               if (res && res.applied === false) toast("not applied: " + (res.apply_error || "see card"), true);
               else toast("approved \u2713 \u2014 section written, staged for checkpoint");
+              _removeHitlCard(btn.dataset.hitlId);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -14156,6 +14166,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             try {
               await api(`/hitl/${btn.dataset.hitlId}`, { method: "PATCH", body: JSON.stringify({ action: "dismiss" }) });
               toast("rejected");
+              _removeHitlCard(btn.dataset.hitlId);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -15256,6 +15267,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         body: JSON.stringify({ action: "answer", answer })
       });
       toast("HITL answered");
+      _removeHitlCard(id);
       refreshHitl();
     } catch (e3) {
       toast("answer failed: " + e3.message, true);
@@ -15268,6 +15280,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         method: "PATCH",
         body: JSON.stringify({ action: "dismiss" })
       });
+      _removeHitlCard(id);
       refreshHitl();
     } catch (e3) {
       toast("dismiss failed: " + e3.message, true);

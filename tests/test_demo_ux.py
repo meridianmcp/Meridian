@@ -480,6 +480,92 @@ def test_auto_answered_hitl_renderer(client):
 
 
 @pytestmark_playwright
+def test_hitl_optimistic_card_removal(client):
+    """83b517d1 — answered/dismissed HITL cards must vanish from the DOM the
+    instant _removeHitlCard(id) runs, not 30-60s later on the next poll/re-fetch.
+
+    Exercises the shared helper against both HITL card markups in dashboard.ts:
+    the per-project tab's `.hitl-row` wrapper (id lives on nested buttons only)
+    and the global hitl bar's `#hitl-list` card (id lives on the wrapper itself).
+    """
+    import threading
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17884, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        import time; time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17884/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            res = page.evaluate(
+                """() => {
+                    const f = window._removeHitlCard;
+                    if (typeof f !== 'function') return {error: 'missing'};
+
+                    // Shape 1: per-project tab card — outer `.hitl-row` has no
+                    // data-hitl-id of its own; only its nested buttons do.
+                    const scratch = document.createElement('div');
+                    scratch.id = '_hitl-test-scratch';
+                    scratch.innerHTML = `
+                        <div class="hitl-row" id="row-x">
+                            <button class="hitl-answer-btn" data-hitl-id="x"></button>
+                            <button class="hitl-dismiss-btn" data-hitl-id="x"></button>
+                        </div>
+                        <div class="hitl-row" id="row-y">
+                            <button class="hitl-answer-btn" data-hitl-id="y"></button>
+                        </div>
+                    `;
+                    document.body.appendChild(scratch);
+
+                    // Shape 2: global hitl bar card — the wrapper itself carries
+                    // data-hitl-id, alongside nested buttons/input with the same id.
+                    const list = document.createElement('div');
+                    list.id = 'hitl-list';
+                    list.innerHTML = `
+                        <div data-hitl-id="z" id="card-z">
+                            <input class="hitl-answer-input" data-hitl-id="z">
+                            <button class="hitl-answer-btn" data-hitl-id="z"></button>
+                            <button class="hitl-dismiss-btn" data-hitl-id="z"></button>
+                        </div>
+                        <div data-hitl-id="w" id="card-w"></div>
+                    `;
+                    document.body.appendChild(list);
+
+                    f('x');
+                    f('z');
+                    f('does-not-exist');
+
+                    const result = {
+                        rowXGone: !document.getElementById('row-x'),
+                        rowYStillThere: !!document.getElementById('row-y'),
+                        cardZGone: !document.getElementById('card-z'),
+                        cardWStillThere: !!document.getElementById('card-w'),
+                    };
+                    scratch.remove();
+                    list.remove();
+                    return result;
+                }"""
+            )
+            assert res.get("error") is None, res
+            # Answering/dismissing one card removes ONLY that card...
+            assert res["rowXGone"] is True
+            assert res["cardZGone"] is True
+            # ...leaving unrelated cards (and a call with a non-matching id)
+            # untouched.
+            assert res["rowYStillThere"] is True
+            assert res["cardWStillThere"] is True
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
 def test_slot_health_warning_renderer(client):
     """9a8645c1 — _renderSlotHealthWarning shows an actionable badge for an
     unhealthy slot and nothing for a healthy one. Runs the real bundle."""
