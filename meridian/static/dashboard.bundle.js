@@ -2118,6 +2118,246 @@
   } catch (e3) {
   }
 
+  // meridian/static/dashboard-waves.ts
+  var _TERMINAL = /* @__PURE__ */ new Set(["done", "skipped", "failed", "pushed"]);
+  var _CLAIMABLE = /* @__PURE__ */ new Set(["pending", "todo"]);
+  var _PRIORITY_RANK = { urgent: 0, high: 1, normal: 2, low: 3 };
+  var _PRIORITY_DEFAULT = _PRIORITY_RANK.normal;
+  function parseTouchesResources(raw) {
+    if (raw == null) return [];
+    let values;
+    if (Array.isArray(raw)) {
+      values = raw;
+    } else {
+      const text = String(raw).trim();
+      if (!text) return [];
+      try {
+        const decoded = JSON.parse(text);
+        values = Array.isArray(decoded) ? decoded : [decoded];
+      } catch {
+        values = text.split(",");
+      }
+    }
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const v3 of values) {
+      const candidate = String(v3 ?? "").trim();
+      if (!candidate) continue;
+      const norm = candidate.toLowerCase().startsWith("inferred:") ? candidate.slice("inferred:".length).trim() : candidate;
+      if (!norm) continue;
+      if (!seen.has(norm)) {
+        seen.add(norm);
+        out.push(norm);
+      }
+    }
+    return out;
+  }
+  function _resourceFileOf(rid) {
+    if (rid.startsWith("file:")) return rid.slice("file:".length);
+    if (rid.startsWith("symbol:")) return rid.slice("symbol:".length).split("::")[0];
+    return null;
+  }
+  function _twoResourcesConflict(r1, r22) {
+    if (r1 === r22) return true;
+    const f1 = _resourceFileOf(r1);
+    const f22 = _resourceFileOf(r22);
+    if (f1 !== null && f1 === f22) {
+      const bothSymbols = r1.startsWith("symbol:") && r22.startsWith("symbol:");
+      return !bothSymbols;
+    }
+    return false;
+  }
+  function _resourceSetsConflict(a3, b2) {
+    for (const ra of a3) {
+      for (const rb of b2) {
+        if (_twoResourcesConflict(ra, rb)) return true;
+      }
+    }
+    return false;
+  }
+  function computeWaveProgress(sprintItems) {
+    const items = Array.isArray(sprintItems) ? sprintItems : [];
+    const statusOf = (it) => String(it.status || "pending");
+    const byId = {};
+    for (const it of items) if (it && it.id) byId[String(it.id)] = it;
+    const doneCount = items.filter((it) => statusOf(it) === "done").length;
+    const blockingParent = (it) => {
+      const seen = /* @__PURE__ */ new Set();
+      let dep = it.depends_on ? String(it.depends_on) : "";
+      while (dep && !seen.has(dep)) {
+        seen.add(dep);
+        const parent = byId[dep];
+        if (!parent) return null;
+        const ps = statusOf(parent);
+        if (!_TERMINAL.has(ps)) return parent;
+        if (ps === "failed" && (it.failure_mode || "continue") !== "continue") return parent;
+        dep = parent.depends_on ? String(parent.depends_on) : "";
+      }
+      return null;
+    };
+    const eligible = [];
+    let runningCount = 0;
+    let blockedCount = 0;
+    for (const it of items) {
+      if (!it || !it.id) continue;
+      if (it.blocker_kind === "manual") continue;
+      const st = statusOf(it);
+      const isRunning = st === "in_progress" || _CLAIMABLE.has(st) && !!it.claimed_at;
+      if (isRunning) runningCount++;
+      if (!_CLAIMABLE.has(st)) continue;
+      if (it.claimed_at) continue;
+      const parent = blockingParent(it);
+      if (parent !== null) {
+        const ps = statusOf(parent);
+        if (ps === "failed" && (it.failure_mode || "continue") === "continue") {
+        } else {
+          blockedCount++;
+          continue;
+        }
+      }
+      eligible.push(it);
+    }
+    const sorted = eligible.slice().sort((a3, b2) => {
+      const pa = _PRIORITY_RANK[String(a3.priority || "normal")] ?? _PRIORITY_DEFAULT;
+      const pb = _PRIORITY_RANK[String(b2.priority || "normal")] ?? _PRIORITY_DEFAULT;
+      if (pa !== pb) return pa - pb;
+      const aa = String(a3.added_at || "");
+      const ab = String(b2.added_at || "");
+      if (aa !== ab) return aa < ab ? -1 : 1;
+      return String(a3.id) < String(b2.id) ? -1 : 1;
+    });
+    const withRes = sorted.map((it) => ({ it, res: parseTouchesResources(it.touches_resources) }));
+    const declared = withRes.filter((x2) => x2.res.length > 0);
+    const undeclared = withRes.filter((x2) => x2.res.length === 0);
+    const groups = [];
+    const groupResources = [];
+    for (const { it, res } of declared) {
+      let placed = false;
+      for (let gi = 0; gi < groupResources.length; gi++) {
+        if (!_resourceSetsConflict(res, groupResources[gi])) {
+          groups[gi].push(it);
+          for (const r3 of res) groupResources[gi].add(r3);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        groups.push([it]);
+        groupResources.push(new Set(res));
+      }
+    }
+    for (const { it } of undeclared) groups.push([it]);
+    const batches = groups.map((groupItems, index) => {
+      let running = 0;
+      let earliest = null;
+      for (const it of groupItems) {
+        const live = byId[String(it.id)] || it;
+        const st = statusOf(live);
+        const isRunning = st === "in_progress" || _CLAIMABLE.has(st) && !!live.claimed_at;
+        if (isRunning) {
+          running++;
+          const c3 = live.claimed_at ? String(live.claimed_at) : null;
+          if (c3 && (earliest === null || c3 < earliest)) earliest = c3;
+        }
+      }
+      return {
+        index,
+        items: groupItems,
+        running,
+        pending: groupItems.length - running,
+        total: groupItems.length,
+        parallel: groupItems.length > 1,
+        earliestClaim: earliest
+      };
+    });
+    const maxFanOut = batches.reduce((m3, b2) => Math.max(m3, b2.total), 0);
+    let activeBatchIndex = batches.findIndex((b2) => b2.running > 0);
+    if (activeBatchIndex < 0) activeBatchIndex = batches.findIndex((b2) => b2.total > 0);
+    return {
+      batches,
+      groupCount: groups.length,
+      eligibleCount: eligible.length,
+      runningCount,
+      blockedCount,
+      undeclaredCount: undeclared.length,
+      doneCount,
+      maxFanOut,
+      activeBatchIndex,
+      strategy: maxFanOut > 1 ? "parallel" : "sequential",
+      hasTokenTelemetry: false
+    };
+  }
+  function formatElapsedSince(claimedAt, nowMs) {
+    if (!claimedAt) return "";
+    const t3 = Date.parse(String(claimedAt).replace(" ", "T"));
+    if (isNaN(t3)) return "";
+    const now = nowMs == null ? Date.now() : nowMs;
+    const mins = Math.max(0, Math.floor((now - t3) / 6e4));
+    if (mins < 60) return `${mins}m`;
+    return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+  }
+  function _esc(s3) {
+    try {
+      return typeof escapeHtml === "function" ? escapeHtml(String(s3 ?? "")) : String(s3 ?? "");
+    } catch {
+      return String(s3 ?? "");
+    }
+  }
+  function buildWaveProgressHtml(wp, nowMs) {
+    if (!wp.batches.length) {
+      if (wp.blockedCount > 0) {
+        return `<div class="live-empty">No parallel batch ready \u2014 ${wp.blockedCount} item(s) blocked on dependencies.</div>`;
+      }
+      return `<div class="live-empty">No parallelizable work right now.</div>`;
+    }
+    const stratColor = wp.strategy === "parallel" ? "var(--accent-green)" : "var(--muted)";
+    const header = `<div class="wave-progress-summary" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px;font-size:11px"><span style="font-weight:600;color:${stratColor}">${_esc(wp.strategy.toUpperCase())}</span><span style="color:var(--muted)">${wp.groupCount} wave${wp.groupCount !== 1 ? "s" : ""}</span><span style="color:var(--muted)">\xB7 ${wp.eligibleCount} eligible</span>` + (wp.runningCount ? `<span style="color:var(--accent-green)">\xB7 ${wp.runningCount} running</span>` : "") + (wp.blockedCount ? `<span style="color:#fbbf24">\xB7 ${wp.blockedCount} blocked</span>` : "") + (wp.maxFanOut > 1 ? `<span style="color:var(--accent)">\xB7 up to ${wp.maxFanOut}\xD7 parallel</span>` : "") + `</div>`;
+    const rows = wp.batches.map((b2) => {
+      const isActive = b2.index === wp.activeBatchIndex;
+      const accent = b2.running > 0 ? "var(--accent-green)" : isActive ? "var(--accent)" : "var(--border)";
+      const elapsed = formatElapsedSince(b2.earliestClaim, nowMs);
+      const parallelTag = b2.parallel ? `<span title="These items touch no shared resources \u2014 safe to run at once" style="font-size:9px;color:var(--accent);border:1px solid var(--accent)55;border-radius:3px;padding:0 4px">\u2225 ${b2.total}\xD7</span>` : `<span title="Runs on its own \u2014 no proven parallel-safe peer" style="font-size:9px;color:var(--muted)">seq</span>`;
+      const counts = (b2.running ? `<span style="color:var(--accent-green)">${b2.running} running</span> \xB7 ` : "") + `<span style="color:var(--muted)">${b2.pending} pending</span>`;
+      const items = b2.items.map((it) => {
+        const live = String(it.status || "pending");
+        const dot = live === "in_progress" || it.claimed_at ? "var(--accent-green)" : "var(--muted)";
+        return `<div style="display:flex;gap:6px;align-items:center;margin-top:3px">
+            <span style="width:5px;height:5px;border-radius:50%;background:${dot};flex:none"></span>
+            <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px" title="${_esc(it.title || it.id)}">${_esc(it.title || it.id)}</span>
+          </div>`;
+      }).join("");
+      return `<div class="wave-batch" data-batch="${b2.index}" style="border-left:3px solid ${accent};padding:4px 0 6px 8px;margin-bottom:8px">
+        <div style="display:flex;gap:6px;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;font-weight:600;color:var(--text)">Wave ${b2.index + 1} ${parallelTag}${isActive ? ' <span style="font-size:9px;color:var(--accent)">\u25CF active</span>' : ""}</span>
+          <span style="font-size:9px;color:var(--muted);flex:none">${counts}${elapsed ? ` \xB7 ${_esc(elapsed)}` : ""}</span>
+        </div>
+        ${items}
+      </div>`;
+    }).join("");
+    const gapNote = `<div class="wave-progress-note" style="margin-top:4px;font-size:9px;color:var(--muted);line-height:1.4">Cost shown is wall-clock elapsed since an item was claimed. Per-wave token/$ cost isn't tracked server-side yet, so it's omitted rather than estimated.</div>`;
+    return header + rows + gapNote;
+  }
+  function renderWaveProgress2(projectId, sprintItems) {
+    try {
+      if (typeof document === "undefined") return;
+      const root = document.getElementById(`live-wave-progress-${projectId}`);
+      if (!root) return;
+      const wp = computeWaveProgress(sprintItems);
+      root.innerHTML = buildWaveProgressHtml(wp);
+    } catch {
+    }
+  }
+  try {
+    Object.assign(window, {
+      computeWaveProgress,
+      buildWaveProgressHtml,
+      renderWaveProgress: renderWaveProgress2,
+      formatElapsedSince,
+      parseTouchesResources
+    });
+  } catch {
+  }
+
   // meridian/static/dashboard-settings.ts
   function suggestNtfyTopic2(projectId) {
     const proj = (window.state?.projects || []).find((p3) => p3.id === projectId);
@@ -10791,6 +11031,20 @@ Current: ${current || "(none)"}`,
 
           <div class="live-section">
 
+            <div class="live-section-label" title="Conflict-free batches the orchestrator can fan out \u2014 successive waves run in sequence (mirrors get_parallelizable_groups)">Parallel waves</div>
+
+            <div id="live-wave-progress-${project.id}" class="live-wave-progress">
+
+              <div class="live-empty">No parallelizable work right now.</div>
+
+            </div>
+
+          </div>
+
+          <hr class="live-divider">
+
+          <div class="live-section">
+
             <details class="live-section-collapse" open>
 
               <summary class="live-section-label" style="cursor:pointer;list-style:none">Active sessions</summary>
@@ -12246,6 +12500,7 @@ Current: ${current || "(none)"}`,
       ]);
       if (sprintItemsResult.status === "fulfilled") {
         renderSprintProgress(projectId, sprintItemsResult.value || []);
+        renderWaveProgress(projectId, sprintItemsResult.value || []);
       } else {
         const sprintRoot = document.getElementById(`live-sprint-progress-${projectId}`);
         if (sprintRoot) {

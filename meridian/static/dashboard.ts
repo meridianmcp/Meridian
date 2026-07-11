@@ -7,6 +7,10 @@ import "./dashboard-demo";
 import "./dashboard-timeline";
 import "./dashboard-mcp";
 import "./dashboard-sprint";
+// e3355ccb — live parallel-execution wave/batch progress panel. Recomputes the
+// server's conflict-free batches (get_parallelizable_groups) client-side from
+// the already-fetched sprint-items payload; rendered in the Live tab.
+import "./dashboard-waves";
 import "./dashboard-settings";
 import "./dashboard-plugins";
 
@@ -3596,6 +3600,20 @@ function buildTabBody(project: any) {
 
           <div class="live-section">
 
+            <div class="live-section-label" title="Conflict-free batches the orchestrator can fan out — successive waves run in sequence (mirrors get_parallelizable_groups)">Parallel waves</div>
+
+            <div id="live-wave-progress-${project.id}" class="live-wave-progress">
+
+              <div class="live-empty">No parallelizable work right now.</div>
+
+            </div>
+
+          </div>
+
+          <hr class="live-divider">
+
+          <div class="live-section">
+
             <details class="live-section-collapse" open>
 
               <summary class="live-section-label" style="cursor:pointer;list-style:none">Active sessions</summary>
@@ -5437,6 +5455,11 @@ async function refreshLiveTab(projectId: any) {
     if (sprintItemsResult.status === 'fulfilled') {
 
       renderSprintProgress(projectId, sprintItemsResult.value || []);
+
+      // e3355ccb — live parallel-execution waves. Recomputes the server's
+      // conflict-free batches from the same sprint-items payload (no extra fetch)
+      // and repaints the wave-progress panel on the existing refresh cadence.
+      renderWaveProgress(projectId, sprintItemsResult.value || []);
 
     } else {
 

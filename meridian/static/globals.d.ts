@@ -101,6 +101,9 @@ declare global {
   const wireSprintAddEnter: any;
   const renderSprintProgress: any;
   const renderQueue: any;
+  const renderWaveProgress: any;
+  const computeWaveProgress: any;
+  const buildWaveProgressHtml: any;
   const _renderPlanBadge: any;
   const _sprintHistoryBadges: any;
   const _queueAction: any;
