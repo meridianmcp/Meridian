@@ -430,6 +430,26 @@ async def lifespan(app: FastAPI):
     from .routes.oauth import _hydrate_oauth_cache as _hydrate_oa  # noqa: PLC0415 — c5f8ac43
     await _hydrate_oa(db)
 
+    # b74099b2 — a server-side deploy lands as a fresh process start, and any
+    # HOSTED MCP tool it added (e.g. search_outputs) is invisible to sessions that
+    # are ALREADY connected: the tunnel `notifications/tools/list_changed` path only
+    # ever fired on a slot-health RECOVERY (54ddd609), never on a deploy. Add the
+    # second trigger here: mark every still-connected tenant pending so the NEXT
+    # tools/list from that session re-aggregates and picks up the newly-deployed
+    # tool set. `notify_tools_list_changed` is a cheap idempotent set-add; enumerating
+    # tunnel_active tenants is a single small-table scan; zero active tenants is a
+    # clean no-op. Fully guarded — it must NEVER block startup.
+    try:
+        from .routes.tunnel import notify_tools_list_changed as _notify_tlc  # noqa: PLC0415
+        for _tid in await db_module.list_active_tunnel_tenant_ids(db):
+            _notify_tlc(_tid)
+    except Exception:  # noqa: BLE001 — deploy tool-cache refresh must never block startup
+        import logging as _tlc_log  # noqa: PLC0415
+        _tlc_log.getLogger(__name__).warning(
+            "startup tools/list_changed refresh raised; continuing",
+            exc_info=True,
+        )
+
     # v2.2 — isolated demo DB.
     # Priority: MERIDIAN_DEMO_DB_URL → MERIDIAN_STANDARD_KEY (legacy secret
     # name on the hosted Fly app) → in-memory SQLite fallback.

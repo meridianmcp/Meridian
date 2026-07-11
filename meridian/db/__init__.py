@@ -11923,6 +11923,36 @@ async def get_tenants_with_payment_failures(
     return [_row_to_dict(r) for r in rows if r is not None]
 
 
+async def list_active_tunnel_tenant_ids(
+    db: aiosqlite.Connection,
+) -> list[str]:
+    """Return the ids of tenants whose local binary tunnel is marked active (b74099b2).
+
+    ``tenants.tunnel_active`` is set to 1 when the tenant's binary opens its tunnel
+    WebSocket and back to 0 on a clean disconnect (b43b0c6a). A server-side deploy
+    kills the old process WITHOUT clearing the flag, so on the fresh process's
+    startup these are exactly the tenants that were connected (and whose
+    already-connected MCP sessions will re-issue a ``tools/list`` after reconnect).
+
+    Used by the startup ``notifications/tools/list_changed`` trigger so a deploy that
+    adds a new hosted MCP tool becomes visible to those sessions on their next list,
+    instead of staying hidden until a full reconnect. Cheap (single indexed column
+    scan of the small control-plane ``tenants`` table); returns [] when none active.
+    """
+    async with db.execute(
+        "SELECT id FROM tenants WHERE tunnel_active = 1"
+    ) as cur:
+        rows = await cur.fetchall()
+    out: list[str] = []
+    for r in rows:
+        if r is None:
+            continue
+        tid = r["id"] if isinstance(r, dict) else r[0]
+        if tid:
+            out.append(tid)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # GDPR / account management
 # ---------------------------------------------------------------------------
