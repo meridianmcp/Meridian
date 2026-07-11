@@ -15,11 +15,16 @@ from meridian import tunnel_plugins as tp
 
 def test_resolve_defaults_returns_builtins_in_order():
     plugins = tp.resolve_plugins(None)
-    assert [p["name"] for p in plugins] == [
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
-        "desktop-commander", "meridian-docs", "zotero-mcp"
-    ]
-    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero"]
+    # Structural invariant (not a frozen literal): resolve_plugins is a pure
+    # merge-over-defaults, so with no config it must pass BUILTIN_PLUGINS through
+    # verbatim — same names, same order, same name↔slot pairing. Deriving the
+    # expected shape from the registry means a new slot never needs this literal
+    # re-patched, while still catching a merge that drops, reorders, or re-slots an
+    # entry. The specific per-slot defaults (command/enabled/env) are pinned below.
+    assert [p["name"] for p in plugins] == [b["name"] for b in tp.BUILTIN_PLUGINS]
+    assert [p["slot"] for p in plugins] == [b["slot"] for b in tp.BUILTIN_PLUGINS]
+    # Every built-in slot resolves to exactly one plugin, and each is a real slot.
+    assert {p["slot"] for p in plugins} == set(tp.SLOTS)
     # The three code/fs slots default ON with no command override; Office slots
     # and desktop-commander default OFF.
     by_name = {p["name"]: p for p in plugins}
@@ -61,11 +66,15 @@ def test_resolve_empty_config_matches_defaults():
 
 
 def test_active_plugins_filters_disabled():
-    # Office slots are off by default, so only the three code/fs slots are active.
-    assert [p["name"] for p in tp.active_plugins(None)] == [
-        "filesystem", "code-intel", "code-extractor"
-    ]
-    # Disabling another slot drops it; enabling word adds it.
+    # active_plugins(None) must be exactly the built-ins the registry ships ON
+    # (enabled=True) by default — derived from resolve_plugins so a slot flipping
+    # its default on/off, or a new always-on slot, updates this automatically while
+    # still proving active_plugins filters strictly on `enabled` (nothing more).
+    default_on = [p["name"] for p in tp.resolve_plugins(None) if p["enabled"]]
+    assert [p["name"] for p in tp.active_plugins(None)] == default_on
+    # Sanity: the default-on set is precisely the three core code/fs slots today.
+    assert default_on == ["filesystem", "code-intel", "code-extractor"]
+    # Disabling another slot drops it; enabling word adds it (order preserved).
     cfg = {"code-extractor": {"enabled": False}, "word": {"enabled": True}}
     assert [p["name"] for p in tp.active_plugins(cfg)] == [
         "filesystem", "code-intel", "word"
@@ -198,10 +207,13 @@ def test_description_overrides_normalized_to_strings():
 
 
 def test_builtin_names_helper():
-    assert tp.builtin_names() == (
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
-        "desktop-commander", "meridian-docs", "zotero-mcp"
-    )
+    # builtin_names() must be the BUILTIN_PLUGINS display names, in order, as a
+    # tuple — derived from the registry so a new plugin never needs this literal
+    # re-patched, while still proving the helper reads the right field and neither
+    # reorders nor dedups.
+    assert tp.builtin_names() == tuple(b["name"] for b in tp.BUILTIN_PLUGINS)
+    # Names are unique (the helper/registry must not accidentally collide two slots).
+    assert len(tp.builtin_names()) == len(set(tp.builtin_names()))
 
 
 def test_office_plugins_enableable_and_overridable():

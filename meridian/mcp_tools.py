@@ -1389,9 +1389,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
          "required": ["session_id"]}},
     {"name": "idle_until_session_done", "description":
-        "Read-only: Poll every 30 seconds until another session is closed or archived. Use this when you need to wait before editing a locked file.",
+        "Read-only: Poll every 30 seconds until another session is closed or archived. Use this when you need to wait before editing a locked file. "
+        "6f9503a9 — BOUNDED: the wait times out after timeout_seconds (default 1800s / 30 min) and returns {done:false, timed_out:true, status} so a stuck subagent in a parallel fan-out fails that one item fast instead of hanging the whole batch. Pass timeout_seconds=0 or a large value to tune; there is no unbounded wait.",
      "inputSchema": {"type": "object", "properties": {
-         "watching_session_id": {"type": "string"}},
+         "watching_session_id": {"type": "string"},
+         "timeout_seconds": {"type": "number", "description": "Max seconds to wait before returning done=false, timed_out=true (default 1800). A stuck/never-closing session can't hang the caller past this."}},
          "required": ["watching_session_id"]}},
     {"name": "update_md_section", "description":
         "Propose a replacement for an anchored section of an agent template doc "

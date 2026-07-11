@@ -218,25 +218,27 @@ def test_tunnel_plugins_get_returns_resolved_defaults(monkeypatch, tmp_path):
         raw, _row = await db_module.create_api_token(db, tenant["id"], label="t")
         return raw
 
+    from meridian import tunnel_plugins as tp
+
     with _make_hosted_client(monkeypatch, tmp_path) as client:
         raw_token = _run(_setup(client.app.state.db))
         r = client.get("/tunnel/plugins", headers={"Authorization": f"Bearer {raw_token}"})
         assert r.status_code == 200
         body = r.json()
-        assert [p["name"] for p in body["plugins"]] == [
-            "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
-            "desktop-commander", "meridian-docs", "zotero-mcp"
-        ]
+        # Invariant: the endpoint surfaces exactly the registry's built-in plugins,
+        # in registry order — derived from tunnel_plugins.builtin_names() so a new
+        # slot (docx swap, zotero add, …) never needs this literal re-patched. This
+        # is the end-to-end half (full FastAPI stack + JSON round-trip) of the pure
+        # registry-order test in tests/test_tunnel_plugins.py.
+        assert [p["name"] for p in body["plugins"]] == list(tp.builtin_names())
         assert body["config"] == {}
-        assert body["active"] == {
-            "fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False,
-            # 9665538a — meridian-docs slot
-            "docs": False,
-            # 39c117b1 — zotero-mcp slot
-            "zotero": False,
-            # 8fb69d54 — 4 pre-allocated custom slots
-            "p0": False, "p1": False, "p2": False, "p3": False,
-        }
+        # Invariant: `active` has one key per built-in slot (tp.SLOTS) plus the 4
+        # pre-allocated custom slots (tp.CUSTOM_SLOT_PORTS, 8fb69d54), all False for
+        # a fresh tenant with no live tunnel. Keys derive from the registry, not a
+        # frozen literal; the all-False value is the real assertion.
+        expected_active_slots = set(tp.SLOTS) | set(tp.CUSTOM_SLOT_PORTS)
+        assert set(body["active"]) == expected_active_slots
+        assert all(v is False for v in body["active"].values())
 
 
 def test_tunnel_plugins_put_persists_command_override(monkeypatch, tmp_path):
@@ -315,6 +317,8 @@ def _tp_token(client):
 def test_add_custom_plugin_persists_and_resolves(monkeypatch, tmp_path):
     """POST /tunnel/plugins/custom stores a custom plugin; GET reflects it in
     `custom` and it survives a fresh read (would resolve at tunnel spawn)."""
+    from meridian import tunnel_plugins as tp
+
     with _make_hosted_client(monkeypatch, tmp_path) as client:
         hdr = _tp_token(client)
         r = client.post("/tunnel/plugins/custom", headers=hdr,
@@ -324,14 +328,13 @@ def test_add_custom_plugin_persists_and_resolves(monkeypatch, tmp_path):
         assert body["ok"] is True
         assert body["added"]["name"] == "fetch" and body["added"]["port"] == 8901
         assert [c["name"] for c in body["custom"]] == ["fetch"]
-        # Persisted — a fresh GET still shows it, and built-in slots are untouched.
+        # Persisted — a fresh GET still shows it, and built-in slots are untouched:
+        # the built-in list must still equal the registry's builtin_names() exactly
+        # (adding a custom plugin adds only to `custom`, never to the built-in set).
         got = client.get("/tunnel/plugins", headers=hdr).json()
         assert [c["name"] for c in got["custom"]] == ["fetch"]
         assert got["custom"][0]["command"] == ["uvx", "mcp-server-fetch"]
-        assert [p["name"] for p in got["plugins"]] == [
-            "filesystem", "code-intel", "code-extractor", "powerpoint", "word",
-            "desktop-commander", "meridian-docs", "zotero-mcp"
-        ]
+        assert [p["name"] for p in got["plugins"]] == list(tp.builtin_names())
 
 
 def test_add_custom_plugin_auto_assigns_port(monkeypatch, tmp_path):

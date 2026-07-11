@@ -1021,6 +1021,48 @@ def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
     return {**os.environ, **coerced}
 
 
+# 2b04a361 — force UTF-8 stdio for the spawned Office-slot MCP servers (ppt/word/
+# dc). These are third-party Python MCP servers (docx-mcp on the `word` slot,
+# powerpoint-mcp on `ppt`) that run their OWN logging. On Windows the child
+# Python inherits the console's legacy cp1252 encoding for sys.stdout/stderr, so
+# the moment the server logs a non-ASCII message — e.g. a docx-mcp log line with
+# Chinese characters — its logger raises UnicodeEncodeError and the slot crashes.
+# This is the third instance of the known Windows-encoding failure class (after
+# hitl_guard's em-dash and install.ps1's UTF-16). We fix it at the spawn site by
+# telling the child Python to encode its own stdio as UTF-8 with the ``replace``
+# error handler (PYTHONIOENCODING=utf-8:replace — the documented
+# ``<encoding>:<errorhandler>`` form) and to run in UTF-8 mode (PYTHONUTF8=1,
+# belt-and-suspenders). The ``:replace`` handler guarantees that a stray byte that
+# still can't be encoded is substituted rather than raising — so a bad log line
+# can never crash the child's logging OR take the slot down. (The launcher's own
+# ``_force_utf8_io`` only exports plain ``utf-8`` with the default *strict* handler,
+# so it does NOT cover an unencodable byte; we harden the office children here.)
+# We do NOT pipe the child's stdout/stderr (they inherit the console fds), so this
+# env-level fix is the correct and minimal lever: it configures the child's own
+# encoding, not a launcher-side decode.
+_UTF8_STDIO_ENV = {"PYTHONIOENCODING": "utf-8:replace", "PYTHONUTF8": "1"}
+
+
+def _office_slot_spawn_env(env: object) -> "dict[str, str]":
+    """Spawn env for an Office slot (ppt/word/dc), with UTF-8 stdio forced.
+
+    Starts from :func:`_plugin_spawn_env` (the plugin's optional ``env`` merged
+    over the parent process env) and layers the UTF-8 stdio vars on top so the
+    spawned third-party Python MCP server writes UTF-8 to stdout/stderr regardless
+    of the parent console's legacy code page (2b04a361 — fixes docx-mcp's own
+    logger crashing on non-ASCII log lines under Windows cp1252). Unlike
+    :func:`_plugin_spawn_env` this NEVER returns ``None``: even a slot with no
+    plugin env still needs the encoding override, so we always materialise a full
+    env dict (parent env + the UTF-8 vars). A plugin ``env`` key that collides with
+    one of the UTF-8 vars is intentionally overridden — correct stdio encoding is
+    non-negotiable for these Python servers.
+    """
+    base = _plugin_spawn_env(env)
+    merged = dict(base) if base is not None else dict(os.environ)
+    merged.update(_UTF8_STDIO_ENV)
+    return merged
+
+
 def _terminate_proc_tree(proc: "subprocess.Popen | None") -> None:
     """Stop a spawned proxy *and its whole child tree*. Best-effort; never raises.
 
@@ -3046,7 +3088,10 @@ async def run_tunnel(
                 print(_warn, flush=True, file=sys.stderr)
             continue
         oport = office_ports[slot]
-        spawn_env = _plugin_spawn_env(plugin.get("env"))
+        # 2b04a361 — Office slots spawn third-party Python MCP servers (docx-mcp,
+        # powerpoint-mcp) that log non-ASCII; force UTF-8 stdio in the child env
+        # so their own loggers can't crash on Windows' cp1252 console encoding.
+        spawn_env = _office_slot_spawn_env(plugin.get("env"))
         # 4ea1b9d5 — persistent slots omit --stateless so their inner process
         # keeps state across requests (DC terminal sessions).
         _persistent = plugin.get("session_mode") == "persistent"

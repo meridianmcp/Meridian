@@ -7405,10 +7405,27 @@ async def claim_file(
 
 
 async def expire_file_read_claims(db: aiosqlite.Connection) -> None:
-    """ffa03655 — drop read claims whose TTL has lapsed (mirrors expire_file_locks)."""
-    await db.execute(
-        "DELETE FROM file_read_claims WHERE expires_at < datetime('now')"
-    )
+    """ffa03655 — drop read claims whose TTL has lapsed (mirrors expire_file_locks).
+
+    949cf1e5 — dialect-split the cutoff comparison. Unlike every sibling lock table
+    (file_locks / resource_locks / file_symbol_claims), whose ``expires_at`` is TEXT
+    on Postgres, ``file_read_claims.expires_at`` is a TIMESTAMPTZ (pg_adapter). The
+    shared ``datetime('now')`` form is rewritten by the adapter to a ``to_char(...)``
+    *text* expression, so on Postgres ``expires_at < datetime('now')`` became
+    ``timestamptz < text`` → ``operator does not exist: timestamp with time zone <
+    text`` (a hard crash surfaced through get_file_claims / claim_file). SQLite is
+    loosely typed so it hid the mismatch, and CI is SQLite-only so it never caught it.
+    On Postgres compare against a real ``now()`` timestamp; keep the text-comparing
+    ``datetime('now')`` on SQLite (where the column is TEXT).
+    """
+    if hasattr(db, "_pool"):  # Postgres — TIMESTAMPTZ column, compare to a timestamp
+        await db.execute(
+            "DELETE FROM file_read_claims WHERE expires_at < now()"
+        )
+    else:  # SQLite — TEXT column, lexical ISO comparison against datetime('now')
+        await db.execute(
+            "DELETE FROM file_read_claims WHERE expires_at < datetime('now')"
+        )
     await db.commit()
 
 
