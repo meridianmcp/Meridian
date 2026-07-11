@@ -828,6 +828,63 @@ def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
     assert token_hash in oauth_module._oa_tokens
 
 
+def test_remote_mcp_tenant_db_open_failure_fails_loud_not_auth_db(client, monkeypatch):
+    """f6aedc56/591242bf — when a hosted /mcp request's tenant project DB can't be
+    opened, the handler must FAIL LOUD (surface the 503), never silently fall back
+    to the shared auth DB (which would serve the request against the wrong DB —
+    the "HITL bug source" the code's own comment named)."""
+    from fastapi import HTTPException
+    from meridian import db as db_module
+    from meridian import _deps as deps_module
+    from meridian import server as server_module
+    from meridian.routes import oauth as oauth_module
+
+    # The hosted DB-routing branch (and thus this fail-loud path) only runs in
+    # hosted mode; the default client fixture is self-hosted.
+    monkeypatch.setattr(server_module, "_hosted_mode", lambda: True)
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "dbfail@example.com")
+        raw_token = "oauth-dbfail-token"
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        # A REAL tenant_id on the token so the hosted DB-routing branch fires.
+        await db.execute(
+            "INSERT INTO oauth_tokens (token_hash, tenant_id, client_id, exp) VALUES (?, ?, ?, ?)",
+            (token_hash, tenant["id"], "claude-ai", int(time.time()) + 3600),
+        )
+        await db.commit()
+        oauth_module._oa_tokens.clear()
+        return raw_token, tenant["id"]
+
+    raw_token, tenant_id = _run(_setup())
+
+    # Simulate the tenant's project DB failing to open (e.g. provisioning race).
+    async def _raising_open(_request, _tenant_id):
+        raise HTTPException(status_code=503, detail="tenant database is provisioning")
+
+    monkeypatch.setattr(deps_module, "_open_tenant_db_by_id", _raising_open)
+    try:
+        r = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0", "id": 7, "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {}},
+            },
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        # FAIL LOUD: the DB-open 503 is surfaced, NOT a silent 200 against auth DB.
+        assert r.status_code == 503, r.text
+        assert "unavailable" in r.text.lower()
+        # It is a well-formed JSON-RPC error carrying the original request id.
+        body = r.json()
+        assert body.get("error") is not None
+        assert body.get("id") == 7
+    finally:
+        oauth_module._oa_tokens.clear()
+        deps_module._tenant_db_cache.pop(tenant_id, None)
+
+
 def test_remote_mcp_tools_list_returns_full_tool_surface(client):
     """POST /mcp tools/list returns the full base MCP tool surface.
 

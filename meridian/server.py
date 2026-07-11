@@ -6398,14 +6398,37 @@ async def _remote_mcp_inner(request: Request) -> Any:
         _mdb = request.app.state.db
         _oa_tenant_id = _td.get("tenant_id")
         if _oa_tenant_id and _hosted_mode():
+            from ._deps import _open_tenant_db_by_id
+            _mcp_req_id = _body.get("id") if isinstance(_body, dict) else None
             try:
-                from ._deps import _open_tenant_db_by_id
                 _mdb = await _open_tenant_db_by_id(request, _oa_tenant_id)
-            except Exception as _db_err:
+            except HTTPException as _db_exc:
+                # f6aedc56 — FAIL LOUD. This used to log and fall through to the
+                # shared auth DB (_mdb = request.app.state.db), silently serving
+                # the tenant's request against the WRONG database — the code's own
+                # comment named it a "HITL bug source". Surface the real error so
+                # the caller gets a clear 503/retry, never a cross-tenant misroute.
                 import logging as _mcp_log
                 _mcp_log.getLogger("meridian.mcp").error(
-                    "[mcp] DB routing failed for tenant %s: %s — request will use auth DB (HITL bug source)",
+                    "[mcp] tenant %s DB open failed (%s) — returning %s, NOT falling back to auth DB",
+                    _oa_tenant_id, _db_exc.detail, _db_exc.status_code,
+                )
+                return JSONResponse(
+                    _jsonrpc_err(
+                        _mcp_req_id, -32000,
+                        f"tenant database unavailable: {_db_exc.detail}",
+                    ),
+                    status_code=_db_exc.status_code,
+                )
+            except Exception as _db_err:  # noqa: BLE001 — any other failure is still a misroute risk
+                import logging as _mcp_log
+                _mcp_log.getLogger("meridian.mcp").error(
+                    "[mcp] tenant %s DB routing error: %s — returning 503, NOT falling back to auth DB",
                     _oa_tenant_id, _db_err,
+                )
+                return JSONResponse(
+                    _jsonrpc_err(_mcp_req_id, -32000, "tenant database unavailable"),
+                    status_code=503,
                 )
         _mdd = request.app.state.data_dir
         _oa_tenant = None
