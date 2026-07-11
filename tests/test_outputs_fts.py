@@ -262,6 +262,155 @@ def test_search_outputs_missing_dir_returns_empty_not_error(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# incremental rebuild — the 4-minute-hang fix (5116078b)
+# ---------------------------------------------------------------------------
+
+class _CountingHasher:
+    """Wraps the real SHA-256 hasher and counts calls per path."""
+
+    def __init__(self):
+        self.calls: dict[str, int] = {}
+
+    def __call__(self, path):
+        self.calls[path] = self.calls.get(path, 0) + 1
+        return oi._sha256_file(path)
+
+    @property
+    def total(self) -> int:
+        return sum(self.calls.values())
+
+
+def test_incremental_rebuild_skips_unchanged_files(tmp_path):
+    # No _old / _-prefixed names → classification never hashes, so every hash
+    # call is attributable to the row build. This isolates the incremental diff.
+    _write(tmp_path / "a.csv", "alpha,beta\n1,2\n")
+    _write(tmp_path / "b.csv", "gamma,delta\n3,4\n")
+    _write(tmp_path / "c.json", json.dumps({"k": "v"}))
+    hasher = _CountingHasher()
+    idx = oi.OutputsFtsIndex(str(tmp_path), hasher=hasher)
+    try:
+        assert idx.rebuild() == 3
+        assert hasher.total == 3  # each file hashed exactly once on the cold pass
+
+        # Nothing changed → a second rebuild re-hashes NOTHING (the whole point).
+        assert idx.rebuild() == 3
+        assert hasher.total == 3
+
+        # Change ONE file (size changes → detected regardless of mtime tick).
+        _write(tmp_path / "b.csv", "gamma,delta,epsilon\n3,4,5\n")
+        assert idx.rebuild() == 3
+        assert hasher.total == 4  # only b.csv re-hashed
+        assert hasher.calls[str(tmp_path / "b.csv")] == 2
+        assert hasher.calls[str(tmp_path / "a.csv")] == 1
+
+        # Delete a file → dropped from the index without hashing anything.
+        os.remove(tmp_path / "c.json")
+        assert idx.rebuild() == 2
+        assert hasher.total == 4
+    finally:
+        idx.close()
+
+
+def test_rebuild_wall_clock_budget_yields_partial_and_resumes(tmp_path):
+    # Distinct ALPHABETIC token per file (taga..tagl): the DuckDB FTS tokenizer
+    # drops digits, so a "markerNN" scheme would collapse every file to the same
+    # "marker" token and BM25 couldn't single one out.
+    for i in range(12):
+        _write(tmp_path / f"f{i:02d}.csv", f"tag{chr(97 + i)},x\n{i},{i}\n")
+
+    def _slow_hasher(path):
+        time.sleep(0.05)
+        return oi._sha256_file(path)
+
+    idx = oi.OutputsFtsIndex(str(tmp_path), hasher=_slow_hasher)
+    try:
+        # A tight budget can't process all 12 slow files → partial result, no hang.
+        n1 = idx.rebuild(max_seconds=0.12)
+        assert idx.last_rebuild_partial is True
+        assert 0 < n1 < 12
+
+        # Subsequent budgeted calls resume where the last left off (already-built
+        # rows are cached, only the still-stale files get worked).
+        for _ in range(20):
+            idx.rebuild(max_seconds=0.12)
+            if not idx.last_rebuild_partial:
+                break
+        assert idx.last_rebuild_partial is False
+        hits = idx.search("tagh", limit=5)  # tagh == f07's token (chr(97+7))
+        assert any(h["path"].endswith("f07.csv") for h in hits)
+    finally:
+        idx.close()
+
+
+def test_get_cached_index_reuses_and_evicts(tmp_path, monkeypatch):
+    monkeypatch.setattr(oi, "_index_cache", oi.OrderedDict())
+    monkeypatch.setattr(oi, "_MAX_CACHED_INDEXES", 2)
+    d1, d2, d3 = (tmp_path / "d1", tmp_path / "d2", tmp_path / "d3")
+    for d in (d1, d2, d3):
+        d.mkdir()
+
+    idx1 = oi._get_cached_index(str(d1))
+    # Same directory → same cached instance (this is what makes rebuild cheap).
+    assert oi._get_cached_index(str(d1)) is idx1
+
+    idx2 = oi._get_cached_index(str(d2))
+    assert idx2 is not idx1
+    # Inserting a 3rd distinct dir evicts the LRU (d1) and closes its connection.
+    oi._get_cached_index(str(d3))
+    assert len(oi._index_cache) == 2
+    assert oi._cache_key(str(d1)) not in oi._index_cache
+
+
+def test_search_outputs_reuses_cached_index_across_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(oi, "_index_cache", oi.OrderedDict())
+    _seed_tree(tmp_path)
+    r1 = oi.search_outputs(str(tmp_path), "accuracy loss", limit=5)
+    assert r1["total_indexed"] == 6
+    # A second call hits the SAME cached, already-populated index.
+    key = oi._cache_key(str(tmp_path))
+    cached = oi._index_cache[key]
+    r2 = oi.search_outputs(str(tmp_path), "temperature pressure", limit=5)
+    assert oi._index_cache[key] is cached
+    assert r2["total_indexed"] == 6
+    assert r2["hits"]
+
+
+def test_invalidate_forces_rehash(tmp_path):
+    _write(tmp_path / "a.csv", "alpha,beta\n1,2\n")
+    hasher = _CountingHasher()
+    idx = oi.OutputsFtsIndex(str(tmp_path), hasher=hasher)
+    try:
+        idx.rebuild()
+        idx.rebuild()
+        assert hasher.total == 1  # unchanged → hashed once total
+        idx.invalidate(str(tmp_path / "a.csv"))
+        idx.rebuild()
+        assert hasher.total == 2  # forced re-hash despite unchanged mtime+size
+    finally:
+        idx.close()
+
+
+def test_handle_event_reindexes_same_size_modify(tmp_path):
+    """Watcher path is EXACT: a same-byte-length in-place edit (which the
+    mtime+size heuristic alone could miss) is still reindexed, because
+    handle_event force-invalidates the changed path."""
+    idx = oi.OutputsIndexer(str(tmp_path))
+    try:
+        _write(tmp_path / "x.csv", "aaaterm,z\n1,2\n")
+        idx.handle_event("created", str(tmp_path / "x.csv"))
+        assert any(h["path"].endswith("x.csv")
+                   for h in idx.search("aaaterm", limit=5))
+        # Overwrite with identical byte length but a different searchable term.
+        _write(tmp_path / "x.csv", "bbbterm,z\n1,2\n")
+        idx.handle_event("modified", str(tmp_path / "x.csv"))
+        assert any(h["path"].endswith("x.csv")
+                   for h in idx.search("bbbterm", limit=5))
+    finally:
+        if idx.fts is not None:
+            idx.fts.close()
+
+
+# ---------------------------------------------------------------------------
 # watchdog change rebuilds the FTS index
 # ---------------------------------------------------------------------------
 
