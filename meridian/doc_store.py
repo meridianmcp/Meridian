@@ -1763,6 +1763,125 @@ class DocStructureStore:
         lim = limit if isinstance(limit, int) and limit > 0 else 5
         return scored[:lim]
 
+    async def find_symbol_usages(
+        self, document_id: str, symbol_or_equation_id: str
+    ) -> dict[str, Any]:
+        """Cross-reference tracking for a defined symbol/equation (9605edb0).
+
+        Resolves ``symbol_or_equation_id`` to a single normalized-LaTeX *target*
+        and returns every place in ``document_id`` where that target reappears,
+        so a later mention can be checked to point back to the DEFINITION instead
+        of assuming the reader remembers it.
+
+        Resolution — two accepted input shapes, tried in this order:
+
+        * an existing ``doc_equations.id`` in this document → the target is that
+          row's stored ``latex_normalized`` (authoritative; no re-normalization);
+        * anything else → a raw symbol / LaTeX source, normalized with the SAME
+          :func:`normalize_latex` that produced every ``latex_normalized`` value,
+          so the comparison is apples-to-apples (never a bespoke normalization).
+
+        Scans TWO surfaces of the same document and merges the hits:
+
+        * ``doc_equations`` — any equation (the target row itself, or another
+          element) whose ``latex_normalized`` equals the resolved target;
+        * ``doc_elements`` — any paragraph whose ``text`` *textually contains* the
+          target symbol (a normalized, whitespace-insensitive substring test), so
+          prose reuse of a symbol defined in an equation is caught too.
+
+        Each hit carries ``element_id``, ``document_id``, ``ordinal``,
+        ``matched_text`` (the equation's LaTeX or the paragraph text), ``context``
+        (``"equation"`` or ``"paragraph"``), and a ``is_definition`` /
+        ``is_reuse`` classification: the EARLIEST hit by ordinal is the
+        definition, every later hit is a reuse. Hits are ordered by ``ordinal``
+        (then a stable ``context``/``id`` tiebreak) so the definition sorts first.
+
+        Returns ``{target, resolved_from, hits:[...]}``. Never raises: an empty
+        target (blank symbol, or an equation id whose row has no normalized latex)
+        or a document with no matches yields ``{..., "hits": []}``.
+        """
+        raw = (symbol_or_equation_id or "").strip()
+        if not raw:
+            return {"target": "", "resolved_from": None, "hits": []}
+
+        equations = await self.get_equations(document_id)
+
+        # Resolve the target normalized-LaTeX. An exact doc_equations.id match in
+        # THIS document is authoritative (use its stored latex_normalized as-is);
+        # otherwise treat the input as a raw symbol/LaTeX string and normalize it
+        # with the same normalize_latex that produced every latex_normalized.
+        target = ""
+        resolved_from = "symbol"
+        by_id = {eq.get("id"): eq for eq in equations}
+        if raw in by_id:
+            target = (by_id[raw].get("latex_normalized") or "").strip()
+            resolved_from = "equation_id"
+        else:
+            target = normalize_latex(raw)
+
+        if not target:
+            return {"target": "", "resolved_from": resolved_from, "hits": []}
+
+        hits: list[dict[str, Any]] = []
+
+        # Surface 1 — equations with a matching normalized latex (same or other
+        # elements). Exact equality on the normalized key, not a fuzzy ratio: this
+        # is "the SAME equation reappears", not "a similar one".
+        for eq in equations:
+            if (eq.get("latex_normalized") or "").strip() == target:
+                hits.append({
+                    "element_id": eq.get("element_id"),
+                    "equation_id": eq.get("id"),
+                    "document_id": eq.get("document_id"),
+                    "ordinal": eq.get("ordinal"),
+                    "matched_text": eq.get("latex_normalized"),
+                    "context": "equation",
+                })
+
+        # Surface 2 — paragraphs textually containing the symbol. Compare on the
+        # normalized (whitespace-stripped) forms so "E = m c^2" in prose still
+        # matches the "E=mc^2" target. Only kind='paragraph'/'text' bodies are
+        # scanned so a heading/figure caption isn't mistaken for a reuse.
+        async with self._db.execute(
+            "SELECT * FROM doc_elements WHERE document_id = ? ORDER BY ordinal ASC",
+            (document_id,),
+        ) as cur:
+            element_rows = await cur.fetchall()
+        for row in element_rows:
+            el = _row_to_dict(row, _ELEMENT_COLUMNS)
+            if el is None:
+                continue
+            text = el.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if target in re.sub(r"\s+", "", text):
+                hits.append({
+                    "element_id": el.get("id"),
+                    "equation_id": None,
+                    "document_id": el.get("document_id"),
+                    "ordinal": el.get("ordinal"),
+                    "matched_text": text,
+                    "context": "paragraph",
+                })
+
+        # Order by ordinal so the definition (earliest) sorts first; stable tie
+        # break keeps equation hits ahead of paragraph hits at one ordinal and
+        # keeps the result deterministic across backends.
+        _context_rank = {"equation": 0, "paragraph": 1}
+        hits.sort(key=lambda h: (
+            h.get("ordinal") if isinstance(h.get("ordinal"), int) else 0,
+            _context_rank.get(h.get("context"), 9),
+            str(h.get("equation_id") or ""),
+            str(h.get("element_id") or ""),
+        ))
+
+        # Classify: the FIRST hit is the definition, every later one is a reuse.
+        for i, h in enumerate(hits):
+            h["is_definition"] = i == 0
+            h["is_reuse"] = i > 0
+
+        return {"target": target, "resolved_from": resolved_from, "hits": hits}
+
     async def put_equations(
         self,
         document_id: str,

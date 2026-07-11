@@ -2305,7 +2305,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, update_paragraph, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, update_paragraph, find_symbol_usages, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -2772,6 +2772,42 @@ async def _handle_notes_decisions(
         except Exception as exc:  # noqa: BLE001 — the write is best-effort
             return {"error": f"could not update paragraph: {exc}"}
         return {"project_id": args["project_id"], **result}
+    if name == "find_symbol_usages":
+        # 9605edb0 — READ-ONLY cross-reference tracking: resolve a symbol /
+        # normalized-LaTeX string OR a doc_equations id to one target and return
+        # every paragraph/equation where it reappears, classified definition vs
+        # reuse (earliest ordinal = definition). Mirrors find_similar_equation's
+        # shape (resolve the store, then look up the document by its stored source).
+        validate_input_size(args.get("doc"), "symbol usages doc", 2_000)
+        validate_input_size(args.get("symbol_or_equation_id"), "symbol_or_equation_id", 100_000)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        symbol_or_equation_id = args.get("symbol_or_equation_id")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not symbol_or_equation_id:
+            return {"error": "symbol_or_equation_id is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"project_id": args["project_id"], "document_id": None, "target": "", "hits": []}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {"project_id": args["project_id"], "document_id": None, "target": "", "hits": []}
+        try:
+            usages = await store.find_symbol_usages(
+                doc_row["id"], symbol_or_equation_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+            return {"error": f"could not find symbol usages: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            **usages,
+        }
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)

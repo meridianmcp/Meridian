@@ -992,6 +992,36 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="find_symbol_usages",
+                description=(
+                    "9605edb0 — READ-ONLY cross-reference tracking. Given a "
+                    "document and EITHER a doc_equations id OR a symbol / "
+                    "normalized-LaTeX string, resolve it to one target "
+                    "normalized-LaTeX (an equation id uses that row's stored "
+                    "latex_normalized; a raw string is normalized with the SAME "
+                    "normalize_latex the store uses) and return every place the "
+                    "target reappears — matching equations plus paragraphs whose "
+                    "text contains the symbol. Each hit carries element_id, "
+                    "document_id, ordinal, matched_text, context "
+                    "(equation|paragraph) and an is_definition/is_reuse flag: the "
+                    "earliest occurrence by ordinal is the definition, later ones "
+                    "are reuse, so a later mention can be checked to point back "
+                    "to the definition. Returns {document_id, target, "
+                    "resolved_from, hits} — an empty hits list (never an error) "
+                    "when nothing matches or doc doesn't resolve."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "symbol_or_equation_id": {"type": "string", "description": "A doc_equations row id, OR a raw symbol / normalized-LaTeX string to track."},
+                    },
+                    "required": ["doc", "symbol_or_equation_id"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1947,7 +1977,7 @@ def build_mcp_server():
                 "list_sessions",
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
                 "get_citation_edges", "resolve_citations",
-                "index_equation", "find_similar_equation", "insert_equation", "update_paragraph",
+                "index_equation", "find_similar_equation", "insert_equation", "update_paragraph", "find_symbol_usages",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",

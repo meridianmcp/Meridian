@@ -40,6 +40,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "find_similar_equation": 'find_similar_equation(project_id="abc-123", doc="thesis/chapter1.docx", latex="E=mc^2")',
     "insert_equation": 'insert_equation(project_id="abc-123", doc="thesis/chapter1.docx", para_id="0000B002", equation_id_or_omml="E=mc^2", position="append")',
     "update_paragraph": 'update_paragraph(project_id="abc-123", doc="thesis/chapter1.docx", para_id="1F2A3B4C", new_text="The revised conclusion sentence.")',
+    "find_symbol_usages": 'find_symbol_usages(project_id="abc-123", doc="thesis/chapter1.docx", symbol_or_equation_id="E=mc^2")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -508,6 +509,29 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "runs": {"type": "array", "description": "List of runs — each a plain string or a {text, bold?, italic?, underline?} object. Provide this OR new_text, not both.",
                   "items": {"type": ["string", "object"]}}},
          "required": ["doc", "para_id"]}},
+    {"name": "find_symbol_usages", "description":
+        "9605edb0 — READ-ONLY cross-reference tracking: given a document and "
+        "EITHER a doc_equations row id OR a symbol / normalized-LaTeX string, "
+        "resolve it to ONE target normalized-LaTeX (an equation id uses that "
+        "row's stored latex_normalized as-is; a raw string is normalized with "
+        "the SAME normalize_latex that produced every stored latex_normalized) "
+        "and return every place that target reappears in the document — matching "
+        "equations (exact normalized-latex equality) AND paragraphs whose text "
+        "textually contains the symbol. Each hit carries element_id, "
+        "document_id, ordinal, matched_text, context (equation|paragraph) and an "
+        "is_definition/is_reuse flag: the EARLIEST occurrence by ordinal is the "
+        "definition, later ones are reuse — so a later mention can be checked to "
+        "point back to the definition instead of assuming the reader remembers "
+        "it. Hits are ordered by ordinal (definition first). Returns "
+        "{document_id, target, resolved_from, hits:[...]} — an empty hits list "
+        "(never an error) when nothing matches, or doc doesn't resolve to a "
+        "stored document.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "symbol_or_equation_id": {"type": "string", "description": "A doc_equations row id, OR a raw symbol / normalized-LaTeX string to track (e.g. 'E=mc^2' or '\\\\sigma')."}},
+         "required": ["doc", "symbol_or_equation_id"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
@@ -1360,7 +1384,7 @@ _READ_ONLY_TOOLS = {
     "list_plugins", "get_plugin_details",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
-    "find_similar_equation",
+    "find_similar_equation", "find_symbol_usages",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
 }
@@ -1416,6 +1440,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "find_similar_equation": "Find Similar Equation",
     "insert_equation": "Insert Equation",
     "update_paragraph": "Update Paragraph",
+    "find_symbol_usages": "Find Symbol Usages",
 }
 
 for _tool in _MCP_TOOLS_LIST:
