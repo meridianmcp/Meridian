@@ -103,6 +103,161 @@ def _read_source(path_or_source: str) -> tuple[str, str | None]:
     return path_or_source, None
 
 
+# --- source pre-expansion: \input/\include (da9815ef) + \newcommand (fae29498) --
+
+_INPUT_RE = re.compile(r"\\(?:input|include)\s*\{([^}]*)\}")
+_MAX_INPUT_DEPTH = 20  # runaway/cyclic \input guard
+
+# A \newcommand/\renewcommand definition head, up to the opening brace of its
+# body: captures the defined macro name. Handles the star form, an optional
+# [nargs] count and an optional [default] first-arg value.
+_NEWCOMMAND_HEAD_RE = re.compile(
+    r"\\(?:re)?newcommand\*?\s*\{\s*\\([A-Za-z@]+)\s*\}"
+    r"\s*(?:\[\d+\])?\s*(?:\[[^\]]*\])?\s*\{"
+)
+_SECTION_MACRO_ALT = "|".join(re.escape(k) for k in _SECTION_LEVELS)
+_SECTION_IN_BODY_RE = re.compile(r"\\(?:" + _SECTION_MACRO_ALT + r")\b")
+
+
+def _brace_match(text: str, open_idx: int) -> tuple[str, int]:
+    """Given ``text[open_idx] == '{'``, return ``(inner, index_after_close)``.
+
+    Depth-aware so nested ``{...}`` inside the group are handled. If the brace is
+    never closed (malformed), returns everything after it and ``len(text)``."""
+    depth, j, n = 0, open_idx, len(text)
+    while j < n:
+        c = text[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1 : j], j + 1
+        j += 1
+    return text[open_idx + 1 :], n
+
+
+def _expand_inputs(
+    source: str,
+    base_dir: str,
+    *,
+    _seen: set | None = None,
+    _depth: int = 0,
+    _unexpanded: list | None = None,
+) -> tuple[str, list[str]]:
+    """Recursively splice ``\\input{f}`` / ``\\include{f}`` file contents inline.
+
+    da9815ef — real multi-file arXiv papers keep chapters/sections in separate
+    files; without this the heading tree is incomplete. Each referenced name
+    resolves to ``<name>.tex`` under ``base_dir`` (or the including file's dir for
+    nested inputs); a file that exists is read and its content expanded in turn
+    (depth- and cycle-guarded). A name that can't be resolved/read is left in
+    place and recorded in the returned ``unexpanded`` list. Never raises — any
+    error leaves that reference unexpanded."""
+    if _seen is None:
+        _seen = set()
+    if _unexpanded is None:
+        _unexpanded = []
+    if _depth > _MAX_INPUT_DEPTH:
+        return source, _unexpanded
+
+    def _repl(m: "re.Match") -> str:
+        name = m.group(1).strip()
+        if not name:
+            return m.group(0)
+        candidate = name if name.lower().endswith(".tex") else name + ".tex"
+        path = candidate if os.path.isabs(candidate) else os.path.join(base_dir, candidate)
+        try:
+            real = os.path.abspath(path)
+            if real in _seen:  # cycle: already included once, drop the re-include
+                return ""
+            if os.path.isfile(real):
+                with open(real, encoding="utf-8", errors="replace") as handle:
+                    inner = handle.read()
+                _seen.add(real)
+                expanded_inner, _ = _expand_inputs(
+                    inner, os.path.dirname(real),
+                    _seen=_seen, _depth=_depth + 1, _unexpanded=_unexpanded,
+                )
+                return expanded_inner
+        except Exception:  # noqa: BLE001 — a bad include must not sink the parse
+            pass
+        if name not in _unexpanded:
+            _unexpanded.append(name)
+        return m.group(0)
+
+    try:
+        return _INPUT_RE.sub(_repl, source), _unexpanded
+    except Exception:  # noqa: BLE001
+        return source, _unexpanded
+
+
+def _expand_section_macros(source: str) -> str:
+    """Rewrite section-aliasing ``\\newcommand`` macros to their base section macro.
+
+    fae29498 — a paper that defines ``\\newcommand{\\mysection}[1]{\\section{#1}}``
+    and writes ``\\mysection{Foo}`` is invisible to the fixed-name heading walker.
+    We detect definitions whose body contains a sectioning macro and uses ``#1``,
+    strip those definitions, then rewrite each use ``\\mysection`` -> ``\\section``
+    so the walker sees a real heading. Full TeX macro expansion is out of scope;
+    this handles the common single-argument section-alias case. Never raises."""
+    try:
+        aliases: dict[str, str] = {}
+        for m in _NEWCOMMAND_HEAD_RE.finditer(source):
+            name = m.group(1)
+            body, _end = _brace_match(source, m.end() - 1)
+            bm = _SECTION_IN_BODY_RE.search(body)
+            if bm and "#1" in body:
+                # bm.group(0) is like '\section'; strip the leading backslash.
+                aliases[name] = bm.group(0)[1:]
+        if not aliases:
+            return source
+        result = source
+        for name, target in aliases.items():
+            # 1. Remove this macro's definition(s) so its self-reference inside
+            #    \newcommand{\name}{...} isn't rewritten into \newcommand{\section}.
+            defpat = re.compile(
+                r"\\(?:re)?newcommand\*?\s*\{\s*\\" + re.escape(name) + r"\s*\}"
+                r"\s*(?:\[\d+\])?\s*(?:\[[^\]]*\])?\s*\{"
+            )
+            pieces: list[str] = []
+            i = 0
+            while True:
+                dm = defpat.search(result, i)
+                if not dm:
+                    pieces.append(result[i:])
+                    break
+                pieces.append(result[i : dm.start()])
+                _body, end = _brace_match(result, dm.end() - 1)
+                i = end
+            result = "".join(pieces)
+            # 2. Rewrite uses \name -> \target (word-boundary so \namex is safe).
+            result = re.sub(
+                r"\\" + re.escape(name) + r"(?![A-Za-z@])", "\\\\" + target, result
+            )
+        return result
+    except Exception:  # noqa: BLE001 — expansion is best-effort; fall back to raw
+        return source
+
+
+def _expand_source(source: str, base_dir: str | None) -> tuple[str, list[str]]:
+    """Pre-expand a LaTeX source: splice \\input/\\include (when ``base_dir`` lets
+    us resolve them) then rewrite section-alias \\newcommand macros. Returns
+    ``(expanded_source, unexpanded_input_names)``. With no ``base_dir`` the inputs
+    can't be resolved, so all referenced names are reported unexpanded (the prior
+    behaviour) — only macro rewriting still applies."""
+    unexpanded: list[str] = []
+    if base_dir:
+        source, unexpanded = _expand_inputs(source, base_dir)
+    else:
+        for m in _INPUT_RE.finditer(source):
+            name = m.group(1).strip()
+            if name and name not in unexpanded:
+                unexpanded.append(name)
+    source = _expand_section_macros(source)
+    return source, unexpanded
+
+
 def _node_text(node2text: Any, nodes: list[Any]) -> str:
     """Render a list of latexwalker nodes to plain text, best-effort."""
     try:
@@ -325,7 +480,7 @@ def _build_tree(headings: list[dict]) -> list[dict]:
     return roots
 
 
-def parse_latex_structure(source: str) -> dict[str, Any]:
+def parse_latex_structure(source: str, base_dir: str | None = None) -> dict[str, Any]:
     """Parse a LaTeX ``source`` string into a document structure tree.
 
     Returns ``{heading_count, headings, tree, unexpanded_inputs}`` where:
@@ -335,14 +490,24 @@ def parse_latex_structure(source: str) -> dict[str, Any]:
       ``headings`` list.
     * ``tree`` — the same headings nested by level (``children`` lists).
     * ``unexpanded_inputs`` — filenames referenced via ``\\input`` / ``\\include``
-      that were NOT expanded (best-effort note; expansion is out of scope for
-      Phase 3, so the caller knows the tree may be incomplete).
+      that could NOT be expanded (a missing file, or no ``base_dir`` to resolve
+      against). When ``base_dir`` is given, resolvable inputs are spliced in
+      first (da9815ef) so multi-file papers get a complete tree, and only the
+      genuinely-unresolvable references remain here.
+
+    ``base_dir`` — directory to resolve ``\\input``/``\\include`` (and nested ones)
+    against. ``analyze_latex`` passes the ``.tex`` file's own directory; a raw
+    source string has none, so its inputs stay unexpanded (prior behaviour).
+    Section-aliasing ``\\newcommand`` macros are expanded regardless (fae29498).
 
     Never raises: on any parse error returns an empty-but-well-formed dict.
     """
     empty = {"heading_count": 0, "headings": [], "tree": [], "unexpanded_inputs": []}
     if not source or not isinstance(source, str):
         return dict(empty)
+    # da9815ef + fae29498 — splice \input/\include and rewrite section-alias
+    # macros BEFORE the heading walk so the tree reflects the whole document.
+    source, unexpanded = _expand_source(source, base_dir)
     latexwalker, node2text = _lazy_latexwalker()
     if latexwalker is None:
         return dict(empty)
@@ -357,16 +522,6 @@ def parse_latex_structure(source: str) -> dict[str, Any]:
         _iter_headings(latexwalker, node2text, nodelist, headings)
     except Exception:  # noqa: BLE001 — partial outline beats a crash
         pass
-
-    # Best-effort \input / \include detection (we do NOT expand them in Phase 3).
-    unexpanded: list[str] = []
-    try:
-        for m in re.finditer(r"\\(?:input|include)\s*\{([^}]*)\}", source):
-            name = m.group(1).strip()
-            if name and name not in unexpanded:
-                unexpanded.append(name)
-    except Exception:  # noqa: BLE001
-        unexpanded = []
 
     return {
         "heading_count": len(headings),
@@ -575,12 +730,16 @@ def analyze_latex(path_or_source: str) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         source, base_dir = (path_or_source if isinstance(path_or_source, str) else ""), None
 
-    structure = parse_latex_structure(source)
+    structure = parse_latex_structure(source, base_dir=base_dir)
     bibliography = get_bibliography(source, base_dir=base_dir)
     # In-text citation markers (fefb596a). parse_latex_citations never raises, but
     # guard defensively so a regression there can never break analyze_latex.
+    # da9815ef — parse citations from the SAME expanded source as the structure so
+    # citations in \input-ed files are found and their section_ordinal aligns with
+    # the (expanded) heading tree.
     try:
-        citations = parse_latex_citations(source)
+        expanded_source, _ = _expand_source(source, base_dir)
+        citations = parse_latex_citations(expanded_source)
     except Exception:  # noqa: BLE001 — citation parse must degrade to [], never crash
         citations = []
     return {
