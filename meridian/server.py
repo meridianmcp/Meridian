@@ -6311,28 +6311,10 @@ async def submit_feedback(request: Request) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Per-token rate limiting for /mcp POST
+# /mcp POST rate limiting is handled upstream by _tenant_rate_limit_middleware
+# (the single tenant-tier limiter, plan-based via _tenant_rl_hits). d8f92669
+# removed the redundant per-token _mcp_rate_check that used to live here.
 # ---------------------------------------------------------------------------
-
-import time as _mcp_time
-
-# {token_hash: (count, window_start_epoch_seconds)}
-_mcp_rate_counters: dict[str, tuple[int, float]] = {}
-_MCP_RATE_WINDOW = 60  # seconds
-
-
-def _mcp_rate_check(token_hash: str, limit: int) -> bool:
-    """Return True (= rate limited) if the token has exceeded limit calls/min."""
-    now = _mcp_time.monotonic()
-    count, window_start = _mcp_rate_counters.get(token_hash, (0, now))
-    if now - window_start >= _MCP_RATE_WINDOW:
-        # New window
-        _mcp_rate_counters[token_hash] = (1, now)
-        return False
-    if count >= limit:
-        return True
-    _mcp_rate_counters[token_hash] = (count + 1, window_start)
-    return False
 
 
 @app.post("/mcp")
@@ -6466,15 +6448,10 @@ async def _remote_mcp_inner(request: Request) -> Any:
     # Extract token_type for read-only enforcement ('readwrite' or 'readonly').
     _token_type = (tenant.pop("_token_type", None) or "readwrite")
 
-    # Per-token rate limiting: 60/min for free tier, 600/min for others.
-    _plan = (tenant.get("plan") or "free").lower()
-    _rate_limit = 100 if _plan == "free" else 1000
-    if _mcp_rate_check(_bearer_hash, _rate_limit):
-        return JSONResponse(
-            {"detail": f"rate limit exceeded ({_rate_limit} req/min)"},
-            status_code=429,
-            headers={"Retry-After": "60"},
-        )
+    # d8f92669 — /mcp rate limiting is handled by the single tenant-tier limiter
+    # in the _tenant_rate_limit_middleware (plan-based, _tenant_rl_hits). The
+    # former per-token _mcp_rate_check here was a redundant SECOND limiter with
+    # its own diverging limits; removed so the effective limit is deterministic.
 
     try:
         body = await request.json()

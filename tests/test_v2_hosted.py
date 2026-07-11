@@ -1179,9 +1179,19 @@ def test_dashboard_js_has_feedback_button():
 
 
 def test_mcp_rate_limit_429_after_limit_exceeded(client, monkeypatch):
-    """POST /mcp returns 429 with Retry-After after exceeding per-token rate limit."""
+    """POST /mcp is metered by the single consolidated tenant-tier limiter
+    (d8f92669): over the plan budget → 429 with Retry-After. Previously /mcp had
+    a redundant SECOND per-token limiter (_mcp_rate_check); this now exercises the
+    _tenant_rate_limit_middleware path (plan-based, _tenant_rl_hits)."""
     from meridian import db as db_module
     from meridian import server as server_module
+    from meridian import _deps as deps_module
+
+    # The tenant-tier limiter only meters in hosted mode; force it, give the free
+    # plan a budget of 1/min, and start from a clean counter so request #2 trips.
+    monkeypatch.setattr(server_module, "_hosted_mode", lambda: True)
+    monkeypatch.setitem(deps_module._TENANT_RL_PER_MINUTE, "free", 1)
+    deps_module._reset_tenant_rate_limit()
 
     async def _setup():
         db = client.app.state.db
@@ -1191,22 +1201,14 @@ def test_mcp_rate_limit_429_after_limit_exceeded(client, monkeypatch):
 
     raw_token = _run(_setup())
 
-    # Inject a mock _mcp_rate_check that rejects after the first call
-    call_count = [0]
-
-    def _mock_check(token_hash: str, limit: int) -> bool:
-        call_count[0] += 1
-        return call_count[0] > 1
-
-    monkeypatch.setattr(server_module, "_mcp_rate_check", _mock_check)
-
     payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {}}}
     headers = {"Authorization": f"Bearer {raw_token}"}
 
     r1 = client.post("/mcp", json=payload, headers=headers)
-    assert r1.status_code == 200
+    assert r1.status_code == 200, r1.text
 
     r2 = client.post("/mcp", json=payload, headers=headers)
-    assert r2.status_code == 429
-    assert r2.headers.get("Retry-After") == "60"
+    assert r2.status_code == 429, r2.text
+    assert r2.headers.get("Retry-After")
+    deps_module._reset_tenant_rate_limit()
