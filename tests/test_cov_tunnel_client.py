@@ -1344,6 +1344,111 @@ def test_plugin_spawn_env_none_when_nothing_to_override():
     assert tc._plugin_spawn_env({"": "blankkey"}) is None
 
 
+# ---------------------------------------------------------------------------
+# 2b04a361 — Office-slot spawn env forces UTF-8 stdio for the child so the
+# third-party Python MCP servers (docx-mcp / powerpoint-mcp) can't crash their
+# own loggers on non-ASCII (e.g. Chinese) log lines under Windows cp1252.
+# ---------------------------------------------------------------------------
+
+def test_office_slot_spawn_env_forces_utf8_with_plugin_env(monkeypatch):
+    # The `word` slot carries a plugin env (MCP_AUTHOR); the UTF-8 stdio vars are
+    # layered on top of it AND the parent env, so the docx-mcp child writes UTF-8.
+    monkeypatch.setenv("PARENT_ONLY", "keep")
+    out = tc._office_slot_spawn_env({"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"})
+    assert out is not None
+    # UTF-8 stdio forced (the actual fix).
+    assert out["PYTHONIOENCODING"] == "utf-8:replace"
+    assert out["PYTHONUTF8"] == "1"
+    # Plugin env still merged.
+    assert out["MCP_AUTHOR"] == "Adam"
+    assert out["MCP_AUTHOR_INITIALS"] == "AC"
+    # Parent env still inherited.
+    assert out["PARENT_ONLY"] == "keep"
+
+
+def test_office_slot_spawn_env_forces_utf8_without_plugin_env(monkeypatch):
+    # A slot with NO plugin env (ppt/dc) must STILL get the UTF-8 override — unlike
+    # _plugin_spawn_env, which would return None (inherit parent) here. We never
+    # inherit silently; we always materialise the encoding vars.
+    monkeypatch.setenv("PARENT_ONLY", "keep")
+    for empty in (None, {}, "nope", {"": "blank"}):
+        out = tc._office_slot_spawn_env(empty)
+        assert out is not None
+        assert out["PYTHONIOENCODING"] == "utf-8:replace"
+        assert out["PYTHONUTF8"] == "1"
+        assert out["PARENT_ONLY"] == "keep"
+
+
+def test_office_slot_spawn_env_encoding_survives_nonascii_log_line(monkeypatch):
+    # End-to-end proof that the declared child encoding neutralises the bug: a
+    # non-ASCII (Chinese) log line, encoded with the encoding+errorhandler the
+    # child is told to use, does NOT raise — the exact crash 2b04a361 fixes.
+    #   Under the buggy cp1252 default this raises UnicodeEncodeError; under the
+    #   forced "utf-8:replace" it round-trips (or degrades gracefully) instead.
+    env = tc._office_slot_spawn_env(None)
+    raw = env["PYTHONIOENCODING"]  # e.g. "utf-8:replace"
+    enc, _, errors = raw.partition(":")
+    errors = errors or "strict"
+    chinese_log = "docx-mcp 日志：正在生成文档 — 完成"  # non-ASCII + em-dash
+    # This is what the child's logger does when it writes to its stdout stream.
+    encoded = chinese_log.encode(enc, errors=errors)
+    assert isinstance(encoded, bytes) and encoded  # no UnicodeEncodeError raised
+    # Sanity: the same line under Windows' legacy cp1252 strict default WOULD crash,
+    # confirming the fix is load-bearing (not a no-op).
+    with pytest.raises(UnicodeEncodeError):
+        chinese_log.encode("cp1252")
+
+
+def test_run_tunnel_word_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path):
+    """End-to-end: enabling the `word` slot spawns docx-mcp with PYTHONIOENCODING=
+    utf-8:replace + PYTHONUTF8=1 in the child env (2b04a361). The office spawn env
+    must carry the UTF-8 override alongside the plugin's own MCP_AUTHOR env."""
+    _stub_run_tunnel_spawn(monkeypatch)
+
+    # Capture the env each Popen is handed (FakeProc only records cmd).
+    spawned: list[dict] = []
+    real_fake_popen = tc.subprocess.Popen
+
+    def cap_popen(cmd, *a, **k):
+        spawned.append({"cmd": cmd, "env": k.get("env")})
+        return real_fake_popen(cmd, *a, **k)
+
+    monkeypatch.setattr(tc.subprocess, "Popen", cap_popen)
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
+    # detect_office_binaries must not auto-enable slots from the host PATH — we
+    # drive enablement purely from the config so the test is host-independent.
+    # run_tunnel imports it locally from meridian.tunnel_plugins, so patch it there.
+    import meridian.tunnel_plugins as _tp
+    monkeypatch.setattr(_tp, "detect_office_binaries", lambda *a, **k: set())
+
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "tid-word", "plan": "pro",
+            "tunnel_plugins_config": [
+                {"name": "word", "enabled": True},
+            ],
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+
+    # Find the docx-mcp (word slot) spawn and inspect its env.
+    word_spawns = [
+        s for s in spawned
+        if any("docx-mcp" in str(t) for t in s["cmd"])
+    ]
+    assert word_spawns, "word slot (docx-mcp) was not spawned"
+    env = word_spawns[0]["env"]
+    assert env is not None, "word slot spawned with inherited env — UTF-8 not forced"
+    assert env.get("PYTHONIOENCODING") == "utf-8:replace"
+    assert env.get("PYTHONUTF8") == "1"
+    # The plugin's own env is preserved alongside the encoding override.
+    assert env.get("MCP_AUTHOR") == "Adam"
+
+
 def test_run_tunnel_command_overrides_and_index(monkeypatch, tmp_path):
     """Custom commands for all three slots + code_dirs auto-index."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
