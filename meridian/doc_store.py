@@ -98,6 +98,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         title TEXT,
         content_hash TEXT,
         element_count INTEGER NOT NULL DEFAULT 0,
+        link_status TEXT NOT NULL DEFAULT 'live',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )
@@ -220,8 +221,44 @@ def _row_to_dict(row: Any, keys: Iterable[str]) -> dict[str, Any] | None:
 
 _DOC_COLUMNS = (
     "id", "project_id", "source", "doc_type", "title",
-    "content_hash", "element_count", "created_at", "updated_at",
+    "content_hash", "element_count", "link_status", "created_at", "updated_at",
 )
+
+# doc_documents.link_status — explicit lifecycle of the link between a stored
+# document header and its physical source .docx (14015718):
+#   * ``live``        — the source column points at a real, writable .docx;
+#                       insert_equation/update_paragraph write back to it and
+#                       reindex_document keeps it in sync. The default, and the
+#                       only state the store implemented before this column.
+#   * ``deprecated``  — a link that once existed but whose file moved / was
+#                       renamed / superseded. The header row persists as history;
+#                       write-backs surface the ordinary missing-file error.
+#   * ``independent`` — a standalone captured snapshot with NO live file to write
+#                       back to (archived drafts, ingest-once-to-query). Write
+#                       attempts refuse LOUDLY with a distinct no-write-back error
+#                       so an independent doc is never confused with a live doc
+#                       whose file is merely temporarily missing.
+_LINK_STATUS_LIVE = "live"
+_LINK_STATUS_DEPRECATED = "deprecated"
+_LINK_STATUS_INDEPENDENT = "independent"
+_LINK_STATUSES = frozenset(
+    {_LINK_STATUS_LIVE, _LINK_STATUS_DEPRECATED, _LINK_STATUS_INDEPENDENT}
+)
+
+
+def _normalize_link_status(value: Any) -> str:
+    """Coerce an arbitrary link_status input to a valid enum value.
+
+    Unknown / blank / non-string inputs fall back to ``'live'`` (the backward-
+    compatible default), so a bad caller value can never produce an out-of-band
+    status or crash the write. The enum is enforced at the app layer — the
+    SQLite ``ADD COLUMN`` migration path can't carry a CHECK constraint (matching
+    how every other additive enum column in this repo is handled)."""
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in _LINK_STATUSES:
+            return v
+    return _LINK_STATUS_LIVE
 _ELEMENT_COLUMNS = (
     "id", "document_id", "parent_id", "ordinal", "level", "kind", "text", "ref",
 )
@@ -1146,10 +1183,57 @@ class DocStructureStore:
     # -- schema --------------------------------------------------------------
 
     async def ensure_schema(self) -> None:
-        """Create the store's tables + indexes if absent (idempotent)."""
+        """Create the store's tables + indexes if absent (idempotent).
+
+        The base ``CREATE TABLE IF NOT EXISTS`` literals only take effect on a
+        FRESH database — an already-existing ``doc_documents`` table is left
+        untouched by them. So after applying the base schema we run additive
+        ``ALTER TABLE`` migrations for columns introduced after this store first
+        shipped (:meth:`_migrate_add_columns`), guarded on the column's presence
+        so they are safe to re-run on both fresh and already-populated DBs.
+        """
         for stmt in _SCHEMA_STATEMENTS:
             await self._db.execute(stmt)
         await self._db.commit()
+        await self._migrate_add_columns()
+
+    async def _column_exists(self, table: str, column: str) -> bool:
+        """True if ``column`` exists on ``table`` in this DB (dual-backend).
+
+        ``PRAGMA table_info`` runs natively on aiosqlite; the psycopg3 adapter
+        intercepts it and answers from ``information_schema.columns`` — so this
+        single query is correct on BOTH backends (mirrors ``db.migrations``'
+        ``_column_exists``). Rows come back as an aiosqlite ``Row`` (``row[1]``
+        is the name) or a pg dict (``row['name']``); handle both."""
+        async with self._db.execute(f"PRAGMA table_info({table})") as cur:
+            rows = await cur.fetchall()
+        names = {
+            (r["name"] if isinstance(r, dict) else r[1])
+            for r in rows
+        }
+        return column in names
+
+    async def _migrate_add_columns(self) -> None:
+        """Idempotent additive-column migrations for already-existing DBs.
+
+        Because ``doc_documents`` is created with ``CREATE TABLE IF NOT EXISTS``,
+        editing the CREATE literal does NOT add a new column to a database that
+        already has the table. Each column introduced after the store's first
+        release is added here with a presence-guarded ``ALTER TABLE ... ADD
+        COLUMN`` — a plain additive alter (nullable-or-defaulted, no inline index,
+        no CHECK) that is safe on both SQLite and Postgres and a no-op once the
+        column is present. New rows already carry the column from the CREATE
+        literal; existing rows get the DEFAULT.
+        """
+        # 14015718 — link_status. DEFAULT 'live' so every pre-existing row (stored
+        # before this column existed) reads back as a live, writable link, exactly
+        # preserving the store's prior only-implemented behaviour.
+        if not await self._column_exists("doc_documents", "link_status"):
+            await self._db.execute(
+                "ALTER TABLE doc_documents "
+                "ADD COLUMN link_status TEXT NOT NULL DEFAULT 'live'"
+            )
+            await self._db.commit()
 
     # -- internals -----------------------------------------------------------
 
@@ -1263,6 +1347,7 @@ class DocStructureStore:
         source: str | None = None,
         title: str | None = None,
         content_hash: str | None = None,
+        link_status: str | None = None,
     ) -> dict[str, Any]:
         """Store (or replace) a document's structure and return its doc dict.
 
@@ -1277,6 +1362,15 @@ class DocStructureStore:
         edges are resolved: ``parent_id`` (an explicit stored id) wins; else
         ``parent_ordinal`` is mapped to the assigned id of the element at that
         ordinal.
+
+        ``link_status`` (14015718) records the lifecycle of the link to the
+        physical source: ``live`` (default — writable, kept in sync),
+        ``deprecated`` (file gone/superseded; kept as history), or
+        ``independent`` (a standalone snapshot never meant to be written back).
+        An unknown/omitted value defaults to ``live``. On an upsert-by-source,
+        an explicit ``link_status`` overrides the stored one; omitting it (None)
+        PRESERVES the existing row's status rather than silently reverting a
+        deprecated/independent doc back to live.
 
         NB: the delete-then-reinsert upsert is NOT wrapped in a single
         transaction — the shared adapter runs each ``execute`` on its own pooled
@@ -1295,6 +1389,13 @@ class DocStructureStore:
         if existing is not None:
             doc_id = existing["id"]
             created_at = existing.get("created_at") or now
+            # Preserve the existing link_status when the caller omits one (None),
+            # so re-storing a deprecated/independent doc's structure doesn't
+            # silently revert it to 'live'. An explicit value always wins.
+            if link_status is None:
+                ls = _normalize_link_status(existing.get("link_status"))
+            else:
+                ls = _normalize_link_status(link_status)
             # Drop old edges FIRST (subquery over the still-present elements), then
             # the elements + doc row, so an upsert leaves no stale/orphan edges.
             await self._delete_edges_for_document(doc_id)
@@ -1305,6 +1406,7 @@ class DocStructureStore:
         else:
             doc_id = uuid.uuid4().hex
             created_at = now
+            ls = _normalize_link_status(link_status)
 
         # Assign element ids first so parent_ordinal edges can be resolved to ids.
         ordinal_to_id: dict[int, str] = {}
@@ -1319,11 +1421,11 @@ class DocStructureStore:
         await self._db.execute(
             "INSERT INTO doc_documents "
             "(id, project_id, source, doc_type, title, content_hash, "
-            "element_count, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "element_count, link_status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 doc_id, project_id, src, doc_type, title, ch,
-                len(prepared), created_at, now,
+                len(prepared), ls, created_at, now,
             ),
         )
 
@@ -1366,8 +1468,8 @@ class DocStructureStore:
         return _row_to_dict(row, _DOC_COLUMNS) or {
             "id": doc_id, "project_id": project_id, "source": src,
             "doc_type": doc_type, "title": title, "content_hash": ch,
-            "element_count": len(prepared), "created_at": created_at,
-            "updated_at": now,
+            "element_count": len(prepared), "link_status": ls,
+            "created_at": created_at, "updated_at": now,
         }
 
     # -- cross-document resolution (opt-in, network) -------------------------
@@ -1800,6 +1902,28 @@ class DocStructureStore:
         await self._db.commit()
         return True
 
+    async def set_link_status(
+        self, project_id: str, source: str, link_status: str
+    ) -> dict[str, Any] | None:
+        """Update a stored document's ``link_status`` and return its refreshed row.
+
+        14015718 — the explicit lifecycle transition primitive: promote a doc to
+        ``deprecated`` (file gone/superseded, keep as history) or ``independent``
+        (standalone snapshot, never write back), or restore it to ``live``. An
+        unknown/blank status is coerced to ``live`` (:func:`_normalize_link_status`).
+        Returns the updated document dict, or ``None`` if no such document exists.
+        """
+        doc = await self.get_document(project_id, source)
+        if doc is None:
+            return None
+        ls = _normalize_link_status(link_status)
+        await self._db.execute(
+            "UPDATE doc_documents SET link_status = ?, updated_at = ? WHERE id = ?",
+            (ls, _now_iso(), doc["id"]),
+        )
+        await self._db.commit()
+        return await self.get_document(project_id, source)
+
     # -- equations (OMML) — 06df6ab3 -----------------------------------------
 
     async def get_equations(self, document_id: str) -> list[dict[str, Any]]:
@@ -2151,6 +2275,17 @@ class DocStructureStore:
                 ),
             }
         document_id = doc_row["id"]
+        # 14015718 — refuse loudly on an independent (no-write-back) document with
+        # a DISTINCT error, before any file resolution, so it is never confused
+        # with a live doc whose file is merely temporarily missing.
+        if _normalize_link_status(doc_row.get("link_status")) == _LINK_STATUS_INDEPENDENT:
+            return {
+                "error": (
+                    f"document {document_id} is marked independent (no write-back): "
+                    "it is a standalone captured snapshot with no live source file — "
+                    "insert_equation cannot write into it"
+                ),
+            }
         docx_path = doc_row.get("source")
         if not isinstance(docx_path, str) or not docx_path.strip():
             return {"error": f"stored document {document_id} has no source path to write back to"}
@@ -2503,6 +2638,16 @@ class DocStructureStore:
             raise ValueError(
                 f"no stored document for source={src!r} — ingest_document or "
                 "reindex_document it first"
+            )
+        # 14015718 — an independent document is a standalone snapshot with no live
+        # file to write back to. Refuse loudly with a DISTINCT message (never the
+        # generic "not found on disk"), before touching the filesystem, so it's
+        # never mistaken for a live doc whose file is temporarily missing.
+        if _normalize_link_status(doc_row.get("link_status")) == _LINK_STATUS_INDEPENDENT:
+            raise ValueError(
+                f"document {doc_row['id']} is marked independent (no write-back): "
+                "it is a standalone captured snapshot with no live source file — "
+                "update_paragraph cannot write into it"
             )
         source_path = doc_row.get("source")
         if not isinstance(source_path, str) or not source_path.strip():
