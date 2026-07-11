@@ -845,6 +845,15 @@ async def _handle_mcp_request(
         # native + GitHub names so the merged list has no duplicates.
         if tenant and tenant.get("id"):
             from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+            if not _tunnel_mod.has_active_tunnel(tenant["id"]) and \
+                    _tunnel_mod.tunnel_cross_instance_miss(tenant):
+                # a19538fe — DB says the tunnel is active but its socket is on a
+                # sibling Fly instance; this instance can't list its tools. Signal
+                # it legibly (reconnecting) instead of silently omitting them.
+                tunnel_health = {
+                    "status": "reconnecting",
+                    "message": _tunnel_mod.CROSS_INSTANCE_MISS_MESSAGE,
+                }
             if _tunnel_mod.has_active_tunnel(tenant["id"]):
                 try:
                     # Reserve native names AND the full GitHub name set: tools/call
@@ -949,6 +958,15 @@ async def _handle_mcp_request(
                         # Pass the tunneled server's result through verbatim — it
                         # already carries the MCP `content` envelope.
                         return _server._jsonrpc_ok(req_id, tunnel_result)
+                elif _tunnel_mod.tunnel_cross_instance_miss(tenant):
+                    # a19538fe — the tunnel IS active (DB flag) but its socket is
+                    # on a sibling Fly instance, so THIS instance can't forward.
+                    # Fail legibly instead of falling through to a misleading
+                    # "unknown tool" (a non-native/non-GitHub name here is very
+                    # likely one of that tunnel's tools we just can't reach).
+                    return _server._jsonrpc_err(
+                        req_id, -32002, _tunnel_mod.CROSS_INSTANCE_MISS_MESSAGE,
+                    )
             if _is_github:
                 result = await _dispatch_github_tool(name, args, tenant, db)
             else:

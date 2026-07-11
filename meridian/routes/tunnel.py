@@ -2206,6 +2206,36 @@ def has_active_tunnel(tenant_id: str) -> bool:
     )
 
 
+def tunnel_cross_instance_miss(tenant: "dict | None") -> bool:
+    """a19538fe — True when the control-plane DB says this tenant's tunnel is
+    active but THIS Fly instance holds no socket for it.
+
+    Tunnel socket state is a per-process in-memory dict, so on Fly.io
+    multi-instance a request the load balancer routes to a sibling instance sees
+    an in-memory MISS even though the tunnel is genuinely open on another
+    machine. ``tenant.tunnel_active`` is a DB flag set on connect / cleared on
+    disconnect (the same flag get_tunnel_plugins already falls back to for the
+    status display), so ``DB-active AND in-memory-miss`` is exactly the
+    cross-instance case. Callers use this to fail LEGIBLY ("held by another
+    instance, retry / reconnect") instead of a misleading "not connected" /
+    "unknown tool". It does NOT fix routing — it makes the miss honest (the real
+    fix, Fly-replay instance affinity, is af5b5739 per decision 229441bc)."""
+    if not tenant:
+        return False
+    return bool(tenant.get("tunnel_active")) and not has_active_tunnel(
+        tenant.get("id", "")
+    )
+
+
+# a19538fe — user-facing message for the cross-instance miss, shared by the
+# MCP tool-call path and the HTTP proxy path so both report it identically.
+CROSS_INSTANCE_MISS_MESSAGE = (
+    "your Meridian tunnel is connected, but to a different server instance than "
+    "the one handling this request — retry (it may route to the right one), or "
+    "restart your local `meridian --tunnel` if this persists"
+)
+
+
 def active_tunnel_tenant_ids() -> "set[str]":
     """4b698ea5 — every tenant_id that currently holds ≥1 live tunnel socket.
 
