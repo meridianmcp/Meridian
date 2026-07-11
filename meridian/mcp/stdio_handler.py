@@ -2046,9 +2046,13 @@ def build_mcp_server():
                 )
                 result = {"released": released, "file_path": arguments["file_path"]}
             elif name == "idle_until_session_done":
+                _idle_kwargs = {}
+                if arguments.get("timeout_seconds") is not None:
+                    _idle_kwargs["timeout_seconds"] = float(arguments["timeout_seconds"])
                 result = await _idle_until_session_done(
                     db,
                     arguments["watching_session_id"],
+                    **_idle_kwargs,
                 )
             elif name == "log_task":
                 result = await db_module.log_task(

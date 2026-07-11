@@ -3746,13 +3746,37 @@ async def _load_executor_session_context(
     return executor_config_for_output(raw_config), build_executor_config_block(raw_config)
 
 
+_IDLE_UNTIL_DEFAULT_TIMEOUT_S = 1800.0
+
+
 async def _idle_until_session_done(
     db: aiosqlite.Connection,
     session_id: str,
     *,
     poll_seconds: int = 30,
+    timeout_seconds: float | None = _IDLE_UNTIL_DEFAULT_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Poll every 30 seconds until the target session is closed/archived."""
+    """Poll every ``poll_seconds`` until the target session is closed/archived.
+
+    6f9503a9 — BOUNDED BARRIER. This is the "wait for X to finish" primitive an
+    orchestrator uses when fanning out a parallel batch of subagents. Previously
+    this was an unbounded ``while True`` poll: if a watched subagent got stuck at
+    the network seam and never transitioned to ``closed``/``archived`` (crashed
+    without closing, or hung mid-work so ``last_seen`` goes stale while status
+    stays ``active``), this loop spun forever and hung the ENTIRE fan-out batch
+    on that one item. Now the wait is bounded by ``timeout_seconds`` (default
+    30 min): on expiry it returns ``done=False, timed_out=True`` with the last
+    observed status so the caller fails that one item fast and lets the rest of
+    the batch continue, instead of blocking indefinitely.
+
+    Pass ``timeout_seconds=None`` to explicitly opt back into an unbounded wait.
+    """
+    deadline = (
+        None
+        if timeout_seconds is None
+        else time.monotonic() + max(0.0, float(timeout_seconds))
+    )
+    last_status = "missing"
     while True:
         async with db.execute(
             "SELECT id, status, project_id, name, human_id, last_seen "
@@ -3764,6 +3788,7 @@ async def _idle_until_session_done(
             return {"session_id": session_id, "done": True, "status": "missing"}
         session = row if isinstance(row, dict) else {k: row[k] for k in row.keys()}
         status_val = session.get("status") or "missing"
+        last_status = status_val
         if status_val in {"closed", "archived"}:
             return {
                 "session_id": session_id,
@@ -3774,7 +3799,28 @@ async def _idle_until_session_done(
                 "human_id": session.get("human_id"),
                 "last_seen": session.get("last_seen"),
             }
-        await asyncio.sleep(max(1, poll_seconds))
+        # Bounded fallback: never wait forever on a subagent that never closes.
+        if deadline is not None and time.monotonic() >= deadline:
+            return {
+                "session_id": session_id,
+                "done": False,
+                "timed_out": True,
+                "status": last_status,
+                "waited_seconds": timeout_seconds,
+                "project_id": session.get("project_id"),
+                "name": session.get("name"),
+                "human_id": session.get("human_id"),
+                "last_seen": session.get("last_seen"),
+            }
+        sleep_for = max(1, poll_seconds)
+        if deadline is not None:
+            # Don't sleep past the deadline — cap the final nap so we return
+            # promptly at (not well after) the timeout.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                continue  # re-check + trip the timeout branch above
+            sleep_for = min(sleep_for, max(1, int(remaining) or 1), remaining)
+        await asyncio.sleep(sleep_for)
 
 
 async def _find_continuation_session(

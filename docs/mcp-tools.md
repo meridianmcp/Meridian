@@ -251,6 +251,7 @@ Read-only: Wait on another session before touching a shared file. The tool polls
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `watching_session_id` | string | required |  |
+| `timeout_seconds` | number | optional | Max seconds to wait before returning done=false, timed_out=true (default 1800). A stuck/never-closing session can't hang the caller past this. |
 
 **Example:**
 ```

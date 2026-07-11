@@ -3486,7 +3486,12 @@ async def _handle_session_tools(
             cfg["repo_paths"] = merge_repo_paths(cfg.get("repo_paths"), args["repo_paths"])
         return await db_module.set_executor_config(db, args["project_id"], cfg)
     if name == "idle_until_session_done":
-        return await _server._idle_until_session_done(db, args["watching_session_id"])
+        _idle_kwargs: dict[str, Any] = {}
+        if args.get("timeout_seconds") is not None:
+            _idle_kwargs["timeout_seconds"] = float(args["timeout_seconds"])
+        return await _server._idle_until_session_done(
+            db, args["watching_session_id"], **_idle_kwargs
+        )
     if name == "search_all":
         return await db_module.search_all(
             db, args["project_id"], args["query"],
