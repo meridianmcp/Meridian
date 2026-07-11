@@ -793,6 +793,127 @@ def parse_docx_equations(source: str | bytes | bytearray) -> list[dict[str, Any]
     return equations
 
 
+# ---------------------------------------------------------------------------
+# .docx write-back helpers (51a595e7) — open / find-paragraph / save
+# ---------------------------------------------------------------------------
+#
+# The READ side (parse_docx_equations / docs_intel) already reaches straight into
+# a .docx's ``word/document.xml`` with lxml + zipfile. These three helpers are the
+# WRITE-side mirror needed to author OMML (insert_equation) or edit paragraph
+# text (a sibling update_paragraph tool) directly into the source .docx WITHOUT a
+# python-docx dependency: parse the document part, mutate the tree in place, and
+# rewrite ONLY that one zip entry (every other part — styles, rels, media — is
+# copied through byte-for-byte). All three are pure/synchronous and unit-testable.
+
+_DOCX_DOCUMENT_PART = "word/document.xml"
+
+
+def _load_docx_xml(source: str | bytes | bytearray) -> tuple[bytes, Any]:
+    """Read a .docx's ``word/document.xml`` and return ``(raw_bytes, root)``.
+
+    ``raw_bytes`` is the *whole* .docx ZIP as bytes (so the caller can rewrite a
+    single part via :func:`_save_docx_xml` without re-reading a path that may have
+    changed); ``root`` is the parsed ``<w:document>`` lxml element. ``source`` is
+    a filesystem path OR the raw .docx bytes. Raises the underlying
+    zipfile/lxml error on a genuinely malformed/missing input (callers guard).
+    """
+    if isinstance(source, (bytes, bytearray)):
+        raw = bytes(source)
+    else:
+        with open(source, "rb") as fh:
+            raw = fh.read()
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        with zf.open(_DOCX_DOCUMENT_PART) as handle:
+            xml_bytes = handle.read()
+    root = _LET.fromstring(xml_bytes)
+    return raw, root
+
+
+def _find_paragraph_by_id(root: Any, para_id: str) -> Any | None:
+    """Return the ``<w:p>`` element whose id == ``para_id``, or ``None``.
+
+    The id is the paragraph's stable ``w14:paraId`` attribute; when a paragraph
+    carries none, a synthesized ``p{index}`` id is matched instead — EXACTLY the
+    convention :func:`parse_docx_equations` / ``docs_intel.parse_docx`` use for
+    ``element_id``, so a ``para_id`` obtained from either read side round-trips
+    here. The synthesized index counts every ``<w:p>`` in document order.
+    """
+    if not isinstance(para_id, str) or not para_id.strip():
+        return None
+    target = para_id.strip()
+    w_p = f"{{{_DOCX_W_NS}}}p"
+    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
+    for idx, p in enumerate(root.iter(w_p)):
+        real_id = p.get(w14_para_id)
+        synthetic_id = f"p{idx}"
+        if real_id == target or (real_id is None and synthetic_id == target) or synthetic_id == target:
+            return p
+    return None
+
+
+def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
+    """Rewrite ``word/document.xml`` with ``root`` into a copy of the .docx at ``dest``.
+
+    Every OTHER zip entry from ``raw`` is copied through unchanged (byte-for-byte,
+    preserving compression), so styles / relationships / media / content-types are
+    untouched — only the document part is replaced with the mutated tree. Writing
+    to a fresh ``BytesIO`` first and flushing to ``dest`` at the end keeps the
+    write atomic-ish (a mid-write crash can't half-truncate the original when
+    ``dest`` differs, and even for an in-place overwrite the new bytes are fully
+    materialised before the file is opened for writing).
+    """
+    new_document = _LET.tostring(
+        root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src:
+        infos = src.infolist()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for info in infos:
+                data = src.read(info.filename)
+                if info.filename == _DOCX_DOCUMENT_PART:
+                    data = new_document
+                # Preserve each entry's original compression type.
+                dst.writestr(info, data)
+    with open(dest, "wb") as fh:
+        fh.write(out.getvalue())
+
+
+def _insert_omath_at_position(
+    paragraph: Any, omath_el: Any, position: str
+) -> None:
+    """Insert a parsed ``<m:oMath>`` element relative to ``paragraph`` in place.
+
+    * ``append``  — append the ``<m:oMath>`` as the last child *inside* the
+      paragraph (an inline equation trailing the paragraph's runs).
+    * ``before`` / ``after`` — wrap the ``<m:oMath>`` in its OWN new ``<w:p>``
+      (a display equation on its own line) and splice that paragraph immediately
+      before / after ``paragraph`` in the parent (body) element.
+
+    ``append`` is the default because a bare ``<m:oMath>`` is only valid as a
+    child of a ``<w:p>`` (or an ``<m:oMathPara>``); splicing it as a body sibling
+    directly would produce a malformed document, hence the ``<w:p>`` wrapper for
+    before/after.
+    """
+    if position == "append":
+        paragraph.append(omath_el)
+        return
+    # before / after — build a standalone paragraph carrying the equation.
+    new_p = _LET.Element(f"{{{_DOCX_W_NS}}}p")
+    new_p.append(omath_el)
+    parent = paragraph.getparent()
+    if parent is None:
+        # No parent to splice into (a detached paragraph) — degrade to an inline
+        # append so the equation is never silently dropped.
+        paragraph.append(omath_el)
+        return
+    index = list(parent).index(paragraph)
+    if position == "before":
+        parent.insert(index, new_p)
+    else:  # after
+        parent.insert(index + 1, new_p)
+
+
 # Delimiter pairs normalize_latex strips when they wrap the WHOLE string (an
 # author pasting "$x^2$" or "\(x^2\)" should dedup-match a bare "x^2").
 _MATH_DELIM_PAIRS: tuple[tuple[str, str], ...] = (
@@ -1650,6 +1771,164 @@ class DocStructureStore:
             "equation": result["inserted"][0] if result["inserted"] else None,
             "near_duplicates": result["near_duplicates"],
         }
+
+    # -- equation write-back (51a595e7) --------------------------------------
+
+    async def _delete_equations(self, document_id: str) -> None:
+        """Drop every stored equation row for a document (idempotent)."""
+        await self._db.execute(
+            "DELETE FROM doc_equations WHERE document_id = ?", (document_id,)
+        )
+
+    async def resync_document_equations(
+        self, document_id: str, file_path: str | bytes | bytearray
+    ) -> dict[str, Any]:
+        """Re-derive a document's equation index straight from its .docx (51a595e7).
+
+        The sidecar's equation rows are a *cache* of the ``<m:oMath>`` elements
+        physically present in the source .docx. After a write-back (insert /
+        update / delete of an equation in the file) that cache is stale, so this
+        drops the document's existing ``doc_equations`` rows and re-runs
+        :meth:`put_equations` over a FRESH :func:`parse_docx_equations` parse —
+        a targeted, self-contained resync (no separate re-verify step). Returns
+        the ``put_equations`` result (``{inserted, near_duplicates}``).
+        """
+        raw_equations = parse_docx_equations(file_path)
+        eq_batch = [
+            {
+                "element_id": eq.get("element_id"),
+                "ordinal": eq.get("ordinal"),
+                "omml_raw": eq.get("omml_raw"),
+                "latex_normalized": _omml_flatten_text(eq.get("omml_raw")),
+            }
+            for eq in raw_equations
+        ]
+        await self._delete_equations(document_id)
+        return await self.put_equations(document_id, eq_batch)
+
+    async def insert_equation(
+        self,
+        project_id: str,
+        source: str,
+        para_id: str,
+        equation_id_or_omml: str,
+        *,
+        position: str = "append",
+    ) -> dict[str, Any]:
+        """Write an OMML equation directly into a stored document's source .docx.
+
+        Collapses the old 4-5 step manual flow (resolve doc -> open zip -> parse
+        xml -> splice OMML -> rewrite zip -> reindex) into one call (51a595e7):
+
+        1. Resolve the ``doc_documents`` row for ``(project_id, source)`` and the
+           physical .docx path from its ``source`` column (the path/URL it was
+           ingested/reindexed under).
+        2. Determine the OMML: if ``equation_id_or_omml`` is the id of an existing
+           ``doc_equations`` row for this document, reuse that row's ``omml_raw``;
+           else a string starting with ``<`` is treated as raw OMML XML, and
+           anything else as a LaTeX source converted best-effort via
+           :func:`latex_to_omml`.
+        3. Open the .docx, find the paragraph whose ``w14:paraId`` (or synthesized
+           ``p{idx}``) == ``para_id``, splice the ``<m:oMath>`` at ``position``
+           (``append`` inside the paragraph, or ``before`` / ``after`` it as its
+           own display-equation paragraph), and rewrite ``word/document.xml`` back
+           into the .docx in place.
+        4. Resync this document's equation index from the modified file
+           (:meth:`resync_document_equations`) so the new equation is queryable —
+           no separate re-verify step.
+
+        Returns ``{document_id, source, para_id, position, omml, resync}`` on
+        success, or ``{error}`` for a bad para_id / unresolvable OMML / missing
+        file. Never mutates the file when the equation or paragraph can't be
+        resolved (fail-before-write).
+        """
+        pos = (position or "append").strip().lower()
+        if pos not in ("append", "before", "after"):
+            return {"error": f"position must be append|before|after, got {position!r}"}
+
+        doc_row = await self.get_document(project_id, source)
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for source={source!r} — ingest_document "
+                    "or reindex_document it first"
+                ),
+            }
+        document_id = doc_row["id"]
+        docx_path = doc_row.get("source")
+        if not isinstance(docx_path, str) or not docx_path.strip():
+            return {"error": f"stored document {document_id} has no source path to write back to"}
+        if not os.path.isfile(docx_path):
+            return {"error": f"source .docx not found on disk: {docx_path!r}"}
+
+        # --- resolve the OMML to insert (fail before touching the file) --------
+        omml_raw = await self._resolve_omml_payload(document_id, equation_id_or_omml)
+        if omml_raw is None:
+            return {
+                "error": (
+                    "could not resolve an OMML equation from "
+                    f"equation_id_or_omml={equation_id_or_omml!r} (unknown equation "
+                    "id, and not parseable as raw OMML or convertible LaTeX)"
+                ),
+            }
+
+        # --- open, locate paragraph, splice, save ------------------------------
+        try:
+            raw, root = _load_docx_xml(docx_path)
+        except Exception as exc:  # noqa: BLE001 — malformed/locked file
+            return {"error": f"could not open source .docx: {exc}"}
+        paragraph = _find_paragraph_by_id(root, para_id)
+        if paragraph is None:
+            return {"error": f"no paragraph with id {para_id!r} in {docx_path!r}"}
+        try:
+            omath_el = _LET.fromstring(
+                omml_raw.encode("utf-8") if isinstance(omml_raw, str) else bytes(omml_raw)
+            )
+        except Exception as exc:  # noqa: BLE001 — payload wasn't valid XML after all
+            return {"error": f"resolved OMML is not valid XML: {exc}"}
+        _insert_omath_at_position(paragraph, omath_el, pos)
+        try:
+            _save_docx_xml(raw, root, docx_path)
+        except Exception as exc:  # noqa: BLE001 — write failure (perms/disk)
+            return {"error": f"could not write back to source .docx: {exc}"}
+
+        # --- resync the sidecar equation index from the modified file ----------
+        resync = await self.resync_document_equations(document_id, docx_path)
+        return {
+            "document_id": document_id,
+            "source": source,
+            "para_id": para_id,
+            "position": pos,
+            "omml": _LET.tostring(omath_el, encoding="unicode"),
+            "resync": resync,
+        }
+
+    async def _resolve_omml_payload(
+        self, document_id: str, equation_id_or_omml: str
+    ) -> str | None:
+        """Resolve ``equation_id_or_omml`` to a real OMML XML string, or ``None``.
+
+        Resolution order (51a595e7):
+
+        1. An id of an existing ``doc_equations`` row for THIS document whose
+           ``omml_raw`` is non-empty -> reuse that stored OMML verbatim.
+        2. A string starting with ``<`` -> treat as raw OMML XML (as-is).
+        3. Anything else -> a LaTeX source, converted best-effort via
+           :func:`latex_to_omml` (``None`` on an unsupported/unparsable construct).
+        """
+        raw = (equation_id_or_omml or "").strip()
+        if not raw:
+            return None
+        # (1) existing equation id for this document.
+        existing = await self.get_equations(document_id)
+        for eq in existing:
+            if eq.get("id") == raw and eq.get("omml_raw"):
+                return eq["omml_raw"]
+        # (2) raw OMML XML.
+        if raw.startswith("<"):
+            return raw
+        # (3) LaTeX source.
+        return latex_to_omml(raw)
 
     # -- orchestrator — 06df6ab3 ---------------------------------------------
 

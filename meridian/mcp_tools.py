@@ -38,6 +38,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "resolve_citations": 'resolve_citations(project_id="abc-123")',
     "index_equation": 'index_equation(project_id="abc-123", doc="thesis/chapter1.docx", omml_or_latex="E=mc^2", semantic_label="mass-energy equivalence")',
     "find_similar_equation": 'find_similar_equation(project_id="abc-123", doc="thesis/chapter1.docx", latex="E=mc^2")',
+    "insert_equation": 'insert_equation(project_id="abc-123", doc="thesis/chapter1.docx", para_id="0000B002", equation_id_or_omml="E=mc^2", position="append")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -454,6 +455,33 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "latex": {"type": "string", "description": "LaTeX source to fuzzy-match against this document's stored equations."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "latex"]}},
+    {"name": "insert_equation", "description":
+        "51a595e7 — write an OMML equation DIRECTLY into a stored document's "
+        "source .docx (real OOXML write-back), collapsing the manual "
+        "resolve->open->parse->splice->rewrite->reindex flow into one call. The "
+        "document must already be stored (via ingest_document / reindex_document) "
+        "AND have a filesystem `source` path to write back to. Locate the target "
+        "paragraph by `para_id` — the paragraph's w14:paraId (or the synthesized "
+        "'p{index}' id that get_document_structure / find_similar_equation surface "
+        "as element_id). equation_id_or_omml is resolved in order: the id of an "
+        "equation already indexed for THIS document (its stored OMML is reused); "
+        "else a string starting with '<' is raw OMML XML; else a LaTeX source "
+        "(converted best-effort via latex2mathml -> MathML -> OOXML). position "
+        "controls placement: 'append' (default) drops the <m:oMath> inline at the "
+        "end of the paragraph; 'before'/'after' add it as its own display-equation "
+        "paragraph adjacent to the target. After the write the document's equation "
+        "index is resynced from the modified file (no separate re-verify step). "
+        "Returns {document_id, source, para_id, position, omml, resync} on "
+        "success, or {error} for a bad para_id / unresolvable equation / missing "
+        "file (the file is never mutated when resolution fails).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path it was ingested/reindexed under; must resolve to a .docx on disk)."},
+         "para_id": {"type": "string", "description": "Target paragraph id — its w14:paraId, or the synthesized 'p{index}' id surfaced as element_id by the read tools."},
+         "equation_id_or_omml": {"type": "string", "description": "An existing indexed equation id (reuses its OMML), OR raw OMML XML (starts with '<'), OR a LaTeX source string."},
+         "position": {"type": "string", "enum": ["append", "before", "after"], "description": "Where to place the equation relative to the paragraph. Default 'append' (inline, end of paragraph)."}},
+         "required": ["doc", "para_id", "equation_id_or_omml"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
@@ -1360,6 +1388,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "analyze_model_efficiency": "Analyze Model Efficiency",
     "index_equation": "Index Equation",
     "find_similar_equation": "Find Similar Equation",
+    "insert_equation": "Insert Equation",
 }
 
 for _tool in _MCP_TOOLS_LIST:

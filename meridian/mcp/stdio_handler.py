@@ -929,6 +929,39 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="insert_equation",
+                description=(
+                    "51a595e7 — write an OMML equation DIRECTLY into a stored "
+                    "document's source .docx (real OOXML write-back), collapsing "
+                    "the manual resolve->open->parse->splice->rewrite->reindex "
+                    "flow into one call. The document must already be stored (via "
+                    "ingest_document / reindex_document) and have a filesystem "
+                    "`source` path. Target the paragraph by `para_id` (its "
+                    "w14:paraId, or the synthesized 'p{index}' id surfaced as "
+                    "element_id by the read tools). equation_id_or_omml resolves "
+                    "in order: an existing indexed equation id for this document "
+                    "(reuses its OMML); a string starting with '<' as raw OMML "
+                    "XML; else a LaTeX source (converted best-effort). position = "
+                    "'append' (default, inline at the paragraph's end) | 'before' "
+                    "| 'after' (its own display-equation paragraph). The equation "
+                    "index is resynced from the modified file afterward. Returns "
+                    "{document_id, source, para_id, position, omml, resync} or "
+                    "{error}; the file is never mutated when resolution fails."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path it was ingested/reindexed under; must resolve to a .docx on disk)."},
+                        "para_id": {"type": "string", "description": "Target paragraph id — its w14:paraId, or the synthesized 'p{index}' id surfaced as element_id by the read tools."},
+                        "equation_id_or_omml": {"type": "string", "description": "An existing indexed equation id (reuses its OMML), OR raw OMML XML (starts with '<'), OR a LaTeX source string."},
+                        "position": {"type": "string", "enum": ["append", "before", "after"], "description": "Where to place the equation relative to the paragraph. Default 'append' (inline)."},
+                    },
+                    "required": ["doc", "para_id", "equation_id_or_omml"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1884,7 +1917,7 @@ def build_mcp_server():
                 "list_sessions",
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
                 "get_citation_edges", "resolve_citations",
-                "index_equation", "find_similar_equation",
+                "index_equation", "find_similar_equation", "insert_equation",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",
