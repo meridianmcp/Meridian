@@ -6486,6 +6486,17 @@ project_id = "${displayPid}"`;
   window._renderZoteroStatusRow = _renderZoteroStatusRow;
 
   // meridian/static/dashboard-notes.ts
+  function notesLoadMoreState(inp) {
+    const { visibleCount, loadedCount, hasMore, totalCount, remaining, filterActive, pageSize } = inp;
+    if (!hasMore) return { show: false, label: "" };
+    if (!filterActive) {
+      const n2 = remaining > 0 ? Math.min(pageSize, remaining) : pageSize;
+      const total = totalCount || loadedCount;
+      return { show: true, label: `Load ${n2} more \u2193  (${loadedCount} of ${total})` };
+    }
+    const shown = visibleCount === 1 ? "1 match" : `${visibleCount} matches`;
+    return { show: true, label: `Load more \u2193  (${shown} loaded \u2014 search the rest)` };
+  }
   async function loadNotesTab2(projectId) {
     const body = document.getElementById(`notes-body-${projectId}`);
     const searchInput = document.getElementById(`notes-search-${projectId}`);
@@ -6524,17 +6535,24 @@ project_id = "${displayPid}"`;
     let hasMore = false;
     let totalCount = 0;
     let remaining = 0;
-    const renderLoadMore = () => {
+    const renderLoadMore = (visibleCount, filterActive) => {
       const existing = document.getElementById(`notes-load-more-${projectId}`);
       if (existing) existing.remove();
-      if (!hasMore) return;
+      const st = notesLoadMoreState({
+        visibleCount,
+        loadedCount: allNotes.length,
+        hasMore,
+        totalCount,
+        remaining,
+        filterActive,
+        pageSize: NOTES_PAGE
+      });
+      if (!st.show) return;
       const btn = document.createElement("button");
       btn.id = `notes-load-more-${projectId}`;
       btn.className = "secondary";
       btn.style = "width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)";
-      const n2 = remaining > 0 ? Math.min(NOTES_PAGE, remaining) : NOTES_PAGE;
-      const total = totalCount || allNotes.length;
-      btn.textContent = `Load ${n2} more \u2193  (${allNotes.length} of ${total})`;
+      btn.textContent = st.label;
       btn.onclick = () => loadMore(btn);
       body.appendChild(btn);
     };
@@ -6554,6 +6572,7 @@ project_id = "${displayPid}"`;
       const selectedTag = (tagSelect?.value || "").trim().toLowerCase();
       const selectedKind = (kindSelect?.value || "").trim().toLowerCase();
       const tab = getActiveTab();
+      const filterActive = tab !== "notes" || !!q2 || !!selectedTag || !!selectedKind;
       const visible = allNotes.filter((n2) => {
         if (tab === "log") {
           if (!isAutoCapture(n2)) return false;
@@ -6577,7 +6596,7 @@ ${n2.tags || ""}`.toLowerCase();
       if (!visible.length) {
         const reason = allNotes.length ? `(no notes in this tab match \u2014 clear the search/tag filter or switch tabs)` : `(no notes yet \u2014 use the form below or <code>add_note</code> MCP tool)`;
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
-        renderLoadMore();
+        renderLoadMore(0, filterActive);
         return;
       }
       body.innerHTML = visible.map((n2) => {
@@ -6615,7 +6634,7 @@ ${n2.tags || ""}`.toLowerCase();
           }
         };
       });
-      renderLoadMore();
+      renderLoadMore(visible.length, filterActive);
     };
     const loadMore = async (btn) => {
       if (btn) {
