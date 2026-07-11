@@ -2524,7 +2524,17 @@ async def _handle_notes_decisions(
             }
         try:
             from ..docs_intel import document_outline  # noqa: PLC0415
-            _outline = document_outline(fp)
+            from .. import hardening as _hardening  # noqa: PLC0415
+            # document_outline is a synchronous zipfile/OOXML parse — previously
+            # run directly on the event loop with no deadline, so a huge/malformed
+            # .docx could block the whole loop (e5f96adf). Run it in the bulkhead
+            # under a hard timeout: fail fast + keep the loop responsive.
+            _outline = await _hardening.run_in_bulkhead(
+                document_outline, fp, label="get_document_structure",
+            )
+        except _hardening.HeavyToolTimeout as exc:
+            _record_peek(ok=False)
+            return {"error": str(exc), "timed_out": True, "file_path": fp}
         except FileNotFoundError:
             return {"error": f"file not found: {fp}"}
         except Exception as exc:  # noqa: BLE001
@@ -5395,6 +5405,7 @@ async def _handle_outputs_tools(
     """Dispatch group: search_outputs (a0e9133e — BM25 over the outputs FTS index)."""
     if name == "search_outputs":
         from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+        from .. import hardening as _hardening  # noqa: PLC0415
         outputs_dir = str(args.get("outputs_dir") or "").strip()
         query = str(args.get("query") or "").strip()
         if not outputs_dir:
@@ -5407,15 +5418,29 @@ async def _handle_outputs_tools(
         except (TypeError, ValueError):
             limit = 10
         include_archival = args.get("include_archival", True)
-        # The walk + hash + DuckDB FTS build is synchronous/CPU-bound; run it off
-        # the event loop so a large tree doesn't block other MCP calls.
-        return await asyncio.to_thread(
-            _outputs_indexer.search_outputs,
-            outputs_dir,
-            query,
-            limit=limit,
-            include_archival=bool(include_archival),
-        )
+        # The walk + hash + DuckDB FTS build is synchronous/CPU-bound. Run it in
+        # the bulkhead pool under a hard deadline (e5f96adf / 1d021501): it now
+        # also has an internal incremental budget (5116078b), so this backstop
+        # only fires on a genuinely pathological cold tree — and fails fast with
+        # a clear error instead of the ~4-minute silent hang that motivated this.
+        try:
+            return await _hardening.run_in_bulkhead(
+                _outputs_indexer.search_outputs,
+                outputs_dir,
+                query,
+                limit=limit,
+                include_archival=bool(include_archival),
+                label="search_outputs",
+            )
+        except _hardening.HeavyToolTimeout as exc:
+            return {
+                "outputs_dir": outputs_dir,
+                "query": query,
+                "hits": [],
+                "total_indexed": 0,
+                "timed_out": True,
+                "error": str(exc),
+            }
     return _MISS
 
 
@@ -5431,6 +5456,7 @@ async def _handle_code_index_tools(
     index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS)."""
     if name == "search_code_semantic":
         from .. import code_index as _code_index  # noqa: PLC0415
+        from .. import hardening as _hardening  # noqa: PLC0415
         root_dir = str(args.get("root_dir") or "").strip()
         query = str(args.get("query") or "").strip()
         if not root_dir:
@@ -5450,17 +5476,30 @@ async def _handle_code_index_tools(
         db_path = ":memory:"
         if data_dir:
             db_path = os.path.join(data_dir, "code_index.duckdb")
-        # The walk + hash + tree-sitter chunk + DuckDB FTS build is CPU-bound;
-        # run it off the event loop so a large repo doesn't block other MCP calls.
-        return await asyncio.to_thread(
-            _code_index.search_code_semantic,
-            root_dir,
-            query,
-            limit=limit,
-            kind=kind,
-            db_path=db_path,
-            reindex=bool(reindex),
-        )
+        # The walk + hash + tree-sitter chunk + DuckDB FTS build is CPU-bound.
+        # Run it in the bulkhead pool under a hard deadline (e5f96adf / 1d021501)
+        # so a pathological repo fails fast + stays isolated instead of blocking
+        # unrelated MCP calls by exhausting the shared to_thread executor.
+        try:
+            return await _hardening.run_in_bulkhead(
+                _code_index.search_code_semantic,
+                root_dir,
+                query,
+                limit=limit,
+                kind=kind,
+                db_path=db_path,
+                reindex=bool(reindex),
+                label="search_code_semantic",
+            )
+        except _hardening.HeavyToolTimeout as exc:
+            return {
+                "root_dir": root_dir,
+                "query": query,
+                "hits": [],
+                "total_indexed": 0,
+                "timed_out": True,
+                "error": str(exc),
+            }
     return _MISS
 
 

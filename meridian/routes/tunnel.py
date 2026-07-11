@@ -25,6 +25,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any
@@ -43,6 +44,46 @@ router = APIRouter()
 _log = logging.getLogger(__name__)
 
 _PROXY_TIMEOUT = 30.0
+
+# 1d021501 — per-slot in-flight budget (bulkhead). Each tunnel slot already has
+# its own socket + pending-futures registry + a 30s per-request deadline
+# (_PROXY_TIMEOUT), so a hung call on one slot cannot block an independent slot.
+# What was missing was a CAP on how many requests may be in flight against a
+# single (tenant, slot) at once: a slow/wedged backend could otherwise let its
+# pending-futures dict grow without bound. This semaphore bounds the blast radius
+# — once a slot has _MAX_SLOT_INFLIGHT requests waiting, further calls to THAT
+# slot fail fast (503) instead of piling on, while every other slot is untouched.
+def _max_slot_inflight() -> int:
+    raw = os.environ.get("MERIDIAN_MAX_SLOT_INFLIGHT", "").strip()
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    return 8
+
+
+# Time a saturated-slot caller waits for a free in-flight slot before giving up
+# fast. Short on purpose: the point is to fail fast, not to queue.
+_SLOT_ACQUIRE_TIMEOUT = 1.0
+
+_slot_inflight: dict[str, asyncio.Semaphore] = {}
+
+
+def _slot_semaphore(label: str, tenant_id: str) -> asyncio.Semaphore:
+    """The per-(slot,tenant) in-flight semaphore, created on first use.
+
+    Keyed by slot label + tenant so one tenant saturating a slot can't starve
+    another tenant's same-named slot, and one slot's saturation never touches a
+    different slot."""
+    key = f"{label}:{tenant_id}"
+    sem = _slot_inflight.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(_max_slot_inflight())
+        _slot_inflight[key] = sem
+    return sem
 
 # Per-process in-memory registry: tenant_id → active WebSocket
 _tunnel_sockets: dict[str, WebSocket] = {}
@@ -767,6 +808,20 @@ async def _do_proxy(
             media_type="application/json",
         )
 
+    # 1d021501 — per-slot in-flight budget: bound how many requests may be waiting
+    # on THIS (slot, tenant) at once. If the slot is already saturated (its backend
+    # is slow/wedged), fail fast instead of growing its pending-futures dict — the
+    # blast radius stays inside this one slot; every other slot is unaffected.
+    sem = _slot_semaphore(label, tenant_id)
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=_SLOT_ACQUIRE_TIMEOUT)
+    except asyncio.TimeoutError:
+        return Response(
+            content=f'{{"error":"{label} tunnel slot saturated — too many requests in flight"}}',
+            status_code=503,
+            media_type="application/json",
+        )
+
     req_id = str(uuid.uuid4())
     loop = asyncio.get_event_loop()
     fut: asyncio.Future[dict] = loop.create_future()
@@ -806,6 +861,7 @@ async def _do_proxy(
         )
     finally:
         pending.pop(req_id, None)
+        sem.release()
 
     status = int(resp_msg.get("status", 502))
     resp_headers = resp_msg.get("headers") or {}
