@@ -2305,7 +2305,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, update_paragraph, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -2730,6 +2730,47 @@ async def _handle_notes_decisions(
             return {"error": f"could not insert equation: {exc}"}
         if "error" in result:
             return result
+        return {"project_id": args["project_id"], **result}
+    if name == "update_paragraph":
+        # f978e588 — ID-addressable docx WRITE (the write counterpart of the
+        # get_element_by_id read primitive). Mirrors index_equation's resolution:
+        # resolve the tier store, look up the stored document by its source, then
+        # rewrite ONE paragraph in the on-disk .docx by its w14:paraId (never by
+        # text match) and resync the doc_elements row.
+        validate_input_size(args.get("doc"), "doc", 2_000)
+        validate_input_size(args.get("para_id"), "para_id", 500)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        para_id = args.get("para_id")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not para_id:
+            return {"error": "para_id is required"}
+        # new_text_or_runs: EITHER a plain string OR a list of runs. Exactly one
+        # of new_text / runs must be provided.
+        new_text = args.get("new_text")
+        runs = args.get("runs")
+        if new_text is None and runs is None:
+            return {"error": "provide either new_text (string) or runs (list)"}
+        if new_text is not None and runs is not None:
+            return {"error": "provide only one of new_text or runs, not both"}
+        new_text_or_runs: Any = runs if runs is not None else new_text
+        if new_text is not None:
+            validate_input_size(new_text, "new_text", 1_000_000)
+        elif not isinstance(runs, list):
+            return {"error": "runs must be a list of strings or run objects"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            result = await store.update_paragraph(
+                args["project_id"], doc_source, para_id, new_text_or_runs,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — the write is best-effort
+            return {"error": f"could not update paragraph: {exc}"}
         return {"project_id": args["project_id"], **result}
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).

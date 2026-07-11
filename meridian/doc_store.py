@@ -794,16 +794,21 @@ def parse_docx_equations(source: str | bytes | bytearray) -> list[dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# .docx write-back helpers (51a595e7) — open / find-paragraph / save
+# .docx write-back helpers (51a595e7 + f978e588) -- open / find / save + run edit
 # ---------------------------------------------------------------------------
 #
 # The READ side (parse_docx_equations / docs_intel) already reaches straight into
-# a .docx's ``word/document.xml`` with lxml + zipfile. These three helpers are the
-# WRITE-side mirror needed to author OMML (insert_equation) or edit paragraph
-# text (a sibling update_paragraph tool) directly into the source .docx WITHOUT a
+# a .docx's ``word/document.xml`` with lxml + zipfile. These helpers are the
+# WRITE-side mirror needed to author OMML (insert_equation) OR edit paragraph
+# text/runs (update_paragraph) directly into the source .docx WITHOUT a
 # python-docx dependency: parse the document part, mutate the tree in place, and
-# rewrite ONLY that one zip entry (every other part — styles, rels, media — is
-# copied through byte-for-byte). All three are pure/synchronous and unit-testable.
+# rewrite ONLY that one zip entry (every other part -- styles, rels, media -- is
+# copied through byte-for-byte). All are pure/synchronous and unit-testable.
+#
+# insert_equation (51a595e7) and update_paragraph (f978e588) were built in
+# parallel and each authored their own copy of the open/find/save primitives.
+# This is the deduped, reconciled canonical set that BOTH tools call.
+# ---------------------------------------------------------------------------
 
 _DOCX_DOCUMENT_PART = "word/document.xml"
 
@@ -814,8 +819,10 @@ def _load_docx_xml(source: str | bytes | bytearray) -> tuple[bytes, Any]:
     ``raw_bytes`` is the *whole* .docx ZIP as bytes (so the caller can rewrite a
     single part via :func:`_save_docx_xml` without re-reading a path that may have
     changed); ``root`` is the parsed ``<w:document>`` lxml element. ``source`` is
-    a filesystem path OR the raw .docx bytes. Raises the underlying
-    zipfile/lxml error on a genuinely malformed/missing input (callers guard).
+    a filesystem path OR the raw .docx bytes. Raises the underlying zipfile/lxml
+    error on a genuinely malformed/missing input (callers guard):
+    ``zipfile.BadZipFile`` for a non-.docx, ``KeyError`` for a missing document
+    part.
     """
     if isinstance(source, (bytes, bytearray)):
         raw = bytes(source)
@@ -833,10 +840,12 @@ def _find_paragraph_by_id(root: Any, para_id: str) -> Any | None:
     """Return the ``<w:p>`` element whose id == ``para_id``, or ``None``.
 
     The id is the paragraph's stable ``w14:paraId`` attribute; when a paragraph
-    carries none, a synthesized ``p{index}`` id is matched instead — EXACTLY the
+    carries none, a synthesized ``p{index}`` id is matched instead -- EXACTLY the
     convention :func:`parse_docx_equations` / ``docs_intel.parse_docx`` use for
     ``element_id``, so a ``para_id`` obtained from either read side round-trips
-    here. The synthesized index counts every ``<w:p>`` in document order.
+    here. The synthesized index counts every ``<w:p>`` in document order. Returns
+    the bare paragraph element (or ``None``); callers needing the body-order index
+    use :func:`_find_paragraph_with_index`.
     """
     if not isinstance(para_id, str) or not para_id.strip():
         return None
@@ -851,12 +860,33 @@ def _find_paragraph_by_id(root: Any, para_id: str) -> Any | None:
     return None
 
 
+def _find_paragraph_with_index(root: Any, para_id: str) -> tuple[Any, int] | None:
+    """Like :func:`_find_paragraph_by_id` but also return the body-order ``idx``.
+
+    Returns ``(element, idx)`` where ``idx`` is the paragraph's zero-based
+    position among every ``<w:p>`` in document order (matching the ``p{index}``
+    synthesized-id convention), or ``None`` when nothing matches. Shares the exact
+    match rule with :func:`_find_paragraph_by_id`.
+    """
+    if not isinstance(para_id, str) or not para_id.strip():
+        return None
+    target = para_id.strip()
+    w_p = f"{{{_DOCX_W_NS}}}p"
+    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
+    for idx, p in enumerate(root.iter(w_p)):
+        real_id = p.get(w14_para_id)
+        synthetic_id = f"p{idx}"
+        if real_id == target or (real_id is None and synthetic_id == target) or synthetic_id == target:
+            return p, idx
+    return None
+
+
 def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
     """Rewrite ``word/document.xml`` with ``root`` into a copy of the .docx at ``dest``.
 
     Every OTHER zip entry from ``raw`` is copied through unchanged (byte-for-byte,
     preserving compression), so styles / relationships / media / content-types are
-    untouched — only the document part is replaced with the mutated tree. Writing
+    untouched -- only the document part is replaced with the mutated tree. Writing
     to a fresh ``BytesIO`` first and flushing to ``dest`` at the end keeps the
     write atomic-ish (a mid-write crash can't half-truncate the original when
     ``dest`` differs, and even for an in-place overwrite the new bytes are fully
@@ -884,9 +914,9 @@ def _insert_omath_at_position(
 ) -> None:
     """Insert a parsed ``<m:oMath>`` element relative to ``paragraph`` in place.
 
-    * ``append``  — append the ``<m:oMath>`` as the last child *inside* the
+    * ``append``  -- append the ``<m:oMath>`` as the last child *inside* the
       paragraph (an inline equation trailing the paragraph's runs).
-    * ``before`` / ``after`` — wrap the ``<m:oMath>`` in its OWN new ``<w:p>``
+    * ``before`` / ``after`` -- wrap the ``<m:oMath>`` in its OWN new ``<w:p>``
       (a display equation on its own line) and splice that paragraph immediately
       before / after ``paragraph`` in the parent (body) element.
 
@@ -898,12 +928,12 @@ def _insert_omath_at_position(
     if position == "append":
         paragraph.append(omath_el)
         return
-    # before / after — build a standalone paragraph carrying the equation.
+    # before / after -- build a standalone paragraph carrying the equation.
     new_p = _LET.Element(f"{{{_DOCX_W_NS}}}p")
     new_p.append(omath_el)
     parent = paragraph.getparent()
     if parent is None:
-        # No parent to splice into (a detached paragraph) — degrade to an inline
+        # No parent to splice into (a detached paragraph) -- degrade to an inline
         # append so the equation is never silently dropped.
         paragraph.append(omath_el)
         return
@@ -912,6 +942,88 @@ def _insert_omath_at_position(
         parent.insert(index, new_p)
     else:  # after
         parent.insert(index + 1, new_p)
+
+
+def _paragraph_plain_text(p: Any) -> str:
+    """Concatenate every ``<w:t>`` run text inside a paragraph (read-side parity)."""
+    w_t = f"{{{_DOCX_W_NS}}}t"
+    return "".join(t.text or "" for t in p.iter(w_t))
+
+
+# The subset of run properties (``<w:rPr>``) a caller may set per run. Each maps a
+# friendly key on a run dict to its OOXML toggle element local-name; a truthy
+# value emits ``<w:{tag}/>``. Deliberately small (bold/italic/underline) -- the
+# common inline emphasis set -- everything else on the original run is dropped when
+# runs are replaced, which is the documented contract.
+_RUN_TOGGLE_PROPS: tuple[tuple[str, str], ...] = (
+    ("bold", "b"),
+    ("italic", "i"),
+    ("underline", "u"),
+)
+
+
+def _normalize_runs(new_text_or_runs: str | list[Any]) -> list[dict[str, Any]]:
+    """Coerce the ``new_text_or_runs`` argument into a list of run dicts.
+
+    Accepts EITHER a plain string (one run, no formatting) OR a list of runs,
+    where each run is either a bare string or a ``{text, bold?, italic?,
+    underline?}`` dict. Returns a normalized ``[{text, bold, italic, underline}]``
+    list. A ``None``/empty input yields a single empty-text run so the paragraph
+    is emptied rather than left untouched.
+    """
+    if new_text_or_runs is None:
+        return [{"text": ""}]
+    if isinstance(new_text_or_runs, str):
+        return [{"text": new_text_or_runs}]
+    runs: list[dict[str, Any]] = []
+    for item in new_text_or_runs:
+        if isinstance(item, str):
+            runs.append({"text": item})
+        elif isinstance(item, dict):
+            run = {"text": str(item.get("text") or "")}
+            for friendly, _tag in _RUN_TOGGLE_PROPS:
+                if item.get(friendly):
+                    run[friendly] = True
+            runs.append(run)
+        else:
+            run = {"text": str(item)}
+            runs.append(run)
+    return runs or [{"text": ""}]
+
+
+def _set_paragraph_runs(p: Any, runs: list[dict[str, Any]]) -> None:
+    """Replace every ``<w:r>`` run in paragraph ``p`` with ``runs`` (in place).
+
+    The paragraph's own properties (``<w:pPr>`` -- its style, numbering, etc.) are
+    PRESERVED: only run children are removed and rebuilt. Each new run is a
+    ``<w:r>`` carrying an optional ``<w:rPr>`` toggle set (bold/italic/underline)
+    and a single ``<w:t xml:space="preserve">`` so leading/trailing spaces survive
+    Word's whitespace collapsing.
+    """
+    w = _DOCX_W_NS
+    w_r = f"{{{w}}}r"
+    w_ppr = f"{{{w}}}pPr"
+    # Remove existing runs (and any bookmark/hyperlink run wrappers' bare runs);
+    # keep pPr and everything that is not a top-level run.
+    for child in list(p):
+        if child.tag == w_r:
+            p.remove(child)
+    # Rebuild: runs go AFTER pPr (OOXML requires pPr first when present).
+    ppr = p.find(w_ppr)
+    insert_at = list(p).index(ppr) + 1 if ppr is not None else 0
+    for offset, run in enumerate(runs):
+        r_el = _LET.Element(w_r)
+        toggles = [(tag, run.get(friendly)) for friendly, tag in _RUN_TOGGLE_PROPS]
+        if any(val for _tag, val in toggles):
+            rpr = _LET.SubElement(r_el, f"{{{w}}}rPr")
+            for tag, val in toggles:
+                if val:
+                    _LET.SubElement(rpr, f"{{{w}}}{tag}")
+        t_el = _LET.SubElement(r_el, f"{{{w}}}t")
+        # xml:space=preserve so runs with leading/trailing spaces round-trip.
+        t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        t_el.text = run.get("text") or ""
+        p.insert(insert_at + offset, r_el)
 
 
 # Delimiter pairs normalize_latex strips when they wrap the WHOLE string (an
@@ -1969,6 +2081,115 @@ class DocStructureStore:
             "document": doc,
             "elements_count": len(elements),
             "equations": equations,
+        }
+
+    # -- ID-addressable docx write (f978e588) --------------------------------
+
+    async def _resync_element_text(
+        self, document_id: str, para_id: str, new_text: str
+    ) -> int:
+        """Refresh the ``text`` of any stored element whose ``ref`` == ``para_id``.
+
+        ``doc_elements`` addresses a docx paragraph by its ``w14:paraId`` in the
+        ``ref`` column (headings, and figures/tables carry a caption ref instead
+        — those never match a paragraph paraId). Only persisted paragraphs
+        (headings) have a row; a plain body paragraph has none, so a zero return
+        is EXPECTED and honest, not a failure. Returns the number of rows updated.
+        """
+        async with self._db.execute(
+            "SELECT id FROM doc_elements WHERE document_id = ? AND ref = ?",
+            (document_id, para_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        ids = [_row_get(r, "id") for r in rows]
+        updated = 0
+        for el_id in ids:
+            if not el_id:
+                continue
+            await self._db.execute(
+                "UPDATE doc_elements SET text = ? WHERE id = ?",
+                (new_text, el_id),
+            )
+            updated += 1
+        if updated:
+            await self._db.commit()
+        return updated
+
+    async def update_paragraph(
+        self,
+        project_id: str,
+        source: str,
+        para_id: str,
+        new_text_or_runs: str | list[Any],
+    ) -> dict[str, Any]:
+        """ID-addressable docx WRITE — the write counterpart of ``get_element_by_id``.
+
+        Resolves the stored document row for ``(project_id, source)``, opens the
+        source .docx (its ``source`` column IS the on-disk path), finds the
+        paragraph whose ``w14:paraId`` (``p{index}`` fallback) equals ``para_id``,
+        replaces its runs with ``new_text_or_runs``, writes ``word/document.xml``
+        back into the ZIP, and re-syncs that element's ``doc_elements`` row so the
+        index matches the new text. Targets the paragraph by id ONLY — never by
+        text match (fragile text-matching is exactly what this replaces).
+
+        ``new_text_or_runs`` is either a plain string (a single unformatted run)
+        OR a list of runs, each a bare string or ``{text, bold?, italic?,
+        underline?}`` (basic run formatting is set when provided; the original
+        runs' formatting is otherwise dropped — replacement, not merge).
+
+        Returns ``{document_id, para_id, new_text, elements_resynced,
+        source_path}``. Raises ``ValueError`` for an unknown document, an
+        unresolvable/missing source path, or a ``para_id`` not present in the
+        document — never fabricates a silent no-op success.
+        """
+        src = source.strip() if isinstance(source, str) else ""
+        if not src:
+            raise ValueError("source is required")
+        if not isinstance(para_id, str) or not para_id.strip():
+            raise ValueError("para_id is required")
+        para_id = para_id.strip()
+
+        doc_row = await self.get_document(project_id, src)
+        if doc_row is None:
+            raise ValueError(
+                f"no stored document for source={src!r} — ingest_document or "
+                "reindex_document it first"
+            )
+        source_path = doc_row.get("source")
+        if not isinstance(source_path, str) or not source_path.strip():
+            raise ValueError("stored document has no resolvable source path")
+        source_path = source_path.strip()
+        if not os.path.isfile(source_path):
+            raise ValueError(f"source docx not found on disk: {source_path}")
+
+        try:
+            raw, root = _load_docx_xml(source_path)
+        except KeyError as exc:  # missing word/document.xml part
+            raise ValueError(f"not a valid .docx (no document part): {exc}") from exc
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"source is not a valid .docx (bad zip): {exc}") from exc
+
+        # Canonical _find_paragraph_by_id returns the bare <w:p> element (or None);
+        # update_paragraph only needs the element, not its body-order index.
+        p = _find_paragraph_by_id(root, para_id)
+        if p is None:
+            raise ValueError(f"no paragraph with para_id={para_id!r} in {source_path}")
+
+        runs = _normalize_runs(new_text_or_runs)
+        _set_paragraph_runs(p, runs)
+        new_text = "".join(r.get("text") or "" for r in runs)
+
+        # Canonical _save_docx_xml serializes ``root`` and rewrites only the
+        # document part into a copy of the original ZIP (``raw``) at ``dest``.
+        _save_docx_xml(raw, root, source_path)
+
+        resynced = await self._resync_element_text(doc_row["id"], para_id, new_text)
+        return {
+            "document_id": doc_row["id"],
+            "para_id": para_id,
+            "new_text": new_text,
+            "elements_resynced": resynced,
+            "source_path": source_path,
         }
 
     async def close(self) -> None:

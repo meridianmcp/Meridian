@@ -962,6 +962,36 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="update_paragraph",
+                description=(
+                    "f978e588 — ID-addressable docx WRITE (write counterpart of "
+                    "the get_element_by_id / paraId read primitive). Rewrites ONE "
+                    "paragraph in a stored .docx addressed by its w14:paraId "
+                    "('p{index}' fallback) — NEVER by text match — then re-syncs "
+                    "the doc_elements index row. Pass the SAME source/path as "
+                    "`doc`. Provide EXACTLY ONE of new_text (a plain string, one "
+                    "unformatted run) OR runs (a list of runs, each a bare string "
+                    "or {text, bold?, italic?, underline?}; basic run formatting "
+                    "applied, paragraph style preserved). Returns {document_id, "
+                    "para_id, new_text, elements_resynced, source_path}; "
+                    "elements_resynced=0 for a plain body paragraph is expected "
+                    "(only headings persist as elements). Errors — never a silent "
+                    "no-op — when doc/source/para_id doesn't resolve."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "para_id": {"type": "string", "description": "The target paragraph's w14:paraId (or 'p{index}' fallback)."},
+                        "new_text": {"type": "string", "description": "New paragraph text as a single unformatted run. Provide this OR runs, not both."},
+                        "runs": {"type": "array", "description": "List of runs — each a plain string or a {text, bold?, italic?, underline?} object. Provide this OR new_text, not both.", "items": {"type": ["string", "object"]}},
+                    },
+                    "required": ["doc", "para_id"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1917,7 +1947,7 @@ def build_mcp_server():
                 "list_sessions",
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
                 "get_citation_edges", "resolve_citations",
-                "index_equation", "find_similar_equation", "insert_equation",
+                "index_equation", "find_similar_equation", "insert_equation", "update_paragraph",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",

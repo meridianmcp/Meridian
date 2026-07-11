@@ -39,6 +39,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "index_equation": 'index_equation(project_id="abc-123", doc="thesis/chapter1.docx", omml_or_latex="E=mc^2", semantic_label="mass-energy equivalence")',
     "find_similar_equation": 'find_similar_equation(project_id="abc-123", doc="thesis/chapter1.docx", latex="E=mc^2")',
     "insert_equation": 'insert_equation(project_id="abc-123", doc="thesis/chapter1.docx", para_id="0000B002", equation_id_or_omml="E=mc^2", position="append")',
+    "update_paragraph": 'update_paragraph(project_id="abc-123", doc="thesis/chapter1.docx", para_id="1F2A3B4C", new_text="The revised conclusion sentence.")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -482,6 +483,31 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "equation_id_or_omml": {"type": "string", "description": "An existing indexed equation id (reuses its OMML), OR raw OMML XML (starts with '<'), OR a LaTeX source string."},
          "position": {"type": "string", "enum": ["append", "before", "after"], "description": "Where to place the equation relative to the paragraph. Default 'append' (inline, end of paragraph)."}},
          "required": ["doc", "para_id", "equation_id_or_omml"]}},
+    {"name": "update_paragraph", "description":
+        "f978e588 — ID-addressable docx WRITE (the write counterpart of the "
+        "get_element_by_id / paraId read primitive). Targets ONE paragraph in a "
+        "stored .docx by its w14:paraId (the 'p{index}' fallback Word writes for "
+        "an unlabelled paragraph) — NEVER by text match — rewrites its runs, "
+        "saves the .docx in place, and re-syncs the doc_elements index row so it "
+        "matches the new text. Pass the SAME source/path the document was "
+        "ingested/reindexed under as `doc`. Provide EXACTLY ONE of: `new_text` (a "
+        "plain string — one unformatted run) OR `runs` (a list of runs, each a "
+        "bare string or {text, bold?, italic?, underline?} — basic run formatting "
+        "is applied; the paragraph's original run formatting is replaced, not "
+        "merged; its paragraph style/numbering is preserved). Returns "
+        "{document_id, para_id, new_text, elements_resynced, source_path}. "
+        "elements_resynced is 0 for a plain body paragraph (only headings are "
+        "persisted as elements) — that is expected, not a failure. Errors "
+        "(never a silent no-op) when the doc/source/para_id doesn't resolve.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "para_id": {"type": "string", "description": "The target paragraph's w14:paraId (or 'p{index}' fallback), as reported by the read side."},
+         "new_text": {"type": "string", "description": "New paragraph text as a single unformatted run. Provide this OR runs, not both."},
+         "runs": {"type": "array", "description": "List of runs — each a plain string or a {text, bold?, italic?, underline?} object. Provide this OR new_text, not both.",
+                  "items": {"type": ["string", "object"]}}},
+         "required": ["doc", "para_id"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
@@ -1389,6 +1415,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "index_equation": "Index Equation",
     "find_similar_equation": "Find Similar Equation",
     "insert_equation": "Insert Equation",
+    "update_paragraph": "Update Paragraph",
 }
 
 for _tool in _MCP_TOOLS_LIST:
