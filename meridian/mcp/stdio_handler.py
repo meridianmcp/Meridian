@@ -1022,6 +1022,60 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="index_figure",
+                description=(
+                    "c623e648 — index ONE figure into the SEMANTIC figure index "
+                    "against a document already stored in the doc-structure "
+                    "store (via ingest_document or a prior reindex — pass the "
+                    "SAME source/path as `doc`). The figure parallel of "
+                    "index_equation, COMPLEMENTARY to the structural "
+                    "kind='figure' section-tree placement (adds caption dedup + "
+                    "similarity, does not replace placement). Provide file_path "
+                    "and/or caption. Before inserting, the normalized caption is "
+                    "fuzzy-matched against figures already indexed for this "
+                    "document — a near-duplicate is still inserted but surfaced "
+                    "via near_duplicates so it isn't silently missed. The "
+                    "file_path is checked on disk: a missing file is flagged "
+                    "(file_exists + missing_files), never a hard failure. Returns "
+                    "{figure, near_duplicates, missing_files}."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "file_path": {"type": "string", "description": "Path to the figure's asset on disk (checked for existence; missing is flagged, not fatal)."},
+                        "caption": {"type": "string", "description": "The figure's caption (drives normalized-caption dedup/similarity)."},
+                        "semantic_label": {"type": "string", "description": "Optional human label for the figure."},
+                    },
+                    "required": ["doc"],
+                },
+            ),
+            Tool(
+                name="find_similar_figure",
+                description=(
+                    "c623e648 — fuzzy-match a free-text description OR a file "
+                    "path against every figure already indexed for one stored "
+                    "document, best match first (difflib similarity score 0..1, "
+                    "the better of the match against normalized_caption and "
+                    "against file_path). Returns {document_id, matches} — an "
+                    "empty list (never an error) when the document has no "
+                    "indexed figures, or doc doesn't resolve."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "description_or_path": {"type": "string", "description": "A free-text description OR a file path to fuzzy-match against this document's indexed figures."},
+                        "limit": {"type": "integer", "description": "Max matches to return (default 5)."},
+                    },
+                    "required": ["doc", "description_or_path"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1978,6 +2032,7 @@ def build_mcp_server():
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
                 "get_citation_edges", "resolve_citations",
                 "index_equation", "find_similar_equation", "insert_equation", "update_paragraph", "find_symbol_usages",
+                "index_figure", "find_similar_figure",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",

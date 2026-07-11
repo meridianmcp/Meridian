@@ -156,6 +156,31 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at TEXT NOT NULL
     )
     """,
+    # Fifth self-contained table (c623e648): the SEMANTIC figure index -- one row
+    # per indexed figure, dedup/similarity keyed on a normalized caption. This is
+    # COMPLEMENTARY to (not a replacement for) the ``kind='figure'`` doc_elements
+    # rows that carry a figure's section-tree PLACEMENT -- those answer "where in
+    # the outline does this figure sit"; ``doc_figures`` answers "have I already
+    # indexed a figure with this caption / at this path" (fuzzy near-dup + ranked
+    # lookup), the exact parallel of what latex_normalized dedup does for
+    # equations. Deliberately NOT a doc_elements kind -- figures carry a file_path
+    # + caption + normalized_caption dedup key that don't fit the generic element
+    # shape. Same self-contained pattern as the four tables above -- created here
+    # by ``ensure_schema``, OUTSIDE the main migration machinery.
+    """
+    CREATE TABLE IF NOT EXISTS doc_figures (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        element_id TEXT,
+        ordinal INTEGER NOT NULL,
+        file_path TEXT,
+        caption TEXT,
+        normalized_caption TEXT,
+        semantic_label TEXT,
+        file_exists INTEGER,
+        created_at TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_doc_documents_project_source "
     "ON doc_documents (project_id, source)",
     "CREATE INDEX IF NOT EXISTS idx_doc_elements_document_ordinal "
@@ -166,6 +191,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON doc_edges (source_element_id)",
     "CREATE INDEX IF NOT EXISTS idx_doc_equations_document_ordinal "
     "ON doc_equations (document_id, ordinal)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_figures_document_ordinal "
+    "ON doc_figures (document_id, ordinal)",
 )
 
 
@@ -207,10 +234,18 @@ _EQUATION_COLUMNS = (
     "id", "document_id", "element_id", "ordinal", "omml_raw",
     "latex_normalized", "semantic_label", "created_at",
 )
+_FIGURE_COLUMNS = (
+    "id", "document_id", "element_id", "ordinal", "file_path", "caption",
+    "normalized_caption", "semantic_label", "file_exists", "created_at",
+)
 
 # Fuzzy-match ratio (difflib) at/above which two equations' latex_normalized
 # values count as a "near-duplicate" for put_equations' advisory dedup surface.
 _EQUATION_DEDUP_THRESHOLD = 0.85
+
+# The same advisory-dedup threshold, applied to figures' normalized_caption
+# (c623e648) -- mirrors _EQUATION_DEDUP_THRESHOLD exactly.
+_FIGURE_DEDUP_THRESHOLD = 0.85
 
 # Sentinel level for a heading dict that carries no usable level. Deliberately
 # large so a level-less heading nests as a deep leaf rather than colliding with a
@@ -1056,6 +1091,36 @@ def normalize_latex(latex: str | None) -> str:
 def _equation_similarity(a: str, b: str) -> float:
     """difflib fuzzy-match ratio (same approach already used for note-dedup in
     ``mcp/handler.py``'s ``add_note`` near-duplicate warning, 6e4e2371)."""
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def normalize_caption(caption: str | None) -> str:
+    """Canonicalize a figure caption for the fuzzy-dedup key (c623e648).
+
+    The figure analogue of :func:`normalize_latex`: lower-cases, strips a
+    leading auto-numbered label (``Figure 3:`` / ``Fig. 12 -`` / ``Figure 3.``),
+    collapses all runs of whitespace to a single space, and drops surrounding
+    whitespace. Caption prose IS word-order sensitive (unlike LaTeX), so -- unlike
+    :func:`normalize_latex` -- whitespace is *collapsed*, not removed entirely, to
+    keep word boundaries for a meaningful difflib ratio. Deterministic and
+    pure -- never raises, ``None``/blank input yields ``""``.
+    """
+    s = (caption or "").strip().lower()
+    if not s:
+        return ""
+    # Strip a leading "figure N" / "fig. N" auto-number label plus its trailing
+    # separator (``:``/``.``/``-``/em-dash), if present.
+    s = re.sub(r"^(?:figure|fig\.?)\s*\d+\s*[:.\-–—]?\s*", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _figure_similarity(a: str, b: str) -> float:
+    """difflib fuzzy-match ratio between two normalized captions (c623e648).
+
+    Same difflib approach as :func:`_equation_similarity`; kept as its own
+    function so figures and equations can diverge later without entangling."""
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
@@ -2160,6 +2225,171 @@ class DocStructureStore:
             return raw
         # (3) LaTeX source.
         return latex_to_omml(raw)
+
+    # -- figures (semantic index) — c623e648 ---------------------------------
+
+    async def get_figures(self, document_id: str) -> list[dict[str, Any]]:
+        """Return every indexed figure for a document, ordered by ``ordinal``."""
+        async with self._db.execute(
+            "SELECT * FROM doc_figures WHERE document_id = ? ORDER BY ordinal ASC",
+            (document_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_dict(r, _FIGURE_COLUMNS) for r in rows]
+
+    async def find_similar_figures(
+        self, document_id: str, description_or_path: str, *, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Fuzzy-match a free-text description OR a file path against this
+        document's indexed figures; returns every stored figure carrying a
+        ``score`` (the better of the difflib ratio against its
+        ``normalized_caption`` and against its ``file_path``), best match first,
+        capped at ``limit``. Mirrors :meth:`find_similar_equations`. Never
+        raises; an empty/unknown document yields ``[]``."""
+        query = (description_or_path or "").strip()
+        norm = normalize_caption(query)
+        query_lower = query.lower()
+        existing = await self.get_figures(document_id)
+        scored: list[dict[str, Any]] = []
+        for fig in existing:
+            cap_score = _figure_similarity(norm, fig.get("normalized_caption") or "")
+            path = (fig.get("file_path") or "").strip().lower()
+            path_score = _figure_similarity(query_lower, path) if path else 0.0
+            scored.append({**fig, "score": round(max(cap_score, path_score), 4)})
+        scored.sort(key=lambda f: f["score"], reverse=True)
+        lim = limit if isinstance(limit, int) and limit > 0 else 5
+        return scored[:lim]
+
+    async def put_figures(
+        self,
+        document_id: str,
+        figures: list[dict[str, Any]],
+        *,
+        dedup_threshold: float = _FIGURE_DEDUP_THRESHOLD,
+    ) -> dict[str, Any]:
+        """Insert a batch of figures for ``document_id``.
+
+        The figure analogue of :meth:`put_equations` -- same ADVISORY (never
+        blocking) dedup contract: every figure is inserted, and a fuzzy-matched
+        near-duplicate (same-document normalized-caption difflib ratio ``>=
+        dedup_threshold``, against already-stored figures AND earlier figures in
+        this same batch) is SURFACED via ``near_duplicates`` rather than silently
+        dropped or silently piled up.
+
+        Each ``figures`` item is ``{file_path?, caption?, semantic_label?,
+        element_id?, ordinal?}``. The referenced ``file_path`` is checked against
+        disk: a missing file is FLAGGED (``file_exists`` on the row, and a
+        ``missing_files`` entry in the result) -- never a hard failure, because a
+        figure can be indexed before its asset lands or when the store runs on a
+        different host than the captured path.
+
+        Returns ``{"inserted": [...], "near_duplicates": [...],
+        "missing_files": [...]}``; a ``near_duplicates`` entry is
+        ``{figure_id, matched_id, matched_caption, score}`` and a
+        ``missing_files`` entry is ``{figure_id, file_path}``.
+        """
+        existing = await self.get_figures(document_id)
+        next_ordinal = (max((f.get("ordinal") or 0) for f in existing) + 1) if existing else 0
+        inserted: list[dict[str, Any]] = []
+        near_duplicates: list[dict[str, Any]] = []
+        missing_files: list[dict[str, Any]] = []
+        pool = list(existing)
+
+        for fig in figures or []:
+            caption = fig.get("caption")
+            normalized_caption = normalize_caption(caption)
+            file_path = fig.get("file_path")
+
+            best_score = 0.0
+            best_match: dict[str, Any] | None = None
+            if normalized_caption:
+                for cand in pool:
+                    score = _figure_similarity(
+                        normalized_caption, cand.get("normalized_caption") or ""
+                    )
+                    if score > best_score:
+                        best_score, best_match = score, cand
+
+            # Advisory on-disk existence check -- flag (don't fail) a missing asset.
+            exists: int | None = None
+            if isinstance(file_path, str) and file_path.strip():
+                try:
+                    exists = 1 if os.path.isfile(file_path) else 0
+                except (OSError, ValueError):
+                    exists = 0
+
+            fig_id = fig.get("id") or uuid.uuid4().hex
+            ordinal = fig.get("ordinal") if isinstance(fig.get("ordinal"), int) else next_ordinal
+            next_ordinal = max(next_ordinal, ordinal + 1)
+            now = _now_iso()
+            semantic_label = fig.get("semantic_label")
+            element_id = fig.get("element_id")
+
+            await self._db.execute(
+                "INSERT INTO doc_figures "
+                "(id, document_id, element_id, ordinal, file_path, caption, "
+                "normalized_caption, semantic_label, file_exists, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (fig_id, document_id, element_id, ordinal, file_path, caption,
+                 normalized_caption, semantic_label, exists, now),
+            )
+            row = {
+                "id": fig_id, "document_id": document_id, "element_id": element_id,
+                "ordinal": ordinal, "file_path": file_path, "caption": caption,
+                "normalized_caption": normalized_caption,
+                "semantic_label": semantic_label, "file_exists": exists,
+                "created_at": now,
+            }
+            inserted.append(row)
+            pool.append(row)
+
+            if exists == 0:
+                missing_files.append({"figure_id": fig_id, "file_path": file_path})
+
+            if best_match is not None and best_score >= dedup_threshold:
+                near_duplicates.append({
+                    "figure_id": fig_id,
+                    "matched_id": best_match.get("id"),
+                    "matched_caption": best_match.get("normalized_caption"),
+                    "score": round(best_score, 4),
+                })
+
+        if inserted:
+            await self._db.commit()
+        return {
+            "inserted": inserted,
+            "near_duplicates": near_duplicates,
+            "missing_files": missing_files,
+        }
+
+    async def add_figure(
+        self,
+        document_id: str,
+        file_path: str | None,
+        *,
+        caption: str | None = None,
+        semantic_label: str | None = None,
+        element_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Index ONE figure -- the ``index_figure`` MCP tool's primitive.
+
+        Inserts a single figure (with the same advisory near-duplicate +
+        missing-file surfacing as :meth:`put_figures`). Returns
+        ``{"figure": <inserted row, or None if not inserted>,
+        "near_duplicates": [...], "missing_files": [...]}``.
+        """
+        fig: dict[str, Any] = {
+            "file_path": file_path.strip() if isinstance(file_path, str) else file_path,
+            "caption": caption,
+            "semantic_label": semantic_label,
+            "element_id": element_id,
+        }
+        result = await self.put_figures(document_id, [fig])
+        return {
+            "figure": result["inserted"][0] if result["inserted"] else None,
+            "near_duplicates": result["near_duplicates"],
+            "missing_files": result["missing_files"],
+        }
 
     # -- orchestrator — 06df6ab3 ---------------------------------------------
 

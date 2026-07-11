@@ -41,6 +41,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "insert_equation": 'insert_equation(project_id="abc-123", doc="thesis/chapter1.docx", para_id="0000B002", equation_id_or_omml="E=mc^2", position="append")',
     "update_paragraph": 'update_paragraph(project_id="abc-123", doc="thesis/chapter1.docx", para_id="1F2A3B4C", new_text="The revised conclusion sentence.")',
     "find_symbol_usages": 'find_symbol_usages(project_id="abc-123", doc="thesis/chapter1.docx", symbol_or_equation_id="E=mc^2")',
+    "index_figure": 'index_figure(project_id="abc-123", doc="thesis/chapter1.docx", file_path="figures/setup.png", caption="Figure 3: The experimental setup", semantic_label="apparatus diagram")',
+    "find_similar_figure": 'find_similar_figure(project_id="abc-123", doc="thesis/chapter1.docx", description_or_path="experimental setup diagram")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -532,6 +534,46 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
          "symbol_or_equation_id": {"type": "string", "description": "A doc_equations row id, OR a raw symbol / normalized-LaTeX string to track (e.g. 'E=mc^2' or '\\\\sigma')."}},
          "required": ["doc", "symbol_or_equation_id"]}},
+    {"name": "index_figure", "description":
+        "c623e648 — index ONE figure into the SEMANTIC figure index against a "
+        "document already stored in the doc-structure store (via "
+        "ingest_document or a prior reindex — pass the SAME source/path as "
+        "`doc`). This is the figure parallel of index_equation and is "
+        "COMPLEMENTARY to the structural kind='figure' section-tree placement "
+        "(it adds caption dedup + similarity, it does not replace placement). "
+        "Provide file_path and/or caption. Before inserting, the normalized "
+        "caption is fuzzy-matched against every figure already indexed for this "
+        "document — a near-duplicate is NOT silently dropped (the figure is "
+        "still inserted) but IS surfaced via near_duplicates:[{figure_id, "
+        "matched_id, matched_caption, score}] so you can spot an accidental "
+        "re-index. The referenced file_path is checked on disk: a missing file "
+        "is FLAGGED (file_exists on the row + a missing_files entry), never a "
+        "hard failure. Returns {figure, near_duplicates, missing_files}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "file_path": {"type": "string", "description": "Path to the figure's asset on disk (checked for existence; missing is flagged, not fatal)."},
+         "caption": {"type": "string", "description": "The figure's caption (drives normalized-caption dedup/similarity)."},
+         "semantic_label": {"type": "string", "description": "Optional human label for the figure (e.g. 'apparatus diagram')."}},
+         "required": ["doc"]}},
+    {"name": "find_similar_figure", "description":
+        "c623e648 — fuzzy-match a free-text description OR a file path against "
+        "every figure already indexed (index_figure) for one stored document, "
+        "best match first. Each result carries the stored figure row PLUS a "
+        "difflib similarity score (0..1) — the better of the match against its "
+        "normalized_caption and against its file_path. Useful before "
+        "index_figure to check whether a figure is already present under a "
+        "slightly different caption or path. Returns {document_id, matches:[...]} "
+        "— an empty list (never an error) when the document has no indexed "
+        "figures, or doc doesn't resolve to a stored document.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "description_or_path": {"type": "string", "description": "A free-text description OR a file path to fuzzy-match against this document's indexed figures."},
+         "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
+         "required": ["doc", "description_or_path"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
@@ -1385,6 +1427,7 @@ _READ_ONLY_TOOLS = {
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
+    "find_similar_figure",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
 }
@@ -1441,6 +1484,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "insert_equation": "Insert Equation",
     "update_paragraph": "Update Paragraph",
     "find_symbol_usages": "Find Symbol Usages",
+    "index_figure": "Index Figure",
+    "find_similar_figure": "Find Similar Figure",
 }
 
 for _tool in _MCP_TOOLS_LIST:
