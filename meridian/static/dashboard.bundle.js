@@ -13529,9 +13529,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
     }
     if (peeks.length) {
-      html += `<div id="doc-peeks-section-${escapeHtml(String(projectId))}" style="margin-top:16px">
-      <div style="font-size:10px;font-weight:600;color:var(--accent)">Recently viewed (not saved) \u2014 ${peeks.length}</div>
-      <div style="font-size:9px;color:var(--muted);margin:2px 0 8px">Peeked with <code>get_document_structure</code> (a stateless outline read) but never ingested \u2014 so they are NOT searchable here. Ingest one to save it.</div>`;
+      html += `<div id="doc-peeks-section-${escapeHtml(String(projectId))}" style="margin-top:16px;border-top:1px dashed var(--border);padding-top:12px">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:10px;font-weight:600;color:var(--accent)">Recently viewed (not saved) \u2014 ${peeks.length}</span>
+        <span title="These outline peeks are recorded per workspace, not per project, so the same list shows in every project's Documents tab." style="font-size:8px;font-weight:600;padding:1px 5px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted);text-transform:uppercase;letter-spacing:0.4px">workspace-wide</span>
+      </div>
+      <div style="font-size:9px;color:var(--muted);margin:2px 0 8px">Peeked with <code>get_document_structure</code> (a stateless outline read) but never ingested \u2014 so they are NOT searchable here, and they are <b>not attached to this project</b> (this list is shared across every project in your workspace). Ingest one to save it as a document on <i>this</i> project.</div>`;
       for (const pk of peeks) {
         const fp = String(pk.file_path || "");
         const failed = pk.ok === false;

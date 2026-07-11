@@ -7779,10 +7779,19 @@ async function loadDocumentsTab(projectId: any) {
   // peeks. They are NOT ingested/searchable — surface them here with a one-click
   // "Ingest this" that copies the ingest_document command, so the ingest/peek
   // distinction is visible exactly where it confused people.
+  // 6b88a22b — these peeks are TENANT/workspace-global, NOT project-scoped: the
+  // backend peek log (doc_peeks) is keyed by tenant only, so the SAME list renders
+  // in every project's Documents tab. Adam saw these as "funny floating notes and
+  // resources files" not attached to any project. Until the peek store is
+  // project-scoped server-side, be explicit that this section is global so the
+  // entries don't masquerade as documents belonging to the current project.
   if (peeks.length) {
-    html += `<div id="doc-peeks-section-${escapeHtml(String(projectId))}" style="margin-top:16px">
-      <div style="font-size:10px;font-weight:600;color:var(--accent)">Recently viewed (not saved) — ${peeks.length}</div>
-      <div style="font-size:9px;color:var(--muted);margin:2px 0 8px">Peeked with <code>get_document_structure</code> (a stateless outline read) but never ingested — so they are NOT searchable here. Ingest one to save it.</div>`;
+    html += `<div id="doc-peeks-section-${escapeHtml(String(projectId))}" style="margin-top:16px;border-top:1px dashed var(--border);padding-top:12px">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:10px;font-weight:600;color:var(--accent)">Recently viewed (not saved) — ${peeks.length}</span>
+        <span title="These outline peeks are recorded per workspace, not per project, so the same list shows in every project's Documents tab." style="font-size:8px;font-weight:600;padding:1px 5px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted);text-transform:uppercase;letter-spacing:0.4px">workspace-wide</span>
+      </div>
+      <div style="font-size:9px;color:var(--muted);margin:2px 0 8px">Peeked with <code>get_document_structure</code> (a stateless outline read) but never ingested — so they are NOT searchable here, and they are <b>not attached to this project</b> (this list is shared across every project in your workspace). Ingest one to save it as a document on <i>this</i> project.</div>`;
     for (const pk of peeks) {
       const fp = String(pk.file_path || '');
       const failed = pk.ok === false;

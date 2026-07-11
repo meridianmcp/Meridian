@@ -1215,6 +1215,11 @@ def test_documents_tab_shows_peeks_and_ingest_copy(demo_client):
             assert "/thesis/chapter1.docx" in content
             assert "Word / PDF?" in content  # prominent ingest_document callout
             assert page.locator(".doc-peek-ingest-btn").count() >= 1
+            # 6b88a22b — peeks are workspace-global, not project-scoped; the section
+            # must say so, so these "floating" entries don't look like documents
+            # attached to the current project.
+            assert "workspace-wide" in content
+            assert "not attached to this project" in content
             browser.close()
         finally:
             server.should_exit = True
