@@ -4229,6 +4229,7 @@ async def _start_session_composite(
     compact: bool = False,
     version: str | None = None,
     mode: str | None = None,
+    expand_stale: bool = False,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -4254,6 +4255,13 @@ async def _start_session_composite(
     continuation block (no new registration, no goal-block flood). Keyed on
     (project_id, session_name); NEVER on Mcp-Session-Id since ChatGPT
     regenerates that header per tool call.
+
+    ``expand_stale`` (2b4e69aa) only affects the full (``compact=False``)
+    payload's ``goal_xml``: it defaults to ``False`` so any goal field the
+    coherence check flagged stale (a week-old north_star / version_goal /
+    sprint) is collapsed to a one-line "expand for detail" summary instead of
+    dumped in full. Pass ``expand_stale=True`` to restore the full bodies; the
+    ``coherence_warning`` flag is always preserved either way.
     """
     # c793377d — "just continue" resume. Auto-detect uses the 5-min heartbeat
     # window; an explicit mode='continue' widens it so an executor can resume a
@@ -4557,9 +4565,15 @@ async def _start_session_composite(
         goal["field_ages"] = field_ages
         goal["coherence_warning"] = coherence
         goal["decisions"] = decisions
+    # 2b4e69aa — collapse any coherence-flagged-stale goal field (stale
+    # north_star / version_goal / sprint) to a one-line summary in the
+    # default orientation, trimming week-old dead weight from every session
+    # start. The full text stays a call away: expand_stale=True here, or
+    # get_session_brief / the /goal endpoint (both keep build_goal_xml's
+    # expand_stale=True default). coherence_warning itself is untouched.
     goal_xml = db_module.build_goal_xml(
         goal, project_name, ambient_for_xml, coherence,
-        decisions=decisions,
+        decisions=decisions, expand_stale=expand_stale,
     )
     # v0.6.2 — Anthropic-API content blocks with cache_control on
     # the two static fields. Same ambient slice used by the XML.

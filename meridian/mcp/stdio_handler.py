@@ -1732,6 +1732,17 @@ def build_mcp_server():
                                 "the bucket with the most pending items."
                             ),
                         },
+                        "expand_stale": {
+                            "type": "boolean",
+                            "description": (
+                                "Default false. When a goal field (north_star / "
+                                "version_goal / sprint) is flagged stale by the "
+                                "coherence check, the orientation collapses it to a "
+                                "one-line summary instead of dumping the week-old "
+                                "body. Pass true to expand those fields to their "
+                                "full text (get_session_brief also returns full text)."
+                            ),
+                        },
                     },
                     "required": ["session_name"],
                 },
@@ -2092,6 +2103,10 @@ def build_mcp_server():
                     role=arguments.get("role"),
                     compact=arguments.get("compact", True),
                     version=arguments.get("version"),
+                    # 2b4e69aa — collapse coherence-flagged-stale goal fields to
+                    # a one-liner by default; opt back into full bodies with
+                    # expand_stale=true.
+                    expand_stale=bool(arguments.get("expand_stale", False)),
                 )
             elif name == "list_projects":
                 result = await db_module.list_project_summaries(db)

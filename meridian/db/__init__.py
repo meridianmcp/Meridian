@@ -1528,12 +1528,88 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
     await db.commit()
 
 
+def _stale_collapse_map(
+    coherence_warning: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Map ``stale_fields`` → per-field collapse metadata.
+
+    Keyed on the goal field name (``north_star`` / ``version_goal`` /
+    ``sprint``) so :func:`build_goal_xml` can look up, for each element,
+    whether the coherence check flagged it stale and by how much. Values
+    carry ``age_seconds`` (raw), ``age_days`` (rounded), and ``date`` (the
+    ``YYYY-MM-DD`` the field was last touched, derived from now − age).
+    Returns ``{}`` when nothing is flagged so the caller stays lean.
+    """
+    if not coherence_warning:
+        return {}
+    stale = coherence_warning.get("stale_fields") or []
+    if not stale:
+        return {}
+    import time as _time
+    now = _time.time()
+    out: dict[str, dict[str, Any]] = {}
+    for entry in stale:
+        field = entry.get("field")
+        if not field:
+            continue
+        age = entry.get("age_seconds")
+        meta: dict[str, Any] = {"age_seconds": age}
+        if isinstance(age, (int, float)):
+            meta["age_days"] = int(age // 86400)
+            from datetime import datetime as _dt, timezone as _tz
+            meta["date"] = _dt.fromtimestamp(
+                max(0.0, now - age), _tz.utc
+            ).strftime("%Y-%m-%d")
+        else:
+            meta["age_days"] = None
+            meta["date"] = None
+        out[field] = meta
+    return out
+
+
+def _collapsed_field_line(
+    tag: str, cache: str, meta: dict[str, Any], escape_fn: Any
+) -> str:
+    """Render a single one-line collapsed replacement for a stale field.
+
+    Instead of the full body, emit a self-closing element that names the
+    staleness and points at the explicit opt-in for the full text. The
+    ``collapsed`` / ``stale`` attributes are machine-checkable; the text
+    of the summary attribute is the human-readable nudge.
+    """
+    date = meta.get("date")
+    age_days = meta.get("age_days")
+    if date and age_days is not None:
+        summary = (
+            f"stale {tag} from {date} ({age_days}d old) — collapsed; pass "
+            "expand_stale=true or call get_session_brief for full text"
+        )
+    else:
+        summary = (
+            f"stale {tag} — collapsed; pass expand_stale=true or call "
+            "get_session_brief for full text"
+        )
+    parts = [f'  <{tag} cache="{cache}" stale="true" collapsed="true"']
+    if date:
+        parts.append(f' stale_since="{escape_fn(str(date))}"')
+    if age_days is not None:
+        parts.append(f' age_days="{int(age_days)}"')
+    parts.append(f' summary={_quoteattr_local(summary)} />')
+    return "".join(parts)
+
+
+def _quoteattr_local(value: str) -> str:
+    from xml.sax.saxutils import quoteattr
+    return quoteattr(value)
+
+
 def build_goal_xml(
     goal: dict[str, Any] | None,
     project_name: str,
     recent_tasks: list[dict[str, Any]] | None = None,
     coherence_warning: dict[str, Any] | None = None,
     decisions: str | None = None,
+    expand_stale: bool = True,
 ) -> str:
     """Serialise the goal + ambient context as XML for MCP consumers.
 
@@ -1554,6 +1630,15 @@ def build_goal_xml(
     itself but it makes the contract explicit in the wire format.
     Returns a valid XML document even when ``goal`` is None so cold
     sessions get a parseable response instead of a 404.
+
+    ``expand_stale`` (2b4e69aa): when ``False`` and ``coherence_warning``
+    has flagged a goal field (north_star / version_goal / sprint) as
+    stale, that field's full body is replaced by a one-line collapsed
+    summary — trimming dead week-old context from the default session
+    orientation. The data is never dropped: passing ``expand_stale=True``
+    (the default, so every existing caller is unchanged) or reading
+    ``get_session_brief`` / the ``/goal`` endpoint returns the full text.
+    Non-stale fields are always rendered in full.
     """
     from xml.sax.saxutils import escape, quoteattr
 
@@ -1572,15 +1657,43 @@ def build_goal_xml(
             version_goal = json.dumps(content, indent=2)
         sprint = goal.get("sprint") or ""
 
+    # 2b4e69aa — which fields did the coherence check flag stale? Only
+    # consult it when the caller opted out of expansion; an empty map
+    # means "render everything in full" (the legacy path).
+    collapse = {} if expand_stale else _stale_collapse_map(coherence_warning)
+
     out: list[str] = []
     out.append(
         f'<goal version="{version}" project={quoteattr(project_name)}>'
     )
-    out.append(f'  <north_star cache="true">{escape(north_star)}</north_star>')
-    out.append(
-        f'  <version_goal cache="true">{escape(version_goal)}</version_goal>'
-    )
-    out.append(f'  <sprint cache="false">{escape(sprint)}</sprint>')
+    if "north_star" in collapse and north_star:
+        out.append(
+            _collapsed_field_line(
+                "north_star", "true", collapse["north_star"], escape
+            )
+        )
+    else:
+        out.append(
+            f'  <north_star cache="true">{escape(north_star)}</north_star>'
+        )
+    if "version_goal" in collapse and version_goal:
+        out.append(
+            _collapsed_field_line(
+                "version_goal", "true", collapse["version_goal"], escape
+            )
+        )
+    else:
+        out.append(
+            f'  <version_goal cache="true">{escape(version_goal)}</version_goal>'
+        )
+    if "sprint" in collapse and sprint:
+        out.append(
+            _collapsed_field_line(
+                "sprint", "false", collapse["sprint"], escape
+            )
+        )
+    else:
+        out.append(f'  <sprint cache="false">{escape(sprint)}</sprint>')
     # v1.1.4 — append-only decisions log. Cached because it changes
     # rarely and only by explicit set_decision calls.
     if decisions is not None and decisions.strip():
