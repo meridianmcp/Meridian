@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# c0d2356d — Claude Code Stop hook: block a session from stopping while this
-# project still has pending sprint items. Structural prevention of RLHF-style
-# early-stopping. generate_handoff() auto-writes this file with PROJECT_ID + URL
-# baked in; this committed copy is the cross-platform fallback.
-#
-# This is NOT hooks.sh (the token-rotation installer) — never confuse the two.
+# c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
+# session from stopping while this project has pending sprint items. Fails OPEN.
+# This is NOT hooks.sh (the token-rotation installer).
+# b4ce3274 — bounded retry ceiling: the server stops reporting pending>0 for a
+# session after MERIDIAN_STOP_OVERRIDE_CEILING forced continuations, so this
+# guard then lets the stop through (exit 0) instead of blocking forever.
 set -uo pipefail
-
-PROJECT_ID="${MERIDIAN_PROJECT_ID:-5787cc92-ba7d-4788-b17c-28ab7938b839}"
+PROJECT_ID="5787cc92-ba7d-4788-b17c-28ab7938b839"
 MERIDIAN_URL="${MERIDIAN_URL:-http://localhost:7878}"
-
-# The Stop hook receives a JSON payload on stdin.
 payload="$(cat 2>/dev/null || true)"
-
-# Loop guard: if we're already continuing because of a previous Stop block
-# (stop_hook_active=true), allow the stop so we can never spin forever.
 if printf '%s' "$payload" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then
   exit 0
 fi
-
-# Fail OPEN on any network/parse error so a down server never traps the user.
-resp="$(curl -sf --max-time 5 "$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count" 2>/dev/null || true)"
+# b4ce3274 — forward the session id (if the hook payload carries one) so the
+# override budget is counted per session, not per project.
+sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"session_id"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)"
+url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count"
+[ -n "$sid" ] && url="$url?session_id=$sid"
+resp="$(curl -sf --max-time 5 "$url" 2>/dev/null || true)"
 [ -z "$resp" ] && exit 0
 pending="$(printf '%s' "$resp" | grep -oE '"pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
 [ -z "$pending" ] && exit 0
-
 if [ "$pending" -gt 0 ] 2>/dev/null; then
-  # exit 2 blocks the stop; stderr is fed back to Claude as the reason.
   echo "Meridian: $pending sprint item(s) still pending — complete or skip them (complete_sprint_item) before stopping." >&2
   exit 2
+fi
+# pending==0: either genuinely done, or the stop-override ceiling was reached —
+# surface the ceiling case so the human/agent knows to generate a delta handoff.
+if printf '%s' "$resp" | grep -Eq '"stopped_at_ceiling"[[:space:]]*:[[:space:]]*true'; then
+  echo "Meridian: stop-override ceiling reached — allowing stop despite pending items; generate a delta handoff." >&2
 fi
 exit 0

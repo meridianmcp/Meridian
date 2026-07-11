@@ -1,6 +1,74 @@
 // dashboard-notes.js — per-project notes wiki tab extracted from dashboard.js
 // Re-exposes its symbols on window so inline handlers + cross-file references resolve after esbuild IIFE bundling.
 
+// 7fa07e10 — inputs to the "Load More" button's visibility + count label.
+export interface NotesLoadMoreInput {
+  /** Notes matching the ACTIVE client-side filter (tab/kind/tag/search) that are
+   *  already loaded — i.e. what's rendered right now. This is the number the
+   *  count label must reflect, NOT the whole loaded/library total. */
+  visibleCount: number;
+  /** Every note loaded so far, across all tabs/kinds (unfiltered). */
+  loadedCount: number;
+  /** Whether the server reports more unfiltered pages to fetch. */
+  hasMore: boolean;
+  /** Server-side COUNT — the UNFILTERED library total (no client-side tab/kind/
+   *  search filter applied). Only meaningful when no client filter is active. */
+  totalCount: number;
+  /** Server-side remaining (unfiltered) rows not yet loaded. */
+  remaining: number;
+  /** True when any client-side filter (non-default tab, kind, tag, or search) is
+   *  active — in that case the server totals describe a DIFFERENT (unfiltered)
+   *  set than what's on screen, so we must not present them as the filtered total. */
+  filterActive: boolean;
+  /** Page size used for the "Load N more" hint when the real remaining is unknown. */
+  pageSize: number;
+}
+
+export interface NotesLoadMoreState {
+  /** Whether to render the button at all. */
+  show: boolean;
+  /** Button label text (empty when show=false). */
+  label: string;
+}
+
+/**
+ * 7fa07e10 — compute the "Load More" button state for the notes list.
+ *
+ * The bug this fixes (regression/gap in 7000554a / 57ba9141): the count label
+ * showed the UNFILTERED library total (e.g. "100 of 150") even when the active
+ * tab/kind/tag/search filter matched ZERO loaded notes. `total_count`/`remaining`
+ * come from a server COUNT that the dashboard calls WITHOUT the tag/query params,
+ * so they describe the whole library — but the visible list is filtered entirely
+ * client-side. The count must reflect the SAME filtered set as the results.
+ *
+ * Rules:
+ *  - No client filter active: the server totals ARE the filtered totals, so keep
+ *    the rich "(loaded of total)" display and show the button while hasMore.
+ *  - A client filter IS active: the server totals describe a different set, so we
+ *    can only honestly report the filtered LOADED count — "(N shown)". We still
+ *    offer "Load more" while hasMore (more library rows might contain matches),
+ *    but never imply a filtered total we don't have. When zero match and there is
+ *    nothing more to load, the button is hidden entirely (no "0 of 150").
+ */
+export function notesLoadMoreState(inp: NotesLoadMoreInput): NotesLoadMoreState {
+  const { visibleCount, loadedCount, hasMore, totalCount, remaining, filterActive, pageSize } = inp;
+  // Nothing more to pull from the server → no button, regardless of filter state.
+  if (!hasMore) return { show: false, label: '' };
+
+  if (!filterActive) {
+    // Server COUNT matches the on-screen (unfiltered) set: real remaining + total.
+    const n = remaining > 0 ? Math.min(pageSize, remaining) : pageSize;
+    const total = totalCount || loadedCount;
+    return { show: true, label: `Load ${n} more ↓  (${loadedCount} of ${total})` };
+  }
+
+  // A client filter is active. The server total/remaining are for the UNFILTERED
+  // library, so we cannot state a filtered total. Report only the filtered count
+  // that is actually shown, and hint that loading more searches the rest.
+  const shown = visibleCount === 1 ? '1 match' : `${visibleCount} matches`;
+  return { show: true, label: `Load more ↓  (${shown} loaded — search the rest)` };
+}
+
 export async function loadNotesTab(projectId: string) {
   /** v0.9 / e5592013 — load + render the per-project notes wiki.
    *
@@ -72,20 +140,29 @@ export async function loadNotesTab(projectId: string) {
   let totalCount = 0;
   let remaining = 0;
 
-  // Render (or remove) the "Load More" button below the notes list based on the
-  // current hasMore flag — appended after the filtered list each render.
-  const renderLoadMore = () => {
+  // Render (or remove) the "Load More" button below the notes list. The count
+  // label must reflect the SAME client-side filter (tab/kind/tag/search) as the
+  // rendered list — so callers pass the filtered `visibleCount` and whether a
+  // filter is active. 7fa07e10: without this the label showed the unfiltered
+  // library total (e.g. "100 of 150") even when the filter matched zero notes.
+  const renderLoadMore = (visibleCount: number, filterActive: boolean) => {
     const existing = document.getElementById(`notes-load-more-${projectId}`);
     if (existing) existing.remove();
-    if (!hasMore) return;
+    const st = notesLoadMoreState({
+      visibleCount,
+      loadedCount: allNotes.length,
+      hasMore,
+      totalCount,
+      remaining,
+      filterActive,
+      pageSize: NOTES_PAGE,
+    });
+    if (!st.show) return;
     const btn = document.createElement('button');
     btn.id = `notes-load-more-${projectId}`;
     btn.className = 'secondary';
     btn.style = 'width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)';
-    // 7000554a — real remaining count, not a hardcoded page size.
-    const n = remaining > 0 ? Math.min(NOTES_PAGE, remaining) : NOTES_PAGE;
-    const total = totalCount || allNotes.length;
-    btn.textContent = `Load ${n} more ↓  (${allNotes.length} of ${total})`;
+    btn.textContent = st.label;
     btn.onclick = () => loadMore(btn);
     body.appendChild(btn);
   };
@@ -111,6 +188,10 @@ export async function loadNotesTab(projectId: string) {
     const selectedTag = (tagSelect?.value || '').trim().toLowerCase();
     const selectedKind = (kindSelect?.value || '').trim().toLowerCase();
     const tab = getActiveTab();
+    // 7fa07e10 — a client-side filter narrows the on-screen set below the server's
+    // unfiltered COUNT, so the "of total" figure only holds on the default Notes
+    // tab with no search/tag/kind selected. Anything else = filterActive.
+    const filterActive = tab !== 'notes' || !!q || !!selectedTag || !!selectedKind;
 
     const visible = allNotes.filter(n => {
       // 42e9f7b5 — partition by tab: Log=summaries, Archive=archived, Notes=rest.
@@ -134,7 +215,11 @@ export async function loadNotesTab(projectId: string) {
         ? `(no notes in this tab match — clear the search/tag filter or switch tabs)`
         : `(no notes yet — use the form below or <code>add_note</code> MCP tool)`;
       body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
-      renderLoadMore();
+      // 7fa07e10 — zero matches: pass visibleCount=0 so the button never claims a
+      // library total (no "0 of 150"). With a filter active it may still offer
+      // "Load more" to search unloaded pages; with no filter + nothing loaded it
+      // stays hidden.
+      renderLoadMore(0, filterActive);
       return;
     }
 
@@ -176,7 +261,7 @@ export async function loadNotesTab(projectId: string) {
       };
     });
 
-    renderLoadMore();
+    renderLoadMore(visible.length, filterActive);
   };
 
   // Fetch the next cursor page and append it to allNotes, then re-render. The

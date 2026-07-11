@@ -2305,7 +2305,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, update_paragraph, find_symbol_usages, index_figure, find_similar_figure, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -2691,6 +2691,201 @@ async def _handle_notes_decisions(
             )
         except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
             return {"error": f"could not find similar equations: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            "matches": matches,
+        }
+    if name == "insert_equation":
+        # 51a595e7 — write an OMML equation straight into a stored document's
+        # source .docx (direct OOXML write-back), then resync the sidecar
+        # equation index. Mirrors index_equation's shape (resolve the store, then
+        # the document by its stored source) but MUTATES the underlying file.
+        validate_input_size(args.get("doc"), "equation doc", 2_000)
+        validate_input_size(args.get("para_id"), "para_id", 500)
+        validate_input_size(
+            args.get("equation_id_or_omml"), "equation_id_or_omml", 100_000
+        )
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        para_id = args.get("para_id")
+        equation_id_or_omml = args.get("equation_id_or_omml")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not para_id:
+            return {"error": "para_id is required"}
+        if not equation_id_or_omml:
+            return {"error": "equation_id_or_omml is required"}
+        position = args.get("position") or "append"
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            result = await store.insert_equation(
+                args["project_id"], doc_source, para_id, equation_id_or_omml,
+                position=position,
+            )
+        except Exception as exc:  # noqa: BLE001 — write-back is best-effort
+            return {"error": f"could not insert equation: {exc}"}
+        if "error" in result:
+            return result
+        return {"project_id": args["project_id"], **result}
+    if name == "update_paragraph":
+        # f978e588 — ID-addressable docx WRITE (the write counterpart of the
+        # get_element_by_id read primitive). Mirrors index_equation's resolution:
+        # resolve the tier store, look up the stored document by its source, then
+        # rewrite ONE paragraph in the on-disk .docx by its w14:paraId (never by
+        # text match) and resync the doc_elements row.
+        validate_input_size(args.get("doc"), "doc", 2_000)
+        validate_input_size(args.get("para_id"), "para_id", 500)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        para_id = args.get("para_id")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not para_id:
+            return {"error": "para_id is required"}
+        # new_text_or_runs: EITHER a plain string OR a list of runs. Exactly one
+        # of new_text / runs must be provided.
+        new_text = args.get("new_text")
+        runs = args.get("runs")
+        if new_text is None and runs is None:
+            return {"error": "provide either new_text (string) or runs (list)"}
+        if new_text is not None and runs is not None:
+            return {"error": "provide only one of new_text or runs, not both"}
+        new_text_or_runs: Any = runs if runs is not None else new_text
+        if new_text is not None:
+            validate_input_size(new_text, "new_text", 1_000_000)
+        elif not isinstance(runs, list):
+            return {"error": "runs must be a list of strings or run objects"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            result = await store.update_paragraph(
+                args["project_id"], doc_source, para_id, new_text_or_runs,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — the write is best-effort
+            return {"error": f"could not update paragraph: {exc}"}
+        return {"project_id": args["project_id"], **result}
+    if name == "find_symbol_usages":
+        # 9605edb0 — READ-ONLY cross-reference tracking: resolve a symbol /
+        # normalized-LaTeX string OR a doc_equations id to one target and return
+        # every paragraph/equation where it reappears, classified definition vs
+        # reuse (earliest ordinal = definition). Mirrors find_similar_equation's
+        # shape (resolve the store, then look up the document by its stored source).
+        validate_input_size(args.get("doc"), "symbol usages doc", 2_000)
+        validate_input_size(args.get("symbol_or_equation_id"), "symbol_or_equation_id", 100_000)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        symbol_or_equation_id = args.get("symbol_or_equation_id")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not symbol_or_equation_id:
+            return {"error": "symbol_or_equation_id is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"project_id": args["project_id"], "document_id": None, "target": "", "hits": []}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {"project_id": args["project_id"], "document_id": None, "target": "", "hits": []}
+        try:
+            usages = await store.find_symbol_usages(
+                doc_row["id"], symbol_or_equation_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+            return {"error": f"could not find symbol usages: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            **usages,
+        }
+    if name == "index_figure":
+        # c623e648 — index ONE figure into the SEMANTIC figure index (dedup +
+        # similarity on a normalized caption), the direct parallel of
+        # index_equation. Complementary to the structural kind='figure'
+        # doc_elements placement, not a duplicate of it.
+        validate_input_size(args.get("doc"), "figure doc", 2_000)
+        validate_input_size(args.get("file_path"), "file_path", 4_000)
+        validate_input_size(args.get("caption"), "caption", 10_000)
+        validate_input_size(args.get("semantic_label"), "semantic_label", 500)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        file_path = args.get("file_path")
+        caption = args.get("caption")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not file_path and not caption:
+            return {"error": "at least one of file_path or caption is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for doc={doc_source!r} — ingest_document "
+                    "or reindex_document it first"
+                ),
+            }
+        try:
+            result = await store.add_figure(
+                doc_row["id"], file_path,
+                caption=caption,
+                semantic_label=args.get("semantic_label"),
+            )
+        except Exception as exc:  # noqa: BLE001 — indexing is best-effort
+            return {"error": f"could not index figure: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            **result,
+        }
+    if name == "find_similar_figure":
+        # c623e648 — fuzzy-match a description OR a path against a document's
+        # already-indexed figures (read-only counterpart of index_figure).
+        validate_input_size(args.get("doc"), "figure doc", 2_000)
+        validate_input_size(args.get("description_or_path"), "description_or_path", 10_000)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        query = args.get("description_or_path")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not query:
+            return {"error": "description_or_path is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        _limit = args.get("limit")
+        try:
+            _limit = int(_limit) if _limit is not None else 5
+        except (TypeError, ValueError):
+            _limit = 5
+        try:
+            matches = await store.find_similar_figures(
+                doc_row["id"], query, limit=_limit,
+            )
+        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+            return {"error": f"could not find similar figures: {exc}"}
         return {
             "project_id": args["project_id"],
             "document_id": doc_row["id"],

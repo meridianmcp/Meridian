@@ -3,6 +3,7 @@ generate_handoff hook-writer."""
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from meridian import db as db_module
 from meridian import handoff as handoff_module
@@ -41,7 +42,13 @@ def test_sprint_pending_count_endpoint(client):
 
 def test_write_sprint_guard_hooks_bakes_project_id(tmp_path):
     # root= makes it write to an isolated dir (real runs skip under pytest).
-    handoff_module._write_sprint_guard_hooks("proj-xyz-123", root=tmp_path)
+    # This is the existing explicit-root test-isolation path — unchanged by
+    # the 34e94e0a cross-project-contamination fix.
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        await handoff_module._write_sprint_guard_hooks(db, "proj-xyz-123", root=tmp_path)
+
+    asyncio.run(_run())
     sh = (tmp_path / ".claude" / "hooks" / "sprint_guard.sh").read_text(encoding="utf-8")
     ps1 = (tmp_path / ".claude" / "hooks" / "sprint_guard.ps1").read_text(encoding="utf-8")
     for text in (sh, ps1):
@@ -56,7 +63,60 @@ def test_write_sprint_guard_hooks_bakes_project_id(tmp_path):
 def test_write_sprint_guard_hooks_skipped_under_pytest_without_root():
     # Without an explicit root, the auto-writer no-ops under pytest so it can
     # never dirty the committed .claude/hooks during the suite.
-    handoff_module._write_sprint_guard_hooks("proj-should-not-write")  # no exception, no write
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        await handoff_module._write_sprint_guard_hooks(db, "proj-should-not-write")
+
+    asyncio.run(_run())  # no exception, no write
+
+
+def test_write_sprint_guard_hooks_uses_executor_config_repo_path(tmp_path, monkeypatch):
+    # 34e94e0a — the production (root=None) path must resolve the write
+    # target from the CALLING PROJECT's own executor_config.repo_path, not
+    # from the server's own install directory. Simulate "production" by
+    # removing PYTEST_CURRENT_TEST (which otherwise always short-circuits the
+    # root=None path during the test suite).
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    repo_dir = tmp_path / "myrepo"
+    (repo_dir / ".claude").mkdir(parents=True)
+
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "sg-repo-path")
+        await db_module.set_executor_config(db, p["id"], {"repo_path": str(repo_dir)})
+        await handoff_module._write_sprint_guard_hooks(db, p["id"])
+        return p["id"]
+
+    project_id = asyncio.run(_run())
+    sh = (repo_dir / ".claude" / "hooks" / "sprint_guard.sh").read_text(encoding="utf-8")
+    ps1 = (repo_dir / ".claude" / "hooks" / "sprint_guard.ps1").read_text(encoding="utf-8")
+    assert project_id in sh
+    assert project_id in ps1
+
+
+def test_write_sprint_guard_hooks_skips_without_repo_path_no_cross_project_leak(monkeypatch):
+    # 34e94e0a regression guard: a project with NO configured repo_path must
+    # never fall back to writing into the server's own checkout
+    # (Path(__file__).parent.parent) — that fallback is exactly how one
+    # project's generate_handoff() clobbered a totally different project's
+    # committed sprint_guard hooks with a foreign project_id.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    real_hooks_dir = Path(handoff_module.__file__).parent.parent / ".claude" / "hooks"
+    sh_path = real_hooks_dir / "sprint_guard.sh"
+    before = sh_path.read_text(encoding="utf-8") if sh_path.exists() else None
+
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "sg-no-repo-path")
+        await handoff_module._write_sprint_guard_hooks(db, p["id"])
+        return p["id"]
+
+    project_id = asyncio.run(_run())
+
+    after = sh_path.read_text(encoding="utf-8") if sh_path.exists() else None
+    assert before == after                 # server's own hooks left untouched
+    if after is not None:
+        assert project_id not in after     # foreign project_id never leaked in
 
 
 # ---------------------------------------------------------------------------

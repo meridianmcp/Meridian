@@ -156,6 +156,31 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at TEXT NOT NULL
     )
     """,
+    # Fifth self-contained table (c623e648): the SEMANTIC figure index -- one row
+    # per indexed figure, dedup/similarity keyed on a normalized caption. This is
+    # COMPLEMENTARY to (not a replacement for) the ``kind='figure'`` doc_elements
+    # rows that carry a figure's section-tree PLACEMENT -- those answer "where in
+    # the outline does this figure sit"; ``doc_figures`` answers "have I already
+    # indexed a figure with this caption / at this path" (fuzzy near-dup + ranked
+    # lookup), the exact parallel of what latex_normalized dedup does for
+    # equations. Deliberately NOT a doc_elements kind -- figures carry a file_path
+    # + caption + normalized_caption dedup key that don't fit the generic element
+    # shape. Same self-contained pattern as the four tables above -- created here
+    # by ``ensure_schema``, OUTSIDE the main migration machinery.
+    """
+    CREATE TABLE IF NOT EXISTS doc_figures (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        element_id TEXT,
+        ordinal INTEGER NOT NULL,
+        file_path TEXT,
+        caption TEXT,
+        normalized_caption TEXT,
+        semantic_label TEXT,
+        file_exists INTEGER,
+        created_at TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_doc_documents_project_source "
     "ON doc_documents (project_id, source)",
     "CREATE INDEX IF NOT EXISTS idx_doc_elements_document_ordinal "
@@ -166,6 +191,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON doc_edges (source_element_id)",
     "CREATE INDEX IF NOT EXISTS idx_doc_equations_document_ordinal "
     "ON doc_equations (document_id, ordinal)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_figures_document_ordinal "
+    "ON doc_figures (document_id, ordinal)",
 )
 
 
@@ -207,10 +234,18 @@ _EQUATION_COLUMNS = (
     "id", "document_id", "element_id", "ordinal", "omml_raw",
     "latex_normalized", "semantic_label", "created_at",
 )
+_FIGURE_COLUMNS = (
+    "id", "document_id", "element_id", "ordinal", "file_path", "caption",
+    "normalized_caption", "semantic_label", "file_exists", "created_at",
+)
 
 # Fuzzy-match ratio (difflib) at/above which two equations' latex_normalized
 # values count as a "near-duplicate" for put_equations' advisory dedup surface.
 _EQUATION_DEDUP_THRESHOLD = 0.85
+
+# The same advisory-dedup threshold, applied to figures' normalized_caption
+# (c623e648) -- mirrors _EQUATION_DEDUP_THRESHOLD exactly.
+_FIGURE_DEDUP_THRESHOLD = 0.85
 
 # Sentinel level for a heading dict that carries no usable level. Deliberately
 # large so a level-less heading nests as a deep leaf rather than colliding with a
@@ -793,6 +828,239 @@ def parse_docx_equations(source: str | bytes | bytearray) -> list[dict[str, Any]
     return equations
 
 
+# ---------------------------------------------------------------------------
+# .docx write-back helpers (51a595e7 + f978e588) -- open / find / save + run edit
+# ---------------------------------------------------------------------------
+#
+# The READ side (parse_docx_equations / docs_intel) already reaches straight into
+# a .docx's ``word/document.xml`` with lxml + zipfile. These helpers are the
+# WRITE-side mirror needed to author OMML (insert_equation) OR edit paragraph
+# text/runs (update_paragraph) directly into the source .docx WITHOUT a
+# python-docx dependency: parse the document part, mutate the tree in place, and
+# rewrite ONLY that one zip entry (every other part -- styles, rels, media -- is
+# copied through byte-for-byte). All are pure/synchronous and unit-testable.
+#
+# insert_equation (51a595e7) and update_paragraph (f978e588) were built in
+# parallel and each authored their own copy of the open/find/save primitives.
+# This is the deduped, reconciled canonical set that BOTH tools call.
+# ---------------------------------------------------------------------------
+
+_DOCX_DOCUMENT_PART = "word/document.xml"
+
+
+def _load_docx_xml(source: str | bytes | bytearray) -> tuple[bytes, Any]:
+    """Read a .docx's ``word/document.xml`` and return ``(raw_bytes, root)``.
+
+    ``raw_bytes`` is the *whole* .docx ZIP as bytes (so the caller can rewrite a
+    single part via :func:`_save_docx_xml` without re-reading a path that may have
+    changed); ``root`` is the parsed ``<w:document>`` lxml element. ``source`` is
+    a filesystem path OR the raw .docx bytes. Raises the underlying zipfile/lxml
+    error on a genuinely malformed/missing input (callers guard):
+    ``zipfile.BadZipFile`` for a non-.docx, ``KeyError`` for a missing document
+    part.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        raw = bytes(source)
+    else:
+        with open(source, "rb") as fh:
+            raw = fh.read()
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        with zf.open(_DOCX_DOCUMENT_PART) as handle:
+            xml_bytes = handle.read()
+    root = _LET.fromstring(xml_bytes)
+    return raw, root
+
+
+def _find_paragraph_by_id(root: Any, para_id: str) -> Any | None:
+    """Return the ``<w:p>`` element whose id == ``para_id``, or ``None``.
+
+    The id is the paragraph's stable ``w14:paraId`` attribute; when a paragraph
+    carries none, a synthesized ``p{index}`` id is matched instead -- EXACTLY the
+    convention :func:`parse_docx_equations` / ``docs_intel.parse_docx`` use for
+    ``element_id``, so a ``para_id`` obtained from either read side round-trips
+    here. The synthesized index counts every ``<w:p>`` in document order. Returns
+    the bare paragraph element (or ``None``); callers needing the body-order index
+    use :func:`_find_paragraph_with_index`.
+    """
+    if not isinstance(para_id, str) or not para_id.strip():
+        return None
+    target = para_id.strip()
+    w_p = f"{{{_DOCX_W_NS}}}p"
+    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
+    for idx, p in enumerate(root.iter(w_p)):
+        real_id = p.get(w14_para_id)
+        synthetic_id = f"p{idx}"
+        if real_id == target or (real_id is None and synthetic_id == target) or synthetic_id == target:
+            return p
+    return None
+
+
+def _find_paragraph_with_index(root: Any, para_id: str) -> tuple[Any, int] | None:
+    """Like :func:`_find_paragraph_by_id` but also return the body-order ``idx``.
+
+    Returns ``(element, idx)`` where ``idx`` is the paragraph's zero-based
+    position among every ``<w:p>`` in document order (matching the ``p{index}``
+    synthesized-id convention), or ``None`` when nothing matches. Shares the exact
+    match rule with :func:`_find_paragraph_by_id`.
+    """
+    if not isinstance(para_id, str) or not para_id.strip():
+        return None
+    target = para_id.strip()
+    w_p = f"{{{_DOCX_W_NS}}}p"
+    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
+    for idx, p in enumerate(root.iter(w_p)):
+        real_id = p.get(w14_para_id)
+        synthetic_id = f"p{idx}"
+        if real_id == target or (real_id is None and synthetic_id == target) or synthetic_id == target:
+            return p, idx
+    return None
+
+
+def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
+    """Rewrite ``word/document.xml`` with ``root`` into a copy of the .docx at ``dest``.
+
+    Every OTHER zip entry from ``raw`` is copied through unchanged (byte-for-byte,
+    preserving compression), so styles / relationships / media / content-types are
+    untouched -- only the document part is replaced with the mutated tree. Writing
+    to a fresh ``BytesIO`` first and flushing to ``dest`` at the end keeps the
+    write atomic-ish (a mid-write crash can't half-truncate the original when
+    ``dest`` differs, and even for an in-place overwrite the new bytes are fully
+    materialised before the file is opened for writing).
+    """
+    new_document = _LET.tostring(
+        root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src:
+        infos = src.infolist()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for info in infos:
+                data = src.read(info.filename)
+                if info.filename == _DOCX_DOCUMENT_PART:
+                    data = new_document
+                # Preserve each entry's original compression type.
+                dst.writestr(info, data)
+    with open(dest, "wb") as fh:
+        fh.write(out.getvalue())
+
+
+def _insert_omath_at_position(
+    paragraph: Any, omath_el: Any, position: str
+) -> None:
+    """Insert a parsed ``<m:oMath>`` element relative to ``paragraph`` in place.
+
+    * ``append``  -- append the ``<m:oMath>`` as the last child *inside* the
+      paragraph (an inline equation trailing the paragraph's runs).
+    * ``before`` / ``after`` -- wrap the ``<m:oMath>`` in its OWN new ``<w:p>``
+      (a display equation on its own line) and splice that paragraph immediately
+      before / after ``paragraph`` in the parent (body) element.
+
+    ``append`` is the default because a bare ``<m:oMath>`` is only valid as a
+    child of a ``<w:p>`` (or an ``<m:oMathPara>``); splicing it as a body sibling
+    directly would produce a malformed document, hence the ``<w:p>`` wrapper for
+    before/after.
+    """
+    if position == "append":
+        paragraph.append(omath_el)
+        return
+    # before / after -- build a standalone paragraph carrying the equation.
+    new_p = _LET.Element(f"{{{_DOCX_W_NS}}}p")
+    new_p.append(omath_el)
+    parent = paragraph.getparent()
+    if parent is None:
+        # No parent to splice into (a detached paragraph) -- degrade to an inline
+        # append so the equation is never silently dropped.
+        paragraph.append(omath_el)
+        return
+    index = list(parent).index(paragraph)
+    if position == "before":
+        parent.insert(index, new_p)
+    else:  # after
+        parent.insert(index + 1, new_p)
+
+
+def _paragraph_plain_text(p: Any) -> str:
+    """Concatenate every ``<w:t>`` run text inside a paragraph (read-side parity)."""
+    w_t = f"{{{_DOCX_W_NS}}}t"
+    return "".join(t.text or "" for t in p.iter(w_t))
+
+
+# The subset of run properties (``<w:rPr>``) a caller may set per run. Each maps a
+# friendly key on a run dict to its OOXML toggle element local-name; a truthy
+# value emits ``<w:{tag}/>``. Deliberately small (bold/italic/underline) -- the
+# common inline emphasis set -- everything else on the original run is dropped when
+# runs are replaced, which is the documented contract.
+_RUN_TOGGLE_PROPS: tuple[tuple[str, str], ...] = (
+    ("bold", "b"),
+    ("italic", "i"),
+    ("underline", "u"),
+)
+
+
+def _normalize_runs(new_text_or_runs: str | list[Any]) -> list[dict[str, Any]]:
+    """Coerce the ``new_text_or_runs`` argument into a list of run dicts.
+
+    Accepts EITHER a plain string (one run, no formatting) OR a list of runs,
+    where each run is either a bare string or a ``{text, bold?, italic?,
+    underline?}`` dict. Returns a normalized ``[{text, bold, italic, underline}]``
+    list. A ``None``/empty input yields a single empty-text run so the paragraph
+    is emptied rather than left untouched.
+    """
+    if new_text_or_runs is None:
+        return [{"text": ""}]
+    if isinstance(new_text_or_runs, str):
+        return [{"text": new_text_or_runs}]
+    runs: list[dict[str, Any]] = []
+    for item in new_text_or_runs:
+        if isinstance(item, str):
+            runs.append({"text": item})
+        elif isinstance(item, dict):
+            run = {"text": str(item.get("text") or "")}
+            for friendly, _tag in _RUN_TOGGLE_PROPS:
+                if item.get(friendly):
+                    run[friendly] = True
+            runs.append(run)
+        else:
+            run = {"text": str(item)}
+            runs.append(run)
+    return runs or [{"text": ""}]
+
+
+def _set_paragraph_runs(p: Any, runs: list[dict[str, Any]]) -> None:
+    """Replace every ``<w:r>`` run in paragraph ``p`` with ``runs`` (in place).
+
+    The paragraph's own properties (``<w:pPr>`` -- its style, numbering, etc.) are
+    PRESERVED: only run children are removed and rebuilt. Each new run is a
+    ``<w:r>`` carrying an optional ``<w:rPr>`` toggle set (bold/italic/underline)
+    and a single ``<w:t xml:space="preserve">`` so leading/trailing spaces survive
+    Word's whitespace collapsing.
+    """
+    w = _DOCX_W_NS
+    w_r = f"{{{w}}}r"
+    w_ppr = f"{{{w}}}pPr"
+    # Remove existing runs (and any bookmark/hyperlink run wrappers' bare runs);
+    # keep pPr and everything that is not a top-level run.
+    for child in list(p):
+        if child.tag == w_r:
+            p.remove(child)
+    # Rebuild: runs go AFTER pPr (OOXML requires pPr first when present).
+    ppr = p.find(w_ppr)
+    insert_at = list(p).index(ppr) + 1 if ppr is not None else 0
+    for offset, run in enumerate(runs):
+        r_el = _LET.Element(w_r)
+        toggles = [(tag, run.get(friendly)) for friendly, tag in _RUN_TOGGLE_PROPS]
+        if any(val for _tag, val in toggles):
+            rpr = _LET.SubElement(r_el, f"{{{w}}}rPr")
+            for tag, val in toggles:
+                if val:
+                    _LET.SubElement(rpr, f"{{{w}}}{tag}")
+        t_el = _LET.SubElement(r_el, f"{{{w}}}t")
+        # xml:space=preserve so runs with leading/trailing spaces round-trip.
+        t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        t_el.text = run.get("text") or ""
+        p.insert(insert_at + offset, r_el)
+
+
 # Delimiter pairs normalize_latex strips when they wrap the WHOLE string (an
 # author pasting "$x^2$" or "\(x^2\)" should dedup-match a bare "x^2").
 _MATH_DELIM_PAIRS: tuple[tuple[str, str], ...] = (
@@ -823,6 +1091,36 @@ def normalize_latex(latex: str | None) -> str:
 def _equation_similarity(a: str, b: str) -> float:
     """difflib fuzzy-match ratio (same approach already used for note-dedup in
     ``mcp/handler.py``'s ``add_note`` near-duplicate warning, 6e4e2371)."""
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def normalize_caption(caption: str | None) -> str:
+    """Canonicalize a figure caption for the fuzzy-dedup key (c623e648).
+
+    The figure analogue of :func:`normalize_latex`: lower-cases, strips a
+    leading auto-numbered label (``Figure 3:`` / ``Fig. 12 -`` / ``Figure 3.``),
+    collapses all runs of whitespace to a single space, and drops surrounding
+    whitespace. Caption prose IS word-order sensitive (unlike LaTeX), so -- unlike
+    :func:`normalize_latex` -- whitespace is *collapsed*, not removed entirely, to
+    keep word boundaries for a meaningful difflib ratio. Deterministic and
+    pure -- never raises, ``None``/blank input yields ``""``.
+    """
+    s = (caption or "").strip().lower()
+    if not s:
+        return ""
+    # Strip a leading "figure N" / "fig. N" auto-number label plus its trailing
+    # separator (``:``/``.``/``-``/em-dash), if present.
+    s = re.sub(r"^(?:figure|fig\.?)\s*\d+\s*[:.\-–—]?\s*", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _figure_similarity(a: str, b: str) -> float:
+    """difflib fuzzy-match ratio between two normalized captions (c623e648).
+
+    Same difflib approach as :func:`_equation_similarity`; kept as its own
+    function so figures and equations can diverge later without entangling."""
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
@@ -1530,6 +1828,125 @@ class DocStructureStore:
         lim = limit if isinstance(limit, int) and limit > 0 else 5
         return scored[:lim]
 
+    async def find_symbol_usages(
+        self, document_id: str, symbol_or_equation_id: str
+    ) -> dict[str, Any]:
+        """Cross-reference tracking for a defined symbol/equation (9605edb0).
+
+        Resolves ``symbol_or_equation_id`` to a single normalized-LaTeX *target*
+        and returns every place in ``document_id`` where that target reappears,
+        so a later mention can be checked to point back to the DEFINITION instead
+        of assuming the reader remembers it.
+
+        Resolution — two accepted input shapes, tried in this order:
+
+        * an existing ``doc_equations.id`` in this document → the target is that
+          row's stored ``latex_normalized`` (authoritative; no re-normalization);
+        * anything else → a raw symbol / LaTeX source, normalized with the SAME
+          :func:`normalize_latex` that produced every ``latex_normalized`` value,
+          so the comparison is apples-to-apples (never a bespoke normalization).
+
+        Scans TWO surfaces of the same document and merges the hits:
+
+        * ``doc_equations`` — any equation (the target row itself, or another
+          element) whose ``latex_normalized`` equals the resolved target;
+        * ``doc_elements`` — any paragraph whose ``text`` *textually contains* the
+          target symbol (a normalized, whitespace-insensitive substring test), so
+          prose reuse of a symbol defined in an equation is caught too.
+
+        Each hit carries ``element_id``, ``document_id``, ``ordinal``,
+        ``matched_text`` (the equation's LaTeX or the paragraph text), ``context``
+        (``"equation"`` or ``"paragraph"``), and a ``is_definition`` /
+        ``is_reuse`` classification: the EARLIEST hit by ordinal is the
+        definition, every later hit is a reuse. Hits are ordered by ``ordinal``
+        (then a stable ``context``/``id`` tiebreak) so the definition sorts first.
+
+        Returns ``{target, resolved_from, hits:[...]}``. Never raises: an empty
+        target (blank symbol, or an equation id whose row has no normalized latex)
+        or a document with no matches yields ``{..., "hits": []}``.
+        """
+        raw = (symbol_or_equation_id or "").strip()
+        if not raw:
+            return {"target": "", "resolved_from": None, "hits": []}
+
+        equations = await self.get_equations(document_id)
+
+        # Resolve the target normalized-LaTeX. An exact doc_equations.id match in
+        # THIS document is authoritative (use its stored latex_normalized as-is);
+        # otherwise treat the input as a raw symbol/LaTeX string and normalize it
+        # with the same normalize_latex that produced every latex_normalized.
+        target = ""
+        resolved_from = "symbol"
+        by_id = {eq.get("id"): eq for eq in equations}
+        if raw in by_id:
+            target = (by_id[raw].get("latex_normalized") or "").strip()
+            resolved_from = "equation_id"
+        else:
+            target = normalize_latex(raw)
+
+        if not target:
+            return {"target": "", "resolved_from": resolved_from, "hits": []}
+
+        hits: list[dict[str, Any]] = []
+
+        # Surface 1 — equations with a matching normalized latex (same or other
+        # elements). Exact equality on the normalized key, not a fuzzy ratio: this
+        # is "the SAME equation reappears", not "a similar one".
+        for eq in equations:
+            if (eq.get("latex_normalized") or "").strip() == target:
+                hits.append({
+                    "element_id": eq.get("element_id"),
+                    "equation_id": eq.get("id"),
+                    "document_id": eq.get("document_id"),
+                    "ordinal": eq.get("ordinal"),
+                    "matched_text": eq.get("latex_normalized"),
+                    "context": "equation",
+                })
+
+        # Surface 2 — paragraphs textually containing the symbol. Compare on the
+        # normalized (whitespace-stripped) forms so "E = m c^2" in prose still
+        # matches the "E=mc^2" target. Only kind='paragraph'/'text' bodies are
+        # scanned so a heading/figure caption isn't mistaken for a reuse.
+        async with self._db.execute(
+            "SELECT * FROM doc_elements WHERE document_id = ? ORDER BY ordinal ASC",
+            (document_id,),
+        ) as cur:
+            element_rows = await cur.fetchall()
+        for row in element_rows:
+            el = _row_to_dict(row, _ELEMENT_COLUMNS)
+            if el is None:
+                continue
+            text = el.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if target in re.sub(r"\s+", "", text):
+                hits.append({
+                    "element_id": el.get("id"),
+                    "equation_id": None,
+                    "document_id": el.get("document_id"),
+                    "ordinal": el.get("ordinal"),
+                    "matched_text": text,
+                    "context": "paragraph",
+                })
+
+        # Order by ordinal so the definition (earliest) sorts first; stable tie
+        # break keeps equation hits ahead of paragraph hits at one ordinal and
+        # keeps the result deterministic across backends.
+        _context_rank = {"equation": 0, "paragraph": 1}
+        hits.sort(key=lambda h: (
+            h.get("ordinal") if isinstance(h.get("ordinal"), int) else 0,
+            _context_rank.get(h.get("context"), 9),
+            str(h.get("equation_id") or ""),
+            str(h.get("element_id") or ""),
+        ))
+
+        # Classify: the FIRST hit is the definition, every later one is a reuse.
+        for i, h in enumerate(hits):
+            h["is_definition"] = i == 0
+            h["is_reuse"] = i > 0
+
+        return {"target": target, "resolved_from": resolved_from, "hits": hits}
+
     async def put_equations(
         self,
         document_id: str,
@@ -1651,6 +2068,329 @@ class DocStructureStore:
             "near_duplicates": result["near_duplicates"],
         }
 
+    # -- equation write-back (51a595e7) --------------------------------------
+
+    async def _delete_equations(self, document_id: str) -> None:
+        """Drop every stored equation row for a document (idempotent)."""
+        await self._db.execute(
+            "DELETE FROM doc_equations WHERE document_id = ?", (document_id,)
+        )
+
+    async def resync_document_equations(
+        self, document_id: str, file_path: str | bytes | bytearray
+    ) -> dict[str, Any]:
+        """Re-derive a document's equation index straight from its .docx (51a595e7).
+
+        The sidecar's equation rows are a *cache* of the ``<m:oMath>`` elements
+        physically present in the source .docx. After a write-back (insert /
+        update / delete of an equation in the file) that cache is stale, so this
+        drops the document's existing ``doc_equations`` rows and re-runs
+        :meth:`put_equations` over a FRESH :func:`parse_docx_equations` parse —
+        a targeted, self-contained resync (no separate re-verify step). Returns
+        the ``put_equations`` result (``{inserted, near_duplicates}``).
+        """
+        raw_equations = parse_docx_equations(file_path)
+        eq_batch = [
+            {
+                "element_id": eq.get("element_id"),
+                "ordinal": eq.get("ordinal"),
+                "omml_raw": eq.get("omml_raw"),
+                "latex_normalized": _omml_flatten_text(eq.get("omml_raw")),
+            }
+            for eq in raw_equations
+        ]
+        await self._delete_equations(document_id)
+        return await self.put_equations(document_id, eq_batch)
+
+    async def insert_equation(
+        self,
+        project_id: str,
+        source: str,
+        para_id: str,
+        equation_id_or_omml: str,
+        *,
+        position: str = "append",
+    ) -> dict[str, Any]:
+        """Write an OMML equation directly into a stored document's source .docx.
+
+        Collapses the old 4-5 step manual flow (resolve doc -> open zip -> parse
+        xml -> splice OMML -> rewrite zip -> reindex) into one call (51a595e7):
+
+        1. Resolve the ``doc_documents`` row for ``(project_id, source)`` and the
+           physical .docx path from its ``source`` column (the path/URL it was
+           ingested/reindexed under).
+        2. Determine the OMML: if ``equation_id_or_omml`` is the id of an existing
+           ``doc_equations`` row for this document, reuse that row's ``omml_raw``;
+           else a string starting with ``<`` is treated as raw OMML XML, and
+           anything else as a LaTeX source converted best-effort via
+           :func:`latex_to_omml`.
+        3. Open the .docx, find the paragraph whose ``w14:paraId`` (or synthesized
+           ``p{idx}``) == ``para_id``, splice the ``<m:oMath>`` at ``position``
+           (``append`` inside the paragraph, or ``before`` / ``after`` it as its
+           own display-equation paragraph), and rewrite ``word/document.xml`` back
+           into the .docx in place.
+        4. Resync this document's equation index from the modified file
+           (:meth:`resync_document_equations`) so the new equation is queryable —
+           no separate re-verify step.
+
+        Returns ``{document_id, source, para_id, position, omml, resync}`` on
+        success, or ``{error}`` for a bad para_id / unresolvable OMML / missing
+        file. Never mutates the file when the equation or paragraph can't be
+        resolved (fail-before-write).
+        """
+        pos = (position or "append").strip().lower()
+        if pos not in ("append", "before", "after"):
+            return {"error": f"position must be append|before|after, got {position!r}"}
+
+        doc_row = await self.get_document(project_id, source)
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for source={source!r} — ingest_document "
+                    "or reindex_document it first"
+                ),
+            }
+        document_id = doc_row["id"]
+        docx_path = doc_row.get("source")
+        if not isinstance(docx_path, str) or not docx_path.strip():
+            return {"error": f"stored document {document_id} has no source path to write back to"}
+        if not os.path.isfile(docx_path):
+            return {"error": f"source .docx not found on disk: {docx_path!r}"}
+
+        # --- resolve the OMML to insert (fail before touching the file) --------
+        omml_raw = await self._resolve_omml_payload(document_id, equation_id_or_omml)
+        if omml_raw is None:
+            return {
+                "error": (
+                    "could not resolve an OMML equation from "
+                    f"equation_id_or_omml={equation_id_or_omml!r} (unknown equation "
+                    "id, and not parseable as raw OMML or convertible LaTeX)"
+                ),
+            }
+
+        # --- open, locate paragraph, splice, save ------------------------------
+        try:
+            raw, root = _load_docx_xml(docx_path)
+        except Exception as exc:  # noqa: BLE001 — malformed/locked file
+            return {"error": f"could not open source .docx: {exc}"}
+        paragraph = _find_paragraph_by_id(root, para_id)
+        if paragraph is None:
+            return {"error": f"no paragraph with id {para_id!r} in {docx_path!r}"}
+        try:
+            omath_el = _LET.fromstring(
+                omml_raw.encode("utf-8") if isinstance(omml_raw, str) else bytes(omml_raw)
+            )
+        except Exception as exc:  # noqa: BLE001 — payload wasn't valid XML after all
+            return {"error": f"resolved OMML is not valid XML: {exc}"}
+        _insert_omath_at_position(paragraph, omath_el, pos)
+        try:
+            _save_docx_xml(raw, root, docx_path)
+        except Exception as exc:  # noqa: BLE001 — write failure (perms/disk)
+            return {"error": f"could not write back to source .docx: {exc}"}
+
+        # --- resync the sidecar equation index from the modified file ----------
+        resync = await self.resync_document_equations(document_id, docx_path)
+        return {
+            "document_id": document_id,
+            "source": source,
+            "para_id": para_id,
+            "position": pos,
+            "omml": _LET.tostring(omath_el, encoding="unicode"),
+            "resync": resync,
+        }
+
+    async def _resolve_omml_payload(
+        self, document_id: str, equation_id_or_omml: str
+    ) -> str | None:
+        """Resolve ``equation_id_or_omml`` to a real OMML XML string, or ``None``.
+
+        Resolution order (51a595e7):
+
+        1. An id of an existing ``doc_equations`` row for THIS document whose
+           ``omml_raw`` is non-empty -> reuse that stored OMML verbatim.
+        2. A string starting with ``<`` -> treat as raw OMML XML (as-is).
+        3. Anything else -> a LaTeX source, converted best-effort via
+           :func:`latex_to_omml` (``None`` on an unsupported/unparsable construct).
+        """
+        raw = (equation_id_or_omml or "").strip()
+        if not raw:
+            return None
+        # (1) existing equation id for this document.
+        existing = await self.get_equations(document_id)
+        for eq in existing:
+            if eq.get("id") == raw and eq.get("omml_raw"):
+                return eq["omml_raw"]
+        # (2) raw OMML XML.
+        if raw.startswith("<"):
+            return raw
+        # (3) LaTeX source.
+        return latex_to_omml(raw)
+
+    # -- figures (semantic index) — c623e648 ---------------------------------
+
+    async def get_figures(self, document_id: str) -> list[dict[str, Any]]:
+        """Return every indexed figure for a document, ordered by ``ordinal``."""
+        async with self._db.execute(
+            "SELECT * FROM doc_figures WHERE document_id = ? ORDER BY ordinal ASC",
+            (document_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_dict(r, _FIGURE_COLUMNS) for r in rows]
+
+    async def find_similar_figures(
+        self, document_id: str, description_or_path: str, *, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Fuzzy-match a free-text description OR a file path against this
+        document's indexed figures; returns every stored figure carrying a
+        ``score`` (the better of the difflib ratio against its
+        ``normalized_caption`` and against its ``file_path``), best match first,
+        capped at ``limit``. Mirrors :meth:`find_similar_equations`. Never
+        raises; an empty/unknown document yields ``[]``."""
+        query = (description_or_path or "").strip()
+        norm = normalize_caption(query)
+        query_lower = query.lower()
+        existing = await self.get_figures(document_id)
+        scored: list[dict[str, Any]] = []
+        for fig in existing:
+            cap_score = _figure_similarity(norm, fig.get("normalized_caption") or "")
+            path = (fig.get("file_path") or "").strip().lower()
+            path_score = _figure_similarity(query_lower, path) if path else 0.0
+            scored.append({**fig, "score": round(max(cap_score, path_score), 4)})
+        scored.sort(key=lambda f: f["score"], reverse=True)
+        lim = limit if isinstance(limit, int) and limit > 0 else 5
+        return scored[:lim]
+
+    async def put_figures(
+        self,
+        document_id: str,
+        figures: list[dict[str, Any]],
+        *,
+        dedup_threshold: float = _FIGURE_DEDUP_THRESHOLD,
+    ) -> dict[str, Any]:
+        """Insert a batch of figures for ``document_id``.
+
+        The figure analogue of :meth:`put_equations` -- same ADVISORY (never
+        blocking) dedup contract: every figure is inserted, and a fuzzy-matched
+        near-duplicate (same-document normalized-caption difflib ratio ``>=
+        dedup_threshold``, against already-stored figures AND earlier figures in
+        this same batch) is SURFACED via ``near_duplicates`` rather than silently
+        dropped or silently piled up.
+
+        Each ``figures`` item is ``{file_path?, caption?, semantic_label?,
+        element_id?, ordinal?}``. The referenced ``file_path`` is checked against
+        disk: a missing file is FLAGGED (``file_exists`` on the row, and a
+        ``missing_files`` entry in the result) -- never a hard failure, because a
+        figure can be indexed before its asset lands or when the store runs on a
+        different host than the captured path.
+
+        Returns ``{"inserted": [...], "near_duplicates": [...],
+        "missing_files": [...]}``; a ``near_duplicates`` entry is
+        ``{figure_id, matched_id, matched_caption, score}`` and a
+        ``missing_files`` entry is ``{figure_id, file_path}``.
+        """
+        existing = await self.get_figures(document_id)
+        next_ordinal = (max((f.get("ordinal") or 0) for f in existing) + 1) if existing else 0
+        inserted: list[dict[str, Any]] = []
+        near_duplicates: list[dict[str, Any]] = []
+        missing_files: list[dict[str, Any]] = []
+        pool = list(existing)
+
+        for fig in figures or []:
+            caption = fig.get("caption")
+            normalized_caption = normalize_caption(caption)
+            file_path = fig.get("file_path")
+
+            best_score = 0.0
+            best_match: dict[str, Any] | None = None
+            if normalized_caption:
+                for cand in pool:
+                    score = _figure_similarity(
+                        normalized_caption, cand.get("normalized_caption") or ""
+                    )
+                    if score > best_score:
+                        best_score, best_match = score, cand
+
+            # Advisory on-disk existence check -- flag (don't fail) a missing asset.
+            exists: int | None = None
+            if isinstance(file_path, str) and file_path.strip():
+                try:
+                    exists = 1 if os.path.isfile(file_path) else 0
+                except (OSError, ValueError):
+                    exists = 0
+
+            fig_id = fig.get("id") or uuid.uuid4().hex
+            ordinal = fig.get("ordinal") if isinstance(fig.get("ordinal"), int) else next_ordinal
+            next_ordinal = max(next_ordinal, ordinal + 1)
+            now = _now_iso()
+            semantic_label = fig.get("semantic_label")
+            element_id = fig.get("element_id")
+
+            await self._db.execute(
+                "INSERT INTO doc_figures "
+                "(id, document_id, element_id, ordinal, file_path, caption, "
+                "normalized_caption, semantic_label, file_exists, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (fig_id, document_id, element_id, ordinal, file_path, caption,
+                 normalized_caption, semantic_label, exists, now),
+            )
+            row = {
+                "id": fig_id, "document_id": document_id, "element_id": element_id,
+                "ordinal": ordinal, "file_path": file_path, "caption": caption,
+                "normalized_caption": normalized_caption,
+                "semantic_label": semantic_label, "file_exists": exists,
+                "created_at": now,
+            }
+            inserted.append(row)
+            pool.append(row)
+
+            if exists == 0:
+                missing_files.append({"figure_id": fig_id, "file_path": file_path})
+
+            if best_match is not None and best_score >= dedup_threshold:
+                near_duplicates.append({
+                    "figure_id": fig_id,
+                    "matched_id": best_match.get("id"),
+                    "matched_caption": best_match.get("normalized_caption"),
+                    "score": round(best_score, 4),
+                })
+
+        if inserted:
+            await self._db.commit()
+        return {
+            "inserted": inserted,
+            "near_duplicates": near_duplicates,
+            "missing_files": missing_files,
+        }
+
+    async def add_figure(
+        self,
+        document_id: str,
+        file_path: str | None,
+        *,
+        caption: str | None = None,
+        semantic_label: str | None = None,
+        element_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Index ONE figure -- the ``index_figure`` MCP tool's primitive.
+
+        Inserts a single figure (with the same advisory near-duplicate +
+        missing-file surfacing as :meth:`put_figures`). Returns
+        ``{"figure": <inserted row, or None if not inserted>,
+        "near_duplicates": [...], "missing_files": [...]}``.
+        """
+        fig: dict[str, Any] = {
+            "file_path": file_path.strip() if isinstance(file_path, str) else file_path,
+            "caption": caption,
+            "semantic_label": semantic_label,
+            "element_id": element_id,
+        }
+        result = await self.put_figures(document_id, [fig])
+        return {
+            "figure": result["inserted"][0] if result["inserted"] else None,
+            "near_duplicates": result["near_duplicates"],
+            "missing_files": result["missing_files"],
+        }
+
     # -- orchestrator — 06df6ab3 ---------------------------------------------
 
     async def reindex_document(
@@ -1690,6 +2430,115 @@ class DocStructureStore:
             "document": doc,
             "elements_count": len(elements),
             "equations": equations,
+        }
+
+    # -- ID-addressable docx write (f978e588) --------------------------------
+
+    async def _resync_element_text(
+        self, document_id: str, para_id: str, new_text: str
+    ) -> int:
+        """Refresh the ``text`` of any stored element whose ``ref`` == ``para_id``.
+
+        ``doc_elements`` addresses a docx paragraph by its ``w14:paraId`` in the
+        ``ref`` column (headings, and figures/tables carry a caption ref instead
+        — those never match a paragraph paraId). Only persisted paragraphs
+        (headings) have a row; a plain body paragraph has none, so a zero return
+        is EXPECTED and honest, not a failure. Returns the number of rows updated.
+        """
+        async with self._db.execute(
+            "SELECT id FROM doc_elements WHERE document_id = ? AND ref = ?",
+            (document_id, para_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        ids = [_row_get(r, "id") for r in rows]
+        updated = 0
+        for el_id in ids:
+            if not el_id:
+                continue
+            await self._db.execute(
+                "UPDATE doc_elements SET text = ? WHERE id = ?",
+                (new_text, el_id),
+            )
+            updated += 1
+        if updated:
+            await self._db.commit()
+        return updated
+
+    async def update_paragraph(
+        self,
+        project_id: str,
+        source: str,
+        para_id: str,
+        new_text_or_runs: str | list[Any],
+    ) -> dict[str, Any]:
+        """ID-addressable docx WRITE — the write counterpart of ``get_element_by_id``.
+
+        Resolves the stored document row for ``(project_id, source)``, opens the
+        source .docx (its ``source`` column IS the on-disk path), finds the
+        paragraph whose ``w14:paraId`` (``p{index}`` fallback) equals ``para_id``,
+        replaces its runs with ``new_text_or_runs``, writes ``word/document.xml``
+        back into the ZIP, and re-syncs that element's ``doc_elements`` row so the
+        index matches the new text. Targets the paragraph by id ONLY — never by
+        text match (fragile text-matching is exactly what this replaces).
+
+        ``new_text_or_runs`` is either a plain string (a single unformatted run)
+        OR a list of runs, each a bare string or ``{text, bold?, italic?,
+        underline?}`` (basic run formatting is set when provided; the original
+        runs' formatting is otherwise dropped — replacement, not merge).
+
+        Returns ``{document_id, para_id, new_text, elements_resynced,
+        source_path}``. Raises ``ValueError`` for an unknown document, an
+        unresolvable/missing source path, or a ``para_id`` not present in the
+        document — never fabricates a silent no-op success.
+        """
+        src = source.strip() if isinstance(source, str) else ""
+        if not src:
+            raise ValueError("source is required")
+        if not isinstance(para_id, str) or not para_id.strip():
+            raise ValueError("para_id is required")
+        para_id = para_id.strip()
+
+        doc_row = await self.get_document(project_id, src)
+        if doc_row is None:
+            raise ValueError(
+                f"no stored document for source={src!r} — ingest_document or "
+                "reindex_document it first"
+            )
+        source_path = doc_row.get("source")
+        if not isinstance(source_path, str) or not source_path.strip():
+            raise ValueError("stored document has no resolvable source path")
+        source_path = source_path.strip()
+        if not os.path.isfile(source_path):
+            raise ValueError(f"source docx not found on disk: {source_path}")
+
+        try:
+            raw, root = _load_docx_xml(source_path)
+        except KeyError as exc:  # missing word/document.xml part
+            raise ValueError(f"not a valid .docx (no document part): {exc}") from exc
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"source is not a valid .docx (bad zip): {exc}") from exc
+
+        # Canonical _find_paragraph_by_id returns the bare <w:p> element (or None);
+        # update_paragraph only needs the element, not its body-order index.
+        p = _find_paragraph_by_id(root, para_id)
+        if p is None:
+            raise ValueError(f"no paragraph with para_id={para_id!r} in {source_path}")
+
+        runs = _normalize_runs(new_text_or_runs)
+        _set_paragraph_runs(p, runs)
+        new_text = "".join(r.get("text") or "" for r in runs)
+
+        # Canonical _save_docx_xml serializes ``root`` and rewrites only the
+        # document part into a copy of the original ZIP (``raw``) at ``dest``.
+        _save_docx_xml(raw, root, source_path)
+
+        resynced = await self._resync_element_text(doc_row["id"], para_id, new_text)
+        return {
+            "document_id": doc_row["id"],
+            "para_id": para_id,
+            "new_text": new_text,
+            "elements_resynced": resynced,
+            "source_path": source_path,
         }
 
     async def close(self) -> None:

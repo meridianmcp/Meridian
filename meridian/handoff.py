@@ -2059,7 +2059,9 @@ exit 0
 """
 
 
-def _write_sprint_guard_hooks(project_id: str, root: Path | None = None) -> None:
+async def _write_sprint_guard_hooks(
+    db: aiosqlite.Connection, project_id: str, root: Path | None = None
+) -> None:
     """c0d2356d — write .claude/hooks/sprint_guard.{sh,ps1} into the repo with
     ``project_id`` + MERIDIAN_URL baked in. Best-effort: a read-only /
     site-packages install (no writable .claude) must never break the mandatory
@@ -2067,13 +2069,32 @@ def _write_sprint_guard_hooks(project_id: str, root: Path | None = None) -> None
     files — never the token-rotation hooks.* scripts.
 
     Skips the repo-side write during the test suite (it would dirty the committed
-    .claude/hooks); tests pass an isolated ``root`` to exercise it directly."""
+    .claude/hooks); tests pass an isolated ``root`` to exercise it directly.
+
+    34e94e0a — when ``root`` is not given (the production path), the target
+    repo is resolved from the CALLING PROJECT's own ``executor_config.repo_path``
+    — NEVER from this server process's own install directory. A single running
+    Meridian server is shared across many of the user's projects, so falling
+    back to ``Path(__file__).parent.parent`` meant one project's
+    ``generate_handoff()`` would clobber a completely different project's
+    repo-local Stop hook with the wrong project_id (the cross-project
+    contamination that let a pending-item early-stop slip past the guard). If
+    the calling project has no configured ``repo_path`` (or it doesn't point at
+    a real checkout with a ``.claude`` dir), the write is skipped entirely — a
+    project with no repo of its own has no business getting a foreign repo's
+    hook files.
+    """
     if root is None and "PYTEST_CURRENT_TEST" in os.environ:
         return
     try:
-        repo_root = root if root is not None else Path(__file__).parent.parent
-        if root is None and not (repo_root / ".claude").exists():
-            return  # not a repo checkout with a .claude dir — nothing to do
+        if root is not None:
+            repo_root = root
+        else:
+            executor_config = await db_module.get_executor_config(db, project_id)
+            repo_path = (executor_config.get("repo_path") or "").strip()
+            if not repo_path or not (Path(repo_path) / ".claude").exists():
+                return  # no configured repo for this project — nothing to do
+            repo_root = Path(repo_path)
         hooks_dir = repo_root / ".claude" / "hooks"
         url = os.environ.get("MERIDIAN_URL") or "http://localhost:7878"
         hooks_dir.mkdir(parents=True, exist_ok=True)
@@ -2654,7 +2675,7 @@ async def generate_handoff(
             pass
     # c0d2356d — refresh the repo's Stop-hook sprint guard with this project's ID
     # (self-guarded; never breaks handoff).
-    _write_sprint_guard_hooks(project_id)
+    await _write_sprint_guard_hooks(db, project_id)
     return str(out_path.resolve()), content
 
 

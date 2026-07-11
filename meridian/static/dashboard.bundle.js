@@ -6486,6 +6486,17 @@ project_id = "${displayPid}"`;
   window._renderZoteroStatusRow = _renderZoteroStatusRow;
 
   // meridian/static/dashboard-notes.ts
+  function notesLoadMoreState(inp) {
+    const { visibleCount, loadedCount, hasMore, totalCount, remaining, filterActive, pageSize } = inp;
+    if (!hasMore) return { show: false, label: "" };
+    if (!filterActive) {
+      const n2 = remaining > 0 ? Math.min(pageSize, remaining) : pageSize;
+      const total = totalCount || loadedCount;
+      return { show: true, label: `Load ${n2} more \u2193  (${loadedCount} of ${total})` };
+    }
+    const shown = visibleCount === 1 ? "1 match" : `${visibleCount} matches`;
+    return { show: true, label: `Load more \u2193  (${shown} loaded \u2014 search the rest)` };
+  }
   async function loadNotesTab2(projectId) {
     const body = document.getElementById(`notes-body-${projectId}`);
     const searchInput = document.getElementById(`notes-search-${projectId}`);
@@ -6524,17 +6535,24 @@ project_id = "${displayPid}"`;
     let hasMore = false;
     let totalCount = 0;
     let remaining = 0;
-    const renderLoadMore = () => {
+    const renderLoadMore = (visibleCount, filterActive) => {
       const existing = document.getElementById(`notes-load-more-${projectId}`);
       if (existing) existing.remove();
-      if (!hasMore) return;
+      const st = notesLoadMoreState({
+        visibleCount,
+        loadedCount: allNotes.length,
+        hasMore,
+        totalCount,
+        remaining,
+        filterActive,
+        pageSize: NOTES_PAGE
+      });
+      if (!st.show) return;
       const btn = document.createElement("button");
       btn.id = `notes-load-more-${projectId}`;
       btn.className = "secondary";
       btn.style = "width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)";
-      const n2 = remaining > 0 ? Math.min(NOTES_PAGE, remaining) : NOTES_PAGE;
-      const total = totalCount || allNotes.length;
-      btn.textContent = `Load ${n2} more \u2193  (${allNotes.length} of ${total})`;
+      btn.textContent = st.label;
       btn.onclick = () => loadMore(btn);
       body.appendChild(btn);
     };
@@ -6554,6 +6572,7 @@ project_id = "${displayPid}"`;
       const selectedTag = (tagSelect?.value || "").trim().toLowerCase();
       const selectedKind = (kindSelect?.value || "").trim().toLowerCase();
       const tab = getActiveTab();
+      const filterActive = tab !== "notes" || !!q2 || !!selectedTag || !!selectedKind;
       const visible = allNotes.filter((n2) => {
         if (tab === "log") {
           if (!isAutoCapture(n2)) return false;
@@ -6577,7 +6596,7 @@ ${n2.tags || ""}`.toLowerCase();
       if (!visible.length) {
         const reason = allNotes.length ? `(no notes in this tab match \u2014 clear the search/tag filter or switch tabs)` : `(no notes yet \u2014 use the form below or <code>add_note</code> MCP tool)`;
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
-        renderLoadMore();
+        renderLoadMore(0, filterActive);
         return;
       }
       body.innerHTML = visible.map((n2) => {
@@ -6615,7 +6634,7 @@ ${n2.tags || ""}`.toLowerCase();
           }
         };
       });
-      renderLoadMore();
+      renderLoadMore(visible.length, filterActive);
     };
     const loadMore = async (btn) => {
       if (btn) {
@@ -13529,9 +13548,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
     }
     if (peeks.length) {
-      html += `<div id="doc-peeks-section-${escapeHtml(String(projectId))}" style="margin-top:16px">
-      <div style="font-size:10px;font-weight:600;color:var(--accent)">Recently viewed (not saved) \u2014 ${peeks.length}</div>
-      <div style="font-size:9px;color:var(--muted);margin:2px 0 8px">Peeked with <code>get_document_structure</code> (a stateless outline read) but never ingested \u2014 so they are NOT searchable here. Ingest one to save it.</div>`;
+      html += `<div id="doc-peeks-section-${escapeHtml(String(projectId))}" style="margin-top:16px;border-top:1px dashed var(--border);padding-top:12px">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:10px;font-weight:600;color:var(--accent)">Recently viewed (not saved) \u2014 ${peeks.length}</span>
+        <span title="These outline peeks are recorded per workspace, not per project, so the same list shows in every project's Documents tab." style="font-size:8px;font-weight:600;padding:1px 5px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted);text-transform:uppercase;letter-spacing:0.4px">workspace-wide</span>
+      </div>
+      <div style="font-size:9px;color:var(--muted);margin:2px 0 8px">Peeked with <code>get_document_structure</code> (a stateless outline read) but never ingested \u2014 so they are NOT searchable here, and they are <b>not attached to this project</b> (this list is shared across every project in your workspace). Ingest one to save it as a document on <i>this</i> project.</div>`;
       for (const pk of peeks) {
         const fp = String(pk.file_path || "");
         const failed = pk.ok === false;
@@ -13931,6 +13953,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }).catch(() => {
     });
   }
+  function _removeHitlCard(id) {
+    document.querySelectorAll(`[data-hitl-id="${id}"]`).forEach((el2) => {
+      (el2.closest(".hitl-row") || el2).remove();
+    });
+  }
+  window._removeHitlCard = _removeHitlCard;
   async function loadHitlTab(projectId) {
     const body = document.getElementById(`hitl-body-${projectId}`);
     const statusFilter = document.getElementById(`hitl-status-filter-${projectId}`);
@@ -14083,6 +14111,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             try {
               await api(`/hitl/${id}`, { method: "PATCH", body: JSON.stringify({ action: "answer", answer }) });
               toast("answered \u2713");
+              _removeHitlCard(id);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -14096,6 +14125,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             try {
               await api(`/hitl/${id}`, { method: "PATCH", body: JSON.stringify({ action: "answer", answer }) });
               toast("answered \u2713");
+              _removeHitlCard(id);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -14128,6 +14158,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             try {
               await api(`/hitl/${btn.dataset.hitlId}`, { method: "PATCH", body: JSON.stringify({ action: "dismiss" }) });
               toast("dismissed");
+              _removeHitlCard(btn.dataset.hitlId);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -14141,6 +14172,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               const res = await api(`/hitl/${btn.dataset.hitlId}`, { method: "PATCH", body: JSON.stringify({ action: "answer", answer: "approved" }) });
               if (res && res.applied === false) toast("not applied: " + (res.apply_error || "see card"), true);
               else toast("approved \u2713 \u2014 section written, staged for checkpoint");
+              _removeHitlCard(btn.dataset.hitlId);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -14153,6 +14185,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             try {
               await api(`/hitl/${btn.dataset.hitlId}`, { method: "PATCH", body: JSON.stringify({ action: "dismiss" }) });
               toast("rejected");
+              _removeHitlCard(btn.dataset.hitlId);
               render();
             } catch (e3) {
               toast("failed: " + e3.message, true);
@@ -15253,6 +15286,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         body: JSON.stringify({ action: "answer", answer })
       });
       toast("HITL answered");
+      _removeHitlCard(id);
       refreshHitl();
     } catch (e3) {
       toast("answer failed: " + e3.message, true);
@@ -15265,6 +15299,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         method: "PATCH",
         body: JSON.stringify({ action: "dismiss" })
       });
+      _removeHitlCard(id);
       refreshHitl();
     } catch (e3) {
       toast("dismiss failed: " + e3.message, true);

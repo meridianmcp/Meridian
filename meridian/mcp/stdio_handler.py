@@ -929,6 +929,153 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="insert_equation",
+                description=(
+                    "51a595e7 — write an OMML equation DIRECTLY into a stored "
+                    "document's source .docx (real OOXML write-back), collapsing "
+                    "the manual resolve->open->parse->splice->rewrite->reindex "
+                    "flow into one call. The document must already be stored (via "
+                    "ingest_document / reindex_document) and have a filesystem "
+                    "`source` path. Target the paragraph by `para_id` (its "
+                    "w14:paraId, or the synthesized 'p{index}' id surfaced as "
+                    "element_id by the read tools). equation_id_or_omml resolves "
+                    "in order: an existing indexed equation id for this document "
+                    "(reuses its OMML); a string starting with '<' as raw OMML "
+                    "XML; else a LaTeX source (converted best-effort). position = "
+                    "'append' (default, inline at the paragraph's end) | 'before' "
+                    "| 'after' (its own display-equation paragraph). The equation "
+                    "index is resynced from the modified file afterward. Returns "
+                    "{document_id, source, para_id, position, omml, resync} or "
+                    "{error}; the file is never mutated when resolution fails."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path it was ingested/reindexed under; must resolve to a .docx on disk)."},
+                        "para_id": {"type": "string", "description": "Target paragraph id — its w14:paraId, or the synthesized 'p{index}' id surfaced as element_id by the read tools."},
+                        "equation_id_or_omml": {"type": "string", "description": "An existing indexed equation id (reuses its OMML), OR raw OMML XML (starts with '<'), OR a LaTeX source string."},
+                        "position": {"type": "string", "enum": ["append", "before", "after"], "description": "Where to place the equation relative to the paragraph. Default 'append' (inline)."},
+                    },
+                    "required": ["doc", "para_id", "equation_id_or_omml"],
+                },
+            ),
+            Tool(
+                name="update_paragraph",
+                description=(
+                    "f978e588 — ID-addressable docx WRITE (write counterpart of "
+                    "the get_element_by_id / paraId read primitive). Rewrites ONE "
+                    "paragraph in a stored .docx addressed by its w14:paraId "
+                    "('p{index}' fallback) — NEVER by text match — then re-syncs "
+                    "the doc_elements index row. Pass the SAME source/path as "
+                    "`doc`. Provide EXACTLY ONE of new_text (a plain string, one "
+                    "unformatted run) OR runs (a list of runs, each a bare string "
+                    "or {text, bold?, italic?, underline?}; basic run formatting "
+                    "applied, paragraph style preserved). Returns {document_id, "
+                    "para_id, new_text, elements_resynced, source_path}; "
+                    "elements_resynced=0 for a plain body paragraph is expected "
+                    "(only headings persist as elements). Errors — never a silent "
+                    "no-op — when doc/source/para_id doesn't resolve."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "para_id": {"type": "string", "description": "The target paragraph's w14:paraId (or 'p{index}' fallback)."},
+                        "new_text": {"type": "string", "description": "New paragraph text as a single unformatted run. Provide this OR runs, not both."},
+                        "runs": {"type": "array", "description": "List of runs — each a plain string or a {text, bold?, italic?, underline?} object. Provide this OR new_text, not both.", "items": {"type": ["string", "object"]}},
+                    },
+                    "required": ["doc", "para_id"],
+                },
+            ),
+            Tool(
+                name="find_symbol_usages",
+                description=(
+                    "9605edb0 — READ-ONLY cross-reference tracking. Given a "
+                    "document and EITHER a doc_equations id OR a symbol / "
+                    "normalized-LaTeX string, resolve it to one target "
+                    "normalized-LaTeX (an equation id uses that row's stored "
+                    "latex_normalized; a raw string is normalized with the SAME "
+                    "normalize_latex the store uses) and return every place the "
+                    "target reappears — matching equations plus paragraphs whose "
+                    "text contains the symbol. Each hit carries element_id, "
+                    "document_id, ordinal, matched_text, context "
+                    "(equation|paragraph) and an is_definition/is_reuse flag: the "
+                    "earliest occurrence by ordinal is the definition, later ones "
+                    "are reuse, so a later mention can be checked to point back "
+                    "to the definition. Returns {document_id, target, "
+                    "resolved_from, hits} — an empty hits list (never an error) "
+                    "when nothing matches or doc doesn't resolve."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "symbol_or_equation_id": {"type": "string", "description": "A doc_equations row id, OR a raw symbol / normalized-LaTeX string to track."},
+                    },
+                    "required": ["doc", "symbol_or_equation_id"],
+                },
+            ),
+            Tool(
+                name="index_figure",
+                description=(
+                    "c623e648 — index ONE figure into the SEMANTIC figure index "
+                    "against a document already stored in the doc-structure "
+                    "store (via ingest_document or a prior reindex — pass the "
+                    "SAME source/path as `doc`). The figure parallel of "
+                    "index_equation, COMPLEMENTARY to the structural "
+                    "kind='figure' section-tree placement (adds caption dedup + "
+                    "similarity, does not replace placement). Provide file_path "
+                    "and/or caption. Before inserting, the normalized caption is "
+                    "fuzzy-matched against figures already indexed for this "
+                    "document — a near-duplicate is still inserted but surfaced "
+                    "via near_duplicates so it isn't silently missed. The "
+                    "file_path is checked on disk: a missing file is flagged "
+                    "(file_exists + missing_files), never a hard failure. Returns "
+                    "{figure, near_duplicates, missing_files}."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "file_path": {"type": "string", "description": "Path to the figure's asset on disk (checked for existence; missing is flagged, not fatal)."},
+                        "caption": {"type": "string", "description": "The figure's caption (drives normalized-caption dedup/similarity)."},
+                        "semantic_label": {"type": "string", "description": "Optional human label for the figure."},
+                    },
+                    "required": ["doc"],
+                },
+            ),
+            Tool(
+                name="find_similar_figure",
+                description=(
+                    "c623e648 — fuzzy-match a free-text description OR a file "
+                    "path against every figure already indexed for one stored "
+                    "document, best match first (difflib similarity score 0..1, "
+                    "the better of the match against normalized_caption and "
+                    "against file_path). Returns {document_id, matches} — an "
+                    "empty list (never an error) when the document has no "
+                    "indexed figures, or doc doesn't resolve."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "description_or_path": {"type": "string", "description": "A free-text description OR a file path to fuzzy-match against this document's indexed figures."},
+                        "limit": {"type": "integer", "description": "Max matches to return (default 5)."},
+                    },
+                    "required": ["doc", "description_or_path"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1884,7 +2031,8 @@ def build_mcp_server():
                 "list_sessions",
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
                 "get_citation_edges", "resolve_citations",
-                "index_equation", "find_similar_equation",
+                "index_equation", "find_similar_equation", "insert_equation", "update_paragraph", "find_symbol_usages",
+                "index_figure", "find_similar_figure",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",
