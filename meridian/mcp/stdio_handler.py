@@ -1076,6 +1076,38 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="search_outputs",
+                description=(
+                    "a0e9133e — READ-ONLY BM25 full-text search over a run's "
+                    "OUTPUTS tree (csv/json/npy + other artifacts), backed by "
+                    "DuckDB native FTS. Walks outputs_dir recursively: each "
+                    ".csv/.json contributes extracted text + a cheap fingerprint "
+                    "(CSV columns / JSON keys / inferred generating_script); .npy "
+                    "is metadata-only (never array content); other binaries are "
+                    "metadata + name only. Canonical-vs-archival is TWO-STAGE and "
+                    "NEVER destructive: a filename heuristic (_old / _old_N / "
+                    "leading underscore) flags a CANDIDATE, a SHA-256 hash "
+                    "CONFIRMS — an archival copy identical to its canonical twin "
+                    "is deprioritized (is_archival=true, canonical_path set), a "
+                    "same-pattern file whose content DIFFERS is surfaced as its "
+                    "own distinct hit. Nothing is deleted/hidden on disk. Pass "
+                    "include_archival=false to drop archival hits. Returns "
+                    "{outputs_dir, query, total_indexed, hits:[{path, score, "
+                    "bm25, is_archival, canonical_path, kind, generating_script, "
+                    "csv_columns, json_keys, size, mtime}]}."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (walked recursively)."},
+                        "query": {"type": "string", "description": "The BM25 query — one or more search terms."},
+                        "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
+                        "include_archival": {"type": "boolean", "description": "Default true — archival copies deprioritized but returned. false excludes confirmed-archival files."},
+                    },
+                    "required": ["outputs_dir", "query"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -2044,6 +2076,7 @@ def build_mcp_server():
                 "get_citation_edges", "resolve_citations",
                 "index_equation", "find_similar_equation", "insert_equation", "update_paragraph", "find_symbol_usages",
                 "index_figure", "find_similar_figure",
+                "search_outputs",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",

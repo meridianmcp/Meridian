@@ -5360,6 +5360,41 @@ async def _handle_tunnel_tools(
     return _MISS
 
 
+async def _handle_outputs_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: search_outputs (a0e9133e — BM25 over the outputs FTS index)."""
+    if name == "search_outputs":
+        from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+        outputs_dir = str(args.get("outputs_dir") or "").strip()
+        query = str(args.get("query") or "").strip()
+        if not outputs_dir:
+            raise ValueError("outputs_dir is required")
+        if not query:
+            raise ValueError("query is required")
+        limit = args.get("limit", 10)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 10
+        include_archival = args.get("include_archival", True)
+        # The walk + hash + DuckDB FTS build is synchronous/CPU-bound; run it off
+        # the event loop so a large tree doesn't block other MCP calls.
+        return await asyncio.to_thread(
+            _outputs_indexer.search_outputs,
+            outputs_dir,
+            query,
+            limit=limit,
+            include_archival=bool(include_archival),
+        )
+    return _MISS
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -5397,6 +5432,7 @@ async def _dispatch_mcp_tool(
         _handle_planning_tools,
         _handle_plugin_tools,
         _handle_tunnel_tools,
+        _handle_outputs_tools,
     )
     for _grp in _groups:
         _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)

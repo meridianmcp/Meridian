@@ -43,6 +43,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "find_symbol_usages": 'find_symbol_usages(project_id="abc-123", doc="thesis/chapter1.docx", symbol_or_equation_id="E=mc^2")',
     "index_figure": 'index_figure(project_id="abc-123", doc="thesis/chapter1.docx", file_path="figures/setup.png", caption="Figure 3: The experimental setup", semantic_label="apparatus diagram")',
     "find_similar_figure": 'find_similar_figure(project_id="abc-123", doc="thesis/chapter1.docx", description_or_path="experimental setup diagram")',
+    "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -574,6 +575,33 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "description_or_path": {"type": "string", "description": "A free-text description OR a file path to fuzzy-match against this document's indexed figures."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "description_or_path"]}},
+    {"name": "search_outputs", "description":
+        "a0e9133e — READ-ONLY full-text search over a run's OUTPUTS tree "
+        "(numeric/tabular/array artifacts), backed by DuckDB native FTS (Okapi "
+        "BM25). Walks outputs_dir recursively and builds a persistent index: "
+        "each .csv/.json contributes its extracted TEXT content plus a cheap "
+        "fingerprint (CSV column names / JSON top-level keys / an inferred "
+        "generating_script); each .npy contributes METADATA ONLY (never array "
+        "content); images/other binaries contribute filesystem metadata + name "
+        "only. The multi-word query is scored with BM25 and ranked hits are "
+        "returned. Canonical-vs-archival is handled TWO-STAGE and is NEVER "
+        "destructive: a filename heuristic (_old / _old_N / leading underscore) "
+        "flags a CANDIDATE, and a SHA-256 content hash CONFIRMS — an archival "
+        "copy byte-identical to its canonical twin is DEPRIORITIZED in ranking "
+        "(is_archival=true, canonical_path set), while a same-name-pattern file "
+        "whose content DIFFERS is surfaced as its own distinct hit (never "
+        "collapsed). Nothing is ever deleted or hidden from disk. Pass "
+        "include_archival=false to drop archival hits entirely. Returns "
+        "{outputs_dir, query, total_indexed, hits:[{path, score, bm25, "
+        "is_archival, canonical_path, kind, generating_script, csv_columns, "
+        "json_keys, size, mtime}]}. A missing dir / empty tree returns an empty "
+        "hits list, never an error.",
+     "inputSchema": {"type": "object", "properties": {
+         "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (walked recursively)."},
+         "query": {"type": "string", "description": "The BM25 query — one or more search terms (column names, keys, script names, or any text in a csv/json)."},
+         "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
+         "include_archival": {"type": "boolean", "description": "Default true — archival copies are deprioritized but still returned. Set false to exclude confirmed-archival files entirely."}},
+         "required": ["outputs_dir", "query"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
@@ -1428,6 +1456,7 @@ _READ_ONLY_TOOLS = {
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
     "find_similar_figure",
+    "search_outputs",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
 }
@@ -1486,6 +1515,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "find_symbol_usages": "Find Symbol Usages",
     "index_figure": "Index Figure",
     "find_similar_figure": "Find Similar Figure",
+    "search_outputs": "Search Outputs",
 }
 
 for _tool in _MCP_TOOLS_LIST:
