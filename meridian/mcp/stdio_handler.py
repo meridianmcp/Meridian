@@ -1076,6 +1076,73 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="search_outputs",
+                description=(
+                    "a0e9133e — READ-ONLY BM25 full-text search over a run's "
+                    "OUTPUTS tree (csv/json/npy + other artifacts), backed by "
+                    "DuckDB native FTS. Walks outputs_dir recursively: each "
+                    ".csv/.json contributes extracted text + a cheap fingerprint "
+                    "(CSV columns / JSON keys / inferred generating_script); .npy "
+                    "is metadata-only (never array content); other binaries are "
+                    "metadata + name only. Canonical-vs-archival is TWO-STAGE and "
+                    "NEVER destructive: a filename heuristic (_old / _old_N / "
+                    "leading underscore) flags a CANDIDATE, a SHA-256 hash "
+                    "CONFIRMS — an archival copy identical to its canonical twin "
+                    "is deprioritized (is_archival=true, canonical_path set), a "
+                    "same-pattern file whose content DIFFERS is surfaced as its "
+                    "own distinct hit. Nothing is deleted/hidden on disk. Pass "
+                    "include_archival=false to drop archival hits. Returns "
+                    "{outputs_dir, query, total_indexed, hits:[{path, score, "
+                    "bm25, is_archival, canonical_path, kind, generating_script, "
+                    "csv_columns, json_keys, size, mtime}]}."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (walked recursively)."},
+                        "query": {"type": "string", "description": "The BM25 query — one or more search terms."},
+                        "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
+                        "include_archival": {"type": "boolean", "description": "Default true — archival copies deprioritized but returned. false excludes confirmed-archival files."},
+                    },
+                    "required": ["outputs_dir", "query"],
+                },
+            ),
+            Tool(
+                name="search_code_semantic",
+                description=(
+                    "93fce816 — Cursor-style LOCAL semantic code search over a "
+                    "source tree. Parses Python (stdlib ast) + TypeScript/"
+                    "JavaScript (tree-sitter) into SEMANTIC CHUNKS at function/"
+                    "class/method boundaries PLUS the un-named blocks "
+                    "search_graph can't see (module-level dict/list literals, "
+                    "bare calls, __main__ guards). Incremental: a content MERKLE "
+                    "TREE detects exactly which files changed since the last pass "
+                    "and re-chunks only the divergent subtree, so repeat calls on "
+                    "an unchanged tree are near-free. Search is HYBRID — DuckDB "
+                    "native FTS (Okapi BM25) for keyword match, fused via "
+                    "Reciprocal Rank Fusion with an OPTIONAL local-embedding "
+                    "vector leg (DuckDB VSS / HNSW cosine over Model2Vec) when "
+                    "MERIDIAN_CODE_INDEX_VECTORS is enabled; otherwise pure BM25. "
+                    "Entirely local in a DuckDB sidecar — no cloud round-trip. "
+                    "Returns {root_dir, query, total_indexed, vectors_enabled, "
+                    "vectors_active, hits:[{chunk_id, path, language, kind, name, "
+                    "line_start, line_end, content, score, bm25, bm25_rank, "
+                    "vector_rank}]}. A missing dir / empty tree returns an empty "
+                    "hits list, never an error."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "root_dir": {"type": "string", "description": "Absolute path to the source tree root to index and search (walked recursively; vendored/build dirs pruned)."},
+                        "query": {"type": "string", "description": "The search query — keywords and/or a natural-language description of the code you want."},
+                        "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
+                        "kind": {"type": "string", "description": "Optional chunk-kind filter (e.g. 'function', 'class', 'method', 'interface', 'module')."},
+                        "reindex": {"type": "boolean", "description": "Default true — run an incremental Merkle-diff reindex before searching so results reflect the current tree. false searches the last-built index as-is."},
+                    },
+                    "required": ["root_dir", "query"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -1732,6 +1799,17 @@ def build_mcp_server():
                                 "the bucket with the most pending items."
                             ),
                         },
+                        "expand_stale": {
+                            "type": "boolean",
+                            "description": (
+                                "Default false. When a goal field (north_star / "
+                                "version_goal / sprint) is flagged stale by the "
+                                "coherence check, the orientation collapses it to a "
+                                "one-line summary instead of dumping the week-old "
+                                "body. Pass true to expand those fields to their "
+                                "full text (get_session_brief also returns full text)."
+                            ),
+                        },
                     },
                     "required": ["session_name"],
                 },
@@ -2033,6 +2111,8 @@ def build_mcp_server():
                 "get_citation_edges", "resolve_citations",
                 "index_equation", "find_similar_equation", "insert_equation", "update_paragraph", "find_symbol_usages",
                 "index_figure", "find_similar_figure",
+                "search_outputs",
+                "search_code_semantic",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",
@@ -2092,6 +2172,10 @@ def build_mcp_server():
                     role=arguments.get("role"),
                     compact=arguments.get("compact", True),
                     version=arguments.get("version"),
+                    # 2b4e69aa — collapse coherence-flagged-stale goal fields to
+                    # a one-liner by default; opt back into full bodies with
+                    # expand_stale=true.
+                    expand_stale=bool(arguments.get("expand_stale", False)),
                 )
             elif name == "list_projects":
                 result = await db_module.list_project_summaries(db)

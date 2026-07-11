@@ -2564,7 +2564,6 @@ async def _handle_notes_decisions(
         from ..latex_intel import analyze_latex  # noqa: PLC0415
         try:
             if fp:
-                import os  # noqa: PLC0415
                 if not os.path.isfile(fp):
                     return {"error": f"file not found: {fp}"}
                 return analyze_latex(fp)
@@ -2880,12 +2879,32 @@ async def _handle_notes_decisions(
             _limit = int(_limit) if _limit is not None else 5
         except (TypeError, ValueError):
             _limit = 5
+        # d2a3537a — cross-store resolve-through: when the caller names an
+        # outputs_dir, each matched figure that carries a file_path is resolved
+        # THROUGH to its outputs_index row (linked_output). Building the DuckDB
+        # index is CPU-bound, so do it once off the event loop and hand the store
+        # a resolver closure over the built index; skipped entirely when no
+        # outputs_dir is given (the tool stays a pure fuzzy match by default).
+        outputs_dir = str(args.get("outputs_dir") or "").strip()
+        _resolver = None
+        _index = None
+        if outputs_dir and os.path.isdir(outputs_dir):
+            from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+            _index = _outputs_indexer.OutputsFtsIndex(outputs_dir)
+            try:
+                await asyncio.to_thread(_index.rebuild)
+                _resolver = _index.resolve_output
+            except Exception:  # noqa: BLE001 — resolve-through is advisory glue
+                _resolver = None
         try:
             matches = await store.find_similar_figures(
-                doc_row["id"], query, limit=_limit,
+                doc_row["id"], query, limit=_limit, output_resolver=_resolver,
             )
         except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
             return {"error": f"could not find similar figures: {exc}"}
+        finally:
+            if _index is not None:
+                _index.close()
         return {
             "project_id": args["project_id"],
             "document_id": doc_row["id"],
@@ -5360,6 +5379,86 @@ async def _handle_tunnel_tools(
     return _MISS
 
 
+async def _handle_outputs_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: search_outputs (a0e9133e — BM25 over the outputs FTS index)."""
+    if name == "search_outputs":
+        from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+        outputs_dir = str(args.get("outputs_dir") or "").strip()
+        query = str(args.get("query") or "").strip()
+        if not outputs_dir:
+            raise ValueError("outputs_dir is required")
+        if not query:
+            raise ValueError("query is required")
+        limit = args.get("limit", 10)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 10
+        include_archival = args.get("include_archival", True)
+        # The walk + hash + DuckDB FTS build is synchronous/CPU-bound; run it off
+        # the event loop so a large tree doesn't block other MCP calls.
+        return await asyncio.to_thread(
+            _outputs_indexer.search_outputs,
+            outputs_dir,
+            query,
+            limit=limit,
+            include_archival=bool(include_archival),
+        )
+    return _MISS
+
+
+async def _handle_code_index_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: search_code_semantic (93fce816 — Cursor-style local code
+    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS)."""
+    if name == "search_code_semantic":
+        from .. import code_index as _code_index  # noqa: PLC0415
+        root_dir = str(args.get("root_dir") or "").strip()
+        query = str(args.get("query") or "").strip()
+        if not root_dir:
+            raise ValueError("root_dir is required")
+        if not query:
+            raise ValueError("query is required")
+        limit = args.get("limit", 10)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 10
+        kind = args.get("kind")
+        kind = str(kind).strip() if kind else None
+        reindex = args.get("reindex", True)
+        # Persist the sidecar per project dir so incremental Merkle reindex is
+        # cheap across calls; falls back to in-memory if data_dir is unset.
+        db_path = ":memory:"
+        if data_dir:
+            db_path = os.path.join(data_dir, "code_index.duckdb")
+        # The walk + hash + tree-sitter chunk + DuckDB FTS build is CPU-bound;
+        # run it off the event loop so a large repo doesn't block other MCP calls.
+        return await asyncio.to_thread(
+            _code_index.search_code_semantic,
+            root_dir,
+            query,
+            limit=limit,
+            kind=kind,
+            db_path=db_path,
+            reindex=bool(reindex),
+        )
+    return _MISS
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -5397,6 +5496,8 @@ async def _dispatch_mcp_tool(
         _handle_planning_tools,
         _handle_plugin_tools,
         _handle_tunnel_tools,
+        _handle_outputs_tools,
+        _handle_code_index_tools,
     )
     for _grp in _groups:
         _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)

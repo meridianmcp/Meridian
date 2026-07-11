@@ -2032,20 +2032,26 @@ async def test_search_all_multiword_terms_across_fields(db):
 
 @pytest.mark.asyncio
 async def test_search_all_sqlite_no_stemming_still_keyword(db):
-    """82e0b887 — the SQLite path is unchanged: it matches substrings only, no
-    stemming. A morphological query ("authenticating user") must NOT match a
-    note body reading "authentication for the users" (neither "authenticating"
-    nor "user" is a substring of the stored text) — that stemmed match is a
-    Postgres-only capability. Guards that the tsvector branch didn't leak into
-    the SQLite keyword path."""
+    """82e0b887 / 25155e91 — the SQLite path matches substrings only, no
+    stemming. A query where NO term is a substring of the stored text
+    ("logon session" vs a note reading "authentication for the users") must NOT
+    match on SQLite — stemmed / morphological matching is a Postgres-only
+    capability. Guards that the tsvector branch didn't leak into the SQLite
+    keyword path.
+
+    (25155e91 changed the query from "authenticating user": under the new
+    OR/ranked semantics that DOES match, because "user" is a genuine substring of
+    "users" — a keyword hit, not stemming. The miss case now uses terms that
+    appear nowhere in the body so it still proves "no stemming on SQLite".)"""
     p = await db_module.create_project(db, "sa-sqlite-nostem")
     await db_module.add_project_note(
         db, p["id"], "Auth design", "authentication for the users")
     # Substring keyword query DOES match (path works as before).
     hit = await db_module.search_all(db, p["id"], "authentication users")
     assert any(n["title"] == "Auth design" for n in hit["notes"])
-    # Stemmed / non-substring query does NOT match on SQLite (no FTS).
-    miss = await db_module.search_all(db, p["id"], "authenticating user")
+    # No query term is a substring of the body → no match on SQLite (no FTS /
+    # stemming would be needed to relate "logon"/"session" to the stored text).
+    miss = await db_module.search_all(db, p["id"], "logon session")
     assert not any(n["title"] == "Auth design" for n in miss["notes"])
 
 

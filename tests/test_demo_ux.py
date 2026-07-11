@@ -1368,3 +1368,171 @@ def test_live_parallelization_tab_renders(demo_client):
             browser.close()
         finally:
             server.should_exit = True
+
+
+@pytestmark_playwright
+def test_subproject_hierarchy_ui(demo_client):
+    """0fed6a42 — the subproject hierarchy UI works end to end in a real browser:
+
+    1. flattenHierarchy orders a child directly after its parent (depth 1) and
+       keeps a grandchild / orphan at top level (the one-level-deep guard);
+    2. eligibleParents (the "Make subproject of…" picker source) excludes self,
+       existing subprojects, and a project that already parents others;
+    3. _makeProjectItem renders a subproject INDENTED with a tree connector so the
+       nesting is visible in the sidebar;
+    4. the project kebab menu (_openTabMenu) shows "Make subproject of…" for a
+       top-level project and "Detach from parent" for one with a parent.
+
+    Uses the seeded demo project so the dashboard bundle is fully booted; the
+    hierarchy logic is exercised with synthetic project rows injected into
+    window.state (no server write needed — writes are demo-blocked)."""
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17894, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17894/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)  # boot JS + auto-open seeded project
+
+            # Wait until the exposed helpers are on window (bundle fully booted).
+            page.wait_for_function(
+                "() => typeof window.flattenHierarchy === 'function'"
+                " && typeof window.eligibleParents === 'function'"
+                " && typeof window._makeProjectItem === 'function'"
+                " && typeof window._openTabMenu === 'function'",
+                timeout=8000,
+            )
+
+            # --- (1) + (2): pure hierarchy logic through the real bundle. ---
+            res = page.evaluate(
+                """() => {
+                    const projects = [
+                        {id: 'parent', name: 'Parent', parent_project_id: null},
+                        {id: 'other',  name: 'Other',  parent_project_id: null},
+                        {id: 'child',  name: 'Child',  parent_project_id: 'parent'},
+                        {id: 'grand',  name: 'Grand',  parent_project_id: 'child'},
+                    ];
+                    const rows = window.flattenHierarchy(projects).map(r => [r.project.id, r.depth]);
+                    const parentsForOther = window.eligibleParents(projects, 'other').map(p => p.id);
+                    const parentsForParent = window.eligibleParents(projects, 'parent').map(p => p.id);
+                    return { rows, parentsForOther, parentsForParent };
+                }"""
+            )
+            # Child nests directly under its parent at depth 1; a grandchild (its
+            # parent is itself a subproject) and 'other' stay at top level. Order
+            # follows the input's top-level order (parent, other, grand) with each
+            # parent's children spliced in right after it.
+            assert res["rows"] == [
+                ["parent", 0],
+                ["child", 1],
+                ["other", 0],
+                ["grand", 0],
+            ], res["rows"]
+            # Candidate parents for 'other' are the projects with NO parent of
+            # their own, excluding 'other' itself: only 'parent' qualifies here
+            # ('child' has parent 'parent'; 'grand' has parent 'child' — both are
+            # subprojects and so are excluded as candidate parents).
+            assert res["parentsForOther"] == ["parent"], res["parentsForOther"]
+            # 'parent' already has a child → it is INELIGIBLE to become a subproject.
+            assert res["parentsForParent"] == [], res["parentsForParent"]
+
+            # --- (3): _makeProjectItem renders a subproject indented + connected. ---
+            render = page.evaluate(
+                """() => {
+                    const top = window._makeProjectItem({id: 'p', name: 'Top'}, 0);
+                    const sub = window._makeProjectItem({id: 'c', name: 'Kid', parent_project_id: 'p'}, 1);
+                    const subName = sub.querySelector('span').textContent;
+                    return {
+                        topClass: top.className,
+                        subClass: sub.className,
+                        subIndented: /padding-left/.test(sub.getAttribute('style') || ''),
+                        topIndented: /padding-left/.test(top.getAttribute('style') || ''),
+                        subName,
+                    };
+                }"""
+            )
+            assert "project-subitem" in render["subClass"], render
+            assert "project-subitem" not in render["topClass"], render
+            assert render["subIndented"] is True, render
+            assert render["topIndented"] is False, render
+            assert render["subName"].startswith("└"), render["subName"]  # └ connector
+
+            # --- (4): kebab menu shows the correct subproject action per row. ---
+            menu = page.evaluate(
+                """() => {
+                    document.querySelectorAll('.tab-context-menu').forEach(m => m.remove());
+                    const anchor = document.body;
+                    // Top-level project → "Make subproject of…".
+                    window._openTabMenu({id: 'topx', project: {id: 'topx', name: 'TopX'}}, anchor);
+                    const topItems = Array.from(document.querySelectorAll('.tab-context-menu div'))
+                        .map(d => d.textContent);
+                    document.querySelectorAll('.tab-context-menu').forEach(m => m.remove());
+                    // Subproject → "Detach from parent".
+                    window._openTabMenu(
+                        {id: 'subx', project: {id: 'subx', name: 'SubX', parent_project_id: 'topx'}},
+                        anchor,
+                    );
+                    const subItems = Array.from(document.querySelectorAll('.tab-context-menu div'))
+                        .map(d => d.textContent);
+                    document.querySelectorAll('.tab-context-menu').forEach(m => m.remove());
+                    return { topItems, subItems };
+                }"""
+            )
+            assert any("Make subproject of" in t for t in menu["topItems"]), menu["topItems"]
+            assert not any("Detach from parent" in t for t in menu["topItems"]), menu["topItems"]
+            assert any("Detach from parent" in t for t in menu["subItems"]), menu["subItems"]
+            assert not any("Make subproject of" in t for t in menu["subItems"]), menu["subItems"]
+
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+def test_set_project_parent_route(client):
+    """0fed6a42 — POST /projects/{id}/parent nests a project under a parent and
+    the /projects listing then reports the parent_project_id (proving the REST
+    route + payload the dashboard's nested render relies on). Also exercises the
+    one-level-deep guard (400) and detach (null parent)."""
+    # Two top-level projects.
+    a = client.post("/projects", json={"name": "sub-parent-a"})
+    assert a.status_code == 201, a.text
+    b = client.post("/projects", json={"name": "sub-child-b"})
+    assert b.status_code == 201, b.text
+    a_id, b_id = a.json()["id"], b.json()["id"]
+
+    # Nest b under a.
+    r = client.post(f"/projects/{b_id}/parent", json={"parent_project_id": a_id})
+    assert r.status_code == 200, r.text
+    assert r.json()["parent_project_id"] == a_id
+
+    # The listing payload the sidebar consumes now carries parent_project_id.
+    listing = {p["id"]: p for p in client.get("/projects").json()}
+    assert listing[b_id]["parent_project_id"] == a_id
+    assert listing[a_id].get("parent_project_id") in (None, "")
+
+    # One-level-deep guard: a (now a parent) cannot itself become a subproject.
+    c = client.post("/projects", json={"name": "sub-other-c"})
+    c_id = c.json()["id"]
+    guard = client.post(f"/projects/{a_id}/parent", json={"parent_project_id": c_id})
+    assert guard.status_code == 400, guard.text
+
+    # Detach b back to top level.
+    detach = client.post(f"/projects/{b_id}/parent", json={"parent_project_id": None})
+    assert detach.status_code == 200, detach.text
+    assert detach.json()["parent_project_id"] in (None, "")
+
+    # Missing key → 400; unknown project → 404.
+    assert client.post(f"/projects/{b_id}/parent", json={}).status_code == 400
+    assert client.post(
+        "/projects/00000000-0000-0000-0000-000000000000/parent",
+        json={"parent_project_id": a_id},
+    ).status_code == 404

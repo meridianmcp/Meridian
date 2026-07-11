@@ -430,6 +430,26 @@ async def lifespan(app: FastAPI):
     from .routes.oauth import _hydrate_oauth_cache as _hydrate_oa  # noqa: PLC0415 — c5f8ac43
     await _hydrate_oa(db)
 
+    # b74099b2 — a server-side deploy lands as a fresh process start, and any
+    # HOSTED MCP tool it added (e.g. search_outputs) is invisible to sessions that
+    # are ALREADY connected: the tunnel `notifications/tools/list_changed` path only
+    # ever fired on a slot-health RECOVERY (54ddd609), never on a deploy. Add the
+    # second trigger here: mark every still-connected tenant pending so the NEXT
+    # tools/list from that session re-aggregates and picks up the newly-deployed
+    # tool set. `notify_tools_list_changed` is a cheap idempotent set-add; enumerating
+    # tunnel_active tenants is a single small-table scan; zero active tenants is a
+    # clean no-op. Fully guarded — it must NEVER block startup.
+    try:
+        from .routes.tunnel import notify_tools_list_changed as _notify_tlc  # noqa: PLC0415
+        for _tid in await db_module.list_active_tunnel_tenant_ids(db):
+            _notify_tlc(_tid)
+    except Exception:  # noqa: BLE001 — deploy tool-cache refresh must never block startup
+        import logging as _tlc_log  # noqa: PLC0415
+        _tlc_log.getLogger(__name__).warning(
+            "startup tools/list_changed refresh raised; continuing",
+            exc_info=True,
+        )
+
     # v2.2 — isolated demo DB.
     # Priority: MERIDIAN_DEMO_DB_URL → MERIDIAN_STANDARD_KEY (legacy secret
     # name on the hosted Fly app) → in-memory SQLite fallback.
@@ -4229,6 +4249,7 @@ async def _start_session_composite(
     compact: bool = False,
     version: str | None = None,
     mode: str | None = None,
+    expand_stale: bool = False,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -4254,6 +4275,13 @@ async def _start_session_composite(
     continuation block (no new registration, no goal-block flood). Keyed on
     (project_id, session_name); NEVER on Mcp-Session-Id since ChatGPT
     regenerates that header per tool call.
+
+    ``expand_stale`` (2b4e69aa) only affects the full (``compact=False``)
+    payload's ``goal_xml``: it defaults to ``False`` so any goal field the
+    coherence check flagged stale (a week-old north_star / version_goal /
+    sprint) is collapsed to a one-line "expand for detail" summary instead of
+    dumped in full. Pass ``expand_stale=True`` to restore the full bodies; the
+    ``coherence_warning`` flag is always preserved either way.
     """
     # c793377d — "just continue" resume. Auto-detect uses the 5-min heartbeat
     # window; an explicit mode='continue' widens it so an executor can resume a
@@ -4557,9 +4585,15 @@ async def _start_session_composite(
         goal["field_ages"] = field_ages
         goal["coherence_warning"] = coherence
         goal["decisions"] = decisions
+    # 2b4e69aa — collapse any coherence-flagged-stale goal field (stale
+    # north_star / version_goal / sprint) to a one-line summary in the
+    # default orientation, trimming week-old dead weight from every session
+    # start. The full text stays a call away: expand_stale=True here, or
+    # get_session_brief / the /goal endpoint (both keep build_goal_xml's
+    # expand_stale=True default). coherence_warning itself is untouched.
     goal_xml = db_module.build_goal_xml(
         goal, project_name, ambient_for_xml, coherence,
-        decisions=decisions,
+        decisions=decisions, expand_stale=expand_stale,
     )
     # v0.6.2 — Anthropic-API content blocks with cache_control on
     # the two static fields. Same ambient slice used by the XML.

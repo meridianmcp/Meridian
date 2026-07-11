@@ -7,6 +7,10 @@ import "./dashboard-demo";
 import "./dashboard-timeline";
 import "./dashboard-mcp";
 import "./dashboard-sprint";
+// e3355ccb — live parallel-execution wave/batch progress panel. Recomputes the
+// server's conflict-free batches (get_parallelizable_groups) client-side from
+// the already-fetched sprint-items payload; rendered in the Live tab.
+import "./dashboard-waves";
 import "./dashboard-settings";
 import "./dashboard-plugins";
 
@@ -46,6 +50,14 @@ import {
   UNGROUPED_LABEL,
   type FolderProject,
 } from "./dashboard-folders";
+// 0fed6a42 — one-level-deep subproject hierarchy (parent_project_id). Pure helpers
+// mirror the server's set_parent_project guards so the picker only offers legal
+// parents and the sidebar can render subprojects nested under their parent.
+import {
+  flattenHierarchy,
+  eligibleParents,
+  type HierProject,
+} from "./dashboard-subprojects";
 ﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
@@ -2643,7 +2655,12 @@ async function loadProjects() {
 
     }
 
-    group.projects.forEach(p => list!.appendChild(_makeProjectItem(p as any)));
+    // 0fed6a42 — within each folder group, nest subprojects under their parent.
+    // flattenHierarchy places each subproject right after its parent and tags it
+    // depth=1; a subproject whose parent lives in a different folder (or is scoped
+    // out) falls back to depth=0 so nothing is dropped.
+    flattenHierarchy<HierProject>(group.projects as unknown as HierProject[])
+      .forEach(row => list!.appendChild(_makeProjectItem(row.project as any, row.depth)));
 
   });
 
@@ -2682,21 +2699,28 @@ async function loadProjects() {
 // d6b7da48 — one sidebar project row. Extracted verbatim from loadProjects so the
 // same row markup/behavior renders whether the list is flat or grouped by folder.
 
-function _makeProjectItem(p: any) {
+function _makeProjectItem(p: any, depth: number = 0) {
 
   const div = document.createElement('div');
 
-  div.className = 'project-item' + (state.activeTab === p.id ? ' active' : '');
+  const isSub = depth > 0;
+
+  div.className = 'project-item' + (state.activeTab === p.id ? ' active' : '') + (isSub ? ' project-subitem' : '');
 
   div.dataset.projectId = p.id;
 
-  div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:4px;';
+  // 0fed6a42 — indent subprojects so the parent→child relationship reads at a
+  // glance in the sidebar. Depth is 0 (top-level) or 1 (subproject).
+  div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:4px;'
+    + (isSub ? `padding-left:${14 + depth * 12}px;` : '');
 
   const nameSpan = document.createElement('span');
 
   nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
 
-  nameSpan.textContent = p.name;
+  // Subprojects get a small tree connector glyph so the nesting is visible even
+  // when the sidebar is narrow enough to clip the indentation.
+  nameSpan.textContent = (isSub ? '└ ' : '') + p.name;
 
   // id shown in kebab menu instead
 
@@ -2770,6 +2794,77 @@ function _moveProjectToFolder(t: any) {
   const folder = (next || '').trim();
 
   toast(folder ? `Moved to folder "${folder}"` : `Moved to ${UNGROUPED_LABEL}`);
+
+}
+
+
+
+// 0fed6a42 — kebab-menu action: make a project a one-level-deep subproject of
+// another. Presents a numbered picker of *eligible* parents (eligibleParents
+// enforces the same guards as the server: not self, parent must be top-level, a
+// project that already has children can't be moved). Persists via the
+// POST /projects/{id}/parent REST route, then re-renders the (now nested) list.
+async function _makeSubproject(t: any) {
+
+  const candidates = eligibleParents(state.projects as HierProject[], t.id);
+
+  if (!candidates.length) {
+    // Either this project already parents others, or there is no legal parent.
+    if (state.projects.some((p: any) => p.parent_project_id === t.id)) {
+      toast('This project has subprojects of its own — subprojects are one level deep.', true);
+    } else {
+      toast('No eligible parent project — add another top-level project first.', true);
+    }
+    return;
+  }
+
+  const lines = candidates.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
+  const raw = window.prompt(
+    `Make "${t.project.name}" a subproject of which project?\n\n${lines}\n\nEnter a number (or leave blank to cancel):`,
+    '',
+  );
+  if (raw === null) return; // cancelled
+  const idx = parseInt(raw.trim(), 10) - 1;
+  if (Number.isNaN(idx) || idx < 0 || idx >= candidates.length) {
+    if (raw.trim() !== '') toast('Invalid selection', true);
+    return;
+  }
+  const parent = candidates[idx];
+
+  try {
+    await api(`/projects/${t.id}/parent`, {
+      method: 'POST', body: JSON.stringify({ parent_project_id: parent.id }),
+    });
+    // Reflect the change on the local row + reload so the nested render applies.
+    t.project = { ...t.project, parent_project_id: parent.id };
+    const proj = state.projects.find((p: any) => p.id === t.id);
+    if (proj) proj.parent_project_id = parent.id;
+    await loadProjects();
+    toast(`"${t.project.name}" is now a subproject of "${parent.name}"`);
+  } catch (e: any) {
+    toast('Could not set parent: ' + e.message, true);
+  }
+
+}
+
+
+
+// 0fed6a42 — kebab-menu action: detach a subproject back to top-level (clears
+// parent_project_id). Same REST route with a null parent.
+async function _detachSubproject(t: any) {
+
+  try {
+    await api(`/projects/${t.id}/parent`, {
+      method: 'POST', body: JSON.stringify({ parent_project_id: null }),
+    });
+    t.project = { ...t.project, parent_project_id: null };
+    const proj = state.projects.find((p: any) => p.id === t.id);
+    if (proj) proj.parent_project_id = null;
+    await loadProjects();
+    toast(`"${t.project.name}" detached to top level`);
+  } catch (e: any) {
+    toast('Could not detach: ' + e.message, true);
+  }
 
 }
 
@@ -3119,6 +3214,14 @@ function _openTabMenu(t: any, anchor: any) {
   menuItem('\ud83c\udfa8 Change icon\u2026', () => _setProjectIcon(t));
 
   menuItem('\ud83d\udcc1 Move to folder\u2026', () => _moveProjectToFolder(t));
+
+  // 0fed6a42 \u2014 subproject hierarchy. Show "Make subproject of\u2026" for a top-level
+  // project, and "Detach from parent" for one that already has a parent.
+  if (t.project && t.project.parent_project_id) {
+    menuItem('\u2934 Detach from parent', () => _detachSubproject(t));
+  } else {
+    menuItem('\ud83d\udd17 Make subproject of\u2026', () => _makeSubproject(t));
+  }
 
   menuItem('\u2b07 Download DB', () => window.open('/admin/snapshot', '_blank'));
 
@@ -3488,6 +3591,20 @@ function buildTabBody(project: any) {
             <div id="live-inprogress-by-session-${project.id}" class="live-inprogress-by-session">
 
               <div class="live-empty">Nothing in progress right now.</div>
+
+            </div>
+
+          </div>
+
+          <hr class="live-divider">
+
+          <div class="live-section">
+
+            <div class="live-section-label" title="Conflict-free batches the orchestrator can fan out — successive waves run in sequence (mirrors get_parallelizable_groups)">Parallel waves</div>
+
+            <div id="live-wave-progress-${project.id}" class="live-wave-progress">
+
+              <div class="live-empty">No parallelizable work right now.</div>
 
             </div>
 
@@ -5338,6 +5455,11 @@ async function refreshLiveTab(projectId: any) {
     if (sprintItemsResult.status === 'fulfilled') {
 
       renderSprintProgress(projectId, sprintItemsResult.value || []);
+
+      // e3355ccb — live parallel-execution waves. Recomputes the server's
+      // conflict-free batches from the same sprint-items payload (no extra fetch)
+      // and repaints the wave-progress panel on the existing refresh cadence.
+      renderWaveProgress(projectId, sprintItemsResult.value || []);
 
     } else {
 
@@ -13203,4 +13325,4 @@ function toggleExpand(id: any) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e: any) {}
+try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, flattenHierarchy, eligibleParents, state }); } catch (e: any) {}

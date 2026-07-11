@@ -4538,6 +4538,147 @@ def test_start_session_endpoint_carries_coherence_warning(client):
 
 
 # ---------------------------------------------------------------------------
+# 2b4e69aa — stale-goal-field collapse in the session orientation
+# ---------------------------------------------------------------------------
+
+
+def _stale_coherence(*fields: str, age_days: int = 8) -> dict:
+    """Build a coherence_warning marking the given fields stale."""
+    age = age_days * 86400
+    return {
+        "level": "warn",
+        "message": "stale",
+        "stale_fields": [{"field": f, "age_seconds": age} for f in fields],
+        "max_age_seconds": age,
+    }
+
+
+def test_build_goal_xml_collapses_stale_field_when_not_expanded():
+    """expand_stale=False replaces a coherence-flagged field's full body
+    with a one-line summary that names the staleness + the opt-in, while
+    non-stale fields keep their full text and the raw body is gone."""
+    goal = {
+        "version": 4,
+        "content": "MEGASPRINT full body — wave A/B/C detail dump",
+        "north_star": "WEEK-OLD NORTH STAR BODY that should be collapsed",
+        "sprint": "fresh sprint focus stays",
+    }
+    cw = _stale_coherence("north_star", "version_goal", age_days=8)
+    xml = db_module.build_goal_xml(
+        goal, "proj", [], cw, expand_stale=False
+    )
+    # Stale full bodies are gone; a collapsed one-liner replaces them.
+    assert "WEEK-OLD NORTH STAR BODY that should be collapsed" not in xml
+    assert "MEGASPRINT full body" not in xml
+    assert 'stale="true"' in xml
+    assert 'collapsed="true"' in xml
+    assert "expand_stale=true" in xml
+    assert "8d old" in xml
+    # Non-stale field (sprint) is untouched — full body present.
+    assert '<sprint cache="false">fresh sprint focus stays</sprint>' in xml
+    # Document is still well-formed XML.
+    import xml.dom.minidom as _md
+    _md.parseString(xml)  # raises on malformed
+
+
+def test_build_goal_xml_expand_stale_true_keeps_full_body():
+    """expand_stale=True (the default) restores the full body even when a
+    field is flagged stale — the opt-in path returns everything."""
+    goal = {
+        "version": 4,
+        "content": "v-body",
+        "north_star": "WEEK-OLD NORTH STAR BODY",
+        "sprint": "sp",
+    }
+    cw = _stale_coherence("north_star", age_days=9)
+    # Explicit opt-in.
+    xml_expanded = db_module.build_goal_xml(
+        goal, "proj", [], cw, expand_stale=True
+    )
+    assert (
+        '<north_star cache="true">WEEK-OLD NORTH STAR BODY</north_star>'
+        in xml_expanded
+    )
+    assert "collapsed=" not in xml_expanded
+    # Default is expand_stale=True — legacy callers are unchanged.
+    xml_default = db_module.build_goal_xml(goal, "proj", [], cw)
+    assert (
+        '<north_star cache="true">WEEK-OLD NORTH STAR BODY</north_star>'
+        in xml_default
+    )
+
+
+def test_build_goal_xml_no_collapse_without_stale_flag():
+    """Even with expand_stale=False, a field that ISN'T flagged stale keeps
+    its full body — the collapse is conservative, driven only by the
+    coherence check's stale_fields list."""
+    goal = {
+        "version": 2,
+        "content": "v-body-full",
+        "north_star": "ns-full",
+        "sprint": "sp-full",
+    }
+    # coherence flags only sprint stale; north_star/version_goal are fresh.
+    cw = _stale_coherence("sprint", age_days=10)
+    xml = db_module.build_goal_xml(goal, "proj", [], cw, expand_stale=False)
+    assert '<north_star cache="true">ns-full</north_star>' in xml
+    assert '<version_goal cache="true">v-body-full</version_goal>' in xml
+    # Only sprint collapsed.
+    assert "sp-full" not in xml
+    assert 'collapsed="true"' in xml
+
+
+@pytest.mark.asyncio
+async def test_start_session_composite_collapses_stale_goal_by_default(
+    db, tmp_path
+):
+    """The full (compact=False) orientation collapses a week-old north_star
+    / version_goal to a one-liner by default, keeps the fresh sprint in
+    full, still sets coherence_warning, and expand_stale=True restores the
+    full bodies."""
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(
+        db, p["id"], "OLD-VERSION-GOAL-MEGASPRINT-BODY",
+        north_star="OLD-NORTH-STAR-BODY", sprint="sp0",
+    )
+    # Backdate every per-field timestamp so all three read ~40 days old.
+    await db.execute(
+        "UPDATE goal_states SET updated_at = datetime('now','-40 days'), "
+        "ns_updated_at = datetime('now','-40 days'), "
+        "content_updated_at = datetime('now','-40 days'), "
+        "sprint_updated_at = datetime('now','-40 days')"
+    )
+    await db.commit()
+    # Refresh ONLY the sprint so it stays out of the stale set.
+    await db_module.set_sprint(db, p["id"], "FRESH-SPRINT-FOCUS")
+
+    # Default: expand_stale=False → stale fields collapsed.
+    res = await server_module._start_session_composite(
+        db, p["id"], "collapse-worker", str(tmp_path), compact=False
+    )
+    goal_xml = res["goal_xml"]
+    # Stale bodies collapsed, not dumped.
+    assert "OLD-NORTH-STAR-BODY" not in goal_xml
+    assert "OLD-VERSION-GOAL-MEGASPRINT-BODY" not in goal_xml
+    assert 'collapsed="true"' in goal_xml
+    assert "expand_stale=true" in goal_xml
+    # Fresh sprint kept in full.
+    assert "FRESH-SPRINT-FOCUS" in goal_xml
+    # coherence_warning flag is still set (behavior preserved).
+    assert res["goal"]["coherence_warning"]["level"] in {"warn", "critical"}
+    assert "<coherence_warning" in goal_xml
+
+    # Opt-in: expand_stale=True → full bodies restored.
+    res2 = await server_module._start_session_composite(
+        db, p["id"], "expand-worker", str(tmp_path),
+        compact=False, expand_stale=True,
+    )
+    assert "OLD-NORTH-STAR-BODY" in res2["goal_xml"]
+    assert "OLD-VERSION-GOAL-MEGASPRINT-BODY" in res2["goal_xml"]
+    assert "collapsed=" not in res2["goal_xml"]
+
+
+# ---------------------------------------------------------------------------
 # v1.1.4 — decisions field
 # ---------------------------------------------------------------------------
 

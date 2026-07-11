@@ -1528,12 +1528,88 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
     await db.commit()
 
 
+def _stale_collapse_map(
+    coherence_warning: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Map ``stale_fields`` → per-field collapse metadata.
+
+    Keyed on the goal field name (``north_star`` / ``version_goal`` /
+    ``sprint``) so :func:`build_goal_xml` can look up, for each element,
+    whether the coherence check flagged it stale and by how much. Values
+    carry ``age_seconds`` (raw), ``age_days`` (rounded), and ``date`` (the
+    ``YYYY-MM-DD`` the field was last touched, derived from now − age).
+    Returns ``{}`` when nothing is flagged so the caller stays lean.
+    """
+    if not coherence_warning:
+        return {}
+    stale = coherence_warning.get("stale_fields") or []
+    if not stale:
+        return {}
+    import time as _time
+    now = _time.time()
+    out: dict[str, dict[str, Any]] = {}
+    for entry in stale:
+        field = entry.get("field")
+        if not field:
+            continue
+        age = entry.get("age_seconds")
+        meta: dict[str, Any] = {"age_seconds": age}
+        if isinstance(age, (int, float)):
+            meta["age_days"] = int(age // 86400)
+            from datetime import datetime as _dt, timezone as _tz
+            meta["date"] = _dt.fromtimestamp(
+                max(0.0, now - age), _tz.utc
+            ).strftime("%Y-%m-%d")
+        else:
+            meta["age_days"] = None
+            meta["date"] = None
+        out[field] = meta
+    return out
+
+
+def _collapsed_field_line(
+    tag: str, cache: str, meta: dict[str, Any], escape_fn: Any
+) -> str:
+    """Render a single one-line collapsed replacement for a stale field.
+
+    Instead of the full body, emit a self-closing element that names the
+    staleness and points at the explicit opt-in for the full text. The
+    ``collapsed`` / ``stale`` attributes are machine-checkable; the text
+    of the summary attribute is the human-readable nudge.
+    """
+    date = meta.get("date")
+    age_days = meta.get("age_days")
+    if date and age_days is not None:
+        summary = (
+            f"stale {tag} from {date} ({age_days}d old) — collapsed; pass "
+            "expand_stale=true or call get_session_brief for full text"
+        )
+    else:
+        summary = (
+            f"stale {tag} — collapsed; pass expand_stale=true or call "
+            "get_session_brief for full text"
+        )
+    parts = [f'  <{tag} cache="{cache}" stale="true" collapsed="true"']
+    if date:
+        parts.append(f' stale_since="{escape_fn(str(date))}"')
+    if age_days is not None:
+        parts.append(f' age_days="{int(age_days)}"')
+    parts.append(f' summary={_quoteattr_local(summary)} />')
+    return "".join(parts)
+
+
+def _quoteattr_local(value: str) -> str:
+    from xml.sax.saxutils import quoteattr
+    return quoteattr(value)
+
+
 def build_goal_xml(
     goal: dict[str, Any] | None,
     project_name: str,
     recent_tasks: list[dict[str, Any]] | None = None,
     coherence_warning: dict[str, Any] | None = None,
     decisions: str | None = None,
+    expand_stale: bool = True,
 ) -> str:
     """Serialise the goal + ambient context as XML for MCP consumers.
 
@@ -1554,6 +1630,15 @@ def build_goal_xml(
     itself but it makes the contract explicit in the wire format.
     Returns a valid XML document even when ``goal`` is None so cold
     sessions get a parseable response instead of a 404.
+
+    ``expand_stale`` (2b4e69aa): when ``False`` and ``coherence_warning``
+    has flagged a goal field (north_star / version_goal / sprint) as
+    stale, that field's full body is replaced by a one-line collapsed
+    summary — trimming dead week-old context from the default session
+    orientation. The data is never dropped: passing ``expand_stale=True``
+    (the default, so every existing caller is unchanged) or reading
+    ``get_session_brief`` / the ``/goal`` endpoint returns the full text.
+    Non-stale fields are always rendered in full.
     """
     from xml.sax.saxutils import escape, quoteattr
 
@@ -1572,15 +1657,43 @@ def build_goal_xml(
             version_goal = json.dumps(content, indent=2)
         sprint = goal.get("sprint") or ""
 
+    # 2b4e69aa — which fields did the coherence check flag stale? Only
+    # consult it when the caller opted out of expansion; an empty map
+    # means "render everything in full" (the legacy path).
+    collapse = {} if expand_stale else _stale_collapse_map(coherence_warning)
+
     out: list[str] = []
     out.append(
         f'<goal version="{version}" project={quoteattr(project_name)}>'
     )
-    out.append(f'  <north_star cache="true">{escape(north_star)}</north_star>')
-    out.append(
-        f'  <version_goal cache="true">{escape(version_goal)}</version_goal>'
-    )
-    out.append(f'  <sprint cache="false">{escape(sprint)}</sprint>')
+    if "north_star" in collapse and north_star:
+        out.append(
+            _collapsed_field_line(
+                "north_star", "true", collapse["north_star"], escape
+            )
+        )
+    else:
+        out.append(
+            f'  <north_star cache="true">{escape(north_star)}</north_star>'
+        )
+    if "version_goal" in collapse and version_goal:
+        out.append(
+            _collapsed_field_line(
+                "version_goal", "true", collapse["version_goal"], escape
+            )
+        )
+    else:
+        out.append(
+            f'  <version_goal cache="true">{escape(version_goal)}</version_goal>'
+        )
+    if "sprint" in collapse and sprint:
+        out.append(
+            _collapsed_field_line(
+                "sprint", "false", collapse["sprint"], escape
+            )
+        )
+    else:
+        out.append(f'  <sprint cache="false">{escape(sprint)}</sprint>')
     # v1.1.4 — append-only decisions log. Cached because it changes
     # rarely and only by explicit set_decision calls.
     if decisions is not None and decisions.strip():
@@ -3034,6 +3147,96 @@ def _multiword_match_clause(
     return "(" + " AND ".join(per_term) + ")", params
 
 
+def _search_terms(query: str) -> "list[str]":
+    """Tokenize a free-text query into search terms for search_all.
+
+    Whitespace-split, drop terms shorter than 2 chars, cap at 8 terms. When
+    every token is too short (or the query is a single short token) fall back to
+    the whole trimmed query as one term. Mirrors :func:`_multiword_match_clause`
+    tokenization so the two paths agree on what a "term" is.
+    """
+    terms = [t for t in query.split() if len(t) >= 2][:8]
+    if not terms:
+        stripped = query.strip()
+        return [stripped] if stripped else []
+    return terms
+
+
+def _multiword_or_ranked_clause(
+    columns: "list[str]", query: str, *, op: str = "LIKE"
+) -> "tuple[str, str, list[str], list[str]]":
+    """25155e91 — graceful-degradation match+rank fragment for search_all (SQLite).
+
+    Unlike :func:`_multiword_match_clause` (which ANDs every term, so one rare
+    absent token — ``x=768`` in a long natural-language query — zeroes the whole
+    result), this matches rows where ANY term appears (OR across terms, OR across
+    columns) and returns a *score* expression counting how many distinct terms
+    matched, so more-complete matches rank first. A completely unrelated query
+    still matches no rows (no term appears anywhere), and a single-term query
+    behaves exactly like the old contiguous-substring match.
+
+    Returns ``(where_sql, score_sql, where_params, score_params)``:
+
+    * ``where_sql`` — a parenthesized ``(... OR ...)`` boolean, safe to AND into
+      an existing WHERE. Matches a row if at least one term is a substring of at
+      least one column.
+    * ``score_sql`` — ``(CASE WHEN <term1 present> THEN 1 ELSE 0 END + ...)``,
+      the count of matched terms, for ``ORDER BY <score> DESC``.
+    * ``where_params`` / ``score_params`` — the LIKE params for each, in the
+      order the fragments emit their placeholders. ``score_sql`` is emitted in
+      the SELECT list (before WHERE), so callers bind ``score_params`` first.
+
+    Placeholders are ``?`` (the pg adapter rewrites to %s); ``op`` is LIKE
+    (SQLite, case-insensitive) or ILIKE (PG).
+    """
+    terms = _search_terms(query)
+    where_parts: list[str] = []
+    score_parts: list[str] = []
+    where_params: list[str] = []
+    score_params: list[str] = []
+    for term in terms:
+        col_or = " OR ".join(f"{c} {op} ?" for c in columns)
+        like = f"%{term}%"
+        where_parts.append(f"({col_or})")
+        where_params.extend([like] * len(columns))
+        score_parts.append(f"(CASE WHEN ({col_or}) THEN 1 ELSE 0 END)")
+        score_params.extend([like] * len(columns))
+    where_sql = "(" + " OR ".join(where_parts) + ")"
+    score_sql = "(" + " + ".join(score_parts) + ")"
+    return where_sql, score_sql, where_params, score_params
+
+
+def _or_tsquery_source(query: str) -> str:
+    """25155e91 — rewrite a free-text query into an OR form for websearch_to_tsquery.
+
+    ``websearch_to_tsquery('english', 'a b c')`` ANDs its terms (``a & b & c``),
+    so a long natural-language query with any rare/absent token matches nothing.
+    websearch treats the bare word ``or`` as the OR operator, so joining the
+    terms with `` or `` yields ``a | b | c`` — match ANY term, and ``ts_rank``
+    then floats rows matching more (and better) terms to the top: graceful
+    degradation instead of zero results.
+
+    Each term is stripped of the characters websearch reads as operators at a
+    term boundary (quotes and a leading ``-`` NOT) so a punctuation-heavy token
+    can't flip the whole query into a phrase/NOT search. websearch still splits
+    intra-token punctuation (``x=768`` -> ``x <-> 768``) on its own. A
+    single-term query is returned unchanged (no ``or`` injected), so existing
+    single-word / stemmed behavior is preserved exactly. The reserved words
+    ``or``/``and`` appearing as literal query terms are dropped from the operator
+    join (they'd be no-ops as lexemes anyway).
+    """
+    cleaned: list[str] = []
+    for raw in query.split():
+        term = raw.strip("\"'")
+        term = term.lstrip("-")
+        if not term or term.lower() in ("or", "and"):
+            continue
+        cleaned.append(term)
+    if not cleaned:
+        return query
+    return " or ".join(cleaned)
+
+
 async def search_tasks(
     db: Any,
     project_id: str,
@@ -3366,13 +3569,17 @@ async def search_all(
       - decisions_pinned.title + decisions_pinned.body
       - sprint_items.title + sprint_items.notes
 
-    SQLite: keyword match — every whitespace-separated query term must appear
-    (as a substring) in one of the text fields (see _multiword_match_clause).
-    Postgres (82e0b887): on-the-fly tsvector full-text search via
-    websearch_to_tsquery, ordered by ts_rank. Stemming/word-form tolerance
-    means "authenticating users" matches "authentication for the user" — which
-    the SQLite substring path cannot. Zero schema / zero index (evaluated per
-    query).
+    SQLite (25155e91): keyword match — a row matches if ANY whitespace-separated
+    query term appears (as a substring) in one of its text fields, ranked by how
+    many terms matched (see _multiword_or_ranked_clause). A long multi-word
+    natural-language query degrades gracefully to the most-relevant rows instead
+    of returning zero the moment one rare token is absent.
+    Postgres (82e0b887, 25155e91): on-the-fly tsvector full-text search via
+    websearch_to_tsquery, ordered by ts_rank. The query terms are OR-combined
+    (a | b | c) so any term can match, with ts_rank surfacing the best rows
+    first. Stemming/word-form tolerance means "authenticating users" matches
+    "authentication for the user" — which the SQLite substring path cannot. Zero
+    schema / zero index (evaluated per query).
 
     Returns grouped results: {tasks, notes, decisions, sprint_items}.
     Each item includes a ``match_type`` key for the source table and a
@@ -3442,10 +3649,20 @@ async def search_all(
             "added_at DESC LIMIT ?"
         )
 
-        tasks = await _search(tasks_sql, (project_id, query, query, limit))
-        notes = await _search(notes_sql, (project_id, query, query, limit))
-        decisions = await _search(decisions_sql, (project_id, query, query, limit))
-        sprint_items = await _search(sprint_sql, (project_id, query, query, limit))
+        # 25155e91 — OR the query terms instead of ANDing them. Plain
+        # websearch_to_tsquery('a b c') builds 'a & b & c', so one rare/absent
+        # token in a long natural-language query ("... BFS x=768 x=1511") zeroed
+        # the whole result. websearch reads the bare word 'or' as the OR
+        # operator, so feeding it "a or b or c" builds 'a | b | c' — match ANY
+        # term. ts_rank still orders by how many/how well terms matched, so the
+        # result degrades gracefully to the most-relevant rows rather than to
+        # nothing. A single-term query is passed through unchanged (still
+        # stemmed). The SQL is untouched — only the bound tsquery source changes.
+        tsq = _or_tsquery_source(query)
+        tasks = await _search(tasks_sql, (project_id, tsq, tsq, limit))
+        notes = await _search(notes_sql, (project_id, tsq, tsq, limit))
+        decisions = await _search(decisions_sql, (project_id, tsq, tsq, limit))
+        sprint_items = await _search(sprint_sql, (project_id, tsq, tsq, limit))
 
         # 56cd8712 — SAFE-BY-DEFAULT, OPT-IN semantic escalation. When keyword /
         # tsvector search genuinely found nothing good, and semantic search is
@@ -3458,43 +3675,62 @@ async def search_all(
             tasks, notes, decisions, sprint_items,
         )
     else:
-        # fcf90f3a — SQLite keyword path (unchanged). AND the query terms across
-        # each content type's text fields so a multi-word query matches rows
-        # containing every term (not only the exact contiguous phrase).
-        m_task, p_task = _multiword_match_clause(["description"], query, op=op)
-        m_note, p_note = _multiword_match_clause(["title", "body"], query, op=op)
-        m_dec, p_dec = _multiword_match_clause(["title", "body"], query, op=op)
-        m_sprint, p_sprint = _multiword_match_clause(["title", "notes"], query, op=op)
+        # 25155e91 — SQLite keyword path: OR the query terms and rank by how many
+        # matched, instead of ANDing them. The old AND-of-all-terms
+        # (_multiword_match_clause) meant one rare/absent token in a long
+        # natural-language query ("... single-path BFS x=768 x=1511") zeroed the
+        # whole result even when several terms clearly matched a row. Now a row
+        # matches if ANY term appears (OR across terms, OR across the row's
+        # fields), and a _match_score column counts matched terms so the most
+        # complete matches sort first — graceful degradation to relevant results
+        # rather than to nothing. A single-term query is identical to the old
+        # contiguous-substring match; a wholly unrelated query still matches no
+        # rows. created_at is the tiebreak within an equal score.
+        w_task, sc_task, wp_task, sp_task = _multiword_or_ranked_clause(
+            ["description"], query, op=op)
+        w_note, sc_note, wp_note, sp_note = _multiword_or_ranked_clause(
+            ["title", "body"], query, op=op)
+        w_dec, sc_dec, wp_dec, sp_dec = _multiword_or_ranked_clause(
+            ["title", "body"], query, op=op)
+        w_sprint, sc_sprint, wp_sprint, sp_sprint = _multiword_or_ranked_clause(
+            ["title", "notes"], query, op=op)
 
         tasks_sql = (
-            "SELECT id, description, status, created_at, 'task' AS match_type "
+            f"SELECT id, description, status, created_at, 'task' AS match_type, {sc_task} AS _match_score "
             "FROM task_log "
-            f"WHERE project_id = ? AND {m_task} "
-            "ORDER BY created_at DESC LIMIT ?"
+            f"WHERE project_id = ? AND {w_task} "
+            "ORDER BY _match_score DESC, created_at DESC LIMIT ?"
         )
         notes_sql = (
-            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+            f"SELECT id, title, body, tags, created_at, 'note' AS match_type, {sc_note} AS _match_score "
             "FROM project_notes "
-            f"WHERE project_id = ? AND {m_note} "
-            "ORDER BY created_at DESC LIMIT ?"
+            f"WHERE project_id = ? AND {w_note} "
+            "ORDER BY _match_score DESC, created_at DESC LIMIT ?"
         )
         decisions_sql = (
-            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+            f"SELECT id, title, body, category, status, created_at, 'decision' AS match_type, {sc_dec} AS _match_score "
             "FROM decisions_pinned "
-            f"WHERE project_id = ? AND status = 'active' AND {m_dec} "
-            "ORDER BY created_at DESC LIMIT ?"
+            f"WHERE project_id = ? AND status = 'active' AND {w_dec} "
+            "ORDER BY _match_score DESC, created_at DESC LIMIT ?"
         )
         sprint_sql = (
-            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            f"SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type, {sc_sprint} AS _match_score "
             "FROM sprint_items "
-            f"WHERE project_id = ? AND {m_sprint} "
-            "ORDER BY added_at DESC LIMIT ?"
+            f"WHERE project_id = ? AND {w_sprint} "
+            "ORDER BY _match_score DESC, added_at DESC LIMIT ?"
         )
 
-        tasks = await _search(tasks_sql, (project_id, *p_task, limit))
-        notes = await _search(notes_sql, (project_id, *p_note, limit))
-        decisions = await _search(decisions_sql, (project_id, *p_dec, limit))
-        sprint_items = await _search(sprint_sql, (project_id, *p_sprint, limit))
+        # score params bind first (SELECT list), then project_id + WHERE params.
+        tasks = await _search(tasks_sql, (*sp_task, project_id, *wp_task, limit))
+        notes = await _search(notes_sql, (*sp_note, project_id, *wp_note, limit))
+        decisions = await _search(decisions_sql, (*sp_dec, project_id, *wp_dec, limit))
+        sprint_items = await _search(sprint_sql, (*sp_sprint, project_id, *wp_sprint, limit))
+
+        # _match_score is an internal ranking column; drop it from returned rows
+        # so the result shape is identical to the Postgres path.
+        for _grp in (tasks, notes, decisions, sprint_items):
+            for _row in _grp:
+                _row.pop("_match_score", None)
 
     # Attach a body-text snippet for each result so the dashboard search bar can
     # surface matching context. The body field name differs per content type.
@@ -4929,6 +5165,72 @@ async def count_pending_sprint_items(
     if row is None:
         return 0
     return int(row["c"] if isinstance(row, dict) else row[0])
+
+
+# 43539c70 - keywords that mark a sprint item as legitimately calling for
+# test/coverage work, so the test-tamper guard exempts test-file edits made under
+# it. Matched case-insensitively against the item's title + notes.
+_TEST_COVERAGE_KEYWORDS = (
+    "test",
+    "tests",
+    "testing",
+    "coverage",
+    "regression",
+    "unit test",
+    "add a test",
+    "write a test",
+)
+
+
+def _text_calls_for_test_coverage(text: str | None) -> bool:
+    """True if free-text explicitly calls for test/coverage work.
+
+    Backs the test-tamper guard's exemption: legitimate feature work that a sprint
+    item asks to cover with tests should NOT be flagged as test tampering. Matched
+    on whole-word ``test``/``tests``/``testing``/``coverage``/``regression`` (plus
+    a couple of phrases) so an incidental substring like ``latest`` or
+    ``contested`` does not trip it.
+    """
+    if not text:
+        return False
+    import re as _re  # noqa: PLC0415
+
+    lowered = text.lower()
+    for kw in _TEST_COVERAGE_KEYWORDS:
+        if " " in kw:
+            if kw in lowered:
+                return True
+        elif _re.search(rf"\b{_re.escape(kw)}\b", lowered):
+            return True
+    return False
+
+
+async def sprint_test_coverage_expected(
+    db: aiosqlite.Connection, project_id: str
+) -> bool:
+    """43539c70 - True if an in-progress sprint item's own text calls for
+    test/coverage work.
+
+    Powers the PostToolUse test-tamper guard's exemption endpoint. If any item the
+    project currently has ``in_progress`` mentions tests/coverage in its title or
+    notes, editing a test file under it is legitimate feature work, not tampering,
+    so the guard stays silent. Only ``in_progress`` items are considered (the item
+    the executor is actively working); done/pending items do not exempt anything.
+    """
+    async with db.execute(
+        "SELECT title, notes FROM sprint_items "
+        "WHERE project_id = ? AND status = 'in_progress'",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    for row in rows or []:
+        if isinstance(row, dict):
+            title, notes = row.get("title"), row.get("notes")
+        else:
+            title, notes = row[0], row[1]
+        if _text_calls_for_test_coverage(title) or _text_calls_for_test_coverage(notes):
+            return True
+    return False
 
 
 async def get_sprint_items(
@@ -11619,6 +11921,36 @@ async def get_tenants_with_payment_failures(
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]
+
+
+async def list_active_tunnel_tenant_ids(
+    db: aiosqlite.Connection,
+) -> list[str]:
+    """Return the ids of tenants whose local binary tunnel is marked active (b74099b2).
+
+    ``tenants.tunnel_active`` is set to 1 when the tenant's binary opens its tunnel
+    WebSocket and back to 0 on a clean disconnect (b43b0c6a). A server-side deploy
+    kills the old process WITHOUT clearing the flag, so on the fresh process's
+    startup these are exactly the tenants that were connected (and whose
+    already-connected MCP sessions will re-issue a ``tools/list`` after reconnect).
+
+    Used by the startup ``notifications/tools/list_changed`` trigger so a deploy that
+    adds a new hosted MCP tool becomes visible to those sessions on their next list,
+    instead of staying hidden until a full reconnect. Cheap (single indexed column
+    scan of the small control-plane ``tenants`` table); returns [] when none active.
+    """
+    async with db.execute(
+        "SELECT id FROM tenants WHERE tunnel_active = 1"
+    ) as cur:
+        rows = await cur.fetchall()
+    out: list[str] = []
+    for r in rows:
+        if r is None:
+            continue
+        tid = r["id"] if isinstance(r, dict) else r[0]
+        if tid:
+            out.append(tid)
+    return out
 
 
 # ---------------------------------------------------------------------------

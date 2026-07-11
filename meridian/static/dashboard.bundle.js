@@ -2118,6 +2118,246 @@
   } catch (e3) {
   }
 
+  // meridian/static/dashboard-waves.ts
+  var _TERMINAL = /* @__PURE__ */ new Set(["done", "skipped", "failed", "pushed"]);
+  var _CLAIMABLE = /* @__PURE__ */ new Set(["pending", "todo"]);
+  var _PRIORITY_RANK = { urgent: 0, high: 1, normal: 2, low: 3 };
+  var _PRIORITY_DEFAULT = _PRIORITY_RANK.normal;
+  function parseTouchesResources(raw) {
+    if (raw == null) return [];
+    let values;
+    if (Array.isArray(raw)) {
+      values = raw;
+    } else {
+      const text = String(raw).trim();
+      if (!text) return [];
+      try {
+        const decoded = JSON.parse(text);
+        values = Array.isArray(decoded) ? decoded : [decoded];
+      } catch {
+        values = text.split(",");
+      }
+    }
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const v3 of values) {
+      const candidate = String(v3 ?? "").trim();
+      if (!candidate) continue;
+      const norm = candidate.toLowerCase().startsWith("inferred:") ? candidate.slice("inferred:".length).trim() : candidate;
+      if (!norm) continue;
+      if (!seen.has(norm)) {
+        seen.add(norm);
+        out.push(norm);
+      }
+    }
+    return out;
+  }
+  function _resourceFileOf(rid) {
+    if (rid.startsWith("file:")) return rid.slice("file:".length);
+    if (rid.startsWith("symbol:")) return rid.slice("symbol:".length).split("::")[0];
+    return null;
+  }
+  function _twoResourcesConflict(r1, r22) {
+    if (r1 === r22) return true;
+    const f1 = _resourceFileOf(r1);
+    const f22 = _resourceFileOf(r22);
+    if (f1 !== null && f1 === f22) {
+      const bothSymbols = r1.startsWith("symbol:") && r22.startsWith("symbol:");
+      return !bothSymbols;
+    }
+    return false;
+  }
+  function _resourceSetsConflict(a3, b2) {
+    for (const ra of a3) {
+      for (const rb of b2) {
+        if (_twoResourcesConflict(ra, rb)) return true;
+      }
+    }
+    return false;
+  }
+  function computeWaveProgress(sprintItems) {
+    const items = Array.isArray(sprintItems) ? sprintItems : [];
+    const statusOf = (it) => String(it.status || "pending");
+    const byId = {};
+    for (const it of items) if (it && it.id) byId[String(it.id)] = it;
+    const doneCount = items.filter((it) => statusOf(it) === "done").length;
+    const blockingParent = (it) => {
+      const seen = /* @__PURE__ */ new Set();
+      let dep = it.depends_on ? String(it.depends_on) : "";
+      while (dep && !seen.has(dep)) {
+        seen.add(dep);
+        const parent = byId[dep];
+        if (!parent) return null;
+        const ps = statusOf(parent);
+        if (!_TERMINAL.has(ps)) return parent;
+        if (ps === "failed" && (it.failure_mode || "continue") !== "continue") return parent;
+        dep = parent.depends_on ? String(parent.depends_on) : "";
+      }
+      return null;
+    };
+    const eligible = [];
+    let runningCount = 0;
+    let blockedCount = 0;
+    for (const it of items) {
+      if (!it || !it.id) continue;
+      if (it.blocker_kind === "manual") continue;
+      const st = statusOf(it);
+      const isRunning = st === "in_progress" || _CLAIMABLE.has(st) && !!it.claimed_at;
+      if (isRunning) runningCount++;
+      if (!_CLAIMABLE.has(st)) continue;
+      if (it.claimed_at) continue;
+      const parent = blockingParent(it);
+      if (parent !== null) {
+        const ps = statusOf(parent);
+        if (ps === "failed" && (it.failure_mode || "continue") === "continue") {
+        } else {
+          blockedCount++;
+          continue;
+        }
+      }
+      eligible.push(it);
+    }
+    const sorted = eligible.slice().sort((a3, b2) => {
+      const pa = _PRIORITY_RANK[String(a3.priority || "normal")] ?? _PRIORITY_DEFAULT;
+      const pb = _PRIORITY_RANK[String(b2.priority || "normal")] ?? _PRIORITY_DEFAULT;
+      if (pa !== pb) return pa - pb;
+      const aa = String(a3.added_at || "");
+      const ab = String(b2.added_at || "");
+      if (aa !== ab) return aa < ab ? -1 : 1;
+      return String(a3.id) < String(b2.id) ? -1 : 1;
+    });
+    const withRes = sorted.map((it) => ({ it, res: parseTouchesResources(it.touches_resources) }));
+    const declared = withRes.filter((x2) => x2.res.length > 0);
+    const undeclared = withRes.filter((x2) => x2.res.length === 0);
+    const groups = [];
+    const groupResources = [];
+    for (const { it, res } of declared) {
+      let placed = false;
+      for (let gi = 0; gi < groupResources.length; gi++) {
+        if (!_resourceSetsConflict(res, groupResources[gi])) {
+          groups[gi].push(it);
+          for (const r3 of res) groupResources[gi].add(r3);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        groups.push([it]);
+        groupResources.push(new Set(res));
+      }
+    }
+    for (const { it } of undeclared) groups.push([it]);
+    const batches = groups.map((groupItems, index) => {
+      let running = 0;
+      let earliest = null;
+      for (const it of groupItems) {
+        const live = byId[String(it.id)] || it;
+        const st = statusOf(live);
+        const isRunning = st === "in_progress" || _CLAIMABLE.has(st) && !!live.claimed_at;
+        if (isRunning) {
+          running++;
+          const c3 = live.claimed_at ? String(live.claimed_at) : null;
+          if (c3 && (earliest === null || c3 < earliest)) earliest = c3;
+        }
+      }
+      return {
+        index,
+        items: groupItems,
+        running,
+        pending: groupItems.length - running,
+        total: groupItems.length,
+        parallel: groupItems.length > 1,
+        earliestClaim: earliest
+      };
+    });
+    const maxFanOut = batches.reduce((m3, b2) => Math.max(m3, b2.total), 0);
+    let activeBatchIndex = batches.findIndex((b2) => b2.running > 0);
+    if (activeBatchIndex < 0) activeBatchIndex = batches.findIndex((b2) => b2.total > 0);
+    return {
+      batches,
+      groupCount: groups.length,
+      eligibleCount: eligible.length,
+      runningCount,
+      blockedCount,
+      undeclaredCount: undeclared.length,
+      doneCount,
+      maxFanOut,
+      activeBatchIndex,
+      strategy: maxFanOut > 1 ? "parallel" : "sequential",
+      hasTokenTelemetry: false
+    };
+  }
+  function formatElapsedSince(claimedAt, nowMs) {
+    if (!claimedAt) return "";
+    const t3 = Date.parse(String(claimedAt).replace(" ", "T"));
+    if (isNaN(t3)) return "";
+    const now = nowMs == null ? Date.now() : nowMs;
+    const mins = Math.max(0, Math.floor((now - t3) / 6e4));
+    if (mins < 60) return `${mins}m`;
+    return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+  }
+  function _esc(s3) {
+    try {
+      return typeof escapeHtml === "function" ? escapeHtml(String(s3 ?? "")) : String(s3 ?? "");
+    } catch {
+      return String(s3 ?? "");
+    }
+  }
+  function buildWaveProgressHtml(wp, nowMs) {
+    if (!wp.batches.length) {
+      if (wp.blockedCount > 0) {
+        return `<div class="live-empty">No parallel batch ready \u2014 ${wp.blockedCount} item(s) blocked on dependencies.</div>`;
+      }
+      return `<div class="live-empty">No parallelizable work right now.</div>`;
+    }
+    const stratColor = wp.strategy === "parallel" ? "var(--accent-green)" : "var(--muted)";
+    const header = `<div class="wave-progress-summary" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px;font-size:11px"><span style="font-weight:600;color:${stratColor}">${_esc(wp.strategy.toUpperCase())}</span><span style="color:var(--muted)">${wp.groupCount} wave${wp.groupCount !== 1 ? "s" : ""}</span><span style="color:var(--muted)">\xB7 ${wp.eligibleCount} eligible</span>` + (wp.runningCount ? `<span style="color:var(--accent-green)">\xB7 ${wp.runningCount} running</span>` : "") + (wp.blockedCount ? `<span style="color:#fbbf24">\xB7 ${wp.blockedCount} blocked</span>` : "") + (wp.maxFanOut > 1 ? `<span style="color:var(--accent)">\xB7 up to ${wp.maxFanOut}\xD7 parallel</span>` : "") + `</div>`;
+    const rows = wp.batches.map((b2) => {
+      const isActive = b2.index === wp.activeBatchIndex;
+      const accent = b2.running > 0 ? "var(--accent-green)" : isActive ? "var(--accent)" : "var(--border)";
+      const elapsed = formatElapsedSince(b2.earliestClaim, nowMs);
+      const parallelTag = b2.parallel ? `<span title="These items touch no shared resources \u2014 safe to run at once" style="font-size:9px;color:var(--accent);border:1px solid var(--accent)55;border-radius:3px;padding:0 4px">\u2225 ${b2.total}\xD7</span>` : `<span title="Runs on its own \u2014 no proven parallel-safe peer" style="font-size:9px;color:var(--muted)">seq</span>`;
+      const counts = (b2.running ? `<span style="color:var(--accent-green)">${b2.running} running</span> \xB7 ` : "") + `<span style="color:var(--muted)">${b2.pending} pending</span>`;
+      const items = b2.items.map((it) => {
+        const live = String(it.status || "pending");
+        const dot = live === "in_progress" || it.claimed_at ? "var(--accent-green)" : "var(--muted)";
+        return `<div style="display:flex;gap:6px;align-items:center;margin-top:3px">
+            <span style="width:5px;height:5px;border-radius:50%;background:${dot};flex:none"></span>
+            <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px" title="${_esc(it.title || it.id)}">${_esc(it.title || it.id)}</span>
+          </div>`;
+      }).join("");
+      return `<div class="wave-batch" data-batch="${b2.index}" style="border-left:3px solid ${accent};padding:4px 0 6px 8px;margin-bottom:8px">
+        <div style="display:flex;gap:6px;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;font-weight:600;color:var(--text)">Wave ${b2.index + 1} ${parallelTag}${isActive ? ' <span style="font-size:9px;color:var(--accent)">\u25CF active</span>' : ""}</span>
+          <span style="font-size:9px;color:var(--muted);flex:none">${counts}${elapsed ? ` \xB7 ${_esc(elapsed)}` : ""}</span>
+        </div>
+        ${items}
+      </div>`;
+    }).join("");
+    const gapNote = `<div class="wave-progress-note" style="margin-top:4px;font-size:9px;color:var(--muted);line-height:1.4">Cost shown is wall-clock elapsed since an item was claimed. Per-wave token/$ cost isn't tracked server-side yet, so it's omitted rather than estimated.</div>`;
+    return header + rows + gapNote;
+  }
+  function renderWaveProgress2(projectId, sprintItems) {
+    try {
+      if (typeof document === "undefined") return;
+      const root = document.getElementById(`live-wave-progress-${projectId}`);
+      if (!root) return;
+      const wp = computeWaveProgress(sprintItems);
+      root.innerHTML = buildWaveProgressHtml(wp);
+    } catch {
+    }
+  }
+  try {
+    Object.assign(window, {
+      computeWaveProgress,
+      buildWaveProgressHtml,
+      renderWaveProgress: renderWaveProgress2,
+      formatElapsedSince,
+      parseTouchesResources
+    });
+  } catch {
+  }
+
   // meridian/static/dashboard-settings.ts
   function suggestNtfyTopic2(projectId) {
     const proj = (window.state?.projects || []).find((p3) => p3.id === projectId);
@@ -8828,6 +9068,56 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
+  // meridian/static/dashboard-subprojects.ts
+  function normParent(pid) {
+    if (pid == null) return null;
+    const s3 = String(pid).trim();
+    return s3 ? s3 : null;
+  }
+  function flattenHierarchy(projects) {
+    const byId = /* @__PURE__ */ new Map();
+    for (const p3 of projects) byId.set(p3.id, p3);
+    const childrenOf = /* @__PURE__ */ new Map();
+    const topLevel = [];
+    for (const p3 of projects) {
+      const parentId = normParent(p3.parent_project_id);
+      const parent = parentId ? byId.get(parentId) : void 0;
+      if (parent && !normParent(parent.parent_project_id)) {
+        let bucket = childrenOf.get(parentId);
+        if (!bucket) {
+          bucket = [];
+          childrenOf.set(parentId, bucket);
+        }
+        bucket.push(p3);
+      } else {
+        topLevel.push(p3);
+      }
+    }
+    const rows = [];
+    for (const p3 of topLevel) {
+      rows.push({ project: p3, depth: 0 });
+      const kids = childrenOf.get(p3.id);
+      if (kids) {
+        for (const kid of kids) rows.push({ project: kid, depth: 1 });
+      }
+    }
+    return rows;
+  }
+  function hasSubprojects(projects, projectId) {
+    return projects.some((p3) => normParent(p3.parent_project_id) === projectId);
+  }
+  function eligibleParents(projects, projectId) {
+    if (hasSubprojects(projects, projectId)) return [];
+    const self = projects.find((p3) => p3.id === projectId);
+    const currentParent = self ? normParent(self.parent_project_id) : null;
+    return projects.filter((p3) => {
+      if (p3.id === projectId) return false;
+      if (normParent(p3.parent_project_id)) return false;
+      if (p3.id === currentParent) return false;
+      return true;
+    });
+  }
+
   // meridian/static/dashboard.ts
   var TABS_KEY = "meridian.openTabs";
   var ACTIVE_PROJECT_KEY = "meridian.activeProject";
@@ -10137,7 +10427,7 @@ ${n2.tags || ""}`.toLowerCase();
         list.appendChild(header);
         if (isCollapsed) return;
       }
-      group.projects.forEach((p3) => list.appendChild(_makeProjectItem(p3)));
+      flattenHierarchy(group.projects).forEach((row) => list.appendChild(_makeProjectItem(row.project, row.depth)));
     });
     const switcher = document.getElementById("project-switcher");
     if (switcher) {
@@ -10154,14 +10444,15 @@ ${n2.tags || ""}`.toLowerCase();
     }
     syncSidebarActiveProject();
   }
-  function _makeProjectItem(p3) {
+  function _makeProjectItem(p3, depth = 0) {
     const div = document.createElement("div");
-    div.className = "project-item" + (state.activeTab === p3.id ? " active" : "");
+    const isSub = depth > 0;
+    div.className = "project-item" + (state.activeTab === p3.id ? " active" : "") + (isSub ? " project-subitem" : "");
     div.dataset.projectId = p3.id;
-    div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;";
+    div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;" + (isSub ? `padding-left:${14 + depth * 12}px;` : "");
     const nameSpan = document.createElement("span");
     nameSpan.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
-    nameSpan.textContent = p3.name;
+    nameSpan.textContent = (isSub ? "\u2514 " : "") + p3.name;
     const menuBtn = document.createElement("button");
     menuBtn.textContent = "\u22EF";
     menuBtn.title = "Project actions";
@@ -10201,6 +10492,61 @@ Existing folders: ${existing.join(", ")}` : "";
     loadProjects();
     const folder = (next || "").trim();
     toast(folder ? `Moved to folder "${folder}"` : `Moved to ${UNGROUPED_LABEL}`);
+  }
+  async function _makeSubproject(t3) {
+    const candidates = eligibleParents(state.projects, t3.id);
+    if (!candidates.length) {
+      if (state.projects.some((p3) => p3.parent_project_id === t3.id)) {
+        toast("This project has subprojects of its own \u2014 subprojects are one level deep.", true);
+      } else {
+        toast("No eligible parent project \u2014 add another top-level project first.", true);
+      }
+      return;
+    }
+    const lines = candidates.map((p3, i3) => `${i3 + 1}. ${p3.name}`).join("\n");
+    const raw = window.prompt(
+      `Make "${t3.project.name}" a subproject of which project?
+
+${lines}
+
+Enter a number (or leave blank to cancel):`,
+      ""
+    );
+    if (raw === null) return;
+    const idx = parseInt(raw.trim(), 10) - 1;
+    if (Number.isNaN(idx) || idx < 0 || idx >= candidates.length) {
+      if (raw.trim() !== "") toast("Invalid selection", true);
+      return;
+    }
+    const parent = candidates[idx];
+    try {
+      await api(`/projects/${t3.id}/parent`, {
+        method: "POST",
+        body: JSON.stringify({ parent_project_id: parent.id })
+      });
+      t3.project = { ...t3.project, parent_project_id: parent.id };
+      const proj = state.projects.find((p3) => p3.id === t3.id);
+      if (proj) proj.parent_project_id = parent.id;
+      await loadProjects();
+      toast(`"${t3.project.name}" is now a subproject of "${parent.name}"`);
+    } catch (e3) {
+      toast("Could not set parent: " + e3.message, true);
+    }
+  }
+  async function _detachSubproject(t3) {
+    try {
+      await api(`/projects/${t3.id}/parent`, {
+        method: "POST",
+        body: JSON.stringify({ parent_project_id: null })
+      });
+      t3.project = { ...t3.project, parent_project_id: null };
+      const proj = state.projects.find((p3) => p3.id === t3.id);
+      if (proj) proj.parent_project_id = null;
+      await loadProjects();
+      toast(`"${t3.project.name}" detached to top level`);
+    } catch (e3) {
+      toast("Could not detach: " + e3.message, true);
+    }
   }
   function openTab(project) {
     const existing = state.tabs.find((t3) => t3.id === project.id);
@@ -10376,6 +10722,11 @@ Existing folders: ${existing.join(", ")}` : "";
     menuItem("\u270F Rename", () => _renameProject(t3));
     menuItem("\u{1F3A8} Change icon\u2026", () => _setProjectIcon(t3));
     menuItem("\u{1F4C1} Move to folder\u2026", () => _moveProjectToFolder(t3));
+    if (t3.project && t3.project.parent_project_id) {
+      menuItem("\u2934 Detach from parent", () => _detachSubproject(t3));
+    } else {
+      menuItem("\u{1F517} Make subproject of\u2026", () => _makeSubproject(t3));
+    }
     menuItem("\u2B07 Download DB", () => window.open("/admin/snapshot", "_blank"));
     menuItem("\u{1F5D1} Delete project\u2026", () => _deleteProject(t3));
     const rect = anchor.getBoundingClientRect();
@@ -10671,6 +11022,20 @@ Current: ${current || "(none)"}`,
             <div id="live-inprogress-by-session-${project.id}" class="live-inprogress-by-session">
 
               <div class="live-empty">Nothing in progress right now.</div>
+
+            </div>
+
+          </div>
+
+          <hr class="live-divider">
+
+          <div class="live-section">
+
+            <div class="live-section-label" title="Conflict-free batches the orchestrator can fan out \u2014 successive waves run in sequence (mirrors get_parallelizable_groups)">Parallel waves</div>
+
+            <div id="live-wave-progress-${project.id}" class="live-wave-progress">
+
+              <div class="live-empty">No parallelizable work right now.</div>
 
             </div>
 
@@ -12135,6 +12500,7 @@ Current: ${current || "(none)"}`,
       ]);
       if (sprintItemsResult.status === "fulfilled") {
         renderSprintProgress(projectId, sprintItemsResult.value || []);
+        renderWaveProgress(projectId, sprintItemsResult.value || []);
       } else {
         const sprintRoot = document.getElementById(`live-sprint-progress-${projectId}`);
         if (sprintRoot) {
@@ -16557,7 +16923,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
+    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, flattenHierarchy, eligibleParents, state });
   } catch (e3) {
   }
 })();

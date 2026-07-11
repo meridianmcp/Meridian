@@ -43,6 +43,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "find_symbol_usages": 'find_symbol_usages(project_id="abc-123", doc="thesis/chapter1.docx", symbol_or_equation_id="E=mc^2")',
     "index_figure": 'index_figure(project_id="abc-123", doc="thesis/chapter1.docx", file_path="figures/setup.png", caption="Figure 3: The experimental setup", semantic_label="apparatus diagram")',
     "find_similar_figure": 'find_similar_figure(project_id="abc-123", doc="thesis/chapter1.docx", description_or_path="experimental setup diagram")',
+    "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
+    "search_code_semantic": 'search_code_semantic(root_dir="/repo/src", query="parse the auth token and refresh it")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -566,14 +568,75 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "index_figure to check whether a figure is already present under a "
         "slightly different caption or path. Returns {document_id, matches:[...]} "
         "— an empty list (never an error) when the document has no indexed "
-        "figures, or doc doesn't resolve to a stored document.",
+        "figures, or doc doesn't resolve to a stored document. "
+        "d2a3537a — pass outputs_dir to RESOLVE THROUGH to the outputs index: "
+        "every matched figure with a file_path that names an already-indexed run "
+        "output gains a linked_output field (the output's path, generating_script, "
+        "canonical/archival flag, fingerprint), so 'does this plot already exist "
+        "as a run output?' and 'where is it referenced in my thesis?' are one "
+        "lookup (linked_output is null when the figure names no indexed output).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
          "description_or_path": {"type": "string", "description": "A free-text description OR a file path to fuzzy-match against this document's indexed figures."},
+         "outputs_dir": {"type": "string", "description": "d2a3537a — optional outputs tree root. When given, each matched figure resolves THROUGH to its outputs_index row (linked_output) by file_path. Omit for a pure fuzzy match."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "description_or_path"]}},
+    {"name": "search_outputs", "description":
+        "a0e9133e — READ-ONLY full-text search over a run's OUTPUTS tree "
+        "(numeric/tabular/array artifacts), backed by DuckDB native FTS (Okapi "
+        "BM25). Walks outputs_dir recursively and builds a persistent index: "
+        "each .csv/.json contributes its extracted TEXT content plus a cheap "
+        "fingerprint (CSV column names / JSON top-level keys / an inferred "
+        "generating_script); each .npy contributes METADATA ONLY (never array "
+        "content); images/other binaries contribute filesystem metadata + name "
+        "only. The multi-word query is scored with BM25 and ranked hits are "
+        "returned. Canonical-vs-archival is handled TWO-STAGE and is NEVER "
+        "destructive: a filename heuristic (_old / _old_N / leading underscore) "
+        "flags a CANDIDATE, and a SHA-256 content hash CONFIRMS — an archival "
+        "copy byte-identical to its canonical twin is DEPRIORITIZED in ranking "
+        "(is_archival=true, canonical_path set), while a same-name-pattern file "
+        "whose content DIFFERS is surfaced as its own distinct hit (never "
+        "collapsed). Nothing is ever deleted or hidden from disk. Pass "
+        "include_archival=false to drop archival hits entirely. Returns "
+        "{outputs_dir, query, total_indexed, hits:[{path, score, bm25, "
+        "is_archival, canonical_path, kind, generating_script, csv_columns, "
+        "json_keys, size, mtime}]}. A missing dir / empty tree returns an empty "
+        "hits list, never an error.",
+     "inputSchema": {"type": "object", "properties": {
+         "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (walked recursively)."},
+         "query": {"type": "string", "description": "The BM25 query — one or more search terms (column names, keys, script names, or any text in a csv/json)."},
+         "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
+         "include_archival": {"type": "boolean", "description": "Default true — archival copies are deprioritized but still returned. Set false to exclude confirmed-archival files entirely."}},
+         "required": ["outputs_dir", "query"]}},
+    {"name": "search_code_semantic", "description":
+        "93fce816 — Cursor-style LOCAL semantic code search over a source tree, "
+        "entirely in a DuckDB sidecar (no cloud round-trip). Parses Python "
+        "(stdlib ast) and TypeScript/JavaScript (tree-sitter) into SEMANTIC "
+        "CHUNKS at function/class/method boundaries PLUS the un-named logical "
+        "blocks that a named-symbols-only graph search can't reach (module-level "
+        "dict/list literals, bare calls, __main__ guards, imports) — so a term "
+        "that only appears in a bare top-level call is still findable. "
+        "Incremental by a content MERKLE TREE: the root hash is compared first "
+        "and only divergent subtrees are walked, so only the files that actually "
+        "changed since the last pass are re-chunked (repeat calls on an "
+        "unchanged tree are near-free). Search is HYBRID — DuckDB native FTS "
+        "(Okapi BM25) for keyword match, fused via Reciprocal Rank Fusion with "
+        "an OPTIONAL local-embedding vector leg (DuckDB VSS / HNSW cosine over a "
+        "Model2Vec static model) when MERIDIAN_CODE_INDEX_VECTORS is enabled; "
+        "with vectors off (the default) it is a complete pure-BM25 code search. "
+        "Returns {root_dir, query, total_indexed, vectors_enabled, "
+        "vectors_active, hits:[{chunk_id, path, language, kind, name, "
+        "line_start, line_end, content, score, bm25, bm25_rank, vector_rank}]}. "
+        "A missing dir / empty tree returns an empty hits list, never an error.",
+     "inputSchema": {"type": "object", "properties": {
+         "root_dir": {"type": "string", "description": "Absolute path to the source-tree root to index and search (walked recursively; vendored/build dirs like node_modules/.git/dist are pruned)."},
+         "query": {"type": "string", "description": "The search query — keywords and/or a natural-language description of the code you want to find."},
+         "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
+         "kind": {"type": "string", "description": "Optional chunk-kind filter: one of 'function', 'class', 'method', 'interface', 'enum', 'module'."},
+         "reindex": {"type": "boolean", "description": "Default true — run an incremental Merkle-diff reindex before searching so results reflect the current tree. Set false to search the last-built index as-is."}},
+         "required": ["root_dir", "query"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
@@ -1428,6 +1491,8 @@ _READ_ONLY_TOOLS = {
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
     "find_similar_figure",
+    "search_outputs",
+    "search_code_semantic",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
 }
@@ -1486,6 +1551,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "find_symbol_usages": "Find Symbol Usages",
     "index_figure": "Index Figure",
     "find_similar_figure": "Find Similar Figure",
+    "search_outputs": "Search Outputs",
+    "search_code_semantic": "Search Code Semantic",
 }
 
 for _tool in _MCP_TOOLS_LIST:
