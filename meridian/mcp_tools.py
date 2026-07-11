@@ -568,12 +568,19 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "index_figure to check whether a figure is already present under a "
         "slightly different caption or path. Returns {document_id, matches:[...]} "
         "— an empty list (never an error) when the document has no indexed "
-        "figures, or doc doesn't resolve to a stored document.",
+        "figures, or doc doesn't resolve to a stored document. "
+        "d2a3537a — pass outputs_dir to RESOLVE THROUGH to the outputs index: "
+        "every matched figure with a file_path that names an already-indexed run "
+        "output gains a linked_output field (the output's path, generating_script, "
+        "canonical/archival flag, fingerprint), so 'does this plot already exist "
+        "as a run output?' and 'where is it referenced in my thesis?' are one "
+        "lookup (linked_output is null when the figure names no indexed output).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
          "description_or_path": {"type": "string", "description": "A free-text description OR a file path to fuzzy-match against this document's indexed figures."},
+         "outputs_dir": {"type": "string", "description": "d2a3537a — optional outputs tree root. When given, each matched figure resolves THROUGH to its outputs_index row (linked_output) by file_path. Omit for a pure fuzzy match."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "description_or_path"]}},
     {"name": "search_outputs", "description":

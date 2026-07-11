@@ -78,6 +78,14 @@ from .zotero_client import resolve_citation_ref
 
 _log = logging.getLogger(__name__)
 
+# Cross-store resolve-through seam (d2a3537a): a callable that maps a figure's
+# ``file_path`` to its ``outputs_index`` row (or ``None`` when the path names no
+# indexed output). Injected so ``doc_store`` never imports/owns the DuckDB
+# outputs index — the two stores stay decoupled connective tissue, not one merged
+# database. In production this is ``OutputsFtsIndex.resolve_output`` or a partial
+# of :func:`meridian.outputs_indexer.resolve_figure_output`.
+OutputResolver = Callable[[str], "dict[str, Any] | None"]
+
 
 # ---------------------------------------------------------------------------
 # Schema (owned by this store — NOT part of db.CREATE_TABLES / migrations)
@@ -2373,14 +2381,32 @@ class DocStructureStore:
         return [_row_to_dict(r, _FIGURE_COLUMNS) for r in rows]
 
     async def find_similar_figures(
-        self, document_id: str, description_or_path: str, *, limit: int = 5
+        self,
+        document_id: str,
+        description_or_path: str,
+        *,
+        limit: int = 5,
+        output_resolver: "OutputResolver | None" = None,
     ) -> list[dict[str, Any]]:
         """Fuzzy-match a free-text description OR a file path against this
         document's indexed figures; returns every stored figure carrying a
         ``score`` (the better of the difflib ratio against its
         ``normalized_caption`` and against its ``file_path``), best match first,
         capped at ``limit``. Mirrors :meth:`find_similar_equations`. Never
-        raises; an empty/unknown document yields ``[]``."""
+        raises; an empty/unknown document yields ``[]``.
+
+        Cross-store resolve-through (d2a3537a): when ``output_resolver`` is given
+        (a callable ``file_path -> output_row | None``, e.g.
+        ``OutputsFtsIndex.resolve_output`` or
+        :func:`meridian.outputs_indexer.resolve_figure_output` partially applied),
+        every returned figure that carries a ``file_path`` is resolved THROUGH to
+        its ``outputs_index`` row and gets a ``linked_output`` key: the matching
+        output row (path, generating_script, is_archival/canonical_path,
+        fingerprint) when the figure's file names an already-indexed run output,
+        else ``None``. So "does this plot already exist as a run output?" and
+        "where is it referenced in my thesis?" become one lookup. A resolver that
+        raises is swallowed (``linked_output`` stays ``None``) — the fuzzy match
+        must never be crashed by the cross-store hop."""
         query = (description_or_path or "").strip()
         norm = normalize_caption(query)
         query_lower = query.lower()
@@ -2390,10 +2416,57 @@ class DocStructureStore:
             cap_score = _figure_similarity(norm, fig.get("normalized_caption") or "")
             path = (fig.get("file_path") or "").strip().lower()
             path_score = _figure_similarity(query_lower, path) if path else 0.0
-            scored.append({**fig, "score": round(max(cap_score, path_score), 4)})
+            row = {**fig, "score": round(max(cap_score, path_score), 4)}
+            if output_resolver is not None:
+                row["linked_output"] = self._resolve_output(fig, output_resolver)
+            scored.append(row)
         scored.sort(key=lambda f: f["score"], reverse=True)
         lim = limit if isinstance(limit, int) and limit > 0 else 5
         return scored[:lim]
+
+    @staticmethod
+    def _resolve_output(
+        figure: dict[str, Any], output_resolver: "OutputResolver",
+    ) -> dict[str, Any] | None:
+        """Resolve ONE figure through to its ``outputs_index`` row (d2a3537a).
+
+        Calls ``output_resolver`` with the figure's ``file_path`` and returns the
+        linked output row, or ``None`` when the figure has no ``file_path`` or
+        names no indexed output. A resolver that raises resolves to ``None`` — the
+        cross-store hop is advisory glue and must never crash the caller."""
+        file_path = figure.get("file_path")
+        if not isinstance(file_path, str) or not file_path.strip():
+            return None
+        try:
+            return output_resolver(file_path)
+        except Exception:  # noqa: BLE001 — a resolver failure is a clean miss
+            _log.debug("figure output resolver failed for %r", file_path, exc_info=True)
+            return None
+
+    async def resolve_figure_output(
+        self, document_id: str, file_path: str, output_resolver: "OutputResolver",
+    ) -> dict[str, Any] | None:
+        """Thin resolve-through for a single stored figure by ``file_path``.
+
+        Cross-store glue (d2a3537a): find this document's figure whose
+        ``file_path`` matches ``file_path`` and return ``{figure, linked_output}``
+        — the figure row plus the ``outputs_index`` row it resolves through to
+        (``None`` linked_output when the file names no indexed output). Returns
+        ``None`` when the document has no figure at that path. Path matching is
+        exact on the stored string (the outputs-index side does the
+        normalization); ``output_resolver`` is the injected
+        ``file_path -> output_row | None`` seam. Never raises."""
+        target = (file_path or "").strip()
+        if not target:
+            return None
+        for fig in await self.get_figures(document_id):
+            fp = fig.get("file_path")
+            if isinstance(fp, str) and fp.strip() == target:
+                return {
+                    "figure": fig,
+                    "linked_output": self._resolve_output(fig, output_resolver),
+                }
+        return None
 
     async def put_figures(
         self,

@@ -140,6 +140,31 @@ def _glob_pattern(outputs_dir: str, suffix: str) -> str:
     return f"{base}/**/*.{suffix}"
 
 
+def _normalize_output_path(path: Any) -> str:
+    """Canonicalize a filesystem path for cross-store equality matching (d2a3537a).
+
+    A document figure's stored ``file_path`` and an ``outputs_index`` row's
+    ``path`` name the SAME file but need not be byte-identical strings — one may
+    use back-slashes, the other forward; one may be relative, one absolute; case
+    can differ on Windows. This normalizes both sides the same way so
+    :meth:`OutputsFtsIndex.resolve_output` matches them: ``os.path.normpath`` +
+    ``os.path.normcase`` on the absolute path, with separators unified to ``/``.
+    Blank / non-string input yields ``""`` (never matches anything).
+    """
+    if not isinstance(path, str):
+        return ""
+    s = path.strip()
+    if not s:
+        return ""
+    try:
+        s = os.path.abspath(s)
+    except (OSError, ValueError):
+        pass
+    # normcase lower-cases + flips slashes on Windows; normpath collapses ./..;
+    # unify to forward slashes so a cross-platform stored path still matches.
+    return os.path.normcase(os.path.normpath(s)).replace("\\", "/")
+
+
 def _rows_from_relation(relation: Any) -> list[dict[str, Any]]:
     """Materialize a DuckDB relation (or an injected stand-in) into row dicts."""
     columns = None
@@ -741,6 +766,65 @@ class OutputsFtsIndex:
         hits.sort(key=lambda h: h["score"], reverse=True)
         return hits[: max(1, int(limit))]
 
+    # -- resolve-through (d2a3537a) ------------------------------------------
+
+    def resolve_output(self, file_path: str) -> dict[str, Any] | None:
+        """Cross-store resolver: look up an indexed output row by its FILE PATH.
+
+        The connective tissue between ``doc_store`` and this index (d2a3537a):
+        given a document figure's ``file_path``, return the ``outputs_index`` row
+        for the SAME file when the figure points at an already-indexed output —
+        so "does this plot exist as a run output?" + "where is it referenced in
+        my thesis?" collapse into one lookup. This is a plain equality query on
+        ``path`` (NOT a BM25 relevance search), so it is exact: only a figure
+        whose file_path names a real indexed output resolves through.
+
+        Matching is path-normalized (:func:`_normalize_output_path`) so a figure
+        stored with back-slashes / a trailing slash / mixed case still resolves
+        to its output on Windows, without depending on the caller having stored a
+        byte-identical string. Returns the linked row as a dict
+        (path, generating_script, is_archival/canonical_path, sha256/mtime/size,
+        kind, csv_columns, json_keys) or ``None`` when no indexed output matches.
+        Never raises: an empty index or a query error yields ``None``.
+        """
+        target = _normalize_output_path(file_path)
+        if not target:
+            return None
+        with self._lock:
+            try:
+                con = self._connect()
+                self._ensure_schema(con)
+                relation = con.execute(
+                    "SELECT path, content, mtime, sha256, size, generating_script, "
+                    "kind, is_archival, canonical_path, csv_columns, json_keys "
+                    "FROM outputs_index"
+                )
+                columns = [c[0] for c in relation.description]
+                fetched = relation.fetchall()
+            except Exception:  # noqa: BLE001 — a bad/empty index resolves to None
+                _log.debug("OutputsFtsIndex.resolve_output failed", exc_info=True)
+                return None
+        for row in fetched:
+            rec = dict(zip(columns, row))
+            if _normalize_output_path(rec.get("path")) == target:
+                return {
+                    "path": rec["path"],
+                    "generating_script": rec.get("generating_script"),
+                    "is_archival": bool(rec.get("is_archival")),
+                    "canonical_path": rec.get("canonical_path"),
+                    "sha256": rec.get("sha256"),
+                    "kind": rec.get("kind"),
+                    "size": rec.get("size"),
+                    "mtime": rec.get("mtime"),
+                    "csv_columns": (
+                        json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+                    ),
+                    "json_keys": (
+                        json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+                    ),
+                }
+        return None
+
     def close(self) -> None:
         """Close the owned DuckDB connection (no-op for an injected one)."""
         with self._lock:
@@ -793,6 +877,30 @@ def search_outputs(
     finally:
         index.close()
     return result
+
+
+def resolve_figure_output(
+    outputs_dir: str, file_path: str,
+) -> dict[str, Any] | None:
+    """Stateless cross-store resolve-through (d2a3537a).
+
+    Walks ``outputs_dir``, builds the persistent-table index in an in-memory
+    DuckDB, and returns the ``outputs_index`` row whose path IS ``file_path``
+    (path-normalized equality, not a relevance search) — the module-level
+    counterpart of :meth:`OutputsFtsIndex.resolve_output` for callers that don't
+    hold a live index. Returns ``None`` for a blank path, a missing outputs
+    directory, or a figure that names no indexed output. Never raises.
+    """
+    if not file_path or not str(file_path).strip():
+        return None
+    if not os.path.isdir(outputs_dir):
+        return None
+    index = OutputsFtsIndex(outputs_dir)
+    try:
+        index.rebuild()
+        return index.resolve_output(file_path)
+    finally:
+        index.close()
 
 
 class OutputsIndexer:

@@ -2564,7 +2564,6 @@ async def _handle_notes_decisions(
         from ..latex_intel import analyze_latex  # noqa: PLC0415
         try:
             if fp:
-                import os  # noqa: PLC0415
                 if not os.path.isfile(fp):
                     return {"error": f"file not found: {fp}"}
                 return analyze_latex(fp)
@@ -2880,12 +2879,32 @@ async def _handle_notes_decisions(
             _limit = int(_limit) if _limit is not None else 5
         except (TypeError, ValueError):
             _limit = 5
+        # d2a3537a — cross-store resolve-through: when the caller names an
+        # outputs_dir, each matched figure that carries a file_path is resolved
+        # THROUGH to its outputs_index row (linked_output). Building the DuckDB
+        # index is CPU-bound, so do it once off the event loop and hand the store
+        # a resolver closure over the built index; skipped entirely when no
+        # outputs_dir is given (the tool stays a pure fuzzy match by default).
+        outputs_dir = str(args.get("outputs_dir") or "").strip()
+        _resolver = None
+        _index = None
+        if outputs_dir and os.path.isdir(outputs_dir):
+            from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+            _index = _outputs_indexer.OutputsFtsIndex(outputs_dir)
+            try:
+                await asyncio.to_thread(_index.rebuild)
+                _resolver = _index.resolve_output
+            except Exception:  # noqa: BLE001 — resolve-through is advisory glue
+                _resolver = None
         try:
             matches = await store.find_similar_figures(
-                doc_row["id"], query, limit=_limit,
+                doc_row["id"], query, limit=_limit, output_resolver=_resolver,
             )
         except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
             return {"error": f"could not find similar figures: {exc}"}
+        finally:
+            if _index is not None:
+                _index.close()
         return {
             "project_id": args["project_id"],
             "document_id": doc_row["id"],
