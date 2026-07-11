@@ -8828,6 +8828,56 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
+  // meridian/static/dashboard-subprojects.ts
+  function normParent(pid) {
+    if (pid == null) return null;
+    const s3 = String(pid).trim();
+    return s3 ? s3 : null;
+  }
+  function flattenHierarchy(projects) {
+    const byId = /* @__PURE__ */ new Map();
+    for (const p3 of projects) byId.set(p3.id, p3);
+    const childrenOf = /* @__PURE__ */ new Map();
+    const topLevel = [];
+    for (const p3 of projects) {
+      const parentId = normParent(p3.parent_project_id);
+      const parent = parentId ? byId.get(parentId) : void 0;
+      if (parent && !normParent(parent.parent_project_id)) {
+        let bucket = childrenOf.get(parentId);
+        if (!bucket) {
+          bucket = [];
+          childrenOf.set(parentId, bucket);
+        }
+        bucket.push(p3);
+      } else {
+        topLevel.push(p3);
+      }
+    }
+    const rows = [];
+    for (const p3 of topLevel) {
+      rows.push({ project: p3, depth: 0 });
+      const kids = childrenOf.get(p3.id);
+      if (kids) {
+        for (const kid of kids) rows.push({ project: kid, depth: 1 });
+      }
+    }
+    return rows;
+  }
+  function hasSubprojects(projects, projectId) {
+    return projects.some((p3) => normParent(p3.parent_project_id) === projectId);
+  }
+  function eligibleParents(projects, projectId) {
+    if (hasSubprojects(projects, projectId)) return [];
+    const self = projects.find((p3) => p3.id === projectId);
+    const currentParent = self ? normParent(self.parent_project_id) : null;
+    return projects.filter((p3) => {
+      if (p3.id === projectId) return false;
+      if (normParent(p3.parent_project_id)) return false;
+      if (p3.id === currentParent) return false;
+      return true;
+    });
+  }
+
   // meridian/static/dashboard.ts
   var TABS_KEY = "meridian.openTabs";
   var ACTIVE_PROJECT_KEY = "meridian.activeProject";
@@ -10137,7 +10187,7 @@ ${n2.tags || ""}`.toLowerCase();
         list.appendChild(header);
         if (isCollapsed) return;
       }
-      group.projects.forEach((p3) => list.appendChild(_makeProjectItem(p3)));
+      flattenHierarchy(group.projects).forEach((row) => list.appendChild(_makeProjectItem(row.project, row.depth)));
     });
     const switcher = document.getElementById("project-switcher");
     if (switcher) {
@@ -10154,14 +10204,15 @@ ${n2.tags || ""}`.toLowerCase();
     }
     syncSidebarActiveProject();
   }
-  function _makeProjectItem(p3) {
+  function _makeProjectItem(p3, depth = 0) {
     const div = document.createElement("div");
-    div.className = "project-item" + (state.activeTab === p3.id ? " active" : "");
+    const isSub = depth > 0;
+    div.className = "project-item" + (state.activeTab === p3.id ? " active" : "") + (isSub ? " project-subitem" : "");
     div.dataset.projectId = p3.id;
-    div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;";
+    div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;" + (isSub ? `padding-left:${14 + depth * 12}px;` : "");
     const nameSpan = document.createElement("span");
     nameSpan.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
-    nameSpan.textContent = p3.name;
+    nameSpan.textContent = (isSub ? "\u2514 " : "") + p3.name;
     const menuBtn = document.createElement("button");
     menuBtn.textContent = "\u22EF";
     menuBtn.title = "Project actions";
@@ -10201,6 +10252,61 @@ Existing folders: ${existing.join(", ")}` : "";
     loadProjects();
     const folder = (next || "").trim();
     toast(folder ? `Moved to folder "${folder}"` : `Moved to ${UNGROUPED_LABEL}`);
+  }
+  async function _makeSubproject(t3) {
+    const candidates = eligibleParents(state.projects, t3.id);
+    if (!candidates.length) {
+      if (state.projects.some((p3) => p3.parent_project_id === t3.id)) {
+        toast("This project has subprojects of its own \u2014 subprojects are one level deep.", true);
+      } else {
+        toast("No eligible parent project \u2014 add another top-level project first.", true);
+      }
+      return;
+    }
+    const lines = candidates.map((p3, i3) => `${i3 + 1}. ${p3.name}`).join("\n");
+    const raw = window.prompt(
+      `Make "${t3.project.name}" a subproject of which project?
+
+${lines}
+
+Enter a number (or leave blank to cancel):`,
+      ""
+    );
+    if (raw === null) return;
+    const idx = parseInt(raw.trim(), 10) - 1;
+    if (Number.isNaN(idx) || idx < 0 || idx >= candidates.length) {
+      if (raw.trim() !== "") toast("Invalid selection", true);
+      return;
+    }
+    const parent = candidates[idx];
+    try {
+      await api(`/projects/${t3.id}/parent`, {
+        method: "POST",
+        body: JSON.stringify({ parent_project_id: parent.id })
+      });
+      t3.project = { ...t3.project, parent_project_id: parent.id };
+      const proj = state.projects.find((p3) => p3.id === t3.id);
+      if (proj) proj.parent_project_id = parent.id;
+      await loadProjects();
+      toast(`"${t3.project.name}" is now a subproject of "${parent.name}"`);
+    } catch (e3) {
+      toast("Could not set parent: " + e3.message, true);
+    }
+  }
+  async function _detachSubproject(t3) {
+    try {
+      await api(`/projects/${t3.id}/parent`, {
+        method: "POST",
+        body: JSON.stringify({ parent_project_id: null })
+      });
+      t3.project = { ...t3.project, parent_project_id: null };
+      const proj = state.projects.find((p3) => p3.id === t3.id);
+      if (proj) proj.parent_project_id = null;
+      await loadProjects();
+      toast(`"${t3.project.name}" detached to top level`);
+    } catch (e3) {
+      toast("Could not detach: " + e3.message, true);
+    }
   }
   function openTab(project) {
     const existing = state.tabs.find((t3) => t3.id === project.id);
@@ -10376,6 +10482,11 @@ Existing folders: ${existing.join(", ")}` : "";
     menuItem("\u270F Rename", () => _renameProject(t3));
     menuItem("\u{1F3A8} Change icon\u2026", () => _setProjectIcon(t3));
     menuItem("\u{1F4C1} Move to folder\u2026", () => _moveProjectToFolder(t3));
+    if (t3.project && t3.project.parent_project_id) {
+      menuItem("\u2934 Detach from parent", () => _detachSubproject(t3));
+    } else {
+      menuItem("\u{1F517} Make subproject of\u2026", () => _makeSubproject(t3));
+    }
     menuItem("\u2B07 Download DB", () => window.open("/admin/snapshot", "_blank"));
     menuItem("\u{1F5D1} Delete project\u2026", () => _deleteProject(t3));
     const rect = anchor.getBoundingClientRect();
@@ -16557,7 +16668,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
+    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, flattenHierarchy, eligibleParents, state });
   } catch (e3) {
   }
 })();

@@ -508,6 +508,47 @@ async def rename_project(
     return updated
 
 
+@router.post("/projects/{project_id}/parent")
+async def set_project_parent(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """0fed6a42 — set / change / clear a project's parent (subproject hierarchy).
+
+    REST mirror of the ``set_parent_project`` MCP tool, wired for the dashboard's
+    "Make subproject of…" / "Detach from parent" kebab actions. Body:
+    ``{"parent_project_id": "<id>"}`` to nest, or ``{"parent_project_id": null}``
+    to detach to top level.
+
+    Validation lives in ``db.set_parent_project`` and enforces the one-level-deep
+    invariant (a project cannot be its own parent, the parent must itself be
+    top-level, and a project that already has subprojects cannot become one). A
+    violation raises ``ValueError`` → 400; an unknown ``project_id`` → 404.
+    Broadcasts a ``project_parent_changed`` WS event so other open dashboards
+    re-render their sidebar tree.
+    """
+    if "parent_project_id" not in body:
+        raise HTTPException(400, "parent_project_id is required (pass null to detach)")
+    raw = body.get("parent_project_id")
+    parent_project_id = str(raw).strip() if raw else None
+    db = await _db(request)
+    try:
+        updated = await db_module.set_parent_project(
+            db, project_id, parent_project_id
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if updated is None:
+        raise HTTPException(404, "project not found")
+    db_module.publish_global(
+        {
+            "type": "project_parent_changed",
+            "project_id": project_id,
+            "parent_project_id": parent_project_id,
+        }
+    )
+    return updated
+
+
 @router.delete("/projects/{project_id}", status_code=204)
 async def delete_project(project_id: str, request: Request) -> None:
     """v1.9.x — delete a project and all data.

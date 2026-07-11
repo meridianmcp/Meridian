@@ -133,6 +133,10 @@ class Project(BaseModel):
     icon: str | None = None
     status: str = "active"       # 8db00fcb — active | parked | archived
     priority: str = "P2"         # 8db00fcb — P0 | P1 | P2
+    # 0fed6a42 — one-level-deep subproject hierarchy. Surfaced on the /projects
+    # listing so the dashboard sidebar can render subprojects nested under their
+    # parent; null/absent means a top-level project.
+    parent_project_id: str | None = None
     created_at: str
 
 
