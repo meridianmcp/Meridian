@@ -5395,6 +5395,51 @@ async def _handle_outputs_tools(
     return _MISS
 
 
+async def _handle_code_index_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: search_code_semantic (93fce816 — Cursor-style local code
+    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS)."""
+    if name == "search_code_semantic":
+        from .. import code_index as _code_index  # noqa: PLC0415
+        root_dir = str(args.get("root_dir") or "").strip()
+        query = str(args.get("query") or "").strip()
+        if not root_dir:
+            raise ValueError("root_dir is required")
+        if not query:
+            raise ValueError("query is required")
+        limit = args.get("limit", 10)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 10
+        kind = args.get("kind")
+        kind = str(kind).strip() if kind else None
+        reindex = args.get("reindex", True)
+        # Persist the sidecar per project dir so incremental Merkle reindex is
+        # cheap across calls; falls back to in-memory if data_dir is unset.
+        db_path = ":memory:"
+        if data_dir:
+            db_path = os.path.join(data_dir, "code_index.duckdb")
+        # The walk + hash + tree-sitter chunk + DuckDB FTS build is CPU-bound;
+        # run it off the event loop so a large repo doesn't block other MCP calls.
+        return await asyncio.to_thread(
+            _code_index.search_code_semantic,
+            root_dir,
+            query,
+            limit=limit,
+            kind=kind,
+            db_path=db_path,
+            reindex=bool(reindex),
+        )
+    return _MISS
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -5433,6 +5478,7 @@ async def _dispatch_mcp_tool(
         _handle_plugin_tools,
         _handle_tunnel_tools,
         _handle_outputs_tools,
+        _handle_code_index_tools,
     )
     for _grp in _groups:
         _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)

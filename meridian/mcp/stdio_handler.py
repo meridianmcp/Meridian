@@ -1108,6 +1108,41 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="search_code_semantic",
+                description=(
+                    "93fce816 — Cursor-style LOCAL semantic code search over a "
+                    "source tree. Parses Python (stdlib ast) + TypeScript/"
+                    "JavaScript (tree-sitter) into SEMANTIC CHUNKS at function/"
+                    "class/method boundaries PLUS the un-named blocks "
+                    "search_graph can't see (module-level dict/list literals, "
+                    "bare calls, __main__ guards). Incremental: a content MERKLE "
+                    "TREE detects exactly which files changed since the last pass "
+                    "and re-chunks only the divergent subtree, so repeat calls on "
+                    "an unchanged tree are near-free. Search is HYBRID — DuckDB "
+                    "native FTS (Okapi BM25) for keyword match, fused via "
+                    "Reciprocal Rank Fusion with an OPTIONAL local-embedding "
+                    "vector leg (DuckDB VSS / HNSW cosine over Model2Vec) when "
+                    "MERIDIAN_CODE_INDEX_VECTORS is enabled; otherwise pure BM25. "
+                    "Entirely local in a DuckDB sidecar — no cloud round-trip. "
+                    "Returns {root_dir, query, total_indexed, vectors_enabled, "
+                    "vectors_active, hits:[{chunk_id, path, language, kind, name, "
+                    "line_start, line_end, content, score, bm25, bm25_rank, "
+                    "vector_rank}]}. A missing dir / empty tree returns an empty "
+                    "hits list, never an error."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "root_dir": {"type": "string", "description": "Absolute path to the source tree root to index and search (walked recursively; vendored/build dirs pruned)."},
+                        "query": {"type": "string", "description": "The search query — keywords and/or a natural-language description of the code you want."},
+                        "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
+                        "kind": {"type": "string", "description": "Optional chunk-kind filter (e.g. 'function', 'class', 'method', 'interface', 'module')."},
+                        "reindex": {"type": "boolean", "description": "Default true — run an incremental Merkle-diff reindex before searching so results reflect the current tree. false searches the last-built index as-is."},
+                    },
+                    "required": ["root_dir", "query"],
+                },
+            ),
+            Tool(
                 name="get_notes",
                 description=(
                     "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
@@ -2077,6 +2112,7 @@ def build_mcp_server():
                 "index_equation", "find_similar_equation", "insert_equation", "update_paragraph", "find_symbol_usages",
                 "index_figure", "find_similar_figure",
                 "search_outputs",
+                "search_code_semantic",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",
