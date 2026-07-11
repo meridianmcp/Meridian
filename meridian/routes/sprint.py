@@ -180,6 +180,28 @@ async def sprint_pending_count(
     }
 
 
+@router.get("/projects/{project_id}/sprint/test_coverage_expected")
+async def sprint_test_coverage_expected_endpoint(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """43539c70 - does the project's current in-progress sprint item call for
+    test/coverage work?
+
+    Powers the PostToolUse test-tamper guard's exemption. The guard flags any
+    test-file edit as a possible "make a failing test pass by editing the test"
+    tamper - UNLESS the item being worked explicitly asks for new/updated tests
+    (legitimate feature work adds tests). Returns
+    ``{"test_coverage_expected": bool}``. Distinct ``/sprint/`` path, mirroring
+    ``/sprint/pending_count``, so there is no collision with ``/sprint-items``.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    expected = await db_module.sprint_test_coverage_expected(db, project_id)
+    return {"test_coverage_expected": bool(expected)}
+
+
 @router.post("/projects/{project_id}/sprint-items", status_code=201)
 async def add_sprint_item_endpoint(
     project_id: str, body: dict[str, Any], request: Request

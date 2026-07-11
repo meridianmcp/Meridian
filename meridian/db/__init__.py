@@ -5167,6 +5167,72 @@ async def count_pending_sprint_items(
     return int(row["c"] if isinstance(row, dict) else row[0])
 
 
+# 43539c70 - keywords that mark a sprint item as legitimately calling for
+# test/coverage work, so the test-tamper guard exempts test-file edits made under
+# it. Matched case-insensitively against the item's title + notes.
+_TEST_COVERAGE_KEYWORDS = (
+    "test",
+    "tests",
+    "testing",
+    "coverage",
+    "regression",
+    "unit test",
+    "add a test",
+    "write a test",
+)
+
+
+def _text_calls_for_test_coverage(text: str | None) -> bool:
+    """True if free-text explicitly calls for test/coverage work.
+
+    Backs the test-tamper guard's exemption: legitimate feature work that a sprint
+    item asks to cover with tests should NOT be flagged as test tampering. Matched
+    on whole-word ``test``/``tests``/``testing``/``coverage``/``regression`` (plus
+    a couple of phrases) so an incidental substring like ``latest`` or
+    ``contested`` does not trip it.
+    """
+    if not text:
+        return False
+    import re as _re  # noqa: PLC0415
+
+    lowered = text.lower()
+    for kw in _TEST_COVERAGE_KEYWORDS:
+        if " " in kw:
+            if kw in lowered:
+                return True
+        elif _re.search(rf"\b{_re.escape(kw)}\b", lowered):
+            return True
+    return False
+
+
+async def sprint_test_coverage_expected(
+    db: aiosqlite.Connection, project_id: str
+) -> bool:
+    """43539c70 - True if an in-progress sprint item's own text calls for
+    test/coverage work.
+
+    Powers the PostToolUse test-tamper guard's exemption endpoint. If any item the
+    project currently has ``in_progress`` mentions tests/coverage in its title or
+    notes, editing a test file under it is legitimate feature work, not tampering,
+    so the guard stays silent. Only ``in_progress`` items are considered (the item
+    the executor is actively working); done/pending items do not exempt anything.
+    """
+    async with db.execute(
+        "SELECT title, notes FROM sprint_items "
+        "WHERE project_id = ? AND status = 'in_progress'",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    for row in rows or []:
+        if isinstance(row, dict):
+            title, notes = row.get("title"), row.get("notes")
+        else:
+            title, notes = row[0], row[1]
+        if _text_calls_for_test_coverage(title) or _text_calls_for_test_coverage(notes):
+            return True
+    return False
+
+
 async def get_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
