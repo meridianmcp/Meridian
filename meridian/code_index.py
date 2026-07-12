@@ -1148,6 +1148,41 @@ _INDEX_CACHE: dict[tuple[str, str], CodeIndex] = {}
 _INDEX_CACHE_LOCK = threading.Lock()
 
 
+def normalize_root_dir(root_dir: str | None) -> str:
+    """Normalize a caller-supplied ``root_dir`` before any ``os.path.isdir`` check.
+
+    a0cf71ef — ``search_code_semantic`` reported ``root_dir does not exist`` for
+    paths that ARE valid local directories, because the raw string was fed to
+    ``os.path.isdir`` unnormalized. Real clients hand us the path in shapes that
+    ``isdir`` rejects verbatim even though the directory exists:
+
+    * surrounding single/double quotes (``"C:\\Users\\...\\repository"``) — a
+      shell / JSON round-trip that never got unquoted;
+    * a leading ``~`` (or ``~user``) that was never expanded;
+    * ``$VAR`` / ``%VAR%`` environment references;
+    * stray surrounding whitespace or a trailing separator.
+
+    We strip quotes + whitespace, expand ``~`` and env vars, and collapse the
+    path with ``abspath`` (which also normalizes separators, so a forward-slash
+    path from a POSIX-style client resolves on Windows). Slash STYLE is left to
+    the OS — both ``os.path.isdir`` and ``os.walk`` accept ``/`` and ``\\`` on
+    Windows, so we deliberately do not rewrite separators ourselves. Returns
+    "" for a falsy input so callers still hit their "required"/"does not exist"
+    guard.
+    """
+    if not root_dir:
+        return ""
+    s = str(root_dir).strip()
+    # Strip a single layer of matching surrounding quotes (JSON/shell artifacts).
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    if not s:
+        return ""
+    # Expand ~ and environment variables, then collapse to an absolute path.
+    s = os.path.expanduser(os.path.expandvars(s))
+    return os.path.abspath(s)
+
+
 def get_code_index(root_dir: str, *, db_path: str = ":memory:") -> CodeIndex:
     """Return a process-cached :class:`CodeIndex` for ``(root_dir, db_path)``.
 
@@ -1175,6 +1210,10 @@ def reindex_at_checkpoint(
     checkpoint the Merkle root-hash compare short-circuits and no re-chunking
     happens. Never raises — a bad root simply reports zero changes.
     """
+    # a0cf71ef — normalize (unquote / expanduser / abspath) before the isdir
+    # check so a valid local dir handed to us in a quoted or ~-prefixed shape is
+    # accepted, and "does not exist" is returned ONLY when it truly is not a dir.
+    root_dir = normalize_root_dir(root_dir)
     if not root_dir or not os.path.isdir(root_dir):
         return {
             "changed_files": [], "added": [], "modified": [], "removed": [],
@@ -1205,6 +1244,11 @@ def search_code_semantic(
     ``{root_dir, query, total_indexed, vectors_enabled, hits:[...]}``. A missing
     directory / empty tree returns an empty hits list, never an error.
     """
+    # a0cf71ef — normalize (unquote / expanduser / abspath) so a valid local dir
+    # handed to us in a quoted or ~-prefixed shape resolves; report the resolved
+    # path back so the caller sees exactly what was searched. "does not exist" is
+    # then returned ONLY when the normalized path truly is not a directory.
+    root_dir = normalize_root_dir(root_dir)
     result: dict[str, Any] = {
         "root_dir": root_dir,
         "query": query,
