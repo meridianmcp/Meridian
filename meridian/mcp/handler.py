@@ -951,8 +951,13 @@ async def _handle_mcp_request(
             if not _is_github and name not in _meridian_tool_names() and tenant and tenant.get("id"):
                 from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
                 if _tunnel_mod.has_active_tunnel(tenant["id"]):
+                    # 73d233e4 — pass db + the caller's session_id so the word/office
+                    # (docx) write path can consult file claims and refuse a
+                    # concurrent-write conflict instead of silently last-save-wins
+                    # overwriting another session's edit to the same document.
                     tunnel_result = await _tunnel_mod.call_tunnel_tool(
                         tenant["id"], name, args,
+                        db=db, session_id=(args.get("session_id") or "").strip() or None,
                     )
                     if tunnel_result is not None:
                         # Pass the tunneled server's result through verbatim — it

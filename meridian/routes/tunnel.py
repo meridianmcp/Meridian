@@ -2660,9 +2660,147 @@ async def list_tunnel_tools(
     return aggregated
 
 
+# ---------------------------------------------------------------------------
+# 73d233e4 — concurrent-write protection for the word/office (docx) tunnel path.
+#
+# The word slot (docx-mcp) is a pure network relay: two agents editing DIFFERENT
+# sections of the same .docx over the tunnel silently overwrite each other, because
+# a .docx is a zip container with NO partial write — every mutating tool re-saves
+# the whole file, so last-save-wins. There is no native cross-agent lock for a
+# tunneled Office document.
+#
+# Meridian already owns the vendor-neutral coordination primitive for exactly this:
+# file claims (claim_file / get_file_claims) + the pure evaluate_claim_guard
+# decision core. The fix wires the word write path into that machinery — before a
+# MUTATING word tool is relayed, we consult the target document's live claims and
+# REFUSE the write when another live session holds a conflicting write/symbol claim
+# on it. A read tool, or a write on a document nobody else has claimed, passes
+# through untouched. Keyed on the target document path so two agents on two
+# different .docx files never contend.
+# ---------------------------------------------------------------------------
+
+# docx-mcp mutating tools re-serialize the whole zip container (no partial write),
+# so every one of these is a last-save-wins hazard under concurrent editing. Names
+# are the bare docx-mcp tool names (the connector prefix is stripped before this
+# runs). Kept as a curated allowlist of *known* writers rather than a "not in a
+# read set" heuristic so a new read tool can never be mis-flagged as a writer.
+_WORD_WRITE_TOOLS = frozenset({
+    "create_document",
+    "save_document",
+    "add_paragraph",
+    "add_heading",
+    "add_table",
+    "add_image",
+    "add_picture",
+    "add_page_break",
+    "add_break",
+    "add_list",
+    "add_bullet_list",
+    "add_numbered_list",
+    "set_paragraph_text",
+    "edit_paragraph",
+    "update_paragraph",
+    "replace_text",
+    "replace_paragraph",
+    "delete_paragraph",
+    "insert_paragraph",
+    "set_heading",
+    "set_style",
+    "apply_style",
+    "set_cell_text",
+    "update_cell",
+    "merge_cells",
+    "set_header",
+    "set_footer",
+    "set_properties",
+    "set_document_properties",
+    "convert_document",
+    "copy_document",
+})
+
+# Argument keys a docx-mcp tool uses to name its target document, in priority order.
+_WORD_DOC_ARG_KEYS = ("filename", "file_path", "path", "document", "document_path",
+                      "doc_path", "output_path", "target")
+
+
+def _word_write_target(name: str, arguments: "dict | None") -> "str | None":
+    """Return the target document path for a MUTATING word-slot tool, else None.
+
+    ``name`` is the BARE (prefix-stripped) docx-mcp tool name. Returns None for a
+    read-only tool, an unknown tool, or a writer whose target document path can't
+    be found in ``arguments`` (fail-open — we can't guard what we can't identify).
+    """
+    bare = name.split("__", 1)[1] if "__" in name else name
+    if bare not in _WORD_WRITE_TOOLS:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    for key in _WORD_DOC_ARG_KEYS:
+        val = arguments.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+async def check_word_write_conflict(
+    db: Any,
+    tenant_id: str,
+    name: str,
+    arguments: "dict | None",
+    session_id: "str | None" = None,
+) -> "dict | None":
+    """Consult file claims before relaying a MUTATING word-slot tool (73d233e4).
+
+    Returns a conflict verdict dict ``{"blocked": True, "document": path,
+    "holder": <session>, "reason": <reason>, "message": <human text>}`` when
+    another live session holds a conflicting write/symbol claim on the target
+    document, else ``None`` (clear — the relay may proceed).
+
+    Coordination reuses the existing primitives: :func:`get_file_claims` for the
+    live claims on the document and :func:`evaluate_claim_guard` (the vendor-neutral
+    decision core) for the allow/block decision, keyed on ``session_id`` (the caller
+    treated as claim-less when unknown, so ANY other session's write claim conflicts).
+
+    Fail-open by design — a missing db, an unidentifiable target, or a claim-lookup
+    error degrades to None (no block). This guard SURFACES a conflict; the .docx is
+    still a real last-save-wins hazard, so a caller that wants a hard gate should
+    claim_file the document first.
+    """
+    target = _word_write_target(name, arguments)
+    if not target or db is None:
+        return None
+    try:
+        claims = await db_module.get_file_claims(db, target)
+    except Exception as exc:  # noqa: BLE001 — never wedge a write on a lookup error
+        _log.debug("word write-guard: get_file_claims(%s) failed: %s", target, exc)
+        return None
+    from ..claim_guard import evaluate_claim_guard  # noqa: PLC0415
+    verdict = evaluate_claim_guard(claims, session_id or "", mode="write")
+    if verdict.get("allow", True):
+        return None
+    holder = verdict.get("holder")
+    reason = verdict.get("reason") or "write_locked"
+    return {
+        "blocked": True,
+        "document": target,
+        "holder": holder,
+        "reason": reason,
+        "message": (
+            f"Concurrent-write conflict on {target}: session {holder} holds a live "
+            f"{reason} claim. A .docx is a zip container with no partial write, so a "
+            f"relayed edit would silently overwrite the other session's work "
+            f"(last-save-wins). Coordinate or wait for the claim to release, then "
+            f"retry. To edit in parallel, claim_file the document first."
+        ),
+    }
+
+
 async def call_tunnel_tool(
     tenant_id: str, name: str, arguments: dict | None,
     repo_path: str | None = None,
+    *,
+    db: Any = None,
+    session_id: "str | None" = None,
 ) -> dict | None:
     """Route a ``tools/call`` to the tunnel that owns ``name``.
 
@@ -2673,6 +2811,14 @@ async def call_tunnel_tool(
     4d9ad87b — ``repo_path`` (explicit or from _tenant_active_repo cache) is
     forwarded as ``X-Meridian-Repo-Path`` so the SerenaDaemonPool on the tunnel
     client routes code-intel requests to the correct per-repo Serena daemon.
+
+    73d233e4 — when a MUTATING word-slot (docx) tool is being relayed and ``db``
+    is supplied, consult the target document's live file claims first and RAISE a
+    concurrent-write conflict (surfaced to the caller as an MCP error) when another
+    live session holds a conflicting claim on it. A .docx is a zip container with no
+    partial write, so two relayed edits silently last-save-wins each other; the
+    guard turns that silent stomp into a legible, coordinatable error. Fail-open —
+    no db / unidentifiable target / lookup error passes through unchanged.
     """
     label = (_tunnel_tool_routes.get(tenant_id) or {}).get(name)
     if label is None:
@@ -2705,6 +2851,17 @@ async def call_tunnel_tool(
                         f"filesystem tools require absolute paths — got relative path {_p!r}. "
                         f"Use a full path, e.g. C:\\\\Users\\\\13144\\\\Documents\\\\...\\\\{_p}"
                     )
+    # 73d233e4 — concurrent-write protection on the word/office (docx) path. A
+    # tunneled .docx write has no partial-write; without this, two sessions editing
+    # the same document silently overwrite each other (last-save-wins). Before
+    # relaying a MUTATING word tool, consult the target document's live claims and
+    # refuse when another live session holds a conflicting write/symbol claim.
+    if label == "word":
+        conflict = await check_word_write_conflict(
+            db, tenant_id, name, arguments, session_id=session_id,
+        )
+        if conflict is not None:
+            raise RuntimeError(conflict["message"])
     # 4d9ad87b — resolve repo_path: explicit arg wins, then cached value from the
     # last send_active_repo_control call for this tenant.
     effective_repo_path = repo_path or _tenant_active_repo.get(tenant_id)
