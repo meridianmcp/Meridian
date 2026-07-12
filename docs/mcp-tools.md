@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **110 tools** over MCP.
+Meridian exposes **111 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -653,6 +653,23 @@ Create a new Meridian project.
 **Example:**
 ```
 create_project(name="my-app")
+```
+
+---
+
+
+### `merge_project`
+d6bd60e0 — merge a phantom-duplicate project INTO another. Re-parents EVERY child row of the source project (sprint items, tasks, decisions, insights, notes, HITL requests, sessions, handoffs, pointers, …) to the target project via pure UPDATEs — NO row is ever deleted. By default the now-empty source project is soft-archived (status='archived', name prefixed with '[merged] '), never hard-deleted; pass archive_source=false to leave it untouched. Returns {source_project_id, target_project_id, moved: {table: count}, source_archived}. Returns {error} if source==target or either project does not exist.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source_project_id` | string | required | The id of the project to merge FROM (its rows are re-parented; it is archived unless archive_source=false). |
+| `target_project_id` | string | required | The id of the project to merge INTO (receives all of the source's rows). |
+| `archive_source` | boolean | optional | Default true — soft-archive the emptied source project (status='archived', name prefixed '[merged] '). Set false to leave the source project row untouched. The source is NEVER hard-deleted either way. |
+
+**Example:**
+```
+merge_project(source_project_id="dup-uuid", target_project_id="keep-uuid")
 ```
 
 ---

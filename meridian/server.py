@@ -3725,6 +3725,7 @@ async def mcp_tools_doc() -> str:
     lines += _render_tool("delete_note")
     lines += ["## Projects\n"]
     lines += _render_tool("create_project")
+    lines += _render_tool("merge_project")
     lines += ["## Legacy\n"]
     lines += _render_tool("register_session",
         "!!! note \"Deprecated\"\n    Use `start_session` instead — it registers the session **and** returns "

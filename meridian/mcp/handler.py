@@ -1868,6 +1868,29 @@ async def _handle_project_tools(
         return await db_module.set_goal(db, args["project_id"], args["content"])
     if name == "set_north_star":
         return await db_module.set_north_star(db, args["project_id"], args["north_star"])
+    if name == "merge_project":
+        # d6bd60e0 — merge a phantom-duplicate project INTO another. Re-parents the
+        # source's child rows to the target (pure UPDATEs, never a delete) and
+        # soft-archives the source unless archive_source is explicitly false. The db
+        # layer returns an {error} dict on self-merge / unknown project, which we
+        # surface verbatim. Resolve BOTH sides by id or name — a name-only arg for
+        # the source never touches the central project_id resolver (that only maps
+        # project_id/project_name), so mirror the set_parent_project resolve-then-
+        # guard pattern for each side.
+        _src = (args.get("source_project_id") or "").strip()
+        if not _src and args.get("source_project_name"):
+            _sp = await db_module.get_project_by_name(db, str(args["source_project_name"]))
+            _src = (_sp or {}).get("id", "") if _sp else ""
+        _tgt = (args.get("target_project_id") or "").strip()
+        if not _tgt and args.get("target_project_name"):
+            _tp = await db_module.get_project_by_name(db, str(args["target_project_name"]))
+            _tgt = (_tp or {}).get("id", "") if _tp else ""
+        if not _src or not _tgt:
+            return {"error": "source_project_id and target_project_id are both required"}
+        return await db_module.merge_project(
+            db, _src, _tgt,
+            archive_source=bool(args.get("archive_source", True)),
+        )
     return _MISS
 
 

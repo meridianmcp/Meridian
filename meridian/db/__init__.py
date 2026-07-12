@@ -1246,6 +1246,122 @@ async def set_parent_project(
     return await get_project(db, project_id)
 
 
+# d6bd60e0 — every table that carries a project_id FK to projects(id) and whose
+# rows should follow the project when two projects are merged. This is the
+# authoritative re-parent set for merge_project: a source project's child rows
+# are UPDATEd to the target's id, table by table. Kept as an explicit, auditable
+# tuple (rather than reflected from the schema) so a merge NEVER silently skips —
+# or silently sweeps up — a table: adding a new project-scoped table is a
+# deliberate one-line addition here, mirrored by a test.
+#
+# NOTE: session_notes / session_findings-style tables keyed ONLY by session_id
+# re-parent transitively via ``sessions`` and are intentionally absent. Tables
+# listed here each have a real ``project_id`` column (verified against
+# CREATE_TABLES + the migration table literals).
+_MERGE_PROJECT_TABLES: tuple[str, ...] = (
+    "goal_states",
+    "sessions",
+    "task_log",
+    "sprint_items",
+    "decisions_pinned",
+    "insights",
+    "project_notes",
+    "hitl_requests",
+    "executor_runs",
+    "active_worktrees",
+    "codebase_graph_entities",
+    "handoffs",
+    "session_findings",
+    "session_messages",
+    "session_graph_snapshots",
+    "sprint_item_pointers",
+)
+
+
+async def merge_project(
+    conn: aiosqlite.Connection,
+    source_project_id: str,
+    target_project_id: str,
+    *,
+    archive_source: bool = True,
+) -> dict[str, Any]:
+    """d6bd60e0 — merge a phantom-duplicate project INTO another.
+
+    Re-parents every child row of ``source_project_id`` to
+    ``target_project_id`` via ``UPDATE ... SET project_id = target WHERE
+    project_id = source`` for each table in :data:`_MERGE_PROJECT_TABLES` (the
+    full set of tables carrying a ``project_id`` FK to ``projects``). This is a
+    pure re-parent: NO row is ever deleted.
+
+    The source project itself is not hard-deleted. When ``archive_source`` is
+    true (default) it is soft-archived in place: its ``status`` is set to
+    ``'archived'`` and its ``name`` is prefixed with ``'[merged] '`` (unless it
+    already carries that prefix), which also frees the original name for reuse.
+    Pass ``archive_source=False`` to leave the now-empty source project
+    untouched.
+
+    Guards (return an ``{'error': ...}`` dict, mutate nothing):
+      * ``source_project_id == target_project_id`` — a project cannot merge into
+        itself.
+      * either project row does not exist.
+
+    Works on both SQLite and Postgres through the shared adapter (``?`` is
+    rewritten to ``%s``; ``autocommit`` — never ``conn.commit()`` on Postgres,
+    while the SQLite path commits explicitly, matching the rest of this module).
+
+    Returns::
+
+        {
+            "source_project_id": <str>,
+            "target_project_id": <str>,
+            "moved": {table: count, ...},   # rows re-parented per table
+            "source_archived": <bool>,
+        }
+    """
+    if source_project_id == target_project_id:
+        return {"error": "source and target project are the same"}
+
+    source = await get_project(conn, source_project_id)
+    if source is None:
+        return {"error": f"source project '{source_project_id}' does not exist"}
+    target = await get_project(conn, target_project_id)
+    if target is None:
+        return {"error": f"target project '{target_project_id}' does not exist"}
+
+    moved: dict[str, int] = {}
+    for table in _MERGE_PROJECT_TABLES:
+        # Table names come from the module-local constant tuple, never user
+        # input, so this f-string interpolation cannot be an injection vector.
+        async with conn.execute(
+            f"UPDATE {table} SET project_id = ? WHERE project_id = ?",
+            (target_project_id, source_project_id),
+        ) as cur:
+            moved[table] = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+
+    source_archived = False
+    if archive_source:
+        current_name = source.get("name") or ""
+        new_name = (
+            current_name
+            if current_name.startswith("[merged] ")
+            else f"[merged] {current_name}"
+        )
+        await conn.execute(
+            "UPDATE projects SET name = ?, status = 'archived' WHERE id = ?",
+            (new_name, source_project_id),
+        )
+        source_archived = True
+
+    await conn.commit()
+
+    return {
+        "source_project_id": source_project_id,
+        "target_project_id": target_project_id,
+        "moved": moved,
+        "source_archived": source_archived,
+    }
+
+
 async def get_project_settings(
     db: aiosqlite.Connection, project_id: str
 ) -> dict[str, Any] | None:
