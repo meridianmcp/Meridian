@@ -16223,7 +16223,10 @@ def test_agent_instructions_include_reindex_at_session_start():
     )
     assert 'index_repository(mode="fast")' in DEFAULT_AGENT_INSTRUCTIONS
     assert AGENT_INSTRUCTIONS_STANDARD_VERSION >= 4
-    assert "meridian-executor-standard: v4" in DEFAULT_AGENT_INSTRUCTIONS
+    assert (
+        f"meridian-executor-standard: v{AGENT_INSTRUCTIONS_STANDARD_VERSION}"
+        in DEFAULT_AGENT_INSTRUCTIONS
+    )
 
 
 @pytest.mark.asyncio

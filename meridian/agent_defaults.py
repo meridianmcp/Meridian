@@ -23,7 +23,11 @@ import re
 #   v3 — reindex-at-session-start guidance (eacf7063).
 #   v4 — request_hitl is the ONLY human-decision channel (never native ask, d261ea2e)
 #        + research-routing protocol (f8c70f9a).
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 4
+#   v5 — code-intel guidance no longer assumes a static pre-loaded tool list
+#        (1c81fee6): under deferred / tool-search loading (claude.ai, Desktop) a
+#        tool is invisible until searched for, so absence from the listing must
+#        trigger a discovery search, not a silent skip of the protocol.
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 5
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -89,23 +93,31 @@ in the Meridian dashboard → Settings → Executor Rules.
   receiving explicit human approval.
 
 ## Code intelligence (if available)
-- If `trace_path` appears in your MCP tool list, use it before opening any file.
+- Absence from the tool list does NOT mean a tool is unavailable. claude.ai and
+  Desktop load tools on demand (deferred / tool-search): a tool is invisible until
+  you explicitly search for it. Before concluding a code-intel tool is missing,
+  issue one tool-search / discovery query for it (`trace_path`, `search_graph`,
+  `get_architecture`, `detect_changes`, `get_code_snippet`).
 - Prefer structural graph queries (`trace_path`, `search_graph`, `get_architecture`,
   `detect_changes`) over raw file reads — they are faster and use far fewer tokens.
-- Fall back to reading files only when a graph query is insufficient.
-- If `trace_path` is not in your tool list, ignore this section.
-- At session start, if `index_repository` is in your tool list and you will touch
-  source files, run `index_repository(mode="fast")` once — the codebase graph goes
+- Fall back to reading files only when a graph query is insufficient, or when a
+  discovery search genuinely surfaces no code-intel tool.
+- At session start, if `index_repository` is available (search for it first if your
+  client defers tool loading) and you will touch source files, run
+  `index_repository(mode="fast")` once — the codebase graph goes
   stale after commits, so a fresh index keeps prospecting accurate (eacf7063).
 
 ## MANDATORY CODE INTEL PROTOCOL
-When `search_graph`, `get_function_tool`, or `get_code_snippet` are in your tool
-list AND the task involves source code files, use them BEFORE any `read_file` or
-`read_multiple_files` call. Call `search_graph` to locate symbols. Call
-`get_function_tool` to extract specific functions. Reading whole source code
-files when code intel tools are present is a protocol violation. For non-code
-files (documents, presentations, spreadsheets, config, data), use filesystem
-tools directly.
+When the task involves source code files, use code-intel tools (`search_graph`,
+`get_function_tool` / `get_code_snippet`) BEFORE any `read_file` or
+`read_multiple_files` call: `search_graph` to locate symbols, `get_function_tool`
+to extract specific functions. Reading whole source files when code-intel tools
+are reachable is a protocol violation. If these tools are not in your current tool
+list, do NOT skip the protocol — clients with deferred / tool-search loading
+(claude.ai, Desktop) hide a tool until it is searched for, so run one tool-search /
+discovery query for them first; only fall back to plain file reads if that search
+genuinely surfaces nothing. For non-code files (documents, presentations,
+spreadsheets, config, data), use filesystem tools directly.
 
 ## RESEARCH ROUTING PROTOCOL
 When a task needs external research, route the query to the most authoritative
@@ -122,7 +134,7 @@ source FIRST — do not default to a generic web search:
 Retrieval beats recall: look it up. Do not answer a decision-relevant factual
 question from memory when a source can be checked.
 
-<!-- meridian-executor-standard: v4 -->
+<!-- meridian-executor-standard: v5 -->
 """
 
 
