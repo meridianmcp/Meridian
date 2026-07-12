@@ -2508,6 +2508,31 @@ async def _handle_notes_decisions(
         validate_input_size(args.get("file_path"), "document file_path", 2_000)
         validate_input_size(args.get("source"), "document source", 2_000)
         validate_input_size(args.get("content"), "document content", 50_000_000)
+        # 832d67af — when only a file_path is given (no inline content) the server
+        # extracts the text from its OWN filesystem (doc_ingest.extract_text), so on
+        # hosted Meridian (Fly.io) it has ZERO access to a caller's local path and
+        # the open fails with a misleading "[Errno 2] No such file or directory".
+        # Mirror get_document_structure's honest guard: fail clearly, telling the
+        # caller why and what to do. `content` (pre-extracted text) needs no
+        # filesystem and DOES work hosted, so only guard the path-only case.
+        _fp = args.get("file_path")
+        _content = args.get("content")
+        _has_content = _content is not None and str(_content).strip() != ""
+        if _hosted_mode() and _fp and not _has_content:
+            return {
+                "error": (
+                    "ingest_document reads the file from the Meridian server's own "
+                    "filesystem, so on hosted Meridian it cannot open a path on your "
+                    "machine (that is what surfaces as a misleading '[Errno 2] No "
+                    "such file or directory'). Run Meridian self-hosted so the server "
+                    "shares a filesystem with the file, pass the already-extracted "
+                    "text as `content` instead of a `file_path`, or read the document "
+                    "through your tunnel's local document tools, which proxy to your "
+                    "machine."
+                ),
+                "hosted": True,
+                "file_path": _fp,
+            }
         from ..doc_ingest import DocExtractionError  # local import: optional dep-free
         try:
             _ingest_result = await db_module.ingest_document(
@@ -2705,7 +2730,8 @@ async def _handle_notes_decisions(
             return {
                 "error": (
                     f"no stored document for doc={doc_source!r} — ingest_document "
-                    "or reindex_document it first"
+                    "it first (that MCP tool populates the doc-structure store; "
+                    "there is no separate reindex_document tool)"
                 ),
             }
         try:
@@ -2899,7 +2925,8 @@ async def _handle_notes_decisions(
             return {
                 "error": (
                     f"no stored document for doc={doc_source!r} — ingest_document "
-                    "or reindex_document it first"
+                    "it first (that MCP tool populates the doc-structure store; "
+                    "there is no separate reindex_document tool)"
                 ),
             }
         try:
