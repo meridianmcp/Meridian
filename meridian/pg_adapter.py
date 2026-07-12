@@ -521,6 +521,31 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     feedback_thumb SMALLINT,
     feedback_note TEXT,
     milestone_type TEXT NOT NULL DEFAULT 'task',
+    -- Task-tree columns (mirror SQLite base + _migrate_pg_sprint_item_tree). NULL =
+    -- no parent / not split / not merged. parent_id references sprint_items(id).
+    parent_id TEXT DEFAULT NULL REFERENCES sprint_items(id),
+    split_from TEXT DEFAULT NULL,
+    merged_into TEXT DEFAULT NULL,
+    merged_from TEXT DEFAULT NULL,
+    -- 4f02340e: mixed-ownership task chains. 'human' | 'ai' | NULL (unassigned).
+    owner TEXT DEFAULT NULL,
+    -- v2.6 (dependency tracking, mirrors db._migrate_sprint_item_dependency):
+    -- depends_on references a sibling sprint item id (NULL = no dependency);
+    -- failure_mode is what to do when the depended-on item has failed —
+    -- 'continue' (default, still claimable) or 'stop' (blocked on parent failure).
+    depends_on TEXT,
+    failure_mode TEXT NOT NULL DEFAULT 'continue',
+    -- touches_files (file conflict tracking) + touches_resources (501ec93f: typed
+    -- resource identifiers, JSON list generalizing touches_files). Both nullable.
+    touches_files TEXT,
+    touches_resources TEXT,
+    -- bc9259b8: worker stall auto-retry counter. NOT NULL DEFAULT 0 so legacy rows
+    -- read as "never stalled".
+    stall_count INTEGER NOT NULL DEFAULT 0,
+    -- 5823db0b: quality gates + actor attribution. required_notes is a note-count
+    -- gate (INTEGER DEFAULT 0); actor records who last acted on the item.
+    required_notes INTEGER DEFAULT 0,
+    actor TEXT,
     slug TEXT,
     nickname TEXT,
     deferred_until TEXT,
