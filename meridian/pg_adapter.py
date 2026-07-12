@@ -2575,6 +2575,29 @@ async def _migrate_pg_sprint_item_priority_blocker(conn: PostgresConnection) -> 
     )
 
 
+async def _migrate_pg_sprint_item_dependency(conn: PostgresConnection) -> None:
+    """b01326e9 / v2.6 — dependency + file-conflict columns on sprint_items.
+
+    Backfills the sprint_items columns that had a SQLite migration but no
+    Postgres upgrade path, so existing prod DBs (where CREATE TABLE IF NOT
+    EXISTS is a no-op) get patched:
+
+      depends_on    — sibling sprint item id this one depends on (NULL = none).
+      failure_mode  — behaviour when depends_on has failed: 'continue' (default,
+                      still claimable) or 'stop' (blocked). NOT NULL DEFAULT.
+      touches_files — file-conflict tracking (predates touches_resources).
+
+    CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path. ADD COLUMN
+    IF NOT EXISTS → idempotent. Mirrors db._migrate_sprint_item_dependency /
+    _migrate_touches_files.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS depends_on TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS failure_mode TEXT NOT NULL DEFAULT 'continue';"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS touches_files TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2633,4 +2656,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_pointers,
     _migrate_pg_sprint_item_deferral,
     _migrate_pg_sprint_item_priority_blocker,
+    _migrate_pg_sprint_item_dependency,
 )

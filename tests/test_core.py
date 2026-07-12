@@ -7149,10 +7149,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_pointers",
         "_migrate_pg_sprint_item_deferral",
         "_migrate_pg_sprint_item_priority_blocker",
+        "_migrate_pg_sprint_item_dependency",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 89
+    assert len(allnames) == len(set(allnames)) == 90
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
