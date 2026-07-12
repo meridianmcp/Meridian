@@ -9,6 +9,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "create_project": 'create_project(name="my-app")',
     "set_parent_project": 'set_parent_project(project_name="ms-thesis", parent_project_name="Camerer_MS_Graduation_2026")',
     "rename_project": 'rename_project(project_name="old-name", new_name="new-name")',
+    "merge_project": 'merge_project(source_project_id="dup-uuid", target_project_id="keep-uuid")',
     "start_session": 'start_session(project_name="my-project", session_name="feature-x", human_id="alice", role="executor")',
     "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
     "log_task": 'log_task(session_id="session-uuid", project_id="abc-123", description="Fixed auth bug", status="done")',
@@ -109,6 +110,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "new_name": {"type": "string", "description": "The new project name."}},
          "required": ["new_name"]}},
+    {"name": "merge_project", "description":
+        "d6bd60e0 — merge a phantom-duplicate project INTO another. Re-parents EVERY "
+        "child row of the source project (sprint items, tasks, decisions, insights, "
+        "notes, HITL requests, sessions, handoffs, pointers, …) to the target project "
+        "via pure UPDATEs — NO row is ever deleted. By default the now-empty source "
+        "project is soft-archived (status='archived', name prefixed with '[merged] '), "
+        "never hard-deleted; pass archive_source=false to leave it untouched. Returns "
+        "{source_project_id, target_project_id, moved: {table: count}, source_archived}. "
+        "Returns {error} if source==target or either project does not exist.",
+     "inputSchema": {"type": "object", "properties": {
+         "source_project_id": {"type": "string", "description": "The id of the project to merge FROM (its rows are re-parented; it is archived unless archive_source=false)."},
+         "target_project_id": {"type": "string", "description": "The id of the project to merge INTO (receives all of the source's rows)."},
+         "archive_source": {"type": "boolean", "description": "Default true — soft-archive the emptied source project (status='archived', name prefixed '[merged] '). Set false to leave the source project row untouched. The source is NEVER hard-deleted either way."}},
+         "required": ["source_project_id", "target_project_id"]}},
     {"name": "register_session", "description": "Low-level: register this session without loading goal context. Use start_session instead for executor/human sessions — it registers AND returns goal + tasks in one call. Use register_session when you only need a session ID and will fetch context separately.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "session_name": {"type": "string"},
