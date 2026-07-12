@@ -248,7 +248,18 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
 ]
 
 # Editable per-slot fields that a tenant override may set.
-_OVERRIDABLE = ("enabled", "command", "port", "description", "description_overrides", "env")
+# 39aae23f — ``pool`` is the elastic backend-copy config for a stateless slot
+# (min/max copies to load-balance behind the slot's single fixed route). It only
+# takes effect for ``session_mode="stateless"`` slots — see :func:`slot_pool_config`.
+_OVERRIDABLE = ("enabled", "command", "port", "description", "description_overrides", "env", "pool")
+
+# 39aae23f — elastic-pool defaults for a stateless slot. Start conservative: one
+# always-on copy, burst to a second under load. Kept in sync with
+# meridian.slot_pool.DEFAULT_MIN_COPIES / DEFAULT_MAX_COPIES (that module owns the
+# runtime pool; this is the config-layer default so an unset config means "1 copy,
+# burst to 2" without importing the pool module here).
+DEFAULT_POOL_MIN_COPIES = 1
+DEFAULT_POOL_MAX_COPIES = 2
 
 
 def builtin_names() -> tuple[str, ...]:
@@ -493,8 +504,106 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
         env = it.get("env")
         if isinstance(env, dict):
             ov["env"] = {str(k): str(v) for k, v in env.items() if str(k)}
+        # 39aae23f — per-slot elastic-pool override. Accept an int ("pool up to N
+        # copies" shorthand) or a {"enabled"?, "min"/"min_copies", "max"/
+        # "max_copies"} dict; normalize into a canonical dict here so downstream
+        # readers (slot_pool_config) get a stable shape. bool is not a size.
+        pool = _normalize_pool_override(it.get("pool"))
+        if pool is not None:
+            ov["pool"] = pool
         out[name] = ov
     return out
+
+
+def _normalize_pool_override(raw: Any) -> "dict | None":
+    """39aae23f — normalize a per-slot ``pool`` override into a canonical dict.
+
+    Returns ``None`` when *raw* carries nothing usable (so the slot keeps the
+    built-in default sizing). Otherwise returns a dict that may contain any of
+    ``enabled`` (bool), ``min`` (int >= 1), ``max`` (int >= 1):
+
+    * an ``int`` N → ``{"max": N}`` ("pool up to N copies"); N<=1 disables pooling.
+    * a ``dict`` → its ``enabled`` / ``min``|``min_copies`` / ``max``|``max_copies``
+      keys, ints only (``bool`` rejected — it is not a size).
+
+    The min<=max invariant and the stateless-slot gate are applied later by
+    :func:`slot_pool_config` (which also owns the numeric floor/clamp), so this
+    stays a pure shape-normalizer.
+    """
+    if isinstance(raw, bool):
+        # A bare bool toggles pooling on/off without changing sizes.
+        return {"enabled": raw}
+    if isinstance(raw, int):
+        return {"max": raw}
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, Any] = {}
+    if "enabled" in raw:
+        out["enabled"] = bool(raw["enabled"])
+    lo = raw.get("min", raw.get("min_copies"))
+    if isinstance(lo, int) and not isinstance(lo, bool):
+        out["min"] = lo
+    hi = raw.get("max", raw.get("max_copies"))
+    if isinstance(hi, int) and not isinstance(hi, bool):
+        out["max"] = hi
+    return out or None
+
+
+def slot_pool_config(plugin: Any) -> "dict":
+    """39aae23f — the effective elastic-pool config for one resolved slot plugin.
+
+    Returns ``{"enabled": bool, "min": int, "max": int}``. Pooling load-balances
+    N identical inner backend copies behind the slot's single FIXED server route
+    (see :mod:`meridian.slot_pool`), so it is only ever offered for
+    ``session_mode="stateless"`` slots — a ``persistent`` slot (Desktop Commander)
+    always resolves to ``enabled=False, min=1, max=1`` regardless of any override,
+    because forking identical copies would split its per-session state.
+
+    For a stateless slot:
+
+    * With no ``pool`` override, pooling is ON with the built-in defaults
+      (:data:`DEFAULT_POOL_MIN_COPIES` / :data:`DEFAULT_POOL_MAX_COPIES` = 1/2) —
+      an unset config still gets elastic burst-to-2.
+    * An override's ``min``/``max`` clamp to ``1 <= min <= max`` (min floors at 1;
+      max is raised to min if inverted).
+    * ``enabled: false`` (or a resolved ``max <= 1``) collapses the slot to a
+      single copy (``enabled=False, min=1, max=1``) — i.e. today's behaviour.
+
+    Pure — no I/O. ``plugin`` is a resolved plugin dict (from
+    :func:`resolve_plugins`); a non-dict yields the single-copy default.
+    """
+    single = {"enabled": False, "min": 1, "max": 1}
+    if not isinstance(plugin, dict):
+        return single
+    # Only stateless slots may pool. Default missing session_mode to "stateless"
+    # so a resolved built-in without the key (shouldn't happen) still behaves.
+    if plugin.get("session_mode", "stateless") != "stateless":
+        return single
+
+    ov = plugin.get("pool")
+    lo = DEFAULT_POOL_MIN_COPIES
+    hi = DEFAULT_POOL_MAX_COPIES
+    enabled_override: bool | None = None
+    if isinstance(ov, dict):
+        if "enabled" in ov:
+            enabled_override = bool(ov["enabled"])
+        if isinstance(ov.get("min"), int) and not isinstance(ov.get("min"), bool):
+            lo = ov["min"]
+        if isinstance(ov.get("max"), int) and not isinstance(ov.get("max"), bool):
+            hi = ov["max"]
+    elif isinstance(ov, int) and not isinstance(ov, bool):
+        hi = ov
+
+    lo = max(1, lo)
+    hi = max(1, hi)
+    if hi < lo:
+        hi = lo
+    # Pooling is meaningful only when we can run >1 copy. An explicit enabled=False
+    # (or a size that never exceeds one copy) collapses to the single-copy default.
+    enabled = (hi > 1) if enabled_override is None else (enabled_override and hi > 1)
+    if not enabled:
+        return single
+    return {"enabled": True, "min": lo, "max": hi}
 
 
 # Built-in default ports — a custom plugin may not reuse one, or its local proxy
