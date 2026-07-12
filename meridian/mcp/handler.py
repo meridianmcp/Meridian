@@ -2978,6 +2978,14 @@ async def _handle_notes_decisions(
         outputs_dir = str(args.get("outputs_dir") or "").strip()
         _resolver = None
         _index = None
+        # Workspace decision 0dedff91 — the outputs resolve-through stats/walks
+        # `outputs_dir` on THIS process's own filesystem (os.path.isdir + a
+        # DuckDB rebuild over the tree). On hosted Meridian that path is on the
+        # caller's machine, which the server can never reach, so skip the
+        # resolve-through entirely (the figure match itself is DB-only and
+        # still works). Never touch a caller's local dir server-side hosted.
+        if _hosted_mode():
+            outputs_dir = ""
         if outputs_dir and os.path.isdir(outputs_dir):
             from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
             _index = _outputs_indexer.OutputsFtsIndex(outputs_dir)
@@ -5513,6 +5521,28 @@ async def _handle_outputs_tools(
             raise ValueError("outputs_dir is required")
         if not query:
             raise ValueError("query is required")
+        # Workspace decision 0dedff91 — outputs_indexer.search_outputs walks
+        # `outputs_dir` off THIS process's own filesystem (os.walk + hash +
+        # DuckDB FTS). On hosted Meridian that's the server, which can never
+        # reach a caller's own machine, so os.walk finds nothing (or silently
+        # mis-resolves a Windows path against the server cwd). Fail honestly
+        # instead — same guard as ingest_document / get_document_structure /
+        # search_code_semantic.
+        if _hosted_mode():
+            return {
+                "outputs_dir": outputs_dir,
+                "query": query,
+                "hits": [],
+                "total_indexed": 0,
+                "error": (
+                    "search_outputs walks a directory on YOUR local filesystem "
+                    "and cannot run on hosted Meridian -- the server has no "
+                    "access to your machine. Run Meridian self-hosted, or use "
+                    "the tunnel-routed local file/search tools, which proxy to "
+                    "your machine."
+                ),
+                "hosted": True,
+            }
         limit = args.get("limit", 10)
         try:
             limit = int(limit)
