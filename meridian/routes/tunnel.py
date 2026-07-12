@@ -130,6 +130,33 @@ _pending_custom_reqs: dict[str, dict[str, "asyncio.Future[dict]"]] = {s: {} for 
 # tools that 503 on first call.
 _slot_health: dict[str, dict[str, bool]] = {}
 
+# 16e02240 — monotonic timestamp (time.monotonic()) at which each slot was last
+# marked UNHEALTHY: tenant_id → {slot: ts}. A slot suppressed by
+# ``_record_slot_health`` otherwise stays dark until the CLIENT sends a fresh
+# healthy plugin_status — a transient hiccup with no follow-up recovery report
+# leaves the slot excluded from every tools/list forever. This map lets
+# ``_slot_is_healthy`` do an OPTIMISTIC re-probe: once the suppression is older
+# than ``_slot_unhealthy_ttl()`` seconds, stop suppressing so the next tools/list
+# re-advertises the slot and a real tools/call re-tests it (a still-broken slot
+# will simply report unhealthy again, re-arming the timer).
+_slot_unhealthy_since: dict[str, dict[str, float]] = {}
+
+
+def _slot_unhealthy_ttl() -> float:
+    """Seconds a slot stays suppressed before an optimistic re-probe (16e02240).
+
+    Configurable via ``MERIDIAN_SLOT_UNHEALTHY_TTL`` (default 120s). A value <= 0
+    disables the timeout (a slot stays suppressed until an explicit healthy report,
+    the pre-16e02240 behaviour)."""
+    raw = os.environ.get("MERIDIAN_SLOT_UNHEALTHY_TTL", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    return 120.0
+
+
 # 9a8645c1 — optional per-slot diagnostic for an unhealthy slot:
 # tenant_id → {slot: {"reason": str, "detail": str}}. Lets the dashboard show an
 # actionable warning (e.g. Serena access-denied + fix hint) instead of a silent
@@ -210,21 +237,60 @@ def _record_slot_health(
     _slot_health.setdefault(tenant_id, {})[slot] = bool(healthy)
     if healthy:
         _slot_status_detail.get(tenant_id, {}).pop(slot, None)
+        # 16e02240 — clear the suppression timestamp so a future unhealthy report
+        # starts a fresh TTL window rather than inheriting a stale one.
+        _clear_slot_unhealthy_since(tenant_id, slot)
         # RECOVERY: this slot was suppressed and is now serving again. Its tools
         # were dropped from the last aggregation (list_tunnel_tools skips unhealthy
         # slots), so trigger the tools/list_changed path to un-hide them.
         if was_unhealthy:
             notify_tools_list_changed(tenant_id)
-    elif reason or detail:
-        _slot_status_detail.setdefault(tenant_id, {})[slot] = {
-            "reason": reason or "unhealthy",
-            "detail": detail or "",
-        }
+    else:
+        # 16e02240 — (re)arm the optimistic re-probe timer. Only stamp on the
+        # healthy->unhealthy transition so a repeated unhealthy report doesn't keep
+        # pushing the re-probe window out indefinitely (the slot would then stay
+        # dark despite the TTL). ``was_unhealthy`` is the prior state read above.
+        if not was_unhealthy:
+            _slot_unhealthy_since.setdefault(tenant_id, {})[slot] = time.monotonic()
+        if reason or detail:
+            _slot_status_detail.setdefault(tenant_id, {})[slot] = {
+                "reason": reason or "unhealthy",
+                "detail": detail or "",
+            }
 
 
 def _slot_is_healthy(tenant_id: str, slot: str) -> bool:
-    """True unless a plugin_status message marked this slot unhealthy."""
-    return _slot_health.get(tenant_id, {}).get(slot, True)
+    """True unless a plugin_status message marked this slot unhealthy.
+
+    16e02240 — a slot marked unhealthy is only suppressed for up to
+    ``_slot_unhealthy_ttl()`` seconds. Past that window we OPTIMISTICALLY treat it
+    as healthy again so the next tools/list re-advertises it and a real call
+    re-tests it — otherwise a transient hiccup with no follow-up healthy report
+    would keep the slot dark forever. A still-broken slot re-reports unhealthy on
+    its next failed call, re-arming the timer."""
+    if _slot_health.get(tenant_id, {}).get(slot, True):
+        return True
+    # Recorded unhealthy — has the suppression aged past the re-probe TTL?
+    ttl = _slot_unhealthy_ttl()
+    if ttl <= 0:
+        return False  # TTL disabled: stay suppressed until an explicit recovery.
+    since = _slot_unhealthy_since.get(tenant_id, {}).get(slot)
+    if since is None:
+        # Marked unhealthy but no timestamp (defensive) — don't pin it dark forever.
+        return True
+    return (time.monotonic() - since) >= ttl
+
+
+def _clear_slot_unhealthy_since(tenant_id: str, slot: "str | None" = None) -> None:
+    """Drop a slot's unhealthy-since timestamp (or all of a tenant's) — 16e02240."""
+    if slot is None:
+        _slot_unhealthy_since.pop(tenant_id, None)
+        return
+    stamps = _slot_unhealthy_since.get(tenant_id)
+    if stamps is not None:
+        stamps.pop(slot, None)
+        if not stamps:
+            _slot_unhealthy_since.pop(tenant_id, None)
 
 
 def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
@@ -233,6 +299,7 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
     if slot is None:
         _slot_health.pop(tenant_id, None)
         _slot_status_detail.pop(tenant_id, None)
+        _clear_slot_unhealthy_since(tenant_id)  # 16e02240
         _tools_list_changed_pending.discard(tenant_id)  # 54ddd609
         return
     slots = _slot_health.get(tenant_id)
@@ -240,6 +307,7 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
         slots.pop(slot, None)
         if not slots:
             _slot_health.pop(tenant_id, None)
+    _clear_slot_unhealthy_since(tenant_id, slot)  # 16e02240
     _det = _slot_status_detail.get(tenant_id)
     if _det is not None:
         _det.pop(slot, None)
