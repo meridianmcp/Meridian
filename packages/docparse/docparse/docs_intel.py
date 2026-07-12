@@ -31,6 +31,8 @@ import zipfile
 import xml.etree.ElementTree as ET
 from typing import Any
 
+from .structural_parser import StructuralParser
+
 # OOXML namespaces.
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
@@ -1149,3 +1151,42 @@ def document_field_structures(source: str | bytes | bytearray) -> dict[str, Any]
             "Word layout engine, which is out of scope."
         ),
     }
+
+
+# --- Shared structural-parser conformance (67402ce7) ------------------------
+
+
+class DocxStructuralParser(StructuralParser):
+    """DOCX conformance to the shared :class:`StructuralParser` interface.
+
+    Interface-only (67402ce7): the OOXML zip/XML parsing logic is untouched — the
+    methods delegate to the existing module functions. :meth:`parse_structure`
+    surfaces the same heading outline :func:`document_outline` already produces,
+    additionally nesting it into a ``tree`` via the shared
+    :meth:`StructuralParser.build_tree` so DOCX exposes the identical
+    ``{heading_count, headings, tree}`` shape the LaTeX layer does. The existing
+    functional API (``document_outline`` / ``document_content_tree`` / ...) is the
+    public entry point and is unchanged — ``document_outline`` in particular still
+    returns exactly its historical keys; the ``tree`` is composed here so no
+    existing caller's result shape shifts.
+    """
+
+    def parse_structure(self, source: Any) -> dict[str, Any]:
+        """Heading outline + level-nested tree, in the shared structural shape.
+
+        Delegates the parse to :func:`document_outline` (behaviour unchanged) and
+        adds a ``tree`` built from its ``headings`` via the shared level-nesting
+        helper, so the returned dict spreads ``document_outline``'s keys plus
+        ``tree``.
+        """
+        outline = document_outline(source)
+        return {**outline, "tree": self.build_tree(outline.get("headings", []))}
+
+    def analyze(self, source: Any) -> dict[str, Any]:
+        """One-call structural map of a .docx.
+
+        Delegates to :func:`document_outline` — docs_intel's stateless one-call
+        structural entrypoint (headings + field codes + citation markers) — with a
+        level-nested ``tree`` added, matching the LaTeX ``analyze`` contract.
+        """
+        return self.parse_structure(source)

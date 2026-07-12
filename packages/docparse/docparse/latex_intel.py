@@ -32,6 +32,8 @@ import os
 import re
 from typing import Any
 
+from .structural_parser import StructuralParser
+
 # Heading macros in outline order. The index is the nesting depth (level) so the
 # tree builder knows how to nest \subsection under \section, etc. Mirrors the
 # integer "level" docs_intel derives from a Word "HeadingN" style.
@@ -465,19 +467,13 @@ def _build_tree(headings: list[dict]) -> list[dict]:
     docs_intel would produce, so downstream consumers treat DOCX and LaTeX
     structure uniformly. A heading attaches under the nearest preceding heading
     of a strictly smaller level; otherwise it is a root.
+
+    Thin wrapper over the shared :meth:`StructuralParser.build_tree` (67402ce7):
+    the level-nesting algorithm is identical across formats, so it lives once on
+    the base. Behaviour is unchanged — for a ``{level, kind, text}`` heading the
+    shared helper yields exactly ``{level, kind, text, children}``.
     """
-    roots: list[dict] = []
-    stack: list[dict] = []
-    for h in headings:
-        node = {"level": h["level"], "kind": h["kind"], "text": h["text"], "children": []}
-        while stack and stack[-1]["level"] >= node["level"]:
-            stack.pop()
-        if stack:
-            stack[-1]["children"].append(node)
-        else:
-            roots.append(node)
-        stack.append(node)
-    return roots
+    return StructuralParser.build_tree(headings)
 
 
 def parse_latex_structure(source: str, base_dir: str | None = None) -> dict[str, Any]:
@@ -748,3 +744,28 @@ def analyze_latex(path_or_source: str) -> dict[str, Any]:
         "bibliography_count": len(bibliography),
         "citations": citations,
     }
+
+
+# --- Shared structural-parser conformance (67402ce7) ------------------------
+
+
+class LatexStructuralParser(StructuralParser):
+    """LaTeX conformance to the shared :class:`StructuralParser` interface.
+
+    Interface-only (67402ce7): every method delegates to the existing
+    module-level functions — the LaTeX ``latexwalker`` parsing logic is untouched.
+    This class merely *declares* that the ``.tex`` layer honours the common
+    structural contract (``parse_structure`` -> heading outline + tree;
+    ``analyze`` -> structure + bibliography + citations), so DOCX and LaTeX are
+    provably conformant to one shape. The functional API
+    (``parse_latex_structure`` / ``analyze_latex`` / ...) remains the public
+    entry point and is unchanged.
+    """
+
+    def parse_structure(self, source: Any) -> dict[str, Any]:
+        """Delegate to :func:`parse_latex_structure` (unchanged behaviour)."""
+        return parse_latex_structure(source)
+
+    def analyze(self, source: Any) -> dict[str, Any]:
+        """Delegate to :func:`analyze_latex` (unchanged behaviour)."""
+        return analyze_latex(source)
