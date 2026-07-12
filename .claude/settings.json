@@ -56,6 +56,16 @@
                         "command": "& \"C:\\Users\\13144\\.claude\\hooks\\meridian-start.ps1\""
                     }
                 ]
+            },
+            {
+                "matcher": "compact",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\post_compact_refresh.ps1\""
+                    }
+                ]
             }
         ]
     },
