@@ -5257,6 +5257,25 @@ async def _handle_plugin_tools(
 
     These are non-fatal if no tunnel is active (returns empty list/error).
     """
+    if name == "refresh_tool_manifest":
+        # 142808f3 — plain tool CALL to re-discover the built-in tool set, for
+        # clients that ignore notifications/tools/list_changed. Best-effort re-fire
+        # of the signal too, so a client that DOES honour it also re-lists.
+        from ..mcp_tools import _MCP_TOOLS_LIST  # noqa: PLC0415
+        from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
+
+        manifest = build_tool_manifest(_MCP_TOOLS_LIST)
+        _tid = tenant.get("id") if tenant else None
+        if _tid:
+            try:
+                from ..routes.tunnel import (  # noqa: PLC0415
+                    notify_tools_list_changed as _notify_tlc,
+                )
+                _notify_tlc(_tid)
+                manifest["list_changed_refired"] = True
+            except Exception:  # noqa: BLE001 — signal is a bonus, manifest is the point
+                manifest["list_changed_refired"] = False
+        return manifest
     if name == "list_plugins":
         from ..tunnel_plugins import BUILTIN_PLUGINS  # noqa: PLC0415
         from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415

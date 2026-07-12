@@ -58,6 +58,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_workspace_decisions": 'get_workspace_decisions()',
     "get_workspace_settings": 'get_workspace_settings()',
     "update_workspace_settings": 'update_workspace_settings(hitl_auto_answer_default=True, sprint_name_default="june-sprint")',
+    "refresh_tool_manifest": 'refresh_tool_manifest()',
     "save_blog_post": 'save_blog_post(title="Shipping the Blog tab", body="# What changed\\n...", status="published")',
     "get_blog_posts": 'get_blog_posts(status="published")',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
@@ -1397,6 +1398,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string", "description": "Plugin name as returned by list_plugins (e.g. 'filesystem', 'code-intel', 'code-extractor')."}},
          "required": ["name"]}},
+    {"name": "refresh_tool_manifest", "description":
+        "Read-only: return the authoritative, compact manifest of ALL built-in "
+        "Meridian MCP tools (name + one-line summary). Call this when you suspect "
+        "your client's tool schema went stale ('I nuked the schema', a tool you "
+        "expected is suddenly 'not found', or right after a /compact) — it is a "
+        "plain tool CALL, so it works even on clients that ignore the "
+        "notifications/tools/list_changed signal (e.g. Claude Desktop). Best-effort "
+        "also re-fires list_changed for your tenant so a client that DOES honour it "
+        "re-lists. Names returned here are canonical: a name present here but absent "
+        "from your tool list is a stale-schema artifact, not a removed tool.",
+     "inputSchema": {"type": "object", "properties": {},
+         "required": []}},
     {"name": "get_graph_diff", "description":
         "Read-only: compare the latest code-graph snapshots of two sessions — returns delta in node_count, hotspot_count, and file_churn. Use snapshot_graph_metrics first to record each session's current state.",
      "inputSchema": {"type": "object", "properties": {
@@ -1510,7 +1523,7 @@ _READ_ONLY_TOOLS = {
     "get_blog_posts",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
-    "list_plugins", "get_plugin_details",
+    "list_plugins", "get_plugin_details", "refresh_tool_manifest",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
@@ -1566,6 +1579,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",
     "get_plugin_details": "Get Plugin Details",
+    "refresh_tool_manifest": "Refresh Tool Manifest",
     "set_active_repo": "Set Active Repo",
     "analyze_model_efficiency": "Analyze Model Efficiency",
     "index_equation": "Index Equation",
