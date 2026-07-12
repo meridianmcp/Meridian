@@ -532,7 +532,9 @@ def test_handler_tools_call_routes_to_tunnel(monkeypatch):
     tenant = {"id": "t1", "plan": "pro"}
     monkeypatch.setattr(tn, "has_active_tunnel", lambda tid: True)
 
-    async def fake_call(tid, name, args):
+    async def fake_call(tid, name, args, **kwargs):
+        # 73d233e4 — the handler now threads db/session_id through so the word
+        # write-guard can consult claims; accept them via **kwargs.
         assert name == "trace_path"
         return {"content": [{"type": "text", "text": "graph-result"}]}
 
