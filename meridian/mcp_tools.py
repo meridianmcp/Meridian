@@ -425,8 +425,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": []}},
     {"name": "index_equation", "description":
         "06df6ab3 — index ONE Word equation (OMML) against a document already "
-        "stored in the doc-structure store (via ingest_document or a prior "
-        "reindex, so pass the SAME source/path used there as `doc`). "
+        "stored in the doc-structure store — populated by reindex_document (or a "
+        "direct put_document), NOT by ingest_document (which only stores flat "
+        "note text, a separate system). Pass the SAME source/path you reindexed "
+        "under as `doc`. "
         "omml_or_latex is auto-detected: a string starting with '<' is treated "
         "as raw OMML XML (stored as-is); anything else is treated as LaTeX "
         "source (real OMML is generated best-effort — pure-Python latex2mathml "
@@ -441,7 +443,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you reindexed it under via reindex_document/put_document — NOT ingest_document)."},
          "omml_or_latex": {"type": "string", "description": "Raw OMML XML (starts with '<') OR a LaTeX source string."},
          "semantic_label": {"type": "string", "description": "Optional human label for the equation (e.g. 'mass-energy equivalence')."}},
          "required": ["doc", "omml_or_latex"]}},
@@ -457,7 +459,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you reindexed it under via reindex_document/put_document — NOT ingest_document)."},
          "latex": {"type": "string", "description": "LaTeX source to fuzzy-match against this document's stored equations."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "latex"]}},
@@ -465,7 +467,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "51a595e7 — write an OMML equation DIRECTLY into a stored document's "
         "source .docx (real OOXML write-back), collapsing the manual "
         "resolve->open->parse->splice->rewrite->reindex flow into one call. The "
-        "document must already be stored (via ingest_document / reindex_document) "
+        "document must already be stored in the doc-structure store via "
+        "reindex_document (or a direct put_document) — NOT ingest_document, which "
+        "only stores flat note text and does NOT register the document here — "
         "AND have a filesystem `source` path to write back to. Locate the target "
         "paragraph by `para_id` — the paragraph's w14:paraId (or the synthesized "
         "'p{index}' id that get_document_structure / find_similar_equation surface "
@@ -483,7 +487,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "doc": {"type": "string", "description": "The stored document's source (the path it was ingested/reindexed under; must resolve to a .docx on disk)."},
+         "doc": {"type": "string", "description": "The stored document's source (the path you reindexed it under via reindex_document/put_document — NOT ingest_document; must resolve to a .docx on disk)."},
          "para_id": {"type": "string", "description": "Target paragraph id — its w14:paraId, or the synthesized 'p{index}' id surfaced as element_id by the read tools."},
          "equation_id_or_omml": {"type": "string", "description": "An existing indexed equation id (reuses its OMML), OR raw OMML XML (starts with '<'), OR a LaTeX source string."},
          "position": {"type": "string", "enum": ["append", "before", "after"], "description": "Where to place the equation relative to the paragraph. Default 'append' (inline, end of paragraph)."}},
@@ -494,8 +498,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "stored .docx by its w14:paraId (the 'p{index}' fallback Word writes for "
         "an unlabelled paragraph) — NEVER by text match — rewrites its runs, "
         "saves the .docx in place, and re-syncs the doc_elements index row so it "
-        "matches the new text. Pass the SAME source/path the document was "
-        "ingested/reindexed under as `doc`. Provide EXACTLY ONE of: `new_text` (a "
+        "matches the new text. The document must already be stored in the "
+        "doc-structure store via reindex_document (or a direct put_document) — "
+        "NOT ingest_document, which only stores flat note text and does NOT "
+        "register the document here. Pass the SAME source/path you reindexed "
+        "under as `doc`. Provide EXACTLY ONE of: `new_text` (a "
         "plain string — one unformatted run) OR `runs` (a list of runs, each a "
         "bare string or {text, bold?, italic?, underline?} — basic run formatting "
         "is applied; the paragraph's original run formatting is replaced, not "
@@ -507,7 +514,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you reindexed it under via reindex_document/put_document — NOT ingest_document)."},
          "para_id": {"type": "string", "description": "The target paragraph's w14:paraId (or 'p{index}' fallback), as reported by the read side."},
          "new_text": {"type": "string", "description": "New paragraph text as a single unformatted run. Provide this OR runs, not both."},
          "runs": {"type": "array", "description": "List of runs — each a plain string or a {text, bold?, italic?, underline?} object. Provide this OR new_text, not both.",
@@ -533,14 +540,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you reindexed it under via reindex_document/put_document — NOT ingest_document)."},
          "symbol_or_equation_id": {"type": "string", "description": "A doc_equations row id, OR a raw symbol / normalized-LaTeX string to track (e.g. 'E=mc^2' or '\\\\sigma')."}},
          "required": ["doc", "symbol_or_equation_id"]}},
     {"name": "index_figure", "description":
         "c623e648 — index ONE figure into the SEMANTIC figure index against a "
-        "document already stored in the doc-structure store (via "
-        "ingest_document or a prior reindex — pass the SAME source/path as "
-        "`doc`). This is the figure parallel of index_equation and is "
+        "document already stored in the doc-structure store — populated by "
+        "reindex_document (or a direct put_document), NOT by ingest_document "
+        "(which only stores flat note text, a separate system). Pass the SAME "
+        "source/path you reindexed under as `doc`. This is the figure parallel "
+        "of index_equation and is "
         "COMPLEMENTARY to the structural kind='figure' section-tree placement "
         "(it adds caption dedup + similarity, it does not replace placement). "
         "Provide file_path and/or caption. Before inserting, the normalized "
@@ -554,7 +563,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you reindexed it under via reindex_document/put_document — NOT ingest_document)."},
          "file_path": {"type": "string", "description": "Path to the figure's asset on disk (checked for existence; missing is flagged, not fatal)."},
          "caption": {"type": "string", "description": "The figure's caption (drives normalized-caption dedup/similarity)."},
          "semantic_label": {"type": "string", "description": "Optional human label for the figure (e.g. 'apparatus diagram')."}},
@@ -578,7 +587,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you reindexed it under via reindex_document/put_document — NOT ingest_document)."},
          "description_or_path": {"type": "string", "description": "A free-text description OR a file path to fuzzy-match against this document's indexed figures."},
          "outputs_dir": {"type": "string", "description": "d2a3537a — optional outputs tree root. When given, each matched figure resolves THROUGH to its outputs_index row (linked_output) by file_path. Omit for a pure fuzzy match."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},

@@ -130,6 +130,33 @@ _pending_custom_reqs: dict[str, dict[str, "asyncio.Future[dict]"]] = {s: {} for 
 # tools that 503 on first call.
 _slot_health: dict[str, dict[str, bool]] = {}
 
+# 16e02240 — monotonic timestamp (time.monotonic()) at which each slot was last
+# marked UNHEALTHY: tenant_id → {slot: ts}. A slot suppressed by
+# ``_record_slot_health`` otherwise stays dark until the CLIENT sends a fresh
+# healthy plugin_status — a transient hiccup with no follow-up recovery report
+# leaves the slot excluded from every tools/list forever. This map lets
+# ``_slot_is_healthy`` do an OPTIMISTIC re-probe: once the suppression is older
+# than ``_slot_unhealthy_ttl()`` seconds, stop suppressing so the next tools/list
+# re-advertises the slot and a real tools/call re-tests it (a still-broken slot
+# will simply report unhealthy again, re-arming the timer).
+_slot_unhealthy_since: dict[str, dict[str, float]] = {}
+
+
+def _slot_unhealthy_ttl() -> float:
+    """Seconds a slot stays suppressed before an optimistic re-probe (16e02240).
+
+    Configurable via ``MERIDIAN_SLOT_UNHEALTHY_TTL`` (default 120s). A value <= 0
+    disables the timeout (a slot stays suppressed until an explicit healthy report,
+    the pre-16e02240 behaviour)."""
+    raw = os.environ.get("MERIDIAN_SLOT_UNHEALTHY_TTL", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    return 120.0
+
+
 # 9a8645c1 — optional per-slot diagnostic for an unhealthy slot:
 # tenant_id → {slot: {"reason": str, "detail": str}}. Lets the dashboard show an
 # actionable warning (e.g. Serena access-denied + fix hint) instead of a silent
@@ -210,21 +237,60 @@ def _record_slot_health(
     _slot_health.setdefault(tenant_id, {})[slot] = bool(healthy)
     if healthy:
         _slot_status_detail.get(tenant_id, {}).pop(slot, None)
+        # 16e02240 — clear the suppression timestamp so a future unhealthy report
+        # starts a fresh TTL window rather than inheriting a stale one.
+        _clear_slot_unhealthy_since(tenant_id, slot)
         # RECOVERY: this slot was suppressed and is now serving again. Its tools
         # were dropped from the last aggregation (list_tunnel_tools skips unhealthy
         # slots), so trigger the tools/list_changed path to un-hide them.
         if was_unhealthy:
             notify_tools_list_changed(tenant_id)
-    elif reason or detail:
-        _slot_status_detail.setdefault(tenant_id, {})[slot] = {
-            "reason": reason or "unhealthy",
-            "detail": detail or "",
-        }
+    else:
+        # 16e02240 — (re)arm the optimistic re-probe timer. Only stamp on the
+        # healthy->unhealthy transition so a repeated unhealthy report doesn't keep
+        # pushing the re-probe window out indefinitely (the slot would then stay
+        # dark despite the TTL). ``was_unhealthy`` is the prior state read above.
+        if not was_unhealthy:
+            _slot_unhealthy_since.setdefault(tenant_id, {})[slot] = time.monotonic()
+        if reason or detail:
+            _slot_status_detail.setdefault(tenant_id, {})[slot] = {
+                "reason": reason or "unhealthy",
+                "detail": detail or "",
+            }
 
 
 def _slot_is_healthy(tenant_id: str, slot: str) -> bool:
-    """True unless a plugin_status message marked this slot unhealthy."""
-    return _slot_health.get(tenant_id, {}).get(slot, True)
+    """True unless a plugin_status message marked this slot unhealthy.
+
+    16e02240 — a slot marked unhealthy is only suppressed for up to
+    ``_slot_unhealthy_ttl()`` seconds. Past that window we OPTIMISTICALLY treat it
+    as healthy again so the next tools/list re-advertises it and a real call
+    re-tests it — otherwise a transient hiccup with no follow-up healthy report
+    would keep the slot dark forever. A still-broken slot re-reports unhealthy on
+    its next failed call, re-arming the timer."""
+    if _slot_health.get(tenant_id, {}).get(slot, True):
+        return True
+    # Recorded unhealthy — has the suppression aged past the re-probe TTL?
+    ttl = _slot_unhealthy_ttl()
+    if ttl <= 0:
+        return False  # TTL disabled: stay suppressed until an explicit recovery.
+    since = _slot_unhealthy_since.get(tenant_id, {}).get(slot)
+    if since is None:
+        # Marked unhealthy but no timestamp (defensive) — don't pin it dark forever.
+        return True
+    return (time.monotonic() - since) >= ttl
+
+
+def _clear_slot_unhealthy_since(tenant_id: str, slot: "str | None" = None) -> None:
+    """Drop a slot's unhealthy-since timestamp (or all of a tenant's) — 16e02240."""
+    if slot is None:
+        _slot_unhealthy_since.pop(tenant_id, None)
+        return
+    stamps = _slot_unhealthy_since.get(tenant_id)
+    if stamps is not None:
+        stamps.pop(slot, None)
+        if not stamps:
+            _slot_unhealthy_since.pop(tenant_id, None)
 
 
 def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
@@ -233,6 +299,7 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
     if slot is None:
         _slot_health.pop(tenant_id, None)
         _slot_status_detail.pop(tenant_id, None)
+        _clear_slot_unhealthy_since(tenant_id)  # 16e02240
         _tools_list_changed_pending.discard(tenant_id)  # 54ddd609
         return
     slots = _slot_health.get(tenant_id)
@@ -240,6 +307,7 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
         slots.pop(slot, None)
         if not slots:
             _slot_health.pop(tenant_id, None)
+    _clear_slot_unhealthy_since(tenant_id, slot)  # 16e02240
     _det = _slot_status_detail.get(tenant_id)
     if _det is not None:
         _det.pop(slot, None)
@@ -308,6 +376,9 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
 
     _tunnel_sockets[tenant_id] = ws
     _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd — reconnect: rebuild tool routes
+    # af5b5739 — record THIS Fly instance as the socket owner so a request that
+    # lands on a sibling instance can Fly-replay to us (no-op off Fly).
+    owner_instance = record_tenant_owner_instance(tenant_id)
     try:
         await db_module.update_tenant(auth_db, tenant_id, tunnel_active=1)
     except Exception:
@@ -355,6 +426,9 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     finally:
         _tunnel_sockets.pop(tenant_id, None)
         _clear_slot_health(tenant_id, "fs")
+        # af5b5739 — forget our ownership claim only if it's still ours (a newer
+        # connection on another instance may already have re-claimed the tenant).
+        clear_tenant_owner_instance(tenant_id, owner_instance)
         if not has_active_tunnel(tenant_id):
             _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd
         # Cancel any in-flight proxy requests for this tenant
@@ -802,6 +876,13 @@ async def _do_proxy(
     """Forward one HTTP request over the given tunnel socket and return the response."""
     ws = sockets.get(tenant_id)
     if ws is None:
+        # af5b5739 — in-memory MISS on this instance. If a DIFFERENT Fly instance is
+        # known to own this tenant's socket, replay the request there so Fly routes
+        # it to the machine that can actually serve it. No-op off Fly / unknown
+        # owner (falls through to the legible 503 below).
+        replay = fly_replay_target_for_id(tenant_id)
+        if replay is not None:
+            return fly_replay_response(replay)
         return Response(
             content=f'{{"error":"{label} tunnel not connected"}}',
             status_code=503,
@@ -2234,6 +2315,125 @@ CROSS_INSTANCE_MISS_MESSAGE = (
     "the one handling this request — retry (it may route to the right one), or "
     "restart your local `meridian --tunnel` if this persists"
 )
+
+
+# af5b5739 / decision 229441bc — cross-instance tunnel routing via Fly-replay.
+#
+# The tunnel socket registry (``_tunnel_sockets`` &c.) is per-PROCESS in-memory, so
+# on Fly.io multi-machine a request the edge routes to a sibling instance sees an
+# in-memory MISS even though the tunnel is genuinely open on another machine
+# (``tunnel_cross_instance_miss``). a19538fe made that miss *legible*; this makes it
+# *routable*: when a request lands on the wrong instance, we ask Fly to REPLAY it on
+# the instance that actually holds the socket by returning a ``fly-replay`` response
+# header of the form ``instance=<machine-id>`` (Fly's documented replay mechanism —
+# the edge re-dispatches the same request to the named machine).
+#
+# We capture the owning instance id on WS connect into a module-level map keyed by
+# tenant (decision 229441bc picked a tenant->instance-id column over Redis; a
+# module-level map is the lowest-risk unit-testable shape and mirrors the existing
+# per-process socket registries — a future PR can promote it to the DB column for
+# survival across the owning instance's own restart). ``FLY_ALLOC_ID`` (v1 apps) and
+# ``FLY_MACHINE_ID`` (Machines) are the two env vars Fly exposes for the current
+# instance id; we read whichever is set.
+_tenant_owner_instance: dict[str, str] = {}
+
+
+def _fly_instance_id() -> "str | None":
+    """This Fly instance's id (or None when not running on Fly).
+
+    Fly exposes the current machine id as ``FLY_MACHINE_ID`` (Machines platform) and
+    the legacy allocation id as ``FLY_ALLOC_ID``. Prefer the machine id — it's the
+    value ``fly-replay: instance=<id>`` targets — and fall back to the alloc id."""
+    for var in ("FLY_MACHINE_ID", "FLY_ALLOC_ID"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return None
+
+
+def record_tenant_owner_instance(tenant_id: str) -> "str | None":
+    """Record THIS instance as the owner of ``tenant_id``'s tunnel socket (af5b5739).
+
+    Called on WS connect. No-op (returns None) when not on Fly — there is then only
+    one instance and cross-instance routing is meaningless. Returns the recorded
+    instance id so callers/tests can assert it."""
+    inst = _fly_instance_id()
+    if inst:
+        _tenant_owner_instance[tenant_id] = inst
+    return inst
+
+
+def clear_tenant_owner_instance(tenant_id: str, instance_id: "str | None" = None) -> None:
+    """Forget the owning instance for ``tenant_id`` (af5b5739), called on WS close.
+
+    When ``instance_id`` is given, only clear if it still matches — so a stale
+    disconnect from an already-replaced connection can't erase the new owner's claim
+    (mirrors the socket-eviction guard on reconnect)."""
+    if instance_id is None or _tenant_owner_instance.get(tenant_id) == instance_id:
+        _tenant_owner_instance.pop(tenant_id, None)
+
+
+def tenant_owner_instance(tenant_id: str) -> "str | None":
+    """The Fly instance id known to own ``tenant_id``'s tunnel socket, or None."""
+    return _tenant_owner_instance.get(tenant_id)
+
+
+def fly_replay_target(tenant: "dict | None") -> "str | None":
+    """The ``fly-replay`` header VALUE to re-route a cross-instance miss (af5b5739).
+
+    Returns ``"instance=<id>"`` when, for this tenant, THIS instance has no live
+    socket (in-memory miss) but a DIFFERENT Fly instance is known to own one — i.e.
+    the request should be replayed there. Returns None (a no-op) when:
+
+      * not running on Fly (no self instance id), or
+      * this instance already holds the socket (no miss — handle it locally), or
+      * no owning instance is known for the tenant, or
+      * the known owner IS this instance (replaying to ourselves would loop).
+
+    The caller sets ``fly-replay: <value>`` on the response and Fly re-dispatches the
+    original request to the named machine, which does hold the socket."""
+    if not tenant:
+        return None
+    self_inst = _fly_instance_id()
+    if not self_inst:
+        return None  # not on Fly → single instance, nothing to replay to
+    tenant_id = tenant.get("id", "")
+    if not tenant_id or has_active_tunnel(tenant_id):
+        return None  # we hold it (or no id) → serve locally, don't replay
+    owner = _tenant_owner_instance.get(tenant_id)
+    if not owner or owner == self_inst:
+        return None  # unknown owner, or owner is us (would loop)
+    return f"instance={owner}"
+
+
+def fly_replay_target_for_id(tenant_id: str) -> "str | None":
+    """``fly_replay_target`` keyed by tenant id (af5b5739).
+
+    The HTTP proxy path (`_do_proxy`) only has the tenant id, not the full tenant
+    dict, so it resolves the replay target here. Same guards as
+    :func:`fly_replay_target`: no-op off Fly, when we hold the socket, when the
+    owner is unknown, or when the owner is us."""
+    return fly_replay_target({"id": tenant_id})
+
+
+# af5b5739 — response header Fly reads to re-dispatch a request to another machine.
+FLY_REPLAY_HEADER = "fly-replay"
+
+
+def fly_replay_response(target: str) -> Response:
+    """Build the response that carries the ``fly-replay`` header (af5b5739).
+
+    Fly's edge intercepts the header and REPLAYS the original request on the named
+    instance, so the body/status here are only what a client sees if the replay
+    somehow doesn't happen — hence a legible 503 + message rather than a misleading
+    success."""
+    return Response(
+        content=('{"status":"replaying","message":'
+                 f'"{CROSS_INSTANCE_MISS_MESSAGE}"}}').encode(),
+        status_code=503,
+        media_type="application/json",
+        headers={FLY_REPLAY_HEADER: target},
+    )
 
 
 def active_tunnel_tenant_ids() -> "set[str]":

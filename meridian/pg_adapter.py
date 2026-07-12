@@ -516,11 +516,37 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     human_id TEXT,
     added_at TEXT NOT NULL DEFAULT ({_TS}),
     completed_at TEXT,
+    claimed_at TEXT,
     task_id TEXT,
     notes TEXT,
     feedback_thumb SMALLINT,
     feedback_note TEXT,
     milestone_type TEXT NOT NULL DEFAULT 'task',
+    -- Task-tree columns (mirror SQLite base + _migrate_pg_sprint_item_tree). NULL =
+    -- no parent / not split / not merged. parent_id references sprint_items(id).
+    parent_id TEXT DEFAULT NULL REFERENCES sprint_items(id),
+    split_from TEXT DEFAULT NULL,
+    merged_into TEXT DEFAULT NULL,
+    merged_from TEXT DEFAULT NULL,
+    -- 4f02340e: mixed-ownership task chains. 'human' | 'ai' | NULL (unassigned).
+    owner TEXT DEFAULT NULL,
+    -- v2.6 (dependency tracking, mirrors db._migrate_sprint_item_dependency):
+    -- depends_on references a sibling sprint item id (NULL = no dependency);
+    -- failure_mode is what to do when the depended-on item has failed —
+    -- 'continue' (default, still claimable) or 'stop' (blocked on parent failure).
+    depends_on TEXT,
+    failure_mode TEXT NOT NULL DEFAULT 'continue',
+    -- touches_files (file conflict tracking) + touches_resources (501ec93f: typed
+    -- resource identifiers, JSON list generalizing touches_files). Both nullable.
+    touches_files TEXT,
+    touches_resources TEXT,
+    -- bc9259b8: worker stall auto-retry counter. NOT NULL DEFAULT 0 so legacy rows
+    -- read as "never stalled".
+    stall_count INTEGER NOT NULL DEFAULT 0,
+    -- 5823db0b: quality gates + actor attribution. required_notes is a note-count
+    -- gate (INTEGER DEFAULT 0); actor records who last acted on the item.
+    required_notes INTEGER DEFAULT 0,
+    actor TEXT,
     slug TEXT,
     nickname TEXT,
     deferred_until TEXT,
@@ -763,6 +789,20 @@ CREATE TABLE IF NOT EXISTS sprint_item_pointers (
     targets TEXT NOT NULL,
     label TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
+);
+
+-- 3295c784 — mcp_rate_counters: cross-instance shared hit-counting for the
+-- consolidated /mcp tenant-tier rate limiter. Per-process _tenant_rl_hits
+-- under-counts across N Fly machines; this windowed counter (keyed by
+-- tenant_id + epoch-minute window_start) gives every instance one shared count
+-- via an atomic upsert. Gated by MERIDIAN_SHARED_RATE_LIMIT (default OFF).
+-- The composite PRIMARY KEY indexes lookups; the prune-by-window index lives
+-- ONLY in the guarded _migrate_pg_mcp_rate_counters migration, never inline.
+CREATE TABLE IF NOT EXISTS mcp_rate_counters (
+    tenant_id TEXT NOT NULL,
+    window_start BIGINT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant_id, window_start)
 );
 """
 
@@ -2550,6 +2590,57 @@ async def _migrate_pg_sprint_item_priority_blocker(conn: PostgresConnection) -> 
     )
 
 
+async def _migrate_pg_sprint_item_dependency(conn: PostgresConnection) -> None:
+    """b01326e9 / v2.6 — dependency + file-conflict columns on sprint_items.
+
+    Backfills the sprint_items columns that had a SQLite migration but no
+    Postgres upgrade path, so existing prod DBs (where CREATE TABLE IF NOT
+    EXISTS is a no-op) get patched:
+
+      depends_on    — sibling sprint item id this one depends on (NULL = none).
+      failure_mode  — behaviour when depends_on has failed: 'continue' (default,
+                      still claimable) or 'stop' (blocked). NOT NULL DEFAULT.
+      touches_files — file-conflict tracking (predates touches_resources).
+
+    CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path. ADD COLUMN
+    IF NOT EXISTS → idempotent. Mirrors db._migrate_sprint_item_dependency /
+    _migrate_touches_files.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS depends_on TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS failure_mode TEXT NOT NULL DEFAULT 'continue';"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS touches_files TEXT"
+    )
+
+
+async def _migrate_pg_mcp_rate_counters(conn: PostgresConnection) -> None:
+    """3295c784 — mcp_rate_counters: cross-instance shared hit-counting for the
+    consolidated /mcp tenant-tier rate limiter (mirrors SQLite).
+
+    The per-process ``_tenant_rl_hits`` dict only counts requests on one Fly
+    machine, so across N machines the effective limit is ~Nx intended. This
+    windowed counter keeps one atomic count per (tenant_id, epoch-minute window)
+    so every instance shares a single total. Gated by MERIDIAN_SHARED_RATE_LIMIT
+    (default OFF — prod behavior unchanged until opted in).
+
+    CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path.
+    CREATE TABLE / CREATE INDEX IF NOT EXISTS → idempotent. The extra index on
+    ``window_start`` (for the opportunistic prune) lives here, never inline in
+    the base literal (guarded-migration rule). Mirrors
+    db._migrate_mcp_rate_counters.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS mcp_rate_counters ("
+        "    tenant_id TEXT NOT NULL,"
+        "    window_start BIGINT NOT NULL,"
+        "    count INTEGER NOT NULL DEFAULT 0,"
+        "    PRIMARY KEY (tenant_id, window_start)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_mcp_rate_counters_window "
+        "ON mcp_rate_counters(window_start)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2608,4 +2699,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_pointers,
     _migrate_pg_sprint_item_deferral,
     _migrate_pg_sprint_item_priority_blocker,
+    _migrate_pg_sprint_item_dependency,
+    _migrate_pg_mcp_rate_counters,
 )

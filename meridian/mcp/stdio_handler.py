@@ -2166,21 +2166,44 @@ def build_mcp_server():
                 # 3689f680 — compact by default (full block via compact=False).
                 # a76cb7c0 — optional `version` scopes the session to a
                 # sprint-version bucket.
-                result = await _start_session_composite(
-                    db,
-                    arguments["project_id"],
-                    arguments["session_name"],
-                    state["data_dir"],
-                    human_id=arguments.get("human_id"),
-                    client_type=arguments.get("client"),
-                    role=arguments.get("role"),
-                    compact=arguments.get("compact", True),
-                    version=arguments.get("version"),
-                    # 2b4e69aa — collapse coherence-flagged-stale goal fields to
-                    # a one-liner by default; opt back into full bodies with
-                    # expand_stale=true.
-                    expand_stale=bool(arguments.get("expand_stale", False)),
-                )
+                # ce3693e4 — resolve project_name → project_id. The stdio path
+                # never went through _dispatch_mcp_tool's central resolver, so
+                # start_session(project_name=...) raised a bare
+                # KeyError('project_id') here even though every project-scoped
+                # stdio schema advertises project_name. Resolve it (project_id
+                # wins when both are given), then guard so a missing project
+                # returns a clean error instead of a KeyError.
+                _pid = (arguments.get("project_id") or "").strip()
+                if not _pid and arguments.get("project_name"):
+                    _p = await db_module.get_project_by_name(
+                        db, str(arguments["project_name"])
+                    )
+                    _pid = (_p or {}).get("id", "") if _p else ""
+                if not _pid:
+                    result = {"error": "project_id (or project_name) is required"}
+                else:
+                    # 599d0097 — session_name is optional; generate a default
+                    # from the first pending item when omitted/blank.
+                    _sname = (arguments.get("session_name") or "").strip()
+                    if not _sname:
+                        _sname = await db_module.generate_default_session_name(
+                            db, _pid
+                        )
+                    result = await _start_session_composite(
+                        db,
+                        _pid,
+                        _sname,
+                        state["data_dir"],
+                        human_id=arguments.get("human_id"),
+                        client_type=arguments.get("client"),
+                        role=arguments.get("role"),
+                        compact=arguments.get("compact", True),
+                        version=arguments.get("version"),
+                        # 2b4e69aa — collapse coherence-flagged-stale goal fields
+                        # to a one-liner by default; opt back into full bodies
+                        # with expand_stale=true.
+                        expand_stale=bool(arguments.get("expand_stale", False)),
+                    )
             elif name == "list_projects":
                 result = await db_module.list_project_summaries(db)
             elif name == "get_project_by_name":

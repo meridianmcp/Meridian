@@ -755,6 +755,23 @@ CREATE TABLE IF NOT EXISTS sprint_item_pointers (
     label TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 3295c784 — mcp_rate_counters: cross-instance (shared) hit-counting for the
+-- consolidated /mcp tenant-tier rate limiter. Per-process _tenant_rl_hits under-
+-- counts across N Fly machines (effective limit ~Nx). This windowed counter is
+-- keyed by (tenant_id, window_start) where window_start is an epoch-minute
+-- bucket; increment_rate_counter does an atomic upsert (count = count + 1) so
+-- concurrent requests across instances agree on a single shared count. Gated by
+-- MERIDIAN_SHARED_RATE_LIMIT (default OFF — the per-process path is unchanged).
+-- The composite PRIMARY KEY already indexes (tenant_id, window_start); the
+-- prune-by-window index lives ONLY in the guarded _migrate_mcp_rate_counters
+-- migration, never inline here (2026-07-04 inline-index outage trap).
+CREATE TABLE IF NOT EXISTS mcp_rate_counters (
+    tenant_id TEXT NOT NULL,
+    window_start INTEGER NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant_id, window_start)
+);
 """
 
 
@@ -944,6 +961,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_pointers(db)
     await _migrate_sprint_item_deferral(db)
     await _migrate_sprint_item_priority_blocker(db)
+    await _migrate_mcp_rate_counters(db)
     return db
 
 
@@ -12814,3 +12832,62 @@ async def get_session_file_claims(
     ) as cur:
         rows = await cur.fetchall()
     return [r["file_path"] for r in rows if r is not None]
+
+
+# ---------------------------------------------------------------------------
+# 3295c784 — shared (cross-Fly-instance) rate-limit counters
+# ---------------------------------------------------------------------------
+
+async def increment_rate_counter(
+    db: aiosqlite.Connection, tenant_id: str, window_start_minute: int
+) -> int:
+    """Atomically bump and return the shared hit count for a tenant's window.
+
+    ``window_start_minute`` is an epoch-minute bucket (``int(time.time() // 60)``).
+    The upsert (``INSERT ... ON CONFLICT (tenant_id, window_start) DO UPDATE SET
+    count = count + 1``) is a single atomic statement on BOTH backends, so
+    concurrent requests — even across different Fly machines hitting the same
+    Postgres row — never lose an increment. The value is then read back with a
+    follow-up SELECT rather than ``RETURNING`` because the PG adapter only
+    surfaces rows for SELECT/WITH statements (an INSERT...RETURNING would execute
+    but its row would not be fetched). Under heavy concurrency the read-back may
+    observe a value a hair HIGHER than this caller's own increment (a sibling
+    request bumped it in between); that only ever over-counts, which is the safe
+    direction for a limiter (it never lets a tenant slip past its budget).
+
+    Returns the current shared count for ``window_start_minute`` after this
+    request's increment.
+    """
+    await db.execute(
+        "INSERT INTO mcp_rate_counters (tenant_id, window_start, count) "
+        "VALUES (?, ?, 1) "
+        "ON CONFLICT (tenant_id, window_start) "
+        "DO UPDATE SET count = mcp_rate_counters.count + 1",
+        (tenant_id, window_start_minute),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT count FROM mcp_rate_counters "
+        "WHERE tenant_id = ? AND window_start = ?",
+        (tenant_id, window_start_minute),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0
+    return int(row["count"])
+
+
+async def prune_rate_counters(
+    db: aiosqlite.Connection, older_than_minute: int
+) -> None:
+    """Delete counter rows for windows strictly older than ``older_than_minute``.
+
+    Called opportunistically from the limiter path so the table never grows
+    without bound. Cheap (one DELETE against the ``idx_mcp_rate_counters_window``
+    index); best-effort — a failure here must never affect the request.
+    """
+    await db.execute(
+        "DELETE FROM mcp_rate_counters WHERE window_start < ?",
+        (older_than_minute,),
+    )
+    await db.commit()

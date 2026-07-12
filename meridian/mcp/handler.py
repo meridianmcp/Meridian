@@ -1734,14 +1734,26 @@ async def _handle_project_tools(
         # bucket (orientation counts/items + /goal filter to it).
         # 599d0097 — session_name is optional: when omitted/blank, generate a
         # meaningful default from the first pending item title + timestamp.
+        # ce3693e4 — resolve project_name → project_id HERE too (the central
+        # _dispatch_mcp_tool resolver already does this for the HTTP surface, but
+        # start_session must never index args["project_id"] blind: if only a
+        # project_name reached this handler it would raise a bare
+        # KeyError('project_id') that leaks as a cryptic -32603. Mirror the
+        # set_parent_project / rename_project pattern: resolve, then guard.
+        _pid = (args.get("project_id") or "").strip()
+        if not _pid and args.get("project_name"):
+            _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+            _pid = (_p or {}).get("id", "") if _p else ""
+        if not _pid:
+            return {"error": "project_id (or project_name) is required"}
         _sname = (args.get("session_name") or "").strip()
         if not _sname:
             _sname = await db_module.generate_default_session_name(
-                db, args["project_id"]
+                db, _pid
             )
         result = await _server._start_session_composite(
             db,
-            args["project_id"],
+            _pid,
             _sname,
             data_dir,
             human_id=args.get("human_id"),
@@ -1774,7 +1786,7 @@ async def _handle_project_tools(
         if tenant is not None:
             try:
                 tenant_id = tenant.get("id", "")
-                exec_cfg = await db_module.get_executor_config(db, args["project_id"])
+                exec_cfg = await db_module.get_executor_config(db, _pid)
                 repo_path = exec_cfg.get("repo_path") if exec_cfg else None
                 fs_roots = (exec_cfg.get("filesystem_roots") if exec_cfg else None) or []
                 # Union repo_path + filesystem_roots, deduped, order-preserved.

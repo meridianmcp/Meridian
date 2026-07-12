@@ -10,7 +10,8 @@ Meridian** — pure stdlib. Import the submodules directly:
 """
 from __future__ import annotations
 
-from . import docs_intel, latex_intel  # noqa: F401 — make submodules importable
+from . import docs_intel, latex_intel, structural_parser  # noqa: F401 — importable
+from .structural_parser import StructuralParser  # noqa: F401 — shared base class
 
 __version__ = "0.1.0"
-__all__ = ["docs_intel", "latex_intel"]
+__all__ = ["docs_intel", "latex_intel", "structural_parser", "StructuralParser"]

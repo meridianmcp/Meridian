@@ -454,11 +454,38 @@ _tenant_rl_hits: dict[str, list[float]] = {}
 # token_hash -> (cached_at_monotonic, (tenant_id, plan))
 _tenant_rl_plan_cache: dict[str, "tuple[float, tuple[str, str]]"] = {}
 
+# ---------------------------------------------------------------------------
+# 3295c784 — shared (cross-Fly-instance) rate-limit counters.
+#
+# The default limiter above counts hits in the per-process ``_tenant_rl_hits``
+# dict, so across N Fly machines a tenant's effective budget is ~Nx intended.
+# When ``MERIDIAN_SHARED_RATE_LIMIT`` is set, the decision path instead uses a
+# Postgres atomic counter (mcp_rate_counters) that every instance shares —
+# pinned decision 2ad938a0 (Postgres over Redis, no new infra).
+#
+# The DB round-trip is mitigated by ``_tenant_rl_over_limit``: once a tenant is
+# seen over-budget in a given window we short-circuit every later request in
+# that same window WITHOUT touching the DB. This dict is process-local (only a
+# performance cache — the DB counter is the source of truth) and is cleared by
+# ``_reset_tenant_rate_limit`` so tests never bleed across each other.
+# Keyed by (tenant_id, window_start_minute) -> True.
+# ``MERIDIAN_SHARED_RATE_LIMIT`` defaults OFF: prod behavior is unchanged.
+# ---------------------------------------------------------------------------
+_tenant_rl_over_limit: dict["tuple[str, int]", bool] = {}
+
+
+def _shared_rate_limit_enabled() -> bool:
+    """Return True when the shared (cross-instance) rate limiter is opted in."""
+    return os.environ.get("MERIDIAN_SHARED_RATE_LIMIT", "").lower() in (
+        "1", "true", "yes",
+    )
+
 
 def _reset_tenant_rate_limit() -> None:
     """Clear per-tenant rate-limit counters and the token→plan cache."""
     _tenant_rl_hits.clear()
     _tenant_rl_plan_cache.clear()
+    _tenant_rl_over_limit.clear()
 
 
 def _rate_limit(rate: str):

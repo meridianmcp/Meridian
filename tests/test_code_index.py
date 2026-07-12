@@ -438,6 +438,96 @@ def test_search_code_semantic_missing_dir():
 
 
 # ===========================================================================
+# a0cf71ef — root_dir normalization: a valid local dir handed to us in a
+# quoted / ~-prefixed / trailing-sep shape must be ACCEPTED (was reported as
+# "root_dir does not exist"), while a genuinely missing path still errors.
+# ===========================================================================
+
+def test_normalize_root_dir_strips_quotes_and_whitespace():
+    """Surrounding quotes + whitespace (a JSON/shell round-trip artifact) are
+    stripped so the path resolves; result is an absolute path."""
+    raw = '  "' + os.getcwd() + '"  '
+    out = ci.normalize_root_dir(raw)
+    assert out == os.path.abspath(os.getcwd())
+    assert '"' not in out
+
+
+def test_normalize_root_dir_expands_user_and_env(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_TESTVAR", "sub")
+    out = ci.normalize_root_dir("~")
+    assert out == os.path.abspath(os.path.expanduser("~"))
+    out2 = ci.normalize_root_dir(os.path.join("$MERIDIAN_TESTVAR", "leaf"))
+    assert "sub" in out2 and "$MERIDIAN_TESTVAR" not in out2
+
+
+def test_normalize_root_dir_empty_returns_empty():
+    assert ci.normalize_root_dir("") == ""
+    assert ci.normalize_root_dir(None) == ""
+    assert ci.normalize_root_dir('""') == ""
+
+
+def test_search_code_semantic_accepts_quoted_valid_dir(tmp_path):
+    """A valid local dir passed WITH surrounding quotes indexes + searches
+    instead of returning 'root_dir does not exist'."""
+    _write(tmp_path / "svc.py", _SAMPLE_PY)
+    db_path = str(tmp_path / "idx.duckdb")
+    quoted = '"' + str(tmp_path) + '"'
+    res = ci.search_code_semantic(quoted, "parse_token", db_path=db_path)
+    assert "error" not in res, res
+    assert res["total_indexed"] > 0
+    # root_dir echoes the normalized (unquoted, absolute) path.
+    assert res["root_dir"] == os.path.abspath(str(tmp_path))
+    assert any(h["name"] == "parse_token" for h in res["hits"])
+
+
+def test_search_code_semantic_accepts_trailing_sep_and_forward_slashes(tmp_path):
+    """Trailing separator + POSIX-style forward slashes still resolve on any OS."""
+    _write(tmp_path / "svc.py", _SAMPLE_PY)
+    db_path = str(tmp_path / "idx.duckdb")
+    forward = str(tmp_path).replace(os.sep, "/") + "/"
+    res = ci.search_code_semantic(forward, "parse_token", db_path=db_path)
+    assert "error" not in res, res
+    assert res["total_indexed"] > 0
+
+
+def test_search_code_semantic_truly_missing_dir_still_errors(tmp_path):
+    """Normalization must NOT mask a genuinely non-existent path — a path that
+    does not resolve to a real directory still returns the 'does not exist'
+    error, never a silent empty success on some other directory."""
+    missing = str(tmp_path / "definitely_not_here_zzz")
+    res = ci.search_code_semantic(missing, "x")
+    assert res.get("error", "").startswith("root_dir does not exist")
+    assert res["hits"] == []
+
+
+def test_reindex_at_checkpoint_accepts_quoted_valid_dir(tmp_path):
+    """reindex_at_checkpoint also normalizes: a quoted valid dir reindexes
+    without the 'does not exist' error."""
+    _write(tmp_path / "svc.py", "def hello():\n    return 1\n")
+    db_path = str(tmp_path / "idx.duckdb")
+    quoted = '"' + str(tmp_path) + '"'
+    s = ci.reindex_at_checkpoint(quoted, db_path=db_path)
+    assert "error" not in s, s
+    assert "svc.py" in s["added"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_search_code_semantic_accepts_quoted_dir(tmp_path):
+    """End-to-end through _dispatch_mcp_tool: a quoted valid root_dir searches
+    (the handler .strip()s but code_index does the real normalization)."""
+    from meridian import server as srv
+
+    _write(tmp_path / "svc.py", "def unique_dispatch_marker():\n    return 7\n")
+    res = await srv._dispatch_mcp_tool(
+        "search_code_semantic",
+        {"root_dir": '"' + str(tmp_path) + '"', "query": "unique_dispatch_marker"},
+        None, str(tmp_path),
+    )
+    assert "error" not in res, res
+    assert any(h["name"] == "unique_dispatch_marker" for h in res["hits"])
+
+
+# ===========================================================================
 # Optional vector (VSS) leg — real end-to-end when deps are present
 # ===========================================================================
 

@@ -120,7 +120,9 @@ def test_build_quick_start_goal_excludes_manual_items():
     items = [
         {"id": "code01", "title": "FEAT: real code work"},
         {"id": "man-title", "title": "MANUAL (Adam): publish the blog post"},
-        {"id": "man-human", "title": "Configure PyPI publisher", "human_id": "adam"},
+        # 943afe1e — a manual signal is blocker_kind=='manual' (a real-world action
+        # outside Meridian), NOT the mere presence of human_id.
+        {"id": "man-blk", "title": "Configure PyPI publisher", "blocker_kind": "manual"},
         {"id": "man-mile", "title": "Install binary", "milestone_type": "human"},
     ]
     goal = handoff_module._build_quick_start_goal(items)
@@ -134,7 +136,7 @@ def test_build_quick_start_goal_excludes_manual_items():
     exec_clause, _, manual_clause = goal.partition("<exclusions>")
     assert manual_clause, "expected a separate <exclusions> MANUAL todo section"
     assert "maintainer's own todo" in manual_clause
-    for mid in ("man-title", "man-human", "man-mile"):
+    for mid in ("man-title", "man-blk", "man-mile"):
         assert mid not in exec_clause, f"{mid} leaked into the executor list"
         assert mid in manual_clause
     assert "code01" not in manual_clause
@@ -144,11 +146,56 @@ def test_build_quick_start_goal_excludes_manual_items():
     assert "not done while any listed item" not in manual_clause
     assert "must NOT claim, execute, or complete" in manual_clause
 
-    # Helper classifies each MANUAL signal, and leaves real work alone.
+    # Helper classifies each GENUINE MANUAL signal, and leaves real work alone.
     assert _is_manual_sprint_item({"title": "MANUAL (Adam): x"})
-    assert _is_manual_sprint_item({"title": "x", "human_id": "adam"})
+    assert _is_manual_sprint_item({"title": "x", "blocker_kind": "manual"})
     assert _is_manual_sprint_item({"title": "x", "milestone_type": "human"})
     assert not _is_manual_sprint_item({"id": "y", "title": "FEAT: y"})
+    # 943afe1e — human_id ALONE (who is assigned) is NOT a manual-only signal: an
+    # executor-actionable item assigned to a maintainer stays claimable.
+    assert not _is_manual_sprint_item(
+        {"id": "y", "title": "BUG: crash on start", "human_id": "adam"}
+    )
+
+
+def test_human_id_bug_item_is_actionable_not_excluded():
+    """943afe1e — regression: generate_handoff's <exclusions> logic wrongly caught
+    recently-created/edited ``human_id='adam'`` items alongside genuine MANUAL-only
+    items. An executor-actionable item (BUG/FIX/FEAT title, real touches_resources)
+    assigned to a human must land in the claim-and-execute list, NOT the exclusions
+    block; genuine MANUAL items must still be excluded."""
+    from meridian.handoff import _is_manual_sprint_item
+
+    items = [
+        # Executor-actionable, merely assigned to a human — must be actionable.
+        {
+            "id": "bug-adam",
+            "title": "BUG: file_read_claims TTL cleanup crashes",
+            "human_id": "adam",
+            "touches_resources": ["file:meridian/db/__init__.py"],
+        },
+        # A genuine maintainer-only todo — must stay excluded.
+        {
+            "id": "man-adam",
+            "title": "MANUAL (Adam): configure PyPI trusted publisher",
+            "human_id": "adam",
+        },
+    ]
+
+    # Direct classifier: assignment is not a manual signal; a MANUAL title is.
+    assert not _is_manual_sprint_item(items[0])
+    assert _is_manual_sprint_item(items[1])
+
+    goal = handoff_module._build_quick_start_goal(items)
+    exec_clause, _, manual_clause = goal.partition("<exclusions>")
+    assert manual_clause, "expected a separate <exclusions> MANUAL todo section"
+
+    # The BUG item assigned to adam is in the claim-and-execute list, NOT excluded.
+    assert "bug-adam" in exec_clause
+    assert "bug-adam" not in manual_clause
+    # The genuine MANUAL item is still excluded and never leaks into the exec list.
+    assert "man-adam" in manual_clause
+    assert "man-adam" not in exec_clause
 
 
 def test_build_quick_start_goal_all_manual_still_surfaces_todo():
@@ -158,6 +205,7 @@ def test_build_quick_start_goal_all_manual_still_surfaces_todo():
         [{"id": "m1", "title": "MANUAL (Adam): screenshots", "human_id": "adam"}]
     )
     assert "Verify remaining work is complete" in goal   # empty executable path
+    # (MANUAL-tagged title is the manual signal here; human_id is incidental.)
     assert "maintainer's own todo" in goal
     # 5abf3e12 — the maintainer todo is the <exclusions> tag.
     before_note = goal.split("<exclusions>")[0]

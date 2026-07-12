@@ -345,10 +345,12 @@ async def test_annotate_skips_manual_items():
         return [{"file": "x.py", "function": "y", "qualified_name": "y"}]
 
     manual_by_title = {"id": "m1", "title": "MANUAL (Adam): form an LLC", "status": "pending"}
-    manual_by_human = {"id": "m2", "title": "install the binary", "human_id": "adam", "status": "pending"}
+    # 943afe1e — a genuine manual signal is blocker_kind=='manual' (a real-world
+    # action outside Meridian), NOT the mere presence of human_id (who is assigned).
+    manual_by_blocker = {"id": "m2", "title": "install the binary", "blocker_kind": "manual", "status": "pending"}
     manual_by_milestone = {"id": "m3", "title": "capture screenshots", "milestone_type": "human", "status": "pending"}
     out = await handoff_module._annotate_code_pointers(
-        [manual_by_title, manual_by_human, manual_by_milestone], searcher
+        [manual_by_title, manual_by_blocker, manual_by_milestone], searcher
     )
     assert called == []  # searcher never consulted for MANUAL items
     for it in out:

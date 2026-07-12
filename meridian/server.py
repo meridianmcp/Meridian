@@ -51,6 +51,8 @@ from ._deps import (
     _TENANT_RL_PER_MINUTE,
     _tenant_rl_hits,
     _tenant_rl_plan_cache,
+    _tenant_rl_over_limit,
+    _shared_rate_limit_enabled,
     _get_authenticated_tenant,
     _mask_api_token_hash,
     _md_ts,
@@ -1087,6 +1089,64 @@ async def _body_size_guard_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+def _rate_limit_429(plan: str, limit: int, retry: int):
+    """Build the 429 JSONResponse both limiter paths return when over budget."""
+    from fastapi.responses import JSONResponse  # noqa: PLC0415
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": f"Rate limit exceeded: plan '{plan}' allows {limit} requests/min.",
+            "plan": plan,
+            "limit_per_minute": limit,
+            "retry_after_seconds": retry,
+        },
+        headers={"Retry-After": str(retry)},
+    )
+
+
+async def _tenant_rate_limit_decision_shared(
+    request: Request, tenant_id: str, plan: str, limit: int, now_wall: float
+):
+    """3295c784 — shared (cross-Fly-instance) counter path for the tenant limiter.
+
+    Uses a Postgres atomic counter (mcp_rate_counters) keyed by
+    (tenant_id, epoch-minute) so N Fly machines share ONE hit count instead of
+    each keeping its own per-process tally (which multiplied the effective limit
+    by N). Chosen over Redis per pinned decision 2ad938a0 (no new infra).
+
+    Perf mitigation (also from 2ad938a0): the first time a tenant is seen over
+    budget in a window we record it in the process-local ``_tenant_rl_over_limit``
+    cache and short-circuit every subsequent request in that SAME window without
+    a DB round-trip. The DB counter stays the source of truth; the cache only
+    avoids re-querying a tenant we already know is blocked this minute.
+
+    FAIL-OPEN: any DB error lets the request through (the caller wraps this in a
+    try/except too). Returns a 429 JSONResponse when over budget, else None.
+    """
+    window = int(now_wall // 60)
+    retry = max(1, 60 - int(now_wall % 60))
+
+    # Fast path: already known to be over budget this window — no DB hit.
+    if _tenant_rl_over_limit.get((tenant_id, window)):
+        return _rate_limit_429(plan, limit, retry)
+
+    from . import db as _db_mod  # noqa: PLC0415
+    db = request.app.state.db
+    new_count = await _db_mod.increment_rate_counter(db, tenant_id, window)
+
+    # Opportunistically prune windows older than the current + previous minute so
+    # the table never grows unbounded. Best-effort — never block the request.
+    try:
+        await _db_mod.prune_rate_counters(db, window - 1)
+    except Exception:  # noqa: BLE001 — pruning is never load-bearing
+        pass
+
+    if new_count > limit:
+        _tenant_rl_over_limit[(tenant_id, window)] = True
+        return _rate_limit_429(plan, limit, retry)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Tier-based per-tenant rate limiting (live-queue hardening, 2b93cb59)
 #
@@ -1096,7 +1156,8 @@ async def _body_size_guard_middleware(request: Request, call_next):
 # /static traffic is never metered. FAIL-OPEN: any error resolving the tenant or
 # counting hits lets the request through, so a limiter bug can never take down
 # live traffic. In-memory sliding window (process-local, no Redis), matching the
-# slowapi limiter's storage model.
+# slowapi limiter's storage model. 3295c784 adds an opt-in shared-counter path
+# (MERIDIAN_SHARED_RATE_LIMIT) so the count is consistent across Fly instances.
 # ---------------------------------------------------------------------------
 async def _tenant_rate_limit_decision(request: Request):
     """Return a 429 JSONResponse when the bearer tenant is over its per-minute
@@ -1130,6 +1191,14 @@ async def _tenant_rate_limit_decision(request: Request):
     limit = _TENANT_RL_PER_MINUTE.get(plan, _TENANT_RL_PER_MINUTE["free"])
     if limit is None:
         return None  # pro / admin — unlimited
+
+    # 3295c784 — shared (cross-Fly-instance) path, opt-in via
+    # MERIDIAN_SHARED_RATE_LIMIT. Default OFF → fall through to the unchanged
+    # per-process window below.
+    if _shared_rate_limit_enabled():
+        return await _tenant_rate_limit_decision_shared(
+            request, tenant_id, plan, limit, _time.time()
+        )
 
     hits = _tenant_rl_hits.setdefault(tenant_id, [])
     cutoff = now - _TENANT_RL_WINDOW_SECONDS
@@ -3965,16 +4034,29 @@ def _execution_mode_directive(mode: str | None) -> str:
 
 # 72e12ed8 — HITL auto-answer directive surfaced in the start_session orientation
 # so executors know whether request_hitl resolves inline or blocks for a human.
+# 67f118c3 — this directive is prepended to agent_instructions, so for modes 1/2
+# it must ALSO override the unconditional "request_hitl is mandatory for any human
+# question" rule baked into DEFAULT_AGENT_INSTRUCTIONS. Without the override, the
+# injected body contradicts the /goal's mode>=1 "Do NOT file HITLs" clause and
+# sessions still file unwanted mid-sprint HITLs. Mode 0 keeps the mandatory wording.
 _HITL_MODE_DIRECTIVES = {
     0: ("HITL: auto-answer OFF — request_hitl queues for a human and "
         "urgency='blocking' pauses you until answered. Still ALWAYS use request_hitl "
         "to ask the human; never just ask in chat."),
     1: ("HITL: auto-answer SAFE — request_hitl resolves immediately for "
         "non-destructive questions and returns the answer inline (it does not "
-        "block). Use it freely; require_human=true still routes to a human."),
+        "block). Use it freely; require_human=true still routes to a human. "
+        "OVERRIDE: auto-answer is ON, so filing a request_hitl is NOT mandatory — "
+        "the 'request_hitl is the ONLY human-decision channel / MUST go through "
+        "request_hitl' rule below does NOT apply mid-sprint. Prefer to skip blocked "
+        "items and continue; only file a HITL when you genuinely need a human."),
     2: ("HITL: auto-answer AGGRESSIVE — request_hitl resolves immediately and "
         "returns the answer inline for nearly all questions. Use it freely; "
-        "require_human=true still forces a human reply."),
+        "require_human=true still forces a human reply. "
+        "OVERRIDE: auto-answer is ON, so filing a request_hitl is NOT mandatory — "
+        "the 'request_hitl is the ONLY human-decision channel / MUST go through "
+        "request_hitl' rule below does NOT apply mid-sprint. Prefer to skip blocked "
+        "items and continue; only file a HITL when you genuinely need a human."),
 }
 
 
