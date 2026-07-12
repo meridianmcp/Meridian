@@ -28,6 +28,10 @@ jobs:
       # 696bf9d6 — --durations=20 surfaces the 20 slowest tests in every run so the
       # test-core duration regression (53s -> 301s) can be attributed to real
       # per-test timings before any fast/slow job split, rather than guessed.
+      # bad568b5 — analysis recorded in tests/PERF_test_core_durations.md: the cost
+      # is per-test `client`-fixture setup (importlib.reload(meridian.server) on
+      # ~390/946 tests), not any single slow test. Keep --durations so the fix's
+      # before/after is measurable.
       - run: pixi run python -m pytest tests/ -n auto -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=82
 
   test-postgres:
