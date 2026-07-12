@@ -2795,6 +2795,151 @@ async def check_word_write_conflict(
     }
 
 
+# 7ef712a8 — code-intel graph tools identify a project by the *local repo-path
+# slug* (e.g. "C-Users-13144-Documents-Meridian-repository"), NOT the Meridian
+# planning-project name (e.g. "meridian-build"). A session naturally passes the
+# planning name first, gets a bare "project not found", and may abandon
+# code-intel. These are the code-slot (codebase-memory-mcp) tools that take a
+# project identifier; when one 404s on the project we enrich the error with the
+# slug explanation + the list of actually-indexed identifiers (closest first).
+_CODE_INTEL_PROJECT_TOOLS = frozenset({
+    "search_graph", "query_graph", "trace_path", "get_architecture",
+    "get_graph_schema", "search_code", "get_code_snippet", "detect_changes",
+    "index_status", "ingest_traces", "manage_adr", "delete_project",
+})
+
+
+def _is_project_not_found_error(msg: str) -> bool:
+    """Heuristic: does an error message look like a code-intel project lookup miss?
+
+    The codebase-memory server phrases this a few ways ("project not found",
+    "no project ... found", "unknown project", "project '<slug>' does not
+    exist"). Match loosely on the (project + not-found) signal so we enrich the
+    right failures without hijacking unrelated errors (e.g. a query syntax error).
+    """
+    low = (msg or "").lower()
+    if "project" not in low:
+        return False
+    return any(
+        phrase in low
+        for phrase in (
+            "not found", "no such", "unknown project", "does not exist",
+            "no project", "not indexed", "isn't indexed", "is not indexed",
+        )
+    )
+
+
+def _closest_project_ids(wanted: str, available: "list[str]") -> "list[str]":
+    """Order ``available`` project identifiers by similarity to ``wanted``.
+
+    Uses difflib so the caller's likely-intended slug floats to the top of the
+    hint. Pure string ranking — never raises, returns ``available`` order on any
+    degenerate input.
+    """
+    if not wanted or not available:
+        return list(available)
+    import difflib  # noqa: PLC0415 — only needed on the error path
+    scored = sorted(
+        available,
+        key=lambda p: difflib.SequenceMatcher(None, wanted.lower(), p.lower()).ratio(),
+        reverse=True,
+    )
+    return scored
+
+
+async def _list_indexed_project_ids(tenant_id: str) -> "list[str]":
+    """Best-effort: fetch the code-intel server's indexed project identifiers.
+
+    Calls the codebase ``list_projects`` tool over the same tunnel and pulls out
+    each project's identifier (``id`` / ``project_id`` / ``name`` / ``slug``,
+    whichever the server returns). Never raises — returns ``[]`` on any failure so
+    error enrichment can't itself throw.
+    """
+    try:
+        result = await call_tunnel_tool(tenant_id, "codebase__list_projects", {})
+    except Exception:  # noqa: BLE001 — enrichment must never mask the real error
+        return []
+    payload = _extract_graph_matches(result)
+    projects: Any = payload
+    if isinstance(payload, dict):
+        projects = (
+            payload.get("projects")
+            or payload.get("results")
+            or payload.get("items")
+            or []
+        )
+    ids: list[str] = []
+    if isinstance(projects, list):
+        for proj in projects:
+            if isinstance(proj, str):
+                ids.append(proj)
+            elif isinstance(proj, dict):
+                ident = (
+                    proj.get("id")
+                    or proj.get("project_id")
+                    or proj.get("name")
+                    or proj.get("slug")
+                    or proj.get("path")
+                )
+                if ident:
+                    ids.append(str(ident))
+    # De-dupe, preserve order.
+    seen: set[str] = set()
+    return [i for i in ids if not (i in seen or seen.add(i))]
+
+
+async def _enrich_code_intel_project_error(
+    tenant_id: str, name: str, arguments: dict | None, original_msg: str,
+) -> str:
+    """Turn a bare code-intel "project not found" into an actionable hint.
+
+    Explains that the identifier is the *local repo-path slug*, not the Meridian
+    planning-project name, and lists the actually-indexed identifiers (closest
+    match to what the caller passed floated to the top). Returns the original
+    message unchanged if enrichment doesn't apply or can't add anything.
+    """
+    bare = name.split("__", 1)[1] if "__" in name else name
+    if bare not in _CODE_INTEL_PROJECT_TOOLS:
+        return original_msg
+    if not _is_project_not_found_error(original_msg):
+        return original_msg
+    wanted = ""
+    if isinstance(arguments, dict):
+        wanted = str(
+            arguments.get("project_id")
+            or arguments.get("project")
+            or arguments.get("project_name")
+            or ""
+        ).strip()
+    available = await _list_indexed_project_ids(tenant_id)
+    ranked = _closest_project_ids(wanted, available)
+    hint = (
+        f"{original_msg}\n\n"
+        "Note: code-intel graph tools identify a project by its LOCAL REPO-PATH "
+        "slug (e.g. \"C-Users-13144-Documents-Meridian-repository\"), NOT the "
+        "Meridian planning-project name (e.g. \"meridian-build\")."
+    )
+    if wanted:
+        hint += f" You passed {wanted!r}."
+    if ranked:
+        shown = ranked[:10]
+        hint += "\n\nAvailable indexed project identifiers:\n" + "\n".join(
+            f"  - {p}" for p in shown
+        )
+        if len(ranked) > len(shown):
+            hint += f"\n  ... and {len(ranked) - len(shown)} more"
+        hint += (
+            f"\n\nRetry with the closest match, e.g. project_id={ranked[0]!r}."
+        )
+    else:
+        hint += (
+            "\n\nNo indexed projects were reported — call "
+            "codebase__list_projects to see what is available, or "
+            "codebase__index_repository to index this repo first."
+        )
+    return hint
+
+
 async def call_tunnel_tool(
     tenant_id: str, name: str, arguments: dict | None,
     repo_path: str | None = None,
@@ -2876,7 +3021,19 @@ async def call_tunnel_tool(
         return None
     err = resp.get("error")
     if err:
-        raise RuntimeError(str(err.get("message") if isinstance(err, dict) else err))
+        _msg = str(err.get("message") if isinstance(err, dict) else err)
+        # 7ef712a8 — a code-intel graph tool that misses on the project id gets a
+        # slug-vs-planning-name hint + the list of indexed identifiers so the
+        # caller can retry instead of abandoning code-intel. Only the code slot's
+        # project-taking tools are eligible; enrichment never itself raises.
+        if label == "code":
+            try:
+                _msg = await _enrich_code_intel_project_error(
+                    tenant_id, name, arguments, _msg
+                )
+            except Exception:  # noqa: BLE001 — surface the original error regardless
+                pass
+        raise RuntimeError(_msg)
     return resp.get("result")
 
 
