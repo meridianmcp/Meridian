@@ -263,6 +263,65 @@ def test_index_is_idempotent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 2426dce9 — staleness detection: a read call auto-refreshes when the source
+# .docx's mtime has moved since the last index_docx call, instead of silently
+# serving a stale cached paragraph table forever.
+# ---------------------------------------------------------------------------
+
+
+def test_check_staleness_reports_no_source_for_bytes_index(tmp_path):
+    # index_docx(bytes, ...) has no file path to track — check_staleness must
+    # report stale=False with an explicit "no-source-tracked" reason, not a
+    # false positive.
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+    info = docs_intel.check_staleness(db)
+    assert info == {"stale": False, "source_path": None, "reason": "no-source-tracked"}
+
+
+def test_check_staleness_detects_mtime_change_and_get_structure_auto_refreshes(tmp_path):
+    docx_path = tmp_path / "doc.docx"
+    docx_path.write_bytes(_synthetic_docx())
+    db = str(tmp_path / "doc.idx.sqlite")
+
+    docs_intel.index_docx(str(docx_path), db)
+    assert docs_intel.check_staleness(db)["stale"] is False
+
+    # Rewrite the source with new content and force the mtime forward so this
+    # assertion is never flaky on filesystems with coarse mtime resolution.
+    docx_path.write_bytes(_synthetic_docx())
+    new_mtime = docx_path.stat().st_mtime + 5
+    import os as _os
+
+    _os.utime(docx_path, (new_mtime, new_mtime))
+
+    stale_info = docs_intel.check_staleness(db)
+    assert stale_info["stale"] is True
+    assert stale_info["source_path"] == str(docx_path)
+
+    # get_structure must auto-refresh transparently — no manual re-index call.
+    docs_intel.get_structure(db)
+    assert docs_intel.check_staleness(db)["stale"] is False
+
+
+def test_get_paragraph_and_find_paragraphs_also_auto_refresh(tmp_path):
+    docx_path = tmp_path / "doc.docx"
+    docx_path.write_bytes(_synthetic_docx())
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(str(docx_path), db)
+
+    docx_path.write_bytes(_synthetic_docx())
+    new_mtime = docx_path.stat().st_mtime + 5
+    import os as _os
+
+    _os.utime(docx_path, (new_mtime, new_mtime))
+
+    # Either read entry point should trigger the same auto-refresh.
+    docs_intel.get_paragraph(db, "00000001")
+    assert docs_intel.check_staleness(db)["stale"] is False
+
+
+# ---------------------------------------------------------------------------
 # a62e5b4f — Word FIELD CODES (simple <w:fldSimple> + complex fldChar/instrText).
 # ---------------------------------------------------------------------------
 

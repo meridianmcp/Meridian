@@ -24,6 +24,7 @@ synthetic in-memory .docx (see tests/test_docs_intel.py).
 from __future__ import annotations
 
 import io
+import os
 import re
 import json
 import sqlite3
@@ -710,7 +711,69 @@ def _connect(index_db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    # 2426dce9 — staleness metadata: the source .docx's own path + mtime at
+    # index time, so a read call can detect "the file changed since I was
+    # last indexed" instead of silently serving a stale cached paragraph
+    # table forever. NULL source_path (source was raw bytes, not a file) means
+    # no staleness check is possible for this index — reads just skip it.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
     return conn
+
+
+def _stat_mtime(path: str) -> float | None:
+    """Best-effort mtime lookup — None if the path is missing/unreadable."""
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def check_staleness(index_db_path: str) -> dict[str, Any]:
+    """2426dce9 — compare the indexed source's stored mtime against its current
+    mtime on disk. Returns {"stale": bool, "source_path": str|None, "reason": str}.
+    A missing source_path (bytes-sourced index, or never set) always reports
+    stale=False with reason "no-source-tracked" — there is nothing to compare
+    against, so silence rather than a false-positive staleness claim.
+    """
+    conn = _connect(index_db_path)
+    try:
+        rows = dict(
+            conn.execute(
+                "SELECT key, value FROM docx_index_meta "
+                "WHERE key IN ('source_path', 'source_mtime')"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+    source_path = rows.get("source_path")
+    if not source_path:
+        return {"stale": False, "source_path": None, "reason": "no-source-tracked"}
+    stored_mtime = rows.get("source_mtime")
+    current_mtime = _stat_mtime(source_path)
+    if current_mtime is None:
+        return {"stale": False, "source_path": source_path, "reason": "source-unreadable"}
+    if stored_mtime is None or float(stored_mtime) != current_mtime:
+        return {"stale": True, "source_path": source_path, "reason": "mtime-mismatch"}
+    return {"stale": False, "source_path": source_path, "reason": "current"}
+
+
+def _ensure_fresh(index_db_path: str) -> None:
+    """2426dce9 — auto-reindex transparently if the source has changed since
+    the last index_docx call, so read functions never silently serve stale
+    data. A no-op when there's nothing trackable (bytes-sourced index) or the
+    source file is genuinely unreadable right now — those cases fall through
+    to whatever's already in the index rather than raising.
+    """
+    info = check_staleness(index_db_path)
+    if info["stale"] and info["source_path"]:
+        index_docx(info["source_path"], index_db_path)
 
 
 def index_docx(
@@ -721,6 +784,13 @@ def index_docx(
     Returns a summary ``{index_db, paragraph_count, heading_count}``. Idempotent:
     the paragraph table is fully replaced each run so re-indexing an edited doc
     stays consistent.
+
+    2426dce9 — when ``source`` is a file path (not raw bytes), the path and its
+    current mtime are stamped into ``docx_index_meta`` so a later read call can
+    detect the source changed since this index and auto-refresh (see
+    :func:`_ensure_fresh`) instead of silently serving stale paragraphs. Bytes
+    sources carry no path to track, so no staleness check is possible for them
+    — read calls on such an index simply skip the check.
     """
     paragraphs = parse_docx(source)
     conn = _connect(index_db_path)
@@ -731,6 +801,16 @@ def index_docx(
             "VALUES (?, ?, ?, ?)",
             [(p["para_id"], p["index"], p["style"], p["text"]) for p in paragraphs],
         )
+        if isinstance(source, str):
+            mtime = _stat_mtime(source)
+            conn.execute(
+                "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+                ("source_path", source),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+                ("source_mtime", str(mtime) if mtime is not None else None),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -742,7 +822,12 @@ def index_docx(
 
 
 def get_paragraph(index_db_path: str, para_id: str) -> dict[str, Any] | None:
-    """Look up one paragraph by its ``w14:paraId`` (the targeted-navigation op)."""
+    """Look up one paragraph by its ``w14:paraId`` (the targeted-navigation op).
+
+    2426dce9 — auto-refreshes the index first if the source .docx changed
+    since it was last indexed (see :func:`_ensure_fresh`).
+    """
+    _ensure_fresh(index_db_path)
     conn = _connect(index_db_path)
     try:
         cur = conn.execute(
@@ -758,7 +843,12 @@ def get_paragraph(index_db_path: str, para_id: str) -> dict[str, Any] | None:
 
 
 def get_structure(index_db_path: str) -> list[dict[str, Any]]:
-    """Return the heading outline (para_id, level, text) in document order."""
+    """Return the heading outline (para_id, level, text) in document order.
+
+    2426dce9 — auto-refreshes the index first if the source .docx changed
+    since it was last indexed (see :func:`_ensure_fresh`).
+    """
+    _ensure_fresh(index_db_path)
     conn = _connect(index_db_path)
     try:
         rows = conn.execute(
@@ -778,7 +868,12 @@ def get_structure(index_db_path: str) -> list[dict[str, Any]]:
 def find_paragraphs(
     index_db_path: str, query: str, limit: int = 20
 ) -> list[dict[str, Any]]:
-    """Substring search over paragraph text (document order); returns paraIds."""
+    """Substring search over paragraph text (document order); returns paraIds.
+
+    2426dce9 — auto-refreshes the index first if the source .docx changed
+    since it was last indexed (see :func:`_ensure_fresh`).
+    """
+    _ensure_fresh(index_db_path)
     conn = _connect(index_db_path)
     try:
         rows = conn.execute(
