@@ -98,3 +98,47 @@ def test_touches_resources_schema_documents_symbol_level_format():
         assert "file:path.py:" in d, (name, d)
         assert "symbol" in d.lower(), (name, d)
         assert "same file" in d.lower(), (name, d)
+
+
+# ---------------------------------------------------------------------------
+# d4886bd3 — the doc-structure write/index tools resolve a document via
+# get_document(), which reads ONLY the doc_documents table — populated by
+# reindex_document / put_document, NEVER by ingest_document (that stores flat
+# note text in a SEPARATE system). Their descriptions must name the CORRECT
+# prerequisite so a session isn't led into a dead end: reindex_document /
+# put_document, and must NOT present ingest_document as the way to make the
+# document resolvable.
+# ---------------------------------------------------------------------------
+
+def _full_tool_text(tool: dict) -> str:
+    """Description + every inputSchema property description, lowercased."""
+    parts = [tool.get("description", "")]
+    props = (tool.get("inputSchema") or {}).get("properties") or {}
+    for p in props.values():
+        if isinstance(p, dict) and p.get("description"):
+            parts.append(p["description"])
+    return " ".join(parts).lower()
+
+
+def test_doc_store_tools_name_reindex_not_ingest_as_prerequisite():
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    # Tools whose target document is resolved via get_document(doc_documents).
+    doc_store_tools = (
+        "index_equation",
+        "insert_equation",
+        "update_paragraph",
+        "index_figure",
+    )
+    for name in doc_store_tools:
+        assert name in by_name, name
+        text = _full_tool_text(by_name[name])
+        # Must name the CORRECT prerequisite store path.
+        assert "reindex_document" in text, (name, "missing reindex_document")
+        assert "put_document" in text, (name, "missing put_document")
+        # Must NOT tell the session ingest_document makes the doc resolvable.
+        # (ingest_document may appear only to DISAVOW it — flag if it's presented
+        # as a store path, i.e. not immediately negated.)
+        for frag in ("via ingest_document", "ingest_document or a prior reindex",
+                     "ingest_document / reindex_document",
+                     "ingested/reindexed"):
+            assert frag not in text, (name, f"stale prerequisite wording: {frag!r}")
