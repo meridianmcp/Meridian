@@ -3238,6 +3238,100 @@ async def test_dispatch_project_scoped_tool_with_neither_fails_cleanly(db):
 
 
 # ---------------------------------------------------------------------------
+# ce3693e4 — start_session resolves project_name (was: bare KeyError('project_id'))
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_start_session_by_project_name_succeeds(db):
+    """start_session(project_name=<existing>) through _dispatch_mcp_tool resolves
+    the name and registers a session for the RIGHT project — previously it read
+    args['project_id'] blind and raised KeyError('project_id')."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "start-by-name")
+    result = await srv._dispatch_mcp_tool(
+        "start_session",
+        {"project_name": "start-by-name", "session_name": "s1"},
+        db, "/tmp",
+    )
+    assert isinstance(result, dict)
+    assert result.get("session_id"), result
+    # The registered session belongs to the resolved project.
+    sessions = await db_module.get_sessions(db, p["id"], active_only=True)
+    assert any(s["id"] == result["session_id"] for s in sessions)
+
+
+@pytest.mark.asyncio
+async def test_start_session_neither_id_nor_name_clean_error(db):
+    """start_session with neither project_id nor project_name returns a clean
+    error dict instead of a bare KeyError leaking as a cryptic -32603."""
+    from meridian import server as srv
+
+    result = await srv._dispatch_mcp_tool(
+        "start_session", {"session_name": "orphan"}, db, "/tmp",
+    )
+    assert isinstance(result, dict) and result.get("error")
+    assert "project_id" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_start_session_unknown_project_name_clean_error(db):
+    """start_session(project_name=<missing>) surfaces a clean ValueError (which
+    the MCP layer turns into a -32602/-32603), never a raw KeyError or a silent
+    success on the wrong project."""
+    from meridian import server as srv
+
+    with pytest.raises(ValueError, match="no project found matching name"):
+        await srv._dispatch_mcp_tool(
+            "start_session",
+            {"project_name": "no-such-project", "session_name": "x"},
+            db, "/tmp",
+        )
+
+
+def test_stdio_start_session_resolves_project_name_in_source():
+    """stdio parity (ce3693e4): the stdio call_tool start_session branch must
+    resolve project_name and NOT index arguments['project_id'] directly (which
+    raised KeyError). Parsed from source so the test sees the real dispatch."""
+    import ast
+
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "meridian" / "mcp" / "stdio_handler.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    # Find the `elif name == "start_session":` block and inspect its body.
+    found_block = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        # match: name == "start_session"
+        if (
+            isinstance(node.left, ast.Name)
+            and node.left.id == "name"
+            and node.comparators
+            and isinstance(node.comparators[0], ast.Constant)
+            and node.comparators[0].value == "start_session"
+        ):
+            found_block = node
+            break
+    assert found_block is not None, "start_session branch not found in stdio_handler"
+
+    # The whole stdio source must reference get_project_by_name from within the
+    # start_session handling (resolution present) and must never subscript
+    # arguments['project_id'] blind inside that branch.
+    seg = src[src.index('name == "start_session"'):]
+    # cut at the next elif to bound the branch
+    end = seg.find("\n            elif name ==", 5)
+    branch_src = seg[:end] if end != -1 else seg[:2000]
+    assert "get_project_by_name" in branch_src, "stdio start_session missing resolver"
+    assert 'arguments["project_id"]' not in branch_src, (
+        "stdio start_session still indexes arguments['project_id'] blind"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 5b13b7b6 — session name uniqueness
 # ---------------------------------------------------------------------------
 
