@@ -539,6 +539,46 @@ async def _reprobe_once(proxy, probe) -> bool:
     return healthy
 
 
+def _relay_timed_out(resp: object) -> bool:
+    """True iff a ``_relay_request`` result carries the private timeout marker.
+
+    3bde892a — ``_relay_request`` tags a genuine ``httpx.TimeoutException`` with a
+    private ``_timed_out`` key (a connection-refused / bad-response 502 does NOT
+    get it). This reader keeps the ``dict``/key check in one place; it never
+    raises on a non-dict/None result (a missing key ⇒ not a timeout)."""
+    return bool(isinstance(resp, dict) and resp.get("_timed_out"))
+
+
+async def _kill_on_request_timeout(proxy) -> None:
+    """Force-kill a SlotProxy after a request-level timeout so the NEXT request
+    re-triggers ``ensure_running()`` (3bde892a).
+
+    The bug this closes: a request that times out against a freshly-lazy-spawned
+    slot (mcp-proxy's ``createServer()`` hung on the MCP ``initialize`` handshake
+    with no internal timeout) is reported as a 502, but the mcp-proxy process is
+    left alive — and because :meth:`SlotProxy.is_running` falls back to a port
+    check, a zombie proxy still bound to the port keeps ``is_running`` True, so
+    ``ensure_running()`` stays a no-op and the slot is silently dead until the
+    whole tunnel restarts. Killing it here reuses the same kill+respawn recovery
+    a failed health probe already gets via :func:`_reprobe_once`: the slot is
+    torn down now and re-spawned on the next request. Best-effort — a kill that
+    itself raises must never break the relay loop.
+
+    Scoped so it only fires on an *actual* timeout (the caller gates on
+    :func:`_relay_timed_out`), never on a normal slow-but-successful request."""
+    try:
+        if proxy.is_running:
+            print(
+                f"tunnel:{getattr(proxy, 'label', '?')}: request timed out against "
+                f"the slot on port {getattr(proxy, 'port', '?')} — force-killing the "
+                "proxy so the next request respawns it (watchdog)",
+                file=sys.stderr, flush=True,
+            )
+            proxy.kill()
+    except Exception:  # noqa: BLE001 — recovery must never break the relay loop
+        pass
+
+
 async def _preflight_slot(
     ws,
     port: int,
@@ -770,6 +810,18 @@ async def _run_connection_lazy(
                                                 http_client, local_base, msg,
                                                 tool_prefix=tool_prefix,
                                             )
+                        # 3bde892a — request-timeout watchdog. If the relay to a
+                        # freshly-lazy-spawned slot TIMED OUT (mcp-proxy hung on
+                        # the MCP initialize handshake — no internal timeout in
+                        # createServer()), the proxy may be a zombie still holding
+                        # the port, which keeps is_running True and makes
+                        # ensure_running() a no-op forever. Force-kill it now so
+                        # the NEXT request respawns it — the same kill+respawn
+                        # recovery a failed health probe gets via _reprobe_once.
+                        # Only fires on an actual timeout, never a slow-but-OK req.
+                        if _relay_timed_out(resp):
+                            resp.pop("_timed_out", None)  # never send on the wire
+                            await _kill_on_request_timeout(proxy)
                         await ws.send(json.dumps(resp))
     finally:
         # Stop the background re-probe when the connection closes so it doesn't
@@ -938,6 +990,12 @@ async def _run_extract_pool_connection(
                         http_client, f"http://127.0.0.1:{daemon.port}", msg,
                         tool_prefix=tool_prefix,
                     )
+                    # 3bde892a — the private timeout marker is an in-process
+                    # signal only; strip it so it never leaks onto the wire. (The
+                    # extract slot recovers stuck daemons via its own pool reap +
+                    # reprobe, so no kill hook is wired here.)
+                    if isinstance(resp, dict):
+                        resp.pop("_timed_out", None)
                     await ws.send(json.dumps(resp))
     finally:
         if _reprobe_task is not None:
@@ -2329,13 +2387,27 @@ async def _relay_request(
         }
     except Exception as exc:  # local proxy down / timeout / bad response
         err = json.dumps({"error": f"local proxy error: {exc}"}).encode()
-        return {
+        out = {
             "type": "response",
             "id": req_id,
             "status": 502,
             "headers": {"content-type": "application/json"},
             "body": base64.b64encode(err).decode(),
         }
+        # 3bde892a — tag a *timeout* distinctly from any other local failure so
+        # the lazy-spawn caller can recover the slot (kill+respawn) rather than
+        # just report a 502 and leave a possibly-zombie mcp-proxy holding the
+        # port. This ``_timed_out`` key is a private, in-process signal only:
+        # callers MUST pop it before sending ``out`` on the wire (it is not part
+        # of the tunnel response protocol). A connection-refused / bad-response
+        # error is NOT a timeout and does not set it.
+        try:
+            import httpx  # noqa: PLC0415 — already imported by callers; local keeps module light
+            if isinstance(exc, httpx.TimeoutException):
+                out["_timed_out"] = True
+        except Exception:  # noqa: BLE001 — never let the tag break the relay
+            pass
+        return out
 
 
 # ---------------------------------------------------------------------------

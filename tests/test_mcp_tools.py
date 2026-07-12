@@ -120,9 +120,20 @@ def _full_tool_text(tool: dict) -> str:
     return " ".join(parts).lower()
 
 
-def test_doc_store_tools_name_reindex_not_ingest_as_prerequisite():
+def test_doc_store_tools_name_ingest_document_as_prerequisite():
+    """832d67af — the doc-store tools resolve their target via
+    get_document(doc_documents). Ground truth (handler.py: the post-ingest
+    _persist structure hook calls store.put_document AFTER a successful
+    ingest_document): ``ingest_document`` IS the registered MCP tool that
+    populates doc_documents. ``reindex_document`` / ``put_document`` are NOT
+    registered MCP tools (put_document is an internal DocStructureStore method),
+    so descriptions must name ingest_document as the store path and must NOT
+    point sessions at a non-existent reindex_document tool (finding b2d1c1a2 —
+    an earlier fix, d4886bd3, wrongly enforced the phantom references)."""
     by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
-    # Tools whose target document is resolved via get_document(doc_documents).
+    registered = {t["name"] for t in _MCP_TOOLS_LIST}
+    # reindex_document is not, and never was, a registered MCP tool.
+    assert "reindex_document" not in registered
     doc_store_tools = (
         "index_equation",
         "insert_equation",
@@ -132,13 +143,7 @@ def test_doc_store_tools_name_reindex_not_ingest_as_prerequisite():
     for name in doc_store_tools:
         assert name in by_name, name
         text = _full_tool_text(by_name[name])
-        # Must name the CORRECT prerequisite store path.
-        assert "reindex_document" in text, (name, "missing reindex_document")
-        assert "put_document" in text, (name, "missing put_document")
-        # Must NOT tell the session ingest_document makes the doc resolvable.
-        # (ingest_document may appear only to DISAVOW it — flag if it's presented
-        # as a store path, i.e. not immediately negated.)
-        for frag in ("via ingest_document", "ingest_document or a prior reindex",
-                     "ingest_document / reindex_document",
-                     "ingested/reindexed"):
-            assert frag not in text, (name, f"stale prerequisite wording: {frag!r}")
+        # Names the REAL store path (ingest_document, a registered tool).
+        assert "ingest_document" in text, (name, "should name ingest_document as the store path")
+        # Must NOT point at the phantom reindex_document tool.
+        assert "reindex_document" not in text, (name, "references non-existent reindex_document tool")

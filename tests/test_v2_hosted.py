@@ -1212,3 +1212,164 @@ def test_mcp_rate_limit_429_after_limit_exceeded(client, monkeypatch):
     assert r2.status_code == 429, r2.text
     assert r2.headers.get("Retry-After")
     deps_module._reset_tenant_rate_limit()
+
+
+# ---------------------------------------------------------------------------
+# 832d67af — ingest_document hosted-mode honesty + no phantom reindex_document
+# ---------------------------------------------------------------------------
+
+_INGEST_DOCX_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<w:document '
+    'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+    'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">'
+    '<w:body>'
+    '<w:p w14:paraId="00000001">'
+    '<w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+    '<w:r><w:t>Introduction</w:t></w:r>'
+    '</w:p>'
+    '<w:p w14:paraId="00000002">'
+    '<w:r><w:t>Meridian coordinates AI sessions.</w:t></w:r>'
+    '</w:p>'
+    '</w:body>'
+    '</w:document>'
+)
+
+
+def _write_synthetic_docx(path: Path) -> None:
+    """Write a minimal valid .docx (a ZIP with word/document.xml) to *path*."""
+    import zipfile
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", _INGEST_DOCX_XML)
+
+
+def test_ingest_document_hosted_path_only_errors_honestly(tmp_path, monkeypatch):
+    """832d67af — on hosted Meridian, ingest_document with a bare local file_path
+    (no inline content) must fail HONESTLY: the server can't open a path on the
+    caller's machine, so it returns hosted=True + actionable guidance INSTEAD of a
+    misleading '[Errno 2] No such file or directory' filesystem error."""
+    from meridian import server as mh
+    from meridian import db as db_module
+
+    monkeypatch.setattr("meridian.mcp.handler._hosted_mode", lambda: True)
+    docx_path = tmp_path / "chapter.docx"
+    _write_synthetic_docx(docx_path)  # physically present on THIS box; must still refuse
+    db = _run(db_module.init_db(":memory:"))
+    try:
+        proj = _run(db_module.create_project(db, "hosted-ingest-proj"))
+        pid = proj["id"] if isinstance(proj, dict) else proj
+        res = _run(mh._dispatch_mcp_tool(
+            "ingest_document",
+            {"project_id": pid, "file_path": str(docx_path)},
+            db, str(tmp_path)))
+        # Honest guard: hosted flag + actionable guidance, NOT a raw errno.
+        assert res.get("hosted") is True
+        assert res.get("file_path") == str(docx_path)
+        assert "error" in res
+        low = res["error"].lower()
+        # Actionable, honest guidance (all three remediations are named).
+        assert "self-host" in low
+        assert "tunnel" in low
+        assert "content" in low
+        assert "ingest_document" in res["error"]
+        # The whole point: this is the honest GUARD, not the doomed read's bare
+        # filesystem error. The old misleading result was JUST "[Errno 2] No such
+        # file or directory: '<path>'" — no hosted flag, no guidance. The guard may
+        # quote that phrase to EXPLAIN it, but the message is the explanatory guard,
+        # not the raw error (which never carried hosted/guidance).
+        assert not low.strip().startswith("[errno 2]")
+        assert not low.strip().startswith("[errno")
+    finally:
+        _run(db.close())
+
+
+def test_ingest_document_hosted_with_content_still_works(tmp_path, monkeypatch):
+    """832d67af — the guard is path-only: inline `content` needs no filesystem, so
+    a hosted content ingest must still succeed (the server never touches a path)."""
+    from meridian import server as mh
+    from meridian import db as db_module
+
+    monkeypatch.setattr("meridian.mcp.handler._hosted_mode", lambda: True)
+    db = _run(db_module.init_db(":memory:"))
+    try:
+        proj = _run(db_module.create_project(db, "hosted-content-proj"))
+        pid = proj["id"] if isinstance(proj, dict) else proj
+        res = _run(mh._dispatch_mcp_tool(
+            "ingest_document",
+            {"project_id": pid, "content": "pre-extracted body text",
+             "title": "Q3 report", "source": "https://example.com/q3.pdf"},
+            db, str(tmp_path)))
+        assert not res.get("hosted")
+        assert "error" not in res or not res["error"]
+    finally:
+        _run(db.close())
+
+
+def test_ingest_document_self_hosted_path_unchanged(tmp_path, monkeypatch):
+    """832d67af — self-hosted behavior is byte-for-byte unchanged: the guard never
+    fires, so a real server-side .docx path extracts + ingests as before."""
+    from meridian import server as mh
+    from meridian import db as db_module
+
+    monkeypatch.setattr("meridian.mcp.handler._hosted_mode", lambda: False)
+    docx_path = tmp_path / "chapter.docx"
+    _write_synthetic_docx(docx_path)
+    db = _run(db_module.init_db(":memory:"))
+    try:
+        proj = _run(db_module.create_project(db, "selfhosted-ingest-proj"))
+        pid = proj["id"] if isinstance(proj, dict) else proj
+        res = _run(mh._dispatch_mcp_tool(
+            "ingest_document",
+            {"project_id": pid, "file_path": str(docx_path)},
+            db, str(tmp_path)))
+        # No hosted guard: real extraction happened, no hosted flag.
+        assert not res.get("hosted")
+        assert "error" not in res or not res["error"]
+    finally:
+        _run(db.close())
+
+
+def test_no_registered_tool_references_phantom_reindex_document():
+    """832d67af — 'reindex_document' is NOT a registered MCP tool anywhere, so no
+    tool schema (name/description/param docs) may point callers at it as a tool.
+    The only place the name may appear is an explicit 'there is no reindex_document
+    tool' disclaimer in a runtime error string (checked separately)."""
+    from meridian import mcp_tools
+
+    registered = {t["name"] for t in mcp_tools._MCP_TOOLS_LIST}
+    assert "reindex_document" not in registered
+    assert "put_document" not in registered  # internal store method, not a tool
+    assert "ingest_document" in registered  # the real doc-store populating tool
+
+    import json as _json
+    blob = _json.dumps(mcp_tools._MCP_TOOLS_LIST)
+    assert "reindex_document" not in blob, (
+        "a tool schema still names the phantom reindex_document tool"
+    )
+    # The remediation the schemas point at must be a REAL registered tool.
+    assert "ingest_document" in blob
+
+
+def test_index_equation_missing_doc_error_names_only_real_tool(tmp_path):
+    """832d67af — index_equation's 'no stored document' error used to tell callers
+    to 'reindex_document it first' — a phantom tool. It must now name only the real
+    remediation (ingest_document) and explicitly disclaim the phantom."""
+    from meridian import server as mh
+    from meridian import db as db_module
+
+    db = _run(db_module.init_db(":memory:"))
+    try:
+        proj = _run(db_module.create_project(db, "eq-missing-doc-proj"))
+        pid = proj["id"] if isinstance(proj, dict) else proj
+        res = _run(mh._dispatch_mcp_tool(
+            "index_equation",
+            {"project_id": pid, "doc": "/nope/ghost.docx", "omml_or_latex": "E=mc^2"},
+            db, str(tmp_path)))
+        assert "error" in res
+        err = res["error"]
+        assert "ingest_document" in err
+        # It must not tell the caller to REACH FOR reindex_document as a real tool;
+        # the only allowed mention is the negative disclaimer we added.
+        assert "no separate reindex_document tool" in err
+    finally:
+        _run(db.close())
