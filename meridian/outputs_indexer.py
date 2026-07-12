@@ -41,10 +41,29 @@ import logging
 import os
 import re
 import threading
+import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 _log = logging.getLogger(__name__)
+
+# Wall-clock budget for one rebuild() pass (5116078b): a cold/huge outputs tree
+# bails out early with whatever rows it managed to (re)compute rather than
+# hanging until an external client-side timeout kicks in. Subsequent calls
+# pick up where this one left off (unprocessed files are still "stale" in the
+# manifest and get retried). None disables the budget entirely.
+DEFAULT_REBUILD_BUDGET_SECONDS = 5.0
+
+# search_outputs()/resolve_figure_output() are stateless call sites hit
+# repeatedly (once per MCP call) for a small set of distinct outputs_dir
+# trees — cache the OutputsFtsIndex per directory so the incremental rebuild()
+# below has a manifest to diff against instead of starting from empty every
+# call. Bounded + LRU so an unbounded number of distinct directories (hosted,
+# multi-tenant) can't leak DuckDB connections forever.
+_MAX_CACHED_INDEXES = 32
+_index_cache_lock = threading.Lock()
+_index_cache: OrderedDict[str, OutputsFtsIndex] = OrderedDict()
 
 # The three extensions this indexer watches/indexes — everything else (images,
 # other binaries) is explicitly out of scope (see module docstring).
@@ -607,11 +626,15 @@ class OutputsFtsIndex:
 
     Backs the ``search_outputs`` MCP tool. Holds a single owned in-process
     DuckDB connection (``:memory:`` by default; a file path persists across
-    process restarts). :meth:`rebuild` walks the outputs tree, replaces the
-    table's rows, and — CRITICAL, per the DuckDB FTS contract — REBUILDS the FTS
-    index with ``overwrite`` every time, because the FTS index does NOT
-    auto-update when its source table changes. :meth:`search` runs a BM25 query,
-    deprioritizing (never excluding) archival-flagged rows.
+    process restarts). :meth:`rebuild` is INCREMENTAL (5116078b): it walks the
+    tree (cheap — stat only) and, for each file, compares (mtime, size) against
+    the signature used to build its currently-cached row — only files that are
+    new, changed, or removed since the last call get re-hashed / re-parsed /
+    re-extracted. The DuckDB table + FTS index are only rewritten when at least
+    one row actually changed (rewriting an unchanged table wastes the same
+    O(tree) DuckDB work the incremental hashing above was added to avoid).
+    :meth:`search` runs a BM25 query, deprioritizing (never excluding)
+    archival-flagged rows.
 
     ``connection`` / ``hasher`` are injectable for tests; production leaves them
     default. Thread-safe: every DB op holds an internal lock so the watchdog
@@ -638,6 +661,12 @@ class OutputsFtsIndex:
         self._con = connection
         self._owns_con = connection is None
         self._fts_built = False
+        # Incremental-rebuild state (5116078b): the (mtime, size) signature and
+        # computed OutputRow last used for each path, so an unchanged file is
+        # never re-hashed/re-parsed on a later rebuild() call.
+        self._manifest: dict[str, tuple[float | None, int | None]] = {}
+        self._row_cache: dict[str, OutputRow] = {}
+        self.last_rebuild_partial = False
 
     # -- connection / schema --------------------------------------------------
 
@@ -659,34 +688,153 @@ class OutputsFtsIndex:
 
     # -- (re)build -----------------------------------------------------------
 
-    def rebuild(self) -> int:
-        """Rebuild the table from a full walk of ``outputs_dir`` AND rebuild the
-        FTS index (``overwrite``). Returns the row count. Idempotent; safe to
-        call on every watchdog event. Best-effort: a DuckDB/FTS failure is logged
-        and swallowed (the indexer must never crash a run), returning the count
-        of rows that were staged."""
+    def rebuild(
+        self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
+    ) -> int:
+        """Incrementally rebuild the table + FTS index. Returns the row count.
+
+        Only files whose (mtime, size) changed since the last call to this
+        instance are re-hashed/re-parsed (5116078b) — a repeat call on a mostly
+        unchanged tree is cheap regardless of tree size. The DuckDB table + FTS
+        index are only rewritten when at least one row actually changed.
+        Idempotent; safe to call on every watchdog event. Best-effort: a
+        DuckDB/FTS failure is logged and swallowed (the indexer must never
+        crash a run), returning the count of rows that were staged.
+
+        ``max_seconds`` bounds the wall-clock time spent (re)computing rows —
+        a huge/cold tree bails out early with a partial result
+        (:attr:`last_rebuild_partial` set) instead of hanging; already-cached
+        rows are unaffected, and files not yet reached stay "stale" for the
+        next call. ``None`` disables the budget.
+        """
         with self._lock:
-            rows = build_output_rows(self.outputs_dir, hasher=self._hasher)
-            try:
-                con = self._connect()
-                self._ensure_schema(con)
-                con.execute("DELETE FROM outputs_index")
-                for r in rows:
-                    con.execute(
-                        "INSERT INTO outputs_index VALUES "
-                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        [
-                            r.path, r.content, r.mtime, r.sha256, r.size,
-                            r.generating_script, r.kind, r.is_archival,
-                            r.canonical_path,
-                            json.dumps(r.csv_columns) if r.csv_columns else None,
-                            json.dumps(r.json_keys) if r.json_keys else None,
-                        ],
-                    )
-                self._rebuild_fts(con)
-            except Exception:  # noqa: BLE001 — never crash the watcher/run
-                _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
+            deadline = None if max_seconds is None else time.monotonic() + max_seconds
+            rows, changed = self._compute_rows_incremental(deadline)
+            if changed:
+                try:
+                    con = self._connect()
+                    self._ensure_schema(con)
+                    con.execute("DELETE FROM outputs_index")
+                    for r in rows:
+                        con.execute(
+                            "INSERT INTO outputs_index VALUES "
+                            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                r.path, r.content, r.mtime, r.sha256, r.size,
+                                r.generating_script, r.kind, r.is_archival,
+                                r.canonical_path,
+                                json.dumps(r.csv_columns) if r.csv_columns else None,
+                                json.dumps(r.json_keys) if r.json_keys else None,
+                            ],
+                        )
+                    self._rebuild_fts(con)
+                except Exception:  # noqa: BLE001 — never crash the watcher/run
+                    _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
             return len(rows)
+
+    def _compute_rows_incremental(
+        self, deadline: float | None,
+    ) -> tuple[list[OutputRow], bool]:
+        """Diff the current tree against :attr:`_manifest`/:attr:`_row_cache`.
+
+        Returns ``(rows, changed)`` — ``rows`` is every currently-cacheable row
+        (existing files this instance has ever computed, refreshed as needed);
+        ``changed`` is True iff the caller must rewrite the DuckDB table + FTS
+        index (a file was added/modified/removed, or an archival verdict
+        flipped because a SIBLING file changed — see below).
+        """
+        self.last_rebuild_partial = False
+        paths = _iter_output_files(self.outputs_dir)
+        path_set = set(paths)
+        changed = False
+
+        removed = set(self._manifest) - path_set
+        for p in removed:
+            self._manifest.pop(p, None)
+            self._row_cache.pop(p, None)
+            changed = True
+
+        stale: list[str] = []
+        for p in paths:
+            try:
+                st = os.stat(p)
+                sig: tuple[float | None, int | None] = (st.st_mtime, st.st_size)
+            except OSError:
+                sig = (None, None)
+            if self._manifest.get(p) != sig or p not in self._row_cache:
+                stale.append(p)
+
+        if stale:
+            # Re-run the two-stage classification over the WHOLE current path
+            # set — cheap (only hashes name-pattern candidates + their twins),
+            # and a sibling's add/remove/edit can flip another file's archival
+            # verdict even when that file's own content is untouched.
+            classifications = classify_canonical_archival(paths, hasher=self._hasher)
+            for p in stale:
+                if deadline is not None and time.monotonic() > deadline:
+                    self.last_rebuild_partial = True
+                    break
+                fp = file_fingerprint(p)
+                try:
+                    st = os.stat(p)
+                    size: int | None = st.st_size
+                    mtime: float | None = st.st_mtime
+                except OSError:
+                    size = mtime = None
+                cls = classifications.get(p)
+                row = OutputRow(
+                    path=p,
+                    content=_content_for_fts(p, fp),
+                    mtime=mtime,
+                    sha256=self._hasher(p),
+                    size=size,
+                    generating_script=fp.generating_script,
+                    kind=fp.kind,
+                    is_archival=bool(cls and cls.is_archival),
+                    canonical_path=(cls.canonical_path if cls else None),
+                    csv_columns=fp.csv_columns,
+                    json_keys=fp.json_keys,
+                )
+                self._row_cache[p] = row
+                self._manifest[p] = (mtime, size)
+                changed = True
+            # Files that didn't need re-fingerprinting may still need their
+            # is_archival/canonical_path refreshed (cheap metadata-only patch,
+            # no re-hash/re-read) if a sibling's change flipped their verdict.
+            for p in paths:
+                if p in stale:
+                    continue
+                row = self._row_cache.get(p)
+                if row is None:
+                    continue
+                cls = classifications.get(p)
+                new_is_archival = bool(cls and cls.is_archival)
+                new_canonical = cls.canonical_path if cls else None
+                if row.is_archival != new_is_archival or row.canonical_path != new_canonical:
+                    row.is_archival = new_is_archival
+                    row.canonical_path = new_canonical
+                    changed = True
+
+        rows = [self._row_cache[p] for p in paths if p in self._row_cache]
+        return rows, changed
+
+    def invalidate(self, path: str) -> None:
+        """Force ``path`` to be re-hashed/re-parsed on the next :meth:`rebuild`.
+
+        The mtime+size diff in :meth:`_compute_rows_incremental` is a heuristic
+        (a same-size in-place edit landing inside one mtime tick could be
+        missed). The live watchdog, however, KNOWS a specific file changed, so
+        it drops that path's CACHED ROW here — the ``p not in self._row_cache``
+        stale test then re-processes it — giving exact correctness on the
+        watcher path, heuristic-only on the stateless ``search_outputs`` path.
+
+        Only the row cache is dropped, NOT the manifest entry: a delete event
+        names a path that is already gone from disk, and the manifest is what
+        the removed-set diff uses to notice the deletion — popping it here would
+        hide the delete and leave a stale row in the table. Unknown paths are a
+        harmless no-op."""
+        with self._lock:
+            self._row_cache.pop(path, None)
 
     def _rebuild_fts(self, con: Any) -> None:
         """(Re)build the DuckDB FTS index over ``content``, keyed on ``path``.
@@ -838,23 +986,53 @@ class OutputsFtsIndex:
                 self._fts_built = False
 
 
+def _cache_key(outputs_dir: str) -> str:
+    return _normalize_output_path(outputs_dir) or os.path.abspath(str(outputs_dir))
+
+
+def _get_cached_index(outputs_dir: str) -> OutputsFtsIndex:
+    """Look up (or create) the cached :class:`OutputsFtsIndex` for a directory.
+
+    ``search_outputs``/``resolve_figure_output`` are stateless call sites hit
+    repeatedly for a small set of distinct trees (once per MCP call) — without
+    this cache each call would start ``rebuild()``'s manifest from empty,
+    defeating the incremental diff entirely. Bounded + LRU (evicting closes the
+    connection) so an unbounded number of distinct directories can't leak
+    DuckDB connections in a long-running (hosted, multi-tenant) process.
+    """
+    key = _cache_key(outputs_dir)
+    with _index_cache_lock:
+        idx = _index_cache.pop(key, None)
+        if idx is None:
+            idx = OutputsFtsIndex(outputs_dir)
+        _index_cache[key] = idx  # (re-)insert at the MRU end
+        while len(_index_cache) > _MAX_CACHED_INDEXES:
+            _, evicted = _index_cache.popitem(last=False)
+            evicted.close()
+        return idx
+
+
 def search_outputs(
     outputs_dir: str,
     query: str,
     *,
     limit: int = 10,
     include_archival: bool = True,
+    max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
 ) -> dict[str, Any]:
-    """Stateless one-shot BM25 search over an outputs tree (backs the
-    ``search_outputs`` MCP tool).
+    """BM25 search over an outputs tree (backs the ``search_outputs`` MCP tool).
 
-    Walks ``outputs_dir``, builds the persistent-table + FTS index in an
-    in-memory DuckDB, runs the BM25 query, and returns ranked hits. Archival
-    rows are DEPRIORITIZED (halved score), never hard-excluded, unless
+    Reuses a cached, persistent :class:`OutputsFtsIndex` per ``outputs_dir``
+    (5116078b) so repeat calls only re-hash/re-parse files that changed since
+    the last call — a call on an unchanged real Outputs directory no longer
+    re-walks/re-hashes/re-rebuilds the whole tree. Archival rows are
+    DEPRIORITIZED (halved score), never hard-excluded, unless
     ``include_archival=False``. A missing directory / empty tree returns an
     empty result rather than an error. Each hit carries path, score, the cheap
     fingerprint (csv_columns / json_keys / generating_script), the archival flag
-    and its canonical twin.
+    and its canonical twin. ``result["partial"]`` is set when ``max_seconds``
+    was exceeded mid-rebuild — the returned hits reflect whatever was indexed
+    so far, not necessarily every file on disk right now.
     """
     result: dict[str, Any] = {
         "outputs_dir": outputs_dir,
@@ -868,14 +1046,13 @@ def search_outputs(
     if not os.path.isdir(outputs_dir):
         result["error"] = f"outputs_dir does not exist: {outputs_dir}"
         return result
-    index = OutputsFtsIndex(outputs_dir)
-    try:
-        result["total_indexed"] = index.rebuild()
-        result["hits"] = index.search(
-            query, limit=limit, include_archival=include_archival,
-        )
-    finally:
-        index.close()
+    index = _get_cached_index(outputs_dir)
+    result["total_indexed"] = index.rebuild(max_seconds=max_seconds)
+    result["hits"] = index.search(
+        query, limit=limit, include_archival=include_archival,
+    )
+    if index.last_rebuild_partial:
+        result["partial"] = True
     return result
 
 
@@ -884,23 +1061,21 @@ def resolve_figure_output(
 ) -> dict[str, Any] | None:
     """Stateless cross-store resolve-through (d2a3537a).
 
-    Walks ``outputs_dir``, builds the persistent-table index in an in-memory
-    DuckDB, and returns the ``outputs_index`` row whose path IS ``file_path``
-    (path-normalized equality, not a relevance search) — the module-level
-    counterpart of :meth:`OutputsFtsIndex.resolve_output` for callers that don't
-    hold a live index. Returns ``None`` for a blank path, a missing outputs
-    directory, or a figure that names no indexed output. Never raises.
+    Reuses the same cached, incremental index as :func:`search_outputs`
+    (5116078b) and returns the ``outputs_index`` row whose path IS
+    ``file_path`` (path-normalized equality, not a relevance search) — the
+    module-level counterpart of :meth:`OutputsFtsIndex.resolve_output` for
+    callers that don't hold a live index. Returns ``None`` for a blank path, a
+    missing outputs directory, or a figure that names no indexed output. Never
+    raises.
     """
     if not file_path or not str(file_path).strip():
         return None
     if not os.path.isdir(outputs_dir):
         return None
-    index = OutputsFtsIndex(outputs_dir)
-    try:
-        index.rebuild()
-        return index.resolve_output(file_path)
-    finally:
-        index.close()
+    index = _get_cached_index(outputs_dir)
+    index.rebuild()
+    return index.resolve_output(file_path)
 
 
 class OutputsIndexer:
@@ -979,10 +1154,14 @@ class OutputsIndexer:
                 else:
                     self.npy_index[src_path] = npy_metadata(src_path)
         # a0e9133e — the persistent FTS index can't track source-table changes
-        # incrementally, so ANY watched change (create/modify/delete of a
-        # csv/json/npy) triggers a full table + FTS rebuild with overwrite.
+        # incrementally. The watcher knows the EXACT path that changed, so it
+        # force-invalidates that path (5116078b — exact, not mtime-heuristic)
+        # then triggers an incremental rebuild: only the changed file is
+        # re-hashed/re-parsed, and the table + FTS index are rewritten only
+        # because that one row changed.
         if self.fts is not None:
-            self.fts.rebuild()
+            self.fts.invalidate(src_path)
+            self.fts.rebuild(max_seconds=None)
 
     def search(
         self, query: str, *, limit: int = 10, include_archival: bool = True,

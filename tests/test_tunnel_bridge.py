@@ -307,6 +307,34 @@ def test_call_tunnel_tool_routes_to_owner(monkeypatch):
     assert seen["params"] == {"name": "trace_path", "arguments": {"symbol": "foo"}}
 
 
+# ---------------------------------------------------------------------------
+# a19538fe — cross-instance tunnel miss (DB flag fallback for legibility)
+# ---------------------------------------------------------------------------
+
+def test_cross_instance_miss_true_when_db_active_but_memory_miss():
+    # DB says the tunnel is active, but THIS instance holds no socket → the
+    # socket is on a sibling Fly instance.
+    assert tn.tunnel_cross_instance_miss({"id": "t1", "tunnel_active": 1}) is True
+
+
+def test_cross_instance_miss_false_when_socket_present():
+    tn._tunnel_sockets["t1"] = object()
+    # In-memory socket present → not a cross-instance miss (it's genuinely here).
+    assert tn.tunnel_cross_instance_miss({"id": "t1", "tunnel_active": 1}) is False
+
+
+def test_cross_instance_miss_false_when_db_inactive():
+    # No DB flag → a real "not connected", not a cross-instance miss.
+    assert tn.tunnel_cross_instance_miss({"id": "t1", "tunnel_active": 0}) is False
+    assert tn.tunnel_cross_instance_miss({"id": "t1"}) is False
+
+
+def test_cross_instance_miss_false_when_tenant_none():
+    assert tn.tunnel_cross_instance_miss(None) is False
+    assert isinstance(tn.CROSS_INSTANCE_MISS_MESSAGE, str)
+    assert tn.CROSS_INSTANCE_MISS_MESSAGE
+
+
 def test_build_graph_searcher_none_without_tunnel():
     """4cfaecc2 — no active tunnel → no searcher (enrichment stays a no-op)."""
     assert tn.build_graph_searcher(None) is None

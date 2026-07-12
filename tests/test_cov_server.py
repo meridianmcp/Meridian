@@ -1381,16 +1381,10 @@ def test_notification_prefs_from_raw():
     assert prefs2.get("hitl") is False
 
 
-def test_mcp_rate_check_window():
-    import meridian.server as server_module
-
-    th = "ratecheck-" + hashlib.sha256(b"x").hexdigest()
-    server_module._mcp_rate_counters.pop(th, None)
-    # First call within limit -> not limited
-    assert server_module._mcp_rate_check(th, limit=2) is False
-    assert server_module._mcp_rate_check(th, limit=2) is False
-    # Third exceeds limit of 2 -> limited
-    assert server_module._mcp_rate_check(th, limit=2) is True
+# d8f92669 — removed test_mcp_rate_check_window: the redundant per-token
+# _mcp_rate_check limiter it covered was deleted in favour of the single
+# tenant-tier limiter (see test_mcp_rate_limit_429_after_limit_exceeded in
+# test_v2_hosted.py, which now exercises the consolidated middleware limiter).
 
 
 def test_notification_pref_enabled():

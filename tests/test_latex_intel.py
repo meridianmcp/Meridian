@@ -266,3 +266,104 @@ def test_get_latex_structure_mcp_tool(tmp_path):
         assert "error" in err2
     finally:
         asyncio.run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# da9815ef — \input / \include expansion
+# ---------------------------------------------------------------------------
+
+def test_input_expansion_splices_included_headings(tmp_path):
+    (tmp_path / "chapter1.tex").write_text(
+        r"\section{Included Chapter}" "\n" r"\subsection{Included Detail}",
+        encoding="utf-8",
+    )
+    main = r"\section{Main}" "\n" r"\input{chapter1}" "\n" r"\section{Tail}"
+    out = latex_intel.parse_latex_structure(main, base_dir=str(tmp_path))
+    texts = [h["text"] for h in out["headings"]]
+    # The included file's headings appear in document order between Main and Tail.
+    assert texts == ["Main", "Included Chapter", "Included Detail", "Tail"]
+    # Successfully expanded → nothing left unexpanded.
+    assert out["unexpanded_inputs"] == []
+    # Tree nests the included subsection under the included section.
+    included = out["tree"][1]
+    assert included["text"] == "Included Chapter"
+    assert [c["text"] for c in included["children"]] == ["Included Detail"]
+
+
+def test_input_expansion_missing_file_stays_unexpanded(tmp_path):
+    main = r"\section{Main}" "\n" r"\input{does_not_exist}"
+    out = latex_intel.parse_latex_structure(main, base_dir=str(tmp_path))
+    assert [h["text"] for h in out["headings"]] == ["Main"]
+    # A reference that can't be resolved is honestly reported, not silently lost.
+    assert out["unexpanded_inputs"] == ["does_not_exist"]
+
+
+def test_input_expansion_is_recursive_and_cycle_safe(tmp_path):
+    # a.tex inputs b.tex; b.tex inputs a.tex (a cycle) — must terminate.
+    (tmp_path / "a.tex").write_text(
+        r"\section{A}" "\n" r"\input{b}", encoding="utf-8"
+    )
+    (tmp_path / "b.tex").write_text(
+        r"\subsection{B}" "\n" r"\input{a}", encoding="utf-8"
+    )
+    main = r"\input{a}"
+    out = latex_intel.parse_latex_structure(main, base_dir=str(tmp_path))
+    # Both headings surface once; the cycle back to a is dropped, no hang.
+    assert [h["text"] for h in out["headings"]] == ["A", "B"]
+
+
+def test_no_base_dir_leaves_inputs_unexpanded(tmp_path):
+    # Without a base_dir the inputs can't be resolved — prior behaviour preserved.
+    out = latex_intel.parse_latex_structure(r"\section{X}" "\n" r"\input{foo}")
+    assert out["unexpanded_inputs"] == ["foo"]
+
+
+def test_analyze_latex_expands_inputs_from_file(tmp_path):
+    (tmp_path / "sec.tex").write_text(r"\section{From Include}", encoding="utf-8")
+    main_path = tmp_path / "main.tex"
+    main_path.write_text(r"\section{Root}" "\n" r"\input{sec}", encoding="utf-8")
+    res = latex_intel.analyze_latex(str(main_path))
+    assert [h["text"] for h in res["headings"]] == ["Root", "From Include"]
+    assert res["unexpanded_inputs"] == []
+
+
+# ---------------------------------------------------------------------------
+# fae29498 — \newcommand / \renewcommand section-alias expansion
+# ---------------------------------------------------------------------------
+
+def test_newcommand_section_alias_is_expanded():
+    src = (
+        r"\newcommand{\mysection}[1]{\section{#1}}" "\n"
+        r"\mysection{Aliased Heading}" "\n"
+        r"\section{Plain Heading}"
+    )
+    out = latex_intel.parse_latex_structure(src)
+    kinds_texts = [(h["kind"], h["text"]) for h in out["headings"]]
+    # The \mysection use is recovered as a real section; the definition itself
+    # produces no spurious heading.
+    assert kinds_texts == [
+        ("section", "Aliased Heading"),
+        ("section", "Plain Heading"),
+    ]
+
+
+def test_newcommand_alias_to_subsection_level():
+    src = (
+        r"\renewcommand{\mysub}[1]{\subsection{#1}}" "\n"
+        r"\section{Top}" "\n"
+        r"\mysub{Nested}"
+    )
+    out = latex_intel.parse_latex_structure(src)
+    assert [(h["kind"], h["text"]) for h in out["headings"]] == [
+        ("section", "Top"),
+        ("subsection", "Nested"),
+    ]
+    # Tree nests the aliased subsection under the section.
+    assert out["tree"][0]["children"][0]["text"] == "Nested"
+
+
+def test_non_section_newcommand_is_untouched():
+    # A \newcommand that is NOT a section alias must not create headings.
+    src = r"\newcommand{\foo}[1]{\textbf{#1}}" "\n" r"\section{Real}" "\n" r"\foo{bold}"
+    out = latex_intel.parse_latex_structure(src)
+    assert [h["text"] for h in out["headings"]] == ["Real"]
