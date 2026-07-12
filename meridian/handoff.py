@@ -320,12 +320,23 @@ def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
     post, capturing screenshots, configuring a PyPI trusted publisher, installing
     a local binary, etc. These must be kept OUT of the executor /goal's "claim and
     execute … stopping early is a FAILURE" list — an AI executor cannot do them the
-    way intended and, under completion pressure, may fake-complete them. Signals
-    (any one): an explicit human assignee (``human_id``), ``milestone_type ==
-    'human'``, or a ``MANUAL``-tagged title."""
+    way intended and, under completion pressure, may fake-complete them.
+
+    943afe1e — the classification keys on a GENUINE manual-only signal, NOT on the
+    mere presence of ``human_id``. ``human_id`` records *who* an item is assigned to,
+    not *whether* it needs a human — an executor-actionable ``BUG:``/``FIX:``/``FEAT:``
+    item with a real ``touches_resources`` set can be assigned to a maintainer and is
+    still perfectly claimable. Excluding on ``human_id`` alone over-broadly dropped
+    such items from the executor list (it correlated with recency/assignment, not with
+    any manual-only property). Signals (any one):
+
+    * ``blocker_kind == 'manual'`` — blocked on a real-world action outside Meridian
+      (the canonical DB signal; see ``_VALID_SPRINT_BLOCKER_KINDS``),
+    * ``milestone_type == 'human'`` — WHO/what executes is a human by design,
+    * a ``MANUAL``-tagged title (case-insensitive leading ``MANUAL``)."""
     if not isinstance(item, dict):
         return False
-    if item.get("milestone_type") == "human" or item.get("human_id"):
+    if item.get("blocker_kind") == "manual" or item.get("milestone_type") == "human":
         return True
     return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
 
