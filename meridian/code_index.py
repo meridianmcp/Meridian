@@ -1244,6 +1244,27 @@ def search_code_semantic(
     ``{root_dir, query, total_indexed, vectors_enabled, hits:[...]}``. A missing
     directory / empty tree returns an empty hits list, never an error.
     """
+    # Workspace decision 0dedff91 (2026-07-12) — this function reads root_dir
+    # off the LOCAL filesystem of whatever process is running it. On hosted
+    # Meridian that's the server, which can never reach a caller's own
+    # machine — fail honestly here instead of letting os.path.abspath silently
+    # mis-resolve a Windows path against the server's own cwd (the original
+    # bug this guard was written to close for good). Inlined (not imported
+    # from meridian._deps) to keep this module dependency-light, matching the
+    # existing git_md.py/goal_md.py/md_anchors.py pattern of a local
+    # _hosted_mode copy rather than pulling in the FastAPI-heavy _deps module.
+    if os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes"):
+        return {
+            "root_dir": root_dir, "query": query, "hits": [],
+            "total_indexed": 0, "vectors_enabled": _vectors_enabled(),
+            "error": (
+                "search_code_semantic requires access to YOUR local filesystem "
+                "and cannot run on hosted Meridian -- the server has no access "
+                "to your machine. Use the tunnel-routed equivalent instead "
+                "(e.g. codebase__search_graph, extractor__find_symbol, or a "
+                "meridian-docs/desktop-commander tool)."
+            ),
+        }
     # a0cf71ef — normalize (unquote / expanduser / abspath) so a valid local dir
     # handed to us in a quoted or ~-prefixed shape resolves; report the resolved
     # path back so the caller sees exactly what was searched. "does not exist" is
