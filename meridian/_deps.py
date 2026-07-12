@@ -122,6 +122,44 @@ def _hosted_mode() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Local-filesystem-tool guard (workspace decision 0dedff91, 2026-07-12)
+# ---------------------------------------------------------------------------
+#
+# ARCHITECTURAL LAW: any MCP tool whose job requires touching a path on the
+# CALLER's own local filesystem -- not Meridian's own server/database -- must
+# be built as a tunnel-spawned local plugin (codebase-memory-mcp, Serena,
+# meridian-docs, desktop-commander are the correct pattern), never as a
+# handler.py-dispatched server-side function calling os.path.*/open()/os.stat()
+# etc. directly on a caller-supplied path. Violated twice before this guard
+# existed: ingest_document (832d67af) and search_code_semantic -- both tried
+# to open a caller's local path on the SERVER's own filesystem, where it can
+# never exist, producing misleading "file/dir not found" errors instead of an
+# honest explanation. No path-normalization or error-message fix can solve
+# this class of bug -- the two computers are physically different machines.
+#
+# Every server-side dispatch function that touches a caller-supplied local
+# path parameter MUST call this FIRST and return its result verbatim (as the
+# tool's error field) when it is not None, instead of attempting the
+# filesystem call.
+
+def require_local_fs_access(tool_name: str) -> str | None:
+    """Return an honest error string if this process cannot reach the
+    caller's local filesystem (hosted mode), else None.
+
+    Call this before any os.path.isdir/exists, open(), os.stat(), or os.walk()
+    on a caller-supplied path in a server-side MCP tool dispatch function.
+    """
+    if _hosted_mode():
+        return (
+            f"{tool_name} requires access to YOUR local filesystem and cannot "
+            "run on hosted Meridian -- the server has no access to your machine. "
+            "Use the tunnel-routed equivalent instead (e.g. codebase__search_graph, "
+            "extractor__find_symbol, or a meridian-docs/desktop-commander tool)."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Demo cookie name
 # ---------------------------------------------------------------------------
 
