@@ -1310,6 +1310,150 @@ async def _annotate_code_pointers(
     return pending_items
 
 
+# ---------------------------------------------------------------------------
+# 36fea6ca — inline RESOLVED sprint-item pointers in the handoff markdown.
+#
+# add_sprint_item_pointer persists a durable pointer (symbol / range / node_id /
+# zotero_key / …) on a sprint item, and resolve_sprint_item_pointers turns each
+# into a concrete location. Previously those resolved locations were reachable
+# ONLY through a separate resolve_sprint_item_pointers MCP call — a resuming
+# executor reading the plain-text handoff never saw them. This renders each
+# pending item's DURABLE, resolved pointers inline (default on via the
+# workspace_settings.handoff_inline_pointers flag), so the next session starts
+# with exact locations instead of an extra round-trip.
+#
+# Distinct from the prospected code_pointers above: those are best-effort guesses
+# derived from the item title at handoff time; these are the pointers a human /
+# agent deliberately PINNED to the item and stored in sprint_item_pointers. Fully
+# guarded — never raises out of the mandatory handoff.
+# ---------------------------------------------------------------------------
+
+
+def _format_resolved_pointer_target(target: dict[str, Any]) -> str | None:
+    """Render ONE resolved target (from resolve_pointer) as a compact md string.
+
+    Returns a short human/agent-readable location line, or None when the target
+    carries nothing usable. Handles the resolved shapes emitted by pointers.
+    resolve_pointer per selector_type (symbol/range/node_id/zotero_key/
+    text_quote/finding_id) plus the unresolved ``{resolved: False, reason}`` case.
+    """
+    if not isinstance(target, dict):
+        return None
+    uri = str(target.get("uri") or "").strip()
+    stype = target.get("selector_type")
+    resolved = bool(target.get("resolved"))
+    if stype == "symbol":
+        qn = str(target.get("qualified_name") or "").strip()
+        file = str(target.get("file") or "").strip()
+        if resolved:
+            loc = f"`{qn}`" if qn else "(symbol)"
+            if file:
+                loc += f" — {file}"
+            elif uri:
+                loc += f" — {uri}"
+            return loc
+        base = f"`{qn}`" if qn else (uri or "(symbol)")
+        return f"{base} — unresolved ({target.get('reason') or 'no match'})"
+    if stype == "range":
+        rng = target.get("range") or {}
+        sl, el = rng.get("start_line"), rng.get("end_line")
+        span = f":{sl}-{el}" if sl is not None and el is not None else ""
+        return f"{uri or '(file)'}{span}"
+    if stype == "node_id":
+        nid = target.get("id")
+        base = f"{uri or '(doc)'} #{nid}"
+        return base if resolved else f"{base} — unresolved"
+    if stype == "zotero_key":
+        key = target.get("key")
+        item = target.get("item") if isinstance(target.get("item"), dict) else None
+        title = (item or {}).get("title") if item else None
+        if resolved and title:
+            return f"{title} (zotero:{key})"
+        return f"zotero:{key}" + ("" if resolved else " — unresolved")
+    if stype == "text_quote":
+        exact = str(target.get("exact") or "").strip()
+        snippet = (exact[:60] + "…") if len(exact) > 60 else exact
+        drift = " ⚠ drift" if target.get("drift") else ""
+        return f"{uri or '(url)'}: “{snippet}”{drift}" if snippet else (uri or None)
+    if stype == "finding_id":
+        fid = target.get("id")
+        return f"finding {fid}" + ("" if resolved else " — unresolved")
+    # Unknown / malformed target — surface the uri + reason if any.
+    if uri:
+        return uri if resolved else f"{uri} — unresolved"
+    return None
+
+
+def _format_resolved_pointer(resolved: dict[str, Any]) -> dict[str, Any] | None:
+    """Turn a resolve_pointer() result into a compact ``{label?, source_type,
+    targets: [str, ...]}`` for the handoff template. None when it has no target
+    lines. Best-effort; never raises."""
+    if not isinstance(resolved, dict):
+        return None
+    lines: list[str] = []
+    for t in resolved.get("targets") or []:
+        try:
+            s = _format_resolved_pointer_target(t)
+        except Exception:  # noqa: BLE001 — one bad target must not drop the rest
+            s = None
+        if s:
+            lines.append(s)
+    if not lines:
+        return None
+    out: dict[str, Any] = {
+        "source_type": resolved.get("source_type") or "code",
+        "targets": lines,
+    }
+    if resolved.get("label"):
+        out["label"] = str(resolved["label"])
+    return out
+
+
+async def _annotate_resolved_pointers(
+    db: Any,
+    project_id: str,
+    pending_items: list[dict[str, Any]],
+    *,
+    node_resolver: Callable[[str], Any] | None = None,
+) -> list[dict[str, Any]]:
+    """36fea6ca — attach each pending item's DURABLE, resolved pointers as a
+    ``resolved_pointers`` list for inline rendering in the handoff markdown.
+
+    For every pending item, fetch its persisted ``sprint_item_pointers`` rows and
+    resolve each via :func:`pointers.resolve_pointer` (the same path
+    resolve_sprint_item_pointers uses), then flatten every resolved target into a
+    compact string line. Items with no stored pointers are left untouched.
+
+    Fully guarded: a per-item failure degrades to no ``resolved_pointers`` for
+    that item; the pass NEVER raises so the mandatory handoff can't break.
+    """
+    from .pointers import resolve_pointer  # noqa: PLC0415 — avoid import cycle
+    for item in pending_items:
+        iid = item.get("id")
+        if not iid:
+            continue
+        try:
+            stored = await db_module.get_sprint_item_pointers(db, iid)
+        except Exception:  # noqa: BLE001 — pre-migration DB / fetch failure
+            continue
+        if not stored:
+            continue
+        rendered: list[dict[str, Any]] = []
+        for ptr in stored:
+            try:
+                resolved = await resolve_pointer(
+                    db, ptr, project_id=project_id, node_resolver=node_resolver
+                )
+            except Exception:  # noqa: BLE001 — resolve_pointer never raises, but be safe
+                continue
+            formatted = _format_resolved_pointer(resolved)
+            if formatted:
+                rendered.append(formatted)
+        if rendered:
+            item["resolved_pointers"] = rendered
+    return pending_items
+
+
 def resolve_handoff_mode(
     requested_mode: str | None,
     session_id: str | None = None,
@@ -2456,6 +2600,23 @@ async def generate_handoff(
             code_pointer_skip_reason = (
                 "code-pointer enrichment skipped — no live tunnel/graph searcher"
             )
+    # 36fea6ca — inline each pending item's DURABLE resolved pointers in the
+    # handoff markdown (default on via workspace_settings.handoff_inline_pointers)
+    # so a resuming session sees exact locations without a separate
+    # resolve_sprint_item_pointers call. Fully guarded: a missing settings column,
+    # pre-migration pointers table, or resolve failure degrades to no inline
+    # pointers and never breaks the mandatory handoff.
+    try:
+        _inline_ws = await db_module.get_workspace_settings(db)
+    except Exception:  # noqa: BLE001 — column/row may be absent on older DBs
+        _inline_ws = {}
+    if (_inline_ws or {}).get("handoff_inline_pointers", True):
+        try:
+            pending_sprint_items = await _annotate_resolved_pointers(
+                db, project_id, pending_sprint_items
+            )
+        except Exception:  # noqa: BLE001 — inline pointers are best-effort
+            pass
     decisions_log = (project.get("decisions") or "").strip()
     now_utc = datetime.now(timezone.utc)
     generated_at = now_utc.isoformat(timespec="seconds")

@@ -753,6 +753,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     auto_refresh_enabled INTEGER NOT NULL DEFAULT 0,
     refresh_interval_turns INTEGER NOT NULL DEFAULT 10,
     refresh_triggers TEXT,
+    handoff_inline_pointers INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -2096,7 +2097,11 @@ async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> No
         "auto_refresh_enabled INTEGER NOT NULL DEFAULT 0;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
         "refresh_interval_turns INTEGER NOT NULL DEFAULT 10;"
-        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS refresh_triggers TEXT"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS refresh_triggers TEXT;"
+        # 36fea6ca — inline each pending item's RESOLVED pointers in the handoff
+        # markdown (default on). Off (0) keeps them DB-only (separate resolve call).
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "handoff_inline_pointers INTEGER NOT NULL DEFAULT 1"
     )
 
 

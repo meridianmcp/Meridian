@@ -11086,7 +11086,7 @@ async def get_workspace_settings(
         "log_task_sprint_nudge_threshold, handoff_template, "
         "execution_mode_default, code_intel_enabled_default, "
         "loop_enabled_default, auto_refresh_enabled, refresh_interval_turns, "
-        "refresh_triggers, updated_at "
+        "refresh_triggers, handoff_inline_pointers, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -11122,6 +11122,9 @@ async def get_workspace_settings(
         except Exception:  # noqa: BLE001 — malformed row ⇒ fall back to default
             _refresh_triggers = None
     _interval = data.get("refresh_interval_turns")
+    # 36fea6ca — inline-resolved-pointers toggle. Missing column/row ⇒ True
+    # (default on); a stored 0 keeps pointers DB-only in the handoff.
+    _inline_ptrs = data.get("handoff_inline_pointers")
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -11136,6 +11139,7 @@ async def get_workspace_settings(
         "auto_refresh_enabled": bool(data.get("auto_refresh_enabled")),
         "refresh_interval_turns": (int(_interval) if _interval is not None else 10) or 10,
         "refresh_triggers": _refresh_triggers,
+        "handoff_inline_pointers": (True if _inline_ptrs is None else bool(_inline_ptrs)),
         "updated_at": data.get("updated_at"),
     }
 
@@ -11154,6 +11158,7 @@ async def update_workspace_settings(
     auto_refresh_enabled: "bool | int | str | None" = None,
     refresh_interval_turns: int | None = None,
     refresh_triggers: "list[str] | str | None" = None,
+    handoff_inline_pointers: "bool | int | str | None" = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -11222,6 +11227,13 @@ async def update_workspace_settings(
             params.append(refresh_triggers.strip() or None)
         else:
             params.append(None)
+    if handoff_inline_pointers is not None:
+        # 36fea6ca — inline resolved pointers in the handoff. Truthy/1 → 1,
+        # falsey/0 (incl. the strings "0"/"false") → 0.
+        updates.append("handoff_inline_pointers = ?")
+        params.append(
+            1 if handoff_inline_pointers and handoff_inline_pointers not in ("0", "false", "False") else 0
+        )
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

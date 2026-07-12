@@ -381,6 +381,12 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
         db, "workspace_settings", "refresh_interval_turns", "INTEGER NOT NULL DEFAULT 10"
     )
     await _migrate_add_column_if_missing(db, "workspace_settings", "refresh_triggers", "TEXT")
+    # 36fea6ca — inline each pending item's RESOLVED pointers directly in the
+    # handoff markdown (default 1 = on) so a resuming session sees them without a
+    # separate resolve_sprint_item_pointers call. A stored 0 keeps them DB-only.
+    await _migrate_add_column_if_missing(
+        db, "workspace_settings", "handoff_inline_pointers", "INTEGER NOT NULL DEFAULT 1"
+    )
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:

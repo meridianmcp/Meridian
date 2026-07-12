@@ -3134,6 +3134,8 @@ async def _handle_notes_decisions(
             code_intel_enabled_default=args.get("code_intel_enabled_default"),
             # 76cf8bda — /loop auto-continue workspace default.
             loop_enabled_default=args.get("loop_enabled_default"),
+            # 36fea6ca — inline resolved sprint-item pointers in the handoff.
+            handoff_inline_pointers=args.get("handoff_inline_pointers"),
             tenant_id=_mcp_tenant_id,
         )
     if name == "save_blog_post":

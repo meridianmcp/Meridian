@@ -80,6 +80,14 @@ _⚠ {{ code_pointer_skip_reason }}._
    - `{{ ptr.qualified_name or ptr.function }}`{% if ptr.file %} — {{ ptr.file }}{% endif %}{% if ptr.function and ptr.function != ptr.qualified_name %} ({{ ptr.function }}){% endif %}
 {% endfor -%}
 {% endif -%}
+{% if it.resolved_pointers -%}
+   Resolved pointers:
+{% for ptr in it.resolved_pointers -%}
+{% for loc in ptr.targets -%}
+   - {% if ptr.label %}{{ ptr.label }}: {% endif %}{{ loc }} _[{{ ptr.source_type }}]_
+{% endfor -%}
+{% endfor -%}
+{% endif -%}
 {% endfor %}
 {% endif %}
 
