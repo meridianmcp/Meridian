@@ -4034,16 +4034,29 @@ def _execution_mode_directive(mode: str | None) -> str:
 
 # 72e12ed8 — HITL auto-answer directive surfaced in the start_session orientation
 # so executors know whether request_hitl resolves inline or blocks for a human.
+# 67f118c3 — this directive is prepended to agent_instructions, so for modes 1/2
+# it must ALSO override the unconditional "request_hitl is mandatory for any human
+# question" rule baked into DEFAULT_AGENT_INSTRUCTIONS. Without the override, the
+# injected body contradicts the /goal's mode>=1 "Do NOT file HITLs" clause and
+# sessions still file unwanted mid-sprint HITLs. Mode 0 keeps the mandatory wording.
 _HITL_MODE_DIRECTIVES = {
     0: ("HITL: auto-answer OFF — request_hitl queues for a human and "
         "urgency='blocking' pauses you until answered. Still ALWAYS use request_hitl "
         "to ask the human; never just ask in chat."),
     1: ("HITL: auto-answer SAFE — request_hitl resolves immediately for "
         "non-destructive questions and returns the answer inline (it does not "
-        "block). Use it freely; require_human=true still routes to a human."),
+        "block). Use it freely; require_human=true still routes to a human. "
+        "OVERRIDE: auto-answer is ON, so filing a request_hitl is NOT mandatory — "
+        "the 'request_hitl is the ONLY human-decision channel / MUST go through "
+        "request_hitl' rule below does NOT apply mid-sprint. Prefer to skip blocked "
+        "items and continue; only file a HITL when you genuinely need a human."),
     2: ("HITL: auto-answer AGGRESSIVE — request_hitl resolves immediately and "
         "returns the answer inline for nearly all questions. Use it freely; "
-        "require_human=true still forces a human reply."),
+        "require_human=true still forces a human reply. "
+        "OVERRIDE: auto-answer is ON, so filing a request_hitl is NOT mandatory — "
+        "the 'request_hitl is the ONLY human-decision channel / MUST go through "
+        "request_hitl' rule below does NOT apply mid-sprint. Prefer to skip blocked "
+        "items and continue; only file a HITL when you genuinely need a human."),
 }
 
 

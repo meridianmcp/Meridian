@@ -2161,6 +2161,63 @@ def test_start_session_reports_hitl_auto_answer_mode():
         _run(db.close())
 
 
+def test_start_session_agent_instructions_hitl_mode_aware():
+    """67f118c3 — the injected agent_instructions must reflect hitl_auto_answer_mode.
+
+    DEFAULT_AGENT_INSTRUCTIONS unconditionally says request_hitl is the ONLY /
+    mandatory human-decision channel. For mode>=1 (auto-answer on) that
+    contradicts the /goal's 'Do NOT file HITLs' clause, so the assembled
+    instructions injected via start_session must carry an explicit override that
+    request_hitl is NOT mandatory. For mode==0 the mandatory wording is unchanged.
+    """
+    import meridian.db as db_module
+    from meridian.agent_defaults import DEFAULT_AGENT_INSTRUCTIONS
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool(
+            "create_project", {"name": "hitlbody"}, db, "/tmp"))
+        pid = proj["id"]
+        # Store the DEFAULT body (as the backfill migration does for real projects)
+        # so the assembled agent_instructions carry the unconditional mandatory rule
+        # — that body text is exactly what the override must neutralize for mode>=1.
+        _run(db_module.set_agent_instructions(db, pid, DEFAULT_AGENT_INSTRUCTIONS))
+        assert "ONLY" in DEFAULT_AGENT_INSTRUCTIONS
+        assert "request_hitl" in DEFAULT_AGENT_INSTRUCTIONS
+
+        # Mode 0: unchanged — no NOT-mandatory override, keeps ALWAYS-use wording,
+        # and the mandatory body rule is still present untouched.
+        out0 = _run(mh._dispatch_mcp_tool(
+            "start_session", {"project_id": pid, "session_name": "m0"}, db, "/tmp"))
+        ai0 = out0["agent_instructions"]
+        assert "auto-answer OFF" in ai0
+        assert "ALWAYS use request_hitl" in ai0
+        assert "not mandatory" not in ai0.lower()
+        # The DEFAULT body (with its mandatory-HITL section) is still injected.
+        assert "Human decisions route through" in ai0
+
+        # Mode 1: the injected instructions must NOT mandate request_hitl — the
+        # prepended override says auto-answer is on / HITL is not mandatory / skip.
+        _run(db_module.update_project_settings(db, pid, hitl_auto_answer=1))
+        out1 = _run(mh._dispatch_mcp_tool(
+            "start_session", {"project_id": pid, "session_name": "m1"}, db, "/tmp"))
+        ai1 = out1["agent_instructions"]
+        assert "auto-answer SAFE" in ai1
+        assert "not mandatory" in ai1.lower()
+        assert "does NOT apply" in ai1
+        assert "skip blocked items" in ai1.lower()
+
+        # Mode 2: same override present.
+        _run(db_module.update_project_settings(db, pid, hitl_auto_answer=2))
+        out2 = _run(mh._dispatch_mcp_tool(
+            "start_session", {"project_id": pid, "session_name": "m2"}, db, "/tmp"))
+        ai2 = out2["agent_instructions"]
+        assert "AGGRESSIVE" in ai2
+        assert "not mandatory" in ai2.lower()
+        assert "does NOT apply" in ai2
+    finally:
+        _run(db.close())
+
+
 def test_update_sprint_item_blocks_in_progress():
     """586eeda9 — mutating an in_progress item is blocked unless force=true."""
     db = _make_db()
