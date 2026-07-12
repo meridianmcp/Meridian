@@ -376,6 +376,9 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
 
     _tunnel_sockets[tenant_id] = ws
     _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd — reconnect: rebuild tool routes
+    # af5b5739 — record THIS Fly instance as the socket owner so a request that
+    # lands on a sibling instance can Fly-replay to us (no-op off Fly).
+    owner_instance = record_tenant_owner_instance(tenant_id)
     try:
         await db_module.update_tenant(auth_db, tenant_id, tunnel_active=1)
     except Exception:
@@ -423,6 +426,9 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     finally:
         _tunnel_sockets.pop(tenant_id, None)
         _clear_slot_health(tenant_id, "fs")
+        # af5b5739 — forget our ownership claim only if it's still ours (a newer
+        # connection on another instance may already have re-claimed the tenant).
+        clear_tenant_owner_instance(tenant_id, owner_instance)
         if not has_active_tunnel(tenant_id):
             _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd
         # Cancel any in-flight proxy requests for this tenant
@@ -870,6 +876,13 @@ async def _do_proxy(
     """Forward one HTTP request over the given tunnel socket and return the response."""
     ws = sockets.get(tenant_id)
     if ws is None:
+        # af5b5739 — in-memory MISS on this instance. If a DIFFERENT Fly instance is
+        # known to own this tenant's socket, replay the request there so Fly routes
+        # it to the machine that can actually serve it. No-op off Fly / unknown
+        # owner (falls through to the legible 503 below).
+        replay = fly_replay_target_for_id(tenant_id)
+        if replay is not None:
+            return fly_replay_response(replay)
         return Response(
             content=f'{{"error":"{label} tunnel not connected"}}',
             status_code=503,
@@ -2302,6 +2315,125 @@ CROSS_INSTANCE_MISS_MESSAGE = (
     "the one handling this request — retry (it may route to the right one), or "
     "restart your local `meridian --tunnel` if this persists"
 )
+
+
+# af5b5739 / decision 229441bc — cross-instance tunnel routing via Fly-replay.
+#
+# The tunnel socket registry (``_tunnel_sockets`` &c.) is per-PROCESS in-memory, so
+# on Fly.io multi-machine a request the edge routes to a sibling instance sees an
+# in-memory MISS even though the tunnel is genuinely open on another machine
+# (``tunnel_cross_instance_miss``). a19538fe made that miss *legible*; this makes it
+# *routable*: when a request lands on the wrong instance, we ask Fly to REPLAY it on
+# the instance that actually holds the socket by returning a ``fly-replay`` response
+# header of the form ``instance=<machine-id>`` (Fly's documented replay mechanism —
+# the edge re-dispatches the same request to the named machine).
+#
+# We capture the owning instance id on WS connect into a module-level map keyed by
+# tenant (decision 229441bc picked a tenant->instance-id column over Redis; a
+# module-level map is the lowest-risk unit-testable shape and mirrors the existing
+# per-process socket registries — a future PR can promote it to the DB column for
+# survival across the owning instance's own restart). ``FLY_ALLOC_ID`` (v1 apps) and
+# ``FLY_MACHINE_ID`` (Machines) are the two env vars Fly exposes for the current
+# instance id; we read whichever is set.
+_tenant_owner_instance: dict[str, str] = {}
+
+
+def _fly_instance_id() -> "str | None":
+    """This Fly instance's id (or None when not running on Fly).
+
+    Fly exposes the current machine id as ``FLY_MACHINE_ID`` (Machines platform) and
+    the legacy allocation id as ``FLY_ALLOC_ID``. Prefer the machine id — it's the
+    value ``fly-replay: instance=<id>`` targets — and fall back to the alloc id."""
+    for var in ("FLY_MACHINE_ID", "FLY_ALLOC_ID"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return None
+
+
+def record_tenant_owner_instance(tenant_id: str) -> "str | None":
+    """Record THIS instance as the owner of ``tenant_id``'s tunnel socket (af5b5739).
+
+    Called on WS connect. No-op (returns None) when not on Fly — there is then only
+    one instance and cross-instance routing is meaningless. Returns the recorded
+    instance id so callers/tests can assert it."""
+    inst = _fly_instance_id()
+    if inst:
+        _tenant_owner_instance[tenant_id] = inst
+    return inst
+
+
+def clear_tenant_owner_instance(tenant_id: str, instance_id: "str | None" = None) -> None:
+    """Forget the owning instance for ``tenant_id`` (af5b5739), called on WS close.
+
+    When ``instance_id`` is given, only clear if it still matches — so a stale
+    disconnect from an already-replaced connection can't erase the new owner's claim
+    (mirrors the socket-eviction guard on reconnect)."""
+    if instance_id is None or _tenant_owner_instance.get(tenant_id) == instance_id:
+        _tenant_owner_instance.pop(tenant_id, None)
+
+
+def tenant_owner_instance(tenant_id: str) -> "str | None":
+    """The Fly instance id known to own ``tenant_id``'s tunnel socket, or None."""
+    return _tenant_owner_instance.get(tenant_id)
+
+
+def fly_replay_target(tenant: "dict | None") -> "str | None":
+    """The ``fly-replay`` header VALUE to re-route a cross-instance miss (af5b5739).
+
+    Returns ``"instance=<id>"`` when, for this tenant, THIS instance has no live
+    socket (in-memory miss) but a DIFFERENT Fly instance is known to own one — i.e.
+    the request should be replayed there. Returns None (a no-op) when:
+
+      * not running on Fly (no self instance id), or
+      * this instance already holds the socket (no miss — handle it locally), or
+      * no owning instance is known for the tenant, or
+      * the known owner IS this instance (replaying to ourselves would loop).
+
+    The caller sets ``fly-replay: <value>`` on the response and Fly re-dispatches the
+    original request to the named machine, which does hold the socket."""
+    if not tenant:
+        return None
+    self_inst = _fly_instance_id()
+    if not self_inst:
+        return None  # not on Fly → single instance, nothing to replay to
+    tenant_id = tenant.get("id", "")
+    if not tenant_id or has_active_tunnel(tenant_id):
+        return None  # we hold it (or no id) → serve locally, don't replay
+    owner = _tenant_owner_instance.get(tenant_id)
+    if not owner or owner == self_inst:
+        return None  # unknown owner, or owner is us (would loop)
+    return f"instance={owner}"
+
+
+def fly_replay_target_for_id(tenant_id: str) -> "str | None":
+    """``fly_replay_target`` keyed by tenant id (af5b5739).
+
+    The HTTP proxy path (`_do_proxy`) only has the tenant id, not the full tenant
+    dict, so it resolves the replay target here. Same guards as
+    :func:`fly_replay_target`: no-op off Fly, when we hold the socket, when the
+    owner is unknown, or when the owner is us."""
+    return fly_replay_target({"id": tenant_id})
+
+
+# af5b5739 — response header Fly reads to re-dispatch a request to another machine.
+FLY_REPLAY_HEADER = "fly-replay"
+
+
+def fly_replay_response(target: str) -> Response:
+    """Build the response that carries the ``fly-replay`` header (af5b5739).
+
+    Fly's edge intercepts the header and REPLAYS the original request on the named
+    instance, so the body/status here are only what a client sees if the replay
+    somehow doesn't happen — hence a legible 503 + message rather than a misleading
+    success."""
+    return Response(
+        content=('{"status":"replaying","message":'
+                 f'"{CROSS_INSTANCE_MISS_MESSAGE}"}}').encode(),
+        status_code=503,
+        media_type="application/json",
+        headers={FLY_REPLAY_HEADER: target},
+    )
 
 
 def active_tunnel_tenant_ids() -> "set[str]":
