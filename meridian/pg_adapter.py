@@ -790,6 +790,20 @@ CREATE TABLE IF NOT EXISTS sprint_item_pointers (
     label TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
+
+-- 3295c784 — mcp_rate_counters: cross-instance shared hit-counting for the
+-- consolidated /mcp tenant-tier rate limiter. Per-process _tenant_rl_hits
+-- under-counts across N Fly machines; this windowed counter (keyed by
+-- tenant_id + epoch-minute window_start) gives every instance one shared count
+-- via an atomic upsert. Gated by MERIDIAN_SHARED_RATE_LIMIT (default OFF).
+-- The composite PRIMARY KEY indexes lookups; the prune-by-window index lives
+-- ONLY in the guarded _migrate_pg_mcp_rate_counters migration, never inline.
+CREATE TABLE IF NOT EXISTS mcp_rate_counters (
+    tenant_id TEXT NOT NULL,
+    window_start BIGINT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant_id, window_start)
+);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -2599,6 +2613,34 @@ async def _migrate_pg_sprint_item_dependency(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_mcp_rate_counters(conn: PostgresConnection) -> None:
+    """3295c784 — mcp_rate_counters: cross-instance shared hit-counting for the
+    consolidated /mcp tenant-tier rate limiter (mirrors SQLite).
+
+    The per-process ``_tenant_rl_hits`` dict only counts requests on one Fly
+    machine, so across N machines the effective limit is ~Nx intended. This
+    windowed counter keeps one atomic count per (tenant_id, epoch-minute window)
+    so every instance shares a single total. Gated by MERIDIAN_SHARED_RATE_LIMIT
+    (default OFF — prod behavior unchanged until opted in).
+
+    CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path.
+    CREATE TABLE / CREATE INDEX IF NOT EXISTS → idempotent. The extra index on
+    ``window_start`` (for the opportunistic prune) lives here, never inline in
+    the base literal (guarded-migration rule). Mirrors
+    db._migrate_mcp_rate_counters.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS mcp_rate_counters ("
+        "    tenant_id TEXT NOT NULL,"
+        "    window_start BIGINT NOT NULL,"
+        "    count INTEGER NOT NULL DEFAULT 0,"
+        "    PRIMARY KEY (tenant_id, window_start)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_mcp_rate_counters_window "
+        "ON mcp_rate_counters(window_start)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2658,4 +2700,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_deferral,
     _migrate_pg_sprint_item_priority_blocker,
     _migrate_pg_sprint_item_dependency,
+    _migrate_pg_mcp_rate_counters,
 )
