@@ -516,6 +516,7 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     human_id TEXT,
     added_at TEXT NOT NULL DEFAULT ({_TS}),
     completed_at TEXT,
+    claimed_at TEXT,
     task_id TEXT,
     notes TEXT,
     feedback_thumb SMALLINT,
