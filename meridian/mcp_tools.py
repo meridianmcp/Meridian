@@ -1663,7 +1663,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Per-project: only runs when test_cmd is configured for that project.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string", "description": "Meridian project id — whose stored test_cmd to run."},
-         "project_name": {"type": "string", "description": "Project name — resolved to id internally. project_id wins if both given."}},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
          "required": []}},
     {"name": "analyze_model_efficiency",
      "description":
