@@ -116,13 +116,18 @@ def test_all_six_known_editors_are_already_bundled():
 # The remaining gap is precisely the two related items (no duplication)
 # ---------------------------------------------------------------------------
 
-def test_unbundled_catalog_is_empty_all_known_tools_bundled():
-    # After 9665538a (docs slot) AND 39c117b1 (zotero slot) shipped, every known
-    # plugin tool is a first-class bundled built-in — nothing remains catalog-only.
-    assert tp.unbundled_plugin_tools() == []
-    assert {t["name"] for t in tp.bundled_plugin_tools()} == {
-        t["name"] for t in tp.known_plugin_tools()
-    }
+def test_unbundled_catalog_contains_only_context7():
+    # After 9665538a (docs slot) AND 39c117b1 (zotero slot) shipped, all tunnel-
+    # proxied tools are bundled built-ins. Context7 (88dbb675) is the sole known
+    # tool that remains unbundled: it is a remote-first MCP with no dedicated
+    # tunnel slot, wired as a custom plugin or direct MCP connection instead.
+    unbundled_names = {t["name"] for t in tp.unbundled_plugin_tools()}
+    assert unbundled_names == {"context7"}, (
+        f"Expected only context7 to be unbundled; got {unbundled_names}"
+    )
+    # context7's entry must carry the owner_item that owns its eventual wiring.
+    by_name = {t["name"]: t for t in tp.known_plugin_tools()}
+    assert by_name["context7"]["owner_item"] == "88dbb675"
 
 
 def test_meridian_docs_is_distinct_from_the_docx_editor():

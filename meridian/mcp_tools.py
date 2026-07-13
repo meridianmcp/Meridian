@@ -44,7 +44,10 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "find_symbol_usages": 'find_symbol_usages(project_id="abc-123", doc="thesis/chapter1.docx", symbol_or_equation_id="E=mc^2")',
     "index_figure": 'index_figure(project_id="abc-123", doc="thesis/chapter1.docx", file_path="figures/setup.png", caption="Figure 3: The experimental setup", semantic_label="apparatus diagram")',
     "find_similar_figure": 'find_similar_figure(project_id="abc-123", doc="thesis/chapter1.docx", description_or_path="experimental setup diagram")',
+    "index_table": 'index_table(project_id="abc-123", doc="thesis/chapter1.docx", table_index=2, caption="Table 2: Summary of experimental results", semantic_label="results table")',
+    "find_similar_table": 'find_similar_table(project_id="abc-123", doc="thesis/chapter1.docx", description="summary of experimental results")',
     "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
+    "annotate_outputs": 'annotate_outputs(outputs_dir="/repo/outputs", path="/repo/outputs/run_42", note="PCA on, BFS off — final params", run_params={"lr": 0.001, "epochs": 100})',
     "search_code_semantic": 'search_code_semantic(root_dir="/repo/src", query="parse the auth token and refresh it")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -54,6 +57,10 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
     "get_workspace_notes": 'get_workspace_notes(tag="setup")',
+    "add_workspace_proposal": 'add_workspace_proposal(title="IDEA: expose auth as plugin", body="Could ship auth as a separate optional plugin so self-hosters can swap it out", tags="arch")',
+    "get_workspace_proposals": 'get_workspace_proposals(status="investigating")',
+    "advance_proposal_status": 'advance_proposal_status(proposal_id="prop-uuid", status="investigating")',
+    "promote_proposal": 'promote_proposal(proposal_id="prop-uuid", project_id="proj-uuid", sprint_item_title="Expose auth as plugin")',
     "pin_workspace_decision": 'pin_workspace_decision(title="Monorepo", body="One repo for all services", category="ARCHITECTURAL")',
     "get_workspace_decisions": 'get_workspace_decisions()',
     "get_workspace_settings": 'get_workspace_settings()',
@@ -80,6 +87,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_session_log": 'get_session_log(session_id="session-uuid")',
     "set_active_repo": 'set_active_repo(repo_path="C:\\\\Users\\\\me\\\\project")',
     "analyze_model_efficiency": 'analyze_model_efficiency(title="Refactor auth across 12 files + migration", file_count=12, touches_resources=["auth_db", "sessions_table"], size="xl")',
+    "run_verification": 'run_verification(project_id="abc-123")  # runs stored test_cmd on your local machine via tunnel',
 }
 
 
@@ -607,6 +615,48 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "outputs_dir": {"type": "string", "description": "d2a3537a — optional outputs tree root. When given, each matched figure resolves THROUGH to its outputs_index row (linked_output) by file_path. Omit for a pure fuzzy match."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "description_or_path"]}},
+    {"name": "index_table", "description":
+        "2622182d — index ONE table into the SEMANTIC table index against a "
+        "document already stored in the doc-structure store — populated by "
+        "ingest_document (which registers a docx/latex document's structure here "
+        "in addition to storing the flat note text). Pass the SAME "
+        "source/path you ingested under as `doc`. This is the table parallel "
+        "of index_figure and is "
+        "COMPLEMENTARY to the structural kind='table' section-tree placement "
+        "(it adds caption dedup + similarity, it does not replace placement). "
+        "Provide caption and/or table_index. Before inserting, the normalized "
+        "caption is fuzzy-matched against every table already indexed for this "
+        "document — a near-duplicate is NOT silently dropped (the table is "
+        "still inserted) but IS surfaced via near_duplicates:[{table_id, "
+        "matched_id, matched_caption, score}] so you can spot an accidental "
+        "re-index. When paired_figure_id is omitted, the nearest figure in the "
+        "same structural section is surfaced as suggested_figure_id (advisory, "
+        "never auto-applied). Returns {table, near_duplicates}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you ingested it under via ingest_document, which registers a docx/latex document in the doc-structure store)."},
+         "table_index": {"type": "integer", "description": "The table's document-order index (0-based or 1-based, your convention)."},
+         "caption": {"type": "string", "description": "The table's caption (drives normalized-caption dedup/similarity)."},
+         "semantic_label": {"type": "string", "description": "Optional human label for the table (e.g. 'results table')."},
+         "paired_figure_id": {"type": "string", "description": "Optional: the doc_figures or doc_elements id of a related figure. When omitted, the nearest figure in the same structural section is suggested (advisory only)."}},
+         "required": ["doc"]}},
+    {"name": "find_similar_table", "description":
+        "2622182d — fuzzy-match a free-text description against "
+        "every table already indexed (index_table) for one stored document, "
+        "best match first. Each result carries the stored table row PLUS a "
+        "difflib similarity score (0..1) against its normalized_caption. Useful "
+        "before index_table to check whether a table is already present under a "
+        "slightly different caption. Returns {document_id, matches:[...]} "
+        "— an empty list (never an error) when the document has no indexed "
+        "tables, or doc doesn't resolve to a stored document.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you ingested it under via ingest_document, which registers a docx/latex document in the doc-structure store)."},
+         "description": {"type": "string", "description": "A free-text description to fuzzy-match against this document's indexed tables."},
+         "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
+         "required": ["doc", "description"]}},
     {"name": "search_outputs", "description":
         "a0e9133e — READ-ONLY full-text search over a run's OUTPUTS tree "
         "(numeric/tabular/array artifacts), backed by DuckDB native FTS (Okapi "
@@ -626,14 +676,39 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "include_archival=false to drop archival hits entirely. Returns "
         "{outputs_dir, query, total_indexed, hits:[{path, score, bm25, "
         "is_archival, canonical_path, kind, generating_script, csv_columns, "
-        "json_keys, size, mtime}]}. A missing dir / empty tree returns an empty "
-        "hits list, never an error.",
+        "json_keys, size, mtime, annotations:[{path, note, run_params, "
+        "created_at, updated_at, source}]}]}. annotations is auto-included "
+        "for each hit (any annotation keyed to the hit path OR a nearest "
+        "ancestor directory) — no second tool call needed. A missing dir / "
+        "empty tree returns an empty hits list, never an error.",
      "inputSchema": {"type": "object", "properties": {
          "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (walked recursively)."},
          "query": {"type": "string", "description": "The BM25 query — one or more search terms (column names, keys, script names, or any text in a csv/json)."},
          "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
          "include_archival": {"type": "boolean", "description": "Default true — archival copies are deprioritized but still returned. Set false to exclude confirmed-archival files entirely."}},
          "required": ["outputs_dir", "query"]}},
+    {"name": "annotate_outputs", "description":
+        "9e02e448 — capture a human annotation for a path inside an outputs "
+        "tree WITHOUT touching the filesystem. Upserts a row into the "
+        "annotations layer of the local DuckDB outputs index for outputs_dir. "
+        "Two tiers, same mechanism: Tier 1 = pass outputs_dir as path to "
+        "annotate the whole tree ('what this experiment tree is about'); "
+        "Tier 2 = pass any sub-path (file or directory) to annotate a specific "
+        "run, file, or subdirectory ('PCA on, BFS off, overwritten 5x'). "
+        "run_params is an optional free-form dict of parameters logged alongside "
+        "the note (e.g. {\"lr\": 0.001, \"batch_size\": 32}). Annotations are "
+        "automatically surfaced in search_outputs results — any hit's path (or "
+        "its nearest ancestor directory) that has an annotation will have it "
+        "included in the hit's 'annotations' field without a second tool call. "
+        "A MERIDIAN_NOTES.md file placed anywhere in the tree is also "
+        "auto-ingested into the same table on every rebuild, keyed to its "
+        "containing directory. Returns the stored annotation as a dict.",
+     "inputSchema": {"type": "object", "properties": {
+         "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree root (same value you pass to search_outputs)."},
+         "path": {"type": "string", "description": "The path to annotate — either the outputs_dir root (Tier 1, tree-level annotation) or any file/subdirectory path within the tree (Tier 2, per-run or per-file annotation)."},
+         "note": {"type": "string", "description": "The annotation text (e.g. 'PCA on, BFS off — results from run on 2026-07-12 with lr=0.001')."},
+         "run_params": {"type": "object", "description": "Optional free-form key-value dict of run parameters to log alongside the note (e.g. {\"lr\": 0.001, \"epochs\": 100})."}},
+         "required": ["outputs_dir", "path", "note"]}},
     {"name": "search_code_semantic", "description":
         "93fce816 — Cursor-style LOCAL semantic code search over a source tree, "
         "entirely in a DuckDB sidecar (no cloud round-trip). Parses Python "
@@ -661,6 +736,31 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "kind": {"type": "string", "description": "Optional chunk-kind filter: one of 'function', 'class', 'method', 'interface', 'enum', 'module'."},
          "reindex": {"type": "boolean", "description": "Default true — run an incremental Merkle-diff reindex before searching so results reflect the current tree. Set false to search the last-built index as-is."}},
          "required": ["root_dir", "query"]}},
+    {"name": "prospect_symbol", "description":
+        "2ce5bc76 — ROBUST symbol prospecting with a three-rung fallback chain: "
+        "tries codebase__search_graph FIRST (fast, graph-indexed); when it returns "
+        "zero results OR the caller flags a mismatch (stale_graph=true), "
+        "automatically retries via Serena extractor__find_symbol / "
+        "extractor__find_declaration (AST-accurate, never stale); falls back to "
+        "a BM25 keyword grep over search_code_semantic as a last resort so the "
+        "caller NEVER has to notice a miss and switch tools by hand. Each rung is "
+        "labelled in the result ({rung: 'graph'|'serena'|'semantic', hits:[...], "
+        "fallback_reason: str?}) so the caller knows which level succeeded. "
+        "All three legs are best-effort: a missing tunnel, inactive slot, or "
+        "missing root_dir degrades to the next rung, never an error. "
+        "Use this instead of calling codebase__search_graph directly whenever "
+        "you are prospecting for a symbol, function, or class location — it "
+        "is structurally immune to the class of silent graph-index miss that "
+        "previously returned wrong line numbers or empty results for real symbols.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string", "description": "The symbol/function/class/method name or short search query to prospect for."},
+         "project_id": {"type": "string", "description": "Code-intel project id (repo-path slug) passed to codebase__search_graph."},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "root_dir": {"type": "string", "description": "Absolute path to the source tree root — used for the search_code_semantic fallback. If omitted, the semantic leg is skipped."},
+         "limit": {"type": "integer", "description": "Max results per rung (default 5)."},
+         "stale_graph": {"type": "boolean", "description": "Set true to SKIP the graph rung and go straight to Serena (e.g. you already know the graph is stale from a _graph_staleness warning)."},
+         "kind": {"type": "string", "description": "Optional symbol kind filter passed to search_code_semantic fallback (function/class/method/etc)."}},
+         "required": ["symbol"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
@@ -930,6 +1030,50 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "item_id": {"type": "string"}},
          "required": ["item_id"]}},
+    {"name": "add_workspace_proposal", "description":
+        "Capture a workspace-level flash of insight into the 'drawer of inspiration' — "
+        "cross-project ideas that don't belong to any one project yet. Unlike sprint items "
+        "these are NOT executor-claimable; they require a human to review and promote them. "
+        "Proposals start at status='raw' and progress through an enforced lifecycle: "
+        "raw → investigating → promoted|rejected. Use advance_proposal_status to move "
+        "through the lifecycle; use promote_proposal to convert one into a real sprint item.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Short idea title."},
+         "body": {"type": "string", "description": "Full description of the insight or idea."},
+         "tags": {"type": "string", "description": "Optional comma-separated tags."}},
+         "required": ["title", "body"]}},
+    {"name": "get_workspace_proposals", "description":
+        "Read-only: List workspace proposals (human-authored flashes of insight), newest first. "
+        "Optional status filter (raw/investigating/promoted/rejected) and tag substring filter.",
+     "inputSchema": {"type": "object", "properties": {
+         "status": {"type": "string", "enum": ["raw", "investigating", "promoted", "rejected"],
+                    "description": "Filter to proposals in this status."},
+         "tag": {"type": "string", "description": "Substring filter on tags."}},
+         "required": []}},
+    {"name": "advance_proposal_status", "description":
+        "Transition a workspace proposal through its lifecycle. Enforced transitions: "
+        "raw → investigating|rejected; investigating → promoted|rejected|raw; "
+        "rejected → raw. 'promoted' is a terminal status reachable only via "
+        "promote_proposal (which also creates the sprint item). "
+        "Returns the updated proposal.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string"},
+         "status": {"type": "string", "enum": ["raw", "investigating", "rejected"],
+                    "description": "Target status. 'promoted' is not allowed here — use promote_proposal instead."}},
+         "required": ["proposal_id", "status"]}},
+    {"name": "promote_proposal", "description":
+        "Promote a workspace proposal into a real sprint item, creating the link between them. "
+        "The proposal must be in 'raw' or 'investigating' state. Creates a sprint item under "
+        "the given project and sets the proposal's status to 'promoted' with "
+        "promoted_to_sprint_item_id pointing to the new item. "
+        "Returns {proposal, sprint_item_id, sprint_item_title, project_id}.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string"},
+         "project_id": {"type": "string", "description": "Project to create the sprint item under."},
+         "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
+         "sprint_item_title": {"type": "string", "description": "Override title for the sprint item; defaults to the proposal title."},
+         "sprint_item_version": {"type": "string", "description": "Sprint version for the new item; defaults to 'current'."}},
+         "required": ["proposal_id"]}},
     {"name": "get_session_brief", "description":
         "Read-only: Call this FIRST for project summaries or to see what a session did — "
         "returns session, tasks, decisions, and recent commits in one call. "
@@ -1506,6 +1650,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "repo_path": {"type": "string", "description": "Absolute path to the repository to activate (e.g. /home/me/project or C:\\\\Users\\\\me\\\\project)."}},
          "required": ["repo_path"]}},
+    {"name": "run_verification",
+     "description":
+        "0e973e52 — run the project's stored test_cmd on YOUR local machine via the "
+        "tunnel and return a REAL, structured result — not self-reported. "
+        "Fields: {exit_code, passed, failed, stdout_tail, stderr_tail, status, timed_out}. "
+        "Returns {status: 'not_configured'} (never an error) when no test_cmd is set; "
+        "call set_executor_config(test_cmd='pixi run test') first. "
+        "Requires an active `meridian --tunnel`; the hosted server has no access to "
+        "your machine (same architectural class as ingest_document / search_code_semantic "
+        "/ search_outputs — decision 0dedff91). "
+        "Per-project: only runs when test_cmd is configured for that project.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string", "description": "Meridian project id — whose stored test_cmd to run."},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
     {"name": "analyze_model_efficiency",
      "description":
         "0fba4cb6 — MECHANICAL (zero-token) model-tier suggestion for a task or "
@@ -1548,8 +1707,10 @@ _READ_ONLY_TOOLS = {
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
     "find_similar_figure",
+    "find_similar_table",
     "search_outputs",
     "search_code_semantic",
+    "prospect_symbol",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
 }
@@ -1584,6 +1745,10 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "pin_workspace_decision": "Pin Workspace Decision",
     "get_workspace_notes": "Get Workspace Notes",
     "add_workspace_note": "Add Workspace Note",
+    "get_workspace_proposals": "Get Workspace Proposals",
+    "add_workspace_proposal": "Add Workspace Proposal",
+    "advance_proposal_status": "Advance Proposal Status",
+    "promote_proposal": "Promote Proposal to Sprint Item",
     "get_workspace_settings": "Get Workspace Settings",
     "update_workspace_settings": "Update Workspace Settings",
     "save_blog_post": "Save Blog Post",
@@ -1610,8 +1775,13 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "find_symbol_usages": "Find Symbol Usages",
     "index_figure": "Index Figure",
     "find_similar_figure": "Find Similar Figure",
+    "index_table": "Index Table",
+    "find_similar_table": "Find Similar Table",
     "search_outputs": "Search Outputs",
+    "annotate_outputs": "Annotate Outputs",
     "search_code_semantic": "Search Code Semantic",
+    "run_verification": "Run Verification",
+    "prospect_symbol": "Prospect Symbol",
 }
 
 for _tool in _MCP_TOOLS_LIST:

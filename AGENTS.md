@@ -35,6 +35,37 @@ Hosted tier (no install):
 
 Project ID lives in `CLAUDE.local.md`. Docs: https://docs.usemeridian.us
 
+### Context7 (library/framework docs MCP)
+
+Context7 (by Upstash) indexes React, Tailwind, Next.js, and thousands of other
+library docs so AI agents get up-to-date versioned API docs without web search.
+It complements `paper_search` (academic papers) and GitHub search (code/issues).
+
+Wire it as a Meridian custom tunnel plugin, or add it directly to your MCP client:
+
+```json
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    }
+  }
+}
+```
+
+Remote endpoint (no local install, works with mcp-remote or Streamable HTTP clients):
+
+```
+https://mcp.context7.com/mcp
+```
+
+No API key required for the free tier. Generate one at https://context7.com/dashboard
+for higher rate limits and usage tracking (pass as `CONTEXT7_API_KEY` env var).
+
+Per the research-routing protocol in executor rules: if Context7 is in your tool list,
+call `resolve-library-id` then `get-library-docs` FIRST for framework/library questions.
+
 ---
 
 ## Session protocol (every session)

@@ -3709,6 +3709,21 @@ async def mcp_tools_doc() -> str:
         "---\n",
         "\n",
     ]
+    lines += ["## Workspace proposals\n"]
+    lines += _render_tool("add_workspace_proposal",
+        "Capture a workspace-level flash of insight into the 'drawer of inspiration' — cross-project ideas that "
+        "don't belong to any one project yet. NOT executor-claimable. status: raw → investigating → promoted|rejected. "
+        "Use `advance_proposal_status` to move through the lifecycle; `promote_proposal` to convert one into a real sprint item.")
+    lines += _render_tool("get_workspace_proposals",
+        "Read-only: List workspace proposals (human-authored flashes of insight), newest first. "
+        "Optional status filter (raw/investigating/promoted/rejected) and tag substring filter.")
+    lines += _render_tool("advance_proposal_status",
+        "Transition a workspace proposal through its lifecycle (raw → investigating|rejected; "
+        "investigating → promoted|rejected|raw; rejected → raw). 'promoted' is a terminal status "
+        "reachable only via `promote_proposal`.")
+    lines += _render_tool("promote_proposal",
+        "Promote a workspace proposal into a real sprint item, creating the link between them. "
+        "The proposal must be in 'raw' or 'investigating' state. Returns {proposal, sprint_item_id, sprint_item_title, project_id}.")
     lines += ["## Notes\n"]
     lines += _render_tool("add_note",
         "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")

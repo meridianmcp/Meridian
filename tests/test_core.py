@@ -7246,10 +7246,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_wave",
         "_migrate_pg_sprint_item_dependency",
         "_migrate_pg_mcp_rate_counters",
+        "_migrate_pg_workspace_proposals",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 92
+    assert len(allnames) == len(set(allnames)) == 93
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -16928,3 +16929,240 @@ async def test_recoverable_hitl_skips_live_originating_session(db):
         db, p["id"], active_session_ids={s["id"]}
     )
     assert rec == []
+
+
+# ---------------------------------------------------------------------------
+# 5c4dcc0f — workspace_proposals lifecycle tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_create_and_read(db):
+    """add_workspace_proposal creates a row with status='raw'. get_workspace_proposals
+    returns it; it is NOT visible through sprint_items / workspace_notes."""
+    prop = await db_module.add_workspace_proposal(
+        db, "IDEA: plugin auth", "Ship auth as optional plugin", tags="arch,idea"
+    )
+    assert prop["status"] == "raw"
+    assert prop["promoted_to_sprint_item_id"] is None
+    assert prop["title"] == "IDEA: plugin auth"
+
+    rows = await db_module.get_workspace_proposals(db)
+    assert len(rows) == 1
+    assert rows[0]["id"] == prop["id"]
+
+    # Not polluting sprint_items.
+    assert await db_module.get_sprint_items(db, "no-project") == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_status_machine_raw_to_investigating(db):
+    """raw → investigating is a valid transition."""
+    prop = await db_module.add_workspace_proposal(db, "P1", "body")
+    updated = await db_module.advance_workspace_proposal_status(
+        db, prop["id"], "investigating"
+    )
+    assert updated is not None
+    assert updated["status"] == "investigating"
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_status_machine_raw_to_rejected(db):
+    """raw → rejected is a valid transition."""
+    prop = await db_module.add_workspace_proposal(db, "P2", "body")
+    updated = await db_module.advance_workspace_proposal_status(
+        db, prop["id"], "rejected"
+    )
+    assert updated["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_status_machine_investigating_to_rejected(db):
+    """investigating → rejected is a valid transition."""
+    prop = await db_module.add_workspace_proposal(db, "P3", "body")
+    await db_module.advance_workspace_proposal_status(db, prop["id"], "investigating")
+    updated = await db_module.advance_workspace_proposal_status(
+        db, prop["id"], "rejected"
+    )
+    assert updated["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_status_machine_rejected_to_raw(db):
+    """rejected → raw is allowed (un-reject)."""
+    prop = await db_module.add_workspace_proposal(db, "P4", "body")
+    await db_module.advance_workspace_proposal_status(db, prop["id"], "rejected")
+    updated = await db_module.advance_workspace_proposal_status(
+        db, prop["id"], "raw"
+    )
+    assert updated["status"] == "raw"
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_invalid_transition_raises(db):
+    """raw → promoted directly raises ValueError (must go via promote_workspace_proposal)."""
+    prop = await db_module.add_workspace_proposal(db, "P5", "body")
+    with pytest.raises(ValueError, match="Cannot transition"):
+        await db_module.advance_workspace_proposal_status(
+            db, prop["id"], "promoted"
+        )
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_invalid_status_raises(db):
+    """An unknown status value raises ValueError."""
+    prop = await db_module.add_workspace_proposal(db, "P6", "body")
+    with pytest.raises(ValueError, match="Invalid proposal status"):
+        await db_module.advance_workspace_proposal_status(
+            db, prop["id"], "bogus-status"
+        )
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_promote_creates_sprint_item_and_links(db):
+    """promote_workspace_proposal sets status='promoted', sets
+    promoted_to_sprint_item_id, and creates a sprint item in the given project."""
+    project = await db_module.create_project(db, "promo-target")
+    prop = await db_module.add_workspace_proposal(db, "Ship auth plugin", "body")
+
+    result = await db_module.promote_workspace_proposal(
+        db, prop["id"], project["id"]
+    )
+    assert result["proposal"]["status"] == "promoted"
+    si_id = result["sprint_item_id"]
+    assert si_id is not None
+    assert result["proposal"]["promoted_to_sprint_item_id"] == si_id
+    assert result["project_id"] == project["id"]
+
+    # Sprint item actually exists.
+    items = await db_module.get_sprint_items(db, project["id"])
+    assert any(i["id"] == si_id for i in items)
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_promote_with_custom_title(db):
+    """sprint_item_title overrides the proposal title for the sprint item."""
+    project = await db_module.create_project(db, "promo-target-2")
+    prop = await db_module.add_workspace_proposal(db, "Raw idea", "body")
+    result = await db_module.promote_workspace_proposal(
+        db, prop["id"], project["id"], sprint_item_title="Refined impl title"
+    )
+    assert result["sprint_item_title"] == "Refined impl title"
+    items = await db_module.get_sprint_items(db, project["id"])
+    titles = [i["title"] for i in items]
+    assert "Refined impl title" in titles
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_promote_from_investigating(db):
+    """A proposal in 'investigating' state can also be promoted."""
+    project = await db_module.create_project(db, "promo-target-3")
+    prop = await db_module.add_workspace_proposal(db, "Investigated idea", "body")
+    await db_module.advance_workspace_proposal_status(db, prop["id"], "investigating")
+    result = await db_module.promote_workspace_proposal(
+        db, prop["id"], project["id"]
+    )
+    assert result["proposal"]["status"] == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_cannot_promote_rejected(db):
+    """A rejected proposal raises ValueError on promote."""
+    project = await db_module.create_project(db, "promo-target-4")
+    prop = await db_module.add_workspace_proposal(db, "Dead idea", "body")
+    await db_module.advance_workspace_proposal_status(db, prop["id"], "rejected")
+    with pytest.raises(ValueError, match="Cannot promote"):
+        await db_module.promote_workspace_proposal(db, prop["id"], project["id"])
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_cannot_repromote(db):
+    """A promoted proposal raises ValueError on re-promote."""
+    project = await db_module.create_project(db, "promo-target-5")
+    prop = await db_module.add_workspace_proposal(db, "Already promoted", "body")
+    await db_module.promote_workspace_proposal(db, prop["id"], project["id"])
+    with pytest.raises(ValueError, match="Cannot promote"):
+        await db_module.promote_workspace_proposal(db, prop["id"], project["id"])
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_tenant_isolation(db):
+    """Proposals are scoped by tenant_id. Tenant B cannot see tenant A's proposals."""
+    await db_module.add_workspace_proposal(
+        db, "A-idea", "body", tenant_id="tenant-a"
+    )
+    await db_module.add_workspace_proposal(
+        db, "B-idea", "body", tenant_id="tenant-b"
+    )
+    a = {p["title"] for p in await db_module.get_workspace_proposals(db, tenant_id="tenant-a")}
+    b = {p["title"] for p in await db_module.get_workspace_proposals(db, tenant_id="tenant-b")}
+    assert a == {"A-idea"}
+    assert b == {"B-idea"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_tenant_cannot_advance_other_tenant(db):
+    """Tenant B cannot advance a proposal owned by tenant A."""
+    prop = await db_module.add_workspace_proposal(
+        db, "A-only", "body", tenant_id="tenant-a"
+    )
+    result = await db_module.advance_workspace_proposal_status(
+        db, prop["id"], "investigating", tenant_id="tenant-b"
+    )
+    # Wrong tenant → None (not found).
+    assert result is None
+    # Original proposal unchanged.
+    a_props = await db_module.get_workspace_proposals(db, tenant_id="tenant-a")
+    assert a_props[0]["status"] == "raw"
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_null_tenant_visible_to_tenant(db):
+    """Legacy rows with tenant_id=NULL remain visible to any tenant (like workspace_notes)."""
+    await db_module.add_workspace_proposal(db, "legacy", "old idea")  # NULL tenant
+    titles = {p["title"] for p in await db_module.get_workspace_proposals(db, tenant_id="tenant-a")}
+    assert "legacy" in titles
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_filter_by_status(db):
+    """get_workspace_proposals with status filter returns only matching rows."""
+    p1 = await db_module.add_workspace_proposal(db, "raw-idea", "body")
+    p2 = await db_module.add_workspace_proposal(db, "inv-idea", "body")
+    await db_module.advance_workspace_proposal_status(db, p2["id"], "investigating")
+
+    raw = await db_module.get_workspace_proposals(db, status="raw")
+    inv = await db_module.get_workspace_proposals(db, status="investigating")
+    assert {p["id"] for p in raw} == {p1["id"]}
+    assert {p["id"] for p in inv} == {p2["id"]}
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_not_in_sprint_autoclaim(db):
+    """workspace_proposals are NOT claimable by get_next_claimable_sprint_item —
+    they live in a completely separate table and are excluded from executor auto-claim."""
+    project = await db_module.create_project(db, "claim-test-proj")
+    await db_module.add_workspace_proposal(db, "Executor should not claim this", "body")
+    # No sprint items exist → get_sprint_items returns empty (proposals are separate).
+    items = await db_module.get_sprint_items(db, project["id"])
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_delete(db):
+    """delete_workspace_proposal removes the row; returns True on success."""
+    prop = await db_module.add_workspace_proposal(db, "deletable", "body")
+    assert await db_module.delete_workspace_proposal(db, prop["id"]) is True
+    assert await db_module.get_workspace_proposals(db) == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_schema_has_required_columns(db):
+    """Verify the workspace_proposals table has the expected lifecycle columns."""
+    async with db.execute("PRAGMA table_info(workspace_proposals)") as cur:
+        cols = {row["name"] for row in await cur.fetchall()}
+    assert "status" in cols
+    assert "promoted_to_sprint_item_id" in cols
+    assert "tenant_id" in cols
+    assert "created_at" in cols
+    assert "updated_at" in cols

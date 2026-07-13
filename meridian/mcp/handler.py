@@ -2363,7 +2363,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, update_paragraph, find_symbol_usages, index_figure, find_similar_figure, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, update_paragraph, find_symbol_usages, index_figure, find_similar_figure, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item, add_workspace_proposal, get_workspace_proposals, advance_proposal_status, promote_proposal."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -3013,6 +3013,96 @@ async def _handle_notes_decisions(
             "document_id": doc_row["id"],
             "matches": matches,
         }
+    if name == "index_table":
+        # 2622182d — index ONE table into the SEMANTIC table index (dedup +
+        # similarity on a normalized caption), the direct parallel of
+        # index_figure. Complementary to the structural kind='table'
+        # doc_elements placement, not a duplicate of it.
+        validate_input_size(args.get("doc"), "table doc", 2_000)
+        validate_input_size(args.get("caption"), "caption", 10_000)
+        validate_input_size(args.get("semantic_label"), "semantic_label", 500)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        caption = args.get("caption")
+        table_index_raw = args.get("table_index")
+        table_index: int | None = None
+        if table_index_raw is not None:
+            try:
+                table_index = int(table_index_raw)
+            except (TypeError, ValueError):
+                return {"error": f"table_index must be an integer, got {table_index_raw!r}"}
+        if not doc_source:
+            return {"error": "doc is required"}
+        if table_index is None and not caption:
+            return {"error": "at least one of table_index or caption is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for doc={doc_source!r} — ingest_document "
+                    "it first (that MCP tool populates the doc-structure store; "
+                    "there is no separate reindex_document tool)"
+                ),
+            }
+        try:
+            result = await store.add_table(
+                doc_row["id"], table_index,
+                caption=caption,
+                semantic_label=args.get("semantic_label"),
+                paired_figure_id=args.get("paired_figure_id"),
+            )
+        except Exception as exc:  # noqa: BLE001 — indexing is best-effort
+            return {"error": f"could not index table: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            **result,
+        }
+    if name == "find_similar_table":
+        # 2622182d — fuzzy-match a description against a document's
+        # already-indexed tables (read-only counterpart of index_table).
+        validate_input_size(args.get("doc"), "table doc", 2_000)
+        validate_input_size(args.get("description"), "description", 10_000)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        query = args.get("description")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not query:
+            return {"error": "description is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        _limit = args.get("limit")
+        try:
+            _limit = int(_limit) if _limit is not None else 5
+        except (TypeError, ValueError):
+            _limit = 5
+        try:
+            matches = await store.find_similar_tables(
+                doc_row["id"], query, limit=_limit,
+            )
+        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+            return {"error": f"could not find similar tables: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            "matches": matches,
+        }
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)
@@ -3194,6 +3284,43 @@ async def _handle_notes_decisions(
             db, args["item_id"], tenant_id=_mcp_tenant_id,
         )
         return item or {"error": "workspace sprint item not found"}
+    # 5c4dcc0f — workspace proposals lifecycle
+    if name == "add_workspace_proposal":
+        validate_input_size(args.get("title"), "proposal title", 500)
+        validate_input_size(args.get("body"), "proposal body", 100_000)
+        return await db_module.add_workspace_proposal(
+            db, args["title"], args["body"],
+            tags=args.get("tags"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "get_workspace_proposals":
+        return await db_module.get_workspace_proposals(
+            db, status=args.get("status"), tag=args.get("tag"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "advance_proposal_status":
+        try:
+            result = await db_module.advance_workspace_proposal_status(
+                db, args["proposal_id"], args["status"],
+                tenant_id=_mcp_tenant_id,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return result or {"error": "proposal not found"}
+    if name == "promote_proposal":
+        _promo_project_id = args.get("project_id") or ""
+        if not _promo_project_id:
+            return {"error": "project_id (or project_name) is required for promote_proposal"}
+        try:
+            result = await db_module.promote_workspace_proposal(
+                db, args["proposal_id"], _promo_project_id,
+                sprint_item_title=args.get("sprint_item_title"),
+                sprint_item_version=args.get("sprint_item_version"),
+                tenant_id=_mcp_tenant_id,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return result
     return _MISS
 
 
@@ -5495,7 +5622,7 @@ async def _handle_tunnel_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: set_active_repo (tunnel control)."""
+    """Dispatch group: set_active_repo (tunnel control), run_verification (0e973e52)."""
     if name == "set_active_repo":
         repo_path = str(args.get("repo_path") or "").strip()
         if not repo_path:
@@ -5518,6 +5645,79 @@ async def _handle_tunnel_tools(
         # access the new repo path without requiring --repo to be set at startup.
         await _tunnel_mod.send_add_fs_roots_control(tenant_id, [repo_path])
         return result
+
+    if name == "run_verification":
+        # 0e973e52 — run the project's stored test_cmd on the caller's local
+        # machine via the FS tunnel and return a structured real result.
+        # ARCHITECTURAL REQUIREMENT (decision 0dedff91): this MUST run on the
+        # caller's machine via the tunnel — the hosted server can never reach a
+        # caller's test suite. This is the exact same class of mistake that
+        # search_code_semantic / ingest_document made and were fixed for.
+        project_id = args.get("project_id", "")
+        if not project_id:
+            raise ValueError("project_id is required")
+
+        # Load the project's stored executor config to get test_cmd and cwd.
+        exec_cfg = await db_module.get_executor_config(db, project_id) or {}
+        test_cmd = (exec_cfg.get("test_cmd") or "").strip()
+        repo_path = (exec_cfg.get("repo_path") or "").strip()
+
+        if not test_cmd:
+            # Clean, honest "not configured" — never an error or fabricated pass.
+            return {
+                "status": "not_configured",
+                "message": (
+                    "No test_cmd is configured for this project. "
+                    "Call set_executor_config(project_id=..., test_cmd='...') to set one."
+                ),
+                "project_id": project_id,
+                "exit_code": None,
+                "passed": None,
+                "failed": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+
+        if tenant is None:
+            raise ValueError("run_verification requires an authenticated tenant (tunnel mode)")
+        tenant_id = tenant.get("id", "")
+
+        from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+
+        # Hosted guard: the hosted server can never spawn a process on the caller's
+        # machine directly. We ALWAYS require the tunnel — same class of fix as
+        # ingest_document / search_code_semantic / search_outputs (decision 0dedff91).
+        if _hosted_mode() and not _tunnel_mod.has_active_tunnel(tenant_id):
+            return {
+                "status": "not_connected",
+                "message": (
+                    "run_verification must run on YOUR local machine via the tunnel "
+                    "(hosted Meridian has no access to your machine or its test suite). "
+                    "Start `meridian --tunnel` in your terminal to enable it."
+                ),
+                "project_id": project_id,
+                "test_cmd": test_cmd,
+                "exit_code": None,
+                "passed": None,
+                "failed": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "hosted": True,
+            }
+
+        result = await _tunnel_mod.send_run_cmd_control(
+            tenant_id,
+            cmd=test_cmd,
+            cwd=repo_path or None,
+        )
+
+        # Enrich the result with project context so the caller has everything.
+        result["project_id"] = project_id
+        result["test_cmd"] = test_cmd
+        if repo_path:
+            result["cwd"] = repo_path
+        return result
+
     return _MISS
 
 
@@ -5529,7 +5729,33 @@ async def _handle_outputs_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: search_outputs (a0e9133e — BM25 over the outputs FTS index)."""
+    """Dispatch group: search_outputs + annotate_outputs (9e02e448 / a0e9133e)."""
+    if name == "annotate_outputs":
+        from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+        outputs_dir = str(args.get("outputs_dir") or "").strip()
+        path = str(args.get("path") or "").strip()
+        note = str(args.get("note") or "").strip()
+        run_params = args.get("run_params")
+        if not outputs_dir:
+            raise ValueError("outputs_dir is required")
+        if not path:
+            raise ValueError("path is required")
+        if not note:
+            raise ValueError("note is required")
+        # 9e02e448 — local-only annotation, same guard as search_outputs:
+        # hosted Meridian can't reach the caller's machine.
+        if _hosted_mode():
+            return {
+                "error": (
+                    "annotate_outputs stores annotations in a local DuckDB index "
+                    "on YOUR filesystem and cannot run on hosted Meridian. "
+                    "Run Meridian self-hosted."
+                ),
+                "hosted": True,
+            }
+        return _outputs_indexer.annotate_outputs(
+            outputs_dir, path, note, run_params=run_params,
+        )
     if name == "search_outputs":
         from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
         from .. import hardening as _hardening  # noqa: PLC0415
@@ -5602,7 +5828,34 @@ async def _handle_code_index_tools(
     _mcp_tenant_id: Any,
 ) -> Any:
     """Dispatch group: search_code_semantic (93fce816 — Cursor-style local code
-    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS)."""
+    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS)
+    and prospect_symbol (2ce5bc76 — three-rung fallback chain for robust
+    symbol prospecting)."""
+    if name == "prospect_symbol":
+        symbol = str(args.get("symbol") or "").strip()
+        if not symbol:
+            raise ValueError("symbol is required")
+        project_id = str(args.get("project_id") or "").strip()
+        root_dir = str(args.get("root_dir") or "").strip()
+        limit = args.get("limit", 5)
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 5
+        kind = args.get("kind")
+        kind = str(kind).strip() if kind else None
+        stale_graph = bool(args.get("stale_graph", False))
+        from .. import prospect as _prospect  # noqa: PLC0415
+        return await _prospect.prospect_symbol_impl(
+            symbol=symbol,
+            project_id=project_id,
+            root_dir=root_dir,
+            limit=limit,
+            kind=kind,
+            stale_graph=stale_graph,
+            tenant=tenant,
+            data_dir=data_dir,
+        )
     if name == "search_code_semantic":
         from .. import code_index as _code_index  # noqa: PLC0415
         from .. import hardening as _hardening  # noqa: PLC0415

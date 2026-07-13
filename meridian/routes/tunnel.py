@@ -114,6 +114,12 @@ _pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_docs_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_zotero_reqs: dict[str, asyncio.Future[dict]] = {}
 
+# 0e973e52 — run_verification: per-request futures for run_cmd control messages
+# sent over the FS WebSocket. The FS receive loop resolves these when the client
+# sends back a {"type": "run_cmd_result", "id": "...", ...} message. Keyed by
+# correlation id (uuid4), independent of _pending_reqs (HTTP proxy futures).
+_pending_run_cmd_reqs: dict[str, "asyncio.Future[dict]"] = {}
+
 # 8fb69d54 — 4 pre-allocated custom tunnel slots (p0-p3, ports 8814-8817) so
 # custom plugins get real server routes and appear in the claude.ai connector
 # (closes ecf5b8c6). Registries are keyed by slot label, mirroring word/dc.
@@ -419,6 +425,15 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
                 if fut is not None and not fut.done():
                     fut.set_result(msg)
 
+            # 0e973e52 — run_verification: client sends back run_cmd results
+            # over the same FS socket using a separate message type so these
+            # never collide with HTTP-proxy "response" futures.
+            if msg_type == "run_cmd_result":
+                req_id = msg.get("id")
+                fut_rc = _pending_run_cmd_reqs.get(req_id)
+                if fut_rc is not None and not fut_rc.done():
+                    fut_rc.set_result(msg)
+
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -435,6 +450,10 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
         for fut in list(_pending_reqs.values()):
             if not fut.done():
                 fut.cancel()
+        # 0e973e52 — cancel any in-flight run_cmd requests when FS socket drops
+        for fut_rc in list(_pending_run_cmd_reqs.values()):
+            if not fut_rc.done():
+                fut_rc.cancel()
         try:
             await db_module.update_tenant(auth_db, tenant_id, tunnel_active=0)
         except Exception:
@@ -1994,6 +2013,101 @@ async def send_set_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[st
         return {"status": "error", "message": str(exc)}
 
 
+# 0e973e52 — run_verification: timeout for waiting on the client's run_cmd_result.
+# The test suite may be slow (minutes); default 300 s is generous but bounded.
+# Configurable via MERIDIAN_RUN_CMD_TIMEOUT for power users.
+def _run_cmd_timeout() -> float:
+    raw = os.environ.get("MERIDIAN_RUN_CMD_TIMEOUT", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    return 300.0
+
+
+async def send_run_cmd_control(
+    tenant_id: str,
+    cmd: str | list[str],
+    cwd: str | None = None,
+) -> dict:
+    """0e973e52 — send a run_cmd control message over the FS WebSocket.
+
+    Sends ``{"type": "run_cmd", "id": "<uuid>", "cmd": ..., "cwd": ...}`` to the
+    tenant's local tunnel client and awaits a ``{"type": "run_cmd_result", ...}``
+    reply. Returns a structured result dict::
+
+        {
+            "exit_code": int,
+            "passed": int | None,    # parsed from pytest/pixi output
+            "failed": int | None,
+            "stdout_tail": str,
+            "stderr_tail": str,
+            "timed_out": bool,       # True when client didn't reply in time
+            "status": "ok" | "not_connected" | "error" | "timeout",
+        }
+
+    Requires an active FS tunnel (``_tunnel_sockets``). If no tunnel is connected
+    returns ``{"status": "not_connected", ...}`` so callers can surface an honest
+    "not configured" message instead of a spurious error.
+    """
+    ws = _tunnel_sockets.get(tenant_id)
+    if ws is None:
+        return {
+            "status": "not_connected",
+            "message": "tunnel not connected — run `meridian --tunnel` first",
+            "exit_code": None,
+            "passed": None,
+            "failed": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+
+    req_id = str(uuid.uuid4())
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future[dict] = loop.create_future()
+    _pending_run_cmd_reqs[req_id] = fut
+
+    try:
+        await ws.send_json({
+            "type": "run_cmd",
+            "id": req_id,
+            "cmd": cmd,
+            "cwd": cwd or "",
+        })
+        result = await asyncio.wait_for(fut, timeout=_run_cmd_timeout())
+    except asyncio.TimeoutError:
+        _pending_run_cmd_reqs.pop(req_id, None)
+        return {
+            "status": "timeout",
+            "message": f"test command timed out after {_run_cmd_timeout():.0f}s",
+            "exit_code": None,
+            "passed": None,
+            "failed": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "timed_out": True,
+        }
+    except Exception as exc:  # noqa: BLE001
+        _pending_run_cmd_reqs.pop(req_id, None)
+        return {
+            "status": "error",
+            "message": str(exc),
+            "exit_code": None,
+            "passed": None,
+            "failed": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    finally:
+        _pending_run_cmd_reqs.pop(req_id, None)
+
+    # The client sends back the structured result directly.
+    return result
+
+
 # live-fs-roots — POST/DELETE /tunnel/filesystem-roots: add or remove a single
 # served root LIVE from the dashboard. The tunnel is tenant-scoped and the served
 # set is the UNION of ``executor_config.filesystem_roots`` across the tenant's
@@ -2940,6 +3054,244 @@ async def _enrich_code_intel_project_error(
     return hint
 
 
+# caf95f81 — get_code_snippet truncation detection.
+#
+# The external codebase-memory-mcp server returns start_line/end_line in its
+# get_code_snippet response, but silently truncates the source text when a function
+# is very long (confirmed bug: a 114-line function returned ~40 lines short with
+# NO indicator).  Meridian cannot patch the plugin directly — same class of
+# limitation as 19b3259e / 7ef712a8.  Instead, after a successful get_code_snippet
+# call, we inspect the result, compute the expected line count from the declared
+# range, count the actual lines in the source text, and attach a clear
+# ``truncation_warning`` key when the snippet is meaningfully short.
+#
+# The source text lives inside the MCP content-block envelope:
+#   result["content"][0]["text"] → JSON string → {start_line, end_line, source/code/snippet}
+# We probe multiple plausible source-field names in priority order.  Fail-open:
+# any missing / malformed / unexpected field silently skips enrichment — the
+# caller still gets the (possibly truncated) result unchanged.
+
+# Candidate field names for the source text, in probe order.
+_CODE_SNIPPET_SOURCE_FIELDS = ("source", "code", "snippet", "content", "text")
+
+# Slack for trailing-newline edge cases.  A snippet that is only 1 line short
+# may simply lack a terminal newline; we only warn when genuinely short by more
+# than this many lines.
+_TRUNCATION_SLACK = 2
+
+
+def _check_code_snippet_truncation(result: Any) -> Any:
+    """caf95f81 — attach a truncation_warning to a get_code_snippet result when
+    the returned source text is meaningfully shorter than the declared line range.
+
+    The result is the MCP ``tools/call`` result object (``{"content": [...]}``)
+    returned by ``call_tunnel_tool``.  The warning is added as a top-level
+    ``truncation_warning`` key so callers can detect it without re-parsing the
+    content blocks.  Returns the result unchanged (no copy) if no truncation is
+    detected — including all fail-open cases (missing fields, wrong types,
+    parse errors, zero-length range).  Never raises.
+    """
+    try:
+        if not isinstance(result, dict):
+            return result
+        content = result.get("content")
+        if not isinstance(content, list) or not content:
+            return result
+        # Probe the first text block for the JSON payload.
+        payload: Any = None
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            raw_text = block.get("text") or ""
+            if not raw_text:
+                continue
+            try:
+                payload = json.loads(raw_text)
+            except Exception:  # noqa: BLE001 — non-JSON text block: skip
+                continue
+            break  # use the first parseable text block
+        if not isinstance(payload, dict):
+            return result
+        # Extract start_line / end_line from the JSON payload.
+        start_line = payload.get("start_line")
+        end_line = payload.get("end_line")
+        if not isinstance(start_line, int) or not isinstance(end_line, int):
+            return result
+        expected_lines = end_line - start_line + 1
+        if expected_lines <= 0:
+            return result  # degenerate range — skip
+        # Probe the source text field.
+        source_text: str | None = None
+        for field in _CODE_SNIPPET_SOURCE_FIELDS:
+            candidate = payload.get(field)
+            if isinstance(candidate, str):
+                source_text = candidate
+                break
+        if source_text is None:
+            return result
+        # Count lines in the source text.  splitlines() handles \r\n and \r
+        # correctly.  An empty string → 0 lines.
+        actual_lines = len(source_text.splitlines())
+        if (expected_lines - actual_lines) > _TRUNCATION_SLACK:
+            result = dict(result)  # shallow copy — don't mutate the original
+            result["truncation_warning"] = (
+                f"get_code_snippet returned a truncated snippet: expected "
+                f"{expected_lines} lines (start_line={start_line}, "
+                f"end_line={end_line}) but the source field contains only "
+                f"{actual_lines} lines. The tail of the function/block is "
+                f"missing. Re-fetch the missing portion via a direct file read "
+                f"(e.g. filesystem__read_file with offset={start_line + actual_lines - 1} "
+                f"limit={expected_lines - actual_lines + _TRUNCATION_SLACK}) to "
+                f"get the complete source."
+            )
+    except Exception:  # noqa: BLE001 — enrichment must never mask the real result
+        pass
+    return result
+
+
+# 2ce5bc76 — code-graph staleness fingerprinting. The codebase-memory-mcp graph
+# index goes stale after edits without reliably re-indexing (confirmed failures:
+# wrong line numbers, zero results for existing symbols). We store a per-
+# (tenant, project_id) fingerprint at index_repository time and compare it on
+# each search_graph call. A mismatch injects a clear staleness warning in the
+# result so the caller can see it was wrong rather than silently trusting it.
+#
+# Fingerprint = the git commit hash OR the "indexed_at" timestamp surfaced by
+# index_repository / index_status responses — whichever is present. We can't
+# call into the external plugin's internals (same class as 7ef712a8/19b3259e),
+# so we extract it from the MCP result envelope.
+_code_graph_fingerprints: dict[str, str] = {}  # "{tenant_id}:{project_id}" → fingerprint
+
+
+def _extract_graph_fingerprint(result: Any) -> "str | None":
+    """Pull the staleness fingerprint from a code-intel MCP result.
+
+    Looks for ``git_commit``, ``commit_hash``, ``indexed_commit``,
+    ``indexed_at``, or ``commit`` in the unwrapped payload — whatever the
+    codebase-memory-mcp server chooses to surface. Returns None when nothing
+    identifiable is present.
+    """
+    payload = _extract_graph_matches(result) if isinstance(result, dict) else result
+    if not isinstance(payload, dict):
+        return None
+    _keys = ("git_commit", "commit_hash", "indexed_commit", "commit", "indexed_at", "last_indexed_at")
+    for k in _keys:
+        v = payload.get(k)
+        if v and isinstance(v, str):
+            return v.strip()
+    # Also look one level down inside a "status" or "index" sub-dict.
+    for sub_key in ("status", "index", "metadata"):
+        sub = payload.get(sub_key)
+        if isinstance(sub, dict):
+            for k in _keys:
+                v = sub.get(k)
+                if v and isinstance(v, str):
+                    return v.strip()
+    return None
+
+
+def _graph_fingerprint_key(tenant_id: str, arguments: "dict | None") -> "str | None":
+    """The cache key for the staleness fingerprint given a call's arguments.
+
+    Returns ``"{tenant_id}:{project_id}"`` when a project_id is present, or
+    ``"{tenant_id}:*"`` as a fallback (single-project tenants / no id passed).
+    """
+    project_id = ""
+    if isinstance(arguments, dict):
+        project_id = str(
+            arguments.get("project_id")
+            or arguments.get("project")
+            or arguments.get("project_name")
+            or ""
+        ).strip()
+    return f"{tenant_id}:{project_id or '*'}"
+
+
+async def _fetch_graph_current_fingerprint(tenant_id: str, arguments: "dict | None") -> "str | None":
+    """Best-effort: ask the code-intel server for the current index fingerprint.
+
+    Calls ``codebase__index_status`` (passing the same project_id/project
+    arguments the caller used) and extracts the fingerprint from the response.
+    Never raises — returns None on any failure so staleness detection degrades
+    silently rather than breaking the search call.
+    """
+    try:
+        status_args: dict[str, Any] = {}
+        if isinstance(arguments, dict):
+            for k in ("project_id", "project", "project_name"):
+                if arguments.get(k):
+                    status_args[k] = arguments[k]
+                    break
+        result = await call_tunnel_tool(tenant_id, "codebase__index_status", status_args)
+        return _extract_graph_fingerprint(result)
+    except Exception:  # noqa: BLE001 — staleness detection must never raise
+        return None
+
+
+async def _annotate_graph_result_staleness(
+    tenant_id: str,
+    name: str,
+    arguments: "dict | None",
+    result: "dict | None",
+) -> "dict | None":
+    """2ce5bc76 — inject a ``_graph_staleness`` warning when the code graph is stale.
+
+    Called after a successful ``search_graph`` call. If the stored fingerprint
+    for this (tenant, project_id) differs from the current one fetched via
+    ``index_status``, wraps the result in a dict that carries a
+    ``_graph_staleness`` warning so the caller can see the index is stale and
+    cross-check with Serena. When fingerprints match (or either is unknown),
+    the result passes through unchanged. Fail-open — any error returns the
+    original result untouched.
+    """
+    bare = name.split("__", 1)[1] if "__" in name else name
+    if bare != "search_graph":
+        return result
+    if result is None:
+        return result
+    try:
+        fkey = _graph_fingerprint_key(tenant_id, arguments)
+        stored = _code_graph_fingerprints.get(fkey)
+        # Only fetch the current fingerprint when we have a stored baseline to
+        # compare against. Without a stored fingerprint there's nothing to diff,
+        # and we avoid an extra codebase__index_status round-trip on every
+        # search_graph call (important: it prevents spurious side-effects in
+        # tests and on hot paths where no index_repository has been run yet).
+        if not stored:
+            return result
+        current = await _fetch_graph_current_fingerprint(tenant_id, arguments)
+        if current and stored != current:
+            # Stale! Surface the warning in the result without destroying it.
+            # The MCP result envelope is a dict with "content": [...]; we add an
+            # extra ``_graph_staleness`` field to carry the diagnostic so the
+            # caller can see it without having to parse the content array.
+            enriched = dict(result)
+            enriched["_graph_staleness"] = {
+                "stale": True,
+                "reason": "index-fingerprint-mismatch",
+                "stored_fingerprint": stored,
+                "current_fingerprint": current,
+                "warning": (
+                    "The code graph index appears STALE: the fingerprint at "
+                    "last index_repository differs from the current index "
+                    f"({stored!r} -> {current!r}). Line numbers and symbol "
+                    "locations in these results may be wrong (confirmed real "
+                    "failures: off-by-440-lines, zero results for existing "
+                    "symbols). Cross-check with extractor__find_symbol or "
+                    "extractor__find_declaration before trusting line ranges. "
+                    "Re-run codebase__index_repository to refresh the graph."
+                ),
+            }
+            return enriched
+        # Fingerprints match (or current is unknown) — update the stored value
+        # with the current reading for future comparisons.
+        if current:
+            _code_graph_fingerprints[fkey] = current
+    except Exception:  # noqa: BLE001 — never break a search call for staleness bookkeeping
+        pass
+    return result
+
+
 async def call_tunnel_tool(
     tenant_id: str, name: str, arguments: dict | None,
     repo_path: str | None = None,
@@ -2960,10 +3312,16 @@ async def call_tunnel_tool(
     73d233e4 — when a MUTATING word-slot (docx) tool is being relayed and ``db``
     is supplied, consult the target document's live file claims first and RAISE a
     concurrent-write conflict (surfaced to the caller as an MCP error) when another
-    live session holds a conflicting claim on it. A .docx is a zip container with no
-    partial write, so two relayed edits silently last-save-wins each other; the
-    guard turns that silent stomp into a legible, coordinatable error. Fail-open —
-    no db / unidentifiable target / lookup error passes through unchanged.
+    live session holds a conflicting write/symbol claim on it. A .docx is a zip
+    container with no partial write, so two relayed edits silently last-save-wins
+    each other; the guard turns that silent stomp into a legible, coordinatable
+    error. Fail-open — no db / unidentifiable target / lookup error passes through
+    unchanged.
+
+    2ce5bc76 — when ``index_repository`` succeeds, its fingerprint is stored per
+    (tenant, project_id) so future ``search_graph`` calls can detect a stale
+    index and inject a ``_graph_staleness`` warning instead of silently returning
+    wrong line numbers.
     """
     label = (_tunnel_tool_routes.get(tenant_id) or {}).get(name)
     if label is None:
@@ -3034,7 +3392,36 @@ async def call_tunnel_tool(
             except Exception:  # noqa: BLE001 — surface the original error regardless
                 pass
         raise RuntimeError(_msg)
-    return resp.get("result")
+    result = resp.get("result")
+    # caf95f81 — detect silent truncation in get_code_snippet responses from the
+    # code slot.  When the declared line range (start_line/end_line) is
+    # meaningfully larger than the actual source line count, attach a
+    # truncation_warning key so the caller knows to re-fetch the missing tail.
+    # Pure enrichment — never mutates the original result, never raises.
+    if label == "code" and bare_name == "get_code_snippet":
+        result = _check_code_snippet_truncation(result)
+    # 2ce5bc76 — staleness fingerprinting for the code graph.
+    # (a) index_repository success → capture the fingerprint for future comparison.
+    # (b) search_graph success → compare against stored fingerprint and inject a
+    #     staleness warning in the result when the index appears out of date.
+    if label == "code":
+        bare = name.split("__", 1)[1] if "__" in name else name
+        if bare == "index_repository" and result is not None:
+            try:
+                fp = _extract_graph_fingerprint(result)
+                if fp:
+                    fkey = _graph_fingerprint_key(tenant_id, arguments)
+                    _code_graph_fingerprints[fkey] = fp
+            except Exception:  # noqa: BLE001 — fingerprint capture is best-effort
+                pass
+        elif bare == "search_graph":
+            try:
+                result = await _annotate_graph_result_staleness(
+                    tenant_id, name, arguments, result
+                )
+            except Exception:  # noqa: BLE001 — staleness annotation is best-effort
+                pass
+    return result
 
 
 def _extract_graph_matches(result: Any) -> Any:
