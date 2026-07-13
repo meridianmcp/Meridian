@@ -807,6 +807,25 @@ CREATE TABLE IF NOT EXISTS mcp_rate_counters (
     count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, window_start)
 );
+
+-- 5c4dcc0f — workspace_proposals: human-only "drawer of inspiration" for
+-- cross-project flashes of insight. Workspace-scoped (tenant_id, not
+-- project_id). status: raw → investigating → promoted | rejected.
+-- promoted_to_sprint_item_id links a promoted proposal to the sprint item it
+-- became. NOT auto-claimable by executors — human-reviewed promotion gate only.
+-- idx_workspace_proposals_tenant created by _migrate_pg_workspace_proposals
+-- (guarded migration), never inline here (2026-07-04 inline-index outage rule).
+CREATE TABLE IF NOT EXISTS workspace_proposals (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    tags TEXT,
+    status TEXT NOT NULL DEFAULT 'raw',
+    promoted_to_sprint_item_id TEXT,
+    tenant_id TEXT,
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS})
+);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -2660,6 +2679,32 @@ async def _migrate_pg_mcp_rate_counters(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_workspace_proposals(conn: PostgresConnection) -> None:
+    """5c4dcc0f — workspace_proposals: human-only "drawer of inspiration".
+
+    Workspace-scoped (tenant_id, not project_id) table for cross-project flashes
+    of insight. status: raw → investigating → promoted | rejected.
+    promoted_to_sprint_item_id links a promoted proposal to its sprint item.
+    NOT auto-claimable by executors. CREATE_TABLES_CORE covers fresh DBs; this
+    is the upgrade path. Mirrors db._migrate_workspace_proposals.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS workspace_proposals ("
+        "    id TEXT PRIMARY KEY,"
+        "    title TEXT NOT NULL,"
+        "    body TEXT NOT NULL,"
+        "    tags TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'raw',"
+        "    promoted_to_sprint_item_id TEXT,"
+        "    tenant_id TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_tenant "
+        "ON workspace_proposals(tenant_id)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2721,4 +2766,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_wave,
     _migrate_pg_sprint_item_dependency,
     _migrate_pg_mcp_rate_counters,
+    _migrate_pg_workspace_proposals,
 )

@@ -2363,7 +2363,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, update_paragraph, find_symbol_usages, index_figure, find_similar_figure, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, update_paragraph, find_symbol_usages, index_figure, find_similar_figure, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item, add_workspace_proposal, get_workspace_proposals, advance_proposal_status, promote_proposal."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -3194,6 +3194,43 @@ async def _handle_notes_decisions(
             db, args["item_id"], tenant_id=_mcp_tenant_id,
         )
         return item or {"error": "workspace sprint item not found"}
+    # 5c4dcc0f — workspace proposals lifecycle
+    if name == "add_workspace_proposal":
+        validate_input_size(args.get("title"), "proposal title", 500)
+        validate_input_size(args.get("body"), "proposal body", 100_000)
+        return await db_module.add_workspace_proposal(
+            db, args["title"], args["body"],
+            tags=args.get("tags"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "get_workspace_proposals":
+        return await db_module.get_workspace_proposals(
+            db, status=args.get("status"), tag=args.get("tag"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "advance_proposal_status":
+        try:
+            result = await db_module.advance_workspace_proposal_status(
+                db, args["proposal_id"], args["status"],
+                tenant_id=_mcp_tenant_id,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return result or {"error": "proposal not found"}
+    if name == "promote_proposal":
+        _promo_project_id = args.get("project_id") or ""
+        if not _promo_project_id:
+            return {"error": "project_id (or project_name) is required for promote_proposal"}
+        try:
+            result = await db_module.promote_workspace_proposal(
+                db, args["proposal_id"], _promo_project_id,
+                sprint_item_title=args.get("sprint_item_title"),
+                sprint_item_version=args.get("sprint_item_version"),
+                tenant_id=_mcp_tenant_id,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return result
     return _MISS
 
 

@@ -54,6 +54,10 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
     "get_workspace_notes": 'get_workspace_notes(tag="setup")',
+    "add_workspace_proposal": 'add_workspace_proposal(title="IDEA: expose auth as plugin", body="Could ship auth as a separate optional plugin so self-hosters can swap it out", tags="arch")',
+    "get_workspace_proposals": 'get_workspace_proposals(status="investigating")',
+    "advance_proposal_status": 'advance_proposal_status(proposal_id="prop-uuid", status="investigating")',
+    "promote_proposal": 'promote_proposal(proposal_id="prop-uuid", project_id="proj-uuid", sprint_item_title="Expose auth as plugin")',
     "pin_workspace_decision": 'pin_workspace_decision(title="Monorepo", body="One repo for all services", category="ARCHITECTURAL")',
     "get_workspace_decisions": 'get_workspace_decisions()',
     "get_workspace_settings": 'get_workspace_settings()',
@@ -930,6 +934,50 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "item_id": {"type": "string"}},
          "required": ["item_id"]}},
+    {"name": "add_workspace_proposal", "description":
+        "Capture a workspace-level flash of insight into the 'drawer of inspiration' — "
+        "cross-project ideas that don't belong to any one project yet. Unlike sprint items "
+        "these are NOT executor-claimable; they require a human to review and promote them. "
+        "Proposals start at status='raw' and progress through an enforced lifecycle: "
+        "raw → investigating → promoted|rejected. Use advance_proposal_status to move "
+        "through the lifecycle; use promote_proposal to convert one into a real sprint item.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Short idea title."},
+         "body": {"type": "string", "description": "Full description of the insight or idea."},
+         "tags": {"type": "string", "description": "Optional comma-separated tags."}},
+         "required": ["title", "body"]}},
+    {"name": "get_workspace_proposals", "description":
+        "Read-only: List workspace proposals (human-authored flashes of insight), newest first. "
+        "Optional status filter (raw/investigating/promoted/rejected) and tag substring filter.",
+     "inputSchema": {"type": "object", "properties": {
+         "status": {"type": "string", "enum": ["raw", "investigating", "promoted", "rejected"],
+                    "description": "Filter to proposals in this status."},
+         "tag": {"type": "string", "description": "Substring filter on tags."}},
+         "required": []}},
+    {"name": "advance_proposal_status", "description":
+        "Transition a workspace proposal through its lifecycle. Enforced transitions: "
+        "raw → investigating|rejected; investigating → promoted|rejected|raw; "
+        "rejected → raw. 'promoted' is a terminal status reachable only via "
+        "promote_proposal (which also creates the sprint item). "
+        "Returns the updated proposal.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string"},
+         "status": {"type": "string", "enum": ["raw", "investigating", "rejected"],
+                    "description": "Target status. 'promoted' is not allowed here — use promote_proposal instead."}},
+         "required": ["proposal_id", "status"]}},
+    {"name": "promote_proposal", "description":
+        "Promote a workspace proposal into a real sprint item, creating the link between them. "
+        "The proposal must be in 'raw' or 'investigating' state. Creates a sprint item under "
+        "the given project and sets the proposal's status to 'promoted' with "
+        "promoted_to_sprint_item_id pointing to the new item. "
+        "Returns {proposal, sprint_item_id, sprint_item_title, project_id}.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string"},
+         "project_id": {"type": "string", "description": "Project to create the sprint item under."},
+         "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
+         "sprint_item_title": {"type": "string", "description": "Override title for the sprint item; defaults to the proposal title."},
+         "sprint_item_version": {"type": "string", "description": "Sprint version for the new item; defaults to 'current'."}},
+         "required": ["proposal_id"]}},
     {"name": "get_session_brief", "description":
         "Read-only: Call this FIRST for project summaries or to see what a session did — "
         "returns session, tasks, decisions, and recent commits in one call. "
@@ -1584,6 +1632,10 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "pin_workspace_decision": "Pin Workspace Decision",
     "get_workspace_notes": "Get Workspace Notes",
     "add_workspace_note": "Add Workspace Note",
+    "get_workspace_proposals": "Get Workspace Proposals",
+    "add_workspace_proposal": "Add Workspace Proposal",
+    "advance_proposal_status": "Advance Proposal Status",
+    "promote_proposal": "Promote Proposal to Sprint Item",
     "get_workspace_settings": "Get Workspace Settings",
     "update_workspace_settings": "Update Workspace Settings",
     "save_blog_post": "Save Blog Post",

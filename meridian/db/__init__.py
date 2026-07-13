@@ -778,6 +778,27 @@ CREATE TABLE IF NOT EXISTS mcp_rate_counters (
     count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, window_start)
 );
+
+-- 5c4dcc0f — workspace_proposals: human-only "drawer of inspiration" for
+-- cross-project flashes of insight. Workspace-scoped (tenant_id, not
+-- project_id). Distinct from workspace_notes (no lifecycle) and sprint items
+-- (executor-claimable). status enum: raw → investigating → promoted|rejected.
+-- promoted_to_sprint_item_id links a promoted proposal to the sprint item it
+-- became. NOT auto-claimable by executors — human-reviewed promotion gate only.
+-- idx_workspace_proposals_tenant is created by _migrate_workspace_proposals
+-- (guarded migration), never inline here (2026-07-04 inline-index outage rule).
+CREATE TABLE IF NOT EXISTS workspace_proposals (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    tags TEXT,
+    status TEXT NOT NULL DEFAULT 'raw'
+        CHECK (status IN ('raw', 'investigating', 'promoted', 'rejected')),
+    promoted_to_sprint_item_id TEXT,
+    tenant_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -969,6 +990,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_priority_blocker(db)
     await _migrate_sprint_item_wave(db)
     await _migrate_mcp_rate_counters(db)
+    await _migrate_workspace_proposals(db)
     return db
 
 
@@ -10971,6 +10993,205 @@ async def delete_workspace_decision(
     scope, scope_params = _ws_tenant_clause(tenant_id)
     sql = "DELETE FROM workspace_decisions WHERE id = ?" + (f" AND {scope}" if scope else "")
     async with db.execute(sql, [decision_id, *scope_params]) as cur:
+        rc = cur.rowcount or 0
+    await db.commit()
+    return rc > 0
+
+
+# --- Workspace proposals (human-only "drawer of inspiration") ---------------
+# 5c4dcc0f — workspace-scoped (tenant_id) flash-of-insight capture. Distinct
+# from workspace_notes (no lifecycle) and sprint_items (executor-claimable).
+# status machine: raw → investigating → promoted | rejected.
+
+_VALID_PROPOSAL_STATUSES = {"raw", "investigating", "promoted", "rejected"}
+_PROPOSAL_TRANSITIONS: dict[str, set[str]] = {
+    "raw": {"investigating", "rejected"},
+    "investigating": {"promoted", "rejected", "raw"},
+    "promoted": set(),   # terminal — use promote_workspace_proposal instead
+    "rejected": {"raw"},  # allow un-reject back to raw
+}
+
+
+async def add_workspace_proposal(
+    db: aiosqlite.Connection,
+    title: str,
+    body: str,
+    tags: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Insert a workspace_proposals row with status='raw'.
+
+    Workspace-scoped by ``tenant_id`` (like ``add_workspace_note``). These are
+    human-authored flashes of insight — NOT auto-claimable by executors."""
+    pid = _new_id()
+    await db.execute(
+        "INSERT INTO workspace_proposals (id, title, body, tags, tenant_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (pid, title, body, tags, tenant_id),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM workspace_proposals WHERE id = ?", (pid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {"id": pid}
+
+
+async def get_workspace_proposals(
+    db: aiosqlite.Connection,
+    status: str | None = None,
+    tag: str | None = None,
+    tenant_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return workspace proposals, newest first.
+
+    Optional filters: ``status`` (raw/investigating/promoted/rejected) and
+    ``tag`` (substring match). Scoped to ``tenant_id`` when provided."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if tag:
+        clauses.append("tags LIKE ?")
+        params.append(f"%{tag}%")
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    if scope:
+        clauses.append(scope)
+        params.extend(scope_params)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db.execute(
+        f"SELECT * FROM workspace_proposals{where} ORDER BY created_at DESC",
+        params or None,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def advance_workspace_proposal_status(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    new_status: str,
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Transition a proposal to ``new_status`` following the enforced state machine.
+
+    Allowed transitions::
+
+        raw         → investigating | rejected
+        investigating → promoted | rejected | raw
+        promoted    → (terminal — use promote_workspace_proposal)
+        rejected    → raw
+
+    Returns the updated row, or None if not found / wrong tenant.
+    Raises ``ValueError`` on an invalid or disallowed transition."""
+    if new_status not in _VALID_PROPOSAL_STATUSES:
+        raise ValueError(
+            f"Invalid proposal status '{new_status}'. "
+            f"Valid: {sorted(_VALID_PROPOSAL_STATUSES)}"
+        )
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    scope_sql = f" AND {scope}" if scope else ""
+    async with db.execute(
+        f"SELECT * FROM workspace_proposals WHERE id = ?{scope_sql}",
+        [proposal_id, *scope_params],
+    ) as cur:
+        row = await cur.fetchone()
+    proposal = _row_to_dict(row) if row is not None else None
+    if not proposal:
+        return None
+    current = proposal["status"]
+    allowed = _PROPOSAL_TRANSITIONS.get(current, set())
+    if new_status not in allowed:
+        raise ValueError(
+            f"Cannot transition proposal from '{current}' to '{new_status}'. "
+            f"Allowed from '{current}': {sorted(allowed) or '(none)'}"
+        )
+    await db.execute(
+        f"UPDATE workspace_proposals SET status = ?, updated_at = datetime('now') WHERE id = ?{scope_sql}",
+        [new_status, proposal_id, *scope_params],
+    )
+    await db.commit()
+    async with db.execute(
+        f"SELECT * FROM workspace_proposals WHERE id = ?{scope_sql}",
+        [proposal_id, *scope_params],
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def promote_workspace_proposal(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    project_id: str,
+    sprint_item_title: str | None = None,
+    sprint_item_version: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Promote a proposal to a real sprint item and link the two.
+
+    Creates a sprint item under ``project_id`` (using the proposal's title by
+    default, overrideable via ``sprint_item_title``). Sets the proposal's
+    status to 'promoted' and records ``promoted_to_sprint_item_id``.
+
+    Raises ``ValueError`` if the proposal is not found, wrong tenant, or is
+    not in 'raw' or 'investigating' state (cannot promote rejected/promoted)."""
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    scope_sql = f" AND {scope}" if scope else ""
+    async with db.execute(
+        f"SELECT * FROM workspace_proposals WHERE id = ?{scope_sql}",
+        [proposal_id, *scope_params],
+    ) as cur:
+        row = await cur.fetchone()
+    proposal = _row_to_dict(row) if row is not None else None
+    if not proposal:
+        raise ValueError(f"Proposal '{proposal_id}' not found")
+    current = proposal["status"]
+    if current not in ("raw", "investigating"):
+        raise ValueError(
+            f"Cannot promote a proposal in status '{current}'. "
+            "Only 'raw' or 'investigating' proposals can be promoted."
+        )
+    # Verify the target project exists.
+    if await get_project(db, project_id) is None:
+        raise ValueError(f"Project '{project_id}' not found")
+    title = sprint_item_title or proposal["title"]
+    version = sprint_item_version or "current"
+    # Create the sprint item (bare-bones; caller can update it further).
+    si_id = _new_id()
+    await db.execute(
+        "INSERT INTO sprint_items (id, project_id, version, title, status) "
+        "VALUES (?, ?, ?, ?, 'pending')",
+        (si_id, project_id, version, title),
+    )
+    # Mark the proposal promoted.
+    await db.execute(
+        f"UPDATE workspace_proposals "
+        f"SET status = 'promoted', promoted_to_sprint_item_id = ?, updated_at = datetime('now') "
+        f"WHERE id = ?{scope_sql}",
+        [si_id, proposal_id, *scope_params],
+    )
+    await db.commit()
+    async with db.execute(
+        f"SELECT * FROM workspace_proposals WHERE id = ?{scope_sql}",
+        [proposal_id, *scope_params],
+    ) as cur:
+        row = await cur.fetchone()
+    return {
+        "proposal": _row_to_dict(row),
+        "sprint_item_id": si_id,
+        "sprint_item_title": title,
+        "project_id": project_id,
+    }
+
+
+async def delete_workspace_proposal(
+    db: aiosqlite.Connection, proposal_id: str, tenant_id: str | None = None
+) -> bool:
+    """Hard-delete a workspace proposal. Returns True if a row was removed."""
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    sql = "DELETE FROM workspace_proposals WHERE id = ?" + (f" AND {scope}" if scope else "")
+    async with db.execute(sql, [proposal_id, *scope_params]) as cur:
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
