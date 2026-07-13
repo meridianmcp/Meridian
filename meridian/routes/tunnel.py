@@ -2940,6 +2940,101 @@ async def _enrich_code_intel_project_error(
     return hint
 
 
+# caf95f81 — get_code_snippet truncation detection.
+#
+# The external codebase-memory-mcp server returns start_line/end_line in its
+# get_code_snippet response, but silently truncates the source text when a function
+# is very long (confirmed bug: a 114-line function returned ~40 lines short with
+# NO indicator).  Meridian cannot patch the plugin directly — same class of
+# limitation as 19b3259e / 7ef712a8.  Instead, after a successful get_code_snippet
+# call, we inspect the result, compute the expected line count from the declared
+# range, count the actual lines in the source text, and attach a clear
+# ``truncation_warning`` key when the snippet is meaningfully short.
+#
+# The source text lives inside the MCP content-block envelope:
+#   result["content"][0]["text"] → JSON string → {start_line, end_line, source/code/snippet}
+# We probe multiple plausible source-field names in priority order.  Fail-open:
+# any missing / malformed / unexpected field silently skips enrichment — the
+# caller still gets the (possibly truncated) result unchanged.
+
+# Candidate field names for the source text, in probe order.
+_CODE_SNIPPET_SOURCE_FIELDS = ("source", "code", "snippet", "content", "text")
+
+# Slack for trailing-newline edge cases.  A snippet that is only 1 line short
+# may simply lack a terminal newline; we only warn when genuinely short by more
+# than this many lines.
+_TRUNCATION_SLACK = 2
+
+
+def _check_code_snippet_truncation(result: Any) -> Any:
+    """caf95f81 — attach a truncation_warning to a get_code_snippet result when
+    the returned source text is meaningfully shorter than the declared line range.
+
+    The result is the MCP ``tools/call`` result object (``{"content": [...]}``)
+    returned by ``call_tunnel_tool``.  The warning is added as a top-level
+    ``truncation_warning`` key so callers can detect it without re-parsing the
+    content blocks.  Returns the result unchanged (no copy) if no truncation is
+    detected — including all fail-open cases (missing fields, wrong types,
+    parse errors, zero-length range).  Never raises.
+    """
+    try:
+        if not isinstance(result, dict):
+            return result
+        content = result.get("content")
+        if not isinstance(content, list) or not content:
+            return result
+        # Probe the first text block for the JSON payload.
+        payload: Any = None
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            raw_text = block.get("text") or ""
+            if not raw_text:
+                continue
+            try:
+                payload = json.loads(raw_text)
+            except Exception:  # noqa: BLE001 — non-JSON text block: skip
+                continue
+            break  # use the first parseable text block
+        if not isinstance(payload, dict):
+            return result
+        # Extract start_line / end_line from the JSON payload.
+        start_line = payload.get("start_line")
+        end_line = payload.get("end_line")
+        if not isinstance(start_line, int) or not isinstance(end_line, int):
+            return result
+        expected_lines = end_line - start_line + 1
+        if expected_lines <= 0:
+            return result  # degenerate range — skip
+        # Probe the source text field.
+        source_text: str | None = None
+        for field in _CODE_SNIPPET_SOURCE_FIELDS:
+            candidate = payload.get(field)
+            if isinstance(candidate, str):
+                source_text = candidate
+                break
+        if source_text is None:
+            return result
+        # Count lines in the source text.  splitlines() handles \r\n and \r
+        # correctly.  An empty string → 0 lines.
+        actual_lines = len(source_text.splitlines())
+        if (expected_lines - actual_lines) > _TRUNCATION_SLACK:
+            result = dict(result)  # shallow copy — don't mutate the original
+            result["truncation_warning"] = (
+                f"get_code_snippet returned a truncated snippet: expected "
+                f"{expected_lines} lines (start_line={start_line}, "
+                f"end_line={end_line}) but the source field contains only "
+                f"{actual_lines} lines. The tail of the function/block is "
+                f"missing. Re-fetch the missing portion via a direct file read "
+                f"(e.g. filesystem__read_file with offset={start_line + actual_lines - 1} "
+                f"limit={expected_lines - actual_lines + _TRUNCATION_SLACK}) to "
+                f"get the complete source."
+            )
+    except Exception:  # noqa: BLE001 — enrichment must never mask the real result
+        pass
+    return result
+
+
 async def call_tunnel_tool(
     tenant_id: str, name: str, arguments: dict | None,
     repo_path: str | None = None,
@@ -3034,7 +3129,15 @@ async def call_tunnel_tool(
             except Exception:  # noqa: BLE001 — surface the original error regardless
                 pass
         raise RuntimeError(_msg)
-    return resp.get("result")
+    result = resp.get("result")
+    # caf95f81 — detect silent truncation in get_code_snippet responses from the
+    # code slot.  When the declared line range (start_line/end_line) is
+    # meaningfully larger than the actual source line count, attach a
+    # truncation_warning key so the caller knows to re-fetch the missing tail.
+    # Pure enrichment — never mutates the original result, never raises.
+    if label == "code" and bare_name == "get_code_snippet":
+        result = _check_code_snippet_truncation(result)
+    return result
 
 
 def _extract_graph_matches(result: Any) -> Any:
