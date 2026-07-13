@@ -2782,6 +2782,25 @@ async def touch_latest_active_session(
 # HITL, no human ping) so the orchestrator just moves on.
 _MAX_SPRINT_STALL_RETRIES = 2
 
+# 890046a2 — time-based stall detection threshold for analyze_sprint.
+#
+# The persisted stall_count is only incremented when a session is explicitly
+# archived/closed with items still claimed.  Items abandoned by a chat window
+# that was simply closed — the common real-world case — never get their
+# stall_count bumped, regardless of how many days pass.
+#
+# This constant guards a second, time-based detection path: any item still
+# in_progress (or claimed) after this many hours is surfaced as a stall even
+# when stall_count == 0.
+#
+# The threshold is intentionally LONGER than the 2-hour auto-release window
+# used by release_stale_task_claims / _FILE_LOCK_TTL_HOURS.  Those mechanisms
+# are defensive (prevent orphaned locks); this one surfaces to a human planner
+# who should see truly long-running items, not routine in-flight work.  A
+# sprint item sitting in_progress for 4+ hours without progress almost
+# certainly represents an abandoned session, not an active worker.
+_SPRINT_STALL_FLAG_HOURS = 4
+
 
 async def _session_stall_summary(
     db: aiosqlite.Connection, session_id: str, *, limit: int = 5
@@ -8556,11 +8575,42 @@ async def analyze_sprint(
         for res, ids in sorted(res_map.items()) if len(ids) > 1
     ]
 
-    stalls = [
-        {"id": it["id"], "title": it.get("title", ""),
-         "stall_count": it.get("stall_count") or 0}
-        for it in open_items if (it.get("stall_count") or 0) > 0
-    ]
+    # 890046a2 — two-path stall detection:
+    #   "counter" — stall_count > 0 (incremented on explicit session close)
+    #   "time"    — claimed_at older than _SPRINT_STALL_FLAG_HOURS, even when
+    #               stall_count == 0 (catches abandoned sessions never cleanly
+    #               closed, which is the common real-world failure mode)
+    #   "both"    — both conditions are true simultaneously
+    from datetime import datetime, timezone, timedelta
+    _stall_cutoff = datetime.now(timezone.utc) - timedelta(hours=_SPRINT_STALL_FLAG_HOURS)
+
+    def _is_time_stalled(item: dict[str, Any]) -> bool:
+        raw = item.get("claimed_at")
+        if not raw:
+            return False
+        try:
+            # SQLite stores as "YYYY-MM-DD HH:MM:SS" (no TZ); treat as UTC.
+            ca = datetime.fromisoformat(str(raw).replace(" ", "T"))
+            if ca.tzinfo is None:
+                ca = ca.replace(tzinfo=timezone.utc)
+            return ca < _stall_cutoff
+        except (ValueError, TypeError):
+            return False
+
+    stalls: list[dict[str, Any]] = []
+    for it in open_items:
+        sc = (it.get("stall_count") or 0) > 0
+        st = _is_time_stalled(it)
+        if not sc and not st:
+            continue
+        reason = "both" if (sc and st) else ("counter" if sc else "time")
+        stalls.append({
+            "id": it["id"],
+            "title": it.get("title", ""),
+            "stall_count": it.get("stall_count") or 0,
+            "claimed_at": it.get("claimed_at"),
+            "reason": reason,
+        })
 
     groups = groups_info.get("groups", [])
     max_group = max((len(g) for g in groups), default=0)
