@@ -15377,6 +15377,186 @@ async def test_reconcile_sprint_drift_unknown_project(db):
         )
 
 
+# 8eea5a9a — notes-blocker-drift detection tests
+
+def test_detect_notes_blocker_drift_flagged_keyword():
+    """(a) A pending item with 'FLAGGED — deferred...' in notes and no
+    blocker_kind/deferred_until IS caught by the check."""
+    from meridian.mcp.handler import _detect_notes_blocker_drift
+
+    items = [
+        {
+            "id": "item-001",
+            "title": "Fix the widget render bug",
+            "status": "pending",
+            "blocker_kind": None,
+            "deferred_until": None,
+            "notes": "FLAGGED — deferred until the renderer is rewritten.",
+        }
+    ]
+    findings = _detect_notes_blocker_drift(items)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f["item_id"] == "item-001"
+    assert f["matched_keyword"] == "flagged"
+    assert "blocker_kind" in f["warning"]
+    assert "deferred_until" in f["warning"]
+
+
+def test_detect_notes_blocker_drift_resolved_by_blocker_kind():
+    """(b) Once blocker_kind IS set the item is NOT flagged."""
+    from meridian.mcp.handler import _detect_notes_blocker_drift
+
+    items = [
+        {
+            "id": "item-002",
+            "title": "Fix the widget render bug",
+            "status": "pending",
+            "blocker_kind": "manual",
+            "deferred_until": None,
+            "notes": "FLAGGED — deferred until the renderer is rewritten.",
+        }
+    ]
+    findings = _detect_notes_blocker_drift(items)
+    assert findings == []
+
+
+def test_detect_notes_blocker_drift_resolved_by_deferred_until():
+    """(b-alt) Once deferred_until IS set the item is NOT flagged."""
+    from meridian.mcp.handler import _detect_notes_blocker_drift
+
+    items = [
+        {
+            "id": "item-003",
+            "title": "Fix the widget render bug",
+            "status": "pending",
+            "blocker_kind": None,
+            "deferred_until": "2026-09-01T00:00:00",
+            "notes": "DEFERRED — waiting for upstream dependency.",
+        }
+    ]
+    findings = _detect_notes_blocker_drift(items)
+    assert findings == []
+
+
+def test_detect_notes_blocker_drift_no_false_positive_ordinary_notes():
+    """(c) A pending item with ordinary, unrelated notes is NOT flagged."""
+    from meridian.mcp.handler import _detect_notes_blocker_drift
+
+    items = [
+        {
+            "id": "item-004",
+            "title": "Add CSV export feature",
+            "status": "pending",
+            "blocker_kind": None,
+            "deferred_until": None,
+            "notes": "This feature requires adding a new endpoint. See design doc.",
+        }
+    ]
+    findings = _detect_notes_blocker_drift(items)
+    assert findings == []
+
+
+def test_detect_notes_blocker_drift_human_id_alone_not_a_signal():
+    """(d) 943afe1e non-regression: human_id set but no deferral language in
+    notes and no structured signal must NOT be flagged."""
+    from meridian.mcp.handler import _detect_notes_blocker_drift
+
+    items = [
+        {
+            "id": "item-005",
+            "title": "Write onboarding docs",
+            "status": "pending",
+            "blocker_kind": None,
+            "deferred_until": None,
+            "human_id": "alice@example.com",
+            "notes": "Assigned to Alice for the next sprint cycle.",
+        }
+    ]
+    findings = _detect_notes_blocker_drift(items)
+    assert findings == []
+
+
+def test_detect_notes_blocker_drift_multiple_keywords():
+    """Multiple items: only the ones with deferral-language and unset fields fire."""
+    from meridian.mcp.handler import _detect_notes_blocker_drift
+
+    items = [
+        {
+            "id": "item-006",
+            "title": "Ordinary work",
+            "status": "pending",
+            "blocker_kind": None,
+            "deferred_until": None,
+            "notes": "Just a normal task.",
+        },
+        {
+            "id": "item-007",
+            "title": "Blocked task",
+            "status": "pending",
+            "blocker_kind": None,
+            "deferred_until": None,
+            "notes": "BLOCKED on infra provisioning — not fixable here.",
+        },
+        {
+            "id": "item-008",
+            "title": "Already tagged",
+            "status": "pending",
+            "blocker_kind": "manual",
+            "deferred_until": None,
+            "notes": "BLOCKED on infra — already tagged.",
+        },
+    ]
+    findings = _detect_notes_blocker_drift(items)
+    assert len(findings) == 1
+    assert findings[0]["item_id"] == "item-007"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_sprint_drift_includes_notes_blocker_drift(db):
+    """reconcile_sprint_drift response includes notes_blocker_drift list and count."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "drift-notes-test")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the widget render bug")
+    # Patch in deferral-language notes without setting blocker_kind/deferred_until
+    await db_module.patch_sprint_item(
+        db, p["id"], item["id"],
+        notes="FLAGGED — deferred until the renderer is rewritten.",
+    )
+
+    res = await srv._dispatch_mcp_tool(
+        "reconcile_sprint_drift", {"project_id": p["id"]}, db, "/tmp"
+    )
+    assert "notes_blocker_drift" in res
+    assert "notes_blocker_drift_count" in res
+    assert res["notes_blocker_drift_count"] == 1
+    drift = res["notes_blocker_drift"][0]
+    assert drift["item_id"] == item["id"]
+    assert drift["matched_keyword"] == "flagged"
+    assert "blocker_kind" in drift["warning"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_sprint_drift_notes_drift_cleared_after_blocker_kind_set(db):
+    """Once blocker_kind is set, notes_blocker_drift_count drops to zero."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "drift-notes-clear")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the widget render bug")
+    await db_module.patch_sprint_item(
+        db, p["id"], item["id"],
+        notes="FLAGGED — deferred until the renderer is rewritten.",
+        blocker_kind="manual",
+    )
+
+    res = await srv._dispatch_mcp_tool(
+        "reconcile_sprint_drift", {"project_id": p["id"]}, db, "/tmp"
+    )
+    assert res["notes_blocker_drift_count"] == 0
+    assert res["notes_blocker_drift"] == []
+
+
 @pytest.mark.asyncio
 async def test_get_planning_brief_returns_structure(db):
     """get_planning_brief returns all expected keys."""
@@ -17166,3 +17346,76 @@ async def test_workspace_proposal_schema_has_required_columns(db):
     assert "tenant_id" in cols
     assert "created_at" in cols
     assert "updated_at" in cols
+
+
+# ---------------------------------------------------------------------------
+# 605ca2c4 — assign_sprint_waves active session warning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_warns_when_session_active(db):
+    """assign_sprint_waves returns active_session_warning when an executor session is live."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "waves-active-warn")
+    pid = p["id"]
+    # Create a sprint item so assign_sprint_waves has something to label.
+    await db_module.add_sprint_item(db, pid, "v1", "item-for-wave-warn", touches_resources=["file:foo.py"])
+    # Register an active executor session — this is what triggers the warning.
+    await db_module.register_session(db, pid, "mid-flight-executor")
+
+    res = await srv._dispatch_mcp_tool(
+        "assign_sprint_waves", {"project_id": pid}, db, "/tmp"
+    )
+    assert "active_session_warning" in res, "Expected warning key missing from response"
+    warning = res["active_session_warning"]
+    assert "WARNING" in warning
+    assert "mid-flight-executor" in warning
+    # Consequence clause must be specific to wave-relabeling, not add_sprint_item wording.
+    assert "wave" in warning.lower(), "Warning should mention wave relabeling"
+    assert "desync" in warning.lower() or "re-label" in warning.lower(), (
+        "Warning should describe the desync/re-label consequence"
+    )
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_no_warning_when_no_sessions(db):
+    """assign_sprint_waves does NOT include active_session_warning when no sessions are active."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "waves-no-warn")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "item-for-wave-no-warn", touches_resources=["file:bar.py"])
+
+    res = await srv._dispatch_mcp_tool(
+        "assign_sprint_waves", {"project_id": pid}, db, "/tmp"
+    )
+    assert "active_session_warning" not in res, (
+        "No active sessions exist — warning must not appear (false positive)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_warning_text_is_wave_specific(db):
+    """The active_session_warning text is specific to wave relabeling, not a copy of add_sprint_item's."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "waves-warn-specific")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "task-a", touches_resources=["file:a.py"])
+    await db_module.register_session(db, pid, "running-executor")
+
+    res = await srv._dispatch_mcp_tool(
+        "assign_sprint_waves", {"project_id": pid}, db, "/tmp"
+    )
+    assert "active_session_warning" in res
+    warning = res["active_session_warning"]
+    # Must NOT use the generic add_sprint_item consequence clause verbatim.
+    assert "may not be picked up until next session start" not in warning, (
+        "Warning text must be specific to assign_sprint_waves, not a copy of add_sprint_item's clause"
+    )
+    # Must mention the wave/goal desync consequence specific to this tool.
+    assert "/goal" in warning or "wave" in warning.lower(), (
+        "Warning must mention the /goal or wave-label desync specific to assign_sprint_waves"
+    )

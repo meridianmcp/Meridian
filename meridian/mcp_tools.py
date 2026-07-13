@@ -1284,6 +1284,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Read-only: Cross-reference pending sprint items against recent git commits and "
         "return items that may already be done. Uses keyword matching — confidence 'high' "
         "means 3+ keywords overlap (safe to mark done), 'medium' means 1-2 (verify first). "
+        "Also surfaces 'notes_blocker_drift': pending items whose notes describe a deferral "
+        "or blocker (keywords: FLAGGED, DEFERRED, BLOCKED, 'not implementable', etc.) but "
+        "whose structured fields (blocker_kind, deferred_until) are both unset — these items "
+        "will keep surfacing as ordinary claimable work until you call update_sprint_item "
+        "with blocker_kind='manual' or deferred_until=<ISO timestamp>. "
         "Call during planning sessions to identify board drift before filing new items.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
@@ -1345,7 +1350,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "left untouched (re-run once they clear). Idempotent — recomputes from the live "
         "board each call. Hand-override any item afterwards with update_sprint_item(wave=...). "
         "Returns {version, wave_count, assigned, waves: {'wave-1': [ids...], ...}, "
-        "blocked_count, undeclared_count}.",
+        "blocked_count, undeclared_count}. 605ca2c4 — if active executor sessions are "
+        "detected, the response also includes active_session_warning: re-labeling wave "
+        "numbers while a session is mid-flight can desync it from a /goal string that "
+        "already references specific wave labels.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "Optional: only assign waves to items in this sprint-version bucket."}},

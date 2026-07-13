@@ -2782,6 +2782,25 @@ async def touch_latest_active_session(
 # HITL, no human ping) so the orchestrator just moves on.
 _MAX_SPRINT_STALL_RETRIES = 2
 
+# 890046a2 — time-based stall detection threshold for analyze_sprint.
+#
+# The persisted stall_count is only incremented when a session is explicitly
+# archived/closed with items still claimed.  Items abandoned by a chat window
+# that was simply closed — the common real-world case — never get their
+# stall_count bumped, regardless of how many days pass.
+#
+# This constant guards a second, time-based detection path: any item still
+# in_progress (or claimed) after this many hours is surfaced as a stall even
+# when stall_count == 0.
+#
+# The threshold is intentionally LONGER than the 2-hour auto-release window
+# used by release_stale_task_claims / _FILE_LOCK_TTL_HOURS.  Those mechanisms
+# are defensive (prevent orphaned locks); this one surfaces to a human planner
+# who should see truly long-running items, not routine in-flight work.  A
+# sprint item sitting in_progress for 4+ hours without progress almost
+# certainly represents an abandoned session, not an active worker.
+_SPRINT_STALL_FLAG_HOURS = 4
+
 
 async def _session_stall_summary(
     db: aiosqlite.Connection, session_id: str, *, limit: int = 5
@@ -8294,6 +8313,34 @@ async def get_resource_conflicts(
     return conflicts
 
 
+def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
+    """5a85a78f — True for items only a human can carry out; mirrors the EXACT
+    semantics of ``handoff._is_manual_sprint_item`` (943afe1e).
+
+    These items must be excluded from executor-facing eligible/parallel lists
+    (``get_parallelizable_groups``, ``analyze_sprint``) — an AI cannot do them as
+    intended and may fake-complete them under completion pressure.
+
+    Three signals (any one is sufficient):
+    * ``blocker_kind == 'manual'`` — blocked on a real-world action outside Meridian,
+    * ``milestone_type == 'human'`` — execution is intentionally human-only,
+    * a ``MANUAL``-tagged title (case-insensitive leading ``MANUAL``).
+
+    943afe1e — does NOT key on ``human_id`` alone. ``human_id`` records *who* an
+    item is assigned to, not *whether* it requires human execution. A BUG:/FIX:/FEAT:
+    item assigned to a maintainer via ``human_id`` is still executor-claimable.
+
+    NOTE: This helper MUST be kept in sync with ``meridian.handoff._is_manual_sprint_item``
+    (db/__init__.py is imported BY handoff.py, so we cannot import handoff here
+    without a circular import — hence the deliberate duplication).
+    """
+    if not isinstance(item, dict):
+        return False
+    if item.get("blocker_kind") == "manual" or item.get("milestone_type") == "human":
+        return True
+    return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
+
+
 async def get_parallelizable_groups(
     db: aiosqlite.Connection,
     project_id: str,
@@ -8321,12 +8368,19 @@ async def get_parallelizable_groups(
     2282a636 — items with ``blocker_kind='manual'`` (blocked on a real-world
     action outside Meridian) are excluded here: they are not executor-claimable,
     so they never join a parallel batch.
+    5a85a78f — items matching :func:`_is_manual_sprint_item` (blocker_kind='manual',
+    milestone_type='human', or MANUAL-tagged title) are also excluded: milestone_type
+    was previously passed through because ``get_sprint_items`` only gates on
+    ``include_manual_blocker``, not on ``milestone_type='human'`` or title prefix.
     e08fee30 — within the safe-parallel ordering, higher-priority eligible items
     are placed first so urgent work colors into the earliest groups.
     """
     # include_manual_blocker=False: a manual-blocker item is not claimable work,
     # so it must not be offered as a parallelizable batch member.
     items = await get_sprint_items(db, project_id, include_manual_blocker=False)
+    # 5a85a78f — also filter out milestone_type='human' and MANUAL-titled items;
+    # get_sprint_items only gates on blocker_kind, not the other two manual signals.
+    items = [it for it in items if not _is_manual_sprint_item(it)]
     if version is not None:
         items = [it for it in items if it.get("version") == version]
     claimable_statuses = {"pending", "todo"}
@@ -8521,11 +8575,42 @@ async def analyze_sprint(
         for res, ids in sorted(res_map.items()) if len(ids) > 1
     ]
 
-    stalls = [
-        {"id": it["id"], "title": it.get("title", ""),
-         "stall_count": it.get("stall_count") or 0}
-        for it in open_items if (it.get("stall_count") or 0) > 0
-    ]
+    # 890046a2 — two-path stall detection:
+    #   "counter" — stall_count > 0 (incremented on explicit session close)
+    #   "time"    — claimed_at older than _SPRINT_STALL_FLAG_HOURS, even when
+    #               stall_count == 0 (catches abandoned sessions never cleanly
+    #               closed, which is the common real-world failure mode)
+    #   "both"    — both conditions are true simultaneously
+    from datetime import datetime, timezone, timedelta
+    _stall_cutoff = datetime.now(timezone.utc) - timedelta(hours=_SPRINT_STALL_FLAG_HOURS)
+
+    def _is_time_stalled(item: dict[str, Any]) -> bool:
+        raw = item.get("claimed_at")
+        if not raw:
+            return False
+        try:
+            # SQLite stores as "YYYY-MM-DD HH:MM:SS" (no TZ); treat as UTC.
+            ca = datetime.fromisoformat(str(raw).replace(" ", "T"))
+            if ca.tzinfo is None:
+                ca = ca.replace(tzinfo=timezone.utc)
+            return ca < _stall_cutoff
+        except (ValueError, TypeError):
+            return False
+
+    stalls: list[dict[str, Any]] = []
+    for it in open_items:
+        sc = (it.get("stall_count") or 0) > 0
+        st = _is_time_stalled(it)
+        if not sc and not st:
+            continue
+        reason = "both" if (sc and st) else ("counter" if sc else "time")
+        stalls.append({
+            "id": it["id"],
+            "title": it.get("title", ""),
+            "stall_count": it.get("stall_count") or 0,
+            "claimed_at": it.get("claimed_at"),
+            "reason": reason,
+        })
 
     groups = groups_info.get("groups", [])
     max_group = max((len(g) for g in groups), default=0)
