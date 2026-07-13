@@ -27,7 +27,14 @@ import re
 #        (1c81fee6): under deferred / tool-search loading (claude.ai, Desktop) a
 #        tool is invisible until searched for, so absence from the listing must
 #        trigger a discovery search, not a silent skip of the protocol.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 5
+#   v6 — search_graph cross-check with Serena extractor__* tools (b2d312b1):
+#        codebase-memory-mcp's graph index goes stale and has produced actively wrong
+#        line spans and zero results for symbols that genuinely exist. When search_graph
+#        returns zero results for a known symbol, or a returned span looks wrong,
+#        MUST cross-check with extractor__get_symbols_overview or
+#        extractor__find_declaration (live LSP-based) before concluding absence or
+#        accepting the span. Also added restart tip for transient extractor__* failures.
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 6
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -106,6 +113,18 @@ in the Meridian dashboard → Settings → Executor Rules.
   client defers tool loading) and you will touch source files, run
   `index_repository(mode="fast")` once — the codebase graph goes
   stale after commits, so a fresh index keeps prospecting accurate (eacf7063).
+- **`search_graph` results can be stale or wrong (b2d312b1).** The codebase-memory-mcp
+  index (`codebase__search_graph` / `search_graph`) has been observed returning zero
+  results for symbols that genuinely exist AND returning line spans that are off by
+  hundreds of lines. These are NOT the same tool as Serena's extractor__* tools, which
+  use live LSP-based parsing and are reliable. If `search_graph` returns zero results
+  for a symbol you believe exists, or a returned line span looks suspicious, cross-check
+  with `extractor__get_symbols_overview` or `extractor__find_declaration` (Serena)
+  BEFORE concluding the symbol is absent or accepting the span as correct. If
+  extractor__* tools appear missing even though list_plugins confirms the plugin is
+  active, a full restart (tunnel + Claude Desktop) has been observed to fix transient
+  tool-discovery failures for these tools — try that before concluding they are
+  permanently unavailable.
 
 ## MANDATORY CODE INTEL PROTOCOL
 When the task involves source code files, use code-intel tools (`search_graph`,
@@ -118,6 +137,22 @@ list, do NOT skip the protocol — clients with deferred / tool-search loading
 discovery query for them first; only fall back to plain file reads if that search
 genuinely surfaces nothing. For non-code files (documents, presentations,
 spreadsheets, config, data), use filesystem tools directly.
+
+**search_graph cross-check rule (b2d312b1):** `codebase__search_graph` indexes can
+go stale and have been observed producing actively wrong results — zero hits for
+symbols that exist, and line spans off by hundreds of lines. The Serena
+`extractor__*` tools (extractor__get_symbols_overview, extractor__find_declaration)
+use live LSP-based parsing and are a separate, more reliable source. When
+`search_graph` returns ZERO results for a symbol you have reason to believe exists,
+or when you have independent reason to doubt a returned line span, you MUST
+cross-check with `extractor__get_symbols_overview` or `extractor__find_declaration`
+BEFORE concluding the symbol does not exist or trusting the span. Do NOT silently
+fall back to a raw grep or whole-file read as the FIRST recourse — the Serena
+cross-check is still structured, fast, and more accurate. If extractor__* tools
+appear unavailable despite list_plugins confirming the plugin is active server-side,
+a full restart (tunnel + Claude Desktop) has been observed to fix transient
+tool-discovery failures for extractor__* — try that before concluding the tool is
+permanently gone.
 
 ## RESEARCH ROUTING PROTOCOL
 When a task needs external research, route the query to the most authoritative
@@ -134,7 +169,7 @@ source FIRST — do not default to a generic web search:
 Retrieval beats recall: look it up. Do not answer a decision-relevant factual
 question from memory when a source can be checked.
 
-<!-- meridian-executor-standard: v5 -->
+<!-- meridian-executor-standard: v6 -->
 """
 
 
