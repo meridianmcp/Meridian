@@ -956,9 +956,7 @@ async def test_generate_handoff_delta_with_in_progress(db, tmp_path):
     await db_module.set_goal(db, p["id"], "delta work")
     running = await db_module.add_sprint_item(db, p["id"], "v1", "Running item")
     await db_module.add_sprint_item(db, p["id"], "v1", "Pending item")
-    await db_module.patch_sprint_item(
-        db, p["id"], running["id"], status="in_progress"
-    )
+    await db_module.claim_sprint_item(db, p["id"], running["id"])
     _, content = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
         session_id="sess-delta-ip",
@@ -1022,7 +1020,7 @@ async def test_generate_handoff_writes_retrospective_note(db, tmp_path):
     p = await db_module.create_project(db, "retro-proj")
     await db_module.set_goal(db, p["id"], "ship", sprint="v0.1.x")
     it = await db_module.add_sprint_item(db, p["id"], "v0.1.x", "Ship the retro")
-    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+    await db_module.complete_sprint_item(db, p["id"], it["id"])
 
     await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), summarizer=_retro_summarizer,
@@ -1045,7 +1043,7 @@ async def test_generate_handoff_retrospective_is_idempotent(db, tmp_path):
     p = await db_module.create_project(db, "retro-idem")
     await db_module.set_goal(db, p["id"], "ship", sprint="v9")
     it = await db_module.add_sprint_item(db, p["id"], "v9", "Item one")
-    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+    await db_module.complete_sprint_item(db, p["id"], it["id"])
 
     seq = {"n": 0}
 
@@ -1072,7 +1070,7 @@ async def test_generate_handoff_skip_ai_summary_no_retrospective(db, tmp_path):
     p = await db_module.create_project(db, "retro-skip")
     await db_module.set_goal(db, p["id"], "ship", sprint="v1")
     it = await db_module.add_sprint_item(db, p["id"], "v1", "Item")
-    await db_module.patch_sprint_item(db, p["id"], it["id"], status="done")
+    await db_module.complete_sprint_item(db, p["id"], it["id"])
     await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
     )
@@ -1824,7 +1822,7 @@ async def test_generate_handoff_delta_with_datetime_completed_at(db, tmp_path, m
     p = await db_module.create_project(db, "alpha-delta-pg")
     await db_module.set_goal(db, p["id"], "delta pg work")
     done = await db_module.add_sprint_item(db, p["id"], "v1", "Shipped PG item")
-    await db_module.patch_sprint_item(db, p["id"], done["id"], status="done")
+    await db_module.complete_sprint_item(db, p["id"], done["id"])
 
     real_get = db_module.get_sprint_items
 

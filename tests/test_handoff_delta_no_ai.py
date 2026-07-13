@@ -21,7 +21,7 @@ async def test_delta_handoff_invokes_no_summarizer(db, tmp_path):
     for i in range(4):
         await db_module.log_task(db, s["id"], p["id"], f"did thing {i}", "done")
     done = await db_module.add_sprint_item(db, p["id"], "v1", "a completed thing")
-    await db_module.patch_sprint_item(db, p["id"], done["id"], status="done")
+    await db_module.complete_sprint_item(db, p["id"], done["id"])
 
     calls: list[str] = []
 

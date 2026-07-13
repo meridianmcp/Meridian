@@ -4692,6 +4692,28 @@ class SprintItemEvidenceRequired(ValueError):
     (5823db0b) — the item is flagged required_notes but has no evidence."""
 
 
+# 6a17e735 — the ONLY statuses patch_sprint_item may set directly. These are
+# plain administrative resets with no attached business logic: no evidence
+# gate, no completed_at semantics beyond "clear it", no parent rollup, no
+# task-chain advancement. Every OTHER status has a dedicated function
+# (complete_sprint_item -> done, skip_sprint_item -> skipped, fail_sprint_item
+# -> failed, provisional_complete_sprint_item -> provisional_complete,
+# claim_sprint_item -> in_progress) that enforces real guards
+# _update_sprint_item_status's raw UPDATE does not replicate on its own —
+# required_notes evidence, completed_at stamping, claimed_at backfill, parent
+# rollup, task-chain advancement, cache invalidation, and the live dashboard
+# event. Letting patch_sprint_item set an arbitrary status silently bypassed
+# ALL of that: a required_notes item could be marked "done" with zero
+# evidence, a parent's rollup could desync, and the sprint-items cache could
+# go stale. Confirmed as a genuine backdoor, not a theoretical one — see
+# meridian/routes/sprint.py's PATCH endpoint, which had already independently
+# self-restricted to this exact non-terminal subset for its own safety;
+# patch_sprint_item now enforces that restriction itself so every OTHER
+# caller (including any future one) gets the same protection for free instead
+# of having to remember to add it.
+_PATCH_SPRINT_ITEM_ALLOWED_STATUSES = {"pending", "todo", "indeterminate"}
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4966,8 +4988,33 @@ async def patch_sprint_item(
     if status is not None:
         if status not in _VALID_SPRINT_STATUSES:
             raise ValueError(f"invalid sprint-item status: {status!r}")
+        # 6a17e735 — patch_sprint_item is a generic field-editor, not a
+        # state-transition function. Only administrative resets are allowed
+        # here; every terminal/business-logic status has a dedicated function
+        # that enforces its own guards (evidence gate, rollup, task-chain,
+        # claimed_at, cache invalidation, live dashboard event) and MUST be
+        # used instead — silently allowing them here bypassed all of that.
+        if status not in _PATCH_SPRINT_ITEM_ALLOWED_STATUSES:
+            _dedicated = {
+                "done": "complete_sprint_item",
+                "skipped": "skip_sprint_item",
+                "failed": "fail_sprint_item",
+                "pushed": "push_sprint_item (or the version-push flow)",
+                "in_progress": "claim_sprint_item",
+                "provisional_complete": "provisional_complete_sprint_item",
+            }.get(status, "a dedicated state-transition function")
+            raise ValueError(
+                f"patch_sprint_item cannot set status={status!r} — this is a "
+                f"guarded transition that must go through {_dedicated}, which "
+                "enforces evidence/rollup/task-chain rules patch_sprint_item "
+                f"does not. Allowed here: {sorted(_PATCH_SPRINT_ITEM_ALLOWED_STATUSES)}."
+            )
         fields.append("status = ?")
         values.append(status)
+        # Every status patch_sprint_item is allowed to set is non-terminal —
+        # mirror _update_sprint_item_status's else-branch so a reset via this
+        # function can never leave a stale completed_at behind.
+        fields.append("completed_at = NULL")
     if feedback_thumb is not None:
         fields.append("feedback_thumb = ?")
         values.append(int(feedback_thumb))
@@ -5031,6 +5078,14 @@ async def patch_sprint_item(
     await db.commit()
     if cursor.rowcount == 0:
         return None
+    if status is not None:
+        # 6a17e735 — a status change (even the restricted, non-terminal subset
+        # patch_sprint_item allows) must get the same cache/live-refresh
+        # treatment _update_sprint_item_status gives every other transition —
+        # otherwise a caller could see a stale cached list or a dashboard that
+        # never refreshes after a reset.
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": status})
     return await get_sprint_item(db, item_id)
 
 
