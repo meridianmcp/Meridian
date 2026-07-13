@@ -17166,3 +17166,76 @@ async def test_workspace_proposal_schema_has_required_columns(db):
     assert "tenant_id" in cols
     assert "created_at" in cols
     assert "updated_at" in cols
+
+
+# ---------------------------------------------------------------------------
+# 605ca2c4 — assign_sprint_waves active session warning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_warns_when_session_active(db):
+    """assign_sprint_waves returns active_session_warning when an executor session is live."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "waves-active-warn")
+    pid = p["id"]
+    # Create a sprint item so assign_sprint_waves has something to label.
+    await db_module.add_sprint_item(db, pid, "v1", "item-for-wave-warn", touches_resources=["file:foo.py"])
+    # Register an active executor session — this is what triggers the warning.
+    await db_module.register_session(db, pid, "mid-flight-executor")
+
+    res = await srv._dispatch_mcp_tool(
+        "assign_sprint_waves", {"project_id": pid}, db, "/tmp"
+    )
+    assert "active_session_warning" in res, "Expected warning key missing from response"
+    warning = res["active_session_warning"]
+    assert "WARNING" in warning
+    assert "mid-flight-executor" in warning
+    # Consequence clause must be specific to wave-relabeling, not add_sprint_item wording.
+    assert "wave" in warning.lower(), "Warning should mention wave relabeling"
+    assert "desync" in warning.lower() or "re-label" in warning.lower(), (
+        "Warning should describe the desync/re-label consequence"
+    )
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_no_warning_when_no_sessions(db):
+    """assign_sprint_waves does NOT include active_session_warning when no sessions are active."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "waves-no-warn")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "item-for-wave-no-warn", touches_resources=["file:bar.py"])
+
+    res = await srv._dispatch_mcp_tool(
+        "assign_sprint_waves", {"project_id": pid}, db, "/tmp"
+    )
+    assert "active_session_warning" not in res, (
+        "No active sessions exist — warning must not appear (false positive)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_warning_text_is_wave_specific(db):
+    """The active_session_warning text is specific to wave relabeling, not a copy of add_sprint_item's."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "waves-warn-specific")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "task-a", touches_resources=["file:a.py"])
+    await db_module.register_session(db, pid, "running-executor")
+
+    res = await srv._dispatch_mcp_tool(
+        "assign_sprint_waves", {"project_id": pid}, db, "/tmp"
+    )
+    assert "active_session_warning" in res
+    warning = res["active_session_warning"]
+    # Must NOT use the generic add_sprint_item consequence clause verbatim.
+    assert "may not be picked up until next session start" not in warning, (
+        "Warning text must be specific to assign_sprint_waves, not a copy of add_sprint_item's clause"
+    )
+    # Must mention the wave/goal desync consequence specific to this tool.
+    assert "/goal" in warning or "wave" in warning.lower(), (
+        "Warning must mention the /goal or wave-label desync specific to assign_sprint_waves"
+    )

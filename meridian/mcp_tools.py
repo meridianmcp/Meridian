@@ -1345,7 +1345,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "left untouched (re-run once they clear). Idempotent — recomputes from the live "
         "board each call. Hand-override any item afterwards with update_sprint_item(wave=...). "
         "Returns {version, wave_count, assigned, waves: {'wave-1': [ids...], ...}, "
-        "blocked_count, undeclared_count}.",
+        "blocked_count, undeclared_count}. 605ca2c4 — if active executor sessions are "
+        "detected, the response also includes active_session_warning: re-labeling wave "
+        "numbers while a session is mid-flight can desync it from a /goal string that "
+        "already references specific wave labels.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "Optional: only assign waves to items in this sprint-version bucket."}},

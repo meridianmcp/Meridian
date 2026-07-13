@@ -4398,9 +4398,22 @@ async def _handle_sprint_tools(
         # 58a45b92 — persist the parallelizable grouping onto each eligible item's
         # stored `wave` field so parallelism is deterministic + inspectable, then
         # hand-editable via update_sprint_item(wave=...).
-        return await db_module.assign_sprint_waves(
+        _wave_result = await db_module.assign_sprint_waves(
             db, args["project_id"], version=args.get("version")
         )
+        # 605ca2c4 — warn if active executor sessions exist when re-running
+        # assign_sprint_waves: greedy coloring order can shift if the pending set
+        # changed since the last assignment, silently relabeling still-pending items
+        # to different wave numbers and desyncing a mid-flight /goal that already
+        # references specific wave labels.
+        _wave_warnings = await _active_executor_session_warnings(db, args["project_id"])
+        if _wave_warnings:
+            _wave_result["active_session_warning"] = (
+                "WARNING: " + "; ".join(_wave_warnings)
+                + " — re-labeling wave numbers while a session is mid-flight can"
+                " desync it from a /goal string that already references specific wave labels."
+            )
+        return _wave_result
     if name == "analyze_sprint":
         # e77f09d1 — one-call planning brief: parallelism + dependency chains +
         # resource conflicts + stalls synthesized for a planning session.
