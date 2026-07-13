@@ -8294,6 +8294,34 @@ async def get_resource_conflicts(
     return conflicts
 
 
+def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
+    """5a85a78f — True for items only a human can carry out; mirrors the EXACT
+    semantics of ``handoff._is_manual_sprint_item`` (943afe1e).
+
+    These items must be excluded from executor-facing eligible/parallel lists
+    (``get_parallelizable_groups``, ``analyze_sprint``) — an AI cannot do them as
+    intended and may fake-complete them under completion pressure.
+
+    Three signals (any one is sufficient):
+    * ``blocker_kind == 'manual'`` — blocked on a real-world action outside Meridian,
+    * ``milestone_type == 'human'`` — execution is intentionally human-only,
+    * a ``MANUAL``-tagged title (case-insensitive leading ``MANUAL``).
+
+    943afe1e — does NOT key on ``human_id`` alone. ``human_id`` records *who* an
+    item is assigned to, not *whether* it requires human execution. A BUG:/FIX:/FEAT:
+    item assigned to a maintainer via ``human_id`` is still executor-claimable.
+
+    NOTE: This helper MUST be kept in sync with ``meridian.handoff._is_manual_sprint_item``
+    (db/__init__.py is imported BY handoff.py, so we cannot import handoff here
+    without a circular import — hence the deliberate duplication).
+    """
+    if not isinstance(item, dict):
+        return False
+    if item.get("blocker_kind") == "manual" or item.get("milestone_type") == "human":
+        return True
+    return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
+
+
 async def get_parallelizable_groups(
     db: aiosqlite.Connection,
     project_id: str,
@@ -8321,12 +8349,19 @@ async def get_parallelizable_groups(
     2282a636 — items with ``blocker_kind='manual'`` (blocked on a real-world
     action outside Meridian) are excluded here: they are not executor-claimable,
     so they never join a parallel batch.
+    5a85a78f — items matching :func:`_is_manual_sprint_item` (blocker_kind='manual',
+    milestone_type='human', or MANUAL-tagged title) are also excluded: milestone_type
+    was previously passed through because ``get_sprint_items`` only gates on
+    ``include_manual_blocker``, not on ``milestone_type='human'`` or title prefix.
     e08fee30 — within the safe-parallel ordering, higher-priority eligible items
     are placed first so urgent work colors into the earliest groups.
     """
     # include_manual_blocker=False: a manual-blocker item is not claimable work,
     # so it must not be offered as a parallelizable batch member.
     items = await get_sprint_items(db, project_id, include_manual_blocker=False)
+    # 5a85a78f — also filter out milestone_type='human' and MANUAL-titled items;
+    # get_sprint_items only gates on blocker_kind, not the other two manual signals.
+    items = [it for it in items if not _is_manual_sprint_item(it)]
     if version is not None:
         items = [it for it in items if it.get("version") == version]
     claimable_statuses = {"pending", "todo"}
