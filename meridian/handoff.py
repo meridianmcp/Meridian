@@ -2687,7 +2687,30 @@ async def generate_handoff(
         )
 
     if mode == "delta":
+        # 00dbeed0 — since_ts MUST be durable, not the in-memory
+        # _SESSION_HANDOFF_STATE dict, which is a plain per-process Python dict:
+        # it is empty after every redeploy/restart and is not shared across
+        # prod's multiple Fly machines/regions (deploy.yml's ensure-regions job
+        # spreads iad+ord). Either condition makes since_ts silently fall back
+        # to None, which _completed_after treats as "no lower bound" — the
+        # "Completed since last handoff" list then dumps the ENTIRE project
+        # history (confirmed live: 496KB+ for a project with weeks of history)
+        # instead of a genuinely compact delta. The handoffs table (8819d6b1)
+        # already durably records every handoff keyed by session_id; read the
+        # prior one from there instead of the unreliable in-memory cache. Must
+        # run BEFORE this call's own record_handoff() below, or it would see
+        # itself. Fail-open to the in-memory value (then None) on any DB error
+        # so a lookup failure degrades to "full history" rather than raising.
         since_ts = _SESSION_HANDOFF_STATE.get(session_id, None) if session_id else None
+        if session_id:
+            try:
+                _prior = await db_module.get_handoffs(
+                    db, project_id, limit=1, session_id=session_id
+                )
+                if _prior:
+                    since_ts = _prior[0].get("created_at") or since_ts
+            except Exception:  # noqa: BLE001 — durable lookup is best-effort
+                pass
         completed_items = [
             item for item in sprint_items_all
             if item.get("status") in {"done", "skipped", "failed", "pushed"}

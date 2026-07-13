@@ -43,7 +43,11 @@ import re
 #        real executor session tonight used raw grep exclusively rather than
 #        search_code_semantic because the fallback was never named as a rule,
 #        only an unwritten intention.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 8
+#   v9 — "Before ending" now says to DISPLAY generate_handoff/checkpoint's
+#        returned content field verbatim (f318c7e3): the server already returns
+#        paste-ready plain text, but a calling session could narrate success
+#        without ever pasting it — purely a behavioral gap, not a server bug.
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 9
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -99,6 +103,10 @@ in the Meridian dashboard → Settings → Executor Rules.
 - Call `checkpoint(session_id, project_id)` before context fills and before ending
   the session. It snapshots progress, generates a delta handoff, and returns the
   next `/goal` string.
+- `generate_handoff`/`checkpoint` already return paste-ready plain text in their
+  `content` field (code-fence markers stripped server-side, f318c7e3) — DISPLAY
+  IT VERBATIM to the user. Do not just narrate "handoff generated" or summarize
+  it in your own words; paste the actual returned text.
 
 ## Secrets hygiene
 - Never put credentials, connection strings, or API keys in chat messages, task
@@ -189,7 +197,7 @@ source FIRST — do not default to a generic web search:
 Retrieval beats recall: look it up. Do not answer a decision-relevant factual
 question from memory when a source can be checked.
 
-<!-- meridian-executor-standard: v8 -->
+<!-- meridian-executor-standard: v9 -->
 """
 
 
