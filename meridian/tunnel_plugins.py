@@ -380,6 +380,37 @@ KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
             "Citation / reference-manager resolution against the local Zotero API."
         ),
     },
+    {
+        # 88dbb675 — Context7 (by Upstash): general-purpose library/framework docs MCP.
+        # Indexes React, Tailwind, Next.js, and thousands of other libraries so agents
+        # get up-to-date API docs without web search. Complements paper_search (academic)
+        # and the GitHub source (code/issues) by covering framework documentation.
+        #
+        # Connection options (no API key needed for the free tier):
+        #   Remote (preferred): npx -y mcp-remote https://mcp.context7.com/mcp
+        #   Local stdio:        npx -y @upstash/context7-mcp
+        #   Optional env:       CONTEXT7_API_KEY — free key from context7.com/dashboard
+        #                       unlocks higher rate limits; omit for basic free-tier use.
+        #
+        # NOT a tunnel built-in: Context7 is a remote-first MCP with no local binary,
+        # so it has no dedicated server route (no slot). Wire it as a custom plugin in
+        # the Meridian dashboard → Tunnel → Add Plugin, or add it directly to your
+        # .mcp.json / claude_desktop_config.json. See AGENTS.md for connection examples.
+        "name": "context7",
+        "package": "@upstash/context7-mcp",
+        "runtime": "npx",
+        "slot": None,  # no dedicated tunnel slot — wire as a custom plugin or direct MCP
+        "bundled": False,
+        "owner_item": "88dbb675",
+        "description": (
+            "Library/framework docs MCP (Context7 by Upstash) — up-to-date React, "
+            "Tailwind, Next.js, and thousands of other library docs for AI agents. "
+            "Use as a custom tunnel plugin (npx @upstash/context7-mcp) or connect "
+            "directly via the remote endpoint https://mcp.context7.com/mcp. "
+            "Free tier requires no API key; generate one at context7.com/dashboard "
+            "for higher rate limits."
+        ),
+    },
 ]
 
 

@@ -34,7 +34,10 @@ import re
 #        MUST cross-check with extractor__get_symbols_overview or
 #        extractor__find_declaration (live LSP-based) before concluding absence or
 #        accepting the span. Also added restart tip for transient extractor__* failures.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 6
+#   v7 — research-routing protocol adds Context7 as the preferred source for
+#        framework/library docs questions (88dbb675): if Context7 is in the tool
+#        list, consult it before web search for React/Tailwind/Next.js/etc.
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 7
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -160,6 +163,10 @@ source FIRST — do not default to a generic web search:
 - **GitHub / library / API questions** — search GitHub natively first (that repo's
   code, issues, releases, and its own docs) before any general web search. The
   primary source is the code and its issue tracker, not a blog summarizing them.
+- **Framework / library docs questions** — if Context7 is in your tool list
+  (context7 MCP: `resolve-library-id` then `get-library-docs`), use it first for
+  React, Tailwind, Next.js, and other framework/library questions; it returns
+  up-to-date versioned API docs rather than web-search excerpts.
 - **Academic / paper questions** — call the `paper_search` tool first (the paper-search
   MCP: a keyless arXiv lookup, now in your tool list); fall back to web search only if
   it is unavailable. Cite the paper itself, not a secondary write-up.
@@ -169,7 +176,7 @@ source FIRST — do not default to a generic web search:
 Retrieval beats recall: look it up. Do not answer a decision-relevant factual
 question from memory when a source can be checked.
 
-<!-- meridian-executor-standard: v6 -->
+<!-- meridian-executor-standard: v7 -->
 """
 
 
