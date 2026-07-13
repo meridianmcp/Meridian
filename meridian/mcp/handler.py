@@ -3994,6 +3994,7 @@ async def _handle_sprint_tools(
                 track=args.get("track"),
                 priority=args.get("priority"),
                 blocker_kind=args.get("blocker_kind"),
+                wave=args.get("wave"),
             )
         except ValueError as exc:
             # 501ec93f — malformed touches_resources identifier; also e08fee30 /
@@ -4120,6 +4121,11 @@ async def _handle_sprint_tools(
         # sentinel); pass "" / null to clear (ordinary item), or 'manual' to set.
         if "blocker_kind" in args:
             _patch_kwargs["blocker_kind"] = args.get("blocker_kind")
+        # 58a45b92 — set/clear the stored wave label. Only forward when the caller
+        # supplied the key (_UNSET sentinel), so omitting it leaves the stored value
+        # untouched; pass "" / null to clear (unassigned).
+        if "wave" in args:
+            _patch_kwargs["wave"] = args.get("wave")
         try:
             item = await db_module.patch_sprint_item(
                 db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -4261,6 +4267,13 @@ async def _handle_sprint_tools(
                 "touches_resources to let them parallelize."
             )
         return _grp
+    if name == "assign_sprint_waves":
+        # 58a45b92 — persist the parallelizable grouping onto each eligible item's
+        # stored `wave` field so parallelism is deterministic + inspectable, then
+        # hand-editable via update_sprint_item(wave=...).
+        return await db_module.assign_sprint_waves(
+            db, args["project_id"], version=args.get("version")
+        )
     if name == "analyze_sprint":
         # e77f09d1 — one-call planning brief: parallelism + dependency chains +
         # resource conflicts + stalls synthesized for a planning session.

@@ -298,7 +298,13 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- blocker item is surfaced distinctly and excluded from executor "just claim
     -- the next pending" scoping, mirroring milestone_type='human'. Nullable plain
     -- column — no inline index (guarded-migration rule).
-    blocker_kind TEXT
+    blocker_kind TEXT,
+    -- 58a45b92: stored, deterministic wave label (e.g. 'wave-1'). Replaces
+    -- recompute-every-time parallel grouping with an inspectable, editable field:
+    -- assign_sprint_waves auto-fills it from get_parallelizable_groups, and
+    -- update_sprint_item(wave=...) edits it by hand. NULL = unassigned. Nullable
+    -- plain column — no inline index (guarded-migration rule).
+    wave TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -961,6 +967,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_pointers(db)
     await _migrate_sprint_item_deferral(db)
     await _migrate_sprint_item_priority_blocker(db)
+    await _migrate_sprint_item_wave(db)
     await _migrate_mcp_rate_counters(db)
     return db
 
@@ -4370,6 +4377,7 @@ async def add_sprint_item(
     track: str | None = None,
     priority: str | None = None,
     blocker_kind: str | None = None,
+    wave: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -4464,12 +4472,12 @@ async def add_sprint_item(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
-        "deferred_until, track, priority, blocker_kind) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "deferred_until, track, priority, blocker_kind, wave) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
-         priority, blocker_kind or None),
+         priority, blocker_kind or None, wave or None),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -4862,6 +4870,7 @@ async def patch_sprint_item(
     track: Any = _UNSET,
     priority: str | None = None,
     blocker_kind: Any = _UNSET,
+    wave: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
@@ -4943,6 +4952,12 @@ async def patch_sprint_item(
             )
         fields.append("blocker_kind = ?")
         values.append(_bk)
+    if wave is not _UNSET:
+        # 58a45b92 — empty string / None CLEARS the wave (unassigned); any other
+        # value sets the stored wave label. No enum: labels are free-form (e.g.
+        # 'wave-1'), auto-filled by assign_sprint_waves or hand-set here.
+        fields.append("wave = ?")
+        values.append(wave or None)
     if not fields:
         return await get_sprint_item(db, item_id)
     values.extend([item_id, project_id])
@@ -8357,6 +8372,49 @@ async def get_parallelizable_groups(
         "undeclared_count": undeclared,
         "blocked": blocked,
         "running": running,  # df573218 — items currently in flight
+    }
+
+
+async def assign_sprint_waves(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """58a45b92 — persist the parallelizable grouping as a STORED, editable wave label.
+
+    :func:`get_parallelizable_groups` recomputes conflict-free batches on every
+    call; this writes that plan onto each eligible item's ``wave`` column (group i →
+    ``'wave-{i+1}'``) so parallelism is deterministic and inspectable (get_sprint_items
+    surfaces ``wave``) instead of recomputed each time. An operator can then override
+    any item by hand via ``update_sprint_item(wave=...)``.
+
+    Only currently-ELIGIBLE items (pending/todo, dependency-satisfied, unclaimed,
+    non-manual-blocker) are labelled — the same set get_parallelizable_groups fans
+    out. Blocked / in-flight / done items are left untouched (re-run once they clear).
+    Idempotent: re-running recomputes from the live board and rewrites the labels.
+
+    Returns ``{version, wave_count, assigned, waves: {'wave-1': [ids...], ...},
+    blocked_count, undeclared_count}``.
+    """
+    plan = await get_parallelizable_groups(db, project_id, version=version)
+    waves: dict[str, list[str]] = {}
+    assigned = 0
+    for gi, group in enumerate(plan.get("groups") or []):
+        label = f"wave-{gi + 1}"
+        ids: list[str] = []
+        for item in group:
+            await patch_sprint_item(db, project_id, item["id"], wave=label)
+            ids.append(item["id"])
+            assigned += 1
+        if ids:
+            waves[label] = ids
+    return {
+        "version": version,
+        "wave_count": len(waves),
+        "assigned": assigned,
+        "waves": waves,
+        "blocked_count": len(plan.get("blocked") or []),
+        "undeclared_count": plan.get("undeclared_count", 0),
     }
 
 
