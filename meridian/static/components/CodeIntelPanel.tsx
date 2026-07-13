@@ -12,7 +12,7 @@
 // this with mountCodeIntelPanel().
 import { render } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { Architecture, ArchPackage } from "./types";
+import type { Architecture, ArchPackage, ArchChild } from "./types";
 
 export interface CodeIntelPanelProps {
   /** Top-level fetch state for the panel. */
@@ -119,14 +119,11 @@ export const CI_EDGE_COLORS: Record<CiEdgeType, string> = {
   invokes: "#f59e0b",
 };
 
-/** An optional deeper node (file/class/method) hanging off a package. */
-export interface CiChild {
-  name?: string;
-  kind?: "file" | "class" | "method";
-  children?: CiChild[];
-  imports?: string[];
-  inherits?: string[];
-}
+/**
+ * An optional deeper node (file/class/method) hanging off a package. Alias of
+ * the backend-contract `ArchChild` in ./types (kept for import back-compat).
+ */
+export type CiChild = ArchChild;
 
 export interface CyElement {
   group: "nodes" | "edges";
@@ -164,7 +161,7 @@ export function buildCytoscapeElements(arch?: Architecture | null): CyElement[] 
         group: "nodes",
         data: { id: pid, parent: parentId, label: p.name, kind: "package", node_count: p.node_count ?? 0 },
       });
-      _emitChildren(els, pid, (p as ArchPackage & { children?: CiChild[] }).children);
+      _emitChildren(els, pid, p.children);
     }
   }
   const boundaries = arch && Array.isArray(arch.boundaries) ? arch.boundaries : [];

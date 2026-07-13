@@ -58,12 +58,14 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_workspace_decisions": 'get_workspace_decisions()',
     "get_workspace_settings": 'get_workspace_settings()',
     "update_workspace_settings": 'update_workspace_settings(hitl_auto_answer_default=True, sprint_name_default="june-sprint")',
+    "refresh_tool_manifest": 'refresh_tool_manifest()',
     "save_blog_post": 'save_blog_post(title="Shipping the Blog tab", body="# What changed\\n...", status="published")',
     "get_blog_posts": 'get_blog_posts(status="published")',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
     "fan_out_sprint_items": 'fan_out_sprint_items(project_id="abc-123", items=[{"title": "Design DB schema", "group": "backend"}, {"title": "Build API endpoints", "group": "backend"}, {"title": "Wire up frontend", "group": "frontend"}])',
     "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
     "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
+    "assign_sprint_waves": 'assign_sprint_waves(project_id="abc-123")',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
@@ -1061,7 +1063,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "priority": {"type": "string", "enum": ["urgent", "high", "normal", "low"],
                       "description": "e08fee30 — item priority (default 'normal'). Higher-priority PENDING items are surfaced, claimed, and grouped FIRST: get_sprint_items and get_parallelizable_groups order urgent-first within their existing ordering, so an executor picks up higher-priority work before lower. Ordering-only for now; a running-session preemption/interrupt mechanism is deferred."},
          "blocker_kind": {"type": "string", "enum": ["manual"],
-                          "description": "2282a636 — omit for an ordinary item; 'manual' marks the item as blocked on a REAL-WORLD action OUTSIDE Meridian (publish something, obtain an API key, talk to an advisor). DISTINCT from milestone_type='human' (which is about WHO executes): a manual-blocker item is surfaced distinctly and is EXCLUDED from executor 'just claim the next pending' scoping, so an executor never treats it as claimable work."}},
+                          "description": "2282a636 — omit for an ordinary item; 'manual' marks the item as blocked on a REAL-WORLD action OUTSIDE Meridian (publish something, obtain an API key, talk to an advisor). DISTINCT from milestone_type='human' (which is about WHO executes): a manual-blocker item is surfaced distinctly and is EXCLUDED from executor 'just claim the next pending' scoping, so an executor never treats it as claimable work."},
+         "wave": {"type": "string",
+                  "description": "58a45b92 — stored, deterministic wave/batch label (e.g. 'wave-1') for enforced wave-a/wave-b grouping. Usually auto-filled by assign_sprint_waves from the conflict-free parallel groups; set it here only to pin an item to a specific wave up front. Omit to leave unassigned."}},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -1111,7 +1115,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "priority": {"type": "string", "enum": ["urgent", "high", "normal", "low"],
                       "description": "e08fee30 — set the item's priority (urgent|high|normal|low). Higher-priority pending items are surfaced/claimed/grouped first. Omit to leave unchanged."},
          "blocker_kind": {"type": "string", "enum": ["manual"],
-                          "description": "2282a636 — 'manual' marks the item as blocked on a real-world action OUTSIDE Meridian (distinct from milestone_type='human'; excluded from executor scoping). Pass an empty string to CLEAR it (ordinary item); omit to leave unchanged."}},
+                          "description": "2282a636 — 'manual' marks the item as blocked on a real-world action OUTSIDE Meridian (distinct from milestone_type='human'; excluded from executor scoping). Pass an empty string to CLEAR it (ordinary item); omit to leave unchanged."},
+         "wave": {"type": "string",
+                  "description": "58a45b92 — set/clear the stored wave label (e.g. 'wave-1') for enforced parallel-batch grouping. Hand-override of what assign_sprint_waves computes. Pass an empty string to CLEAR (unassigned); omit to leave unchanged."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "
@@ -1181,6 +1187,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "Optional: only consider items in this sprint-version bucket."}},
+         "required": []}},
+    {"name": "assign_sprint_waves", "description":
+        "58a45b92 — PERSIST the parallel grouping: writes the conflict-free batches "
+        "get_parallelizable_groups computes onto each eligible item's stored `wave` "
+        "field (group i -> 'wave-{i+1}'), so parallelism becomes deterministic and "
+        "inspectable (get_sprint_items surfaces `wave`) instead of recomputed every "
+        "call. Only currently-eligible items (pending/todo, dependency-satisfied, "
+        "unclaimed, non-manual-blocker) are labelled; blocked/in-flight/done items are "
+        "left untouched (re-run once they clear). Idempotent — recomputes from the live "
+        "board each call. Hand-override any item afterwards with update_sprint_item(wave=...). "
+        "Returns {version, wave_count, assigned, waves: {'wave-1': [ids...], ...}, "
+        "blocked_count, undeclared_count}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "version": {"type": "string", "description": "Optional: only assign waves to items in this sprint-version bucket."}},
          "required": []}},
     {"name": "analyze_sprint", "description":
         "PLANNING: Read-only synthesis of the current sprint into one structured brief — "
@@ -1397,6 +1418,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string", "description": "Plugin name as returned by list_plugins (e.g. 'filesystem', 'code-intel', 'code-extractor')."}},
          "required": ["name"]}},
+    {"name": "refresh_tool_manifest", "description":
+        "Read-only: return the authoritative, compact manifest of ALL built-in "
+        "Meridian MCP tools (name + one-line summary). Call this when you suspect "
+        "your client's tool schema went stale ('I nuked the schema', a tool you "
+        "expected is suddenly 'not found', or right after a /compact) — it is a "
+        "plain tool CALL, so it works even on clients that ignore the "
+        "notifications/tools/list_changed signal (e.g. Claude Desktop). Best-effort "
+        "also re-fires list_changed for your tenant so a client that DOES honour it "
+        "re-lists. Names returned here are canonical: a name present here but absent "
+        "from your tool list is a stale-schema artifact, not a removed tool.",
+     "inputSchema": {"type": "object", "properties": {},
+         "required": []}},
     {"name": "get_graph_diff", "description":
         "Read-only: compare the latest code-graph snapshots of two sessions — returns delta in node_count, hotspot_count, and file_churn. Use snapshot_graph_metrics first to record each session's current state.",
      "inputSchema": {"type": "object", "properties": {
@@ -1510,7 +1543,7 @@ _READ_ONLY_TOOLS = {
     "get_blog_posts",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
-    "list_plugins", "get_plugin_details",
+    "list_plugins", "get_plugin_details", "refresh_tool_manifest",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
@@ -1562,10 +1595,12 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "get_agent_instructions": "Get Agent Instructions",
     "set_agent_instructions": "Set Agent Instructions",
     "reconcile_sprint_drift": "Reconcile Sprint Drift",
+    "assign_sprint_waves": "Assign Sprint Waves",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",
     "get_plugin_details": "Get Plugin Details",
+    "refresh_tool_manifest": "Refresh Tool Manifest",
     "set_active_repo": "Set Active Repo",
     "analyze_model_efficiency": "Analyze Model Efficiency",
     "index_equation": "Index Equation",

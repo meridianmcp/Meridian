@@ -558,7 +558,9 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     priority TEXT NOT NULL DEFAULT 'normal',
     -- 2282a636: NULL = ordinary, 'manual' = blocked on a real-world action outside
     -- Meridian. Distinct from milestone_type='human'; excluded from executor scoping.
-    blocker_kind TEXT
+    blocker_kind TEXT,
+    -- 58a45b92: stored, deterministic wave label (e.g. 'wave-1'); NULL = unassigned.
+    wave TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -753,6 +755,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     auto_refresh_enabled INTEGER NOT NULL DEFAULT 0,
     refresh_interval_turns INTEGER NOT NULL DEFAULT 10,
     refresh_triggers TEXT,
+    handoff_inline_pointers INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -2096,7 +2099,11 @@ async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> No
         "auto_refresh_enabled INTEGER NOT NULL DEFAULT 0;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
         "refresh_interval_turns INTEGER NOT NULL DEFAULT 10;"
-        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS refresh_triggers TEXT"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS refresh_triggers TEXT;"
+        # 36fea6ca — inline each pending item's RESOLVED pointers in the handoff
+        # markdown (default on). Off (0) keeps them DB-only (separate resolve call).
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "handoff_inline_pointers INTEGER NOT NULL DEFAULT 1"
     )
 
 
@@ -2590,6 +2597,18 @@ async def _migrate_pg_sprint_item_priority_blocker(conn: PostgresConnection) -> 
     )
 
 
+async def _migrate_pg_sprint_item_wave(conn: PostgresConnection) -> None:
+    """58a45b92 — stored wave label on sprint_items (mirrors SQLite).
+
+    Nullable TEXT (e.g. 'wave-1'); NULL = unassigned. CREATE_TABLES_CORE covers
+    fresh DBs; this is the upgrade path. ADD COLUMN IF NOT EXISTS → idempotent.
+    Mirrors db._migrate_sprint_item_wave.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS wave TEXT"
+    )
+
+
 async def _migrate_pg_sprint_item_dependency(conn: PostgresConnection) -> None:
     """b01326e9 / v2.6 — dependency + file-conflict columns on sprint_items.
 
@@ -2699,6 +2718,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_pointers,
     _migrate_pg_sprint_item_deferral,
     _migrate_pg_sprint_item_priority_blocker,
+    _migrate_pg_sprint_item_wave,
     _migrate_pg_sprint_item_dependency,
     _migrate_pg_mcp_rate_counters,
 )

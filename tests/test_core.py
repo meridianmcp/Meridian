@@ -7243,12 +7243,13 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_pointers",
         "_migrate_pg_sprint_item_deferral",
         "_migrate_pg_sprint_item_priority_blocker",
+        "_migrate_pg_sprint_item_wave",
         "_migrate_pg_sprint_item_dependency",
         "_migrate_pg_mcp_rate_counters",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 91
+    assert len(allnames) == len(set(allnames)) == 92
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -16223,7 +16224,10 @@ def test_agent_instructions_include_reindex_at_session_start():
     )
     assert 'index_repository(mode="fast")' in DEFAULT_AGENT_INSTRUCTIONS
     assert AGENT_INSTRUCTIONS_STANDARD_VERSION >= 4
-    assert "meridian-executor-standard: v4" in DEFAULT_AGENT_INSTRUCTIONS
+    assert (
+        f"meridian-executor-standard: v{AGENT_INSTRUCTIONS_STANDARD_VERSION}"
+        in DEFAULT_AGENT_INSTRUCTIONS
+    )
 
 
 @pytest.mark.asyncio

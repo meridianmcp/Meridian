@@ -951,8 +951,13 @@ async def _handle_mcp_request(
             if not _is_github and name not in _meridian_tool_names() and tenant and tenant.get("id"):
                 from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
                 if _tunnel_mod.has_active_tunnel(tenant["id"]):
+                    # 73d233e4 — pass db + the caller's session_id so the word/office
+                    # (docx) write path can consult file claims and refuse a
+                    # concurrent-write conflict instead of silently last-save-wins
+                    # overwriting another session's edit to the same document.
                     tunnel_result = await _tunnel_mod.call_tunnel_tool(
                         tenant["id"], name, args,
+                        db=db, session_id=(args.get("session_id") or "").strip() or None,
                     )
                     if tunnel_result is not None:
                         # Pass the tunneled server's result through verbatim — it
@@ -2978,6 +2983,14 @@ async def _handle_notes_decisions(
         outputs_dir = str(args.get("outputs_dir") or "").strip()
         _resolver = None
         _index = None
+        # Workspace decision 0dedff91 — the outputs resolve-through stats/walks
+        # `outputs_dir` on THIS process's own filesystem (os.path.isdir + a
+        # DuckDB rebuild over the tree). On hosted Meridian that path is on the
+        # caller's machine, which the server can never reach, so skip the
+        # resolve-through entirely (the figure match itself is DB-only and
+        # still works). Never touch a caller's local dir server-side hosted.
+        if _hosted_mode():
+            outputs_dir = ""
         if outputs_dir and os.path.isdir(outputs_dir):
             from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
             _index = _outputs_indexer.OutputsFtsIndex(outputs_dir)
@@ -3134,6 +3147,8 @@ async def _handle_notes_decisions(
             code_intel_enabled_default=args.get("code_intel_enabled_default"),
             # 76cf8bda — /loop auto-continue workspace default.
             loop_enabled_default=args.get("loop_enabled_default"),
+            # 36fea6ca — inline resolved sprint-item pointers in the handoff.
+            handoff_inline_pointers=args.get("handoff_inline_pointers"),
             tenant_id=_mcp_tenant_id,
         )
     if name == "save_blog_post":
@@ -3979,6 +3994,7 @@ async def _handle_sprint_tools(
                 track=args.get("track"),
                 priority=args.get("priority"),
                 blocker_kind=args.get("blocker_kind"),
+                wave=args.get("wave"),
             )
         except ValueError as exc:
             # 501ec93f — malformed touches_resources identifier; also e08fee30 /
@@ -4105,6 +4121,11 @@ async def _handle_sprint_tools(
         # sentinel); pass "" / null to clear (ordinary item), or 'manual' to set.
         if "blocker_kind" in args:
             _patch_kwargs["blocker_kind"] = args.get("blocker_kind")
+        # 58a45b92 — set/clear the stored wave label. Only forward when the caller
+        # supplied the key (_UNSET sentinel), so omitting it leaves the stored value
+        # untouched; pass "" / null to clear (unassigned).
+        if "wave" in args:
+            _patch_kwargs["wave"] = args.get("wave")
         try:
             item = await db_module.patch_sprint_item(
                 db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -4246,6 +4267,13 @@ async def _handle_sprint_tools(
                 "touches_resources to let them parallelize."
             )
         return _grp
+    if name == "assign_sprint_waves":
+        # 58a45b92 — persist the parallelizable grouping onto each eligible item's
+        # stored `wave` field so parallelism is deterministic + inspectable, then
+        # hand-editable via update_sprint_item(wave=...).
+        return await db_module.assign_sprint_waves(
+            db, args["project_id"], version=args.get("version")
+        )
     if name == "analyze_sprint":
         # e77f09d1 — one-call planning brief: parallelism + dependency chains +
         # resource conflicts + stalls synthesized for a planning session.
@@ -5257,6 +5285,25 @@ async def _handle_plugin_tools(
 
     These are non-fatal if no tunnel is active (returns empty list/error).
     """
+    if name == "refresh_tool_manifest":
+        # 142808f3 — plain tool CALL to re-discover the built-in tool set, for
+        # clients that ignore notifications/tools/list_changed. Best-effort re-fire
+        # of the signal too, so a client that DOES honour it also re-lists.
+        from ..mcp_tools import _MCP_TOOLS_LIST  # noqa: PLC0415
+        from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
+
+        manifest = build_tool_manifest(_MCP_TOOLS_LIST)
+        _tid = tenant.get("id") if tenant else None
+        if _tid:
+            try:
+                from ..routes.tunnel import (  # noqa: PLC0415
+                    notify_tools_list_changed as _notify_tlc,
+                )
+                _notify_tlc(_tid)
+                manifest["list_changed_refired"] = True
+            except Exception:  # noqa: BLE001 — signal is a bonus, manifest is the point
+                manifest["list_changed_refired"] = False
+        return manifest
     if name == "list_plugins":
         from ..tunnel_plugins import BUILTIN_PLUGINS  # noqa: PLC0415
         from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
@@ -5492,6 +5539,28 @@ async def _handle_outputs_tools(
             raise ValueError("outputs_dir is required")
         if not query:
             raise ValueError("query is required")
+        # Workspace decision 0dedff91 — outputs_indexer.search_outputs walks
+        # `outputs_dir` off THIS process's own filesystem (os.walk + hash +
+        # DuckDB FTS). On hosted Meridian that's the server, which can never
+        # reach a caller's own machine, so os.walk finds nothing (or silently
+        # mis-resolves a Windows path against the server cwd). Fail honestly
+        # instead — same guard as ingest_document / get_document_structure /
+        # search_code_semantic.
+        if _hosted_mode():
+            return {
+                "outputs_dir": outputs_dir,
+                "query": query,
+                "hits": [],
+                "total_indexed": 0,
+                "error": (
+                    "search_outputs walks a directory on YOUR local filesystem "
+                    "and cannot run on hosted Meridian -- the server has no "
+                    "access to your machine. Run Meridian self-hosted, or use "
+                    "the tunnel-routed local file/search tools, which proxy to "
+                    "your machine."
+                ),
+                "hosted": True,
+            }
         limit = args.get("limit", 10)
         try:
             limit = int(limit)

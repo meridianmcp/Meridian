@@ -2660,9 +2660,292 @@ async def list_tunnel_tools(
     return aggregated
 
 
+# ---------------------------------------------------------------------------
+# 73d233e4 — concurrent-write protection for the word/office (docx) tunnel path.
+#
+# The word slot (docx-mcp) is a pure network relay: two agents editing DIFFERENT
+# sections of the same .docx over the tunnel silently overwrite each other, because
+# a .docx is a zip container with NO partial write — every mutating tool re-saves
+# the whole file, so last-save-wins. There is no native cross-agent lock for a
+# tunneled Office document.
+#
+# Meridian already owns the vendor-neutral coordination primitive for exactly this:
+# file claims (claim_file / get_file_claims) + the pure evaluate_claim_guard
+# decision core. The fix wires the word write path into that machinery — before a
+# MUTATING word tool is relayed, we consult the target document's live claims and
+# REFUSE the write when another live session holds a conflicting write/symbol claim
+# on it. A read tool, or a write on a document nobody else has claimed, passes
+# through untouched. Keyed on the target document path so two agents on two
+# different .docx files never contend.
+# ---------------------------------------------------------------------------
+
+# docx-mcp mutating tools re-serialize the whole zip container (no partial write),
+# so every one of these is a last-save-wins hazard under concurrent editing. Names
+# are the bare docx-mcp tool names (the connector prefix is stripped before this
+# runs). Kept as a curated allowlist of *known* writers rather than a "not in a
+# read set" heuristic so a new read tool can never be mis-flagged as a writer.
+_WORD_WRITE_TOOLS = frozenset({
+    "create_document",
+    "save_document",
+    "add_paragraph",
+    "add_heading",
+    "add_table",
+    "add_image",
+    "add_picture",
+    "add_page_break",
+    "add_break",
+    "add_list",
+    "add_bullet_list",
+    "add_numbered_list",
+    "set_paragraph_text",
+    "edit_paragraph",
+    "update_paragraph",
+    "replace_text",
+    "replace_paragraph",
+    "delete_paragraph",
+    "insert_paragraph",
+    "set_heading",
+    "set_style",
+    "apply_style",
+    "set_cell_text",
+    "update_cell",
+    "merge_cells",
+    "set_header",
+    "set_footer",
+    "set_properties",
+    "set_document_properties",
+    "convert_document",
+    "copy_document",
+})
+
+# Argument keys a docx-mcp tool uses to name its target document, in priority order.
+_WORD_DOC_ARG_KEYS = ("filename", "file_path", "path", "document", "document_path",
+                      "doc_path", "output_path", "target")
+
+
+def _word_write_target(name: str, arguments: "dict | None") -> "str | None":
+    """Return the target document path for a MUTATING word-slot tool, else None.
+
+    ``name`` is the BARE (prefix-stripped) docx-mcp tool name. Returns None for a
+    read-only tool, an unknown tool, or a writer whose target document path can't
+    be found in ``arguments`` (fail-open — we can't guard what we can't identify).
+    """
+    bare = name.split("__", 1)[1] if "__" in name else name
+    if bare not in _WORD_WRITE_TOOLS:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    for key in _WORD_DOC_ARG_KEYS:
+        val = arguments.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+async def check_word_write_conflict(
+    db: Any,
+    tenant_id: str,
+    name: str,
+    arguments: "dict | None",
+    session_id: "str | None" = None,
+) -> "dict | None":
+    """Consult file claims before relaying a MUTATING word-slot tool (73d233e4).
+
+    Returns a conflict verdict dict ``{"blocked": True, "document": path,
+    "holder": <session>, "reason": <reason>, "message": <human text>}`` when
+    another live session holds a conflicting write/symbol claim on the target
+    document, else ``None`` (clear — the relay may proceed).
+
+    Coordination reuses the existing primitives: :func:`get_file_claims` for the
+    live claims on the document and :func:`evaluate_claim_guard` (the vendor-neutral
+    decision core) for the allow/block decision, keyed on ``session_id`` (the caller
+    treated as claim-less when unknown, so ANY other session's write claim conflicts).
+
+    Fail-open by design — a missing db, an unidentifiable target, or a claim-lookup
+    error degrades to None (no block). This guard SURFACES a conflict; the .docx is
+    still a real last-save-wins hazard, so a caller that wants a hard gate should
+    claim_file the document first.
+    """
+    target = _word_write_target(name, arguments)
+    if not target or db is None:
+        return None
+    try:
+        claims = await db_module.get_file_claims(db, target)
+    except Exception as exc:  # noqa: BLE001 — never wedge a write on a lookup error
+        _log.debug("word write-guard: get_file_claims(%s) failed: %s", target, exc)
+        return None
+    from ..claim_guard import evaluate_claim_guard  # noqa: PLC0415
+    verdict = evaluate_claim_guard(claims, session_id or "", mode="write")
+    if verdict.get("allow", True):
+        return None
+    holder = verdict.get("holder")
+    reason = verdict.get("reason") or "write_locked"
+    return {
+        "blocked": True,
+        "document": target,
+        "holder": holder,
+        "reason": reason,
+        "message": (
+            f"Concurrent-write conflict on {target}: session {holder} holds a live "
+            f"{reason} claim. A .docx is a zip container with no partial write, so a "
+            f"relayed edit would silently overwrite the other session's work "
+            f"(last-save-wins). Coordinate or wait for the claim to release, then "
+            f"retry. To edit in parallel, claim_file the document first."
+        ),
+    }
+
+
+# 7ef712a8 — code-intel graph tools identify a project by the *local repo-path
+# slug* (e.g. "C-Users-13144-Documents-Meridian-repository"), NOT the Meridian
+# planning-project name (e.g. "meridian-build"). A session naturally passes the
+# planning name first, gets a bare "project not found", and may abandon
+# code-intel. These are the code-slot (codebase-memory-mcp) tools that take a
+# project identifier; when one 404s on the project we enrich the error with the
+# slug explanation + the list of actually-indexed identifiers (closest first).
+_CODE_INTEL_PROJECT_TOOLS = frozenset({
+    "search_graph", "query_graph", "trace_path", "get_architecture",
+    "get_graph_schema", "search_code", "get_code_snippet", "detect_changes",
+    "index_status", "ingest_traces", "manage_adr", "delete_project",
+})
+
+
+def _is_project_not_found_error(msg: str) -> bool:
+    """Heuristic: does an error message look like a code-intel project lookup miss?
+
+    The codebase-memory server phrases this a few ways ("project not found",
+    "no project ... found", "unknown project", "project '<slug>' does not
+    exist"). Match loosely on the (project + not-found) signal so we enrich the
+    right failures without hijacking unrelated errors (e.g. a query syntax error).
+    """
+    low = (msg or "").lower()
+    if "project" not in low:
+        return False
+    return any(
+        phrase in low
+        for phrase in (
+            "not found", "no such", "unknown project", "does not exist",
+            "no project", "not indexed", "isn't indexed", "is not indexed",
+        )
+    )
+
+
+def _closest_project_ids(wanted: str, available: "list[str]") -> "list[str]":
+    """Order ``available`` project identifiers by similarity to ``wanted``.
+
+    Uses difflib so the caller's likely-intended slug floats to the top of the
+    hint. Pure string ranking — never raises, returns ``available`` order on any
+    degenerate input.
+    """
+    if not wanted or not available:
+        return list(available)
+    import difflib  # noqa: PLC0415 — only needed on the error path
+    scored = sorted(
+        available,
+        key=lambda p: difflib.SequenceMatcher(None, wanted.lower(), p.lower()).ratio(),
+        reverse=True,
+    )
+    return scored
+
+
+async def _list_indexed_project_ids(tenant_id: str) -> "list[str]":
+    """Best-effort: fetch the code-intel server's indexed project identifiers.
+
+    Calls the codebase ``list_projects`` tool over the same tunnel and pulls out
+    each project's identifier (``id`` / ``project_id`` / ``name`` / ``slug``,
+    whichever the server returns). Never raises — returns ``[]`` on any failure so
+    error enrichment can't itself throw.
+    """
+    try:
+        result = await call_tunnel_tool(tenant_id, "codebase__list_projects", {})
+    except Exception:  # noqa: BLE001 — enrichment must never mask the real error
+        return []
+    payload = _extract_graph_matches(result)
+    projects: Any = payload
+    if isinstance(payload, dict):
+        projects = (
+            payload.get("projects")
+            or payload.get("results")
+            or payload.get("items")
+            or []
+        )
+    ids: list[str] = []
+    if isinstance(projects, list):
+        for proj in projects:
+            if isinstance(proj, str):
+                ids.append(proj)
+            elif isinstance(proj, dict):
+                ident = (
+                    proj.get("id")
+                    or proj.get("project_id")
+                    or proj.get("name")
+                    or proj.get("slug")
+                    or proj.get("path")
+                )
+                if ident:
+                    ids.append(str(ident))
+    # De-dupe, preserve order.
+    seen: set[str] = set()
+    return [i for i in ids if not (i in seen or seen.add(i))]
+
+
+async def _enrich_code_intel_project_error(
+    tenant_id: str, name: str, arguments: dict | None, original_msg: str,
+) -> str:
+    """Turn a bare code-intel "project not found" into an actionable hint.
+
+    Explains that the identifier is the *local repo-path slug*, not the Meridian
+    planning-project name, and lists the actually-indexed identifiers (closest
+    match to what the caller passed floated to the top). Returns the original
+    message unchanged if enrichment doesn't apply or can't add anything.
+    """
+    bare = name.split("__", 1)[1] if "__" in name else name
+    if bare not in _CODE_INTEL_PROJECT_TOOLS:
+        return original_msg
+    if not _is_project_not_found_error(original_msg):
+        return original_msg
+    wanted = ""
+    if isinstance(arguments, dict):
+        wanted = str(
+            arguments.get("project_id")
+            or arguments.get("project")
+            or arguments.get("project_name")
+            or ""
+        ).strip()
+    available = await _list_indexed_project_ids(tenant_id)
+    ranked = _closest_project_ids(wanted, available)
+    hint = (
+        f"{original_msg}\n\n"
+        "Note: code-intel graph tools identify a project by its LOCAL REPO-PATH "
+        "slug (e.g. \"C-Users-13144-Documents-Meridian-repository\"), NOT the "
+        "Meridian planning-project name (e.g. \"meridian-build\")."
+    )
+    if wanted:
+        hint += f" You passed {wanted!r}."
+    if ranked:
+        shown = ranked[:10]
+        hint += "\n\nAvailable indexed project identifiers:\n" + "\n".join(
+            f"  - {p}" for p in shown
+        )
+        if len(ranked) > len(shown):
+            hint += f"\n  ... and {len(ranked) - len(shown)} more"
+        hint += (
+            f"\n\nRetry with the closest match, e.g. project_id={ranked[0]!r}."
+        )
+    else:
+        hint += (
+            "\n\nNo indexed projects were reported — call "
+            "codebase__list_projects to see what is available, or "
+            "codebase__index_repository to index this repo first."
+        )
+    return hint
+
+
 async def call_tunnel_tool(
     tenant_id: str, name: str, arguments: dict | None,
     repo_path: str | None = None,
+    *,
+    db: Any = None,
+    session_id: "str | None" = None,
 ) -> dict | None:
     """Route a ``tools/call`` to the tunnel that owns ``name``.
 
@@ -2673,6 +2956,14 @@ async def call_tunnel_tool(
     4d9ad87b — ``repo_path`` (explicit or from _tenant_active_repo cache) is
     forwarded as ``X-Meridian-Repo-Path`` so the SerenaDaemonPool on the tunnel
     client routes code-intel requests to the correct per-repo Serena daemon.
+
+    73d233e4 — when a MUTATING word-slot (docx) tool is being relayed and ``db``
+    is supplied, consult the target document's live file claims first and RAISE a
+    concurrent-write conflict (surfaced to the caller as an MCP error) when another
+    live session holds a conflicting claim on it. A .docx is a zip container with no
+    partial write, so two relayed edits silently last-save-wins each other; the
+    guard turns that silent stomp into a legible, coordinatable error. Fail-open —
+    no db / unidentifiable target / lookup error passes through unchanged.
     """
     label = (_tunnel_tool_routes.get(tenant_id) or {}).get(name)
     if label is None:
@@ -2705,6 +2996,17 @@ async def call_tunnel_tool(
                         f"filesystem tools require absolute paths — got relative path {_p!r}. "
                         f"Use a full path, e.g. C:\\\\Users\\\\13144\\\\Documents\\\\...\\\\{_p}"
                     )
+    # 73d233e4 — concurrent-write protection on the word/office (docx) path. A
+    # tunneled .docx write has no partial-write; without this, two sessions editing
+    # the same document silently overwrite each other (last-save-wins). Before
+    # relaying a MUTATING word tool, consult the target document's live claims and
+    # refuse when another live session holds a conflicting write/symbol claim.
+    if label == "word":
+        conflict = await check_word_write_conflict(
+            db, tenant_id, name, arguments, session_id=session_id,
+        )
+        if conflict is not None:
+            raise RuntimeError(conflict["message"])
     # 4d9ad87b — resolve repo_path: explicit arg wins, then cached value from the
     # last send_active_repo_control call for this tenant.
     effective_repo_path = repo_path or _tenant_active_repo.get(tenant_id)
@@ -2719,7 +3021,19 @@ async def call_tunnel_tool(
         return None
     err = resp.get("error")
     if err:
-        raise RuntimeError(str(err.get("message") if isinstance(err, dict) else err))
+        _msg = str(err.get("message") if isinstance(err, dict) else err)
+        # 7ef712a8 — a code-intel graph tool that misses on the project id gets a
+        # slug-vs-planning-name hint + the list of indexed identifiers so the
+        # caller can retry instead of abandoning code-intel. Only the code slot's
+        # project-taking tools are eligible; enrichment never itself raises.
+        if label == "code":
+            try:
+                _msg = await _enrich_code_intel_project_error(
+                    tenant_id, name, arguments, _msg
+                )
+            except Exception:  # noqa: BLE001 — surface the original error regardless
+                pass
+        raise RuntimeError(_msg)
     return resp.get("result")
 
 
