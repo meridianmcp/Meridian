@@ -3261,6 +3261,23 @@ async def get_tasks(
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+def _like_escape(term: str) -> str:
+    """f51e38d8 — escape LIKE/ILIKE wildcard characters in a search term.
+
+    SQLite (and Postgres) LIKE/ILIKE treat ``%``, ``_``, and the escape
+    character itself as special. When user input is used as a LIKE operand
+    via a parameterized placeholder the special chars are still interpreted
+    as wildcards, so searching for ``file_name`` would match ``file1name``
+    and searching for ``100%`` would widen to match anything containing
+    ``100``.
+
+    This function escapes ``!`` → ``!!``, ``%`` → ``!%``, ``_`` → ``!_``
+    so the caller can use ``LIKE ? ESCAPE '!'`` and get literal substring
+    matching even when the term contains those characters.
+    """
+    return term.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+
 def _multiword_match_clause(
     columns: "list[str]", query: str, *, op: str = "LIKE"
 ) -> "tuple[str, list[str]]":
@@ -3329,6 +3346,11 @@ def _multiword_or_ranked_clause(
 
     Placeholders are ``?`` (the pg adapter rewrites to %s); ``op`` is LIKE
     (SQLite, case-insensitive) or ILIKE (PG).
+
+    f51e38d8 — wildcard characters (``%``, ``_``, ``!``) in query terms are
+    escaped via :func:`_like_escape` and ``ESCAPE '!'`` is appended to every
+    LIKE/ILIKE clause so that literal substring matching is preserved even when
+    the query contains those characters.
     """
     terms = _search_terms(query)
     where_parts: list[str] = []
@@ -3336,8 +3358,8 @@ def _multiword_or_ranked_clause(
     where_params: list[str] = []
     score_params: list[str] = []
     for term in terms:
-        col_or = " OR ".join(f"{c} {op} ?" for c in columns)
-        like = f"%{term}%"
+        col_or = " OR ".join(f"{c} {op} ? ESCAPE '!'" for c in columns)
+        like = f"%{_like_escape(term)}%"
         where_parts.append(f"({col_or})")
         where_params.extend([like] * len(columns))
         score_parts.append(f"(CASE WHEN ({col_or}) THEN 1 ELSE 0 END)")

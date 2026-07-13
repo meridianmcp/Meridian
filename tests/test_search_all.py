@@ -117,28 +117,92 @@ async def test_search_all_result_shape_has_no_internal_score(anydb):
 
 
 def test_multiword_or_ranked_clause_helper():
-    """25155e91 — the OR/ranked builder: one OR clause per term (>=2 chars,
+    """25155e91/f51e38d8 — the OR/ranked builder: one OR clause per term (>=2 chars,
     capped), OR-ed across columns AND across terms; a score expression counting
-    matched terms; params emitted score-first (SELECT list) then WHERE."""
+    matched terms; params emitted score-first (SELECT list) then WHERE.
+    Each LIKE/ILIKE clause now carries ESCAPE '!' so wildcard chars in terms are
+    literal (f51e38d8)."""
     where_sql, score_sql, wp, sp = db_module._multiword_or_ranked_clause(
         ["title", "body"], "alpha beta", op="LIKE")
     assert where_sql == (
-        "((title LIKE ? OR body LIKE ?) OR (title LIKE ? OR body LIKE ?))")
+        "((title LIKE ? ESCAPE '!' OR body LIKE ? ESCAPE '!') OR "
+        "(title LIKE ? ESCAPE '!' OR body LIKE ? ESCAPE '!'))")
     assert score_sql == (
-        "((CASE WHEN (title LIKE ? OR body LIKE ?) THEN 1 ELSE 0 END) + "
-        "(CASE WHEN (title LIKE ? OR body LIKE ?) THEN 1 ELSE 0 END))")
+        "((CASE WHEN (title LIKE ? ESCAPE '!' OR body LIKE ? ESCAPE '!') THEN 1 ELSE 0 END) + "
+        "(CASE WHEN (title LIKE ? ESCAPE '!' OR body LIKE ? ESCAPE '!') THEN 1 ELSE 0 END))")
     assert wp == ["%alpha%", "%alpha%", "%beta%", "%beta%"]
     assert sp == ["%alpha%", "%alpha%", "%beta%", "%beta%"]
 
     # ILIKE for the PG op, single column.
     w1, _s1, wp1, _sp1 = db_module._multiword_or_ranked_clause(
         ["description"], "auth", op="ILIKE")
-    assert w1 == "((description ILIKE ?))"
+    assert w1 == "((description ILIKE ? ESCAPE '!'))"
     assert wp1 == ["%auth%"]
 
     # All-short tokens → fall back to the whole query as one term.
     _w2, _s2, wp2, _sp2 = db_module._multiword_or_ranked_clause(["c"], "a b")
     assert wp2 == ["%a b%"]
+
+    # f51e38d8 — wildcard chars in the term are escaped in the bound value.
+    _w3, _s3, wp3, _sp3 = db_module._multiword_or_ranked_clause(["c"], "file_name")
+    assert wp3 == ["%file!_name%"], "underscore must be escaped to '!_'"
+
+    _w4, _s4, wp4, _sp4 = db_module._multiword_or_ranked_clause(["c"], "100%")
+    assert wp4 == ["%100!%%"], "percent must be escaped to '!%'"
+
+
+def test_like_escape_helper():
+    """f51e38d8 — _like_escape escapes the three SQLite/PG LIKE special chars."""
+    from meridian.db import _like_escape
+    assert _like_escape("normal") == "normal"
+    assert _like_escape("file_name") == "file!_name"
+    assert _like_escape("100%") == "100!%"
+    assert _like_escape("a!b") == "a!!b"
+    # All three at once.
+    assert _like_escape("!_%") == "!!!_!%"
+
+
+@pytest.mark.asyncio
+async def test_search_all_special_chars_no_error_no_wildcard(anydb):
+    """f51e38d8 — queries containing %, _, or quote chars must not raise errors
+    and must not expand into unexpected wildcard matches.
+
+    Specifically:
+    - searching '100%' must NOT match a record that only contains '100' (no %)
+    - searching 'file_name' must NOT match 'file1name' (underscore wildcard)
+    - searching "O'Brien" must not raise a SQL error
+    """
+    db = anydb
+    p = await db_module.create_project(db, "sa-special-chars")
+
+    # A record that contains '100' but NOT the literal '%'.
+    await db_module.add_project_note(
+        db, p["id"], "100 items note", "there are 100 items in the list")
+    # A record that contains '100%' literally.
+    await db_module.add_project_note(
+        db, p["id"], "100 percent note", "this is 100% done and complete")
+    # A record whose name contains 'file1name' (one char between, not underscore).
+    await db_module.add_project_note(
+        db, p["id"], "file1name note", "the file1name identifier is used here")
+
+    # Searching for '100%' must match the literal '100%' record but NOT the
+    # '100 items' record (which only has '100', not '100%').
+    result = await db_module.search_all(db, p["id"], "100%")
+    matched_titles = [n["title"] for n in result["notes"]]
+    assert "100 percent note" in matched_titles, (
+        "search for '100%' must find the record literally containing '100%'")
+    assert "100 items note" not in matched_titles, (
+        "search for '100%' must NOT match a record that only has '100' without '%'")
+
+    # Searching for 'file_name' must NOT match 'file1name' (the _ is not a wildcard).
+    result2 = await db_module.search_all(db, p["id"], "file_name")
+    matched2 = [n["title"] for n in result2["notes"]]
+    assert "file1name note" not in matched2, (
+        "underscore in query must be escaped (not a single-char wildcard)")
+
+    # A query with a SQL quote character must not raise any error.
+    result3 = await db_module.search_all(db, p["id"], "O'Brien")
+    assert isinstance(result3, dict)  # no exception, any result shape is fine
 
 
 def test_or_tsquery_source_helper():
