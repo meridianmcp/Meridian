@@ -13148,6 +13148,34 @@ async def record_handoff(
     return (await get_handoff(db, hid)) or {"id": hid}
 
 
+async def amend_handoff(
+    db: aiosqlite.Connection,
+    project_id: str,
+    body: str,
+    mode: str,
+) -> dict[str, Any] | None:
+    """edd9c54b — update the most recent handoff row for a project in-place.
+
+    Called when generate_handoff detects that the prior handoff was never
+    consumed (pending_goal is still set, meaning no start_session has popped
+    it since the last generate_handoff). Amending avoids inflating the handoffs
+    table with redundant rows and suppresses the context-refresh nudge.
+
+    Returns the updated row, or None if no prior row exists (caller falls back
+    to record_handoff).
+    """
+    rows = await get_handoffs(db, project_id, limit=1)
+    if not rows:
+        return None
+    hid = rows[0]["id"]
+    await db.execute(
+        "UPDATE handoffs SET body = ?, mode = ?, created_at = datetime('now') WHERE id = ?",
+        (body, mode, hid),
+    )
+    await db.commit()
+    return await get_handoff(db, hid)
+
+
 async def get_handoff(
     db: aiosqlite.Connection, handoff_id: str
 ) -> dict[str, Any] | None:

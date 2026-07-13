@@ -32,7 +32,7 @@ async def planner_handoff_endpoint(
     db = await _db(request)
     data_dir = _data_dir(request)
     try:
-        path, content = await asyncio.wait_for(
+        path, content, _ = await asyncio.wait_for(
             handoff_module.generate_handoff(
                 db, project_id, data_dir, mode="planner"
             ),
@@ -66,7 +66,7 @@ async def generate_handoff_endpoint(
     db = await _db(request)
     data_dir = _data_dir(request)
     try:
-        path, content = await asyncio.wait_for(
+        path, content, _ = await asyncio.wait_for(
             handoff_module.generate_handoff(
                 db, project_id, data_dir,
                 skip_ai_summary=skip_summary,

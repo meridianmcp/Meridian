@@ -5459,7 +5459,7 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
                 )
             except Exception:  # noqa: BLE001
                 _narrative = ""
-        path, _content = await asyncio.wait_for(
+        path, _content, _amended = await asyncio.wait_for(
             handoff_module_local.generate_handoff(
                 db, project_id, _data_dir(request), mode="delta",
                 session_id=session_id, extra_narrative=_narrative or None,

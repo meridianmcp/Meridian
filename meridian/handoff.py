@@ -2487,11 +2487,13 @@ async def generate_handoff(
     graph_searcher: Callable[[str], Any] | None = None,
     extra_narrative: str | None = None,
     identity: str | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
-    Returns ``(path, content)`` where ``path`` is the absolute path to the
-    rendered file on disk.
+    Returns ``(path, content, amended)`` where ``path`` is the absolute path to
+    the rendered file on disk and ``amended`` is True when the prior handoff was
+    still unconsumed (pending_goal never popped by start_session) so this call
+    amended the existing record in-place rather than creating a new one.
 
     Set ``skip_ai_summary=True`` for hot-path / test code that shouldn't
     burn a Haiku call. Pass ``summarizer`` to inject a stub for either
@@ -2501,9 +2503,11 @@ async def generate_handoff(
     if project is None:
         raise ValueError(f"project not found: {project_id}")
     if mode == "planner":
-        return await _generate_planner_handoff(db, project_id, output_dir)
+        _pl_path, _pl_content = await _generate_planner_handoff(db, project_id, output_dir)
+        return _pl_path, _pl_content, False
     if mode in {"starter", "compact"}:
-        return await _generate_starter_handoff(db, project, output_dir, identity=identity)
+        _st_path, _st_content = await _generate_starter_handoff(db, project, output_dir, identity=identity)
+        return _st_path, _st_content, False
     if mode not in {"full", "delta"}:
         raise ValueError("mode must be 'full', 'delta', 'planner', 'starter', or 'compact'")
 
@@ -2832,12 +2836,31 @@ async def generate_handoff(
     out_path.write_text(content, encoding="utf-8")
     if session_id:
         _SESSION_HANDOFF_STATE[session_id] = state_ts
-    # 8819d6b1 — persist this handoff to the history table so the dashboard /
-    # planner can list past handoffs and detect new ones. Never break handoff
-    # generation if the insert fails (e.g. pre-migration DB).
+    # edd9c54b — amend-vs-fresh: if the prior handoff was never consumed (the
+    # project's pending_goal is still set, meaning no start_session has popped it
+    # since generate_handoff last ran), amend the existing handoffs row in-place
+    # instead of inserting a new record. This suppresses the context-refresh nudge
+    # (nothing new has happened that the nudge would be informing about) and avoids
+    # inflating the handoffs table with redundant rows.
+    # Detection: pending_goal is NULL after start_session pops it, so non-NULL here
+    # unambiguously means the prior handoff was set but never picked up.
+    _amended = False
     try:
-        await db_module.record_handoff(db, project_id, mode, content, session_id)
-    except Exception:  # noqa: BLE001
+        _prior_goal = await db_module.get_pending_goal(db, project_id)
+        if _prior_goal is not None:
+            # Prior handoff exists and was never consumed — amend in-place.
+            _amend_result = await db_module.amend_handoff(db, project_id, content, mode)
+            if _amend_result is not None:
+                _amended = True
+            else:
+                # No prior row to amend (e.g. pre-migration DB or the row was
+                # deleted externally) — fall through to fresh record.
+                await db_module.record_handoff(db, project_id, mode, content, session_id)
+        else:
+            # 8819d6b1 — fresh handoff: persist to the history table so the
+            # dashboard / planner can list past handoffs and detect new ones.
+            await db_module.record_handoff(db, project_id, mode, content, session_id)
+    except Exception:  # noqa: BLE001 — never break handoff generation
         pass
     # 5efe254b — persist the /goal to the trusted channel so the next
     # start_session can surface it as an MCP tool result (keyed on project_id)
@@ -2886,7 +2909,7 @@ async def generate_handoff(
     # c0d2356d — refresh the repo's Stop-hook sprint guard with this project's ID
     # (self-guarded; never breaks handoff).
     await _write_sprint_guard_hooks(db, project_id)
-    return str(out_path.resolve()), content
+    return str(out_path.resolve()), content, _amended
 
 
 async def _generate_planner_handoff(

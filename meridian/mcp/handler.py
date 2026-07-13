@@ -2049,8 +2049,9 @@ async def _handle_task_tools(
             )
         except Exception:  # noqa: BLE001
             _graph_searcher = None
+        _handoff_amended = False
         try:
-            path, content = await asyncio.wait_for(
+            path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
                     db,
                     args["project_id"],
@@ -2127,6 +2128,7 @@ async def _handle_task_tools(
             "file_path": path,
             "content": _plain_content,
             "mode": mode,
+            "amended": _handoff_amended,
             "template_stale": _tpl_stale,
             "insight_hints": _insight_hints[:5],
             "goal_length_warning": _goal_warn,
@@ -3564,7 +3566,7 @@ async def _handle_session_tools(
         _ckpt_project = await db_module.get_project(db, project_id)
         _commits = await _fetch_recent_commits(_ckpt_project or {}, tenant)
         try:
-            _, content = await asyncio.wait_for(
+            _, content, _ = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
                     db, project_id, data_dir, mode="delta", session_id=session_id,
                     commit_messages=[c["message"] for c in _commits],
@@ -6161,8 +6163,17 @@ async def _dispatch_mcp_tool(
                                 _interval = settings.get("refresh_interval_turns") or 10
                                 _calls = _state["calls"]
                                 _last = _state["last_refresh"]
+                                # edd9c54b — amend path: suppress the
+                                # trigger-based nudge for generate_handoff when
+                                # the call merely amended an unconsumed prior
+                                # handoff (nothing genuinely new to report).
+                                _amended_handoff = (
+                                    name == "generate_handoff"
+                                    and isinstance(_result, dict)
+                                    and _result.get("amended") is True
+                                )
                                 _fire = (
-                                    name in enabled_triggers
+                                    (name in enabled_triggers and not _amended_handoff)
                                     or (_calls - _last) >= _interval
                                 )
                                 # One-per-call: only fire if we haven't already

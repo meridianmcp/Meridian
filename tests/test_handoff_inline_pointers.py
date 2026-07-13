@@ -1,4 +1,4 @@
-"""Tests for 36fea6ca — inline RESOLVED sprint-item pointers in the handoff.
+﻿"""Tests for 36fea6ca — inline RESOLVED sprint-item pointers in the handoff.
 
 generate_handoff improvement (2): each pending sprint item's DURABLE pointers
 (the ones persisted in sprint_item_pointers via add_sprint_item_pointer) are
@@ -182,7 +182,7 @@ async def test_generate_handoff_renders_resolved_pointers_inline(db, tmp_path):
         label="guard site",
     )
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "Resolved pointers:" in content
@@ -209,7 +209,7 @@ async def test_generate_handoff_omits_resolved_pointers_when_flag_off(db, tmp_pa
     )
     await db_module.update_workspace_settings(db, handoff_inline_pointers=False)
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "Resolved pointers:" not in content
@@ -241,7 +241,7 @@ async def test_generate_handoff_survives_pointer_resolve_blowup(db, tmp_path, mo
     monkeypatch.setattr(db_module, "get_sprint_item_pointers", _boom)
 
     # Must not raise, and must still produce a handoff.
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "resilient item" in content

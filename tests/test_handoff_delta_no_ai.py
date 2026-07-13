@@ -1,4 +1,4 @@
-"""Regression test for 4c7cd788 — generate_handoff(mode='delta') must be AI-free.
+﻿"""Regression test for 4c7cd788 — generate_handoff(mode='delta') must be AI-free.
 
 Two independent sessions saw generate_handoff(mode='delta', session_id=...) hang
 ~4 minutes (client timeout) while a lighter call stayed instant. Root cause: the
@@ -30,7 +30,7 @@ async def test_delta_handoff_invokes_no_summarizer(db, tmp_path):
         return "AI OUTPUT SHOULD NOT APPEAR"
 
     # Delta mode with skip_ai_summary=False: NONE of the AI seams may run.
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), summarizer=_spy, skip_ai_summary=False,
         mode="delta", session_id="sess-delta",
     )
@@ -55,7 +55,7 @@ async def test_full_handoff_still_invokes_summarizer(db, tmp_path):
         calls.append(prompt)
         return "STUB SUMMARY"
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), summarizer=_spy, skip_ai_summary=False,
         mode="full",
     )

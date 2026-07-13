@@ -288,7 +288,7 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     s2 = await db_module.register_session(db, p["id"], "sess-2")
     await db_module.log_task(db, s1["id"], p["id"], "did A", "done")
     await db_module.log_task(db, s2["id"], p["id"], "did B", "done")
-    path, content = await handoff_module.generate_handoff(
+    path, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "MERIDIAN_CONTEXT" in content
@@ -322,7 +322,7 @@ async def test_handoff_custom_template(db, tmp_path):
     item = await db_module.add_sprint_item(db, p["id"], "v1.1", "Custom handoff item")
 
     # Default behavior first: no template set → standard L0/L1 handoff.
-    _, default_content = await handoff_module.generate_handoff(
+    _, default_content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "MERIDIAN_CONTEXT" in default_content
@@ -338,7 +338,7 @@ async def test_handoff_custom_template(db, tmp_path):
         ),
     )
     assert (await db_module.get_workspace_settings(db))["handoff_template"]
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "# Custom Handoff" in content
@@ -352,7 +352,7 @@ async def test_handoff_custom_template(db, tmp_path):
     # Empty string reverts to the server default.
     await db_module.update_workspace_settings(db, handoff_template="")
     assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
-    _, reverted = await handoff_module.generate_handoff(
+    _, reverted, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "MERIDIAN_CONTEXT" in reverted
@@ -366,7 +366,7 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     second = await db_module.add_sprint_item(
         db, p["id"], "v1", "Second fix", depends_on=first["id"]
     )
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "1. [pending] First fix" in content
@@ -403,7 +403,7 @@ async def test_handoff_includes_strategic_notes(db, tmp_path):
         "This should stay out of L0 strategic notes.",
         "technical",
     )
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "Strategic Notes (1)" in content
@@ -429,7 +429,7 @@ async def test_handoff_delta_mode_reports_recent_changes(db, tmp_path):
         session_id="sess-delta",
     )
     await db_module.complete_sprint_item(db, p["id"], first["id"])
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db,
         p["id"],
         str(tmp_path),
@@ -450,7 +450,7 @@ async def test_handoff_starter_mode(db, tmp_path):
     it1 = await db_module.add_sprint_item(db, p["id"], "v1", "First item")
     it2 = await db_module.add_sprint_item(db, p["id"], "v1", "Second item")
     await db_module.complete_sprint_item(db, p["id"], it1["id"])
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="starter"
     )
     lines = [l for l in content.splitlines() if l]
@@ -5401,14 +5401,14 @@ async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
     from meridian import handoff as handoff_module
     p = await db_module.create_project(db, "queue-proj2")
     await db_module.set_queued_session(db, p["id"], "/goal next sprint")
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "=== QUEUED NEXT SESSION ===" in content
     assert "/goal next sprint" in content
     # Cleared after exactly one handoff.
     assert await db_module.get_queued_session(db, p["id"]) is None
-    _, content2 = await handoff_module.generate_handoff(
+    _, content2, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "=== QUEUED NEXT SESSION ===" not in content2
@@ -10345,7 +10345,7 @@ def test_hooks_stop_explicit_session_generates_delta_handoff(client, monkeypatch
         captured["mode"] = mode
         captured["project_id"] = project_id
         captured["session_id"] = session_id
-        return ("/tmp/handoff-delta.md", "# delta handoff\n")
+        return ("/tmp/handoff-delta.md", "# delta handoff\n", False)
 
     monkeypatch.setattr("meridian.handoff.generate_handoff", _fake_handoff)
 
@@ -10375,7 +10375,7 @@ def test_hooks_stop_resolves_most_recent_active_session_without_session_id(clien
     async def _fake_handoff(db, project_id, output_dir, *, mode="full", session_id=None, **kw):
         captured["mode"] = mode
         captured["session_id"] = session_id
-        return ("/tmp/handoff-delta.md", "# delta handoff\n")
+        return ("/tmp/handoff-delta.md", "# delta handoff\n", False)
 
     monkeypatch.setattr("meridian.handoff.generate_handoff", _fake_handoff)
 
@@ -10400,7 +10400,7 @@ def test_hooks_stop_no_resolvable_session_returns_ok_null_handoff(client, monkey
 
     async def _fake_handoff(*a, **kw):
         called["n"] += 1
-        return ("/tmp/x.md", "x")
+        return ("/tmp/x.md", "x", False)
 
     monkeypatch.setattr("meridian.handoff.generate_handoff", _fake_handoff)
 
@@ -14331,7 +14331,7 @@ def test_generate_handoff_accepts_commit_messages(db, tmp_path):
             "feat: implement oauth token refresh for expired sessions",
             "fix: unrelated change",
         ]
-        _, content = await hm.generate_handoff(
+        _, content, _ = await hm.generate_handoff(
             db, p["id"], str(tmp_path),
             skip_ai_summary=True,
             commit_messages=commits,

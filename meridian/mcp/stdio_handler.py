@@ -2169,7 +2169,7 @@ def build_mcp_server():
                     session_id,
                 )
                 try:
-                    path, content = await asyncio.wait_for(
+                    path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
                             db,
                             arguments["project_id"],
