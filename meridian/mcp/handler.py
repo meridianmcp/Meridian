@@ -3013,6 +3013,56 @@ async def _handle_notes_decisions(
             "document_id": doc_row["id"],
             "matches": matches,
         }
+    if name == "link_figure_caption":
+        # 0ff8b982 — durably link an already-indexed doc_figures row to its
+        # caption paragraph by stable doc_elements id (not proximity). Confirmation
+        # primitive for the advisory suggestion from index_figure, and the
+        # backfill mechanism for figures indexed before caption linkage was added.
+        validate_input_size(args.get("doc"), "figure doc", 2_000)
+        validate_input_size(args.get("figure_id"), "figure_id", 200)
+        validate_input_size(args.get("caption_element_id"), "caption_element_id", 200)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        figure_id = (args.get("figure_id") or "").strip()
+        caption_element_id = (args.get("caption_element_id") or "").strip()
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not figure_id:
+            return {"error": "figure_id is required"}
+        if not caption_element_id:
+            return {"error": "caption_element_id is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for doc={doc_source!r} — ingest_document "
+                    "it first (that MCP tool populates the doc-structure store; "
+                    "there is no separate reindex_document tool)"
+                ),
+            }
+        try:
+            updated = await store.set_figure_caption_link(figure_id, caption_element_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not set caption link: {exc}"}
+        if updated is None:
+            return {
+                "error": (
+                    f"no doc_figures row found for figure_id={figure_id!r} "
+                    "— use find_similar_figure to locate the correct figure_id"
+                ),
+            }
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            "figure": updated,
+        }
     if name == "index_table":
         # 2622182d — index ONE table into the SEMANTIC table index (dedup +
         # similarity on a normalized caption), the direct parallel of

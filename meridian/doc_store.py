@@ -187,6 +187,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         normalized_caption TEXT,
         semantic_label TEXT,
         file_exists INTEGER,
+        caption_element_id TEXT,
         created_at TEXT NOT NULL
     )
     """,
@@ -307,7 +308,8 @@ _EQUATION_COLUMNS = (
 )
 _FIGURE_COLUMNS = (
     "id", "document_id", "element_id", "ordinal", "file_path", "caption",
-    "normalized_caption", "semantic_label", "file_exists", "created_at",
+    "normalized_caption", "semantic_label", "file_exists", "caption_element_id",
+    "created_at",
 )
 _TABLE_COLUMNS = (
     "id", "document_id", "element_id", "ordinal", "table_index", "caption",
@@ -1299,6 +1301,17 @@ class DocStructureStore:
             await self._db.execute(
                 "ALTER TABLE doc_documents "
                 "ADD COLUMN link_status TEXT NOT NULL DEFAULT 'live'"
+            )
+            await self._db.commit()
+        # 0ff8b982 — caption_element_id: durable linkage from a doc_figures row to
+        # the doc_elements element (kind='figure' paragraph carrying the SEQ field)
+        # that IS that figure's caption, by stable element id rather than paragraph
+        # proximity. DEFAULT NULL so every pre-existing figure row (stored before
+        # this column) reads back as unlinked (not yet confirmed), which is honest
+        # — they can be back-filled via the link_figure_caption MCP tool.
+        if not await self._column_exists("doc_figures", "caption_element_id"):
+            await self._db.execute(
+                "ALTER TABLE doc_figures ADD COLUMN caption_element_id TEXT"
             )
             await self._db.commit()
 
@@ -2527,6 +2540,44 @@ class DocStructureStore:
                 }
         return None
 
+    async def _find_all_caption_candidates(
+        self, document_id: str, element_id: str | None
+    ) -> list[str]:
+        """Return ALL ``kind='figure'`` elements in the same section as ``element_id``.
+
+        0ff8b982 — advisory lookup: when a doc_figures row's ``caption_element_id``
+        is not given, find every ``kind='figure'`` doc_elements row (SEQ-field
+        caption paragraph) that shares the same parent section as the anchor
+        ``element_id``. Returns an ordered list of element ids (empty when
+        element_id is None or the section has no figure-caption elements).
+
+        When exactly ONE candidate exists -> ``put_figures`` surfaces it as
+        ``suggested_caption_element_id`` (unambiguous advisory suggestion).
+        When MULTIPLE candidates exist -> ``put_figures`` surfaces all of them
+        as ``suggested_caption_candidates`` (the "Figure 3b used twice" ambiguity
+        scenario from the real thesis -- two caption elements in one section that
+        must be disambiguated via :meth:`set_figure_caption_link`, not silently
+        auto-resolved). ADVISORY ONLY -- never auto-applied.
+        """
+        if not isinstance(element_id, str) or not element_id.strip():
+            return []
+        async with self._db.execute(
+            "SELECT parent_id FROM doc_elements WHERE id = ?",
+            (element_id.strip(),),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return []
+        parent_id = _row_get(row, "parent_id")
+        async with self._db.execute(
+            "SELECT id FROM doc_elements "
+            "WHERE document_id = ? AND kind = 'figure' AND parent_id IS ? "
+            "ORDER BY ordinal ASC",
+            (document_id, parent_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_get(r, "id") for r in rows if _row_get(r, "id")]
+
     async def put_figures(
         self,
         document_id: str,
@@ -2544,11 +2595,22 @@ class DocStructureStore:
         dropped or silently piled up.
 
         Each ``figures`` item is ``{file_path?, caption?, semantic_label?,
-        element_id?, ordinal?}``. The referenced ``file_path`` is checked against
-        disk: a missing file is FLAGGED (``file_exists`` on the row, and a
-        ``missing_files`` entry in the result) -- never a hard failure, because a
-        figure can be indexed before its asset lands or when the store runs on a
-        different host than the captured path.
+        element_id?, ordinal?, caption_element_id?}``. The referenced ``file_path``
+        is checked against disk: a missing file is FLAGGED (``file_exists`` on the
+        row, and a ``missing_files`` entry in the result) -- never a hard failure,
+        because a figure can be indexed before its asset lands or when the store
+        runs on a different host than the captured path.
+
+        NEW vs original put_figures (0ff8b982): when ``caption_element_id`` is
+        not given, the nearest ``kind='figure'`` doc_elements element in the same
+        structural section (the SEQ-field caption paragraph) is surfaced as a
+        SUGGESTION in ``suggested_caption_element_id`` on the inserted row (NOT
+        auto-applied -- advisory only, same pattern as near_duplicates and
+        doc_tables' paired_figure_id). When MULTIPLE caption elements exist in
+        the same section (the "Figure 3b used twice" ambiguity scenario), ALL
+        candidates are surfaced in ``suggested_caption_candidates`` (a list of
+        element ids) so the caller can confirm the correct one via
+        link_figure_caption rather than having the store silently pick one.
 
         Returns ``{"inserted": [...], "near_duplicates": [...],
         "missing_files": [...]}``; a ``near_duplicates`` entry is
@@ -2591,22 +2653,52 @@ class DocStructureStore:
             now = _now_iso()
             semantic_label = fig.get("semantic_label")
             element_id = fig.get("element_id")
+            caption_element_id = fig.get("caption_element_id")
+
+            # 0ff8b982 — advisory suggestion: when no caption_element_id is given,
+            # find all caption-shaped elements (kind='figure') in the same structural
+            # section. Surface:
+            #   * a single suggestion as suggested_caption_element_id when there is
+            #     exactly one candidate (unambiguous), or
+            #   * ALL candidates as suggested_caption_candidates when there are
+            #     multiple (the "Figure 3b used twice" ambiguity scenario).
+            # Never auto-applied -- advisory only.
+            suggested_caption_element_id: str | None = None
+            suggested_caption_candidates: list[str] | None = None
+            if caption_element_id is None and element_id is not None:
+                try:
+                    candidates = await self._find_all_caption_candidates(
+                        document_id, element_id
+                    )
+                except Exception:  # noqa: BLE001 — suggestion is advisory only
+                    candidates = []
+                if len(candidates) == 1:
+                    suggested_caption_element_id = candidates[0]
+                elif len(candidates) > 1:
+                    suggested_caption_candidates = candidates
 
             await self._db.execute(
                 "INSERT INTO doc_figures "
                 "(id, document_id, element_id, ordinal, file_path, caption, "
-                "normalized_caption, semantic_label, file_exists, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "normalized_caption, semantic_label, file_exists, "
+                "caption_element_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (fig_id, document_id, element_id, ordinal, file_path, caption,
-                 normalized_caption, semantic_label, exists, now),
+                 normalized_caption, semantic_label, exists,
+                 caption_element_id, now),
             )
-            row = {
+            row: dict[str, Any] = {
                 "id": fig_id, "document_id": document_id, "element_id": element_id,
                 "ordinal": ordinal, "file_path": file_path, "caption": caption,
                 "normalized_caption": normalized_caption,
                 "semantic_label": semantic_label, "file_exists": exists,
+                "caption_element_id": caption_element_id,
                 "created_at": now,
             }
+            if suggested_caption_element_id is not None:
+                row["suggested_caption_element_id"] = suggested_caption_element_id
+            if suggested_caption_candidates is not None:
+                row["suggested_caption_candidates"] = suggested_caption_candidates
             inserted.append(row)
             pool.append(row)
 
@@ -2637,6 +2729,7 @@ class DocStructureStore:
         caption: str | None = None,
         semantic_label: str | None = None,
         element_id: str | None = None,
+        caption_element_id: str | None = None,
     ) -> dict[str, Any]:
         """Index ONE figure -- the ``index_figure`` MCP tool's primitive.
 
@@ -2644,12 +2737,19 @@ class DocStructureStore:
         missing-file surfacing as :meth:`put_figures`). Returns
         ``{"figure": <inserted row, or None if not inserted>,
         "near_duplicates": [...], "missing_files": [...]}``.
+
+        0ff8b982 — ``caption_element_id`` (optional): the doc_elements id of the
+        caption paragraph (kind='figure' SEQ-field element) that is DURABLY linked
+        to this figure. When not given, an advisory suggestion is surfaced on the
+        returned figure row (``suggested_caption_element_id`` or
+        ``suggested_caption_candidates`` for the ambiguous-multi-candidate case).
         """
         fig: dict[str, Any] = {
             "file_path": file_path.strip() if isinstance(file_path, str) else file_path,
             "caption": caption,
             "semantic_label": semantic_label,
             "element_id": element_id,
+            "caption_element_id": caption_element_id,
         }
         result = await self.put_figures(document_id, [fig])
         return {
@@ -2657,6 +2757,43 @@ class DocStructureStore:
             "near_duplicates": result["near_duplicates"],
             "missing_files": result["missing_files"],
         }
+
+    async def set_figure_caption_link(
+        self,
+        figure_id: str,
+        caption_element_id: str,
+    ) -> dict[str, Any] | None:
+        """Durably set the ``caption_element_id`` on an existing doc_figures row.
+
+        0ff8b982 — the write primitive for the ``link_figure_caption`` MCP tool:
+        confirms (or corrects) the durable linkage from a figure to its caption
+        paragraph element, identified by the stable ``doc_elements.id``. This is
+        the backfill mechanism for figures already indexed before the
+        ``caption_element_id`` column existed, and the confirmation primitive
+        when the advisory suggestion from :meth:`put_figures` surfaces multiple
+        candidates (the "Figure 3b used twice" ambiguity scenario).
+
+        Returns the updated figure row as a dict, or ``None`` when ``figure_id``
+        does not resolve to any stored figure.
+        """
+        if not isinstance(figure_id, str) or not figure_id.strip():
+            return None
+        async with self._db.execute(
+            "SELECT * FROM doc_figures WHERE id = ?", (figure_id.strip(),)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        await self._db.execute(
+            "UPDATE doc_figures SET caption_element_id = ? WHERE id = ?",
+            (caption_element_id, figure_id.strip()),
+        )
+        await self._db.commit()
+        async with self._db.execute(
+            "SELECT * FROM doc_figures WHERE id = ?", (figure_id.strip(),)
+        ) as cur:
+            updated_row = await cur.fetchone()
+        return _row_to_dict(updated_row, _FIGURE_COLUMNS)
 
     # -- tables (semantic index) — 2622182d ----------------------------------
 

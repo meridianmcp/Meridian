@@ -44,6 +44,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "find_symbol_usages": 'find_symbol_usages(project_id="abc-123", doc="thesis/chapter1.docx", symbol_or_equation_id="E=mc^2")',
     "index_figure": 'index_figure(project_id="abc-123", doc="thesis/chapter1.docx", file_path="figures/setup.png", caption="Figure 3: The experimental setup", semantic_label="apparatus diagram")',
     "find_similar_figure": 'find_similar_figure(project_id="abc-123", doc="thesis/chapter1.docx", description_or_path="experimental setup diagram")',
+    "link_figure_caption": 'link_figure_caption(project_id="abc-123", doc="thesis/chapter1.docx", figure_id="fig-uuid-here", caption_element_id="el-uuid-here")',
     "index_table": 'index_table(project_id="abc-123", doc="thesis/chapter1.docx", table_index=2, caption="Table 2: Summary of experimental results", semantic_label="results table")',
     "find_similar_table": 'find_similar_table(project_id="abc-123", doc="thesis/chapter1.docx", description="summary of experimental results")',
     "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
@@ -618,6 +619,28 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "outputs_dir": {"type": "string", "description": "d2a3537a — optional outputs tree root. When given, each matched figure resolves THROUGH to its outputs_index row (linked_output) by file_path. Omit for a pure fuzzy match."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "description_or_path"]}},
+    {"name": "link_figure_caption", "description":
+        "0ff8b982 — DURABLY link an already-indexed figure (doc_figures row) to "
+        "its caption paragraph (a doc_elements id), by stable structural id "
+        "rather than paragraph proximity. Use this to confirm an advisory "
+        "suggested_caption_element_id returned by index_figure, or to "
+        "backfill a durable link on a figure that was indexed before caption "
+        "linkage was supported. Provide figure_id (the doc_figures.id of the "
+        "figure to link) and caption_element_id (the doc_elements.id of the "
+        "caption paragraph — a kind='figure' SEQ-field element from the "
+        "section-tree store). This is the confirmation primitive for the "
+        "'Figure 3b used twice' ambiguity scenario: when index_figure surfaces "
+        "suggested_caption_candidates (multiple captions in the same section), "
+        "inspect them and call this tool with the correct one to confirm the "
+        "durable link. Returns the updated figure row on success, or {error} "
+        "when figure_id doesn't resolve to a known figure.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you ingested it under via ingest_document)."},
+         "figure_id": {"type": "string", "description": "The doc_figures.id of the figure row to update (from index_figure or find_similar_figure)."},
+         "caption_element_id": {"type": "string", "description": "The doc_elements.id of the caption paragraph to durably link to this figure."}},
+         "required": ["doc", "figure_id", "caption_element_id"]}},
     {"name": "index_table", "description":
         "2622182d — index ONE table into the SEMANTIC table index against a "
         "document already stored in the doc-structure store — populated by "
