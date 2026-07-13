@@ -5622,7 +5622,7 @@ async def _handle_tunnel_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: set_active_repo (tunnel control)."""
+    """Dispatch group: set_active_repo (tunnel control), run_verification (0e973e52)."""
     if name == "set_active_repo":
         repo_path = str(args.get("repo_path") or "").strip()
         if not repo_path:
@@ -5645,6 +5645,79 @@ async def _handle_tunnel_tools(
         # access the new repo path without requiring --repo to be set at startup.
         await _tunnel_mod.send_add_fs_roots_control(tenant_id, [repo_path])
         return result
+
+    if name == "run_verification":
+        # 0e973e52 — run the project's stored test_cmd on the caller's local
+        # machine via the FS tunnel and return a structured real result.
+        # ARCHITECTURAL REQUIREMENT (decision 0dedff91): this MUST run on the
+        # caller's machine via the tunnel — the hosted server can never reach a
+        # caller's test suite. This is the exact same class of mistake that
+        # search_code_semantic / ingest_document made and were fixed for.
+        project_id = args.get("project_id", "")
+        if not project_id:
+            raise ValueError("project_id is required")
+
+        # Load the project's stored executor config to get test_cmd and cwd.
+        exec_cfg = await db_module.get_executor_config(db, project_id) or {}
+        test_cmd = (exec_cfg.get("test_cmd") or "").strip()
+        repo_path = (exec_cfg.get("repo_path") or "").strip()
+
+        if not test_cmd:
+            # Clean, honest "not configured" — never an error or fabricated pass.
+            return {
+                "status": "not_configured",
+                "message": (
+                    "No test_cmd is configured for this project. "
+                    "Call set_executor_config(project_id=..., test_cmd='...') to set one."
+                ),
+                "project_id": project_id,
+                "exit_code": None,
+                "passed": None,
+                "failed": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+
+        if tenant is None:
+            raise ValueError("run_verification requires an authenticated tenant (tunnel mode)")
+        tenant_id = tenant.get("id", "")
+
+        from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+
+        # Hosted guard: the hosted server can never spawn a process on the caller's
+        # machine directly. We ALWAYS require the tunnel — same class of fix as
+        # ingest_document / search_code_semantic / search_outputs (decision 0dedff91).
+        if _hosted_mode() and not _tunnel_mod.has_active_tunnel(tenant_id):
+            return {
+                "status": "not_connected",
+                "message": (
+                    "run_verification must run on YOUR local machine via the tunnel "
+                    "(hosted Meridian has no access to your machine or its test suite). "
+                    "Start `meridian --tunnel` in your terminal to enable it."
+                ),
+                "project_id": project_id,
+                "test_cmd": test_cmd,
+                "exit_code": None,
+                "passed": None,
+                "failed": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "hosted": True,
+            }
+
+        result = await _tunnel_mod.send_run_cmd_control(
+            tenant_id,
+            cmd=test_cmd,
+            cwd=repo_path or None,
+        )
+
+        # Enrich the result with project context so the caller has everything.
+        result["project_id"] = project_id
+        result["test_cmd"] = test_cmd
+        if repo_path:
+            result["cwd"] = repo_path
+        return result
+
     return _MISS
 
 

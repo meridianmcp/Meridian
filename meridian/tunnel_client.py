@@ -742,6 +742,18 @@ async def _run_connection_lazy(
                                 flush=True,
                             )
                         continue
+                    if msg.get("type") == "run_cmd":
+                        # 0e973e52 — run_verification: spawn test_cmd as a real local
+                        # process and send the structured result back to the server.
+                        # Only the FS slot handles this; other slots ignore it.
+                        req_id = msg.get("id", "")
+                        cmd_val = msg.get("cmd") or ""
+                        cwd_val = (msg.get("cwd") or "").strip() or None
+                        run_result = await _handle_run_cmd(cmd_val, cwd_val)
+                        run_result["type"] = "run_cmd_result"
+                        run_result["id"] = req_id
+                        await ws.send(json.dumps(run_result))
+                        continue
                     if msg.get("type") == "request":
                         # Lazy spawn: bring the proxy up if it died or was idle-killed.
                         _was_running = proxy.is_running
@@ -2060,6 +2072,102 @@ def _is_subpath(child: "Path", parent: "Path") -> bool:
         return True
     except ValueError:
         return False
+
+
+def _parse_test_counts(text: str) -> "tuple[int | None, int | None]":
+    """0e973e52 — parse passed/failed counts from common test runner output.
+
+    Recognises pytest-style summary lines ("5 passed", "2 failed") and
+    pixi/cargo/go patterns. Returns (passed, failed) — both None when the text
+    carries no recognisable summary. Never raises.
+    """
+    import re  # noqa: PLC0415
+    if not text:
+        return None, None
+    try:
+        # pytest: "5 passed, 2 failed in 3.14s" or "3 passed" or "0 failed"
+        passed: "int | None" = None
+        failed: "int | None" = None
+        pm = re.search(r"(\d+)\s+passed", text)
+        if pm:
+            passed = int(pm.group(1))
+        fm = re.search(r"(\d+)\s+failed", text)
+        if fm:
+            failed = int(fm.group(1))
+        return passed, failed
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
+    """0e973e52 — spawn *cmd* as a local process and return structured results.
+
+    Accepts a shell command string (run via the platform shell) or a list of
+    tokens (run directly). Captures stdout+stderr with a per-call hard cap of
+    16 KiB each (tail-trimmed so the most informative end is preserved). Limits
+    the output so a verbose test suite never floods the tunnel with megabytes.
+
+    Returns a dict with keys: exit_code (int), passed (int|None),
+    failed (int|None), stdout_tail (str), stderr_tail (str), status (str).
+    """
+    import asyncio as _asyncio  # noqa: PLC0415
+    import shlex as _shlex  # noqa: PLC0415
+
+    _TAIL_BYTES = 16_384
+
+    if not cmd:
+        return {
+            "status": "error",
+            "message": "cmd is empty",
+            "exit_code": None,
+            "passed": None,
+            "failed": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+
+    try:
+        if isinstance(cmd, list):
+            proc = await _asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+                cwd=cwd or None,
+            )
+        else:
+            proc = await _asyncio.create_subprocess_shell(
+                str(cmd),
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+                cwd=cwd or None,
+            )
+        stdout_b, stderr_b = await proc.communicate()
+        exit_code: int = proc.returncode if proc.returncode is not None else -1
+
+        stdout_str = stdout_b[-_TAIL_BYTES:].decode("utf-8", errors="replace") if stdout_b else ""
+        stderr_str = stderr_b[-_TAIL_BYTES:].decode("utf-8", errors="replace") if stderr_b else ""
+
+        combined = stdout_str + "\n" + stderr_str
+        passed, failed = _parse_test_counts(combined)
+
+        return {
+            "status": "ok",
+            "exit_code": exit_code,
+            "passed": passed,
+            "failed": failed,
+            "stdout_tail": stdout_str,
+            "stderr_tail": stderr_str,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "message": str(exc),
+            "exit_code": None,
+            "passed": None,
+            "failed": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
 
 
 def _add_fs_roots_to_cmd(cmd: "list[str]", new_roots: "list[str]") -> "tuple[list[str], bool]":

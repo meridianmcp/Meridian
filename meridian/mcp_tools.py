@@ -87,6 +87,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_session_log": 'get_session_log(session_id="session-uuid")',
     "set_active_repo": 'set_active_repo(repo_path="C:\\\\Users\\\\me\\\\project")',
     "analyze_model_efficiency": 'analyze_model_efficiency(title="Refactor auth across 12 files + migration", file_count=12, touches_resources=["auth_db", "sessions_table"], size="xl")',
+    "run_verification": 'run_verification(project_id="abc-123")  # runs stored test_cmd on your local machine via tunnel',
 }
 
 
@@ -1624,6 +1625,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "repo_path": {"type": "string", "description": "Absolute path to the repository to activate (e.g. /home/me/project or C:\\\\Users\\\\me\\\\project)."}},
          "required": ["repo_path"]}},
+    {"name": "run_verification",
+     "description":
+        "0e973e52 — run the project's stored test_cmd on YOUR local machine via the "
+        "tunnel and return a REAL, structured result — not self-reported. "
+        "Fields: {exit_code, passed, failed, stdout_tail, stderr_tail, status, timed_out}. "
+        "Returns {status: 'not_configured'} (never an error) when no test_cmd is set; "
+        "call set_executor_config(test_cmd='pixi run test') first. "
+        "Requires an active `meridian --tunnel`; the hosted server has no access to "
+        "your machine (same architectural class as ingest_document / search_code_semantic "
+        "/ search_outputs — decision 0dedff91). "
+        "Per-project: only runs when test_cmd is configured for that project.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string", "description": "Meridian project id — whose stored test_cmd to run."},
+         "project_name": {"type": "string", "description": "Project name — resolved to id internally. project_id wins if both given."}},
+         "required": []}},
     {"name": "analyze_model_efficiency",
      "description":
         "0fba4cb6 — MECHANICAL (zero-token) model-tier suggestion for a task or "
@@ -1738,6 +1754,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "search_outputs": "Search Outputs",
     "annotate_outputs": "Annotate Outputs",
     "search_code_semantic": "Search Code Semantic",
+    "run_verification": "Run Verification",
 }
 
 for _tool in _MCP_TOOLS_LIST:

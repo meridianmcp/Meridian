@@ -114,6 +114,12 @@ _pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_docs_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_zotero_reqs: dict[str, asyncio.Future[dict]] = {}
 
+# 0e973e52 — run_verification: per-request futures for run_cmd control messages
+# sent over the FS WebSocket. The FS receive loop resolves these when the client
+# sends back a {"type": "run_cmd_result", "id": "...", ...} message. Keyed by
+# correlation id (uuid4), independent of _pending_reqs (HTTP proxy futures).
+_pending_run_cmd_reqs: dict[str, "asyncio.Future[dict]"] = {}
+
 # 8fb69d54 — 4 pre-allocated custom tunnel slots (p0-p3, ports 8814-8817) so
 # custom plugins get real server routes and appear in the claude.ai connector
 # (closes ecf5b8c6). Registries are keyed by slot label, mirroring word/dc.
@@ -419,6 +425,15 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
                 if fut is not None and not fut.done():
                     fut.set_result(msg)
 
+            # 0e973e52 — run_verification: client sends back run_cmd results
+            # over the same FS socket using a separate message type so these
+            # never collide with HTTP-proxy "response" futures.
+            if msg_type == "run_cmd_result":
+                req_id = msg.get("id")
+                fut_rc = _pending_run_cmd_reqs.get(req_id)
+                if fut_rc is not None and not fut_rc.done():
+                    fut_rc.set_result(msg)
+
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -435,6 +450,10 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
         for fut in list(_pending_reqs.values()):
             if not fut.done():
                 fut.cancel()
+        # 0e973e52 — cancel any in-flight run_cmd requests when FS socket drops
+        for fut_rc in list(_pending_run_cmd_reqs.values()):
+            if not fut_rc.done():
+                fut_rc.cancel()
         try:
             await db_module.update_tenant(auth_db, tenant_id, tunnel_active=0)
         except Exception:
@@ -1992,6 +2011,101 @@ async def send_set_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[st
         return {"status": "ok", "roots": roots}
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "message": str(exc)}
+
+
+# 0e973e52 — run_verification: timeout for waiting on the client's run_cmd_result.
+# The test suite may be slow (minutes); default 300 s is generous but bounded.
+# Configurable via MERIDIAN_RUN_CMD_TIMEOUT for power users.
+def _run_cmd_timeout() -> float:
+    raw = os.environ.get("MERIDIAN_RUN_CMD_TIMEOUT", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    return 300.0
+
+
+async def send_run_cmd_control(
+    tenant_id: str,
+    cmd: str | list[str],
+    cwd: str | None = None,
+) -> dict:
+    """0e973e52 — send a run_cmd control message over the FS WebSocket.
+
+    Sends ``{"type": "run_cmd", "id": "<uuid>", "cmd": ..., "cwd": ...}`` to the
+    tenant's local tunnel client and awaits a ``{"type": "run_cmd_result", ...}``
+    reply. Returns a structured result dict::
+
+        {
+            "exit_code": int,
+            "passed": int | None,    # parsed from pytest/pixi output
+            "failed": int | None,
+            "stdout_tail": str,
+            "stderr_tail": str,
+            "timed_out": bool,       # True when client didn't reply in time
+            "status": "ok" | "not_connected" | "error" | "timeout",
+        }
+
+    Requires an active FS tunnel (``_tunnel_sockets``). If no tunnel is connected
+    returns ``{"status": "not_connected", ...}`` so callers can surface an honest
+    "not configured" message instead of a spurious error.
+    """
+    ws = _tunnel_sockets.get(tenant_id)
+    if ws is None:
+        return {
+            "status": "not_connected",
+            "message": "tunnel not connected — run `meridian --tunnel` first",
+            "exit_code": None,
+            "passed": None,
+            "failed": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+
+    req_id = str(uuid.uuid4())
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future[dict] = loop.create_future()
+    _pending_run_cmd_reqs[req_id] = fut
+
+    try:
+        await ws.send_json({
+            "type": "run_cmd",
+            "id": req_id,
+            "cmd": cmd,
+            "cwd": cwd or "",
+        })
+        result = await asyncio.wait_for(fut, timeout=_run_cmd_timeout())
+    except asyncio.TimeoutError:
+        _pending_run_cmd_reqs.pop(req_id, None)
+        return {
+            "status": "timeout",
+            "message": f"test command timed out after {_run_cmd_timeout():.0f}s",
+            "exit_code": None,
+            "passed": None,
+            "failed": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "timed_out": True,
+        }
+    except Exception as exc:  # noqa: BLE001
+        _pending_run_cmd_reqs.pop(req_id, None)
+        return {
+            "status": "error",
+            "message": str(exc),
+            "exit_code": None,
+            "passed": None,
+            "failed": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    finally:
+        _pending_run_cmd_reqs.pop(req_id, None)
+
+    # The client sends back the structured result directly.
+    return result
 
 
 # live-fs-roots — POST/DELETE /tunnel/filesystem-roots: add or remove a single
