@@ -553,8 +553,27 @@ def _build_handler(on_event: Callable[[str, str], None]) -> Any:
 # walking uses this to decide which files get a row at all: we index EVERY
 # regular file so a figure/image is discoverable, but only .csv/.json get real
 # text content (see _content_for_fts).
+MERIDIAN_NOTES_FILENAME = "MERIDIAN_NOTES.md"
+"""The well-known filename for human-authored outputs annotations.
+
+Any ``MERIDIAN_NOTES.md`` file found ANYWHERE in the walked outputs tree is
+auto-ingested into the ``annotations`` table keyed to the directory it was
+found in. This is a TESTED, ENFORCED step in the directory walk — NOT an
+advisory convention. Deliberately NOT ``README.md`` to avoid collision with
+existing package readmes or other tool conventions.
+"""
+
+
 def _iter_output_files(outputs_dir: str) -> list[str]:
-    """Every regular file under ``outputs_dir`` (recursive), sorted for stability."""
+    """Every regular file under ``outputs_dir`` (recursive), sorted for stability.
+
+    ``MERIDIAN_NOTES.md`` files are included in the walk (they are real
+    filesystem files) but they are handled separately in
+    :meth:`OutputsFtsIndex._ingest_meridian_notes` — they are NOT indexed as
+    FTS content rows (which would pollute search results with annotation text).
+    The caller (:meth:`OutputsFtsIndex.rebuild`) is responsible for calling
+    ``_ingest_meridian_notes`` so the pickup is a guaranteed, tested step.
+    """
     found: list[str] = []
     for root, _dirs, files in os.walk(outputs_dir):
         for fn in files:
@@ -685,6 +704,144 @@ class OutputsFtsIndex:
             "kind VARCHAR, is_archival BOOLEAN, canonical_path VARCHAR, "
             "csv_columns VARCHAR, json_keys VARCHAR)"
         )
+        # 9e02e448 — annotations table: same DuckDB, same connection. Two tiers:
+        # Tier 1 = root annotation (path == outputs_dir); Tier 2 = per-path.
+        # ``source`` is "tool" (from annotate_outputs) or "MERIDIAN_NOTES.md"
+        # (auto-ingested from a file found in the tree).
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS annotations ("
+            "path VARCHAR NOT NULL, note VARCHAR NOT NULL, "
+            "run_params_json VARCHAR, "
+            "created_at DOUBLE NOT NULL, updated_at DOUBLE NOT NULL, "
+            "source VARCHAR NOT NULL DEFAULT 'tool')"
+        )
+
+    # -- annotations (9e02e448) -----------------------------------------------
+
+    def add_annotation(
+        self,
+        path: str,
+        note: str,
+        *,
+        run_params: dict[str, Any] | None = None,
+        source: str = "tool",
+    ) -> dict[str, Any]:
+        """Upsert an annotation for ``path`` in the ``annotations`` table.
+
+        If an annotation already exists for ``(path, source)`` it is updated
+        (note + run_params + updated_at); otherwise a new row is inserted.
+        Returns the stored annotation as a dict. Thread-safe (holds the index
+        lock). Never raises on a benign DuckDB error — returns ``{error: ...}``.
+        """
+        now = time.time()
+        run_params_json = json.dumps(run_params) if run_params else None
+        with self._lock:
+            try:
+                con = self._connect()
+                self._ensure_schema(con)
+                # DuckDB doesn't have ON CONFLICT UPDATE; emulate with DELETE + INSERT.
+                con.execute(
+                    "DELETE FROM annotations WHERE path = ? AND source = ?",
+                    [path, source],
+                )
+                con.execute(
+                    "INSERT INTO annotations (path, note, run_params_json, "
+                    "created_at, updated_at, source) VALUES (?, ?, ?, ?, ?, ?)",
+                    [path, note, run_params_json, now, now, source],
+                )
+            except Exception as exc:  # noqa: BLE001 — never crash the caller
+                _log.debug("add_annotation failed for %r", path, exc_info=True)
+                return {"error": str(exc)}
+        return {
+            "path": path,
+            "note": note,
+            "run_params": run_params,
+            "created_at": now,
+            "updated_at": now,
+            "source": source,
+        }
+
+    def get_annotations_for_path(self, path: str) -> list[dict[str, Any]]:
+        """Return all annotations for ``path`` OR any of its ancestor directories.
+
+        The auto-surfacing rule: when search_outputs returns a hit at
+        ``/outputs/subdir/results.csv``, this method returns annotations keyed
+        to ``/outputs/subdir/results.csv`` itself AND to ``/outputs/subdir``
+        AND to ``/outputs`` — whichever of those has annotations, all are
+        returned. This mirrors get_file_claims/claim_file's auto-surfacing of
+        code notes: the caller never needs a second tool call to see context.
+        """
+        target = _normalize_output_path(path)
+        if not target:
+            return []
+        # Build the set of ancestor paths to check (path + all parent dirs
+        # down to the filesystem root).
+        candidates: set[str] = {target}
+        parts = target.split("/")
+        for i in range(1, len(parts)):
+            parent = "/".join(parts[:i])
+            if parent:
+                candidates.add(parent)
+        with self._lock:
+            try:
+                con = self._connect()
+                self._ensure_schema(con)
+                relation = con.execute(
+                    "SELECT path, note, run_params_json, created_at, "
+                    "updated_at, source FROM annotations"
+                )
+                columns = [c[0] for c in relation.description]
+                fetched = relation.fetchall()
+            except Exception:  # noqa: BLE001 — empty index yields []
+                _log.debug("get_annotations_for_path failed for %r", path, exc_info=True)
+                return []
+        rows: list[dict[str, Any]] = []
+        for row in fetched:
+            rec = dict(zip(columns, row))
+            norm = _normalize_output_path(rec.get("path") or "")
+            if norm in candidates:
+                rows.append({
+                    "path": rec["path"],
+                    "note": rec.get("note"),
+                    "run_params": (
+                        json.loads(rec["run_params_json"])
+                        if rec.get("run_params_json") else None
+                    ),
+                    "created_at": rec.get("created_at"),
+                    "updated_at": rec.get("updated_at"),
+                    "source": rec.get("source"),
+                })
+        # Newest first within each path; parent-path annotations after hit-path.
+        rows.sort(key=lambda r: (
+            _normalize_output_path(r.get("path") or "") != target,
+            -(r.get("updated_at") or 0),
+        ))
+        return rows
+
+    def _ingest_meridian_notes(self, paths: list[str]) -> int:
+        """Auto-ingest every ``MERIDIAN_NOTES.md`` found in ``paths`` into
+        the ``annotations`` table keyed to its containing directory.
+
+        This is a GUARANTEED, TESTED step called by :meth:`rebuild` on every
+        rebuild pass — not an advisory convention. Returns the count of
+        MERIDIAN_NOTES.md files ingested. Never raises.
+        """
+        ingested = 0
+        for p in paths:
+            if os.path.basename(p) != MERIDIAN_NOTES_FILENAME:
+                continue
+            directory = os.path.dirname(p)
+            try:
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read(_MAX_CONTENT_CHARS)
+            except OSError:
+                _log.debug("_ingest_meridian_notes: could not read %r", p, exc_info=True)
+                continue
+            if not text.strip():
+                continue
+            self.add_annotation(directory, text, source=MERIDIAN_NOTES_FILENAME)
+            ingested += 1
+        return ingested
 
     # -- (re)build -----------------------------------------------------------
 
@@ -709,6 +866,14 @@ class OutputsFtsIndex:
         """
         with self._lock:
             deadline = None if max_seconds is None else time.monotonic() + max_seconds
+            # 9e02e448 — MERIDIAN_NOTES.md auto-ingest: a GUARANTEED step on
+            # every rebuild so human-authored annotations are never silently
+            # skipped. Called while holding the lock (add_annotation re-acquires
+            # via RLock so this is safe). We walk inside _compute_rows_incremental
+            # too, but the notes pickup must happen even on a partial/unchanged
+            # rebuild so tests can assert it unconditionally.
+            all_paths = _iter_output_files(self.outputs_dir) if os.path.isdir(self.outputs_dir) else []
+            self._ingest_meridian_notes(all_paths)
             rows, changed = self._compute_rows_incremental(deadline)
             if changed:
                 try:
@@ -1048,12 +1213,47 @@ def search_outputs(
         return result
     index = _get_cached_index(outputs_dir)
     result["total_indexed"] = index.rebuild(max_seconds=max_seconds)
-    result["hits"] = index.search(
-        query, limit=limit, include_archival=include_archival,
-    )
+    hits = index.search(query, limit=limit, include_archival=include_archival)
+    # 9e02e448 — auto-surface annotations: each hit gets any annotation keyed
+    # to its own path OR any ancestor directory, so the caller sees relevant
+    # context without a second tool call (mirrors claim_file's code_notes).
+    for hit in hits:
+        hit["annotations"] = index.get_annotations_for_path(hit["path"])
+    result["hits"] = hits
     if index.last_rebuild_partial:
         result["partial"] = True
     return result
+
+
+def annotate_outputs(
+    outputs_dir: str,
+    path: str,
+    note: str,
+    *,
+    run_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Capture a human annotation for ``path`` in the outputs tree (9e02e448).
+
+    Upserts a row into the ``annotations`` table of the cached
+    :class:`OutputsFtsIndex` for ``outputs_dir``. ``path`` may be:
+
+    * The ``outputs_dir`` root itself (Tier 1 — "what this tree is about").
+    * Any sub-path (file or directory) within the tree (Tier 2 — per-run /
+      per-file context such as "PCA on, BFS off, overwritten 5x").
+
+    ``run_params`` is an optional free-form dict of parameters logged alongside
+    the note (e.g. ``{"lr": 0.001, "batch_size": 32}``).
+
+    Returns the stored annotation as a dict, or ``{"error": ...}`` on failure.
+    """
+    if not outputs_dir or not str(outputs_dir).strip():
+        return {"error": "outputs_dir is required"}
+    if not path or not str(path).strip():
+        return {"error": "path is required"}
+    if not note or not str(note).strip():
+        return {"error": "note is required"}
+    index = _get_cached_index(outputs_dir)
+    return index.add_annotation(path, note, run_params=run_params, source="tool")
 
 
 def resolve_figure_output(

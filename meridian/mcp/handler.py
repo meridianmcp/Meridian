@@ -5566,7 +5566,33 @@ async def _handle_outputs_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: search_outputs (a0e9133e — BM25 over the outputs FTS index)."""
+    """Dispatch group: search_outputs + annotate_outputs (9e02e448 / a0e9133e)."""
+    if name == "annotate_outputs":
+        from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+        outputs_dir = str(args.get("outputs_dir") or "").strip()
+        path = str(args.get("path") or "").strip()
+        note = str(args.get("note") or "").strip()
+        run_params = args.get("run_params")
+        if not outputs_dir:
+            raise ValueError("outputs_dir is required")
+        if not path:
+            raise ValueError("path is required")
+        if not note:
+            raise ValueError("note is required")
+        # 9e02e448 — local-only annotation, same guard as search_outputs:
+        # hosted Meridian can't reach the caller's machine.
+        if _hosted_mode():
+            return {
+                "error": (
+                    "annotate_outputs stores annotations in a local DuckDB index "
+                    "on YOUR filesystem and cannot run on hosted Meridian. "
+                    "Run Meridian self-hosted."
+                ),
+                "hosted": True,
+            }
+        return _outputs_indexer.annotate_outputs(
+            outputs_dir, path, note, run_params=run_params,
+        )
     if name == "search_outputs":
         from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
         from .. import hardening as _hardening  # noqa: PLC0415

@@ -45,6 +45,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "index_figure": 'index_figure(project_id="abc-123", doc="thesis/chapter1.docx", file_path="figures/setup.png", caption="Figure 3: The experimental setup", semantic_label="apparatus diagram")',
     "find_similar_figure": 'find_similar_figure(project_id="abc-123", doc="thesis/chapter1.docx", description_or_path="experimental setup diagram")',
     "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
+    "annotate_outputs": 'annotate_outputs(outputs_dir="/repo/outputs", path="/repo/outputs/run_42", note="PCA on, BFS off — final params", run_params={"lr": 0.001, "epochs": 100})',
     "search_code_semantic": 'search_code_semantic(root_dir="/repo/src", query="parse the auth token and refresh it")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -630,14 +631,39 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "include_archival=false to drop archival hits entirely. Returns "
         "{outputs_dir, query, total_indexed, hits:[{path, score, bm25, "
         "is_archival, canonical_path, kind, generating_script, csv_columns, "
-        "json_keys, size, mtime}]}. A missing dir / empty tree returns an empty "
-        "hits list, never an error.",
+        "json_keys, size, mtime, annotations:[{path, note, run_params, "
+        "created_at, updated_at, source}]}]}. annotations is auto-included "
+        "for each hit (any annotation keyed to the hit path OR a nearest "
+        "ancestor directory) — no second tool call needed. A missing dir / "
+        "empty tree returns an empty hits list, never an error.",
      "inputSchema": {"type": "object", "properties": {
          "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (walked recursively)."},
          "query": {"type": "string", "description": "The BM25 query — one or more search terms (column names, keys, script names, or any text in a csv/json)."},
          "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
          "include_archival": {"type": "boolean", "description": "Default true — archival copies are deprioritized but still returned. Set false to exclude confirmed-archival files entirely."}},
          "required": ["outputs_dir", "query"]}},
+    {"name": "annotate_outputs", "description":
+        "9e02e448 — capture a human annotation for a path inside an outputs "
+        "tree WITHOUT touching the filesystem. Upserts a row into the "
+        "annotations layer of the local DuckDB outputs index for outputs_dir. "
+        "Two tiers, same mechanism: Tier 1 = pass outputs_dir as path to "
+        "annotate the whole tree ('what this experiment tree is about'); "
+        "Tier 2 = pass any sub-path (file or directory) to annotate a specific "
+        "run, file, or subdirectory ('PCA on, BFS off, overwritten 5x'). "
+        "run_params is an optional free-form dict of parameters logged alongside "
+        "the note (e.g. {\"lr\": 0.001, \"batch_size\": 32}). Annotations are "
+        "automatically surfaced in search_outputs results — any hit's path (or "
+        "its nearest ancestor directory) that has an annotation will have it "
+        "included in the hit's 'annotations' field without a second tool call. "
+        "A MERIDIAN_NOTES.md file placed anywhere in the tree is also "
+        "auto-ingested into the same table on every rebuild, keyed to its "
+        "containing directory. Returns the stored annotation as a dict.",
+     "inputSchema": {"type": "object", "properties": {
+         "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree root (same value you pass to search_outputs)."},
+         "path": {"type": "string", "description": "The path to annotate — either the outputs_dir root (Tier 1, tree-level annotation) or any file/subdirectory path within the tree (Tier 2, per-run or per-file annotation)."},
+         "note": {"type": "string", "description": "The annotation text (e.g. 'PCA on, BFS off — results from run on 2026-07-12 with lr=0.001')."},
+         "run_params": {"type": "object", "description": "Optional free-form key-value dict of run parameters to log alongside the note (e.g. {\"lr\": 0.001, \"epochs\": 100})."}},
+         "required": ["outputs_dir", "path", "note"]}},
     {"name": "search_code_semantic", "description":
         "93fce816 — Cursor-style LOCAL semantic code search over a source tree, "
         "entirely in a DuckDB sidecar (no cloud round-trip). Parses Python "
@@ -1663,6 +1689,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "index_figure": "Index Figure",
     "find_similar_figure": "Find Similar Figure",
     "search_outputs": "Search Outputs",
+    "annotate_outputs": "Annotate Outputs",
     "search_code_semantic": "Search Code Semantic",
 }
 
