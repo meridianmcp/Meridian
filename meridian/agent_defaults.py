@@ -37,7 +37,13 @@ import re
 #   v7 — research-routing protocol adds Context7 as the preferred source for
 #        framework/library docs questions (88dbb675): if Context7 is in the tool
 #        list, consult it before web search for React/Tailwind/Next.js/etc.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 7
+#   v8 — MANDATORY CODE INTEL PROTOCOL names search_code_semantic explicitly as
+#        the fallback for fuzzy/conceptual/multi-occurrence queries (44db89b3):
+#        search_graph and Serena extractor__* are exact-symbol lookups only: a
+#        real executor session tonight used raw grep exclusively rather than
+#        search_code_semantic because the fallback was never named as a rule,
+#        only an unwritten intention.
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 8
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -157,6 +163,13 @@ a full restart (tunnel + Claude Desktop) has been observed to fix transient
 tool-discovery failures for extractor__* — try that before concluding the tool is
 permanently gone.
 
+**search_code_semantic fallback (44db89b3):** `search_graph` and Serena's
+`extractor__*` tools are EXACT-SYMBOL lookups — they need a known name. When your
+query is fuzzy, conceptual, or expected to match multiple occurrences (e.g. "where
+do we validate webhook signatures", "every place that reads MERIDIAN_DB_URL"), use
+`search_code_semantic` instead of iterating exact-symbol tools or falling back to
+grep — it is the designated fallback for that query shape, not a last resort.
+
 ## RESEARCH ROUTING PROTOCOL
 When a task needs external research, route the query to the most authoritative
 source FIRST — do not default to a generic web search:
@@ -176,7 +189,7 @@ source FIRST — do not default to a generic web search:
 Retrieval beats recall: look it up. Do not answer a decision-relevant factual
 question from memory when a source can be checked.
 
-<!-- meridian-executor-standard: v7 -->
+<!-- meridian-executor-standard: v8 -->
 """
 
 
