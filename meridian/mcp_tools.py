@@ -1284,6 +1284,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Read-only: Cross-reference pending sprint items against recent git commits and "
         "return items that may already be done. Uses keyword matching — confidence 'high' "
         "means 3+ keywords overlap (safe to mark done), 'medium' means 1-2 (verify first). "
+        "Also surfaces 'notes_blocker_drift': pending items whose notes describe a deferral "
+        "or blocker (keywords: FLAGGED, DEFERRED, BLOCKED, 'not implementable', etc.) but "
+        "whose structured fields (blocker_kind, deferred_until) are both unset — these items "
+        "will keep surfacing as ordinary claimable work until you call update_sprint_item "
+        "with blocker_kind='manual' or deferred_until=<ISO timestamp>. "
         "Call during planning sessions to identify board drift before filing new items.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},

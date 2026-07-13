@@ -5214,6 +5214,75 @@ def _classify_task_tier(descriptor: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# 8eea5a9a — Deferral/blocker language in notes without matching structured
+# fields.  A prior session correctly diagnosed 5 items as deferred/blocked in
+# PROSE (notes) but never called the structured field update, so
+# get_parallelizable_groups / generate_handoff kept surfacing them as ordinary
+# claimable work.  This check is the SYSTEMIC prevention: scan every pending
+# item (blocker_kind IS NULL, deferred_until IS NULL) for well-known
+# deferral/blocker keywords in its notes and surface mismatches as drift
+# warnings so a planner or executor can apply the structured field deliberately.
+# It is intentionally READ-ONLY — auto-guessing blocker_kind or deferred_until
+# would be presumptuous and wrong.
+_DEFERRAL_NOTES_KEYWORDS: tuple[str, ...] = (
+    "flagged",
+    "deferred",
+    "blocked",
+    "not implementable",
+    "not fixable here",
+    "not for executor",
+)
+
+
+def _detect_notes_blocker_drift(
+    pending_items: list[dict],
+) -> list[dict]:
+    """Return drift findings for pending items whose notes describe a deferral
+    or blocker but whose structured fields (blocker_kind, deferred_until) are
+    both unset.
+
+    Only items that are status='pending' AND blocker_kind IS NULL AND
+    deferred_until IS NULL are candidates.  This is a read-only check; it does
+    NOT set any field.
+
+    Returns a list of dicts:
+        {item_id, title, matched_keyword, snippet, warning}
+    """
+    findings: list[dict] = []
+    for item in pending_items:
+        # Only candidates: truly unblocked-by-structure pending items.
+        if item.get("blocker_kind") is not None:
+            continue
+        if item.get("deferred_until") is not None:
+            continue
+        notes_raw: str = (item.get("notes") or "").strip()
+        if not notes_raw:
+            continue
+        notes_lower = notes_raw.lower()
+        for kw in _DEFERRAL_NOTES_KEYWORDS:
+            if kw in notes_lower:
+                # Surface a short snippet around the matched keyword for context.
+                idx = notes_lower.find(kw)
+                snippet_start = max(0, idx - 20)
+                snippet_end = min(len(notes_raw), idx + len(kw) + 60)
+                snippet = notes_raw[snippet_start:snippet_end].strip()
+                findings.append({
+                    "item_id": item.get("id"),
+                    "title": item.get("title", ""),
+                    "matched_keyword": kw,
+                    "snippet": snippet,
+                    "warning": (
+                        f"Item notes describe a deferral or blocker "
+                        f"(keyword: '{kw}') but blocker_kind and deferred_until "
+                        f"are both unset. Call update_sprint_item with "
+                        f"blocker_kind='manual' or deferred_until=<ISO timestamp> "
+                        f"so this item stops surfacing as ordinary claimable work."
+                    ),
+                })
+                break  # one finding per item is enough
+    return findings
+
+
 async def _handle_planning_tools(
     name: str,
     args: dict[str, Any],
@@ -5233,7 +5302,13 @@ async def _handle_planning_tools(
         project = await db_module.get_project(db, args["project_id"])
         if project is None:
             raise ValueError("project not found")
-        pending_items = await db_module.get_sprint_items(db, args["project_id"], status="pending")
+        # include_manual_blocker=True so we can inspect ALL pending items,
+        # including those already tagged manual — the notes-drift check only
+        # fires on items where blocker_kind IS NULL, so tagged items are
+        # skipped automatically inside _detect_notes_blocker_drift.
+        pending_items = await db_module.get_sprint_items(
+            db, args["project_id"], status="pending", include_manual_blocker=True
+        )
         commits = await _fetch_recent_commits(project, tenant)
         matches = handoff_module_local.reconcile_sprint_items(pending_items, commits)
         action_items = [
@@ -5250,6 +5325,10 @@ async def _handle_planning_tools(
             }
             for m in matches
         ]
+        # 8eea5a9a — surface items whose notes describe a deferral/blocker
+        # but whose structured fields (blocker_kind, deferred_until) are unset.
+        # Read-only: callers must apply the structured field themselves.
+        notes_drift = _detect_notes_blocker_drift(pending_items)
         return {
             "pending_item_count": len(pending_items),
             "commit_count": len(commits),
@@ -5257,6 +5336,8 @@ async def _handle_planning_tools(
             "high_confidence": sum(1 for m in matches if m["confidence"] == "high"),
             "medium_confidence": sum(1 for m in matches if m["confidence"] == "medium"),
             "matches": action_items,
+            "notes_blocker_drift": notes_drift,
+            "notes_blocker_drift_count": len(notes_drift),
         }
     if name == "get_planning_brief":
         project_id = args["project_id"]
