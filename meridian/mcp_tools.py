@@ -537,7 +537,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "{document_id, para_id, new_text, elements_resynced, source_path}. "
         "elements_resynced is 0 for a plain body paragraph (only headings are "
         "persisted as elements) — that is expected, not a failure. Errors "
-        "(never a silent no-op) when the doc/source/para_id doesn't resolve.",
+        "(never a silent no-op) when the doc/source/para_id doesn't resolve. "
+        "f7ee1ba7 — pass session_id to enable scoped-region claim enforcement: "
+        "if another session has claimed the target para_id (or holds a whole-file "
+        "lock), the write is REJECTED with error='docx_region_conflict'. Use "
+        "claim_docx_region to acquire your region before writing.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -545,7 +549,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "para_id": {"type": "string", "description": "The target paragraph's w14:paraId (or 'p{index}' fallback), as reported by the read side."},
          "new_text": {"type": "string", "description": "New paragraph text as a single unformatted run. Provide this OR runs, not both."},
          "runs": {"type": "array", "description": "List of runs — each a plain string or a {text, bold?, italic?, underline?} object. Provide this OR new_text, not both.",
-                  "items": {"type": ["string", "object"]}}},
+                  "items": {"type": ["string", "object"]}},
+         "session_id": {"type": "string", "description": "f7ee1ba7 — calling session id. When provided, scoped-region claim enforcement activates: the write is rejected if another session claims the target para_id or holds a whole-file lock. Without session_id the guard is skipped (legacy/unclaimed writes pass through)."}},
          "required": ["doc", "para_id"]}},
     {"name": "find_symbol_usages", "description":
         "9605edb0 — READ-ONLY cross-reference tracking: given a document and "
@@ -1579,6 +1584,39 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "min_sessions": {"type": "integer"},
          "days": {"type": "integer"}},
          "required": []}},
+    {"name": "claim_docx_region", "description":
+        "f7ee1ba7 — Model B scoped-region claiming for .docx files. Claim a "
+        "specific paragraph/element by its durable `element_id` (the w14:paraId "
+        "surfaced by get_document_structure / update_paragraph) so another session "
+        "cannot overwrite it concurrently. Two sessions can hold NON-OVERLAPPING "
+        "element claims on the SAME file — the real precision benefit vs. a "
+        "whole-file lock. An edit to a claimed element_id by another session is "
+        "REJECTED structurally (not just advisory) at the update_paragraph level. "
+        "A whole-file lock by another session blocks this claim. Returns "
+        "{claimed: true, file_path, session_id, element_id} on success or "
+        "{claimed: false, reason, message, conflicts} on conflict.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string", "description": "The calling session."},
+         "file_path": {"type": "string", "description": "The .docx source path (the same value as the `doc` arg to update_paragraph / ingest_document)."},
+         "element_id": {"type": "string", "description": "The target element's durable id (w14:paraId or p{index} fallback) as surfaced by get_document_structure."}},
+         "required": ["session_id", "file_path", "element_id"]}},
+    {"name": "get_docx_region_claims", "description":
+        "f7ee1ba7 — Read-only: list active scoped docx-region claims on a file "
+        "(who owns which element_ids). Use before update_paragraph to see whether "
+        "the target element is claimed.",
+     "inputSchema": {"type": "object", "properties": {
+         "file_path": {"type": "string", "description": "The .docx source path."}},
+         "required": ["file_path"]}},
+    {"name": "release_docx_region_claims", "description":
+        "f7ee1ba7 — Release scoped docx-region claims held by a session. "
+        "Without element_id releases all claims on the file; with element_id "
+        "releases only that one element. Without file_path releases ALL region "
+        "claims held by the session across all files.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string", "description": "The session releasing its claims."},
+         "file_path": {"type": "string", "description": "Optional: scope release to one file."},
+         "element_id": {"type": "string", "description": "Optional: scope release to one element (requires file_path)."}},
+         "required": ["session_id"]}},
     {"name": "list_plugins", "description":
         "Read-only: Lightweight index of active tunnel plugins — name, description, "
         "enabled state, and tool_count. Does NOT return full tool schemas (use "

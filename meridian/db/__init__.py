@@ -991,6 +991,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_wave(db)
     await _migrate_mcp_rate_counters(db)
     await _migrate_workspace_proposals(db)
+    await _migrate_docx_region_claims(db)
     return db
 
 
@@ -13460,3 +13461,372 @@ async def prune_rate_counters(
         (older_than_minute,),
     )
     await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# f7ee1ba7 — Model B: scoped docx-region claims
+#
+# A .docx is a zip container with no partial write; every mutating tool
+# re-saves the whole file (last-save-wins). ``file_locks`` (whole-file) and
+# ``file_symbol_claims`` (code line-ranges) already guard code files at two
+# granularities. This extends the same pattern to DOCX documents:
+#
+# * A session may claim a specific paragraph/element by its durable ``para_id``
+#   (the ``w14:paraId`` the OOXML layer already surfaces — the same id used by
+#   ``update_paragraph`` and ``get_document_structure``).
+# * Two sessions can hold NON-OVERLAPPING element claims on the same file
+#   concurrently — the precision benefit mirroring symbol claims for code.
+# * An edit attempt OUTSIDE the caller's claimed element is REJECTED before
+#   touching the filesystem — structural prevention, not advice.
+# * A whole-file (unscoped) claim still works as before; scoped claims
+#   compose with it (a whole-file lock blocks all scoped writers, exactly as
+#   file_locks blocks symbol claims).
+# ---------------------------------------------------------------------------
+
+async def _migrate_docx_region_claims(db: aiosqlite.Connection) -> None:
+    """f7ee1ba7 — create file_docx_region_claims table if it doesn't exist.
+
+    Guarded migration (no inline CREATE INDEX in CREATE_TABLES — 2026-07-04
+    outage rule): the table and its indexes are created here, so existing DBs
+    pick them up on first startup after the deploy.
+    """
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_docx_region_claims (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL,
+            element_id TEXT NOT NULL,
+            claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            released_at TEXT
+        )
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_docx_region_claims_file "
+        "ON file_docx_region_claims (file_path)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_docx_region_claims_session "
+        "ON file_docx_region_claims (session_id)"
+    )
+    await db.commit()
+
+
+async def _live_docx_region_claims_for_file(
+    db: aiosqlite.Connection,
+    file_path: str,
+    exclude_session_id: str,
+) -> list[dict[str, Any]]:
+    """Active scoped docx-region claims on ``file_path`` held by OTHER sessions.
+
+    Uses the same _CLAIM_LIVE_HOURS staleness cutoff as file_symbol_claims so
+    a crashed session's element claims time out consistently.
+    """
+    cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
+    async with db.execute(
+        "SELECT drc.id, drc.session_id, drc.file_path, drc.element_id, "
+        "       drc.claimed_at, s.name AS session_name "
+        "FROM file_docx_region_claims drc "
+        "JOIN sessions s ON s.id = drc.session_id "
+        "WHERE drc.file_path = ? AND drc.session_id != ? "
+        "AND drc.released_at IS NULL "
+        "AND s.status IN ('active', 'live') "
+        "AND (s.last_seen IS NULL OR s.last_seen > ?)",
+        (file_path, exclude_session_id, cutoff),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
+async def claim_docx_region(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+    element_id: str,
+) -> dict[str, Any]:
+    """Claim a specific paragraph/element of a .docx for exclusive editing.
+
+    f7ee1ba7 — Model B scoped-region claiming. ``element_id`` is the durable
+    ``w14:paraId`` (or ``p{index}`` fallback) surfaced by
+    ``get_document_structure`` / ``update_paragraph`` — the same stable id that
+    round-trips through the OOXML layer.
+
+    Conflict rules (mirror file_symbol_claims / claim_symbol):
+
+    * A whole-file write lock on the document by ANOTHER session blocks this
+      claim (the file owner may touch any element).
+    * Another session's scoped claim on the SAME ``element_id`` blocks (hard
+      conflict — two writers would race on the same paragraph).
+    * Another session's claim on a DIFFERENT element is allowed (the real
+      precision benefit: parallel editing of non-overlapping regions).
+    * The caller's own prior claim on this element is refreshed (idempotent).
+
+    Returns ``{"claimed": True, ...}`` on success, ``{"claimed": False,
+    "reason": ..., ...}`` on conflict, never raises.
+    """
+    normalized = _normalize_file_path(file_path)
+    if not normalized:
+        return {"claimed": False, "reason": "invalid", "message": "file_path is required"}
+    elem = (element_id or "").strip()
+    if not elem:
+        return {"claimed": False, "reason": "invalid", "message": "element_id is required"}
+
+    # Check for a whole-file write lock held by another session.
+    await expire_file_locks(db)
+    async with db.execute(
+        "SELECT session_id, claimed_at, expires_at FROM file_locks WHERE file_path = ?",
+        (normalized,),
+    ) as cur:
+        _fl_row = await cur.fetchone()
+    _fl = _row_to_dict(_fl_row)
+    if _fl and _fl.get("session_id") and _fl.get("session_id") != session_id:
+        return {
+            "claimed": False,
+            "reason": "file_locked",
+            "file_path": normalized,
+            "element_id": elem,
+            "holder_session_id": _fl.get("session_id"),
+            "message": (
+                f"Cannot claim element {elem!r} in {normalized}: another live session "
+                "holds a whole-file lock on it. Wait for it to release, or coordinate."
+            ),
+        }
+
+    # Check for another session's claim on the same element_id.
+    others = await _live_docx_region_claims_for_file(db, normalized, session_id)
+    conflicts = [c for c in others if c.get("element_id") == elem]
+    if conflicts:
+        holder = conflicts[0]
+        safe_elements = list({c["element_id"] for c in others if c["element_id"] != elem})
+        holder_name = holder.get("session_name") or (holder.get("session_id") or "unknown")[:8]
+        return {
+            "claimed": False,
+            "reason": "element_conflict",
+            "file_path": normalized,
+            "element_id": elem,
+            "conflicts": [
+                {
+                    "element_id": c["element_id"],
+                    "holder_session_id": c["session_id"],
+                    "holder_session_name": c.get("session_name"),
+                }
+                for c in conflicts
+            ],
+            "other_claimed_elements": safe_elements,
+            "message": (
+                f"Element {elem!r} in {normalized} is already claimed by session "
+                f"{holder_name}. Pick a different element or wait for the claim to release."
+            ),
+        }
+
+    # No conflict — (re)claim this element (idempotent per session+file+element).
+    await db.execute(
+        "DELETE FROM file_docx_region_claims "
+        "WHERE session_id = ? AND file_path = ? AND element_id = ?",
+        (session_id, normalized, elem),
+    )
+    await db.execute(
+        "INSERT INTO file_docx_region_claims (id, session_id, file_path, element_id) "
+        "VALUES (?, ?, ?, ?)",
+        (_new_id(), session_id, normalized, elem),
+    )
+    await db.commit()
+    return {
+        "claimed": True,
+        "file_path": normalized,
+        "session_id": session_id,
+        "element_id": elem,
+    }
+
+
+async def get_docx_region_claims(
+    db: aiosqlite.Connection,
+    file_path: str,
+) -> list[dict[str, Any]]:
+    """Return active scoped docx-region claims on ``file_path`` (released_at IS NULL).
+
+    f7ee1ba7 — read-only; newest first. Expired claims (sessions gone stale)
+    are NOT pruned here — read-only so it never writes. Use claim_docx_region
+    to auto-expire on the write path.
+    """
+    normalized = _normalize_file_path(file_path)
+    async with db.execute(
+        "SELECT drc.*, s.name AS session_name "
+        "FROM file_docx_region_claims drc "
+        "LEFT JOIN sessions s ON s.id = drc.session_id "
+        "WHERE drc.file_path = ? AND drc.released_at IS NULL "
+        "ORDER BY drc.claimed_at DESC",
+        (normalized,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
+async def release_docx_region_claims(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str | None = None,
+    element_id: str | None = None,
+) -> int:
+    """Soft-release scoped docx-region claims held by ``session_id``.
+
+    f7ee1ba7 — sets released_at (never deletes) so history is retained.
+    Scoping: all claims for the session (no args), all claims on one file
+    (file_path), or a single element claim (file_path + element_id).
+    Returns the number of claims released.
+    """
+    if file_path and element_id:
+        normalized = _normalize_file_path(file_path)
+        cur = await db.execute(
+            "UPDATE file_docx_region_claims SET released_at = datetime('now') "
+            "WHERE session_id = ? AND file_path = ? AND element_id = ? "
+            "AND released_at IS NULL",
+            (session_id, normalized, element_id.strip()),
+        )
+    elif file_path:
+        normalized = _normalize_file_path(file_path)
+        cur = await db.execute(
+            "UPDATE file_docx_region_claims SET released_at = datetime('now') "
+            "WHERE session_id = ? AND file_path = ? AND released_at IS NULL",
+            (session_id, normalized),
+        )
+    else:
+        cur = await db.execute(
+            "UPDATE file_docx_region_claims SET released_at = datetime('now') "
+            "WHERE session_id = ? AND released_at IS NULL",
+            (session_id,),
+        )
+    await db.commit()
+    return cur.rowcount
+
+
+async def check_docx_region_write_conflict(
+    db: "Any",
+    session_id: str | None,
+    file_path: str,
+    element_id: str | None,
+) -> "dict[str, Any] | None":
+    """Scoped-claim enforcement gate for docx writes (f7ee1ba7 Model B).
+
+    Called by ``update_paragraph`` before writing a paragraph into a .docx.
+    Returns a conflict dict ``{"blocked": True, "reason": ..., "message": ...}``
+    when the write must be rejected, else ``None`` (clear — proceed).
+
+    Rules (strictly enforced, not advisory):
+
+    1. Whole-file lock: if another session holds a whole-file write lock on
+       ``file_path``, BLOCK (regardless of element_id). The file owner controls
+       every element.
+    2. Scoped-claim enforcement: if ANY session holds a scoped claim on
+       ``file_path`` AND ``session_id`` is NOT the holder AND ``element_id``
+       is NOT in the caller's own scoped claims for this file → BLOCK.
+       - If the write is for an element another session has claimed → BLOCK
+         (element owned by someone else).
+       - If the write is for an element the caller DOES own → ALLOW (owner
+         writes their own region).
+       - If no scoped claims exist at all → ALLOW (unscoped/unclaimed).
+    3. Fail-open: a DB error, missing db, or unidentifiable element degrades
+       to None (no block). The gate surfaces conflicts; claim_docx_region is
+       the real primitive.
+    """
+    if db is None:
+        return None
+    normalized = _normalize_file_path(file_path)
+    if not normalized:
+        return None
+    _sid = (session_id or "").strip()
+    _elem = (element_id or "").strip()
+
+    try:
+        # Rule 1: whole-file write lock by another session.
+        await expire_file_locks(db)
+        async with db.execute(
+            "SELECT session_id FROM file_locks WHERE file_path = ?",
+            (normalized,),
+        ) as cur:
+            fl_row = await cur.fetchone()
+        fl = _row_to_dict(fl_row)
+        if fl and fl.get("session_id") and fl.get("session_id") != _sid:
+            holder = fl["session_id"]
+            return {
+                "blocked": True,
+                "reason": "file_locked",
+                "file_path": normalized,
+                "element_id": _elem or None,
+                "holder": holder,
+                "message": (
+                    f"Cannot write element {_elem!r} in {normalized}: session {holder} "
+                    "holds a whole-file write lock. Wait for it to release or coordinate."
+                ),
+            }
+
+        # Rule 2: scoped-claim enforcement.
+        # Any scoped claim on this file means the file is in "region-partitioned"
+        # mode — edits without owning the target element are rejected.
+        all_claims = await get_docx_region_claims(db, normalized)
+        if not all_claims:
+            return None  # No scoped claims — unguarded, allow.
+
+        # Check whether the caller owns the target element.
+        if _elem:
+            caller_owns = any(
+                c.get("session_id") == _sid and c.get("element_id") == _elem
+                for c in all_claims
+            )
+            if caller_owns:
+                return None  # Caller owns this element — allow.
+
+            # Check if another session claims THIS element.
+            other_owns_target = any(
+                c.get("session_id") != _sid and c.get("element_id") == _elem
+                for c in all_claims
+            )
+            if other_owns_target:
+                holder_row = next(
+                    c for c in all_claims
+                    if c.get("session_id") != _sid and c.get("element_id") == _elem
+                )
+                holder = holder_row.get("session_id", "unknown")
+                return {
+                    "blocked": True,
+                    "reason": "element_locked",
+                    "file_path": normalized,
+                    "element_id": _elem,
+                    "holder": holder,
+                    "message": (
+                        f"Element {_elem!r} in {normalized} is claimed by session "
+                        f"{holder}. You do not own this element. Use claim_docx_region "
+                        "to acquire a non-conflicting element, or wait for the claim to release."
+                    ),
+                }
+
+            # The file is in scoped mode but the target element is unclaimed by
+            # anyone. Editing an unclaimed element while others are scoped is
+            # still risky (last-save-wins), but NOT a conflict per the Model-B
+            # spec — block only when a claimed element would be overwritten.
+            return None
+
+        # No element_id provided — the caller is trying a whole-element or
+        # unscoped write on a file that has scoped claims. Block if the caller
+        # has no claims themselves (they should use a scoped claim or wait).
+        caller_has_any = any(c.get("session_id") == _sid for c in all_claims)
+        if not caller_has_any:
+            other_sessions = list({c.get("session_id") for c in all_claims if c.get("session_id") != _sid})
+            return {
+                "blocked": True,
+                "reason": "scoped_mode",
+                "file_path": normalized,
+                "element_id": None,
+                "holder": other_sessions[0] if other_sessions else "unknown",
+                "message": (
+                    f"{normalized} is in scoped-edit mode: {len(other_sessions)} other "
+                    "session(s) hold region claims on it. Provide an element_id and "
+                    "use claim_docx_region to acquire your region before writing."
+                ),
+            }
+
+    except Exception:  # noqa: BLE001 — never wedge a write on a guard error
+        return None
+
+    return None
