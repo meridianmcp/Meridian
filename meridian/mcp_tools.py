@@ -192,7 +192,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "mode='delta' returns a compact session update (completed + pending + /goal); "
         "mode='starter' returns a <=20-line block for paste-after-/compact or cold start - "
         "project_id, start_session command, last 5 completed titles, top 3 pending IDs, /goal; "
-        "mode='planner' returns strategic context for a claude.ai planning chat.",
+        "mode='planner' returns strategic context for a claude.ai planning chat. "
+        "DISPLAY THE RETURNED content FIELD VERBATIM to the user (f318c7e3) - the server "
+        "already strips code-fence markers for clean pasting, so it is paste-ready as-is. "
+        "Do NOT just narrate that the handoff succeeded; paste the actual text.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter"]},
