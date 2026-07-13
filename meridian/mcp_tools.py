@@ -736,6 +736,31 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "kind": {"type": "string", "description": "Optional chunk-kind filter: one of 'function', 'class', 'method', 'interface', 'enum', 'module'."},
          "reindex": {"type": "boolean", "description": "Default true — run an incremental Merkle-diff reindex before searching so results reflect the current tree. Set false to search the last-built index as-is."}},
          "required": ["root_dir", "query"]}},
+    {"name": "prospect_symbol", "description":
+        "2ce5bc76 — ROBUST symbol prospecting with a three-rung fallback chain: "
+        "tries codebase__search_graph FIRST (fast, graph-indexed); when it returns "
+        "zero results OR the caller flags a mismatch (stale_graph=true), "
+        "automatically retries via Serena extractor__find_symbol / "
+        "extractor__find_declaration (AST-accurate, never stale); falls back to "
+        "a BM25 keyword grep over search_code_semantic as a last resort so the "
+        "caller NEVER has to notice a miss and switch tools by hand. Each rung is "
+        "labelled in the result ({rung: 'graph'|'serena'|'semantic', hits:[...], "
+        "fallback_reason: str?}) so the caller knows which level succeeded. "
+        "All three legs are best-effort: a missing tunnel, inactive slot, or "
+        "missing root_dir degrades to the next rung, never an error. "
+        "Use this instead of calling codebase__search_graph directly whenever "
+        "you are prospecting for a symbol, function, or class location — it "
+        "is structurally immune to the class of silent graph-index miss that "
+        "previously returned wrong line numbers or empty results for real symbols.",
+     "inputSchema": {"type": "object", "properties": {
+         "symbol": {"type": "string", "description": "The symbol/function/class/method name or short search query to prospect for."},
+         "project_id": {"type": "string", "description": "Code-intel project id (repo-path slug) passed to codebase__search_graph."},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "root_dir": {"type": "string", "description": "Absolute path to the source tree root — used for the search_code_semantic fallback. If omitted, the semantic leg is skipped."},
+         "limit": {"type": "integer", "description": "Max results per rung (default 5)."},
+         "stale_graph": {"type": "boolean", "description": "Set true to SKIP the graph rung and go straight to Serena (e.g. you already know the graph is stale from a _graph_staleness warning)."},
+         "kind": {"type": "string", "description": "Optional symbol kind filter passed to search_code_semantic fallback (function/class/method/etc)."}},
+         "required": ["symbol"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
         "reference to a thing-in-a-source, grounded in LSP Location + W3C Web Annotation "
@@ -1685,6 +1710,7 @@ _READ_ONLY_TOOLS = {
     "find_similar_table",
     "search_outputs",
     "search_code_semantic",
+    "prospect_symbol",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
 }
@@ -1755,6 +1781,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "annotate_outputs": "Annotate Outputs",
     "search_code_semantic": "Search Code Semantic",
     "run_verification": "Run Verification",
+    "prospect_symbol": "Prospect Symbol",
 }
 
 for _tool in _MCP_TOOLS_LIST:

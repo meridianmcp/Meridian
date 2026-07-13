@@ -3149,6 +3149,149 @@ def _check_code_snippet_truncation(result: Any) -> Any:
     return result
 
 
+# 2ce5bc76 — code-graph staleness fingerprinting. The codebase-memory-mcp graph
+# index goes stale after edits without reliably re-indexing (confirmed failures:
+# wrong line numbers, zero results for existing symbols). We store a per-
+# (tenant, project_id) fingerprint at index_repository time and compare it on
+# each search_graph call. A mismatch injects a clear staleness warning in the
+# result so the caller can see it was wrong rather than silently trusting it.
+#
+# Fingerprint = the git commit hash OR the "indexed_at" timestamp surfaced by
+# index_repository / index_status responses — whichever is present. We can't
+# call into the external plugin's internals (same class as 7ef712a8/19b3259e),
+# so we extract it from the MCP result envelope.
+_code_graph_fingerprints: dict[str, str] = {}  # "{tenant_id}:{project_id}" → fingerprint
+
+
+def _extract_graph_fingerprint(result: Any) -> "str | None":
+    """Pull the staleness fingerprint from a code-intel MCP result.
+
+    Looks for ``git_commit``, ``commit_hash``, ``indexed_commit``,
+    ``indexed_at``, or ``commit`` in the unwrapped payload — whatever the
+    codebase-memory-mcp server chooses to surface. Returns None when nothing
+    identifiable is present.
+    """
+    payload = _extract_graph_matches(result) if isinstance(result, dict) else result
+    if not isinstance(payload, dict):
+        return None
+    _keys = ("git_commit", "commit_hash", "indexed_commit", "commit", "indexed_at", "last_indexed_at")
+    for k in _keys:
+        v = payload.get(k)
+        if v and isinstance(v, str):
+            return v.strip()
+    # Also look one level down inside a "status" or "index" sub-dict.
+    for sub_key in ("status", "index", "metadata"):
+        sub = payload.get(sub_key)
+        if isinstance(sub, dict):
+            for k in _keys:
+                v = sub.get(k)
+                if v and isinstance(v, str):
+                    return v.strip()
+    return None
+
+
+def _graph_fingerprint_key(tenant_id: str, arguments: "dict | None") -> "str | None":
+    """The cache key for the staleness fingerprint given a call's arguments.
+
+    Returns ``"{tenant_id}:{project_id}"`` when a project_id is present, or
+    ``"{tenant_id}:*"`` as a fallback (single-project tenants / no id passed).
+    """
+    project_id = ""
+    if isinstance(arguments, dict):
+        project_id = str(
+            arguments.get("project_id")
+            or arguments.get("project")
+            or arguments.get("project_name")
+            or ""
+        ).strip()
+    return f"{tenant_id}:{project_id or '*'}"
+
+
+async def _fetch_graph_current_fingerprint(tenant_id: str, arguments: "dict | None") -> "str | None":
+    """Best-effort: ask the code-intel server for the current index fingerprint.
+
+    Calls ``codebase__index_status`` (passing the same project_id/project
+    arguments the caller used) and extracts the fingerprint from the response.
+    Never raises — returns None on any failure so staleness detection degrades
+    silently rather than breaking the search call.
+    """
+    try:
+        status_args: dict[str, Any] = {}
+        if isinstance(arguments, dict):
+            for k in ("project_id", "project", "project_name"):
+                if arguments.get(k):
+                    status_args[k] = arguments[k]
+                    break
+        result = await call_tunnel_tool(tenant_id, "codebase__index_status", status_args)
+        return _extract_graph_fingerprint(result)
+    except Exception:  # noqa: BLE001 — staleness detection must never raise
+        return None
+
+
+async def _annotate_graph_result_staleness(
+    tenant_id: str,
+    name: str,
+    arguments: "dict | None",
+    result: "dict | None",
+) -> "dict | None":
+    """2ce5bc76 — inject a ``_graph_staleness`` warning when the code graph is stale.
+
+    Called after a successful ``search_graph`` call. If the stored fingerprint
+    for this (tenant, project_id) differs from the current one fetched via
+    ``index_status``, wraps the result in a dict that carries a
+    ``_graph_staleness`` warning so the caller can see the index is stale and
+    cross-check with Serena. When fingerprints match (or either is unknown),
+    the result passes through unchanged. Fail-open — any error returns the
+    original result untouched.
+    """
+    bare = name.split("__", 1)[1] if "__" in name else name
+    if bare != "search_graph":
+        return result
+    if result is None:
+        return result
+    try:
+        fkey = _graph_fingerprint_key(tenant_id, arguments)
+        stored = _code_graph_fingerprints.get(fkey)
+        # Only fetch the current fingerprint when we have a stored baseline to
+        # compare against. Without a stored fingerprint there's nothing to diff,
+        # and we avoid an extra codebase__index_status round-trip on every
+        # search_graph call (important: it prevents spurious side-effects in
+        # tests and on hot paths where no index_repository has been run yet).
+        if not stored:
+            return result
+        current = await _fetch_graph_current_fingerprint(tenant_id, arguments)
+        if current and stored != current:
+            # Stale! Surface the warning in the result without destroying it.
+            # The MCP result envelope is a dict with "content": [...]; we add an
+            # extra ``_graph_staleness`` field to carry the diagnostic so the
+            # caller can see it without having to parse the content array.
+            enriched = dict(result)
+            enriched["_graph_staleness"] = {
+                "stale": True,
+                "reason": "index-fingerprint-mismatch",
+                "stored_fingerprint": stored,
+                "current_fingerprint": current,
+                "warning": (
+                    "The code graph index appears STALE: the fingerprint at "
+                    "last index_repository differs from the current index "
+                    f"({stored!r} -> {current!r}). Line numbers and symbol "
+                    "locations in these results may be wrong (confirmed real "
+                    "failures: off-by-440-lines, zero results for existing "
+                    "symbols). Cross-check with extractor__find_symbol or "
+                    "extractor__find_declaration before trusting line ranges. "
+                    "Re-run codebase__index_repository to refresh the graph."
+                ),
+            }
+            return enriched
+        # Fingerprints match (or current is unknown) — update the stored value
+        # with the current reading for future comparisons.
+        if current:
+            _code_graph_fingerprints[fkey] = current
+    except Exception:  # noqa: BLE001 — never break a search call for staleness bookkeeping
+        pass
+    return result
+
+
 async def call_tunnel_tool(
     tenant_id: str, name: str, arguments: dict | None,
     repo_path: str | None = None,
@@ -3169,10 +3312,16 @@ async def call_tunnel_tool(
     73d233e4 — when a MUTATING word-slot (docx) tool is being relayed and ``db``
     is supplied, consult the target document's live file claims first and RAISE a
     concurrent-write conflict (surfaced to the caller as an MCP error) when another
-    live session holds a conflicting claim on it. A .docx is a zip container with no
-    partial write, so two relayed edits silently last-save-wins each other; the
-    guard turns that silent stomp into a legible, coordinatable error. Fail-open —
-    no db / unidentifiable target / lookup error passes through unchanged.
+    live session holds a conflicting write/symbol claim on it. A .docx is a zip
+    container with no partial write, so two relayed edits silently last-save-wins
+    each other; the guard turns that silent stomp into a legible, coordinatable
+    error. Fail-open — no db / unidentifiable target / lookup error passes through
+    unchanged.
+
+    2ce5bc76 — when ``index_repository`` succeeds, its fingerprint is stored per
+    (tenant, project_id) so future ``search_graph`` calls can detect a stale
+    index and inject a ``_graph_staleness`` warning instead of silently returning
+    wrong line numbers.
     """
     label = (_tunnel_tool_routes.get(tenant_id) or {}).get(name)
     if label is None:
@@ -3251,6 +3400,27 @@ async def call_tunnel_tool(
     # Pure enrichment — never mutates the original result, never raises.
     if label == "code" and bare_name == "get_code_snippet":
         result = _check_code_snippet_truncation(result)
+    # 2ce5bc76 — staleness fingerprinting for the code graph.
+    # (a) index_repository success → capture the fingerprint for future comparison.
+    # (b) search_graph success → compare against stored fingerprint and inject a
+    #     staleness warning in the result when the index appears out of date.
+    if label == "code":
+        bare = name.split("__", 1)[1] if "__" in name else name
+        if bare == "index_repository" and result is not None:
+            try:
+                fp = _extract_graph_fingerprint(result)
+                if fp:
+                    fkey = _graph_fingerprint_key(tenant_id, arguments)
+                    _code_graph_fingerprints[fkey] = fp
+            except Exception:  # noqa: BLE001 — fingerprint capture is best-effort
+                pass
+        elif bare == "search_graph":
+            try:
+                result = await _annotate_graph_result_staleness(
+                    tenant_id, name, arguments, result
+                )
+            except Exception:  # noqa: BLE001 — staleness annotation is best-effort
+                pass
     return result
 
 

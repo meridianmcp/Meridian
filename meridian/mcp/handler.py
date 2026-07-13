@@ -5828,7 +5828,34 @@ async def _handle_code_index_tools(
     _mcp_tenant_id: Any,
 ) -> Any:
     """Dispatch group: search_code_semantic (93fce816 — Cursor-style local code
-    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS)."""
+    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS)
+    and prospect_symbol (2ce5bc76 — three-rung fallback chain for robust
+    symbol prospecting)."""
+    if name == "prospect_symbol":
+        symbol = str(args.get("symbol") or "").strip()
+        if not symbol:
+            raise ValueError("symbol is required")
+        project_id = str(args.get("project_id") or "").strip()
+        root_dir = str(args.get("root_dir") or "").strip()
+        limit = args.get("limit", 5)
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 5
+        kind = args.get("kind")
+        kind = str(kind).strip() if kind else None
+        stale_graph = bool(args.get("stale_graph", False))
+        from .. import prospect as _prospect  # noqa: PLC0415
+        return await _prospect.prospect_symbol_impl(
+            symbol=symbol,
+            project_id=project_id,
+            root_dir=root_dir,
+            limit=limit,
+            kind=kind,
+            stale_graph=stale_graph,
+            tenant=tenant,
+            data_dir=data_dir,
+        )
     if name == "search_code_semantic":
         from .. import code_index as _code_index  # noqa: PLC0415
         from .. import hardening as _hardening  # noqa: PLC0415
