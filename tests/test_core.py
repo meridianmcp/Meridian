@@ -17419,3 +17419,164 @@ async def test_assign_sprint_waves_warning_text_is_wave_specific(db):
     assert "/goal" in warning or "wave" in warning.lower(), (
         "Warning must mention the /goal or wave-label desync specific to assign_sprint_waves"
     )
+
+
+# ---------------------------------------------------------------------------
+# 39bd7d33 — build_item_briefing: deterministic XML-tagged single-item briefing
+# ---------------------------------------------------------------------------
+
+
+def test_build_item_briefing_basic_structure():
+    """build_item_briefing produces a /goal-prefixed, XML-structured briefing."""
+    from meridian.handoff import build_item_briefing
+
+    item = {
+        "id": "abc123",
+        "title": "Implement feature X",
+        "version": "v1",
+        "status": "pending",
+    }
+    brief = build_item_briefing(item)
+
+    # Must start with /goal (same convention as _build_quick_start_goal).
+    assert brief.startswith("/goal\n")
+    # Required XML tags must all be present.
+    assert "<role>" in brief and "</role>" in brief
+    assert "<first_step>" in brief and "</first_step>" in brief
+    assert "<task>" in brief and "</task>" in brief
+    assert "<completion_criteria>" in brief and "</completion_criteria>" in brief
+    assert "<not_done_until>" in brief and "</not_done_until>" in brief
+    assert "<stop_conditions>" in brief and "</stop_conditions>" in brief
+
+
+def test_build_item_briefing_item_id_and_title_in_task():
+    """Item id and title are embedded in the <task> section."""
+    from meridian.handoff import build_item_briefing
+
+    item = {
+        "id": "xyz999",
+        "title": "Fix the auth redirect bug",
+    }
+    brief = build_item_briefing(item)
+    assert "xyz999" in brief
+    assert "Fix the auth redirect bug" in brief
+
+
+def test_build_item_briefing_touches_resources_renders_resources_tag():
+    """When touches_resources is set, a <resources> tag is emitted with file paths."""
+    from meridian.handoff import build_item_briefing
+    import json
+
+    item = {
+        "id": "res001",
+        "title": "Refactor handoff module",
+        "touches_resources": json.dumps(["file:meridian/handoff.py", "file:tests/test_core.py"]),
+    }
+    brief = build_item_briefing(item)
+    assert "<resources>" in brief and "</resources>" in brief
+    assert "meridian/handoff.py" in brief
+    assert "tests/test_core.py" in brief
+
+
+def test_build_item_briefing_no_resources_tag_when_empty():
+    """No <resources> tag is emitted when touches_resources is absent or empty."""
+    from meridian.handoff import build_item_briefing
+
+    item = {"id": "nores", "title": "Some task", "touches_resources": None}
+    brief = build_item_briefing(item)
+    assert "<resources>" not in brief
+
+    item2 = {"id": "nores2", "title": "Another task"}
+    assert "<resources>" not in build_item_briefing(item2)
+
+
+def test_build_item_briefing_optional_fields_included():
+    """Optional fields (item_group, wave, priority, notes, depends_on) appear in <task>."""
+    from meridian.handoff import build_item_briefing
+
+    item = {
+        "id": "full001",
+        "title": "Full-featured item",
+        "item_group": "auth",
+        "wave": "wave-2",
+        "priority": "urgent",
+        "notes": "Check the OAuth RFC before touching this.",
+        "depends_on": "dep_parent_id",
+    }
+    brief = build_item_briefing(item)
+    assert "auth" in brief
+    assert "wave-2" in brief
+    assert "urgent" in brief
+    assert "Check the OAuth RFC before touching this." in brief
+    assert "dep_parent_id" in brief
+
+
+def test_build_item_briefing_completion_criteria_includes_id_and_test_floor():
+    """<completion_criteria> references the item id and the test floor."""
+    from meridian.handoff import build_item_briefing
+
+    item = {"id": "crit42", "title": "Ship it"}
+    brief = build_item_briefing(item, test_floor=3000)
+    assert "crit42" in brief
+    assert "3000" in brief
+    assert "complete_sprint_item" in brief
+
+
+def test_build_item_briefing_max_turns_reflected_in_stop_conditions():
+    """<stop_conditions> respects the max_turns argument."""
+    from meridian.handoff import build_item_briefing
+
+    item = {"id": "turns1", "title": "Turn test"}
+    brief = build_item_briefing(item, max_turns=42)
+    assert "42 turns" in brief
+
+
+def test_build_item_briefing_hitl_auto_answer_mode():
+    """hitl_auto_answer_mode=1 switches the HITL clause to 'skip blocked items'."""
+    from meridian.handoff import build_item_briefing
+
+    item = {"id": "hitl1", "title": "HITL test"}
+    normal = build_item_briefing(item, hitl_auto_answer_mode=0)
+    auto = build_item_briefing(item, hitl_auto_answer_mode=1)
+    assert "HITL triggered" in normal
+    assert "skip blocked items" in auto
+    assert "Do NOT file HITLs" in auto
+
+
+def test_build_item_briefing_xml_escape_in_title():
+    """Titles containing XML-special characters are escaped in the output."""
+    from meridian.handoff import build_item_briefing
+
+    item = {
+        "id": "esc01",
+        "title": "Handle <html> & 'quotes' in \"titles\"",
+    }
+    brief = build_item_briefing(item)
+    # The raw angle brackets must NOT appear unescaped outside of our own tags.
+    # The <task> tag body should have escaped content.
+    assert "<html>" not in brief.split("<task>")[1].split("</task>")[0]
+    assert "&amp;" in brief or "&lt;" in brief
+
+
+def test_build_item_briefing_deterministic():
+    """Same input always produces the same output (no randomness)."""
+    from meridian.handoff import build_item_briefing
+
+    item = {
+        "id": "det01",
+        "title": "Deterministic briefing",
+        "item_group": "stability",
+        "wave": "wave-1",
+        "notes": "No side effects.",
+    }
+    assert build_item_briefing(item) == build_item_briefing(item)
+
+
+def test_build_item_briefing_minimal_item():
+    """Works correctly with a bare-minimum item dict (only id/title required)."""
+    from meridian.handoff import build_item_briefing
+
+    brief = build_item_briefing({"id": "min1", "title": "Minimal"})
+    assert "/goal" in brief
+    assert "min1" in brief
+    assert "Minimal" in brief
