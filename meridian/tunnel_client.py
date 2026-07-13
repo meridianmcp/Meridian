@@ -360,11 +360,35 @@ class SlotProxy:
                 self._proc = None
                 self.holder["proc"] = None
                 return
-            # Brief pause to let the proxy's port bind before the first request
-            # hits it.  28s request timeout means a slow startup is recoverable
-            # (the caller retries on the next WS message) but 1s is usually
-            # enough for mcp-proxy to be ready.
-            await asyncio.sleep(1.0)
+            # e75f4fc4 — poll real readiness instead of a blind fixed sleep.
+            # A blind asyncio.sleep(1.0) was long enough for a warm restart but
+            # not for a genuinely cold spawn (post-idle-kill npx/uvx package
+            # resolution + server boot), which can legitimately take several
+            # seconds. That gap let the FIRST request after a cold spawn hit an
+            # unready proxy and either fail immediately or hang until
+            # mcp-proxy's own internal ~60s timeout (-32001) — a separate,
+            # external-library timeout Meridian's 1s pause did nothing to
+            # protect against. _probe_slot_health already exists and is proven
+            # for exactly this "is the proxy actually answering yet" check (it
+            # backs the reactive post-timeout watchdog); reuse it here instead
+            # of inventing a new mechanism. attempts=6/delay=3.0 gives up to
+            # ~15-18s of real polling — generous for a slow cold resolve while
+            # staying comfortably under the 28s caller-side request timeout
+            # referenced below, so a slow-but-eventually-successful spawn is
+            # still usually caught before the caller's own request fires.
+            healthy = await _probe_slot_health(self.port, attempts=6, delay=3.0)
+            if not healthy:
+                # Don't raise — the existing behavior never raised here either.
+                # A caller's actual request will now get an honest connection
+                # error rather than a silently-assumed-ready slot; the request-
+                # timeout watchdog (3bde892a) recovers from there. Just make the
+                # miss visible in the tunnel log for diagnosis.
+                print(
+                    f"tunnel:{self.label}: proxy did not answer tools/list within "
+                    "the cold-spawn readiness window — a real request may still "
+                    "fail; the request-timeout watchdog will retry if so",
+                    flush=True,
+                )
             self.touch()
 
     def kill(self) -> None:
