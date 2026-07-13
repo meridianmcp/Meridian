@@ -2507,6 +2507,14 @@ async def generate_handoff(
     if mode not in {"full", "delta"}:
         raise ValueError("mode must be 'full', 'delta', 'planner', 'starter', or 'compact'")
 
+    # 4c7cd788 — generate_handoff has THREE network Haiku seams (session-summary
+    # fan-out, the ai_summary blurb, the sprint retrospective). The delta template
+    # uses NONE of them, so making those calls for mode='delta' was pure latency AND
+    # the hang that stalled generate_handoff(mode='delta') for minutes (the client
+    # 4-min timeout fired before any internal fallback). Disable all three for delta
+    # (and honour the existing skip_ai_summary for the two that already did).
+    _ai_disabled = skip_ai_summary or mode == "delta"
+
     goal = await db_module.get_goal(db, project_id)
     if goal is None:
         goal = {
@@ -2519,15 +2527,18 @@ async def generate_handoff(
         goal = {**goal, "content": _format_content(goal["content"])}
 
     sessions = await db_module.get_sessions(db, project_id, active_only=False)
-    # v1.2.1 — summarise eligible sessions before reading tasks so
-    # the rendered handoff can reference fresh session_summary values.
-    for s in sessions:
-        try:
-            await db_module.summarize_session(
-                db, s["id"], summarizer=summarizer
-            )
-        except Exception:  # noqa: BLE001 — never break handoff on summary fail
-            continue
+    # v1.2.1 — summarise eligible sessions before reading tasks so the rendered
+    # handoff can reference fresh session_summary values. 4c7cd788 — the delta
+    # render never reads session_summary, so skip this network fan-out for delta
+    # (a slow summarizer here was one of the mode='delta' hang seams).
+    if mode != "delta":
+        for s in sessions:
+            try:
+                await db_module.summarize_session(
+                    db, s["id"], summarizer=summarizer
+                )
+            except Exception:  # noqa: BLE001 — never break handoff on summary fail
+                continue
     tasks = await db_module.get_tasks(db, project_id, limit=50)
 
     session_names = {s["id"]: s["name"] for s in sessions}
@@ -2666,8 +2677,9 @@ async def generate_handoff(
         s for s in sessions if s.get("status") in ("closed", "archived")
     ]
 
-    # v2.4 — AI summary (Haiku or fallback). Skipable for tests / hot paths.
-    if skip_ai_summary:
+    # v2.4 — AI summary (Haiku or fallback). Skipable for tests / hot paths, and
+    # skipped for delta (see _ai_disabled above — the delta template discards it).
+    if _ai_disabled:
         ai_summary = ""
     else:
         ai_summary = await _generate_ai_summary(
@@ -2828,7 +2840,10 @@ async def generate_handoff(
     # patterns / direction) as an insight note surfaced in the planner brief.
     # Skippable on hot paths / tests (skip_ai_summary) and fully guarded so it
     # never breaks handoff generation.
-    if not skip_ai_summary:
+    # 4c7cd788 — also skipped for mode='delta': it makes another network Haiku
+    # call, and a full AI retrospective does not belong on every lightweight delta /
+    # checkpoint (it's a full/session-end concern). Same hang class as _ai_summary.
+    if not _ai_disabled:
         try:
             retro_completed = [
                 it for it in sprint_items_all
