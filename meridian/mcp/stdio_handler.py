@@ -1077,6 +1077,58 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="index_table",
+                description=(
+                    "2622182d — index ONE table into the SEMANTIC table index "
+                    "against a document already stored in the doc-structure "
+                    "store (via ingest_document or a prior reindex — pass the "
+                    "SAME source/path as `doc`). The table parallel of "
+                    "index_figure, COMPLEMENTARY to the structural "
+                    "kind='table' section-tree placement (adds caption dedup + "
+                    "similarity, does not replace placement). Provide caption "
+                    "and/or table_index. A near-duplicate is still inserted but "
+                    "surfaced via near_duplicates. When paired_figure_id is "
+                    "omitted, the nearest figure in the same structural section "
+                    "is suggested (advisory only). Returns "
+                    "{table, near_duplicates}."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "table_index": {"type": "integer", "description": "The table's document-order index."},
+                        "caption": {"type": "string", "description": "The table's caption (drives normalized-caption dedup/similarity)."},
+                        "semantic_label": {"type": "string", "description": "Optional human label for the table."},
+                        "paired_figure_id": {"type": "string", "description": "Optional id of a related figure; omit to receive an advisory suggestion."},
+                    },
+                    "required": ["doc"],
+                },
+            ),
+            Tool(
+                name="find_similar_table",
+                description=(
+                    "2622182d — fuzzy-match a free-text description against "
+                    "every table already indexed for one stored document, best "
+                    "match first (difflib similarity score 0..1 against "
+                    "normalized_caption). Returns {document_id, matches} — an "
+                    "empty list (never an error) when the document has no "
+                    "indexed tables, or doc doesn't resolve."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "description": {"type": "string", "description": "A free-text description to fuzzy-match against this document's indexed tables."},
+                        "limit": {"type": "integer", "description": "Max matches to return (default 5)."},
+                    },
+                    "required": ["doc", "description"],
+                },
+            ),
+            Tool(
                 name="search_outputs",
                 description=(
                     "a0e9133e — READ-ONLY BM25 full-text search over a run's "
@@ -2116,6 +2168,7 @@ def build_mcp_server():
                 "get_citation_edges", "resolve_citations",
                 "index_equation", "find_similar_equation", "insert_equation", "update_paragraph", "find_symbol_usages",
                 "index_figure", "find_similar_figure",
+                "index_table", "find_similar_table",
                 "search_outputs",
                 "search_code_semantic",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",

@@ -44,6 +44,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "find_symbol_usages": 'find_symbol_usages(project_id="abc-123", doc="thesis/chapter1.docx", symbol_or_equation_id="E=mc^2")',
     "index_figure": 'index_figure(project_id="abc-123", doc="thesis/chapter1.docx", file_path="figures/setup.png", caption="Figure 3: The experimental setup", semantic_label="apparatus diagram")',
     "find_similar_figure": 'find_similar_figure(project_id="abc-123", doc="thesis/chapter1.docx", description_or_path="experimental setup diagram")',
+    "index_table": 'index_table(project_id="abc-123", doc="thesis/chapter1.docx", table_index=2, caption="Table 2: Summary of experimental results", semantic_label="results table")',
+    "find_similar_table": 'find_similar_table(project_id="abc-123", doc="thesis/chapter1.docx", description="summary of experimental results")',
     "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
     "annotate_outputs": 'annotate_outputs(outputs_dir="/repo/outputs", path="/repo/outputs/run_42", note="PCA on, BFS off — final params", run_params={"lr": 0.001, "epochs": 100})',
     "search_code_semantic": 'search_code_semantic(root_dir="/repo/src", query="parse the auth token and refresh it")',
@@ -612,6 +614,48 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "outputs_dir": {"type": "string", "description": "d2a3537a — optional outputs tree root. When given, each matched figure resolves THROUGH to its outputs_index row (linked_output) by file_path. Omit for a pure fuzzy match."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "description_or_path"]}},
+    {"name": "index_table", "description":
+        "2622182d — index ONE table into the SEMANTIC table index against a "
+        "document already stored in the doc-structure store — populated by "
+        "ingest_document (which registers a docx/latex document's structure here "
+        "in addition to storing the flat note text). Pass the SAME "
+        "source/path you ingested under as `doc`. This is the table parallel "
+        "of index_figure and is "
+        "COMPLEMENTARY to the structural kind='table' section-tree placement "
+        "(it adds caption dedup + similarity, it does not replace placement). "
+        "Provide caption and/or table_index. Before inserting, the normalized "
+        "caption is fuzzy-matched against every table already indexed for this "
+        "document — a near-duplicate is NOT silently dropped (the table is "
+        "still inserted) but IS surfaced via near_duplicates:[{table_id, "
+        "matched_id, matched_caption, score}] so you can spot an accidental "
+        "re-index. When paired_figure_id is omitted, the nearest figure in the "
+        "same structural section is surfaced as suggested_figure_id (advisory, "
+        "never auto-applied). Returns {table, near_duplicates}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you ingested it under via ingest_document, which registers a docx/latex document in the doc-structure store)."},
+         "table_index": {"type": "integer", "description": "The table's document-order index (0-based or 1-based, your convention)."},
+         "caption": {"type": "string", "description": "The table's caption (drives normalized-caption dedup/similarity)."},
+         "semantic_label": {"type": "string", "description": "Optional human label for the table (e.g. 'results table')."},
+         "paired_figure_id": {"type": "string", "description": "Optional: the doc_figures or doc_elements id of a related figure. When omitted, the nearest figure in the same structural section is suggested (advisory only)."}},
+         "required": ["doc"]}},
+    {"name": "find_similar_table", "description":
+        "2622182d — fuzzy-match a free-text description against "
+        "every table already indexed (index_table) for one stored document, "
+        "best match first. Each result carries the stored table row PLUS a "
+        "difflib similarity score (0..1) against its normalized_caption. Useful "
+        "before index_table to check whether a table is already present under a "
+        "slightly different caption. Returns {document_id, matches:[...]} "
+        "— an empty list (never an error) when the document has no indexed "
+        "tables, or doc doesn't resolve to a stored document.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you ingested it under via ingest_document, which registers a docx/latex document in the doc-structure store)."},
+         "description": {"type": "string", "description": "A free-text description to fuzzy-match against this document's indexed tables."},
+         "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
+         "required": ["doc", "description"]}},
     {"name": "search_outputs", "description":
         "a0e9133e — READ-ONLY full-text search over a run's OUTPUTS tree "
         "(numeric/tabular/array artifacts), backed by DuckDB native FTS (Okapi "
@@ -1622,6 +1666,7 @@ _READ_ONLY_TOOLS = {
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
     "find_similar_figure",
+    "find_similar_table",
     "search_outputs",
     "search_code_semantic",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
@@ -1688,6 +1733,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "find_symbol_usages": "Find Symbol Usages",
     "index_figure": "Index Figure",
     "find_similar_figure": "Find Similar Figure",
+    "index_table": "Index Table",
+    "find_similar_table": "Find Similar Table",
     "search_outputs": "Search Outputs",
     "annotate_outputs": "Annotate Outputs",
     "search_code_semantic": "Search Code Semantic",

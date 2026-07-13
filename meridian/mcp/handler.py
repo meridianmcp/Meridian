@@ -3013,6 +3013,96 @@ async def _handle_notes_decisions(
             "document_id": doc_row["id"],
             "matches": matches,
         }
+    if name == "index_table":
+        # 2622182d — index ONE table into the SEMANTIC table index (dedup +
+        # similarity on a normalized caption), the direct parallel of
+        # index_figure. Complementary to the structural kind='table'
+        # doc_elements placement, not a duplicate of it.
+        validate_input_size(args.get("doc"), "table doc", 2_000)
+        validate_input_size(args.get("caption"), "caption", 10_000)
+        validate_input_size(args.get("semantic_label"), "semantic_label", 500)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        caption = args.get("caption")
+        table_index_raw = args.get("table_index")
+        table_index: int | None = None
+        if table_index_raw is not None:
+            try:
+                table_index = int(table_index_raw)
+            except (TypeError, ValueError):
+                return {"error": f"table_index must be an integer, got {table_index_raw!r}"}
+        if not doc_source:
+            return {"error": "doc is required"}
+        if table_index is None and not caption:
+            return {"error": "at least one of table_index or caption is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for doc={doc_source!r} — ingest_document "
+                    "it first (that MCP tool populates the doc-structure store; "
+                    "there is no separate reindex_document tool)"
+                ),
+            }
+        try:
+            result = await store.add_table(
+                doc_row["id"], table_index,
+                caption=caption,
+                semantic_label=args.get("semantic_label"),
+                paired_figure_id=args.get("paired_figure_id"),
+            )
+        except Exception as exc:  # noqa: BLE001 — indexing is best-effort
+            return {"error": f"could not index table: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            **result,
+        }
+    if name == "find_similar_table":
+        # 2622182d — fuzzy-match a description against a document's
+        # already-indexed tables (read-only counterpart of index_table).
+        validate_input_size(args.get("doc"), "table doc", 2_000)
+        validate_input_size(args.get("description"), "description", 10_000)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        query = args.get("description")
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not query:
+            return {"error": "description is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {"project_id": args["project_id"], "document_id": None, "matches": []}
+        _limit = args.get("limit")
+        try:
+            _limit = int(_limit) if _limit is not None else 5
+        except (TypeError, ValueError):
+            _limit = 5
+        try:
+            matches = await store.find_similar_tables(
+                doc_row["id"], query, limit=_limit,
+            )
+        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+            return {"error": f"could not find similar tables: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            "matches": matches,
+        }
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)

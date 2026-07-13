@@ -202,6 +202,32 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON doc_equations (document_id, ordinal)",
     "CREATE INDEX IF NOT EXISTS idx_doc_figures_document_ordinal "
     "ON doc_figures (document_id, ordinal)",
+    # Sixth self-contained table (2622182d): the SEMANTIC table index -- one row
+    # per indexed table, dedup/similarity keyed on a normalized caption. This is
+    # COMPLEMENTARY to (not a replacement for) the ``kind='table'`` doc_elements
+    # rows that carry a table's section-tree PLACEMENT. Unlike doc_figures, tables
+    # have no image file asset -- instead they carry a ``table_index`` (their
+    # document-order table number) and an optional ``paired_figure_id`` linking to
+    # a related figure in the same section (a table-of-results paired with a
+    # results figure, for example). Same self-contained pattern as the five tables
+    # above -- created here by ``ensure_schema``, OUTSIDE the main migration
+    # machinery.
+    """
+    CREATE TABLE IF NOT EXISTS doc_tables (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        element_id TEXT,
+        ordinal INTEGER NOT NULL,
+        table_index INTEGER,
+        caption TEXT,
+        normalized_caption TEXT,
+        semantic_label TEXT,
+        paired_figure_id TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_doc_tables_document_ordinal "
+    "ON doc_tables (document_id, ordinal)",
 )
 
 
@@ -283,6 +309,10 @@ _FIGURE_COLUMNS = (
     "id", "document_id", "element_id", "ordinal", "file_path", "caption",
     "normalized_caption", "semantic_label", "file_exists", "created_at",
 )
+_TABLE_COLUMNS = (
+    "id", "document_id", "element_id", "ordinal", "table_index", "caption",
+    "normalized_caption", "semantic_label", "paired_figure_id", "created_at",
+)
 
 # Fuzzy-match ratio (difflib) at/above which two equations' latex_normalized
 # values count as a "near-duplicate" for put_equations' advisory dedup surface.
@@ -291,6 +321,10 @@ _EQUATION_DEDUP_THRESHOLD = 0.85
 # The same advisory-dedup threshold, applied to figures' normalized_caption
 # (c623e648) -- mirrors _EQUATION_DEDUP_THRESHOLD exactly.
 _FIGURE_DEDUP_THRESHOLD = 0.85
+
+# The same advisory-dedup threshold, applied to tables' normalized_caption
+# (2622182d) -- mirrors _FIGURE_DEDUP_THRESHOLD exactly.
+_TABLE_DEDUP_THRESHOLD = 0.85
 
 # Sentinel level for a heading dict that carries no usable level. Deliberately
 # large so a level-less heading nests as a deep leaf rather than colliding with a
@@ -1166,6 +1200,31 @@ def _figure_similarity(a: str, b: str) -> float:
 
     Same difflib approach as :func:`_equation_similarity`; kept as its own
     function so figures and equations can diverge later without entangling."""
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def normalize_table_caption(caption: str | None) -> str:
+    """Canonicalize a table caption for the fuzzy-dedup key (2622182d).
+
+    The table analogue of :func:`normalize_caption`: lower-cases, strips a
+    leading auto-numbered label (``Table 3:`` / ``Tbl. 12 -`` / ``Table 3.``),
+    collapses all runs of whitespace to a single space, and drops surrounding
+    whitespace. Deterministic and pure -- never raises, ``None``/blank input
+    yields ``""``.
+    """
+    s = (caption or "").strip().lower()
+    if not s:
+        return ""
+    # Strip a leading "table N" / "tbl. N" auto-number label plus its trailing
+    # separator (``:``/``.``/``-``/em-dash), if present.
+    s = re.sub(r"^(?:table|tbl\.?)\s*\d+\s*[:.\-–—]?\s*", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _table_similarity(a: str, b: str) -> float:
+    """difflib fuzzy-match ratio between two normalized table captions (2622182d)."""
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
@@ -2597,6 +2656,208 @@ class DocStructureStore:
             "figure": result["inserted"][0] if result["inserted"] else None,
             "near_duplicates": result["near_duplicates"],
             "missing_files": result["missing_files"],
+        }
+
+    # -- tables (semantic index) — 2622182d ----------------------------------
+
+    async def get_tables(self, document_id: str) -> list[dict[str, Any]]:
+        """Return every indexed table for a document, ordered by ``ordinal``."""
+        async with self._db.execute(
+            "SELECT * FROM doc_tables WHERE document_id = ? ORDER BY ordinal ASC",
+            (document_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_dict(r, _TABLE_COLUMNS) for r in rows]
+
+    async def find_similar_tables(
+        self,
+        document_id: str,
+        description: str,
+        *,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Fuzzy-match a free-text description against this document's indexed
+        tables; returns every stored table carrying a ``score`` (difflib ratio
+        against its ``normalized_caption``), best match first, capped at
+        ``limit``. Mirrors :meth:`find_similar_figures`. Never raises; an
+        empty/unknown document yields ``[]``."""
+        query = (description or "").strip()
+        norm = normalize_table_caption(query)
+        existing = await self.get_tables(document_id)
+        scored: list[dict[str, Any]] = []
+        for tbl in existing:
+            cap_score = _table_similarity(norm, tbl.get("normalized_caption") or "")
+            scored.append({**tbl, "score": round(cap_score, 4)})
+        scored.sort(key=lambda t: t["score"], reverse=True)
+        lim = limit if isinstance(limit, int) and limit > 0 else 5
+        return scored[:lim]
+
+    async def _find_paired_figure_suggestion(
+        self, document_id: str, element_id: str | None
+    ) -> str | None:
+        """Best-effort: find a nearby figure in the same structural section.
+
+        When a table's ``paired_figure_id`` is not given, look for a
+        ``kind='figure'`` doc_elements row in the same document that shares the
+        same ``parent_id`` (section) as the table element (identified by
+        ``element_id``). Returns the first matching figure element's ``id``, or
+        ``None`` when no element_id is given / the section has no figures.
+        This is ADVISORY -- a suggestion, never auto-applied.
+        """
+        if not isinstance(element_id, str) or not element_id.strip():
+            return None
+        # Find the table element's parent section.
+        async with self._db.execute(
+            "SELECT parent_id FROM doc_elements WHERE id = ?",
+            (element_id.strip(),),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        parent_id = _row_get(row, "parent_id")
+        # Find figures in the same section (same parent_id, same document).
+        async with self._db.execute(
+            "SELECT id FROM doc_elements "
+            "WHERE document_id = ? AND kind = 'figure' AND parent_id IS ? "
+            "ORDER BY ordinal ASC LIMIT 1",
+            (document_id, parent_id),
+        ) as cur:
+            fig_row = await cur.fetchone()
+        if fig_row is None:
+            return None
+        return _row_get(fig_row, "id")
+
+    async def put_tables(
+        self,
+        document_id: str,
+        tables: list[dict[str, Any]],
+        *,
+        dedup_threshold: float = _TABLE_DEDUP_THRESHOLD,
+    ) -> dict[str, Any]:
+        """Insert a batch of tables for ``document_id``.
+
+        The table analogue of :meth:`put_figures` -- same ADVISORY (never
+        blocking) dedup contract: every table is inserted, and a fuzzy-matched
+        near-duplicate (same-document normalized-caption difflib ratio ``>=
+        dedup_threshold``, against already-stored tables AND earlier tables in
+        this same batch) is SURFACED via ``near_duplicates`` rather than silently
+        dropped or silently piled up.
+
+        Each ``tables`` item is ``{caption?, table_index?, semantic_label?,
+        element_id?, ordinal?, paired_figure_id?}``. No file-exists check (tables
+        have no image asset).
+
+        NEW vs put_figures: when ``paired_figure_id`` is not given, the nearest
+        already-indexed figure in the same structural section (via doc_elements
+        kind='figure' parent matching) is surfaced as a SUGGESTION in
+        ``suggested_figure_id`` on the inserted row (NOT auto-applied --
+        advisory only, same pattern as near_duplicates).
+
+        Returns ``{"inserted": [...], "near_duplicates": [...]}``;
+        a ``near_duplicates`` entry is ``{table_id, matched_id, matched_caption,
+        score}``.
+        """
+        existing = await self.get_tables(document_id)
+        next_ordinal = (max((t.get("ordinal") or 0) for t in existing) + 1) if existing else 0
+        inserted: list[dict[str, Any]] = []
+        near_duplicates: list[dict[str, Any]] = []
+        pool = list(existing)
+
+        for tbl in tables or []:
+            caption = tbl.get("caption")
+            normalized_caption = normalize_table_caption(caption)
+
+            best_score = 0.0
+            best_match: dict[str, Any] | None = None
+            if normalized_caption:
+                for cand in pool:
+                    score = _table_similarity(
+                        normalized_caption, cand.get("normalized_caption") or ""
+                    )
+                    if score > best_score:
+                        best_score, best_match = score, cand
+
+            tbl_id = tbl.get("id") or uuid.uuid4().hex
+            ordinal = tbl.get("ordinal") if isinstance(tbl.get("ordinal"), int) else next_ordinal
+            next_ordinal = max(next_ordinal, ordinal + 1)
+            now = _now_iso()
+            semantic_label = tbl.get("semantic_label")
+            element_id = tbl.get("element_id")
+            table_index = tbl.get("table_index")
+            paired_figure_id = tbl.get("paired_figure_id")
+
+            # Advisory suggestion: when no paired_figure_id is given, find the
+            # nearest figure in the same structural section (never auto-applied).
+            suggested_figure_id: str | None = None
+            if paired_figure_id is None and element_id is not None:
+                try:
+                    suggested_figure_id = await self._find_paired_figure_suggestion(
+                        document_id, element_id
+                    )
+                except Exception:  # noqa: BLE001 — suggestion is advisory only
+                    suggested_figure_id = None
+
+            await self._db.execute(
+                "INSERT INTO doc_tables "
+                "(id, document_id, element_id, ordinal, table_index, caption, "
+                "normalized_caption, semantic_label, paired_figure_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (tbl_id, document_id, element_id, ordinal, table_index, caption,
+                 normalized_caption, semantic_label, paired_figure_id, now),
+            )
+            row: dict[str, Any] = {
+                "id": tbl_id, "document_id": document_id, "element_id": element_id,
+                "ordinal": ordinal, "table_index": table_index, "caption": caption,
+                "normalized_caption": normalized_caption,
+                "semantic_label": semantic_label,
+                "paired_figure_id": paired_figure_id,
+                "created_at": now,
+            }
+            if suggested_figure_id is not None:
+                row["suggested_figure_id"] = suggested_figure_id
+            inserted.append(row)
+            pool.append(row)
+
+            if best_match is not None and best_score >= dedup_threshold:
+                near_duplicates.append({
+                    "table_id": tbl_id,
+                    "matched_id": best_match.get("id"),
+                    "matched_caption": best_match.get("normalized_caption"),
+                    "score": round(best_score, 4),
+                })
+
+        if inserted:
+            await self._db.commit()
+        return {"inserted": inserted, "near_duplicates": near_duplicates}
+
+    async def add_table(
+        self,
+        document_id: str,
+        table_index: int | None,
+        *,
+        caption: str | None = None,
+        semantic_label: str | None = None,
+        paired_figure_id: str | None = None,
+        element_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Index ONE table -- the ``index_table`` MCP tool's primitive.
+
+        Inserts a single table (with the same advisory near-duplicate surfacing
+        as :meth:`put_tables`). Returns
+        ``{"table": <inserted row, or None if not inserted>,
+        "near_duplicates": [...]}``.
+        """
+        tbl: dict[str, Any] = {
+            "table_index": table_index,
+            "caption": caption,
+            "semantic_label": semantic_label,
+            "paired_figure_id": paired_figure_id,
+            "element_id": element_id,
+        }
+        result = await self.put_tables(document_id, [tbl])
+        return {
+            "table": result["inserted"][0] if result["inserted"] else None,
+            "near_duplicates": result["near_duplicates"],
         }
 
     # -- orchestrator — 06df6ab3 ---------------------------------------------
