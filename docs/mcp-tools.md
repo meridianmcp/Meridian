@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **114 tools** over MCP.
+Meridian exposes **122 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -561,6 +561,75 @@ The hosted MCP surface (Bearer-token requests) is metered per tenant per minute 
 | `pro` | unlimited |
 
 Over-limit requests receive `429 Too Many Requests` with a `Retry-After` header. Dashboard (cookie) traffic, `/health`, and `/static` are never metered, and self-hosted instances are unmetered. Polling `get_sprint_progress` between tasks stays well within these limits — the 10 s server-side cache keeps parallel polling cheap.
+
+---
+
+## Workspace proposals
+
+### `add_workspace_proposal`
+Capture a workspace-level flash of insight into the 'drawer of inspiration' — cross-project ideas that don't belong to any one project yet. NOT executor-claimable. status: raw → investigating → promoted|rejected. Use `advance_proposal_status` to move through the lifecycle; `promote_proposal` to convert one into a real sprint item.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `title` | string | required | Short idea title. |
+| `body` | string | required | Full description of the insight or idea. |
+| `tags` | string | optional | Optional comma-separated tags. |
+
+**Example:**
+```
+add_workspace_proposal(title="IDEA: expose auth as plugin", body="Could ship auth as a separate optional plugin so self-hosters can swap it out", tags="arch")
+```
+
+---
+
+
+### `get_workspace_proposals`
+Read-only: List workspace proposals (human-authored flashes of insight), newest first. Optional status filter (raw/investigating/promoted/rejected) and tag substring filter.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `status` | string | optional | Filter to proposals in this status. |
+| `tag` | string | optional | Substring filter on tags. |
+
+**Example:**
+```
+get_workspace_proposals(status="investigating")
+```
+
+---
+
+
+### `advance_proposal_status`
+Transition a workspace proposal through its lifecycle (raw → investigating|rejected; investigating → promoted|rejected|raw; rejected → raw). 'promoted' is a terminal status reachable only via `promote_proposal`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `proposal_id` | string | required |  |
+| `status` | string | required | Target status. 'promoted' is not allowed here — use promote_proposal instead. |
+
+**Example:**
+```
+advance_proposal_status(proposal_id="prop-uuid", status="investigating")
+```
+
+---
+
+
+### `promote_proposal`
+Promote a workspace proposal into a real sprint item, creating the link between them. The proposal must be in 'raw' or 'investigating' state. Returns {proposal, sprint_item_id, sprint_item_title, project_id}.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `proposal_id` | string | required |  |
+| `project_id` | string | optional | Project to create the sprint item under. |
+| `project_name` | string | optional | Project name — alternative to project_id; resolved to the id internally. |
+| `sprint_item_title` | string | optional | Override title for the sprint item; defaults to the proposal title. |
+| `sprint_item_version` | string | optional | Sprint version for the new item; defaults to 'current'. |
+
+**Example:**
+```
+promote_proposal(proposal_id="prop-uuid", project_id="proj-uuid", sprint_item_title="Expose auth as plugin")
+```
 
 ---
 
