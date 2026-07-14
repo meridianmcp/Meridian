@@ -3934,11 +3934,16 @@ async def _find_continuation_session(
         if not last_seen_raw:
             continue
         try:
-            seen = datetime.strptime(last_seen_raw, "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=timezone.utc,
-            )
+            seen = datetime.strptime(
+                last_seen_raw[:26], "%Y-%m-%d %H:%M:%S.%f"
+            ).replace(tzinfo=timezone.utc)
         except ValueError:
-            continue
+            try:
+                seen = datetime.strptime(last_seen_raw[:19], "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc,
+                )
+            except ValueError:
+                continue
         if seen >= cutoff:
             return s
     return None

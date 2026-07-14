@@ -1362,9 +1362,15 @@ async def get_project_runs(
         if run.get("started_at") and run.get("ended_at"):
             from datetime import datetime
             try:
-                fmt = "%Y-%m-%d %H:%M:%S"
-                start = datetime.strptime(run["started_at"], fmt)
-                end = datetime.strptime(run["ended_at"], fmt)
+                def _parse_run_ts(s: str) -> "datetime":
+                    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                        try:
+                            return datetime.strptime(s, fmt)
+                        except ValueError:
+                            pass
+                    raise ValueError(f"Unrecognised timestamp: {s!r}")
+                start = _parse_run_ts(run["started_at"])
+                end = _parse_run_ts(run["ended_at"])
                 run["duration_s"] = int((end - start).total_seconds())
             except Exception:
                 run["duration_s"] = None

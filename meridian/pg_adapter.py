@@ -109,7 +109,7 @@ def _strip_unsupported_pg_query_params(url: str) -> str:
 # test. clock_timestamp() always returns the actual current time regardless of
 # transaction/savepoint boundaries, matching what callers actually mean by
 # "record when this happened."
-_DATETIME_NOW_EXPR = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')"
+_DATETIME_NOW_EXPR = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')"
 
 
 def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
@@ -129,7 +129,7 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
         r"datetime\('now',\s*(%s)\s*\|\|\s*'([^']+)'\)",
         lambda m: (
             f"to_char(now() at time zone 'utc' + ({m.group(1)} || '{m.group(2)}')::interval,"
-            f" 'YYYY-MM-DD HH24:MI:SS')"
+            f" 'YYYY-MM-DD HH24:MI:SS.US')"
         ),
         sql,
     )
@@ -139,7 +139,7 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
         r"datetime\('now',\s*(%s)\)",
         lambda m: (
             f"to_char(now() at time zone 'utc' + {m.group(1)}::interval,"
-            f" 'YYYY-MM-DD HH24:MI:SS')"
+            f" 'YYYY-MM-DD HH24:MI:SS.US')"
         ),
         sql,
     )
@@ -149,7 +149,7 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
         r"datetime\('now',\s*'([^']+)'\)",
         lambda m: (
             f"to_char(now() at time zone 'utc' + '{m.group(1)}'::interval,"
-            f" 'YYYY-MM-DD HH24:MI:SS')"
+            f" 'YYYY-MM-DD HH24:MI:SS.US')"
         ),
         sql,
     )
@@ -445,7 +445,7 @@ class PostgresConnection:
 # ---------------------------------------------------------------------------
 
 # 8a52dd26 -- clock_timestamp(), not now(): see _DATETIME_NOW_EXPR above for why.
-_TS = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')"
+_TS = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')"
 
 # Tables that go in every Postgres DB — customer DBs and the main auth DB.
 CREATE_TABLES_CORE = f"""
@@ -1192,7 +1192,7 @@ async def _migrate_pg_oauth_codes(conn: PostgresConnection) -> None:
         "    redirect_uri TEXT NOT NULL,"
         "    code_challenge TEXT NOT NULL,"
         "    expires_at TEXT NOT NULL,"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ")"
     )
 
@@ -1257,8 +1257,8 @@ async def _migrate_pg_insights_table(conn: PostgresConnection) -> None:
         "    horizon TEXT NOT NULL DEFAULT 'quarter',"
         "    tags TEXT,"
         "    status TEXT NOT NULL DEFAULT 'active',"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
-        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project_id, horizon);"
     )
@@ -1511,7 +1511,7 @@ async def _migrate_pg_signup_attempts(conn: PostgresConnection) -> None:
         "    id TEXT PRIMARY KEY,"
         "    ip_hash TEXT NOT NULL,"
         "    email_hash TEXT NOT NULL,"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_signup_attempts_ip ON signup_attempts(ip_hash, created_at);"
     )
@@ -1534,8 +1534,8 @@ async def _migrate_pg_provision_queue(conn: PostgresConnection) -> None:
         "    status TEXT NOT NULL DEFAULT 'pending',"
         "    attempts INTEGER NOT NULL DEFAULT 0,"
         "    last_error TEXT,"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
-        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_provision_queue_status ON provision_queue(status);"
     )
@@ -1551,7 +1551,7 @@ async def _migrate_pg_codebase_graph_entities(conn: PostgresConnection) -> None:
         "    file TEXT,"
         "    kind TEXT,"
         "    signature TEXT,"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_cge_project ON codebase_graph_entities(project_id);"
     )
@@ -1902,8 +1902,8 @@ async def _migrate_pg_v09_notes_and_magic_links(conn: PostgresConnection) -> Non
         "    title TEXT NOT NULL,"
         "    body TEXT NOT NULL,"
         "    tags TEXT,"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
-        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_notes_project ON project_notes(project_id);"
         "CREATE TABLE IF NOT EXISTS magic_link_tokens ("
@@ -1912,7 +1912,7 @@ async def _migrate_pg_v09_notes_and_magic_links(conn: PostgresConnection) -> Non
         "    token_hash TEXT NOT NULL UNIQUE,"
         "    used_at TEXT,"
         "    expires_at TEXT NOT NULL,"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_magic_email ON magic_link_tokens(email, used_at)"
     )
@@ -1928,7 +1928,7 @@ async def _migrate_pg_v32_workspace_and_checkpoint(conn: PostgresConnection) -> 
         "    title TEXT NOT NULL,"
         "    body TEXT NOT NULL,"
         "    tags TEXT,"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE TABLE IF NOT EXISTS workspace_decisions ("
         "    id TEXT PRIMARY KEY,"
@@ -1936,7 +1936,7 @@ async def _migrate_pg_v32_workspace_and_checkpoint(conn: PostgresConnection) -> 
         "    body TEXT NOT NULL,"
         "    category TEXT NOT NULL DEFAULT 'TECHNICAL',"
         "    status TEXT NOT NULL DEFAULT 'active',"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_workspace_notes_created ON workspace_notes(created_at DESC);"
         "CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status ON workspace_decisions(status, created_at DESC);"
@@ -2042,8 +2042,8 @@ async def _migrate_pg_v24_pinned_decisions_and_hitl(conn: PostgresConnection) ->
         "    category TEXT NOT NULL DEFAULT 'TECHNICAL',"
         "    status TEXT NOT NULL DEFAULT 'active',"
         "    superseded_by TEXT REFERENCES decisions_pinned(id),"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
-        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project ON decisions_pinned(project_id, status);"
         "CREATE TABLE IF NOT EXISTS hitl_requests ("
@@ -2057,7 +2057,7 @@ async def _migrate_pg_v24_pinned_decisions_and_hitl(conn: PostgresConnection) ->
         "    answer TEXT,"
         "    answered_by TEXT,"
         "    assigned_to TEXT,"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')),"
         "    answered_at TEXT"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_hitl_project ON hitl_requests(project_id, status);"
@@ -2441,7 +2441,7 @@ async def _migrate_pg_session_graph_snapshots(conn: PostgresConnection) -> None:
         "    id TEXT PRIMARY KEY,"
         "    session_id TEXT NOT NULL,"
         "    project_id TEXT NOT NULL,"
-        "    snapshot_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    snapshot_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')),"
         "    node_count INTEGER NOT NULL DEFAULT 0,"
         "    edge_count INTEGER NOT NULL DEFAULT 0,"
         "    hotspot_count INTEGER NOT NULL DEFAULT 0,"
@@ -2601,7 +2601,7 @@ async def _migrate_pg_sprint_item_pointers(conn: PostgresConnection) -> None:
         "    source_type TEXT NOT NULL,"
         "    targets TEXT NOT NULL,"
         "    label TEXT,"
-        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_sprint_item_pointers_item "
         "ON sprint_item_pointers(sprint_item_id);"
