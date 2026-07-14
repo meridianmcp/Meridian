@@ -1,4 +1,4 @@
-"""Regression test for 00dbeed0.
+﻿"""Regression test for 00dbeed0.
 
 generate_handoff(mode='delta')'s "Completed since last handoff" list was scoped
 by since_ts read from _SESSION_HANDOFF_STATE — a plain in-memory, per-process
@@ -52,7 +52,7 @@ async def test_delta_scopes_by_durable_prior_handoff_not_memory_cache(db, tmp_pa
     new_item = await db_module.add_sprint_item(db, p["id"], "v1", "new shipped thing", force=True)
     await db_module.complete_sprint_item(db, p["id"], new_item["id"])
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
         session_id=s["id"],
     )
@@ -79,7 +79,7 @@ async def test_delta_with_no_prior_handoff_at_all_still_shows_everything(db, tmp
     item = await db_module.add_sprint_item(db, p["id"], "v1", "only shipped thing")
     await db_module.complete_sprint_item(db, p["id"], item["id"])
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
         session_id=s["id"],
     )
@@ -112,7 +112,7 @@ async def test_delta_prefers_memory_cache_when_present_no_extra_db_cost_semantic
     new_item = await db_module.add_sprint_item(db, p["id"], "v1", "shipped after warm boundary", force=True)
     await db_module.complete_sprint_item(db, p["id"], new_item["id"])
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
         session_id=s["id"],
     )

@@ -16,7 +16,7 @@ def test_count_pending_sprint_items():
         await db_module.add_sprint_item(db, p["id"], "v1", "one")
         i2 = await db_module.add_sprint_item(db, p["id"], "v1", "two")
         c_both = await db_module.count_pending_sprint_items(db, p["id"])
-        await db_module.patch_sprint_item(db, p["id"], i2["id"], status="done")
+        await db_module.complete_sprint_item(db, p["id"], i2["id"])
         c_one = await db_module.count_pending_sprint_items(db, p["id"])
         c_missing = await db_module.count_pending_sprint_items(db, "no-such-project")
         return c_both, c_one, c_missing
@@ -235,7 +235,7 @@ def test_stop_override_reset_when_no_pending(client, monkeypatch):
     assert sprint_routes._stop_override_counts.get(sid) == 2
 
     # Complete the only item → pending 0 → counter reset.
-    asyncio.run(db_module.patch_sprint_item(db, pid, item["id"], status="done"))
+    asyncio.run(db_module.complete_sprint_item(db, pid, item["id"]))
     r = client.get(f"/projects/{pid}/sprint/pending_count", params={"session_id": sid})
     assert r.json()["pending_count"] == 0
     assert sid not in sprint_routes._stop_override_counts

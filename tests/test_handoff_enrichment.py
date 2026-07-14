@@ -1,4 +1,4 @@
-"""Tests for 91ac0199 — generate_handoff code-pointer enrichment.
+﻿"""Tests for 91ac0199 — generate_handoff code-pointer enrichment.
 
 When the codebase is indexed and the per-project setting
 ``enrich_handoffs_with_code_pointers`` (default True) is on, generate_handoff
@@ -180,7 +180,7 @@ async def test_generate_handoff_injects_pointers_when_indexed(db, tmp_path):
             }
         ]
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, graph_searcher=searcher
     )
     # The graph was actually queried with keywords from the item title.
@@ -209,7 +209,7 @@ async def test_generate_handoff_no_pointers_when_setting_off(db, tmp_path):
         called["n"] += 1
         return [{"file": "x.py", "function": "y", "qualified_name": "y"}]
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, graph_searcher=searcher
     )
     # Searcher must not be consulted at all when the setting is off.
@@ -225,7 +225,7 @@ async def test_generate_handoff_no_pointers_when_not_indexed(db, tmp_path):
     await db_module.set_goal(db, p["id"], "ship enrichment")
     await db_module.add_sprint_item(db, p["id"], "v1", "Fix OAuth redirect bug")
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "Code pointers:" not in content
@@ -243,7 +243,7 @@ async def test_generate_handoff_survives_searcher_blowup(db, tmp_path):
     def searcher(query):
         raise RuntimeError("graph down")
 
-    _, content = await handoff_module.generate_handoff(
+    _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, graph_searcher=searcher
     )
     # Handoff still produced; just no pointers.
@@ -271,7 +271,7 @@ async def test_generate_handoff_surfaces_skip_note_when_no_searcher(db, tmp_path
     # searcher deterministically resolves to None.
     handoff_module.set_graph_searcher_resolver(None)
     try:
-        _, content = await handoff_module.generate_handoff(
+        _, content, _ = await handoff_module.generate_handoff(
             db, p["id"], str(tmp_path), skip_ai_summary=True
         )
     finally:
@@ -305,7 +305,7 @@ async def test_generate_handoff_surfaces_skip_note_when_searcher_errors(db, tmp_
     orig = _h._annotate_code_pointers
     _h._annotate_code_pointers = _raise
     try:
-        _, content = await handoff_module.generate_handoff(
+        _, content, _ = await handoff_module.generate_handoff(
             db, p["id"], str(tmp_path), skip_ai_summary=True, graph_searcher=_Boom()
         )
     finally:

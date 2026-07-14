@@ -39,8 +39,15 @@ def test_docs_slot_registered_in_builtin_plugins():
     assert docs["slot"] == "docs"
     assert docs["url_prefix"] == "/docs"
     assert docs["port"] == tp.DEFAULT_DOCS_PORT == 8818
-    # Launched via `uvx meridian-docs` (the extensions/meridian-docs console entry).
-    assert docs["command"] == ["uvx", "meridian-docs"]
+    # 1b3a2c23 — launched via `uvx --from <local-path> meridian-docs` (NOT bare
+    # `uvx meridian-docs`; the package is not on PyPI, so the local extensions/
+    # meridian-docs source dir must be supplied via --from).
+    cmd = docs["command"]
+    assert cmd[0] == "uvx"
+    assert cmd[1] == "--from"
+    assert cmd[3] == "meridian-docs"
+    # The --from path points at the local extensions/meridian-docs directory.
+    assert "extensions" in cmd[2] and "meridian-docs" in cmd[2]
     # Opt-in like the Office slots: off by default, not a core tool.
     assert docs["enabled"] is False
     assert docs["core"] is False
@@ -73,7 +80,9 @@ def test_docs_slot_resolves_via_resolve_plugins_and_by_slot():
     by_slot = {p["slot"]: p for p in resolved}
     assert "docs" in by_slot
     assert by_slot["docs"]["name"] == "meridian-docs"
-    assert by_slot["docs"]["command"] == ["uvx", "meridian-docs"]
+    # 1b3a2c23 — the resolved command uses --from local-path, not bare uvx package.
+    cmd = by_slot["docs"]["command"]
+    assert cmd[0] == "uvx" and cmd[1] == "--from" and cmd[3] == "meridian-docs"
 
     got = tp.plugin_by_slot(None, "docs")
     assert got is not None and got["name"] == "meridian-docs"

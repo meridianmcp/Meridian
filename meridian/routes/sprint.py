@@ -244,10 +244,13 @@ async def complete_sprint_item_endpoint(
 ) -> dict[str, Any]:
     """Mark a sprint item ``done``. Optional body: ``{task_id}``."""
     db = await _db(request)
-    item = await db_module.complete_sprint_item(
-        db, project_id, item_id,
-        task_id=(body or {}).get("task_id"),
-    )
+    try:
+        item = await db_module.complete_sprint_item(
+            db, project_id, item_id,
+            task_id=(body or {}).get("task_id"),
+        )
+    except db_module.SprintItemStatusRace as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
     # Lazy import to avoid circular dependency on server.py at module level.
@@ -285,10 +288,13 @@ async def skip_sprint_item_endpoint(
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Mark a sprint item ``skipped``. Optional body: ``{reason}``."""
-    item = await db_module.skip_sprint_item(
-        await _db(request), project_id, item_id,
-        reason=(body or {}).get("reason"),
-    )
+    try:
+        item = await db_module.skip_sprint_item(
+            await _db(request), project_id, item_id,
+            reason=(body or {}).get("reason"),
+        )
+    except db_module.SprintItemStatusRace as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
     return item
@@ -300,10 +306,13 @@ async def fail_sprint_item_endpoint(
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Mark a sprint item ``failed``. Optional body: ``{reason}``."""
-    item = await db_module.fail_sprint_item(
-        await _db(request), project_id, item_id,
-        reason=(body or {}).get("reason"),
-    )
+    try:
+        item = await db_module.fail_sprint_item(
+            await _db(request), project_id, item_id,
+            reason=(body or {}).get("reason"),
+        )
+    except db_module.SprintItemStatusRace as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
     return item
@@ -376,6 +385,8 @@ async def push_sprint_item_endpoint(
         item = await db_module.push_sprint_item(
             await _db(request), project_id, item_id, to_version
         )
+    except db_module.SprintItemStatusRace as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     if item is None:

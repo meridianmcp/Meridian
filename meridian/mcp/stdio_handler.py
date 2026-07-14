@@ -977,7 +977,10 @@ def build_mcp_server():
                     "para_id, new_text, elements_resynced, source_path}; "
                     "elements_resynced=0 for a plain body paragraph is expected "
                     "(only headings persist as elements). Errors — never a silent "
-                    "no-op — when doc/source/para_id doesn't resolve."
+                    "no-op — when doc/source/para_id doesn't resolve. "
+                    "f7ee1ba7 — pass session_id to enable scoped-region claim "
+                    "enforcement: the write is rejected if another session owns "
+                    "the target para_id or holds a whole-file lock."
                 ),
                 inputSchema={
                     "type": "object",
@@ -988,6 +991,7 @@ def build_mcp_server():
                         "para_id": {"type": "string", "description": "The target paragraph's w14:paraId (or 'p{index}' fallback)."},
                         "new_text": {"type": "string", "description": "New paragraph text as a single unformatted run. Provide this OR runs, not both."},
                         "runs": {"type": "array", "description": "List of runs — each a plain string or a {text, bold?, italic?, underline?} object. Provide this OR new_text, not both.", "items": {"type": ["string", "object"]}},
+                        "session_id": {"type": "string", "description": "f7ee1ba7 — calling session id. Enables scoped-region enforcement when provided."},
                     },
                     "required": ["doc", "para_id"],
                 },
@@ -2098,6 +2102,35 @@ def build_mcp_server():
                     arguments["session_id"],
                 )
                 result = {"released": released, "file_path": arguments["file_path"]}
+            elif name == "claim_docx_region":
+                # f7ee1ba7 — Model B scoped docx-region claim.
+                result = await db_module.claim_docx_region(
+                    db,
+                    session_id=arguments["session_id"],
+                    file_path=arguments["file_path"],
+                    element_id=arguments["element_id"],
+                )
+            elif name == "get_docx_region_claims":
+                # f7ee1ba7 — read-only: active scoped region claims on a .docx.
+                result = {
+                    "file_path": arguments["file_path"],
+                    "claims": await db_module.get_docx_region_claims(
+                        db, arguments["file_path"]
+                    ),
+                }
+            elif name == "release_docx_region_claims":
+                # f7ee1ba7 — release scoped docx-region claims.
+                released = await db_module.release_docx_region_claims(
+                    db, arguments["session_id"],
+                    file_path=arguments.get("file_path"),
+                    element_id=arguments.get("element_id"),
+                )
+                result = {
+                    "released": released,
+                    "session_id": arguments["session_id"],
+                    "file_path": arguments.get("file_path"),
+                    "element_id": arguments.get("element_id"),
+                }
             elif name == "idle_until_session_done":
                 _idle_kwargs = {}
                 if arguments.get("timeout_seconds") is not None:
@@ -2136,7 +2169,7 @@ def build_mcp_server():
                     session_id,
                 )
                 try:
-                    path, content = await asyncio.wait_for(
+                    path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
                             db,
                             arguments["project_id"],
@@ -2321,29 +2354,38 @@ def build_mcp_server():
                 )
                 result = item or {"error": "sprint item not found"}
             elif name == "complete_sprint_item":
-                item = await db_module.complete_sprint_item(
-                    db,
-                    arguments["project_id"],
-                    arguments["item_id"],
-                    task_id=arguments.get("task_id"),
-                )
-                result = item or {"error": "sprint item not found"}
+                try:
+                    item = await db_module.complete_sprint_item(
+                        db,
+                        arguments["project_id"],
+                        arguments["item_id"],
+                        task_id=arguments.get("task_id"),
+                    )
+                    result = item or {"error": "sprint item not found"}
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "skip_sprint_item":
-                item = await db_module.skip_sprint_item(
-                    db,
-                    arguments["project_id"],
-                    arguments["item_id"],
-                    reason=arguments.get("reason"),
-                )
-                result = item or {"error": "sprint item not found"}
+                try:
+                    item = await db_module.skip_sprint_item(
+                        db,
+                        arguments["project_id"],
+                        arguments["item_id"],
+                        reason=arguments.get("reason"),
+                    )
+                    result = item or {"error": "sprint item not found"}
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "fail_sprint_item":
-                item = await db_module.fail_sprint_item(
-                    db,
-                    arguments["project_id"],
-                    arguments["item_id"],
-                    reason=arguments.get("reason"),
-                )
-                result = item or {"error": "sprint item not found"}
+                try:
+                    item = await db_module.fail_sprint_item(
+                        db,
+                        arguments["project_id"],
+                        arguments["item_id"],
+                        reason=arguments.get("reason"),
+                    )
+                    result = item or {"error": "sprint item not found"}
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "push_sprint_item":
                 try:
                     item = await db_module.push_sprint_item(

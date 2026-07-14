@@ -74,7 +74,15 @@ async def _claim_task_result(
             "sprint_item_id": sprint_item_id,
         }
     if sprint_item_id and sprint_item is not None and sprint_item.get("status") in ("pending", "todo"):
-        await db_module.start_sprint_item(db, project_id, sprint_item_id)
+        try:
+            await db_module.start_sprint_item(db, project_id, sprint_item_id)
+        except db_module.SprintItemStatusRace:
+            # fa3e3331 — the linked sprint item moved out of pending/todo
+            # (e.g. another session claimed it directly) between the check
+            # above and this call. Starting it is a best-effort side effect
+            # of claiming the task, not the primary outcome — don't fail the
+            # whole task claim over a lost race on a secondary action.
+            pass
     return {
         "task_id": claimed["id"],
         "claimed": True,

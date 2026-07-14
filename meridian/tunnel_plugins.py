@@ -19,7 +19,16 @@ Both the tunnel client (``tunnel_client.run_tunnel``) and the dashboard consume
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+
+# 1b3a2c23 — meridian-docs lives in the local extensions/ directory; it is NOT
+# published to PyPI, so `uvx meridian-docs` (bare package name) fails to install.
+# Use `uvx --from <local-path> meridian-docs` to run from the checked-out source.
+# Path(__file__).parent.parent is the repo root (meridian/ → repo root).
+_MERIDIAN_DOCS_LOCAL_PATH: str = str(
+    Path(__file__).parent.parent / "extensions" / "meridian-docs"
+)
 
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
@@ -33,9 +42,10 @@ DEFAULT_PPT_PORT = 8811
 DEFAULT_WORD_PORT = 8812
 DEFAULT_DC_PORT = 8813
 # 9665538a — the meridian-docs slot: the extracted stdlib-only OOXML (DOCX)
-# parser published as its own `uvx meridian-docs` MCP server (extensions/
-# meridian-docs). Distinct from the `word` slot (docx-mcp, authoring): this is
-# fast, dependency-free document *intelligence* — outline/parse/index/search.
+# parser living at extensions/meridian-docs and launched as an MCP server via
+# `uvx --from <local-path> meridian-docs`. Distinct from the `word` slot
+# (docx-mcp, authoring): this is fast, dependency-free document *intelligence*
+# — outline/parse/index/search. (1b3a2c23: NOT on PyPI; spawn from local path.)
 # Port 8818 sits just after the dc slot (8813) and the 4 pre-allocated custom
 # slots (8814-8817), and below the custom auto-assign start (8820) — see
 # CUSTOM_SLOT_PORTS / _CUSTOM_PORT_START.
@@ -202,9 +212,12 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
     },
     {
         # 9665538a — meridian-docs: the extracted stdlib-only OOXML doc parser
-        # (extensions/meridian-docs), launched via `uvx meridian-docs`. Opt-in
-        # like the Office slots. Complements the `word` slot (docx-mcp authoring)
-        # with read-only document intelligence (outline / parse / index / search).
+        # (extensions/meridian-docs), launched via `uvx --from <local-path>
+        # meridian-docs`. Opt-in like the Office slots. Complements the `word`
+        # slot (docx-mcp authoring) with read-only document intelligence.
+        # 1b3a2c23 — NOT published to PyPI; spawn from the local extensions/
+        # meridian-docs directory via `uvx --from` so this works out-of-the-box
+        # without a separate PyPI publish step.
         "name": "meridian-docs",
         "slot": "docs",
         "port": DEFAULT_DOCS_PORT,
@@ -212,7 +225,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": ["uvx", "meridian-docs"],
+        "command": ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs"],
         "env": {},
         # meridian-docs exposes bare tool names (document_outline, parse_document,
         # …) — no self-prefix, so the server bridge namespaces them via

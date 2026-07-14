@@ -991,6 +991,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_wave(db)
     await _migrate_mcp_rate_counters(db)
     await _migrate_workspace_proposals(db)
+    await _migrate_docx_region_claims(db)
     return db
 
 
@@ -2889,24 +2890,38 @@ async def requeue_or_fail_stalled_item(
             f"{'y' if new_count - 1 == 1 else 'ies'} "
             f"(worker closed without completing). Last session log: {last_log}"
         )
-        await db.execute(
+        # fa3e3331 — atomic from-state guard: the pre-check at line 2881 read
+        # 'in_progress', but a concurrent complete/claim/skip/fail could commit
+        # between that read and this UPDATE. Without "AND status = 'in_progress'"
+        # here, a stall-recovery pass could silently clobber a status a
+        # concurrent caller just legitimately set (e.g. re-fail an item that was
+        # just completed). If the guard trips, this stall pass is simply stale —
+        # no-op rather than raise, since stall recovery runs unattended with no
+        # caller positioned to react to a race-lost exception.
+        cursor = await db.execute(
             "UPDATE sprint_items SET status = 'failed', stall_count = ?, "
-            "claimed_at = NULL, notes = ? WHERE id = ? AND project_id = ?",
+            "claimed_at = NULL, notes = ? "
+            "WHERE id = ? AND project_id = ? AND status = 'in_progress'",
             (new_count, reason, item_id, project_id),
         )
         await db.commit()
+        if cursor.rowcount == 0:
+            return None
         _invalidate_sprint_items_cache(project_id)
         _publish_project_event(
             project_id, "sprint_item_updated", {"item_id": item_id, "status": "failed"}
         )
         updated = await get_sprint_item(db, item_id)
         return {"action": "failed", "item": updated, "stall_count": new_count}
-    await db.execute(
+    cursor = await db.execute(
         "UPDATE sprint_items SET status = 'pending', stall_count = ?, "
-        "claimed_at = NULL, completed_at = NULL WHERE id = ? AND project_id = ?",
+        "claimed_at = NULL, completed_at = NULL "
+        "WHERE id = ? AND project_id = ? AND status = 'in_progress'",
         (new_count, item_id, project_id),
     )
     await db.commit()
+    if cursor.rowcount == 0:
+        return None
     _invalidate_sprint_items_cache(project_id)
     _publish_project_event(
         project_id, "sprint_item_updated", {"item_id": item_id, "status": "pending"}
@@ -4613,6 +4628,7 @@ async def _update_sprint_item_status(
     notes: str | None = None,
     pushed_to: str | None = None,
     actor: str | None = None,
+    expected_statuses: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Internal: flip a sprint item's status and optionally link a task.
 
@@ -4620,9 +4636,21 @@ async def _update_sprint_item_status(
     ``completed_at``; non-terminal statuses clear it. ``pushed_to``
     records the target version when status == 'pushed'. ``actor`` (5823db0b)
     records the executor id/name that made this transition.
+
+    fa3e3331 — ``expected_statuses``, when given, adds an atomic from-state
+    condition to the UPDATE's WHERE clause so two concurrent transitions on
+    the same item cannot both "win" (a read-then-write race). If the guard
+    trips (item exists but its current status isn't in ``expected_statuses``),
+    raises :class:`SprintItemStatusRace` rather than silently no-op'ing —
+    genuine "item doesn't exist" still returns ``None``, unchanged.
     """
     if status not in _VALID_SPRINT_STATUSES:
         raise ValueError(f"invalid sprint-item status: {status!r}")
+    if expected_statuses is not None and not expected_statuses:
+        # An empty set would render "AND status IN ()" — invalid SQL — and
+        # semantically could never match anything, so it's always a caller bug
+        # rather than a legitimate "never match" request.
+        raise ValueError("expected_statuses must be non-empty or None")
     fields = ["status = ?"]
     values: list[Any] = [status]
     if status in {"done", "skipped", "failed", "pushed"}:
@@ -4645,13 +4673,21 @@ async def _update_sprint_item_status(
         values.append(actor)
     values.append(item_id)
     values.append(project_id)
+    where = "WHERE id = ? AND project_id = ?"
+    if expected_statuses is not None:
+        ordered_expected = sorted(expected_statuses)
+        where += f" AND status IN ({', '.join('?' for _ in ordered_expected)})"
+        values.extend(ordered_expected)
     cursor = await db.execute(
-        f"UPDATE sprint_items SET {', '.join(fields)} "
-        f"WHERE id = ? AND project_id = ?",
+        f"UPDATE sprint_items SET {', '.join(fields)} {where}",
         values,
     )
     await db.commit()
     if cursor.rowcount == 0:
+        if expected_statuses is not None:
+            _raced = await get_sprint_item(db, item_id)
+            if _raced is not None and _raced.get("project_id") == project_id:
+                raise SprintItemStatusRace(item_id, _raced.get("status"), expected_statuses)
         return None
     _invalidate_sprint_items_cache(project_id)
     result = await get_sprint_item(db, item_id)
@@ -4692,6 +4728,48 @@ class SprintItemEvidenceRequired(ValueError):
     (5823db0b) — the item is flagged required_notes but has no evidence."""
 
 
+class SprintItemStatusRace(ValueError):
+    """Raised by _update_sprint_item_status (fa3e3331) when an ``expected_statuses``
+    guard rejects a transition — the item exists but is no longer in an expected
+    from-state, because a concurrent transition committed first. Distinguishes
+    this from ``cursor.rowcount == 0`` meaning "item not found", which a bare
+    ``None`` return could not — a caller could not previously tell "doesn't
+    exist" from "lost a race" and could not react correctly to either."""
+
+    def __init__(self, item_id: str, current_status: str | None, expected_statuses: set[str]):
+        self.item_id = item_id
+        self.current_status = current_status
+        self.expected_statuses = expected_statuses
+        super().__init__(
+            f"sprint item {item_id} is no longer in an expected state for this "
+            f"transition (current status: {current_status!r}, expected one of "
+            f"{sorted(expected_statuses)}) — another caller already changed it. "
+            "Re-fetch the item before retrying."
+        )
+
+
+# 6a17e735 — the ONLY statuses patch_sprint_item may set directly. These are
+# plain administrative resets with no attached business logic: no evidence
+# gate, no completed_at semantics beyond "clear it", no parent rollup, no
+# task-chain advancement. Every OTHER status has a dedicated function
+# (complete_sprint_item -> done, skip_sprint_item -> skipped, fail_sprint_item
+# -> failed, provisional_complete_sprint_item -> provisional_complete,
+# claim_sprint_item -> in_progress) that enforces real guards
+# _update_sprint_item_status's raw UPDATE does not replicate on its own —
+# required_notes evidence, completed_at stamping, claimed_at backfill, parent
+# rollup, task-chain advancement, cache invalidation, and the live dashboard
+# event. Letting patch_sprint_item set an arbitrary status silently bypassed
+# ALL of that: a required_notes item could be marked "done" with zero
+# evidence, a parent's rollup could desync, and the sprint-items cache could
+# go stale. Confirmed as a genuine backdoor, not a theoretical one — see
+# meridian/routes/sprint.py's PATCH endpoint, which had already independently
+# self-restricted to this exact non-terminal subset for its own safety;
+# patch_sprint_item now enforces that restriction itself so every OTHER
+# caller (including any future one) gets the same protection for free instead
+# of having to remember to add it.
+_PATCH_SPRINT_ITEM_ALLOWED_STATUSES = {"pending", "todo", "indeterminate"}
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4728,7 +4806,8 @@ async def complete_sprint_item(
                     "task_id. This item was flagged required_notes."
                 )
     result = await _update_sprint_item_status(
-        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor
+        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
@@ -4751,7 +4830,8 @@ async def provisional_complete_sprint_item(
     complete_sprint_item once the change is verified/shipped.
     """
     return await _update_sprint_item_status(
-        db, project_id, item_id, "provisional_complete", task_id=task_id
+        db, project_id, item_id, "provisional_complete", task_id=task_id,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
 
 
@@ -4763,7 +4843,8 @@ async def skip_sprint_item(
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``skipped`` (intentionally not shipped)."""
     result = await _update_sprint_item_status(
-        db, project_id, item_id, "skipped", notes=reason
+        db, project_id, item_id, "skipped", notes=reason,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
@@ -4777,7 +4858,8 @@ async def start_sprint_item(
 ) -> dict[str, Any] | None:
     """Flip a sprint item from ``pending``/``todo`` to ``in_progress``."""
     return await _update_sprint_item_status(
-        db, project_id, item_id, "in_progress"
+        db, project_id, item_id, "in_progress",
+        expected_statuses={"pending", "todo"},
     )
 
 
@@ -4868,15 +4950,33 @@ async def claim_sprint_item(
         raise ValueError(
             f"cannot claim item with status '{item.get('status')}'"
         )
+    # fa3e3331 — the pre-check above (read, then this UPDATE) is a classic
+    # TOCTOU race: two concurrent claims can both pass the pre-check before
+    # either commits. The "AND status NOT IN (...)" clause makes the actual
+    # write atomic — only one concurrent caller's UPDATE can match — so at
+    # most one claim ever succeeds even when both callers observed 'pending'.
     cursor = await db.execute(
         "UPDATE sprint_items SET status = 'in_progress', "
         "claimed_at = datetime('now'), actor = COALESCE(?, actor) "
-        "WHERE id = ? AND project_id = ?",
+        "WHERE id = ? AND project_id = ? "
+        "AND status NOT IN ('in_progress', 'done', 'failed', 'skipped')",
         (actor, item_id, project_id),
     )
     await db.commit()
     if cursor.rowcount == 0:
-        return None
+        # The pre-check passed but a concurrent claim committed first between
+        # that read and this UPDATE (or the item vanished/moved project in
+        # between). Re-fetch and raise the SAME ValueError shape the pre-check
+        # above uses, so this race-lost case is indistinguishable to callers
+        # (including the MCP handler's existing except-ValueError handling)
+        # from a claim that was rejected up front — no separate handling
+        # needed for the race case specifically.
+        _raced = await get_sprint_item(db, item_id)
+        if _raced is None or _raced.get("project_id") != project_id:
+            return None
+        raise ValueError(
+            f"cannot claim item with status '{_raced.get('status')}'"
+        )
     updated = await get_sprint_item(db, item_id)
     _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": "in_progress"})
     return updated
@@ -4890,7 +4990,8 @@ async def fail_sprint_item(
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``failed``. ``reason`` stored in ``notes``."""
     result = await _update_sprint_item_status(
-        db, project_id, item_id, "failed", notes=reason
+        db, project_id, item_id, "failed", notes=reason,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
@@ -4911,7 +5012,8 @@ async def push_sprint_item(
     if not to_version:
         raise ValueError("to_version is required for push_sprint_item")
     return await _update_sprint_item_status(
-        db, project_id, item_id, "pushed", pushed_to=to_version
+        db, project_id, item_id, "pushed", pushed_to=to_version,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
 
 
@@ -4966,8 +5068,33 @@ async def patch_sprint_item(
     if status is not None:
         if status not in _VALID_SPRINT_STATUSES:
             raise ValueError(f"invalid sprint-item status: {status!r}")
+        # 6a17e735 — patch_sprint_item is a generic field-editor, not a
+        # state-transition function. Only administrative resets are allowed
+        # here; every terminal/business-logic status has a dedicated function
+        # that enforces its own guards (evidence gate, rollup, task-chain,
+        # claimed_at, cache invalidation, live dashboard event) and MUST be
+        # used instead — silently allowing them here bypassed all of that.
+        if status not in _PATCH_SPRINT_ITEM_ALLOWED_STATUSES:
+            _dedicated = {
+                "done": "complete_sprint_item",
+                "skipped": "skip_sprint_item",
+                "failed": "fail_sprint_item",
+                "pushed": "push_sprint_item (or the version-push flow)",
+                "in_progress": "claim_sprint_item",
+                "provisional_complete": "provisional_complete_sprint_item",
+            }.get(status, "a dedicated state-transition function")
+            raise ValueError(
+                f"patch_sprint_item cannot set status={status!r} — this is a "
+                f"guarded transition that must go through {_dedicated}, which "
+                "enforces evidence/rollup/task-chain rules patch_sprint_item "
+                f"does not. Allowed here: {sorted(_PATCH_SPRINT_ITEM_ALLOWED_STATUSES)}."
+            )
         fields.append("status = ?")
         values.append(status)
+        # Every status patch_sprint_item is allowed to set is non-terminal —
+        # mirror _update_sprint_item_status's else-branch so a reset via this
+        # function can never leave a stale completed_at behind.
+        fields.append("completed_at = NULL")
     if feedback_thumb is not None:
         fields.append("feedback_thumb = ?")
         values.append(int(feedback_thumb))
@@ -5031,6 +5158,14 @@ async def patch_sprint_item(
     await db.commit()
     if cursor.rowcount == 0:
         return None
+    if status is not None:
+        # 6a17e735 — a status change (even the restricted, non-terminal subset
+        # patch_sprint_item allows) must get the same cache/live-refresh
+        # treatment _update_sprint_item_status gives every other transition —
+        # otherwise a caller could see a stale cached list or a dashboard that
+        # never refreshes after a reset.
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": status})
     return await get_sprint_item(db, item_id)
 
 
@@ -5199,8 +5334,19 @@ async def split_sprint_item(
         )
     if not titles:
         raise ValueError("titles must not be empty")
-    # Close the original
-    await _update_sprint_item_status(db, project_id, item_id, "skipped")
+    # Close the original. fa3e3331 — atomic from-state guard: the pre-check
+    # above is a read-then-write race like every other transition; a
+    # concurrent status change between that read and this call must not
+    # silently close an item mid-transition. Re-raise as the same ValueError
+    # shape the pre-check above already uses, for caller consistency.
+    try:
+        await _update_sprint_item_status(
+            db, project_id, item_id, "skipped", expected_statuses=allowed,
+        )
+    except SprintItemStatusRace as exc:
+        raise ValueError(
+            f"can only split pending or in_progress items, got '{exc.current_status}'"
+        ) from exc
     # Create new items
     new_items = []
     for t in titles:
@@ -5254,13 +5400,27 @@ async def merge_sprint_items(
         "VALUES (?, ?, ?, ?, ?, 'task')",
         (survivor_id, project_id, version, new_title, merged_from_json),
     )
-    # Close all sources
+    # Close all sources. fa3e3331 — atomic from-state guard: the pre-check
+    # loop above is a read-then-write race like every other transition. A
+    # source item that a concurrent caller completed/failed/skipped between
+    # that pre-check and this UPDATE must not be silently overwritten to
+    # 'skipped' — roll back the whole merge (including the survivor insert
+    # above) rather than leave a half-merged state, since a merge is only
+    # meaningful as an all-or-nothing operation.
     for iid in item_ids:
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE sprint_items SET status = 'skipped', completed_at = datetime('now'), "
-            "merged_into = ? WHERE id = ? AND project_id = ?",
+            "merged_into = ? WHERE id = ? AND project_id = ? "
+            "AND status IN ('pending', 'in_progress')",
             (survivor_id, iid, project_id),
         )
+        if cursor.rowcount == 0:
+            _raced = await get_sprint_item(db, iid)
+            await db.rollback()
+            raise ValueError(
+                f"cannot merge item '{iid}': status changed to "
+                f"'{(_raced or {}).get('status')}' before the merge could complete"
+            )
     await db.commit()
     _publish_project_event(project_id, "sprint_item_updated", {"merged_into": survivor_id})
     survivor = await get_sprint_item(db, survivor_id)
@@ -13092,6 +13252,34 @@ async def record_handoff(
     return (await get_handoff(db, hid)) or {"id": hid}
 
 
+async def amend_handoff(
+    db: aiosqlite.Connection,
+    project_id: str,
+    body: str,
+    mode: str,
+) -> dict[str, Any] | None:
+    """edd9c54b — update the most recent handoff row for a project in-place.
+
+    Called when generate_handoff detects that the prior handoff was never
+    consumed (pending_goal is still set, meaning no start_session has popped
+    it since the last generate_handoff). Amending avoids inflating the handoffs
+    table with redundant rows and suppresses the context-refresh nudge.
+
+    Returns the updated row, or None if no prior row exists (caller falls back
+    to record_handoff).
+    """
+    rows = await get_handoffs(db, project_id, limit=1)
+    if not rows:
+        return None
+    hid = rows[0]["id"]
+    await db.execute(
+        "UPDATE handoffs SET body = ?, mode = ?, created_at = datetime('now') WHERE id = ?",
+        (body, mode, hid),
+    )
+    await db.commit()
+    return await get_handoff(db, hid)
+
+
 async def get_handoff(
     db: aiosqlite.Connection, handoff_id: str
 ) -> dict[str, Any] | None:
@@ -13405,3 +13593,372 @@ async def prune_rate_counters(
         (older_than_minute,),
     )
     await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# f7ee1ba7 — Model B: scoped docx-region claims
+#
+# A .docx is a zip container with no partial write; every mutating tool
+# re-saves the whole file (last-save-wins). ``file_locks`` (whole-file) and
+# ``file_symbol_claims`` (code line-ranges) already guard code files at two
+# granularities. This extends the same pattern to DOCX documents:
+#
+# * A session may claim a specific paragraph/element by its durable ``para_id``
+#   (the ``w14:paraId`` the OOXML layer already surfaces — the same id used by
+#   ``update_paragraph`` and ``get_document_structure``).
+# * Two sessions can hold NON-OVERLAPPING element claims on the same file
+#   concurrently — the precision benefit mirroring symbol claims for code.
+# * An edit attempt OUTSIDE the caller's claimed element is REJECTED before
+#   touching the filesystem — structural prevention, not advice.
+# * A whole-file (unscoped) claim still works as before; scoped claims
+#   compose with it (a whole-file lock blocks all scoped writers, exactly as
+#   file_locks blocks symbol claims).
+# ---------------------------------------------------------------------------
+
+async def _migrate_docx_region_claims(db: aiosqlite.Connection) -> None:
+    """f7ee1ba7 — create file_docx_region_claims table if it doesn't exist.
+
+    Guarded migration (no inline CREATE INDEX in CREATE_TABLES — 2026-07-04
+    outage rule): the table and its indexes are created here, so existing DBs
+    pick them up on first startup after the deploy.
+    """
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_docx_region_claims (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL,
+            element_id TEXT NOT NULL,
+            claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            released_at TEXT
+        )
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_docx_region_claims_file "
+        "ON file_docx_region_claims (file_path)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_docx_region_claims_session "
+        "ON file_docx_region_claims (session_id)"
+    )
+    await db.commit()
+
+
+async def _live_docx_region_claims_for_file(
+    db: aiosqlite.Connection,
+    file_path: str,
+    exclude_session_id: str,
+) -> list[dict[str, Any]]:
+    """Active scoped docx-region claims on ``file_path`` held by OTHER sessions.
+
+    Uses the same _CLAIM_LIVE_HOURS staleness cutoff as file_symbol_claims so
+    a crashed session's element claims time out consistently.
+    """
+    cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
+    async with db.execute(
+        "SELECT drc.id, drc.session_id, drc.file_path, drc.element_id, "
+        "       drc.claimed_at, s.name AS session_name "
+        "FROM file_docx_region_claims drc "
+        "JOIN sessions s ON s.id = drc.session_id "
+        "WHERE drc.file_path = ? AND drc.session_id != ? "
+        "AND drc.released_at IS NULL "
+        "AND s.status IN ('active', 'live') "
+        "AND (s.last_seen IS NULL OR s.last_seen > ?)",
+        (file_path, exclude_session_id, cutoff),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
+async def claim_docx_region(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+    element_id: str,
+) -> dict[str, Any]:
+    """Claim a specific paragraph/element of a .docx for exclusive editing.
+
+    f7ee1ba7 — Model B scoped-region claiming. ``element_id`` is the durable
+    ``w14:paraId`` (or ``p{index}`` fallback) surfaced by
+    ``get_document_structure`` / ``update_paragraph`` — the same stable id that
+    round-trips through the OOXML layer.
+
+    Conflict rules (mirror file_symbol_claims / claim_symbol):
+
+    * A whole-file write lock on the document by ANOTHER session blocks this
+      claim (the file owner may touch any element).
+    * Another session's scoped claim on the SAME ``element_id`` blocks (hard
+      conflict — two writers would race on the same paragraph).
+    * Another session's claim on a DIFFERENT element is allowed (the real
+      precision benefit: parallel editing of non-overlapping regions).
+    * The caller's own prior claim on this element is refreshed (idempotent).
+
+    Returns ``{"claimed": True, ...}`` on success, ``{"claimed": False,
+    "reason": ..., ...}`` on conflict, never raises.
+    """
+    normalized = _normalize_file_path(file_path)
+    if not normalized:
+        return {"claimed": False, "reason": "invalid", "message": "file_path is required"}
+    elem = (element_id or "").strip()
+    if not elem:
+        return {"claimed": False, "reason": "invalid", "message": "element_id is required"}
+
+    # Check for a whole-file write lock held by another session.
+    await expire_file_locks(db)
+    async with db.execute(
+        "SELECT session_id, claimed_at, expires_at FROM file_locks WHERE file_path = ?",
+        (normalized,),
+    ) as cur:
+        _fl_row = await cur.fetchone()
+    _fl = _row_to_dict(_fl_row)
+    if _fl and _fl.get("session_id") and _fl.get("session_id") != session_id:
+        return {
+            "claimed": False,
+            "reason": "file_locked",
+            "file_path": normalized,
+            "element_id": elem,
+            "holder_session_id": _fl.get("session_id"),
+            "message": (
+                f"Cannot claim element {elem!r} in {normalized}: another live session "
+                "holds a whole-file lock on it. Wait for it to release, or coordinate."
+            ),
+        }
+
+    # Check for another session's claim on the same element_id.
+    others = await _live_docx_region_claims_for_file(db, normalized, session_id)
+    conflicts = [c for c in others if c.get("element_id") == elem]
+    if conflicts:
+        holder = conflicts[0]
+        safe_elements = list({c["element_id"] for c in others if c["element_id"] != elem})
+        holder_name = holder.get("session_name") or (holder.get("session_id") or "unknown")[:8]
+        return {
+            "claimed": False,
+            "reason": "element_conflict",
+            "file_path": normalized,
+            "element_id": elem,
+            "conflicts": [
+                {
+                    "element_id": c["element_id"],
+                    "holder_session_id": c["session_id"],
+                    "holder_session_name": c.get("session_name"),
+                }
+                for c in conflicts
+            ],
+            "other_claimed_elements": safe_elements,
+            "message": (
+                f"Element {elem!r} in {normalized} is already claimed by session "
+                f"{holder_name}. Pick a different element or wait for the claim to release."
+            ),
+        }
+
+    # No conflict — (re)claim this element (idempotent per session+file+element).
+    await db.execute(
+        "DELETE FROM file_docx_region_claims "
+        "WHERE session_id = ? AND file_path = ? AND element_id = ?",
+        (session_id, normalized, elem),
+    )
+    await db.execute(
+        "INSERT INTO file_docx_region_claims (id, session_id, file_path, element_id) "
+        "VALUES (?, ?, ?, ?)",
+        (_new_id(), session_id, normalized, elem),
+    )
+    await db.commit()
+    return {
+        "claimed": True,
+        "file_path": normalized,
+        "session_id": session_id,
+        "element_id": elem,
+    }
+
+
+async def get_docx_region_claims(
+    db: aiosqlite.Connection,
+    file_path: str,
+) -> list[dict[str, Any]]:
+    """Return active scoped docx-region claims on ``file_path`` (released_at IS NULL).
+
+    f7ee1ba7 — read-only; newest first. Expired claims (sessions gone stale)
+    are NOT pruned here — read-only so it never writes. Use claim_docx_region
+    to auto-expire on the write path.
+    """
+    normalized = _normalize_file_path(file_path)
+    async with db.execute(
+        "SELECT drc.*, s.name AS session_name "
+        "FROM file_docx_region_claims drc "
+        "LEFT JOIN sessions s ON s.id = drc.session_id "
+        "WHERE drc.file_path = ? AND drc.released_at IS NULL "
+        "ORDER BY drc.claimed_at DESC",
+        (normalized,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
+async def release_docx_region_claims(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str | None = None,
+    element_id: str | None = None,
+) -> int:
+    """Soft-release scoped docx-region claims held by ``session_id``.
+
+    f7ee1ba7 — sets released_at (never deletes) so history is retained.
+    Scoping: all claims for the session (no args), all claims on one file
+    (file_path), or a single element claim (file_path + element_id).
+    Returns the number of claims released.
+    """
+    if file_path and element_id:
+        normalized = _normalize_file_path(file_path)
+        cur = await db.execute(
+            "UPDATE file_docx_region_claims SET released_at = datetime('now') "
+            "WHERE session_id = ? AND file_path = ? AND element_id = ? "
+            "AND released_at IS NULL",
+            (session_id, normalized, element_id.strip()),
+        )
+    elif file_path:
+        normalized = _normalize_file_path(file_path)
+        cur = await db.execute(
+            "UPDATE file_docx_region_claims SET released_at = datetime('now') "
+            "WHERE session_id = ? AND file_path = ? AND released_at IS NULL",
+            (session_id, normalized),
+        )
+    else:
+        cur = await db.execute(
+            "UPDATE file_docx_region_claims SET released_at = datetime('now') "
+            "WHERE session_id = ? AND released_at IS NULL",
+            (session_id,),
+        )
+    await db.commit()
+    return cur.rowcount
+
+
+async def check_docx_region_write_conflict(
+    db: "Any",
+    session_id: str | None,
+    file_path: str,
+    element_id: str | None,
+) -> "dict[str, Any] | None":
+    """Scoped-claim enforcement gate for docx writes (f7ee1ba7 Model B).
+
+    Called by ``update_paragraph`` before writing a paragraph into a .docx.
+    Returns a conflict dict ``{"blocked": True, "reason": ..., "message": ...}``
+    when the write must be rejected, else ``None`` (clear — proceed).
+
+    Rules (strictly enforced, not advisory):
+
+    1. Whole-file lock: if another session holds a whole-file write lock on
+       ``file_path``, BLOCK (regardless of element_id). The file owner controls
+       every element.
+    2. Scoped-claim enforcement: if ANY session holds a scoped claim on
+       ``file_path`` AND ``session_id`` is NOT the holder AND ``element_id``
+       is NOT in the caller's own scoped claims for this file → BLOCK.
+       - If the write is for an element another session has claimed → BLOCK
+         (element owned by someone else).
+       - If the write is for an element the caller DOES own → ALLOW (owner
+         writes their own region).
+       - If no scoped claims exist at all → ALLOW (unscoped/unclaimed).
+    3. Fail-open: a DB error, missing db, or unidentifiable element degrades
+       to None (no block). The gate surfaces conflicts; claim_docx_region is
+       the real primitive.
+    """
+    if db is None:
+        return None
+    normalized = _normalize_file_path(file_path)
+    if not normalized:
+        return None
+    _sid = (session_id or "").strip()
+    _elem = (element_id or "").strip()
+
+    try:
+        # Rule 1: whole-file write lock by another session.
+        await expire_file_locks(db)
+        async with db.execute(
+            "SELECT session_id FROM file_locks WHERE file_path = ?",
+            (normalized,),
+        ) as cur:
+            fl_row = await cur.fetchone()
+        fl = _row_to_dict(fl_row)
+        if fl and fl.get("session_id") and fl.get("session_id") != _sid:
+            holder = fl["session_id"]
+            return {
+                "blocked": True,
+                "reason": "file_locked",
+                "file_path": normalized,
+                "element_id": _elem or None,
+                "holder": holder,
+                "message": (
+                    f"Cannot write element {_elem!r} in {normalized}: session {holder} "
+                    "holds a whole-file write lock. Wait for it to release or coordinate."
+                ),
+            }
+
+        # Rule 2: scoped-claim enforcement.
+        # Any scoped claim on this file means the file is in "region-partitioned"
+        # mode — edits without owning the target element are rejected.
+        all_claims = await get_docx_region_claims(db, normalized)
+        if not all_claims:
+            return None  # No scoped claims — unguarded, allow.
+
+        # Check whether the caller owns the target element.
+        if _elem:
+            caller_owns = any(
+                c.get("session_id") == _sid and c.get("element_id") == _elem
+                for c in all_claims
+            )
+            if caller_owns:
+                return None  # Caller owns this element — allow.
+
+            # Check if another session claims THIS element.
+            other_owns_target = any(
+                c.get("session_id") != _sid and c.get("element_id") == _elem
+                for c in all_claims
+            )
+            if other_owns_target:
+                holder_row = next(
+                    c for c in all_claims
+                    if c.get("session_id") != _sid and c.get("element_id") == _elem
+                )
+                holder = holder_row.get("session_id", "unknown")
+                return {
+                    "blocked": True,
+                    "reason": "element_locked",
+                    "file_path": normalized,
+                    "element_id": _elem,
+                    "holder": holder,
+                    "message": (
+                        f"Element {_elem!r} in {normalized} is claimed by session "
+                        f"{holder}. You do not own this element. Use claim_docx_region "
+                        "to acquire a non-conflicting element, or wait for the claim to release."
+                    ),
+                }
+
+            # The file is in scoped mode but the target element is unclaimed by
+            # anyone. Editing an unclaimed element while others are scoped is
+            # still risky (last-save-wins), but NOT a conflict per the Model-B
+            # spec — block only when a claimed element would be overwritten.
+            return None
+
+        # No element_id provided — the caller is trying a whole-element or
+        # unscoped write on a file that has scoped claims. Block if the caller
+        # has no claims themselves (they should use a scoped claim or wait).
+        caller_has_any = any(c.get("session_id") == _sid for c in all_claims)
+        if not caller_has_any:
+            other_sessions = list({c.get("session_id") for c in all_claims if c.get("session_id") != _sid})
+            return {
+                "blocked": True,
+                "reason": "scoped_mode",
+                "file_path": normalized,
+                "element_id": None,
+                "holder": other_sessions[0] if other_sessions else "unknown",
+                "message": (
+                    f"{normalized} is in scoped-edit mode: {len(other_sessions)} other "
+                    "session(s) hold region claims on it. Provide an element_id and "
+                    "use claim_docx_region to acquire your region before writing."
+                ),
+            }
+
+    except Exception:  # noqa: BLE001 — never wedge a write on a guard error
+        return None
+
+    return None

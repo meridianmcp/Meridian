@@ -2049,8 +2049,9 @@ async def _handle_task_tools(
             )
         except Exception:  # noqa: BLE001
             _graph_searcher = None
+        _handoff_amended = False
         try:
-            path, content = await asyncio.wait_for(
+            path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
                     db,
                     args["project_id"],
@@ -2127,6 +2128,7 @@ async def _handle_task_tools(
             "file_path": path,
             "content": _plain_content,
             "mode": mode,
+            "amended": _handoff_amended,
             "template_stale": _tpl_stale,
             "insight_hints": _insight_hints[:5],
             "goal_length_warning": _goal_warn,
@@ -2830,6 +2832,10 @@ async def _handle_notes_decisions(
         # resolve the tier store, look up the stored document by its source, then
         # rewrite ONE paragraph in the on-disk .docx by its w14:paraId (never by
         # text match) and resync the doc_elements row.
+        # f7ee1ba7 — Model B scoped-region enforcement: before writing, consult
+        # docx-region claims and REJECT the write when another session owns the
+        # target element (or holds a whole-file lock). Fail-open: a claim-lookup
+        # error degrades to allow so a missing db never wedges a legitimate write.
         validate_input_size(args.get("doc"), "doc", 2_000)
         validate_input_size(args.get("para_id"), "para_id", 500)
         if not args.get("project_id"):
@@ -2853,6 +2859,20 @@ async def _handle_notes_decisions(
             validate_input_size(new_text, "new_text", 1_000_000)
         elif not isinstance(runs, list):
             return {"error": "runs must be a list of strings or run objects"}
+        # f7ee1ba7 — scoped-region claim enforcement gate.
+        _up_session_id = (args.get("session_id") or "").strip() or None
+        if db is not None:
+            _region_conflict = await db_module.check_docx_region_write_conflict(
+                db, _up_session_id, doc_source, para_id,
+            )
+            if _region_conflict is not None and _region_conflict.get("blocked"):
+                return {
+                    "error": "docx_region_conflict",
+                    "blocked": True,
+                    "reason": _region_conflict.get("reason"),
+                    "holder": _region_conflict.get("holder"),
+                    "message": _region_conflict.get("message"),
+                }
         store = await _resolve_ingest_doc_store(db, data_dir, tenant)
         if store is None:
             return {"error": "document-structure store unavailable"}
@@ -3012,6 +3032,56 @@ async def _handle_notes_decisions(
             "project_id": args["project_id"],
             "document_id": doc_row["id"],
             "matches": matches,
+        }
+    if name == "link_figure_caption":
+        # 0ff8b982 — durably link an already-indexed doc_figures row to its
+        # caption paragraph by stable doc_elements id (not proximity). Confirmation
+        # primitive for the advisory suggestion from index_figure, and the
+        # backfill mechanism for figures indexed before caption linkage was added.
+        validate_input_size(args.get("doc"), "figure doc", 2_000)
+        validate_input_size(args.get("figure_id"), "figure_id", 200)
+        validate_input_size(args.get("caption_element_id"), "caption_element_id", 200)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        doc_source = args.get("doc")
+        figure_id = (args.get("figure_id") or "").strip()
+        caption_element_id = (args.get("caption_element_id") or "").strip()
+        if not doc_source:
+            return {"error": "doc is required"}
+        if not figure_id:
+            return {"error": "figure_id is required"}
+        if not caption_element_id:
+            return {"error": "caption_element_id is required"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for doc={doc_source!r} — ingest_document "
+                    "it first (that MCP tool populates the doc-structure store; "
+                    "there is no separate reindex_document tool)"
+                ),
+            }
+        try:
+            updated = await store.set_figure_caption_link(figure_id, caption_element_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not set caption link: {exc}"}
+        if updated is None:
+            return {
+                "error": (
+                    f"no doc_figures row found for figure_id={figure_id!r} "
+                    "— use find_similar_figure to locate the correct figure_id"
+                ),
+            }
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc_row["id"],
+            "figure": updated,
         }
     if name == "index_table":
         # 2622182d — index ONE table into the SEMANTIC table index (dedup +
@@ -3496,7 +3566,7 @@ async def _handle_session_tools(
         _ckpt_project = await db_module.get_project(db, project_id)
         _commits = await _fetch_recent_commits(_ckpt_project or {}, tenant)
         try:
-            _, content = await asyncio.wait_for(
+            _, content, _ = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
                     db, project_id, data_dir, mode="delta", session_id=session_id,
                     commit_messages=[c["message"] for c in _commits],
@@ -4713,6 +4783,17 @@ async def _handle_sprint_tools(
                 "item_id": args["item_id"],
                 "message": str(exc),
             }
+        except db_module.SprintItemStatusRace as exc:
+            # fa3e3331 — another caller already moved this item out of an
+            # active state (e.g. a concurrent skip/fail/complete won the
+            # race). Surface it distinctly rather than a misleading
+            # "not found".
+            return {
+                "error": "STATUS_RACE",
+                "item_id": exc.item_id,
+                "current_status": exc.current_status,
+                "message": str(exc),
+            }
         if item is None:
             raise ValueError("sprint item not found")
         if _merge_warning:
@@ -4927,7 +5008,7 @@ async def _handle_file_claims(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file, get_graph_diff, snapshot_graph_metrics."""
+    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file, get_graph_diff, snapshot_graph_metrics, claim_docx_region, get_docx_region_claims, release_docx_region_claims."""
     if name == "claim_file":
         # 4bac57ff — symbol-level claim when both `symbol` and `content` are
         # supplied; otherwise the coarse whole-file lock. Falls back to a
@@ -5032,6 +5113,33 @@ async def _handle_file_claims(
         if not pid:
             return {"error": "project_id is required (or pass project_name)"}
         return await db_module.snapshot_graph_metrics(db, sid, pid)
+    if name == "claim_docx_region":
+        # f7ee1ba7 — Model B scoped-region claiming for .docx files.
+        return await db_module.claim_docx_region(
+            db,
+            session_id=args["session_id"],
+            file_path=args["file_path"],
+            element_id=args["element_id"],
+        )
+    if name == "get_docx_region_claims":
+        # f7ee1ba7 — read-only: active scoped region claims on a .docx file.
+        return {
+            "file_path": args["file_path"],
+            "claims": await db_module.get_docx_region_claims(db, args["file_path"]),
+        }
+    if name == "release_docx_region_claims":
+        # f7ee1ba7 — release scoped docx-region claims for a session.
+        released = await db_module.release_docx_region_claims(
+            db, args["session_id"],
+            file_path=args.get("file_path"),
+            element_id=args.get("element_id"),
+        )
+        return {
+            "released": released,
+            "session_id": args["session_id"],
+            "file_path": args.get("file_path"),
+            "element_id": args.get("element_id"),
+        }
     if name == "release_file":
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
         return {"released": released, "file_path": args["file_path"]}
@@ -6066,8 +6174,17 @@ async def _dispatch_mcp_tool(
                                 _interval = settings.get("refresh_interval_turns") or 10
                                 _calls = _state["calls"]
                                 _last = _state["last_refresh"]
+                                # edd9c54b — amend path: suppress the
+                                # trigger-based nudge for generate_handoff when
+                                # the call merely amended an unconsumed prior
+                                # handoff (nothing genuinely new to report).
+                                _amended_handoff = (
+                                    name == "generate_handoff"
+                                    and isinstance(_result, dict)
+                                    and _result.get("amended") is True
+                                )
                                 _fire = (
-                                    name in enabled_triggers
+                                    (name in enabled_triggers and not _amended_handoff)
                                     or (_calls - _last) >= _interval
                                 )
                                 # One-per-call: only fire if we haven't already
