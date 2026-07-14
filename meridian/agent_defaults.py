@@ -53,7 +53,13 @@ import re
 #         a single find_symbol call would have found immediately. Added an explicit
 #         "grep/glob NEVER as first step" rule and a before/after illustration so
 #         the anti-pattern is unambiguous.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 10
+#   v11 — PreToolUse hook (aeba8a80) structurally blocks Grep/Glob tool calls when
+#         code_intel_enabled=1 for this project. Prose alone failed (v10 shipped,
+#         live session still grepped exclusively the same night). The hook fires
+#         before the tool call reaches the executor and exits 2 (block) with a
+#         redirect message naming the code-intel alternatives. Fail-open: only
+#         blocks when the project settings endpoint confirms a live index.
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 11
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -183,6 +189,12 @@ STOP — use `find_symbol`, `search_graph`, or `search_code_semantic` instead.
 grep/glob may be used AFTER code-intel tools confirm a file path, or for
 non-symbol content (log output, data files, config values).
 
+**Structural enforcement (aeba8a80):** When code-intel is enabled for this project,
+a PreToolUse hook (`code_intel_guard`) fires on every Grep and Glob call and blocks
+it (exit 2) with a redirect to the alternatives above. This is not a soft warning —
+the tool call will be cancelled. The only way past it is to use a code-intel tool
+first, then fall back to grep/glob once a file path is confirmed.
+
 **search_graph cross-check rule (b2d312b1):** `codebase__search_graph` indexes can
 go stale and have been observed producing actively wrong results — zero hits for
 symbols that exist, and line spans off by hundreds of lines. The Serena
@@ -225,7 +237,7 @@ source FIRST — do not default to a generic web search:
 Retrieval beats recall: look it up. Do not answer a decision-relevant factual
 question from memory when a source can be checked.
 
-<!-- meridian-executor-standard: v10 -->
+<!-- meridian-executor-standard: v11 -->
 """
 
 

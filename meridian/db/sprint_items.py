@@ -1,0 +1,2307 @@
+"""Sprint-item persistence functions — extracted from meridian/db/__init__.py.
+
+This module contains all functions whose primary subject is the sprint_items table:
+add/claim/complete/fail/push/skip/patch/split/merge/pointers/waves and related helpers.
+
+Imported back into meridian.db via ``from .sprint_items import *`` so all existing
+call sites using ``db_module.function_name()`` continue to work unchanged.
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+from typing import Any
+
+import aiosqlite
+
+# Shared helpers from the parent db package — available at import time
+# because sprint_items.py is imported at the bottom of db/__init__.py,
+# after all these names are defined.
+from meridian.db import (  # noqa: PLC0415
+    _new_id,
+    _row_to_dict,
+    _publish_project_event,
+    _UNSET,
+    serialize_touches_resources,
+    parse_touches_resources,
+    _resource_sets_conflict,
+)
+
+
+# ---------------------------------------------------------------------------
+# SECTION 1: Lines 2782-2965 — stall helpers and stalled-item functions
+# ---------------------------------------------------------------------------
+
+# bc9259b8 — worker stall auto-retry budget. A sprint item left in_progress by a
+# closing/stale worker is re-queued to pending while its stall_count is within
+# this budget; once it would exceed the budget it is marked failed silently (no
+# HITL, no human ping) so the orchestrator just moves on.
+_MAX_SPRINT_STALL_RETRIES = 2
+
+# 890046a2 — time-based stall detection threshold for analyze_sprint.
+#
+# The persisted stall_count is only incremented when a session is explicitly
+# archived/closed with items still claimed.  Items abandoned by a chat window
+# that was simply closed — the common real-world case — never get their
+# stall_count bumped, regardless of how many days pass.
+#
+# This constant guards a second, time-based detection path: any item still
+# in_progress (or claimed) after this many hours is surfaced as a stall even
+# when stall_count == 0.
+#
+# The threshold is intentionally LONGER than the 2-hour auto-release window
+# used by release_stale_task_claims / _FILE_LOCK_TTL_HOURS.  Those mechanisms
+# are defensive (prevent orphaned locks); this one surfaces to a human planner
+# who should see truly long-running items, not routine in-flight work.  A
+# sprint item sitting in_progress for 4+ hours without progress almost
+# certainly represents an abandoned session, not an active worker.
+_SPRINT_STALL_FLAG_HOURS = 4
+
+
+async def _session_stall_summary(
+    db: aiosqlite.Connection, session_id: str, *, limit: int = 5
+) -> str:
+    """Build a compact 'last session log' string for a stalled worker session.
+
+    Joins the session's most recent task_log descriptions so the failure note on
+    a permanently-stalled item captures what the worker was doing. Best-effort:
+    returns '(no session log)' when the session logged nothing.
+    """
+    async with db.execute(
+        "SELECT description FROM task_log WHERE session_id = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (session_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    descs = [str((_row_to_dict(r) or {}).get("description") or "").strip() for r in rows]
+    descs = [d for d in descs if d]
+    if not descs:
+        return "(no session log)"
+    return " | ".join(descs)
+
+
+async def _stalled_item_ids_for_session(
+    db: aiosqlite.Connection, session_id: str
+) -> list[str]:
+    """Return distinct sprint-item ids this session was working on.
+
+    A worker links to an item via a registered worktree (active_worktrees.item_id)
+    or via task_log rows tagged with sprint_item_id. The union covers both the
+    worktree-isolated and single-tree worker styles.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    async with db.execute(
+        "SELECT item_id FROM active_worktrees "
+        "WHERE session_id = ? AND item_id IS NOT NULL AND removed_at IS NULL",
+        (session_id,),
+    ) as cur:
+        for r in await cur.fetchall():
+            iid = (_row_to_dict(r) or {}).get("item_id")
+            if iid and iid not in seen:
+                seen.add(iid)
+                ids.append(iid)
+    async with db.execute(
+        "SELECT DISTINCT sprint_item_id FROM task_log "
+        "WHERE session_id = ? AND sprint_item_id IS NOT NULL",
+        (session_id,),
+    ) as cur:
+        for r in await cur.fetchall():
+            iid = (_row_to_dict(r) or {}).get("sprint_item_id")
+            if iid and iid not in seen:
+                seen.add(iid)
+                ids.append(iid)
+    return ids
+
+
+async def requeue_or_fail_stalled_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any] | None:
+    """bc9259b8 — handle one stalled sprint item: re-queue, or fail after the budget.
+
+    Increments ``stall_count``. While the new count is within
+    :data:`_MAX_SPRINT_STALL_RETRIES`, the item is re-queued to ``pending``
+    (claim cleared) so another worker can pick it up. Once the new count exceeds
+    the budget the item is marked ``failed`` with the stalling session's last log
+    appended to its notes — silently, with no HITL. No-op (returns None) when the
+    item is missing, in another project, or not currently ``in_progress``.
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return None
+    if (item.get("status") or "pending") != "in_progress":
+        return None  # completed/failed/already re-queued — not a stall
+    new_count = int(item.get("stall_count") or 0) + 1
+    if new_count > _MAX_SPRINT_STALL_RETRIES:
+        last_log = (
+            await _session_stall_summary(db, session_id) if session_id else "(unknown session)"
+        )
+        reason = (
+            f"Auto-failed after {new_count - 1} stall retr"
+            f"{'y' if new_count - 1 == 1 else 'ies'} "
+            f"(worker closed without completing). Last session log: {last_log}"
+        )
+        # fa3e3331 / ARCH 1B — route through _transition_status so the atomic
+        # from-state guard ("from_statuses=['in_progress']"), cache bust, and
+        # live event are handled by the shared chokepoint. Returns None (no-op)
+        # if the item is no longer in_progress — a concurrent completion beat us.
+        # claimed_at is cleared via a separate stall_count UPDATE below when we
+        # confirm the transition succeeded; stall_count is a stall-specific field
+        # that _transition_status does not model, so we write it afterwards.
+        _failed_result = await _transition_status(
+            db, project_id, item_id, "failed",
+            from_statuses=["in_progress"],
+            notes=reason,
+        )
+        if _failed_result is None:
+            return None
+        # Stamp the new stall_count and clear claimed_at now that we own the row.
+        await db.execute(
+            "UPDATE sprint_items SET stall_count = ?, claimed_at = NULL "
+            "WHERE id = ? AND project_id = ?",
+            (new_count, item_id, project_id),
+        )
+        await db.commit()
+        updated = await get_sprint_item(db, item_id)
+        return {"action": "failed", "item": updated, "stall_count": new_count}
+    # Re-queue path: returns None if a concurrent caller already changed status.
+    _requeued_result = await _transition_status(
+        db, project_id, item_id, "pending",
+        from_statuses=["in_progress"],
+    )
+    if _requeued_result is None:
+        return None
+    # Stamp the new stall_count and clear claimed_at/completed_at.
+    await db.execute(
+        "UPDATE sprint_items SET stall_count = ?, claimed_at = NULL, completed_at = NULL "
+        "WHERE id = ? AND project_id = ?",
+        (new_count, item_id, project_id),
+    )
+    await db.commit()
+    updated = await get_sprint_item(db, item_id)
+    return {"action": "requeued", "item": updated, "stall_count": new_count}
+
+
+async def handle_session_stall(
+    db: aiosqlite.Connection, session_id: str
+) -> dict[str, Any]:
+    """bc9259b8 — re-queue or fail any sprint items a closing worker left in_progress.
+
+    Finds every sprint item this session was working on (worktree or task link)
+    that is still ``in_progress`` and routes it through
+    :func:`requeue_or_fail_stalled_item`. Returns ``{"requeued": [ids], "failed":
+    [ids]}``. Safe no-op when the session completed its work (items already done).
+    """
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        srow = await cur.fetchone()
+    sess = _row_to_dict(srow)
+    requeued: list[str] = []
+    failed: list[str] = []
+    if not sess or not sess.get("project_id"):
+        return {"requeued": requeued, "failed": failed}
+    project_id = sess["project_id"]
+    for item_id in await _stalled_item_ids_for_session(db, session_id):
+        result = await requeue_or_fail_stalled_item(
+            db, project_id, item_id, session_id=session_id
+        )
+        if result is None:
+            continue
+        if result["action"] == "failed":
+            failed.append(item_id)
+        else:
+            requeued.append(item_id)
+    return {"requeued": requeued, "failed": failed}
+
+
+# ---------------------------------------------------------------------------
+# SECTION 2: Lines 4008-4038 — sprint-item task helpers
+# ---------------------------------------------------------------------------
+
+async def get_open_task_for_sprint_item(
+    db: aiosqlite.Connection, sprint_item_id: str
+) -> dict[str, Any] | None:
+    """Return the current pending/in-progress task row for a sprint item."""
+    async with db.execute(
+        "SELECT * FROM task_log WHERE sprint_item_id = ? "
+        "AND status IN ('pending', 'in_progress') "
+        "ORDER BY CASE WHEN status = 'in_progress' THEN 0 ELSE 1 END, "
+        "created_at DESC, id DESC LIMIT 1",
+        (sprint_item_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_blocking_dependency_for_sprint_item(
+    db: aiosqlite.Connection, sprint_item_id: str
+) -> dict[str, Any] | None:
+    """Return the unmet parent sprint item that blocks a claim, if any."""
+    item = await get_sprint_item(db, sprint_item_id)
+    if item is None:
+        return None
+    parent_id = item.get("depends_on")
+    if not parent_id:
+        return None
+    parent = await get_sprint_item(db, parent_id)
+    if parent is None:
+        return {"id": parent_id, "title": "(missing sprint item)", "status": "missing"}
+    if parent.get("status") != "done":
+        return parent
+    return None
+
+
+# ---------------------------------------------------------------------------
+# SECTION 3: Lines 4231-6072 — main sprint-item block
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Sprint items (v1.1) — machine-trackable checklist alongside the
+# free-text sprint field. Fixes the "sprint drift" problem where items
+# get written and silently forgotten across sessions.
+# ---------------------------------------------------------------------------
+
+
+_VALID_SPRINT_STATUSES = {
+    "pending", "todo", "in_progress", "provisional_complete",
+    "done", "failed", "skipped", "pushed", "indeterminate",
+}
+
+# Non-terminal statuses that keep a parent item "active" and never stamp
+# completed_at. provisional_complete sits between in_progress and done:
+# the executor has finished the work but it is not yet verified/deployed, so
+# it must NOT roll a parent up to done or count toward percent_complete.
+_ACTIVE_SPRINT_STATUSES = {
+    "pending", "in_progress", "todo", "indeterminate", "provisional_complete",
+}
+
+# Statuses that make an existing item a *blocking* duplicate when a new item
+# with a near-identical title is added. Only open/active work counts: a title
+# that overlaps a finished item (done / skipped / failed / pushed) is allowed
+# through, since re-doing finished work is legitimate. ``todo`` is the DB
+# default for freshly-added items and is pending-equivalent here.
+_DUP_BLOCKING_SPRINT_STATUSES = {"pending", "todo", "in_progress"}
+
+# e08fee30 — app-layer priority enum for sprint items. Higher-priority PENDING
+# items are surfaced (claimed / grouped) first. The DB column has no CHECK (so the
+# ADD COLUMN migration stays a plain alter); add_sprint_item / patch_sprint_item
+# enforce membership and raise ValueError on a bad value, like milestone_type.
+_VALID_SPRINT_PRIORITIES = ("urgent", "high", "normal", "low")
+# Rank used to order urgent-first (lower rank sorts earlier). Rendered into a
+# portable CASE expression so both SQLite and Postgres order identically without a
+# separate lookup table; an unknown/NULL priority falls back to 'normal's rank.
+_SPRINT_PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
+_SPRINT_PRIORITY_DEFAULT_RANK = _SPRINT_PRIORITY_RANK["normal"]
+
+# 2282a636 — blocker_kind values. NULL = ordinary item; 'manual' = blocked on a
+# real-world action OUTSIDE Meridian (publish something, obtain an API key, talk
+# to an advisor). DISTINCT from milestone_type='human' (WHO executes) — a
+# manual-blocker is excluded from executor "just claim the next pending" scoping.
+_VALID_SPRINT_BLOCKER_KINDS = ("manual",)
+
+
+def _sprint_priority_order_sql(column: str = "priority") -> str:
+    """Return a portable ``CASE`` expression ranking ``column`` urgent-first.
+
+    Renders the app-layer priority enum into an integer rank inside SQL so
+    ``ORDER BY`` can put higher-priority items first on both SQLite and Postgres
+    (neither has a native enum ordering here). NULL / unknown values fall back to
+    'normal's rank, so legacy rows sort as normal rather than first-or-last.
+    """
+    whens = " ".join(
+        f"WHEN '{p}' THEN {r}" for p, r in _SPRINT_PRIORITY_RANK.items()
+    )
+    return f"CASE {column} {whens} ELSE {_SPRINT_PRIORITY_DEFAULT_RANK} END"
+
+# b0d42ef6 — fuzzy-duplicate threshold for add_sprint_item. Two titles are
+# treated as duplicates when their word-set overlap is >= 60%.
+_SPRINT_DUP_OVERLAP_THRESHOLD = 0.60
+
+
+def _title_word_set(title: str) -> set[str]:
+    """Tokenise a sprint-item title into a lowercased word set.
+
+    Splits on any run of non-alphanumeric characters and lowercases, so
+    "Add OAuth login!" and "add  oauth   LOGIN" both yield {add, oauth, login}.
+    Punctuation and surrounding whitespace are discarded.
+    """
+    return {w for w in re.split(r"[^0-9a-z]+", title.lower()) if w}
+
+
+def _title_word_overlap(a: set[str], b: set[str]) -> float:
+    """Word-set overlap of two pre-tokenised titles, in ``[0.0, 1.0]``.
+
+    Defined as ``|a ∩ b| / |smaller set|`` (the overlap coefficient). Dividing
+    by the smaller of the two word sets makes the metric symmetric and means a
+    short title that is fully contained in a longer one scores 1.0 — so
+    "Add OAuth" vs "Add OAuth login and refresh-token rotation" is flagged as a
+    duplicate even though the longer title has many extra words. Returns 0.0 if
+    either set is empty.
+    """
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+# ---------------------------------------------------------------------------
+# get_sprint_progress 10s cache — one get_sprint_items DB query serves all
+# parallel sessions polling between tasks. Keyed by project_id; busted on any
+# sprint-item mutation so progress counts never read stale after a write.
+# ---------------------------------------------------------------------------
+_SPRINT_ITEMS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_SPRINT_ITEMS_CACHE_TTL = 10.0  # seconds
+
+
+def _invalidate_sprint_items_cache(project_id: str) -> None:
+    """Drop the cached sprint-item list for a project after a mutation."""
+    _SPRINT_ITEMS_CACHE.pop(project_id, None)
+
+
+async def get_sprint_items_cached(
+    db: aiosqlite.Connection, project_id: str
+) -> list[dict[str, Any]]:
+    """Return get_sprint_items(project_id), cached for _SPRINT_ITEMS_CACHE_TTL.
+
+    Parallel executors polling get_sprint_progress between tasks share one DB
+    query within the TTL window. Any add/update mutation calls
+    _invalidate_sprint_items_cache so counts are never stale after a write.
+    """
+    now = time.monotonic()
+    hit = _SPRINT_ITEMS_CACHE.get(project_id)
+    if hit is not None and (now - hit[0]) < _SPRINT_ITEMS_CACHE_TTL:
+        return hit[1]
+    items = await get_sprint_items(db, project_id)
+    _SPRINT_ITEMS_CACHE[project_id] = (now, items)
+    return items
+
+
+def _sprint_item_slug_base(text: str) -> str:
+    """b944c905 — kebab-case a title into a short human-readable id base."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return "-".join(words[:6])[:60].strip("-") or "item"
+
+
+async def _unique_sprint_slug(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """b944c905 — ``base``, or base-2/base-3/… if the slug is taken in this
+    project (mirrors _unique_note_slug; slugs are unique per project)."""
+    slug = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM sprint_items WHERE project_id = ? AND slug = ?",
+            (project_id, slug),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
+# b6b0cee6 — short, memorable sprint-item nicknames. Word lists reuse the
+# adjective+noun idiom already proven for session naming (2bce89ed), widened so a
+# title-less fallback stays unique-ish before the per-project collision suffix.
+_NICKNAME_ADJ = (
+    "brisk", "calm", "clever", "bold", "quiet", "swift", "warm", "keen", "bright",
+    "steady", "nimble", "lucid", "amber", "cobalt", "coral", "dusky", "fabled",
+    "gilded", "hardy", "ivory", "jade", "lush", "mellow", "noble",
+)
+_NICKNAME_NOUN = (
+    "otter", "harbor", "cedar", "falcon", "meadow", "ember", "delta", "willow",
+    "quartz", "sparrow", "atlas", "cove", "beacon", "cypress", "drift", "fjord",
+    "grove", "heron", "isle", "kite", "lagoon", "moss", "nimbus", "onyx",
+)
+# Title words too generic to make a distinctive nickname (mostly sprint-item
+# prefixes / connectives). Dropped before picking the 1-2 keeper words.
+_NICKNAME_STOPWORDS = frozenset({
+    "feat", "bug", "fix", "rule", "the", "and", "for", "add", "adds", "added",
+    "new", "serious", "confirmed", "live", "severe", "paper", "blog", "post",
+    "manual", "correction", "with", "via", "not", "its", "this", "that", "into",
+    "from", "onto", "task", "chore", "docs", "doc", "test", "refactor",
+})
+
+
+def _sprint_item_nickname_base(title: str, iid: str) -> str:
+    """b6b0cee6 — a short (1-2 word) memorable nickname base for a sprint item.
+
+    Prefers the first 1-2 distinctive title words (skipping generic prefixes /
+    connectives); when the title has none usable, falls back to a deterministic
+    adjective+noun derived from the item id (so it is stable, not random).
+    """
+    words = re.findall(r"[a-z0-9]+", (title or "").lower())
+    picks = [w for w in words if w not in _NICKNAME_STOPWORDS and len(w) > 2]
+    if picks:
+        return "-".join(picks[:2])[:32].strip("-") or "item"
+    h = sum(ord(c) for c in (iid or "x"))
+    return (
+        f"{_NICKNAME_ADJ[h % len(_NICKNAME_ADJ)]}-"
+        f"{_NICKNAME_NOUN[(h // len(_NICKNAME_ADJ)) % len(_NICKNAME_NOUN)]}"
+    )
+
+
+async def _unique_sprint_nickname(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """b6b0cee6 — ``base``, or base-2/base-3/… if the nickname is taken in this
+    project (mirrors _unique_sprint_slug; nicknames are unique per project)."""
+    nickname = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM sprint_items WHERE project_id = ? AND nickname = ?",
+            (project_id, nickname),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return nickname
+        n += 1
+        nickname = f"{base}-{n}"
+
+
+async def add_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str,
+    title: str,
+    group: str | None = None,
+    human_id: str | None = None,
+    depends_on: str | None = None,
+    failure_mode: str | None = None,
+    milestone_type: str = "task",
+    touches_resources: Any = None,
+    force: bool = False,
+    slug: str | None = None,
+    deferred_until: str | None = None,
+    track: str | None = None,
+    priority: str | None = None,
+    blocker_kind: str | None = None,
+    wave: str | None = None,
+) -> dict[str, Any]:
+    """Append a new ``todo`` sprint item to a project's checklist.
+
+    ``group`` (stored as ``item_group``) lets items be organised under
+    named objectives so the dashboard sprint board can render them in
+    logical clusters. ``human_id`` attributes the item to a person.
+    ``depends_on`` is the id of a parent sprint item that must be done
+    before this item is surfaced as claimable. ``failure_mode`` controls
+    what happens when the parent has failed: 'continue' (default) allows
+    this item to proceed; 'stop' blocks it.
+    ``milestone_type`` is 'task' (default) or 'milestone' — milestones
+    render as vertical timeline markers in the sprint swimlane.
+    ``deferred_until`` (dec69708) is an ISO timestamp; while it is in the
+    future ``claim_sprint_item`` REFUSES the item (enforced deferral, not a
+    text-only note). ``track`` buckets the item into a named lane (e.g.
+    'paper') so a whole track can be skipped.
+    ``priority`` (e08fee30) is one of {urgent, high, normal, low} (default
+    'normal'); higher-priority pending items are surfaced/claimed/grouped first.
+    ``blocker_kind`` (2282a636) is None (ordinary) or 'manual' (blocked on a
+    real-world action outside Meridian) — a manual-blocker is surfaced distinctly
+    and excluded from executor scoping, like milestone_type='human'.
+
+    Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
+    is compared (word-set overlap, see ``_title_word_overlap``) against every
+    open item in the project (status pending / todo / in_progress). If any
+    existing item meets the >= 60% overlap threshold the item is **not**
+    inserted and a structured error dict is returned instead::
+
+        {"error": "duplicate", "message": ..., "existing": {id, title,
+         status, overlap_pct}}
+
+    The caller can pass ``force=True`` to override the guard and insert
+    anyway. Finished items (done / skipped / failed / pushed) never block,
+    so legitimately re-doing past work is unaffected.
+    """
+    if failure_mode not in (None, "continue", "stop"):
+        raise ValueError("failure_mode must be 'continue' or 'stop'")
+    if milestone_type not in ("task", "milestone", "human"):
+        raise ValueError("milestone_type must be 'task', 'milestone', or 'human'")
+    # e08fee30 — validate the priority enum (default 'normal'), mirroring how
+    # milestone_type raises on a bad value.
+    if priority is None:
+        priority = "normal"
+    if priority not in _VALID_SPRINT_PRIORITIES:
+        raise ValueError(
+            f"priority must be one of {_VALID_SPRINT_PRIORITIES}, got {priority!r}"
+        )
+    # 2282a636 — validate blocker_kind. None = ordinary; only 'manual' is defined.
+    if blocker_kind is not None and blocker_kind not in _VALID_SPRINT_BLOCKER_KINDS:
+        raise ValueError(
+            f"blocker_kind must be None or one of {_VALID_SPRINT_BLOCKER_KINDS}, "
+            f"got {blocker_kind!r}"
+        )
+    # b0d42ef6 — block near-duplicate titles against open items unless forced.
+    if not force:
+        _new_words = _title_word_set(title)
+        if _new_words:
+            for _ex in await get_sprint_items(db, project_id):
+                if _ex.get("status") not in _DUP_BLOCKING_SPRINT_STATUSES:
+                    continue
+                _overlap = _title_word_overlap(_new_words, _title_word_set(_ex.get("title", "")))
+                if _overlap >= _SPRINT_DUP_OVERLAP_THRESHOLD:
+                    _pct = round(_overlap * 100)
+                    return {
+                        "error": "duplicate",
+                        "message": (
+                            f"Sprint item not created: title is {_pct}% a word-match "
+                            f"for existing {_ex['status']} item '{_ex.get('title', '')[:120]}' "
+                            f"({_ex['id'][:8]}). Pass force=true to add it anyway, or update "
+                            f"the existing item instead."
+                        ),
+                        "existing": {
+                            "id": _ex["id"],
+                            "title": _ex.get("title", ""),
+                            "status": _ex["status"],
+                            "overlap_pct": _pct,
+                        },
+                    }
+    # 501ec93f — normalize + validate typed resource identifiers (raises on bad input).
+    resources_json = serialize_touches_resources(touches_resources)
+    iid = _new_id()
+    # b944c905 — auto-populate a human-readable slug from the title (or a
+    # caller-supplied one), deduped per project.
+    _item_slug = await _unique_sprint_slug(
+        db, project_id, _sprint_item_slug_base(slug or title)
+    )
+    # b6b0cee6 — a short memorable nickname (1-2 words), deduped per project.
+    _item_nickname = await _unique_sprint_nickname(
+        db, project_id, _sprint_item_nickname_base(title, iid)
+    )
+    await db.execute(
+        "INSERT INTO sprint_items "
+        "(id, project_id, version, title, item_group, human_id, depends_on, "
+        "failure_mode, milestone_type, touches_resources, slug, nickname, "
+        "deferred_until, track, priority, blocker_kind, wave) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (iid, project_id, version, title, group, human_id,
+         depends_on, failure_mode or "continue", milestone_type, resources_json,
+         _item_slug, _item_nickname, deferred_until or None, track or None,
+         priority, blocker_kind or None, wave or None),
+    )
+    await db.commit()
+    item = await get_sprint_item(db, iid)
+    assert item is not None
+    _invalidate_sprint_items_cache(project_id)
+    # ITEM 6 — live push so dashboards refresh the sprint board without polling.
+    _publish_project_event(project_id, "sprint_item_added", {"item_id": iid})
+    return item
+
+
+async def fan_out_sprint_items(
+    db: aiosqlite.Connection,
+    project_id: str,
+    items: list[dict[str, Any]],
+) -> list[str]:
+    """Bulk-insert sprint items for an orchestrator decomposing a goal.
+
+    ``items`` is a list of dicts, each with at minimum ``title`` (required)
+    and optionally ``description``, ``group``, and ``version``.  Missing
+    ``version`` defaults to the empty string (same as the common add_sprint_item
+    convention).  Unlike add_sprint_item the duplicate guard is **not** applied
+    here — the orchestrator is assumed to have already deduped.
+
+    Returns the list of new item IDs in insertion order.
+    """
+    ids: list[str] = []
+    for spec in items:
+        title = (spec.get("title") or "").strip()
+        if not title:
+            continue
+        version = (spec.get("version") or spec.get("sprint") or "").strip()
+        group = spec.get("group") or spec.get("item_group") or None
+        description = spec.get("description") or None
+        try:
+            resources_json = serialize_touches_resources(spec.get("touches_resources"))
+        except ValueError:
+            resources_json = None  # best-effort in bulk insert — skip bad values
+        iid = _new_id()
+        await db.execute(
+            "INSERT INTO sprint_items "
+            "(id, project_id, version, title, item_group, notes, touches_resources) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (iid, project_id, version, title, group, description, resources_json),
+        )
+        ids.append(iid)
+    if ids:
+        await db.commit()
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_items_fanned_out", {"item_ids": ids})
+    return ids
+
+
+async def get_sprint_item(
+    db: aiosqlite.Connection, item_id: str
+) -> dict[str, Any] | None:
+    """Fetch one sprint item by id."""
+    async with db.execute(
+        "SELECT * FROM sprint_items WHERE id = ?", (item_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def _transition_status(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    to_status: str,
+    from_statuses: list[str] | None = None,
+    task_id: str | None = None,
+    notes: str | None = None,
+    pushed_to: str | None = None,
+    actor: str | None = None,
+    claimed_at_now: bool = False,
+) -> dict[str, Any] | None:
+    """Atomic chokepoint for ALL sprint-item status transitions.
+
+    Every public status-changing function (claim/complete/fail/push/skip/patch/
+    provisional_complete/start) routes through here so the atomic UPDATE, cache
+    bust, and live-event publish are never duplicated.
+
+    ``from_statuses`` — when given, appends ``AND status IN (<from_statuses>)``
+    to the WHERE clause so the write is conditional on the item still being in
+    an expected state (TOCTOU guard, closes fa3e3331). If the guard fails
+    (rowcount == 0 and the item exists) this function returns **None** — it does
+    NOT raise :class:`SprintItemStatusRace`. Each calling function is responsible
+    for raising the appropriate exception (SprintItemStatusRace, ValueError, etc.)
+    when it receives None, matching fa3e3331's intent that races are no-ops at the
+    chokepoint level while callers preserve their own error contracts.
+
+    Passing an empty list for ``from_statuses`` is a caller bug (would render
+    ``AND status IN ()`` — invalid SQL) and raises ValueError.
+
+    Terminal statuses (done / skipped / failed / pushed) stamp ``completed_at``;
+    non-terminal statuses clear it. ``task_id``, ``notes``, ``pushed_to``,
+    ``actor`` are optional extra fields. ``claimed_at_now`` sets
+    ``claimed_at = datetime('now')`` (used by claim_sprint_item).
+
+    Side effects on success: cache invalidation via
+    :func:`_invalidate_sprint_items_cache` and live event via
+    :func:`_publish_project_event`. Both are shared here so no caller can forget
+    them — the two bugs in 6a17e735 and fa3e3331 that each found a separate
+    bypass are closed by this consolidation.
+    """
+    if to_status not in _VALID_SPRINT_STATUSES:
+        raise ValueError(f"invalid sprint-item status: {to_status!r}")
+    if from_statuses is not None and not from_statuses:
+        # An empty list would render "AND status IN ()" — invalid SQL — and
+        # semantically could never match anything, so it's always a caller bug
+        # rather than a legitimate "never match" request.
+        raise ValueError("from_statuses must be non-empty or None")
+    fields = ["status = ?"]
+    values: list[Any] = [to_status]
+    if to_status in {"done", "skipped", "failed", "pushed"}:
+        fields.append("completed_at = datetime('now')")
+    else:
+        fields.append("completed_at = NULL")
+    if to_status == "done":
+        fields.append("claimed_at = COALESCE(claimed_at, datetime('now'))")
+    if claimed_at_now:
+        fields.append("claimed_at = datetime('now')")
+    if task_id is not None:
+        fields.append("task_id = ?")
+        values.append(task_id)
+    if notes is not None:
+        fields.append("notes = ?")
+        values.append(notes)
+    if pushed_to is not None:
+        fields.append("pushed_to = ?")
+        values.append(pushed_to)
+    if actor is not None:
+        fields.append("actor = ?")
+        values.append(actor)
+    values.append(item_id)
+    values.append(project_id)
+    where = "WHERE id = ? AND project_id = ?"
+    if from_statuses is not None:
+        ordered_from = sorted(from_statuses)
+        where += f" AND status IN ({', '.join('?' for _ in ordered_from)})"
+        values.extend(ordered_from)
+    cursor = await db.execute(
+        f"UPDATE sprint_items SET {', '.join(fields)} {where}",
+        values,
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    _invalidate_sprint_items_cache(project_id)
+    result = await get_sprint_item(db, item_id)
+    # Broadcast to dashboard WebSocket subscribers so the sprint board refreshes live.
+    _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": to_status})
+    return result
+
+
+async def _update_sprint_item_status(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    status: str,
+    task_id: str | None = None,
+    notes: str | None = None,
+    pushed_to: str | None = None,
+    actor: str | None = None,
+    expected_statuses: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Backward-compatible shim — delegates to :func:`_transition_status`.
+
+    fa3e3331 — when ``expected_statuses`` is given and the item exists but its
+    status is not in the expected set (race-lost), this shim re-raises
+    :class:`SprintItemStatusRace` so every EXISTING caller keeps its error
+    contract unchanged. New callers should prefer :func:`_transition_status`
+    directly and handle the None return themselves.
+    """
+    from_statuses_list = sorted(expected_statuses) if expected_statuses is not None else None
+    if expected_statuses is not None and not expected_statuses:
+        raise ValueError("expected_statuses must be non-empty or None")
+    result = await _transition_status(
+        db, project_id, item_id, status,
+        from_statuses=from_statuses_list,
+        task_id=task_id, notes=notes, pushed_to=pushed_to, actor=actor,
+    )
+    if result is None and expected_statuses is not None:
+        _raced = await get_sprint_item(db, item_id)
+        if _raced is not None and _raced.get("project_id") == project_id:
+            raise SprintItemStatusRace(item_id, _raced.get("status"), expected_statuses)
+    return result
+
+
+async def _maybe_rollup_parent(db: aiosqlite.Connection, project_id: str, item_id: str) -> None:
+    """After a child status change, roll up sibling statuses to parent if applicable."""
+    item = await get_sprint_item(db, item_id)
+    if item is None:
+        return
+    parent_id = item.get("parent_id")
+    if not parent_id:
+        return
+    async with db.execute(
+        "SELECT status FROM sprint_items WHERE parent_id = ? AND project_id = ?",
+        (parent_id, project_id),
+    ) as cur:
+        rows = await cur.fetchall()
+    statuses = [r[0] or "pending" for r in rows]
+    if not statuses:
+        return
+    has_active = any(s in _ACTIVE_SPRINT_STATUSES for s in statuses)
+    if has_active:
+        return
+    has_failed = any(s == "failed" for s in statuses)
+    all_terminal_ok = all(s in {"done", "skipped"} for s in statuses)
+    if all_terminal_ok:
+        await _update_sprint_item_status(db, project_id, parent_id, "done")
+    elif has_failed:
+        await _update_sprint_item_status(db, project_id, parent_id, "indeterminate")
+
+
+class SprintItemEvidenceRequired(ValueError):
+    """Raised when complete_sprint_item is blocked by the required_notes gate
+    (5823db0b) — the item is flagged required_notes but has no evidence."""
+
+
+class SprintItemStatusRace(ValueError):
+    """Raised by _update_sprint_item_status (fa3e3331) when an ``expected_statuses``
+    guard rejects a transition — the item exists but is no longer in an expected
+    from-state, because a concurrent transition committed first. Distinguishes
+    this from ``cursor.rowcount == 0`` meaning "item not found", which a bare
+    ``None`` return could not — a caller could not previously tell "doesn't
+    exist" from "lost a race" and could not react correctly to either."""
+
+    def __init__(self, item_id: str, current_status: str | None, expected_statuses: set[str]):
+        self.item_id = item_id
+        self.current_status = current_status
+        self.expected_statuses = expected_statuses
+        super().__init__(
+            f"sprint item {item_id} is no longer in an expected state for this "
+            f"transition (current status: {current_status!r}, expected one of "
+            f"{sorted(expected_statuses)}) — another caller already changed it. "
+            "Re-fetch the item before retrying."
+        )
+
+
+# 6a17e735 — the ONLY statuses patch_sprint_item may set directly. These are
+# plain administrative resets with no attached business logic: no evidence
+# gate, no completed_at semantics beyond "clear it", no parent rollup, no
+# task-chain advancement. Every OTHER status has a dedicated function
+# (complete_sprint_item -> done, skip_sprint_item -> skipped, fail_sprint_item
+# -> failed, provisional_complete_sprint_item -> provisional_complete,
+# claim_sprint_item -> in_progress) that enforces real guards
+# _update_sprint_item_status's raw UPDATE does not replicate on its own —
+# required_notes evidence, completed_at stamping, claimed_at backfill, parent
+# rollup, task-chain advancement, cache invalidation, and the live dashboard
+# event. Letting patch_sprint_item set an arbitrary status silently bypassed
+# ALL of that: a required_notes item could be marked "done" with zero
+# evidence, a parent's rollup could desync, and the sprint-items cache could
+# go stale. Confirmed as a genuine backdoor, not a theoretical one — see
+# meridian/routes/sprint.py's PATCH endpoint, which had already independently
+# self-restricted to this exact non-terminal subset for its own safety;
+# patch_sprint_item now enforces that restriction itself so every OTHER
+# caller (including any future one) gets the same protection for free instead
+# of having to remember to add it.
+_PATCH_SPRINT_ITEM_ALLOWED_STATUSES = {"pending", "todo", "indeterminate"}
+
+
+async def complete_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    task_id: str | None = None,
+    notes: str | None = None,
+    actor: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``done`` and optionally link the task that shipped it.
+
+    4f02340e — when the completed item is part of a mixed-ownership subtask
+    chain, advance the chain: an AI→human transition auto-files a HITL handoff,
+    a human→AI transition un-blocks the next AI subtask (see
+    :func:`_advance_task_chain`).
+
+    5823db0b — quality gate: when the item is flagged ``required_notes``, refuse
+    to complete unless evidence exists — an existing ``notes`` value, a linked
+    ``task_id``, or a ``notes`` argument on this call (which is persisted).
+    ``actor`` records which executor completed the item.
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is not None and item.get("project_id") == project_id:
+        if item.get("required_notes"):
+            has_evidence = bool(
+                (notes or "").strip()
+                or task_id
+                or (item.get("notes") or "").strip()
+                or (item.get("task_id"))
+            )
+            if not has_evidence:
+                raise SprintItemEvidenceRequired(
+                    f"item {item_id} requires evidence before completion — pass "
+                    "notes=... (what shipped / how it was verified) or link a "
+                    "task_id. This item was flagged required_notes."
+                )
+    result = await _update_sprint_item_status(
+        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
+    )
+    if result is not None:
+        await _maybe_rollup_parent(db, project_id, item_id)
+        await _advance_task_chain(db, project_id, item_id)
+    return result
+
+
+async def provisional_complete_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    task_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``provisional_complete`` — work finished but not yet
+    verified/deployed.
+
+    A non-terminal state between in_progress and done: it does not stamp
+    ``completed_at``, does not count toward percent_complete, and keeps any
+    parent item active (no roll-up). The executor flips it to ``done`` via
+    complete_sprint_item once the change is verified/shipped.
+    """
+    return await _update_sprint_item_status(
+        db, project_id, item_id, "provisional_complete", task_id=task_id,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
+    )
+
+
+async def skip_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``skipped`` (intentionally not shipped)."""
+    result = await _update_sprint_item_status(
+        db, project_id, item_id, "skipped", notes=reason,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
+    )
+    if result is not None:
+        await _maybe_rollup_parent(db, project_id, item_id)
+    return result
+
+
+async def start_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+) -> dict[str, Any] | None:
+    """Flip a sprint item from ``pending``/``todo`` to ``in_progress``."""
+    return await _update_sprint_item_status(
+        db, project_id, item_id, "in_progress",
+        expected_statuses={"pending", "todo"},
+    )
+
+
+def _parse_deferral_ts(value: Any) -> "datetime | None":  # noqa: F821
+    """Parse a ``deferred_until`` value into a naive-UTC ``datetime``.
+
+    dec69708 — accepts a ``datetime`` (returned as naive UTC) OR a string in
+    either the DB's space-separated ``YYYY-MM-DD HH:MM:SS`` form or ISO-8601
+    (``T`` separator, optional trailing ``Z`` / offset / fractional seconds).
+    Returns ``None`` when the value is empty or unparseable, so a malformed
+    stored deferral never hard-blocks a claim (fail-open on garbage).
+    """
+    from datetime import datetime, timezone
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        s = s.replace("Z", "+00:00")
+        dt = None
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    break
+                except ValueError:
+                    continue
+        if dt is None:
+            return None
+    # Normalise to naive UTC so comparison against a naive utcnow() is sound.
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+async def claim_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    actor: str | None = None,
+) -> dict[str, Any] | None:
+    """Claim a sprint item: set status='in_progress' and claimed_at=now().
+
+    Rejects (raises ValueError) if already in_progress, done, failed, or skipped.
+    Returns None if the item doesn't exist. ``actor`` (5823db0b) records which
+    executor claimed the item.
+
+    dec69708 — ENFORCED deferral: if the item's ``deferred_until`` is in the
+    future, the claim is REFUSED and a structured blocked dict is returned
+    (``{"blocked": True, "reason": ..., "deferred_until": ...}``) rather than
+    flipping the item to in_progress. This turns a "we decided to defer this"
+    intent into a real, structural guard nothing can bypass by simply claiming
+    the item anyway.
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None:
+        return None
+    if item.get("project_id") != project_id:
+        return None
+    # dec69708 — refuse a future-deferred item. Compare a parsed deferred_until
+    # (datetime OR str) against now(); fail-open if unparseable so a garbage
+    # value never wedges the board.
+    _deferred_raw = item.get("deferred_until")
+    if _deferred_raw:
+        from datetime import datetime as _dt_cls
+        _deferred_dt = _parse_deferral_ts(_deferred_raw)
+        if _deferred_dt is not None and _deferred_dt > _dt_cls.utcnow():
+            return {
+                "blocked": True,
+                "error": "DEFERRED",
+                "reason": (
+                    f"Sprint item is deferred until {_deferred_raw} — it cannot be "
+                    "claimed before then. Clear deferred_until via update_sprint_item "
+                    "to make it claimable now."
+                ),
+                "deferred_until": _deferred_raw,
+                "track": item.get("track"),
+                "item_id": item_id,
+            }
+    blocked = {"in_progress", "done", "failed", "skipped"}
+    if (item.get("status") or "pending") in blocked:
+        raise ValueError(
+            f"cannot claim item with status '{item.get('status')}'"
+        )
+    # fa3e3331 — the pre-check above (read, then this UPDATE) is a classic
+    # TOCTOU race: two concurrent claims can both pass the pre-check before
+    # either commits. Routing through _transition_status with from_statuses
+    # set to the claimable statuses makes the actual write atomic — only one
+    # concurrent caller's UPDATE can match — so at most one claim ever
+    # succeeds even when both callers observed a claimable status.
+    # actor is handled via COALESCE so an existing actor is never cleared.
+    # claimed_at_now=True sets claimed_at = datetime('now').
+    # Note: actor COALESCE logic: we pass actor through the normal actor= field
+    # (sets actor = ?); the old raw UPDATE used COALESCE(?, actor) to preserve
+    # an existing actor. _transition_status sets actor unconditionally when
+    # provided. For claim, we only pass actor when it is not None, matching
+    # the COALESCE(actor_arg, existing_actor) semantics — if actor is None,
+    # _transition_status leaves the actor column untouched (no "actor = ?" field
+    # is added), so any existing actor value is preserved naturally.
+    claimable = {"pending", "todo", "indeterminate", "provisional_complete"}
+    result = await _transition_status(
+        db, project_id, item_id, "in_progress",
+        from_statuses=sorted(claimable),
+        actor=actor,
+        claimed_at_now=True,
+    )
+    if result is None:
+        # The pre-check passed but a concurrent transition committed first
+        # between that read and this UPDATE (or the item vanished/moved project).
+        # Re-fetch and raise the SAME ValueError shape the pre-check above uses,
+        # so this race-lost case is indistinguishable to callers (including the
+        # MCP handler's existing except-ValueError handling) from a claim that
+        # was rejected up front — no separate handling needed for the race case.
+        _raced = await get_sprint_item(db, item_id)
+        if _raced is None or _raced.get("project_id") != project_id:
+            return None
+        raise ValueError(
+            f"cannot claim item with status '{_raced.get('status')}'"
+        )
+    return result
+
+
+async def fail_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``failed``. ``reason`` stored in ``notes``."""
+    result = await _update_sprint_item_status(
+        db, project_id, item_id, "failed", notes=reason,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
+    )
+    if result is not None:
+        await _maybe_rollup_parent(db, project_id, item_id)
+    return result
+
+
+async def push_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    to_version: str,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``pushed`` — deferred to a future version.
+
+    ``to_version`` is stored in ``pushed_to`` so the board can show
+    where the item was moved and the next sprint can pick it up.
+    """
+    if not to_version:
+        raise ValueError("to_version is required for push_sprint_item")
+    return await _update_sprint_item_status(
+        db, project_id, item_id, "pushed", pushed_to=to_version,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
+    )
+
+
+async def patch_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    title: str | None = None,
+    version: str | None = None,
+    status: str | None = None,
+    feedback_thumb: int | None = None,
+    feedback_note: str | None = None,
+    notes: str | None = None,
+    human_id: str | None = None,
+    item_group: str | None = None,
+    touches_resources: Any = _UNSET,
+    required_notes: bool | int | None = None,
+    deferred_until: Any = _UNSET,
+    track: Any = _UNSET,
+    priority: str | None = None,
+    blocker_kind: Any = _UNSET,
+    wave: Any = _UNSET,
+) -> dict[str, Any] | None:
+    """Update editable fields of a sprint item.
+
+    Editable: title, version, status, feedback, notes, human_id (assignee),
+    item_group, touches_resources, required_notes, deferred_until, track,
+    priority, blocker_kind. Only
+    fields passed as non-None are changed;
+    omitted fields are left untouched. To clear human_id or item_group, pass an
+    empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
+    so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
+    / JSON string / comma-separated string of typed ids to set it.
+    ``deferred_until`` / ``track`` (dec69708) also use the ``_UNSET`` sentinel:
+    omit to leave unchanged, pass an empty string / ``None`` to CLEAR the
+    deferral (making the item immediately claimable again), or an ISO timestamp
+    / track name to set it.
+    ``priority`` (e08fee30) is left unchanged when ``None``; pass one of
+    {urgent, high, normal, low} to set it (a bad value raises ValueError, like
+    milestone_type). ``blocker_kind`` (2282a636) uses the ``_UNSET`` sentinel:
+    omit to leave unchanged, pass an empty string / ``None`` to CLEAR it (ordinary
+    item), or 'manual' to mark it blocked on a real-world action outside Meridian.
+    """
+    # 6a17e735 / ARCH 1B — separate the status change (routed through
+    # _transition_status for guaranteed cache bust + live event) from the
+    # non-status field updates (a plain UPDATE is fine there). Build two
+    # independent lists: ns_fields/ns_values for non-status fields, and
+    # capture status_value for the _transition_status call below.
+    status_value: str | None = None
+    if status is not None:
+        if status not in _VALID_SPRINT_STATUSES:
+            raise ValueError(f"invalid sprint-item status: {status!r}")
+        # 6a17e735 — patch_sprint_item is a generic field-editor, not a
+        # state-transition function. Only administrative resets are allowed
+        # here; every terminal/business-logic status has a dedicated function
+        # that enforces its own guards (evidence gate, rollup, task-chain,
+        # claimed_at, cache invalidation, live dashboard event) and MUST be
+        # used instead — silently allowing them here bypassed all of that.
+        if status not in _PATCH_SPRINT_ITEM_ALLOWED_STATUSES:
+            _dedicated = {
+                "done": "complete_sprint_item",
+                "skipped": "skip_sprint_item",
+                "failed": "fail_sprint_item",
+                "pushed": "push_sprint_item (or the version-push flow)",
+                "in_progress": "claim_sprint_item",
+                "provisional_complete": "provisional_complete_sprint_item",
+            }.get(status, "a dedicated state-transition function")
+            raise ValueError(
+                f"patch_sprint_item cannot set status={status!r} — this is a "
+                f"guarded transition that must go through {_dedicated}, which "
+                "enforces evidence/rollup/task-chain rules patch_sprint_item "
+                f"does not. Allowed here: {sorted(_PATCH_SPRINT_ITEM_ALLOWED_STATUSES)}."
+            )
+        status_value = status
+
+    # Build non-status field lists (no status/completed_at entries here).
+    ns_fields: list[str] = []
+    ns_values: list[Any] = []
+    if title is not None:
+        ns_fields.append("title = ?")
+        ns_values.append(title)
+    if version is not None:
+        ns_fields.append("version = ?")
+        ns_values.append(version)
+    if feedback_thumb is not None:
+        ns_fields.append("feedback_thumb = ?")
+        ns_values.append(int(feedback_thumb))
+    if feedback_note is not None:
+        ns_fields.append("feedback_note = ?")
+        ns_values.append(feedback_note)
+    if notes is not None:
+        ns_fields.append("notes = ?")
+        ns_values.append(notes)
+    if human_id is not None:
+        ns_fields.append("human_id = ?")
+        ns_values.append(human_id or None)
+    if item_group is not None:
+        ns_fields.append("item_group = ?")
+        ns_values.append(item_group or None)
+    if touches_resources is not _UNSET:
+        ns_fields.append("touches_resources = ?")
+        ns_values.append(serialize_touches_resources(touches_resources))
+    if required_notes is not None:
+        ns_fields.append("required_notes = ?")
+        ns_values.append(1 if required_notes else 0)
+    if deferred_until is not _UNSET:
+        # Empty string / None CLEARS the deferral (item becomes claimable).
+        ns_fields.append("deferred_until = ?")
+        ns_values.append(deferred_until or None)
+    if track is not _UNSET:
+        ns_fields.append("track = ?")
+        ns_values.append(track or None)
+    if priority is not None:
+        # e08fee30 — validate the enum; raise on a bad value like milestone_type.
+        if priority not in _VALID_SPRINT_PRIORITIES:
+            raise ValueError(
+                f"priority must be one of {_VALID_SPRINT_PRIORITIES}, got {priority!r}"
+            )
+        ns_fields.append("priority = ?")
+        ns_values.append(priority)
+    if blocker_kind is not _UNSET:
+        # 2282a636 — empty string / None CLEARS it (ordinary item); otherwise
+        # validate the enum (only 'manual' is defined).
+        _bk = blocker_kind or None
+        if _bk is not None and _bk not in _VALID_SPRINT_BLOCKER_KINDS:
+            raise ValueError(
+                f"blocker_kind must be None or one of {_VALID_SPRINT_BLOCKER_KINDS}, "
+                f"got {blocker_kind!r}"
+            )
+        ns_fields.append("blocker_kind = ?")
+        ns_values.append(_bk)
+    if wave is not _UNSET:
+        # 58a45b92 — empty string / None CLEARS the wave (unassigned); any other
+        # value sets the stored wave label. No enum: labels are free-form (e.g.
+        # 'wave-1'), auto-filled by assign_sprint_waves or hand-set here.
+        ns_fields.append("wave = ?")
+        ns_values.append(wave or None)
+
+    if not ns_fields and status_value is None:
+        return await get_sprint_item(db, item_id)
+
+    result = None
+    if ns_fields:
+        # Phase 1: write non-status fields. No race guard needed here — these
+        # are plain metadata updates that are always safe to apply.
+        cursor = await db.execute(
+            f"UPDATE sprint_items SET {', '.join(ns_fields)} "
+            "WHERE id = ? AND project_id = ?",
+            ns_values + [item_id, project_id],
+        )
+        await db.commit()
+        if cursor.rowcount == 0:
+            return None
+        result = await get_sprint_item(db, item_id)
+
+    if status_value is not None:
+        # Phase 2: route the status write through _transition_status so cache
+        # invalidation and live dashboard event are guaranteed (6a17e735).
+        # No from_statuses guard: patch_sprint_item is an administrative reset
+        # and succeeds from any current status.
+        result = await _transition_status(
+            db, project_id, item_id, status_value,
+            from_statuses=None,
+        )
+        if result is None:
+            # Item vanished between the non-status write and this call — very
+            # unlikely but handle it consistently.
+            return None
+
+    if result is None:
+        result = await get_sprint_item(db, item_id)
+    return result
+
+
+async def add_subtask(
+    db: aiosqlite.Connection,
+    project_id: str,
+    parent_id: str,
+    title: str,
+    owner: str | None = None,
+) -> dict[str, Any]:
+    """Create a child sprint item under parent_id.
+
+    Inherits version from parent. Rejects if parent doesn't exist or is
+    done/failed/skipped.
+
+    4f02340e — mixed-ownership task chains. ``owner`` is 'human', 'ai', or None
+    (unassigned). When owner-tagged subtasks are added in sequence they form a
+    *chain*: each new owned subtask ``depends_on`` the previously added owned
+    sibling, so only the head of the chain is claimable and ownership alternates
+    as the chain advances (see :func:`_advance_task_chain`). When an AI subtask
+    completes and the next link is human-owned, a HITL handoff is auto-filed;
+    when a human completes theirs, the next AI subtask un-blocks (becomes
+    claimable). The parent stays in_progress until every subtask is terminal
+    (existing :func:`_maybe_rollup_parent` behavior — unchanged).
+
+    Unowned subtasks (owner=None) keep the legacy behavior: no chaining,
+    independently claimable.
+    """
+    if owner not in (None, "human", "ai"):
+        raise ValueError("owner must be 'human', 'ai', or None")
+    parent = await get_sprint_item(db, parent_id)
+    if parent is None or parent.get("project_id") != project_id:
+        raise ValueError(f"parent sprint item not found: {parent_id}")
+    blocked = {"done", "failed", "skipped"}
+    if (parent.get("status") or "pending") in blocked:
+        raise ValueError(
+            f"cannot add subtask to parent with status '{parent.get('status')}'"
+        )
+    # Chain owned subtasks: a new owned subtask depends on the current tail of
+    # the chain — the owned sibling that no other owned sibling depends on yet.
+    # This is insertion-order-independent (added_at has only second resolution,
+    # so it can't be used to break ties deterministically) and portable across
+    # SQLite/Postgres. Unowned subtasks never chain.
+    depends_on: str | None = None
+    if owner is not None:
+        async with db.execute(
+            "SELECT id FROM sprint_items "
+            "WHERE parent_id = ? AND project_id = ? AND owner IS NOT NULL "
+            "AND id NOT IN ("
+            "  SELECT depends_on FROM sprint_items "
+            "  WHERE parent_id = ? AND project_id = ? AND depends_on IS NOT NULL"
+            ")",
+            (parent_id, project_id, parent_id, project_id),
+        ) as cur:
+            tails = await cur.fetchall()
+        # In a well-formed chain there is exactly one tail. If somehow more than
+        # one (e.g. an unchained owned item existed), prefer the one matching no
+        # dependents — take the first deterministically by id.
+        tail_ids = sorted(
+            (r["id"] if isinstance(r, dict) else r[0]) for r in tails
+        )
+        if tail_ids:
+            depends_on = tail_ids[-1]
+    iid = _new_id()
+    await db.execute(
+        "INSERT INTO sprint_items "
+        "(id, project_id, version, title, parent_id, milestone_type, owner, depends_on) "
+        "VALUES (?, ?, ?, ?, ?, 'task', ?, ?)",
+        (iid, project_id, parent.get("version", ""), title, parent_id, owner, depends_on),
+    )
+    await db.commit()
+    item = await get_sprint_item(db, iid)
+    assert item is not None
+    _invalidate_sprint_items_cache(project_id)
+    return item
+
+
+async def _advance_task_chain(
+    db: aiosqlite.Connection,
+    project_id: str,
+    completed_item_id: str,
+) -> dict[str, Any] | None:
+    """4f02340e — advance a mixed-ownership subtask chain after a completion.
+
+    Called when a subtask is marked ``done``. Finds the next link in the chain
+    (the owned sibling whose ``depends_on`` is the just-completed item) and:
+
+      - next link is **human**-owned  → auto-file a HITL handoff (kind
+        ``'handoff'``, assigned to the human) so a person is pulled in. The next
+        item un-blocks (its depends_on is now done) and shows as claimable in
+        the human's queue.
+      - next link is **ai**-owned     → no HITL; the item simply un-blocks and
+        becomes claimable by an AI session (existing depends_on machinery).
+
+    Returns the filed HITL request dict when a handoff was created, else None.
+    Idempotent-ish: a handoff is only filed when the just-completed item is
+    itself owned (so it is part of a chain) and a next owned link exists.
+    """
+    completed = await get_sprint_item(db, completed_item_id)
+    if completed is None or completed.get("project_id") != project_id:
+        return None
+    if not completed.get("owner"):
+        return None  # not part of an owned chain
+    # The next link: an owned sibling that depends on the completed item.
+    async with db.execute(
+        "SELECT * FROM sprint_items "
+        "WHERE project_id = ? AND depends_on = ? AND owner IS NOT NULL "
+        "ORDER BY added_at ASC, id ASC LIMIT 1",
+        (project_id, completed_item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    nxt = _row_to_dict(row) if row is not None else None
+    if not nxt:
+        return None
+    if (nxt.get("status") or "pending") in {"done", "failed", "skipped"}:
+        return None
+    if nxt.get("owner") != "human":
+        # AI link — nothing to file; depends_on now satisfied → claimable.
+        _publish_project_event(
+            project_id, "sprint_item_updated",
+            {"item_id": nxt["id"], "chain": "ai_claimable"},
+        )
+        return None
+    # Human link — pull a person in via a HITL handoff.
+    title = nxt.get("title", "")
+    question = (
+        f"Task chain handoff: your turn on subtask '{title}'. "
+        f"The preceding AI subtask ('{completed.get('title', '')}') is complete."
+    )
+    context = (
+        f"Mixed-ownership task chain (parent {completed.get('parent_id') or '?'}). "
+        f"Next subtask {nxt['id']} is assigned to a human. Mark it done "
+        f"(complete_sprint_item) to release the following AI subtask."
+    )
+    # Shared helper imported from parent module at call time to avoid circular
+    # import: sprint_items.py is loaded by db/__init__.py, which also contains
+    # request_hitl (defined after the `from .sprint_items import *` line).
+    from meridian.db import request_hitl  # noqa: PLC0415 — lazy import avoids circular dep
+    hitl = await request_hitl(
+        db, project_id, question,
+        context=context,
+        kind="handoff",
+        assigned_to=nxt.get("human_id") or "human",
+    )
+    _publish_project_event(
+        project_id, "sprint_item_updated",
+        {"item_id": nxt["id"], "chain": "human_handoff", "hitl_id": hitl.get("id")},
+    )
+    return hitl
+
+
+async def split_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    titles: list[str],
+) -> list[dict[str, Any]]:
+    """Split a sprint item into N new items at the same level.
+
+    Closes the original (status=skipped). New items inherit parent_id and
+    version from the original, with split_from=item_id.
+    """
+    original = await get_sprint_item(db, item_id)
+    if original is None or original.get("project_id") != project_id:
+        raise ValueError(f"sprint item not found: {item_id}")
+    allowed = {"pending", "in_progress"}
+    if (original.get("status") or "pending") not in allowed:
+        raise ValueError(
+            f"can only split pending or in_progress items, got '{original.get('status')}'"
+        )
+    if not titles:
+        raise ValueError("titles must not be empty")
+    # Close the original. fa3e3331 — atomic from-state guard: the pre-check
+    # above is a read-then-write race like every other transition; a
+    # concurrent status change between that read and this call must not
+    # silently close an item mid-transition. Re-raise as the same ValueError
+    # shape the pre-check above already uses, for caller consistency.
+    try:
+        await _update_sprint_item_status(
+            db, project_id, item_id, "skipped", expected_statuses=allowed,
+        )
+    except SprintItemStatusRace as exc:
+        raise ValueError(
+            f"can only split pending or in_progress items, got '{exc.current_status}'"
+        ) from exc
+    # Create new items
+    new_items = []
+    for t in titles:
+        nid = _new_id()
+        await db.execute(
+            "INSERT INTO sprint_items "
+            "(id, project_id, version, title, parent_id, split_from, milestone_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'task')",
+            (nid, project_id, original.get("version", ""), t,
+             original.get("parent_id"), item_id),
+        )
+        await db.commit()
+        new_item = await get_sprint_item(db, nid)
+        if new_item:
+            new_items.append(new_item)
+    return new_items
+
+
+async def merge_sprint_items(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_ids: list[str],
+    new_title: str,
+) -> dict[str, Any]:
+    """Merge N sprint items into one survivor.
+
+    Closes all sources (status=skipped, merged_into=survivor_id).
+    Creates survivor with merged_from=JSON(item_ids), version from first source.
+    All sources must be pending or in_progress.
+    """
+    if not item_ids:
+        raise ValueError("item_ids must not be empty")
+    sources = []
+    allowed = {"pending", "in_progress"}
+    for iid in item_ids:
+        item = await get_sprint_item(db, iid)
+        if item is None or item.get("project_id") != project_id:
+            raise ValueError(f"sprint item not found: {iid}")
+        if (item.get("status") or "pending") not in allowed:
+            raise ValueError(
+                f"cannot merge item '{iid}' with status '{item.get('status')}'"
+            )
+        sources.append(item)
+    # Create the survivor first
+    survivor_id = _new_id()
+    version = sources[0].get("version", "")
+    merged_from_json = json.dumps(item_ids)
+    await db.execute(
+        "INSERT INTO sprint_items "
+        "(id, project_id, version, title, merged_from, milestone_type) "
+        "VALUES (?, ?, ?, ?, ?, 'task')",
+        (survivor_id, project_id, version, new_title, merged_from_json),
+    )
+    # Close all sources. fa3e3331 — atomic from-state guard: the pre-check
+    # loop above is a read-then-write race like every other transition. A
+    # source item that a concurrent caller completed/failed/skipped between
+    # that pre-check and this UPDATE must not be silently overwritten to
+    # 'skipped' — roll back the whole merge (including the survivor insert
+    # above) rather than leave a half-merged state, since a merge is only
+    # meaningful as an all-or-nothing operation.
+    for iid in item_ids:
+        cursor = await db.execute(
+            "UPDATE sprint_items SET status = 'skipped', completed_at = datetime('now'), "
+            "merged_into = ? WHERE id = ? AND project_id = ? "
+            "AND status IN ('pending', 'in_progress')",
+            (survivor_id, iid, project_id),
+        )
+        if cursor.rowcount == 0:
+            _raced = await get_sprint_item(db, iid)
+            await db.rollback()
+            raise ValueError(
+                f"cannot merge item '{iid}': status changed to "
+                f"'{(_raced or {}).get('status')}' before the merge could complete"
+            )
+    await db.commit()
+    _publish_project_event(project_id, "sprint_item_updated", {"merged_into": survivor_id})
+    survivor = await get_sprint_item(db, survivor_id)
+    assert survivor is not None
+    return survivor
+
+
+async def get_sprint_items_page(
+    db: aiosqlite.Connection,
+    project_id: str,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return one SQL LIMIT/OFFSET page of sprint items plus the total count.
+
+    True server-side pagination for large completed lists (hundreds of rows) so
+    the dashboard's Completed tab doesn't fetch everything at once. Mirrors
+    get_sprint_items ordering. Does not do dependency (show_blocked) filtering —
+    it's for flat status-filtered lists like status='done'.
+    """
+    where = "project_id = ?"
+    params_list: list = [project_id]
+    if status is not None:
+        if status not in _VALID_SPRINT_STATUSES:
+            raise ValueError(
+                f"invalid sprint-item status filter: {status!r}. "
+                f"Valid: {sorted(_VALID_SPRINT_STATUSES)}"
+            )
+        where += " AND status = ?"
+        params_list.append(status)
+    async with db.execute(
+        f"SELECT COUNT(*) AS c FROM sprint_items WHERE {where}", tuple(params_list)
+    ) as cur:
+        crow = await cur.fetchone()
+    total = int(crow["c"] if isinstance(crow, dict) else crow[0]) if crow else 0
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    async with db.execute(
+        f"SELECT * FROM sprint_items WHERE {where} "
+        "ORDER BY added_at ASC, rowid ASC LIMIT ? OFFSET ?",
+        (*params_list, limit, offset),
+    ) as cur:
+        rows = await cur.fetchall()
+    items = [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+    return items, total
+
+
+async def infer_active_sprint_version(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """a76cb7c0 — infer the sprint-version bucket with the most pending items.
+
+    Counts pending (status ``pending``/``todo``) sprint items per non-empty
+    ``version`` and returns the bucket with the most. Human-assigned items
+    (milestone_type='human') are excluded — executor scoping should track the
+    automatable backlog, not a person's task list. Ties break on the bucket whose
+    earliest pending item was added first (the older sprint), so scoping is
+    stable across calls rather than flapping between equally-sized buckets.
+
+    Returns ``None`` when there are no pending items (or none carry a version),
+    so a session over an empty/version-less board is left unscoped (no filter)
+    and behaves exactly as before.
+    """
+    counts: dict[str, int] = {}
+    first_seen: dict[str, str] = {}
+    for it in await get_sprint_items(db, project_id, include_human=False):
+        if it.get("status") not in ("pending", "todo"):
+            continue
+        version = it.get("version")
+        if not version:
+            continue
+        counts[version] = counts.get(version, 0) + 1
+        added = str(it.get("added_at") or "")
+        # Items arrive oldest-first, so the first add_at we see per bucket is
+        # its earliest pending item — record it once for stable tie-breaking.
+        first_seen.setdefault(version, added)
+    if not counts:
+        return None
+    # Most pending wins; ties go to the bucket whose earliest pending item is
+    # oldest (smallest added_at) for deterministic, non-flapping scoping.
+    return max(
+        counts,
+        key=lambda v: (counts[v], _NEG_TS(first_seen.get(v, ""))),
+    )
+
+
+def _NEG_TS(ts: str) -> tuple[int, str]:
+    """Sort key making an EARLIER timestamp rank HIGHER in a max() tie-break.
+
+    Empty timestamps sort last (rank lowest). Returns a tuple whose natural
+    ordering is the reverse of the string order, so ``max(...)`` prefers the
+    oldest item without needing a separate min pass.
+    """
+    if not ts:
+        return (0, "")
+    # 1 outranks 0 (non-empty beats empty); the inverted string makes an
+    # earlier ts compare greater than a later one under default tuple ordering.
+    inverted = "".join(chr(255 - min(ord(c), 255)) for c in ts)
+    return (1, inverted)
+
+
+async def count_pending_sprint_items(
+    db: aiosqlite.Connection, project_id: str
+) -> int:
+    """c0d2356d — count of not-yet-done sprint items (status pending/todo) for a
+    project. Backs the Stop-hook sprint guard's /sprint/pending_count endpoint."""
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM sprint_items "
+        "WHERE project_id = ? AND status IN ('pending', 'todo')",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0
+    return int(row["c"] if isinstance(row, dict) else row[0])
+
+
+# 43539c70 - keywords that mark a sprint item as legitimately calling for
+# test/coverage work, so the test-tamper guard exempts test-file edits made under
+# it. Matched case-insensitively against the item's title + notes.
+_TEST_COVERAGE_KEYWORDS = (
+    "test",
+    "tests",
+    "testing",
+    "coverage",
+    "regression",
+    "unit test",
+    "add a test",
+    "write a test",
+)
+
+
+def _text_calls_for_test_coverage(text: str | None) -> bool:
+    """True if free-text explicitly calls for test/coverage work.
+
+    Backs the test-tamper guard's exemption: legitimate feature work that a sprint
+    item asks to cover with tests should NOT be flagged as test tampering. Matched
+    on whole-word ``test``/``tests``/``testing``/``coverage``/``regression`` (plus
+    a couple of phrases) so an incidental substring like ``latest`` or
+    ``contested`` does not trip it.
+    """
+    if not text:
+        return False
+    import re as _re  # noqa: PLC0415
+
+    lowered = text.lower()
+    for kw in _TEST_COVERAGE_KEYWORDS:
+        if " " in kw:
+            if kw in lowered:
+                return True
+        elif _re.search(rf"\b{_re.escape(kw)}\b", lowered):
+            return True
+    return False
+
+
+async def sprint_test_coverage_expected(
+    db: aiosqlite.Connection, project_id: str
+) -> bool:
+    """43539c70 - True if an in-progress sprint item's own text calls for
+    test/coverage work.
+
+    Powers the PostToolUse test-tamper guard's exemption endpoint. If any item the
+    project currently has ``in_progress`` mentions tests/coverage in its title or
+    notes, editing a test file under it is legitimate feature work, not tampering,
+    so the guard stays silent. Only ``in_progress`` items are considered (the item
+    the executor is actively working); done/pending items do not exempt anything.
+    """
+    async with db.execute(
+        "SELECT title, notes FROM sprint_items "
+        "WHERE project_id = ? AND status = 'in_progress'",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    for row in rows or []:
+        if isinstance(row, dict):
+            title, notes = row.get("title"), row.get("notes")
+        else:
+            title, notes = row[0], row[1]
+        if _text_calls_for_test_coverage(title) or _text_calls_for_test_coverage(notes):
+            return True
+    return False
+
+
+async def get_sprint_items(
+    db: aiosqlite.Connection,
+    project_id: str,
+    status: str | None = None,
+    show_blocked: bool = True,
+    include_human: bool = True,
+    version: str | None = None,
+    include_manual_blocker: bool | None = None,
+) -> list[dict[str, Any]]:
+    """List sprint items for a project, highest-priority first then oldest.
+
+    ``status`` filter is optional. ``None`` returns everything so the
+    dashboard can render the full timeline.
+
+    ``show_blocked=False`` hides items whose ``depends_on`` parent is not
+    yet in a terminal state (done/skipped/failed/pushed), or whose parent
+    has failed while the item has ``failure_mode='stop'``.
+
+    ``include_human=False`` excludes items with milestone_type='human'
+    (used for executor sessions that should not see human-assigned tasks).
+
+    ``include_manual_blocker`` (2282a636) controls whether items with
+    ``blocker_kind='manual'`` (blocked on a real-world action OUTSIDE Meridian —
+    distinct from milestone_type='human', which is about WHO executes) are
+    returned. ``None`` (default) FOLLOWS ``include_human``: an executor-scoped
+    call (``include_human=False``) also hides manual-blocker items so an executor
+    never treats a real-world blocker as a claimable "just claim it" pending; a
+    full-board call (``include_human=True``) still surfaces them (the dashboard
+    renders them distinctly). Pass an explicit ``True``/``False`` to override.
+
+    ``version`` (a76cb7c0) filters to a single sprint-version bucket. ``None``
+    returns every version. Used by version-scoped sessions so an executor sees
+    only the items in its bucket.
+
+    Ordering (e08fee30): items are returned highest-priority first
+    (urgent > high > normal > low), then oldest-first within a priority, so an
+    executor reading the pending bucket claims higher-priority work first. The
+    priority rank is a portable CASE expression (identical on SQLite/Postgres).
+    """
+    # 2282a636 — resolve the manual-blocker visibility: None follows include_human.
+    if include_manual_blocker is None:
+        include_manual_blocker = include_human
+    clauses = ["project_id = ?"]
+    params_list: list = [project_id]
+    if status is not None:
+        if status not in _VALID_SPRINT_STATUSES:
+            raise ValueError(
+                f"invalid sprint-item status filter: {status!r}. "
+                f"Valid: {sorted(_VALID_SPRINT_STATUSES)}"
+            )
+        clauses.append("status = ?")
+        params_list.append(status)
+    if version is not None:
+        clauses.append("version = ?")
+        params_list.append(version)
+    if not include_human:
+        clauses.append("(milestone_type IS NULL OR milestone_type != 'human')")
+    if not include_manual_blocker:
+        clauses.append("(blocker_kind IS NULL OR blocker_kind != 'manual')")
+    query = (
+        f"SELECT * FROM sprint_items WHERE {' AND '.join(clauses)} "
+        f"ORDER BY {_sprint_priority_order_sql()} ASC, added_at ASC, rowid ASC"
+    )
+    params: tuple = tuple(params_list)
+    async with db.execute(query, params) as cur:
+        rows = await cur.fetchall()
+    items = [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+    if show_blocked:
+        return items
+    # Build status lookup for dependency filtering
+    _terminal = {"done", "skipped", "failed", "pushed"}
+    by_id = {it["id"]: it for it in items}
+    # Fetch any parents not in this result set (e.g. filtered by status)
+    all_statuses: dict[str, str] = {it["id"]: it["status"] for it in items}
+    missing_parents = {
+        it["depends_on"] for it in items
+        if it.get("depends_on") and it["depends_on"] not in all_statuses
+    }
+    for parent_id in missing_parents:
+        parent = await get_sprint_item(db, parent_id)
+        if parent:
+            all_statuses[parent["id"]] = parent["status"]
+    result = []
+    for it in items:
+        pid = it.get("depends_on")
+        if not pid:
+            result.append(it)
+            continue
+        parent_status = all_statuses.get(pid, "")
+        if parent_status not in _terminal:
+            continue  # blocked: parent not finished
+        if parent_status == "failed" and it.get("failure_mode") == "stop":
+            continue  # chain stopped
+        result.append(it)
+    return result
+
+
+def build_sprint_items_xml(items: list[dict[str, Any]]) -> str:
+    """Serialise sprint items as a ``<sprint_items>`` XML block.
+
+    Since v1.9x items are optionally grouped by ``item_group``. When a
+    group name is set, items are wrapped in ``<group name="...">`` tags
+    so cold sessions can parse the board structure. Items without a
+    group are emitted at the top level (ungrouped) before any groups.
+
+    Mirrors the get_goal XML envelope (v0.6.1) so cold sessions render
+    the checklist alongside the goal text in a single prompt.
+    """
+    from xml.sax.saxutils import escape, quoteattr
+    from collections import OrderedDict
+
+    # Preserve insertion order: ungrouped first, then named groups in
+    # first-seen order.
+    groups: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+    for it in items:
+        g = it.get("item_group") or ""
+        if g not in groups:
+            groups[g] = []
+        groups[g].append(it)
+
+    out = ['<sprint_items cache="false">']
+    for group_name, group_items in groups.items():
+        if group_name:
+            out.append(f'  <group name={quoteattr(group_name)}>')
+        for it in group_items:
+            ver = quoteattr(it.get("version") or "")
+            status = quoteattr(it.get("status") or "todo")
+            iid = quoteattr(it.get("id") or "")
+            title = escape(it.get("title") or "")
+            pushed_to = it.get("pushed_to")
+            attrs = f"id={iid} version={ver} status={status}"
+            if pushed_to:
+                attrs += f" pushed_to={quoteattr(str(pushed_to))}"
+            indent = "    " if group_name else "  "
+            out.append(f"{indent}<item {attrs}>{title}</item>")
+        if group_name:
+            out.append("  </group>")
+    out.append("</sprint_items>")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# SECTION 4: Lines 7070-7151 — sprint item pointers
+# ---------------------------------------------------------------------------
+
+async def add_sprint_item_pointer(
+    db: aiosqlite.Connection,
+    project_id: str,
+    sprint_item_id: str,
+    source_type: str,
+    targets: list[dict[str, Any]],
+    label: str | None = None,
+) -> dict[str, Any]:
+    """2976e168 — persist a GENERIC POINTER on a sprint item; return the stored row.
+
+    Validates the ``{source_type, targets:[{uri, selector, subSelector?}], label?}``
+    shape via :mod:`meridian.pointers` (raising ``ValueError`` on a malformed
+    pointer BEFORE any write), serializes ``targets`` to the JSON column, and
+    inserts one ``sprint_item_pointers`` row. ``targets`` is an ARRAY (native
+    multi-file); the composite shape is stored as JSON, NOT per-domain columns.
+    The returned dict is the deserialized pointer (targets back as a list).
+
+    psycopg3: ``?`` placeholders are converted to ``%s`` by the adapter; the
+    shared connection is autocommit on Postgres, and ``commit()`` is a real
+    flush on aiosqlite.
+    """
+    from ..pointers import (  # noqa: PLC0415 — avoid an import cycle at module load
+        validate_pointer,
+        serialize_targets,
+        row_to_pointer,
+    )
+
+    normalized = validate_pointer(
+        {"source_type": source_type, "targets": targets, "label": label}
+    )
+    pid = _new_id()
+    targets_json = serialize_targets(normalized["targets"])
+    await db.execute(
+        "INSERT INTO sprint_item_pointers "
+        "(id, project_id, sprint_item_id, source_type, targets, label) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            pid, project_id, sprint_item_id,
+            normalized["source_type"], targets_json, label,
+        ),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM sprint_item_pointers WHERE id = ?", (pid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row_to_pointer(_row_to_dict(row) or {})
+
+
+async def get_sprint_item_pointers(
+    db: aiosqlite.Connection, sprint_item_id: str
+) -> list[dict[str, Any]]:
+    """2976e168 — return all pointers on a sprint item (oldest first).
+
+    Each row's JSON ``targets`` column is deserialized back into a list, so the
+    caller gets the full pointer shape plus its id / source_type / label /
+    created_at.
+    """
+    from ..pointers import row_to_pointer  # noqa: PLC0415
+    async with db.execute(
+        "SELECT * FROM sprint_item_pointers WHERE sprint_item_id = ? "
+        "ORDER BY created_at ASC, id ASC",
+        (sprint_item_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [row_to_pointer(_row_to_dict(r) or {}) for r in rows if r is not None]
+
+
+async def delete_sprint_item_pointer(
+    db: aiosqlite.Connection, pointer_id: str
+) -> bool:
+    """2976e168 — delete one pointer by id. Return True if a row was removed."""
+    async with db.execute(
+        "SELECT 1 FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+    ) as cur:
+        existed = await cur.fetchone() is not None
+    await db.execute(
+        "DELETE FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+    )
+    await db.commit()
+    return existed
+
+
+# ---------------------------------------------------------------------------
+# SECTION 5: Lines 8251-8270 — resource-to-sprint-item lookup
+# ---------------------------------------------------------------------------
+
+async def get_sprint_items_for_resource(
+    db: aiosqlite.Connection, project_id: str, resource_id: str
+) -> list[dict[str, Any]]:
+    """Return sprint items whose touches_resources includes resource_id.
+
+    f5f2a89d — reverse lookup used by the dashboard chip popover.
+    Candidates are pre-filtered with LIKE, then confirmed with parse_touches_resources
+    so inferred: markers and case don't produce false positives.
+    """
+    pattern = f"%{resource_id}%"
+    async with db.execute(
+        "SELECT * FROM sprint_items WHERE project_id = ? AND touches_resources LIKE ?",
+        (project_id, pattern),
+    ) as cur:
+        rows = await cur.fetchall()
+    items = [_row_to_dict(r) for r in (rows or []) if r]
+    return [
+        it for it in items
+        if resource_id in parse_touches_resources(it.get("touches_resources"))
+    ]
+
+
+# ---------------------------------------------------------------------------
+# SECTION 6: Lines 8478-8807 — parallelism and analysis
+# ---------------------------------------------------------------------------
+
+def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
+    """5a85a78f — True for items only a human can carry out; mirrors the EXACT
+    semantics of ``handoff._is_manual_sprint_item`` (943afe1e).
+
+    These items must be excluded from executor-facing eligible/parallel lists
+    (``get_parallelizable_groups``, ``analyze_sprint``) — an AI cannot do them as
+    intended and may fake-complete them under completion pressure.
+
+    Three signals (any one is sufficient):
+    * ``blocker_kind == 'manual'`` — blocked on a real-world action outside Meridian,
+    * ``milestone_type == 'human'`` — execution is intentionally human-only,
+    * a ``MANUAL``-tagged title (case-insensitive leading ``MANUAL``).
+
+    943afe1e — does NOT key on ``human_id`` alone. ``human_id`` records *who* an
+    item is assigned to, not *whether* it requires human execution. A BUG:/FIX:/FEAT:
+    item assigned to a maintainer via ``human_id`` is still executor-claimable.
+
+    NOTE: This helper MUST be kept in sync with ``meridian.handoff._is_manual_sprint_item``
+    (db/__init__.py is imported BY handoff.py, so we cannot import handoff here
+    without a circular import — hence the deliberate duplication).
+    """
+    if not isinstance(item, dict):
+        return False
+    if item.get("blocker_kind") == "manual" or item.get("milestone_type") == "human":
+        return True
+    return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
+
+
+async def get_parallelizable_groups(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """255096d9 — cluster pending sprint items that are safe to run in parallel.
+
+    Algorithm:
+      1. Take pending/todo items (optionally filtered to ``version``) whose
+         ``depends_on`` is satisfied (no parent, or parent is done — or parent
+         failed with failure_mode='continue'). Items still waiting on a parent
+         are returned separately under ``blocked``.
+      2. Build a conflict graph: two eligible items conflict when their
+         ``touches_resources`` sets intersect (see 501ec93f). An item with no
+         declared resources conflicts with nothing (empty ∩ anything = ∅).
+      3. Greedy first-fit coloring partitions the items into groups such that no
+         two items *within a group* share a resource — so every group is a batch
+         the orchestrator can fan out simultaneously, and successive groups run
+         in sequence.
+
+    Returns ``{"version", "groups": [[item, ...], ...], "group_count",
+    "eligible_count", "blocked": [...], "undeclared_count"}``. ``groups`` items
+    are full sprint-item dicts with a derived ``resources`` list attached.
+
+    2282a636 — items with ``blocker_kind='manual'`` (blocked on a real-world
+    action outside Meridian) are excluded here: they are not executor-claimable,
+    so they never join a parallel batch.
+    5a85a78f — items matching :func:`_is_manual_sprint_item` (blocker_kind='manual',
+    milestone_type='human', or MANUAL-tagged title) are also excluded: milestone_type
+    was previously passed through because ``get_sprint_items`` only gates on
+    ``include_manual_blocker``, not on ``milestone_type='human'`` or title prefix.
+    e08fee30 — within the safe-parallel ordering, higher-priority eligible items
+    are placed first so urgent work colors into the earliest groups.
+    """
+    # include_manual_blocker=False: a manual-blocker item is not claimable work,
+    # so it must not be offered as a parallelizable batch member.
+    items = await get_sprint_items(db, project_id, include_manual_blocker=False)
+    # 5a85a78f — also filter out milestone_type='human' and MANUAL-titled items;
+    # get_sprint_items only gates on blocker_kind, not the other two manual signals.
+    items = [it for it in items if not _is_manual_sprint_item(it)]
+    if version is not None:
+        items = [it for it in items if it.get("version") == version]
+    claimable_statuses = {"pending", "todo"}
+    eligible: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    # df573218 — surface currently-claimed work so an orchestrator sees the live
+    # parallelism state (and knows an item it planned was grabbed by another).
+    running: list[dict[str, Any]] = []
+    for it in items:
+        if it.get("status") == "in_progress" or (
+            (it.get("status") or "pending") in claimable_statuses and it.get("claimed_at")
+        ):
+            running.append({
+                "id": it["id"],
+                "title": it.get("title", ""),
+                "status": it.get("status"),
+                "claimed_at": it.get("claimed_at"),
+            })
+        if (it.get("status") or "pending") not in claimable_statuses:
+            continue
+        if it.get("claimed_at"):
+            continue  # already in flight
+        parent_block = await get_blocking_dependency_for_sprint_item(db, it["id"])
+        if parent_block is not None:
+            # Parent failed + this item's failure_mode='continue' → still runnable.
+            if (
+                parent_block.get("status") == "failed"
+                and (it.get("failure_mode") or "continue") == "continue"
+            ):
+                pass
+            else:
+                blocked.append({
+                    "id": it["id"],
+                    "title": it.get("title", ""),
+                    "depends_on": it.get("depends_on"),
+                    "blocked_by_status": parent_block.get("status"),
+                })
+                continue
+        enriched = {**it, "resources": parse_touches_resources(it.get("touches_resources"))}
+        eligible.append(enriched)
+    # Stable order: highest-priority first (e08fee30), then oldest, then id, so
+    # coloring is deterministic AND urgent work colors into the earliest groups.
+    eligible.sort(
+        key=lambda it: (
+            _SPRINT_PRIORITY_RANK.get(
+                it.get("priority") or "normal", _SPRINT_PRIORITY_DEFAULT_RANK
+            ),
+            str(it.get("added_at") or ""),
+            it["id"],
+        )
+    )
+    # de730a25 — separate declared from undeclared items. An item with no
+    # touches_resources is disjoint with everything, so the old single-pass
+    # coloring dropped it into group 0 next to declared items and they fanned
+    # out together — unsafe, because an undeclared item may genuinely conflict
+    # with anything. Now: color-graph only the DECLARED items into safe parallel
+    # groups, then give each UNDECLARED item its own singleton group so they run
+    # sequentially (parallel safety can't be proven for them).
+    declared = [it for it in eligible if it["resources"]]
+    undeclared_items = [it for it in eligible if not it["resources"]]
+    undeclared = len(undeclared_items)
+    # Greedy first-fit graph coloring on the declared items' conflict graph.
+    groups: list[list[dict[str, Any]]] = []
+    group_resource_sets: list[set[str]] = []
+    for it in declared:
+        res = set(it["resources"])
+        placed = False
+        for gi, used in enumerate(group_resource_sets):
+            # 63b030a6 — cross-type aware: file:X conflicts with symbol:X::*, but
+            # symbol:X::a and symbol:X::b can co-schedule. (plain isdisjoint missed this)
+            if not _resource_sets_conflict(res, used):
+                groups[gi].append(it)
+                used.update(res)
+                placed = True
+                break
+        if not placed:
+            groups.append([it])
+            group_resource_sets.append(set(res))
+    # Each undeclared item is its own sequential group (never co-scheduled).
+    for it in undeclared_items:
+        groups.append([it])
+    return {
+        "version": version,
+        "groups": groups,
+        "group_count": len(groups),
+        "eligible_count": len(eligible),
+        "undeclared_count": undeclared,
+        "blocked": blocked,
+        "running": running,  # df573218 — items currently in flight
+    }
+
+
+async def assign_sprint_waves(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """58a45b92 — persist the parallelizable grouping as a STORED, editable wave label.
+
+    :func:`get_parallelizable_groups` recomputes conflict-free batches on every
+    call; this writes that plan onto each eligible item's ``wave`` column (group i →
+    ``'wave-{i+1}'``) so parallelism is deterministic and inspectable (get_sprint_items
+    surfaces ``wave``) instead of recomputed each time. An operator can then override
+    any item by hand via ``update_sprint_item(wave=...)``.
+
+    Only currently-ELIGIBLE items (pending/todo, dependency-satisfied, unclaimed,
+    non-manual-blocker) are labelled — the same set get_parallelizable_groups fans
+    out. Blocked / in-flight / done items are left untouched (re-run once they clear).
+    Idempotent: re-running recomputes from the live board and rewrites the labels.
+
+    Returns ``{version, wave_count, assigned, waves: {'wave-1': [ids...], ...},
+    blocked_count, undeclared_count}``.
+    """
+    plan = await get_parallelizable_groups(db, project_id, version=version)
+    waves: dict[str, list[str]] = {}
+    assigned = 0
+    for gi, group in enumerate(plan.get("groups") or []):
+        label = f"wave-{gi + 1}"
+        ids: list[str] = []
+        for item in group:
+            await patch_sprint_item(db, project_id, item["id"], wave=label)
+            ids.append(item["id"])
+            assigned += 1
+        if ids:
+            waves[label] = ids
+    return {
+        "version": version,
+        "wave_count": len(waves),
+        "assigned": assigned,
+        "waves": waves,
+        "blocked_count": len(plan.get("blocked") or []),
+        "undeclared_count": plan.get("undeclared_count", 0),
+    }
+
+
+async def analyze_sprint(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """e77f09d1 — synthesize a structured planning brief for the current sprint.
+
+    One call combines what a planner otherwise assembles from four:
+      * parallelizability — conflict-free batches from
+        :func:`get_parallelizable_groups` (group_count, max fan-out, blocked).
+      * dependency chains — ``depends_on`` walked to the root for each open item.
+      * resource conflicts — open items whose ``touches_resources`` intersect
+        (why they can't co-schedule).
+      * stalls — open items with a non-zero ``stall_count``.
+
+    Returns a single dict with a human ``summary`` line and a
+    ``recommended_strategy`` ('parallel' when any group holds >1 item).
+    """
+    groups_info = await get_parallelizable_groups(db, project_id, version=version)
+    items = await get_sprint_items(db, project_id)
+    if version is not None:
+        items = [it for it in items if it.get("version") == version]
+    _open = {"pending", "todo", "in_progress"}
+    open_items = [it for it in items if (it.get("status") or "pending") in _open]
+    by_id = {it["id"]: it for it in items}
+
+    # Dependency chains: walk depends_on to the root for each open dependent item.
+    def _chain_for(item: dict[str, Any]) -> list[dict[str, Any]]:
+        chain: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cur: dict[str, Any] | None = item
+        while cur is not None and cur["id"] not in seen:
+            seen.add(cur["id"])
+            chain.append({
+                "id": cur["id"],
+                "title": cur.get("title", ""),
+                "status": cur.get("status"),
+            })
+            dep = cur.get("depends_on")
+            cur = by_id.get(dep) if dep else None
+        chain.reverse()
+        return chain
+
+    chains = [
+        _chain_for(it) for it in open_items if it.get("depends_on")
+    ]
+    chains = [c for c in chains if len(c) > 1]
+    longest_chain = max((len(c) for c in chains), default=1)
+
+    # Resource/file conflicts among open items (shared touches_resources).
+    res_map: dict[str, list[str]] = {}
+    for it in open_items:
+        for res in parse_touches_resources(it.get("touches_resources")):
+            res_map.setdefault(res, []).append(it["id"])
+    conflicts = [
+        {"resource": res, "item_ids": ids}
+        for res, ids in sorted(res_map.items()) if len(ids) > 1
+    ]
+
+    # 890046a2 — two-path stall detection:
+    #   "counter" — stall_count > 0 (incremented on explicit session close)
+    #   "time"    — claimed_at older than _SPRINT_STALL_FLAG_HOURS, even when
+    #               stall_count == 0 (catches abandoned sessions never cleanly
+    #               closed, which is the common real-world failure mode)
+    #   "both"    — both conditions are true simultaneously
+    from datetime import datetime, timezone, timedelta
+    _stall_cutoff = datetime.now(timezone.utc) - timedelta(hours=_SPRINT_STALL_FLAG_HOURS)
+
+    def _is_time_stalled(item: dict[str, Any]) -> bool:
+        raw = item.get("claimed_at")
+        if not raw:
+            return False
+        try:
+            # SQLite stores as "YYYY-MM-DD HH:MM:SS" (no TZ); treat as UTC.
+            ca = datetime.fromisoformat(str(raw).replace(" ", "T"))
+            if ca.tzinfo is None:
+                ca = ca.replace(tzinfo=timezone.utc)
+            return ca < _stall_cutoff
+        except (ValueError, TypeError):
+            return False
+
+    stalls: list[dict[str, Any]] = []
+    for it in open_items:
+        sc = (it.get("stall_count") or 0) > 0
+        st = _is_time_stalled(it)
+        if not sc and not st:
+            continue
+        reason = "both" if (sc and st) else ("counter" if sc else "time")
+        stalls.append({
+            "id": it["id"],
+            "title": it.get("title", ""),
+            "stall_count": it.get("stall_count") or 0,
+            "claimed_at": it.get("claimed_at"),
+            "reason": reason,
+        })
+
+    groups = groups_info.get("groups", [])
+    max_group = max((len(g) for g in groups), default=0)
+    strategy = "parallel" if max_group > 1 else "sequential"
+    summary = (
+        f"{groups_info.get('eligible_count', 0)} eligible item(s) in "
+        f"{groups_info.get('group_count', 0)} group(s) (max {max_group} parallel); "
+        f"longest dependency chain {longest_chain}; {len(conflicts)} resource "
+        f"conflict(s); {len(stalls)} stalled; "
+        f"{len(groups_info.get('blocked', []))} blocked."
+    )
+    return {
+        "version": version,
+        "summary": summary,
+        "recommended_strategy": strategy,
+        "parallelism": {
+            "group_count": groups_info.get("group_count", 0),
+            "eligible_count": groups_info.get("eligible_count", 0),
+            "max_parallel": max_group,
+            "undeclared_count": groups_info.get("undeclared_count", 0),
+            "groups": [
+                [{"id": it["id"], "title": it.get("title", "")} for it in g]
+                for g in groups
+            ],
+        },
+        "dependency_chains": chains,
+        "longest_chain": longest_chain,
+        "file_conflicts": conflicts,
+        "stalls": stalls,
+        "blocked": groups_info.get("blocked", []),
+        "running": groups_info.get("running", []),
+    }

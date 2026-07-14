@@ -699,6 +699,239 @@ def document_content_tree(source: str | bytes | bytearray) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# 7a98286b — structural linter (0ff8b982 Piece 1): a read-only report that
+# flags section/figure ordering drift by consuming document_content_tree's
+# existing ``blocks``/``tree`` output. No new .docx parsing — every signal
+# below (heading text, level, adjacency, field list) is already produced by
+# document_content_tree. Not wired into update_paragraph as a write blocker;
+# ship the check, defer enforcement (per the item's own scoping note).
+# ---------------------------------------------------------------------------
+
+# Section tags are authored as "[§4.2.1] ..." / "[§C.5 — ...]" / multi-tag
+# "[§5.1.1 + §5.1.2 — ...]" in the leading bracketed annotation of a heading.
+# The § prefix is the reliable signal — plain numbers elsewhere in the
+# annotation prose (e.g. "do not reuse B.1") must NOT be mistaken for tags.
+# An appendix letter is its OWN dot-separated component ("C.5", "C.1.3"), not
+# fused to the first digit ("C5") — the two alternatives below match that
+# (letter + one-or-more ".digit" groups) vs. a plain numeric-dotted tag.
+_SECTION_TAG_RE = re.compile(r"§([A-Za-z](?:\.\d+)+|\d+(?:\.\d+)*)")
+
+# A caption paragraph: a plain-text leading label, no SEQ field required (real
+# documents frequently type "Figure 3b." by hand rather than use Word's SEQ
+# field mechanism — this document has zero SEQ fields at all).
+_CAPTION_LABEL_RE = re.compile(r"^\s*(Figure|Table|Fig\.)\s+([A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)", re.IGNORECASE)
+
+# "see Section 3.2" / "defined in C.1.3" / "Section 5.1.1" cross-references.
+_CROSS_REF_RE = re.compile(r"(?:defined in|see\s+section|section)\s+([A-Za-z]?\d+(?:\.\d+)*)", re.IGNORECASE)
+
+
+def _extract_section_tags(heading_text: str) -> list[str]:
+    """All §-prefixed section tags in a heading's leading ``[...]`` annotation,
+    in the order they appear. A heading with no bracketed tag (document title,
+    a ``[META — ...]`` organizational note) returns ``[]`` — it is not a real
+    section and is excluded from every check below."""
+    m = re.match(r"^\s*\[([^\]]*)\]", heading_text or "")
+    scope = m.group(1) if m else (heading_text or "")
+    return _SECTION_TAG_RE.findall(scope)
+
+
+def _tag_sort_key(tag: str) -> tuple:
+    """Natural/version sort key for a section tag like ``4.2.1`` or ``C.2.5``.
+
+    Numeric chapter prefixes always sort before lettered appendix prefixes
+    (the standard convention: chapters 1..N, then appendices A, B, C...).
+    Remaining dot-separated components compare numerically.
+    """
+    parts = tag.split(".")
+    top = parts[0]
+    if top and top[0].isalpha():
+        head = (1, top.upper())
+    else:
+        try:
+            head = (0, int(top))
+        except ValueError:
+            head = (0, top)
+    rest: list[Any] = []
+    for p in parts[1:]:
+        try:
+            rest.append(int(p))
+        except ValueError:
+            rest.append(p)
+    return (head, tuple(rest))
+
+
+def _caption_label(text: str) -> tuple[str, str] | None:
+    """``("Figure", "3b")`` for a caption paragraph's leading label, else None."""
+    m = _CAPTION_LABEL_RE.match(text or "")
+    if not m:
+        return None
+    kind = "Figure" if m.group(1).lower().startswith("fig") else "Table"
+    return (kind, m.group(2))
+
+
+def check_document_structure_issues(source: str | bytes | bytearray) -> dict[str, Any]:
+    """Read-only structural lint over ``document_content_tree(source)``.
+
+    Flags five classes of drift, each entry a dict with at least ``type``,
+    ``message``, ``para_id``, ``index``:
+
+    1. ``heading_order_vs_tag`` — a heading's own ``[§X.Y.Z]`` tag sorts
+       *earlier* than the previous tagged heading's, i.e. the physical
+       document order and the tag-implied order disagree (an appendix entry
+       stranded mid-chapter, a subsection preceding its own parent, ...).
+    2. ``caption_before_image`` — a caption paragraph has no adjacent blank
+       ("image-like") block immediately before it, but does have one
+       immediately after — the inverse of the caption-below convention.
+    3. ``duplicate_label`` — two or more captions share the same Figure/Table
+       label (e.g. "Figure 3b" used twice).
+    4. ``heading_depth_mismatch`` — a heading's Word style level (Heading1,
+       Heading2, ...) does not match the nesting depth implied by its own
+       tag's dot-count (e.g. a Heading2 tagged ``[§3.2.3.1]``, depth 4).
+    5. ``dangling_cross_reference`` — a "see Section X.Y" / "defined in X.Y"
+       reference to a section number no heading's tag set actually contains.
+
+    Only consumes ``blocks``/``tree`` already produced by
+    :func:`document_content_tree` — no new .docx parsing.
+    """
+    content = document_content_tree(source)
+    blocks = content["blocks"]
+    issues: list[dict[str, Any]] = []
+
+    # --- Collect heading entries with their tag(s), in document order. ---
+    heading_entries: list[dict[str, Any]] = []
+    all_known_tags: set[str] = set()
+    for b in blocks:
+        if b["kind"] != "heading":
+            continue
+        tags = _extract_section_tags(b.get("text", ""))
+        entry = {
+            "index": b["index"],
+            "para_id": b.get("para_id"),
+            "level": b.get("level", 1),
+            "text": b.get("text", ""),
+            "tags": tags,
+        }
+        heading_entries.append(entry)
+        all_known_tags.update(tags)
+
+    # --- Check 1: heading order vs. its own tag. ---
+    prev_tagged: dict[str, Any] | None = None
+    for h in heading_entries:
+        if not h["tags"]:
+            continue
+        if prev_tagged is not None:
+            cur_key = _tag_sort_key(h["tags"][0])
+            prev_key = _tag_sort_key(prev_tagged["tags"][0])
+            if cur_key < prev_key:
+                issues.append({
+                    "type": "heading_order_vs_tag",
+                    "message": (
+                        f"Heading tagged [§{h['tags'][0]}] appears immediately after "
+                        f"[§{prev_tagged['tags'][0]}] in document order, but its own "
+                        f"tag sorts earlier — out of sequence."
+                    ),
+                    "para_id": h["para_id"],
+                    "index": h["index"],
+                    "tag": h["tags"][0],
+                    "previous_tag": prev_tagged["tags"][0],
+                    "previous_para_id": prev_tagged["para_id"],
+                })
+        prev_tagged = h
+
+    # --- Check 4: heading nesting level vs. tag-implied depth. ---
+    for h in heading_entries:
+        if not h["tags"]:
+            continue
+        primary = h["tags"][0]
+        implied_depth = len(primary.split("."))
+        if h["level"] != implied_depth:
+            issues.append({
+                "type": "heading_depth_mismatch",
+                "message": (
+                    f"Heading [§{primary}] is styled Heading{h['level']} but its own "
+                    f"tag implies nesting depth {implied_depth}."
+                ),
+                "para_id": h["para_id"],
+                "index": h["index"],
+                "tag": primary,
+                "style_level": h["level"],
+                "implied_depth": implied_depth,
+            })
+
+    # --- Check 2: caption-before-image (adjacent-block check on blocks). ---
+    def _is_blank_paragraph(blk: dict[str, Any] | None) -> bool:
+        return bool(blk) and blk["kind"] == "paragraph" and not (blk.get("text") or "").strip()
+
+    caption_positions: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for pos, b in enumerate(blocks):
+        if b["kind"] != "paragraph":
+            continue
+        label = _caption_label(b.get("text", ""))
+        if label is None:
+            continue
+        caption_positions.setdefault(label, []).append({
+            "index": b["index"], "para_id": b.get("para_id"), "pos": pos, "text": b.get("text", ""),
+        })
+        before = blocks[pos - 1] if pos > 0 else None
+        after = blocks[pos + 1] if pos + 1 < len(blocks) else None
+        # A genuine inversion signal: no image-like slot before this caption,
+        # but one right after — the caption-below convention flipped. (Plain
+        # "blank on both sides" spacing, common in this document, is NOT
+        # flagged — that pattern is consistent with a normal image-above
+        # caption plus routine trailing whitespace, not an inversion.)
+        if not _is_blank_paragraph(before) and _is_blank_paragraph(after):
+            issues.append({
+                "type": "caption_before_image",
+                "message": (
+                    f"Caption \"{label[0]} {label[1]}\" has no image-like block "
+                    f"before it, but one immediately after — possible caption-before-image "
+                    f"(convention is caption-below)."
+                ),
+                "para_id": b.get("para_id"),
+                "index": b["index"],
+                "label": f"{label[0]} {label[1]}",
+            })
+
+    # --- Check 3: duplicate figure/table labels. ---
+    for label, occurrences in caption_positions.items():
+        if len(occurrences) > 1:
+            issues.append({
+                "type": "duplicate_label",
+                "message": (
+                    f"\"{label[0]} {label[1]}\" is used as a caption label "
+                    f"{len(occurrences)} times."
+                ),
+                "label": f"{label[0]} {label[1]}",
+                "para_id": occurrences[0]["para_id"],
+                "index": occurrences[0]["index"],
+                "occurrences": [
+                    {"para_id": o["para_id"], "index": o["index"]} for o in occurrences
+                ],
+            })
+
+    # --- Check 5: dangling cross-references. ---
+    for b in blocks:
+        text = b.get("text", "") or ""
+        for m in _CROSS_REF_RE.finditer(text):
+            ref = m.group(1)
+            if ref not in all_known_tags:
+                issues.append({
+                    "type": "dangling_cross_reference",
+                    "message": (
+                        f"Reference to \"Section {ref}\" does not match any heading's "
+                        f"own [§...] tag."
+                    ),
+                    "para_id": b.get("para_id"),
+                    "index": b["index"],
+                    "referenced_tag": ref,
+                    "context": text[max(0, m.start() - 30): m.end() + 30].strip(),
+                })
+
+    issues.sort(key=lambda i: i["index"])
+    return {"issue_count": len(issues), "issues": issues}
+
+
 def _connect(index_db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(index_db_path)
     conn.execute(

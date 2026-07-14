@@ -100,10 +100,15 @@ async def test_patch_sprint_item_reset_clears_stale_completed_at(db):
 
 @pytest.mark.asyncio
 async def test_patch_sprint_item_status_change_invalidates_cache(db, monkeypatch):
+    # ARCH 1A/1B moved patch_sprint_item's status-write path into
+    # meridian.db.sprint_items (via the shared _transition_status chokepoint),
+    # which calls its own module-local _invalidate_sprint_items_cache binding.
+    # Patching db_module's re-exported name does not affect that binding —
+    # the patch target must be the module where the call actually happens.
     p, item = await _project_with_item(db)
     calls = []
     monkeypatch.setattr(
-        db_module, "_invalidate_sprint_items_cache",
+        db_module.sprint_items, "_invalidate_sprint_items_cache",
         lambda project_id: calls.append(project_id),
     )
     await db_module.patch_sprint_item(db, p["id"], item["id"], status="todo")
@@ -115,7 +120,7 @@ async def test_patch_sprint_item_status_change_publishes_live_event(db, monkeypa
     p, item = await _project_with_item(db)
     events = []
     monkeypatch.setattr(
-        db_module, "_publish_project_event",
+        db_module.sprint_items, "_publish_project_event",
         lambda project_id, event_type, payload: events.append((project_id, event_type, payload)),
     )
     await db_module.patch_sprint_item(db, p["id"], item["id"], status="indeterminate")
@@ -135,7 +140,7 @@ async def test_patch_sprint_item_other_fields_unaffected_when_status_omitted(db,
     p, item = await _project_with_item(db)
     calls = []
     monkeypatch.setattr(
-        db_module, "_invalidate_sprint_items_cache",
+        db_module.sprint_items, "_invalidate_sprint_items_cache",
         lambda project_id: calls.append(project_id),
     )
     result = await db_module.patch_sprint_item(

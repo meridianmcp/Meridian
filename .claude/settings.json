@@ -10,6 +10,16 @@
                         "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\hitl_guard.ps1\""
                     }
                 ]
+            },
+            {
+                "matcher": "Grep|Glob",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\code_intel_guard.ps1\""
+                    }
+                ]
             }
         ],
         "PostToolUse": [

@@ -31,6 +31,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from . import __version__
@@ -255,10 +256,16 @@ class SlotProxy:
     arriving before the process is up).
 
     Args:
-        cmd:   Full command for subprocess.Popen.
-        port:  The port the proxy listens on (``http://127.0.0.1:<port>``).
-        label: Human-readable slot name for log messages.
-        env:   Optional env dict for Popen; ``None`` inherits the parent env.
+        cmd:       Full command for subprocess.Popen.
+        port:      The port the proxy listens on (``http://127.0.0.1:<port>``).
+        label:     Human-readable slot name for log messages.
+        env:       Optional env dict for Popen; ``None`` inherits the parent env.
+        client_id: Per-tunnel-invocation UUID (aaddb273). Written to a slot-claim
+                   file on first spawn so :func:`_kill_stale_port_occupant` on a
+                   NEW tunnel startup can distinguish "owned by a live peer" from
+                   "orphaned from a dead prior-generation tunnel".  ``None`` /
+                   empty string disables claim-file tracking (degrades safely to
+                   the original 963d0bd kill-unconditionally behaviour).
     """
 
     def __init__(
@@ -267,11 +274,13 @@ class SlotProxy:
         port: int,
         label: str,
         env: "dict | None" = None,
+        client_id: str = "",
     ) -> None:
         self.cmd = cmd
         self.port = port
         self.label = label
         self.env = env
+        self.client_id: str = client_id
         self._proc: "subprocess.Popen | None" = None
         self._last_used: float = 0.0
         self._lock = asyncio.Lock()
@@ -352,6 +361,9 @@ class SlotProxy:
                     self.cmd, env=self.env, **_spawn_kwargs()
                 )
                 self.holder["proc"] = self._proc
+                # aaddb273 — record ownership so a subsequent tunnel startup can
+                # distinguish this live process from an orphan (see _write_slot_claim).
+                _write_slot_claim(self.port, self.client_id)
             except Exception as exc:  # noqa: BLE001
                 print(
                     f"tunnel:{self.label}: failed to spawn proxy: {exc}",
@@ -392,10 +404,15 @@ class SlotProxy:
             self.touch()
 
     def kill(self) -> None:
-        """Terminate the proxy process (best-effort, no-op if not running)."""
+        """Terminate the proxy process (best-effort, no-op if not running).
+
+        aaddb273 — also clears the slot-claim file so a subsequent startup does
+        not see a stale claim from this run after we explicitly tore down.
+        """
         _terminate_proc_tree(self._proc)
         self._proc = None
         self.holder["proc"] = None
+        _clear_slot_claim(self.port)
 
     def sync_holder(self) -> None:
         """Sync the holder's proc reference (watchdog may have replaced it)."""
@@ -1197,8 +1214,120 @@ def _terminate_proc_tree(proc: "subprocess.Popen | None") -> None:
             pass
 
 
-def _kill_stale_port_occupant(port: int, label: str) -> None:
+def _slot_claim_dir() -> Path:
+    """Return the directory where per-port slot-claim files are written.
+
+    Uses ``~/.meridian/slot_claims/`` so the claims persist across the brief
+    gap between a tunnel restart and the fresh instance's startup scan — long
+    enough for the live-client check to work, but also cleaned up explicitly
+    on ``kill()`` so there is no long-lived stale-claim build-up.
+    """
+    return Path.home() / ".meridian" / "slot_claims"
+
+
+def _slot_claim_path(port: int) -> Path:
+    """Return the claim-file path for a given port."""
+    return _slot_claim_dir() / f"{port}.json"
+
+
+def _write_slot_claim(port: int, client_id: str) -> None:
+    """Write a slot-ownership claim for *port*.
+
+    Records the per-run *client_id* (a UUID generated once per ``run_tunnel``
+    invocation) and this process's PID so that a subsequent tunnel startup can
+    distinguish "port held by a live tunnel whose PID is still running" from
+    "port held by an orphan whose parent exited". Best-effort — a claim write
+    failure must NEVER block or crash a spawn.
+
+    aaddb273 — written by ``SlotProxy.ensure_running`` immediately after a
+    successful Popen so the claim reflects the current generation.
+    """
+    if not client_id:
+        return
+    try:
+        claim_dir = _slot_claim_dir()
+        claim_dir.mkdir(parents=True, exist_ok=True)
+        claim_path = _slot_claim_path(port)
+        claim_path.write_text(
+            json.dumps({"client_id": client_id, "tunnel_pid": os.getpid()}),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never block spawn
+        pass
+
+
+def _clear_slot_claim(port: int) -> None:
+    """Remove the slot-ownership claim for *port* (best-effort).
+
+    Called from ``SlotProxy.kill()`` when WE own the process and are tearing
+    it down.  A claim left behind by a crashed tunnel that never called kill()
+    is handled by the live-PID check in
+    :func:`_is_slot_claimed_by_live_client`.
+    """
+    try:
+        _slot_claim_path(port).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _is_slot_claimed_by_live_client(port: int, current_client_id: str) -> bool:
+    """Return True iff *port* is claimed by a DIFFERENT, still-running client.
+
+    aaddb273 — guards :func:`_kill_stale_port_occupant` against racing a live
+    second tunnel client: if the claim file on disk names a *different*
+    ``client_id`` AND the recording tunnel process (``tunnel_pid``) is still
+    running, the port occupant is legitimately owned by someone else and must
+    NOT be killed.
+
+    Returns False (safe to kill) in all other cases:
+    * No claim file — orphan from a generation that never wrote claims (or
+      pre-dates this feature); kill as usual (preserves 963d0bd behaviour).
+    * Same ``client_id`` — this IS our process somehow still on the port from
+      a previous incomplete teardown in the same run; kill and respawn.
+    * Claim file exists but ``tunnel_pid`` is not alive — the claiming tunnel
+      crashed without calling kill(); the process on the port is an orphan.
+    * Any read/parse/psutil error — safe default: treat as orphan and let the
+      caller decide.
+
+    Pure + fail-safe: never raises.
+    """
+    if not current_client_id:
+        return False
+    try:
+        text = _slot_claim_path(port).read_text(encoding="utf-8")
+        claim = json.loads(text)
+        claimed_client = claim.get("client_id", "")
+        tunnel_pid = claim.get("tunnel_pid")
+        if not claimed_client or not tunnel_pid:
+            return False
+        if claimed_client == current_client_id:
+            # Same run — OUR process somehow still holds the port; treat as orphan.
+            return False
+        # Different client: check if its tunnel process is still alive.
+        try:
+            import psutil  # type: ignore
+            return psutil.pid_exists(int(tunnel_pid))
+        except Exception:  # noqa: BLE001 — psutil unavailable or bad pid; safe default
+            return False
+    except Exception:  # noqa: BLE001 — missing file, bad JSON, etc.
+        return False
+
+
+def _kill_stale_port_occupant(port: int, label: str, current_client_id: str = "") -> None:
     """Kill whatever process is already listening on ``port``, if any (44892730).
+
+    aaddb273 — extended with per-client liveness tracking: if *current_client_id*
+    is provided and a slot-claim file for *port* records a DIFFERENT client whose
+    tunnel process is still alive, the port occupant is legitimately owned by that
+    live client and is NOT killed. This closes the gap the 963d0bd timeboxed fix
+    explicitly deferred: distinguishing "orphaned from a dead prior-generation
+    tunnel" (safe to kill) from "still owned by another currently-active client"
+    (must NOT kill).
+
+    When *current_client_id* is empty (or psutil is unavailable, or any error
+    occurs in the live-client check) the function falls through to the original
+    963d0bd kill-unconditionally behaviour, so the fix degrades gracefully on
+    machines without psutil or in environments where the claim file is missing.
 
     Root cause: each ``SlotProxy`` starts life with ``_proc = None``, and its
     ``is_running`` check deliberately skips the port probe in that state
@@ -1217,16 +1346,16 @@ def _kill_stale_port_occupant(port: int, label: str) -> None:
     listening on the slot's port, kill it first so the fresh spawn gets a
     clean port. Best-effort and silent on any failure (missing psutil,
     permission error, etc.) — this must never block tunnel startup.
-
-    Note: this intentionally does NOT attempt the fuller per-client
-    session-to-process liveness/routing distinction the underlying item
-    describes (whether an existing process is genuinely still serving another
-    live, active client vs. orphaned) — that needs the tunnel to track client
-    identity per process instance, which does not exist anywhere in this
-    module today and is real, separate follow-up work. This fix only handles
-    the narrower, confirmed trigger: leftover processes from a previous
-    tunnel-client generation.
     """
+    # aaddb273 — live-client guard: if the port is claimed by a DIFFERENT client
+    # whose tunnel process is still running, it is NOT a stale orphan — skip.
+    if _is_slot_claimed_by_live_client(port, current_client_id):
+        print(
+            f"tunnel:{label}: port {port} is claimed by a live client — "
+            "skipping stale-occupant kill",
+            flush=True,
+        )
+        return
     try:
         import psutil  # type: ignore
     except Exception:  # noqa: BLE001 - psutil unavailable; nothing we can do
@@ -3227,6 +3356,10 @@ async def run_tunnel(
     #    lazy spawning (3649a61a) defers each proxy until its first incoming
     #    request, then auto-kills after _IDLE_KILL_SECONDS of idle time.
     npx = _find_npx()
+    # aaddb273 — per-run identity: a UUID that identifies THIS tunnel invocation.
+    # Threaded through every SlotProxy so claim files can be attributed to this
+    # run vs. a prior-generation tunnel that left orphans.
+    _client_id: str = str(uuid.uuid4())
     # SlotProxy objects (one per enabled slot) replace the old proc_holders list.
     slot_proxies: list[SlotProxy] = []
     # Track which built-in slots have a registered SlotProxy (for URL printing).
@@ -3257,7 +3390,7 @@ async def run_tunnel(
                 flush=True, file=sys.stderr,
             )
         print(f"  filesystem:        lazy-spawn on port {fs_port}", flush=True)
-        proxy_fs = SlotProxy(cmd_fs, fs_port, "fs")
+        proxy_fs = SlotProxy(cmd_fs, fs_port, "fs", client_id=_client_id)
         slot_proxies.append(proxy_fs)
     else:
         print("  filesystem:        disabled (tunnel_plugins config)", flush=True)
@@ -3270,7 +3403,7 @@ async def run_tunnel(
     elif code_plugin.get("command"):
         cmd_code = _build_proxy_for_inner(npx, list(code_plugin["command"]), code_port)
         print(f"  code-intel:        lazy-spawn on port {code_port} (custom command)", flush=True)
-        proxy_code = SlotProxy(cmd_code, code_port, "code")
+        proxy_code = SlotProxy(cmd_code, code_port, "code", client_id=_client_id)
         slot_proxies.append(proxy_code)
     else:
         code_binary = await _ensure_codebase_memory_mcp()
@@ -3293,7 +3426,7 @@ async def run_tunnel(
                     flush=True, file=sys.stderr,
                 )
             print(f"  code-intel:        lazy-spawn on port {code_port}", flush=True)
-            proxy_code = SlotProxy(cmd_code, code_port, "code")
+            proxy_code = SlotProxy(cmd_code, code_port, "code", client_id=_client_id)
             slot_proxies.append(proxy_code)
         else:
             print(
@@ -3325,14 +3458,14 @@ async def run_tunnel(
         elif (ext_override := expand_command(ext_raw, repo_path=repo_path)):
             cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
             print(f"  code-extractor:    lazy-spawn on port {extract_port} (custom command)", flush=True)
-            proxy_extract = SlotProxy(cmd_extract, extract_port, "extract")
+            proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
             slot_proxies.append(proxy_extract)
         else:
             extractor_inner = _resolve_extractor_inner_cmd()
             if extractor_inner is not None:
                 cmd_extract = _build_extractor_proxy_command(npx, extractor_inner, extract_port)
                 print(f"  code-extractor:    lazy-spawn on port {extract_port}", flush=True)
-                proxy_extract = SlotProxy(cmd_extract, extract_port, "extract")
+                proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
                 slot_proxies.append(proxy_extract)
             else:
                 print(
@@ -3369,7 +3502,7 @@ async def run_tunnel(
         cmd_office = _build_proxy_for_inner(npx, list(cmd), oport, stateless=not _persistent)
         mode_note = " (persistent)" if _persistent else ""
         print(f"  {human.lower():<16}lazy-spawn on port {oport}{mode_note}", flush=True)
-        op = SlotProxy(cmd_office, oport, slot, env=spawn_env)
+        op = SlotProxy(cmd_office, oport, slot, env=spawn_env, client_id=_client_id)
         office_proxies[slot] = op
         slot_proxies.append(op)
         if _persistent:
@@ -3380,8 +3513,10 @@ async def run_tunnel(
     # _kill_stale_port_occupant's docstring for the full root-cause). Every
     # slot registered above is lazy-spawn (ensure_running fires on first
     # request), so this always runs well before any of them actually launch.
+    # aaddb273 — pass _client_id so the live-client guard can skip killing a
+    # port genuinely owned by another still-running tunnel invocation.
     for _sp in slot_proxies:
-        _kill_stale_port_occupant(_sp.port, _sp.label)
+        _kill_stale_port_occupant(_sp.port, _sp.label, current_client_id=_client_id)
 
     # 4c. Custom plugins (LOCAL-ONLY) — still eagerly spawned because they serve
     #     the local .mcp.json directly without a server relay route.
@@ -3404,7 +3539,8 @@ async def run_tunnel(
         # 44892730 — custom plugins spawn eagerly (unlike the lazy SlotProxy
         # slots above), so the same stale-prior-generation-process gap applies
         # here too, right before the Popen below.
-        _kill_stale_port_occupant(cport, f"custom:{cname}")
+        # aaddb273 — pass _client_id for live-client guard.
+        _kill_stale_port_occupant(cport, f"custom:{cname}", current_client_id=_client_id)
         print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
         try:
             proc_custom = subprocess.Popen(cmd_custom, env=spawn_env, **_spawn_kwargs())

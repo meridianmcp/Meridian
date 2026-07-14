@@ -14,6 +14,7 @@ Exercises:
 from __future__ import annotations
 
 import asyncio
+import os
 import zipfile
 
 from lxml import etree as LET
@@ -97,6 +98,80 @@ def test_load_and_find_paragraph_by_id(tmp_path):
     # An unknown id resolves to None (both accessors).
     assert doc_store._find_paragraph_by_id(root, "NOPE") is None
     assert doc_store._find_paragraph_with_index(root, "NOPE") is None
+
+
+# ---------------------------------------------------------------------------
+# c034fa24 — _save_docx_xml backup-before-overwrite
+# ---------------------------------------------------------------------------
+
+
+def test_save_docx_xml_writes_bak_of_prior_content_before_overwrite(tmp_path):
+    docx = _write_docx(str(tmp_path / "d.docx"))
+    original_bytes = _read_document_xml(docx)
+    raw, root = doc_store._load_docx_xml(docx)
+    p = doc_store._find_paragraph_by_id(root, "AAAA0002")
+    doc_store._set_paragraph_runs(p, [{"text": "Edited body sentence."}])
+
+    doc_store._save_docx_xml(raw, root, docx)
+
+    backup_path = docx + ".bak"
+    assert os.path.exists(backup_path)
+    # The backup holds the PRE-edit content, not the new content.
+    assert _read_document_xml(backup_path) == original_bytes
+    # The real file holds the new content.
+    assert b"Edited body sentence." in _read_document_xml(docx)
+    assert b"The original body sentence." not in _read_document_xml(docx)
+
+
+def test_save_docx_xml_bak_is_overwritten_not_accumulated_across_saves(tmp_path):
+    """A single most-recent backup, not unbounded per-edit history."""
+    docx = _write_docx(str(tmp_path / "d.docx"))
+    raw, root = doc_store._load_docx_xml(docx)
+    p = doc_store._find_paragraph_by_id(root, "AAAA0002")
+    doc_store._set_paragraph_runs(p, [{"text": "First edit."}])
+    doc_store._save_docx_xml(raw, root, docx)
+    backup_path = docx + ".bak"
+    assert b"The original body sentence." in _read_document_xml(backup_path)
+
+    # Second save: the .bak now holds what was on disk before THIS save
+    # (the first edit), not the original content, and there is still only
+    # ever the one backup file.
+    raw2, root2 = doc_store._load_docx_xml(docx)
+    p2 = doc_store._find_paragraph_by_id(root2, "AAAA0002")
+    doc_store._set_paragraph_runs(p2, [{"text": "Second edit."}])
+    doc_store._save_docx_xml(raw2, root2, docx)
+    assert b"First edit." in _read_document_xml(backup_path)
+    assert b"Second edit." in _read_document_xml(docx)
+
+
+def test_save_docx_xml_no_backup_when_dest_does_not_exist_yet(tmp_path):
+    """A brand-new dest (never existed on disk) has nothing to back up."""
+    docx_source = _write_docx(str(tmp_path / "source.docx"))
+    raw, root = doc_store._load_docx_xml(docx_source)
+    new_dest = str(tmp_path / "brand_new.docx")
+
+    doc_store._save_docx_xml(raw, root, new_dest)
+
+    assert os.path.exists(new_dest)
+    assert not os.path.exists(new_dest + ".bak")
+
+
+def test_save_docx_xml_backup_failure_does_not_block_the_save(tmp_path, monkeypatch):
+    """Backup housekeeping is best-effort -- a failure to write it must never
+    prevent the real save from completing."""
+    docx = _write_docx(str(tmp_path / "d.docx"))
+    raw, root = doc_store._load_docx_xml(docx)
+    p = doc_store._find_paragraph_by_id(root, "AAAA0002")
+    doc_store._set_paragraph_runs(p, [{"text": "Edited despite backup failure."}])
+
+    def _boom(*args, **kwargs):
+        raise OSError("simulated backup failure")
+
+    monkeypatch.setattr(doc_store.shutil, "copy2", _boom)
+    doc_store._save_docx_xml(raw, root, docx)  # must not raise
+
+    assert b"Edited despite backup failure." in _read_document_xml(docx)
+    assert not os.path.exists(docx + ".bak")
 
 
 def test_normalize_runs_string_and_list_and_none():
@@ -298,6 +373,133 @@ def test_update_paragraph_missing_source_file_raises(tmp_path):
                 raised = True
                 assert "not found on disk" in str(exc)
             assert raised
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# eab6930a — staleness check before docx write (mtime/hash comparison)
+# ---------------------------------------------------------------------------
+
+def test_update_paragraph_no_stale_warning_when_file_unchanged_since_index(tmp_path):
+    """Baseline: reindex then immediately update -- nothing changed externally,
+    so no stale_warning key should appear at all."""
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "doc.docx"))
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+            result = await store.update_paragraph(
+                "proj-1", docx_path, "AAAA0002", "unrelated body edit",
+            )
+            assert "stale_warning" not in result
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+_DOCUMENT_XML_EXTERNALLY_EDITED = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="AAAA0001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction -- edited directly in Word</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="AAAA0002">
+      <w:r><w:t>The original body sentence.</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>A paragraph with no paraId (p2 fallback).</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
+def test_update_paragraph_flags_stale_warning_when_heading_changed_externally(tmp_path):
+    """The heading's text (a persisted, hashed element) changes on disk OUTSIDE
+    Meridian between reindex and update_paragraph -- a real content-hash drift.
+    update_paragraph must still SUCCEED (advisory only) but surface stale_warning."""
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "doc.docx"))
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+
+            # Simulate an external edit (e.g. opened directly in Word): rewrite
+            # the same file, same para_ids, but different heading text -- this
+            # changes the structural content hash without removing the AAAA0002
+            # target this test's update_paragraph call will address.
+            _write_docx(docx_path, _DOCUMENT_XML_EXTERNALLY_EDITED)
+
+            result = await store.update_paragraph(
+                "proj-1", docx_path, "AAAA0002", "a normal edit, unrelated to the drift",
+            )
+            # The write still succeeds -- advisory only, never a hard block.
+            assert result["new_text"] == "a normal edit, unrelated to the drift"
+            assert "stale_warning" in result
+            warning = result["stale_warning"]
+            assert warning["stale"] is True
+            assert warning["stored_content_hash"] != warning["current_content_hash"]
+            assert "edited outside Meridian" in warning["reason"]
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_update_paragraph_fails_open_when_no_content_hash_recorded(tmp_path):
+    """A document with no stored content_hash (e.g. an older row from before
+    this column was populated) must not be treated as stale -- fails open,
+    mirroring docs_intel's check_staleness "no-source-tracked" case."""
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "doc.docx"))
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+            # Null out the recorded hash directly, simulating a row with none.
+            doc = await store.get_document("proj-1", docx_path)
+            await store._db.execute(
+                "UPDATE doc_documents SET content_hash = NULL WHERE id = ?",
+                (doc["id"],),
+            )
+            await store._db.commit()
+
+            # Also drift the file externally -- even so, no hash to compare
+            # against means no warning is possible (fail open).
+            _write_docx(docx_path, _DOCUMENT_XML_EXTERNALLY_EDITED)
+
+            result = await store.update_paragraph(
+                "proj-1", docx_path, "AAAA0002", "edit with no baseline hash",
+            )
+            assert "stale_warning" not in result
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_insert_equation_flags_stale_warning_when_content_changed_externally(tmp_path):
+    """The same staleness check applies to insert_equation -- the other real
+    docx-write path through _save_docx_xml."""
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "doc.docx"))
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+            _write_docx(docx_path, _DOCUMENT_XML_EXTERNALLY_EDITED)
+
+            result = await store.insert_equation(
+                "proj-1", docx_path, "AAAA0002", "x = y", position="append",
+            )
+            assert "error" not in result
+            assert "stale_warning" in result
+            assert result["stale_warning"]["stale"] is True
         finally:
             await store.close()
 

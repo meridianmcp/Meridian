@@ -65,6 +65,7 @@ import difflib
 import io
 import os
 import re
+import shutil
 import uuid
 import hashlib
 import logging
@@ -554,6 +555,54 @@ def compute_content_hash(elements: list[dict[str, Any]]) -> str:
     return hasher.hexdigest()
 
 
+async def _docx_staleness_check(doc_row: dict[str, Any], source_path: str) -> dict[str, Any] | None:
+    """eab6930a — compare the source .docx's CURRENT structural content hash
+    against the hash recorded at last ingest/reindex (``doc_row['content_hash']``),
+    reusing :func:`compute_content_hash` exactly as :meth:`DocStructureStore.reindex_document`
+    does — no new hashing scheme, per the item's own pointer.
+
+    A mismatch means the file changed on disk (e.g. opened and edited directly
+    in Word) since doc_store last cached it: a write targeting a ``para_id``
+    resolved from that stale index may not mean what the caller thinks, even
+    though ``para_id`` lookups themselves always re-read the file fresh (the
+    id itself will still very likely resolve — Word's w14:paraId is stable
+    across most edits — the risk is the caller's mental model of the
+    surrounding content, not a wrong-paragraph write).
+
+    Returns a warning dict when stale, else ``None`` — including when no
+    ``content_hash`` was ever recorded (fails open, mirroring docs_intel's
+    ``check_staleness`` "no-source-tracked" fail-open case) or when the fresh
+    parse itself fails (the caller's own write-path error handling already
+    covers a genuinely unreadable/corrupt file; this check must never be what
+    blocks a write). Advisory only — never raises, never blocks the write.
+    """
+    stored_hash = doc_row.get("content_hash")
+    if not stored_hash:
+        return None
+    try:
+        from .docs_intel import document_content_tree  # noqa: PLC0415 — lazy, optional
+        tree = document_content_tree(source_path)
+        current_hash = compute_content_hash(elements_from_docx_content_tree(tree))
+    except Exception:  # noqa: BLE001 — best-effort; never blocks the write
+        return None
+    if current_hash == stored_hash:
+        return None
+    return {
+        "stale": True,
+        "reason": (
+            "the source .docx's content has changed on disk since it was last "
+            "indexed (ingest_document/reindex_document) -- it may have been "
+            "edited outside Meridian (e.g. opened directly in Word). This "
+            "write proceeded against the CURRENT file (para_id lookup always "
+            "re-reads fresh), but the caller's own understanding of the "
+            "document's structure may be stale -- consider reindex_document "
+            "before further edits if the target was chosen from cached structure."
+        ),
+        "stored_content_hash": stored_hash,
+        "current_content_hash": current_hash,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Figures/tables (06df6ab3) — NOT a new table: new kind='figure'/'table' values
 # on the EXISTING doc_elements table, nested "by section" via the same
@@ -1007,6 +1056,15 @@ def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
     write atomic-ish (a mid-write crash can't half-truncate the original when
     ``dest`` differs, and even for an in-place overwrite the new bytes are fully
     materialised before the file is opened for writing).
+
+    c034fa24 -- when ``dest`` already exists (the common in-place-overwrite case
+    every docx-mutating tool routes through: update_paragraph, link_figure_caption,
+    ...), the current on-disk bytes are copied to ``dest + ".bak"`` first. A single
+    most-recent backup, overwritten on each subsequent save (not unbounded
+    per-edit history) -- enough to recover from a bad edit or a corrupted write,
+    without indefinitely growing disk usage on a document edited many times.
+    Best-effort: a failure to write the backup is logged but never blocks the
+    actual save -- a doc write must not fail because backup housekeeping did.
     """
     new_document = _LET.tostring(
         root, xml_declaration=True, encoding="UTF-8", standalone=True
@@ -1021,6 +1079,12 @@ def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
                     data = new_document
                 # Preserve each entry's original compression type.
                 dst.writestr(info, data)
+    if os.path.exists(dest):
+        backup_path = dest + ".bak"
+        try:
+            shutil.copy2(dest, backup_path)
+        except OSError as exc:
+            _log.warning("could not write backup %r before overwriting %r: %s", backup_path, dest, exc)
     with open(dest, "wb") as fh:
         fh.write(out.getvalue())
 
@@ -2372,6 +2436,9 @@ class DocStructureStore:
         if not os.path.isfile(docx_path):
             return {"error": f"source .docx not found on disk: {docx_path!r}"}
 
+        # eab6930a — advisory staleness check, computed against the PRE-write file.
+        stale_warning = await _docx_staleness_check(doc_row, docx_path)
+
         # --- resolve the OMML to insert (fail before touching the file) --------
         omml_raw = await self._resolve_omml_payload(document_id, equation_id_or_omml)
         if omml_raw is None:
@@ -2405,7 +2472,7 @@ class DocStructureStore:
 
         # --- resync the sidecar equation index from the modified file ----------
         resync = await self.resync_document_equations(document_id, docx_path)
-        return {
+        result = {
             "document_id": document_id,
             "source": source,
             "para_id": para_id,
@@ -2413,6 +2480,9 @@ class DocStructureStore:
             "omml": _LET.tostring(omath_el, encoding="unicode"),
             "resync": resync,
         }
+        if stale_warning is not None:
+            result["stale_warning"] = stale_warning
+        return result
 
     async def _resolve_omml_payload(
         self, document_id: str, equation_id_or_omml: str
@@ -3127,6 +3197,10 @@ class DocStructureStore:
         if not os.path.isfile(source_path):
             raise ValueError(f"source docx not found on disk: {source_path}")
 
+        # eab6930a — advisory staleness check, computed against the PRE-write
+        # file (before _load_docx_xml/_save_docx_xml touch it below).
+        stale_warning = await _docx_staleness_check(doc_row, source_path)
+
         try:
             raw, root = _load_docx_xml(source_path)
         except KeyError as exc:  # missing word/document.xml part
@@ -3149,13 +3223,16 @@ class DocStructureStore:
         _save_docx_xml(raw, root, source_path)
 
         resynced = await self._resync_element_text(doc_row["id"], para_id, new_text)
-        return {
+        result = {
             "document_id": doc_row["id"],
             "para_id": para_id,
             "new_text": new_text,
             "elements_resynced": resynced,
             "source_path": source_path,
         }
+        if stale_warning is not None:
+            result["stale_warning"] = stale_warning
+        return result
 
     async def close(self) -> None:
         """Close the underlying connection (best-effort)."""
