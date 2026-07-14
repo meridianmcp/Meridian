@@ -18,7 +18,17 @@ race-lost attempt raises SprintItemStatusRace (claim_sprint_item raises the
 same ValueError shape its pre-check already used) instead of silently
 no-op'ing or clobbering a concurrent winner. Genuine "item not found" still
 returns None, unchanged.
+
+ARCH 1B (e0f8f4da): introduced _transition_status as the single atomic
+chokepoint that claim/complete/fail/push/skip/patch/start/provisional_complete
+all route through. The concurrency-safety property now needs to be proven only
+ONCE against that chokepoint. Per-caller tests in this file verify:
+  (a) each caller passes the right from_statuses / to_status to the chokepoint
+  (b) each caller surfaces a race-lost (chokepoint returns None) in the
+      correct way for its own contract (ValueError for claim, SprintItemStatusRace
+      for complete/fail/push/skip/start/provisional_complete).
 """
+import asyncio
 import pytest
 
 from meridian import db as db_module
@@ -571,3 +581,297 @@ def test_transition_status_exported_on_both_modules():
         "meridian.db must re-export _transition_status"
     )
     assert si._transition_status is db_pkg._transition_status
+
+
+# ---------------------------------------------------------------------------
+# ARCH 1C (94a70b98) — consolidated per-caller chokepoint passthrough tests
+#
+# Now that all transition functions route through _transition_status, the
+# concurrency-safety proof is centralised in the _transition_status tests
+# above.  What each public caller still needs:
+#
+#   1. It passes the CORRECT from_statuses / to_status to the chokepoint.
+#   2. It surfaces a race-lost (chokepoint returns None) in its own expected
+#      way — ValueError for claim, SprintItemStatusRace for the rest.
+#
+# Both properties are verified by mocking _transition_status directly (fast,
+# no concurrent threads needed) rather than re-implementing a full async
+# concurrency harness per caller.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transition_status_real_concurrency_exactly_one_winner(db):
+    """One real asyncio.gather concurrency test against _transition_status itself.
+
+    Fires N concurrent coroutines all attempting the SAME pending->in_progress
+    transition.  The from_statuses guard in the chokepoint's UPDATE must ensure
+    exactly one succeeds (rowcount == 1) and the rest return None.  This is the
+    single place that proves atomic concurrency-safety — no per-caller copy
+    of this harness is needed.
+    """
+    p = await db_module.create_project(db, "concurrency-chokepoint")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "concurrent item")
+    N = 10
+
+    async def _attempt():
+        return await _sprint_items_mod._transition_status(
+            db, p["id"], item["id"], "in_progress",
+            from_statuses=["pending", "todo", "indeterminate", "provisional_complete"],
+            claimed_at_now=True,
+        )
+
+    results = await asyncio.gather(*[_attempt() for _ in range(N)])
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1, (
+        f"Expected exactly 1 winner among {N} concurrent _transition_status "
+        f"calls but got {len(winners)}: {winners}"
+    )
+    final = await db_module.get_sprint_item(db, item["id"])
+    assert final["status"] == "in_progress"
+
+
+# ---------------------------------------------------------------------------
+# Per-caller from_statuses / to_status passthrough verification
+#
+# Each test monkeypatches _transition_status to capture the arguments it
+# receives and returns a realistic fake row, then calls the public function
+# and asserts the chokepoint was called with the right parameters.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_passes_active_statuses_to_chokepoint(db, monkeypatch):
+    """complete_sprint_item must call _transition_status (via shim) with
+    expected_statuses == _ACTIVE_SPRINT_STATUSES and to_status == 'done'."""
+    p, item = await _project_with_item(db)
+    captured: dict = {}
+
+    real_update = _sprint_items_mod._update_sprint_item_status
+    async def _capture_update(db_conn, project_id, item_id, status, **kwargs):
+        captured["to_status"] = status
+        captured["expected_statuses"] = kwargs.get("expected_statuses")
+        return await real_update(db_conn, project_id, item_id, status, **kwargs)
+
+    monkeypatch.setattr(db_module, "_update_sprint_item_status", _capture_update)
+    monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _capture_update)
+
+    await db_module.complete_sprint_item(db, p["id"], item["id"])
+    assert captured["to_status"] == "done"
+    assert captured["expected_statuses"] == _sprint_items_mod._ACTIVE_SPRINT_STATUSES
+
+
+@pytest.mark.asyncio
+async def test_fail_sprint_item_passes_active_statuses_to_chokepoint(db, monkeypatch):
+    """fail_sprint_item must call the shim with to_status='failed' and
+    expected_statuses == _ACTIVE_SPRINT_STATUSES."""
+    p, item = await _project_with_item(db)
+    captured: dict = {}
+
+    real_update = _sprint_items_mod._update_sprint_item_status
+    async def _capture_update(db_conn, project_id, item_id, status, **kwargs):
+        captured["to_status"] = status
+        captured["expected_statuses"] = kwargs.get("expected_statuses")
+        return await real_update(db_conn, project_id, item_id, status, **kwargs)
+
+    monkeypatch.setattr(db_module, "_update_sprint_item_status", _capture_update)
+    monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _capture_update)
+
+    await db_module.fail_sprint_item(db, p["id"], item["id"], reason="test")
+    assert captured["to_status"] == "failed"
+    assert captured["expected_statuses"] == _sprint_items_mod._ACTIVE_SPRINT_STATUSES
+
+
+@pytest.mark.asyncio
+async def test_skip_sprint_item_passes_active_statuses_to_chokepoint(db, monkeypatch):
+    """skip_sprint_item must call the shim with to_status='skipped' and
+    expected_statuses == _ACTIVE_SPRINT_STATUSES."""
+    p, item = await _project_with_item(db)
+    captured: dict = {}
+
+    real_update = _sprint_items_mod._update_sprint_item_status
+    async def _capture_update(db_conn, project_id, item_id, status, **kwargs):
+        captured["to_status"] = status
+        captured["expected_statuses"] = kwargs.get("expected_statuses")
+        return await real_update(db_conn, project_id, item_id, status, **kwargs)
+
+    monkeypatch.setattr(db_module, "_update_sprint_item_status", _capture_update)
+    monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _capture_update)
+
+    await db_module.skip_sprint_item(db, p["id"], item["id"], reason="no-op")
+    assert captured["to_status"] == "skipped"
+    assert captured["expected_statuses"] == _sprint_items_mod._ACTIVE_SPRINT_STATUSES
+
+
+@pytest.mark.asyncio
+async def test_push_sprint_item_passes_active_statuses_to_chokepoint(db, monkeypatch):
+    """push_sprint_item must call the shim with to_status='pushed' and
+    expected_statuses == _ACTIVE_SPRINT_STATUSES."""
+    p, item = await _project_with_item(db)
+    captured: dict = {}
+
+    real_update = _sprint_items_mod._update_sprint_item_status
+    async def _capture_update(db_conn, project_id, item_id, status, **kwargs):
+        captured["to_status"] = status
+        captured["expected_statuses"] = kwargs.get("expected_statuses")
+        captured["pushed_to"] = kwargs.get("pushed_to")
+        return await real_update(db_conn, project_id, item_id, status, **kwargs)
+
+    monkeypatch.setattr(db_module, "_update_sprint_item_status", _capture_update)
+    monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _capture_update)
+
+    await db_module.push_sprint_item(db, p["id"], item["id"], "v2.0")
+    assert captured["to_status"] == "pushed"
+    assert captured["expected_statuses"] == _sprint_items_mod._ACTIVE_SPRINT_STATUSES
+    assert captured["pushed_to"] == "v2.0"
+
+
+@pytest.mark.asyncio
+async def test_start_sprint_item_passes_pending_todo_to_chokepoint(db, monkeypatch):
+    """start_sprint_item must call the shim with to_status='in_progress' and
+    expected_statuses == {'pending', 'todo'} (narrower than _ACTIVE_SPRINT_STATUSES)."""
+    p, item = await _project_with_item(db)
+    captured: dict = {}
+
+    real_update = _sprint_items_mod._update_sprint_item_status
+    async def _capture_update(db_conn, project_id, item_id, status, **kwargs):
+        captured["to_status"] = status
+        captured["expected_statuses"] = kwargs.get("expected_statuses")
+        return await real_update(db_conn, project_id, item_id, status, **kwargs)
+
+    monkeypatch.setattr(db_module, "_update_sprint_item_status", _capture_update)
+    monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _capture_update)
+
+    await db_module.start_sprint_item(db, p["id"], item["id"])
+    assert captured["to_status"] == "in_progress"
+    assert captured["expected_statuses"] == {"pending", "todo"}
+
+
+@pytest.mark.asyncio
+async def test_provisional_complete_passes_active_statuses_to_chokepoint(db, monkeypatch):
+    """provisional_complete_sprint_item must call the shim with
+    to_status='provisional_complete' and expected_statuses == _ACTIVE_SPRINT_STATUSES."""
+    p, item = await _project_with_item(db)
+    captured: dict = {}
+
+    real_update = _sprint_items_mod._update_sprint_item_status
+    async def _capture_update(db_conn, project_id, item_id, status, **kwargs):
+        captured["to_status"] = status
+        captured["expected_statuses"] = kwargs.get("expected_statuses")
+        return await real_update(db_conn, project_id, item_id, status, **kwargs)
+
+    monkeypatch.setattr(db_module, "_update_sprint_item_status", _capture_update)
+    monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _capture_update)
+
+    await db_module.provisional_complete_sprint_item(db, p["id"], item["id"])
+    assert captured["to_status"] == "provisional_complete"
+    assert captured["expected_statuses"] == _sprint_items_mod._ACTIVE_SPRINT_STATUSES
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_passes_claimable_statuses_to_chokepoint(db, monkeypatch):
+    """claim_sprint_item must call _transition_status directly (not via shim)
+    with from_statuses covering all claimable states and claimed_at_now=True."""
+    p, item = await _project_with_item(db)
+    captured: dict = {}
+    _claimable = {"pending", "todo", "indeterminate", "provisional_complete"}
+
+    real_transition = _sprint_items_mod._transition_status
+    async def _capture_transition(db_conn, project_id, item_id, to_status,
+                                   from_statuses=None, **kwargs):
+        captured["to_status"] = to_status
+        captured["from_statuses"] = set(from_statuses) if from_statuses is not None else None
+        captured["claimed_at_now"] = kwargs.get("claimed_at_now", False)
+        return await real_transition(db_conn, project_id, item_id, to_status,
+                                     from_statuses=from_statuses, **kwargs)
+
+    monkeypatch.setattr(db_module, "_transition_status", _capture_transition)
+    monkeypatch.setattr(_sprint_items_mod, "_transition_status", _capture_transition)
+
+    await db_module.claim_sprint_item(db, p["id"], item["id"], actor="session-x")
+    assert captured["to_status"] == "in_progress"
+    assert captured["from_statuses"] == _claimable, (
+        f"claim_sprint_item must pass from_statuses={_claimable!r} to "
+        f"_transition_status, got {captured['from_statuses']!r}"
+    )
+    assert captured["claimed_at_now"] is True, (
+        "claim_sprint_item must pass claimed_at_now=True to _transition_status"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-caller race-lost contract: each public function that wraps
+# _update_sprint_item_status must raise SprintItemStatusRace (not return None
+# or raise a different exception) when the chokepoint returns None.
+# claim_sprint_item raises ValueError instead — already covered in the
+# pre-ARCH 1B tests above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fail_sprint_item_raises_status_race_on_transition_none(db, monkeypatch):
+    """fail_sprint_item must raise SprintItemStatusRace when _transition_status
+    returns None (lost race), not silently return None."""
+    p, item = await _project_with_item(db)
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+    await db_module.skip_sprint_item(db, p["id"], item["id"], reason="raced")
+
+    # Now item is skipped (terminal) — a call to fail should raise.
+    with pytest.raises(db_module.SprintItemStatusRace) as exc_info:
+        await db_module.fail_sprint_item(db, p["id"], item["id"])
+    assert exc_info.value.current_status == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_skip_sprint_item_raises_status_race_on_transition_none(db, monkeypatch):
+    """skip_sprint_item must raise SprintItemStatusRace when _transition_status
+    returns None (lost race) — item already in terminal status."""
+    p, item = await _project_with_item(db)
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+    await db_module.fail_sprint_item(db, p["id"], item["id"], reason="raced")
+
+    with pytest.raises(db_module.SprintItemStatusRace) as exc_info:
+        await db_module.skip_sprint_item(db, p["id"], item["id"])
+    assert exc_info.value.current_status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_push_sprint_item_raises_status_race_on_transition_none(db, monkeypatch):
+    """push_sprint_item must raise SprintItemStatusRace when _transition_status
+    returns None (lost race) — item already in terminal status."""
+    p, item = await _project_with_item(db)
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+    await db_module.complete_sprint_item(db, p["id"], item["id"])
+
+    with pytest.raises(db_module.SprintItemStatusRace) as exc_info:
+        await db_module.push_sprint_item(db, p["id"], item["id"], "v2.0")
+    assert exc_info.value.current_status == "done"
+
+
+@pytest.mark.asyncio
+async def test_provisional_complete_raises_status_race_on_transition_none(db, monkeypatch):
+    """provisional_complete_sprint_item must raise SprintItemStatusRace when
+    the item is already in a terminal state."""
+    p, item = await _project_with_item(db)
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+    await db_module.complete_sprint_item(db, p["id"], item["id"])
+
+    with pytest.raises(db_module.SprintItemStatusRace) as exc_info:
+        await db_module.provisional_complete_sprint_item(db, p["id"], item["id"])
+    assert exc_info.value.current_status == "done"
+
+
+@pytest.mark.asyncio
+async def test_start_sprint_item_raises_status_race_on_transition_none(db, monkeypatch):
+    """start_sprint_item must raise SprintItemStatusRace when the item is not
+    in pending/todo (e.g. already in_progress from a concurrent claim)."""
+    p, item = await _project_with_item(db)
+    # Item is already in_progress from _project_with_item which claims it.
+    # But _project_with_item only creates + claims. Let's add item explicitly.
+    p2 = await db_module.create_project(db, "start-race")
+    item2 = await db_module.add_sprint_item(db, p2["id"], "v1", "start-item")
+    await db_module.claim_sprint_item(db, p2["id"], item2["id"])
+
+    with pytest.raises(db_module.SprintItemStatusRace) as exc_info:
+        await db_module.start_sprint_item(db, p2["id"], item2["id"])
+    assert exc_info.value.current_status == "in_progress"
