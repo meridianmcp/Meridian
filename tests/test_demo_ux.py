@@ -9,7 +9,41 @@ when the playwright package or chromium is absent.
 from __future__ import annotations
 
 import json
+import socket
+import threading
+import time
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# Live-server helper — dynamic OS port, safe for -n auto / concurrent workers
+# ---------------------------------------------------------------------------
+
+def _start_live_server(app, startup_sleep: float = 1.5):
+    """Start a live uvicorn server on a dynamically-assigned OS port.
+
+    Binds a socket to port 0 so the OS picks a free port, then passes the
+    pre-bound socket to uvicorn.Server.run(sockets=[sock]).  This is
+    race-free: no TOCTOU window between "find free port" and "bind it".
+
+    Returns ``(server, thread, port)``.  Caller must set
+    ``server.should_exit = True`` in a ``finally`` block to stop the
+    server.  This pattern is safe under ``pytest -n auto`` because every
+    concurrent worker process picks its own port — no two tests share a port.
+    """
+    import uvicorn
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+
+    config = uvicorn.Config(app, log_level="error")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, args=([sock],), daemon=True)
+    thread.start()
+    time.sleep(startup_sleep)
+    return server, thread, port
 
 
 @pytest.fixture
@@ -207,23 +241,15 @@ pytestmark_playwright = pytest.mark.skipif(
 @pytestmark_playwright
 def test_demo_overlay_renders(client):
     """Playwright: onboarding overlay appears on /demo load."""
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        # Start a real server on a free port for Playwright
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17878, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        # Give it a moment to start
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
 
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17878/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)  # allow JS to run
 
             overlay = page.query_selector("#demo-onboarding-overlay")
@@ -238,21 +264,15 @@ def test_demo_overlay_renders(client):
 @pytestmark_playwright
 def test_demo_overlay_dismisses(client):
     """Playwright: X button dismisses overlay; no localStorage key set."""
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17879, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
 
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17879/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
 
             # Click the X dismiss button
@@ -274,21 +294,15 @@ def test_demo_overlay_dismisses(client):
 @pytestmark_playwright
 def test_demo_write_button_shows_friendly_toast(client):
     """Playwright: clicking a write button in demo shows 'Read-only demo' toast, not raw 403."""
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17880, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
 
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17880/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
 
             # Dismiss connection-setup modal if present (appears on CI where no
@@ -330,20 +344,14 @@ def test_demo_write_button_shows_friendly_toast(client):
 def test_codebase_force_graph_builder(client):
     """65742e42 — _buildCodebaseForceGraph + _normalizeGraphEdges produce a valid
     ECharts force-graph option from architecture packages + edges."""
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17887, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17887/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
             res = page.evaluate(
                 """() => {
@@ -394,20 +402,14 @@ def test_codebase_force_graph_builder(client):
 @pytestmark_playwright
 def test_sprint_history_badges_renderer(client):
     """c2fe20c3 — stall counter, retried tag, and live pulse dot render per item."""
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17886, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17886/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
             res = page.evaluate(
                 """() => {
@@ -437,20 +439,14 @@ def test_sprint_history_badges_renderer(client):
 @pytestmark_playwright
 def test_auto_answered_hitl_renderer(client):
     """0b9b12c8 — auto-answered HITLs render greyed; non-auto / empty render ''."""
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17885, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17885/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
             res = page.evaluate(
                 """() => {
@@ -488,20 +484,14 @@ def test_hitl_optimistic_card_removal(client):
     the per-project tab's `.hitl-row` wrapper (id lives on nested buttons only)
     and the global hitl bar's `#hitl-list` card (id lives on the wrapper itself).
     """
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17884, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17884/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
             res = page.evaluate(
                 """() => {
@@ -569,20 +559,14 @@ def test_hitl_optimistic_card_removal(client):
 def test_slot_health_warning_renderer(client):
     """9a8645c1 — _renderSlotHealthWarning shows an actionable badge for an
     unhealthy slot and nothing for a healthy one. Runs the real bundle."""
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17884, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17884/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
             res = page.evaluate(
                 """() => {
@@ -614,21 +598,15 @@ def test_settings_tab_classifier(client):
     Runs the real bundled `window._classifySettingsSection` in-browser so the
     shipped logic (not a re-implementation) is what's asserted.
     """
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17882, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
 
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17882/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)  # allow the bundle to load + run
 
             result = page.evaluate(
@@ -697,21 +675,15 @@ def test_settings_tabs_organize_and_switch(client):
     """0bf67524 — _organizeSettingsIntoTabs builds the Project/Workspace/Account
     tab bar, distributes sections, extracts the nested workspace-section, routes
     async-appended sections, and switches panes on click. Runs the real bundle."""
-    import threading
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17883, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        import time; time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
 
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17883/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
 
             built = page.evaluate(
@@ -805,18 +777,11 @@ def test_panels_render_without_pageerror(client):
     because its sessions/status data never loaded. This asserts both the panel
     container is populated AND that its backing requests succeed.
     """
-    import threading
-    import time
     import urllib.request
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17881, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
 
         # Seed a project against the *live* server so /dashboard renders an
         # active project panel rather than the first-run wizard. The uvicorn
@@ -824,7 +789,7 @@ def test_panels_render_without_pageerror(client):
         # the TestClient, so the row must be created over HTTP, not via client.
         urllib.request.urlopen(
             urllib.request.Request(
-                "http://127.0.0.1:17881/projects",
+                f"http://127.0.0.1:{port}/projects",
                 data=b'{"name": "panel-render"}',
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -860,7 +825,7 @@ def test_panels_render_without_pageerror(client):
                     if r.status >= 500
                     else None,
                 )
-                page.goto(f"http://127.0.0.1:17881{path}", wait_until="domcontentloaded")
+                page.goto(f"http://127.0.0.1:{port}{path}", wait_until="domcontentloaded")
                 page.wait_for_timeout(2500)
                 # Dismiss overlays/modals so they don't mask the panel.
                 for sel in ("#demo-onboarding-overlay", "#conn-setup-modal"):
@@ -918,21 +883,14 @@ def test_panels_render_without_pageerror(client):
 def test_dashboard_shows_visible_error_when_sessions_request_fails(client):
     """Playwright: a failed sessions fetch must surface a visible retryable error."""
     import json as _json
-    import threading
-    import time
     import urllib.request
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17883, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
 
         req = urllib.request.Request(
-            "http://127.0.0.1:17883/projects",
+            f"http://127.0.0.1:{port}/projects",
             data=b'{"name": "panel-error"}',
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -963,7 +921,7 @@ def test_dashboard_shows_visible_error_when_sessions_request_fails(client):
             _visible = False
             for _attempt in range(4):
                 page.goto(
-                    f"http://127.0.0.1:17883/dashboard?project_id={pid}",
+                    f"http://127.0.0.1:{port}/dashboard?project_id={pid}",
                     wait_until="domcontentloaded",
                 )
                 try:
@@ -1000,21 +958,14 @@ def test_demo_never_opens_connection_setup_modal(client):
     """G3.13 — /demo runs against the seeded demo DB and must never trigger
     the local-server connection-setup wizard. _showConnSetupIfNeeded bails
     out early in demo mode."""
-    import threading
-    import time
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17889, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17889/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2200)
             modal = page.locator("#conn-setup-modal")
             assert modal.count() == 1, "conn-setup-modal element must exist in markup"
@@ -1043,9 +994,6 @@ def test_free_tier_signout_visible_on_hosted_dashboard(client, monkeypatch):
     This test boots the server with MERIDIAN_HOSTED=true and a session cookie
     so /me returns {}. The sign-out link must still render and be visible.
     """
-    import threading
-    import time
-    import uvicorn
     from meridian import server as server_module
     from meridian import hosted as hosted_module
     from playwright.sync_api import sync_playwright
@@ -1060,16 +1008,12 @@ def test_free_tier_signout_visible_on_hosted_dashboard(client, monkeypatch):
     monkeypatch.setattr(hosted_module, "get_current_tenant", mock_get_current_tenant)
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17884, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
 
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17884/dashboard", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/dashboard", wait_until="domcontentloaded")
             page.wait_for_timeout(2500)  # let loadServerConfig + /me + init finish
 
             # Remove modals/wizards that can mask the sidebar footer.
@@ -1111,22 +1055,15 @@ def test_free_tier_signout_visible_on_hosted_dashboard(client, monkeypatch):
 def test_demo_tour_persists_and_finishes(client):
     """Phase 4: the rebuilt demo tour persists progress across reloads and,
     once 'Finish tutorial' is clicked, is never auto-shown again."""
-    import threading
-    import time
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17882, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
 
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17882/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
 
             # Start the tour from step 0 (dismiss the onboarding overlay first).
@@ -1176,21 +1113,14 @@ def test_session_timeline_tab_renders(demo_client):
     /projects/{id}/session-timeline and paints the explanatory panel (proving the
     button → tab-switch → loader → endpoint → DOM path end to end). Uses demo_client
     so the seeded demo project auto-opens and the vtab strip is present."""
-    import threading
-    import time
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17891, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17891/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2500)  # allow JS to boot + auto-open the seeded project
 
             # Best-effort dismiss of the onboarding overlay so it can't intercept clicks.
@@ -1225,21 +1155,14 @@ def test_activity_by_domain_chart_renders(demo_client):
     """c975b6ef — the Activity-by-domain chart is wired into the Rewind → Charts
     subtab (alongside the existing Sprint items/day + completion charts) and its
     canvas + heading actually render in a real browser."""
-    import threading
-    import time
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17892, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17892/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
             try:
                 page.click("#demo-onboarding-overlay button[title='Dismiss']", timeout=1500)
@@ -1268,24 +1191,17 @@ def test_documents_tab_shows_peeks_and_ingest_copy(demo_client):
     """79ee73e8 — the Documents tab renders the 'Recently viewed (not saved)' peek
     section (with a one-click Ingest button) + the prominent ingest_document copy
     that distinguishes stateless peeks from ingested docs — verified in a browser."""
-    import threading
-    import time
-    import uvicorn
     from meridian import server as server_module
     from meridian import doc_peeks
 
     doc_peeks.clear()
     doc_peeks.record_peek(None, "/thesis/chapter1.docx")  # same process as the server
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17893, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17893/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
             try:
                 page.click("#demo-onboarding-overlay button[title='Dismiss']", timeout=1500)
@@ -1319,21 +1235,14 @@ def test_live_parallelization_tab_renders(demo_client):
     which groups the currently-in_progress sprint items by their owning session and
     paints them into the section container (proving the section is wired into the live
     view end to end). Distinct from the historical Sessions timeline (1e1bd6b0)."""
-    import threading
-    import time
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17888, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17888/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
             try:
                 page.click("#demo-onboarding-overlay button[title='Dismiss']", timeout=1500)
@@ -1386,21 +1295,14 @@ def test_subproject_hierarchy_ui(demo_client):
     Uses the seeded demo project so the dashboard bundle is fully booted; the
     hierarchy logic is exercised with synthetic project rows injected into
     window.state (no server write needed — writes are demo-blocked)."""
-    import threading
-    import time
-    import uvicorn
     from meridian import server as server_module
 
     with sync_playwright() as p:
-        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17894, log_level="error")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        time.sleep(1.5)
+        server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
-            page.goto("http://127.0.0.1:17894/demo", wait_until="domcontentloaded")
+            page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2500)  # boot JS + auto-open seeded project
 
             # Wait until the exposed helpers are on window (bundle fully booted).
