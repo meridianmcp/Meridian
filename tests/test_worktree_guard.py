@@ -52,22 +52,29 @@ def _find_main_repo() -> Path:
 
 
 _REPO = _find_main_repo()
-_WORKTREE_ROOT = Path(__file__).resolve().parent.parent  # this worktree
+_WORKTREE_ROOT = Path(__file__).resolve().parent.parent  # actual cwd this test runs from
 _HOOK_SH = _WORKTREE_ROOT / ".claude" / "hooks" / "worktree_guard.sh"
 # settings.json lives next to the hook; use _WORKTREE_ROOT's copy (which is the
 # one this sprint item modifies) when running inside a worktree, otherwise the
 # main repo copy.
 _SETTINGS = _WORKTREE_ROOT / ".claude" / "settings.json"
 
-# A real worktree path that exists in this repo (the one we're running in).
-_WORKTREE_DIR = str(_WORKTREE_ROOT)
-# A file inside the worktree (in the worktree's own subdirectory).
-_WORKTREE_FILE = str(_WORKTREE_ROOT / "meridian" / "server.py")
+# A SIMULATED claimed-worktree path for the hook's CLAUDE_PROJECT_DIR input. This must
+# be synthetic and independent of _WORKTREE_ROOT (where the test file itself physically
+# lives) -- deriving it from _WORKTREE_ROOT made these tests pass only when run from
+# inside a real .claude/worktrees/<name>/ checkout and silently fail-open (false pass on
+# the "allow" tests, hard fail on the "block" tests) once merged into the main tree,
+# since _WORKTREE_ROOT there has no .claude/worktrees/ segment. The hook only does
+# string matching, not filesystem existence checks, so this path need not exist.
+_WORKTREE_DIR = str(_REPO / ".claude" / "worktrees" / "test-fixture-worktree")
+# A file inside the simulated worktree.
+_WORKTREE_FILE = str(Path(_WORKTREE_DIR) / "meridian" / "server.py")
 # A file in the main tree (NOT in any worktree).
 _MAIN_FILE = str(_REPO / "tests" / "conftest.py")
-# A file in a sibling worktree (different from this one).
+# A file in a sibling worktree (different from this one, and not tied to any specific
+# transient batch/workflow worktree name).
 _OTHER_WORKTREE_FILE = str(
-    _REPO / ".claude" / "worktrees" / "wf_a1d5f1db-630-1" / "meridian" / "server.py"
+    _REPO / ".claude" / "worktrees" / "test-fixture-sibling-worktree" / "meridian" / "server.py"
 )
 
 _needs_bash = pytest.mark.skipif(
