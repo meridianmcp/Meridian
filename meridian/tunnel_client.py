@@ -76,7 +76,10 @@ _PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
 # first spawn triggers a uvx download of the same order as DC's npx fetch, so they
 # were failing the standard ~23s budget on a cold cache (live symptom:
 # "tunnel:ppt: pre-flight health check FAILED"). Give them the same extended budget.
-_COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc", "ppt", "word"})
+# 105e56b9 — docs/zotero also use uvx and trigger a cold venv build from a local
+# path (`uvx --from <local-path> meridian-docs` / `uvx zotero-mcp`), so they need
+# the same larger budget on a cold cache to avoid a spurious preflight FAILED.
+_COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc", "ppt", "word", "docs", "zotero"})
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +540,18 @@ _OFFICE_PREFLIGHT_HINTS = {
     "word": (
         "The Word slot did not respond on port {port} — its launcher may not be "
         "installed yet; the first launch can take a while to download."
+    ),
+    # 105e56b9 — docs/zotero use uvx --from <local-path> / uvx zotero-mcp and must
+    # build or download their venv on a cold cache; the first launch can take 30-150s.
+    "docs": (
+        "The meridian-docs slot did not respond on port {port} — its first launch "
+        "builds a local uvx venv which can take 30-150s on a cold cache. It will "
+        "auto-retry in the background and recover once the venv is ready."
+    ),
+    "zotero": (
+        "The zotero-mcp slot did not respond on port {port} — its first launch "
+        "downloads zotero-mcp via uvx and can take a while on a cold cache. It will "
+        "auto-retry in the background."
     ),
 }
 
@@ -3280,6 +3295,9 @@ async def run_tunnel(
     ppt_plugin = by_slot.get("ppt") or {}
     word_plugin = by_slot.get("word") or {}
     dc_plugin = by_slot.get("dc") or {}
+    # 105e56b9 — docs (meridian-docs) and zotero (zotero-mcp) slots.
+    docs_plugin = by_slot.get("docs") or {}
+    zotero_plugin = by_slot.get("zotero") or {}
     # Per-slot effective ports (override > the run_tunnel arg default).
     fs_port = int(fs_plugin.get("port") or port)
     code_port = int(code_plugin.get("port") or code_port)
@@ -3287,6 +3305,12 @@ async def run_tunnel(
     ppt_port = int(ppt_plugin.get("port") or 8811)
     word_port = int(word_plugin.get("port") or 8812)
     dc_port = int(dc_plugin.get("port") or 8813)
+    # 105e56b9 — default ports for docs/zotero (see tunnel_plugins.DEFAULT_DOCS_PORT /
+    # DEFAULT_ZOTERO_PORT). Importable but already mirrored here as literals to avoid
+    # a circular import at the top of the file (tunnel_plugins is imported later,
+    # inside the function, for the resolve_plugins call above).
+    docs_port = int(docs_plugin.get("port") or 8818)
+    zotero_port = int(zotero_plugin.get("port") or 8819)
 
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
@@ -3368,7 +3392,10 @@ async def run_tunnel(
     proxy_extract: SlotProxy | None = None
     serena_pool: SerenaDaemonPool | None = None  # 64650cb4 — default-Serena extract
     office_proxies: dict[str, SlotProxy] = {}
-    office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port}
+    # 105e56b9 — include docs/zotero alongside the traditional office slots so
+    # they share the same lazy-spawn + idle-kill + WebSocket reconnect infrastructure.
+    office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port,
+                    "docs": docs_port, "zotero": zotero_port}
     # 4ea1b9d5 — slots whose session_mode is "persistent" (e.g. Desktop
     # Commander): they keep a stateful inner process, so they skip the
     # idle-killer that would otherwise tear the session down after 30min.
@@ -3473,10 +3500,16 @@ async def run_tunnel(
                     flush=True,
                 )
 
-    # 4b. Office MCP slots (ppt/word/dc). Off by default; enabled via dashboard.
+    # 4b. Office MCP slots (ppt/word/dc/docs/zotero). Off by default; enabled via dashboard.
+    # 105e56b9 — docs (meridian-docs DOCX intelligence) and zotero (zotero-mcp citation
+    # resolution) added here alongside the traditional office slots; they use the same
+    # lazy-spawn + mcp-proxy pattern and are wired to their server-side WS routes
+    # (/tunnel-docs and /tunnel-zotero in routes/tunnel.py, added by 9665538a/39c117b1).
     for slot, plugin, human in (("ppt", ppt_plugin, "PowerPoint"),
                                 ("word", word_plugin, "Word"),
-                                ("dc", dc_plugin, "Desktop Commander")):
+                                ("dc", dc_plugin, "Desktop Commander"),
+                                ("docs", docs_plugin, "meridian-docs"),
+                                ("zotero", zotero_plugin, "zotero-mcp")):
         if not plugin.get("enabled", False):
             continue
         cmd = _office_slot_command(slot, plugin)
@@ -3648,9 +3681,10 @@ async def run_tunnel(
     # b4455202 — per-slot tool-name display prefix (e.g. "Filesystem", "Serena")
     # the relay prepends to that slot's tools/list. Slots whose inner server
     # already self-prefixes carry prefix=None (no-op).
+    # 105e56b9 — include docs/zotero so their tool-name prefixes are relayed correctly.
     slot_prefixes = {
         s: (by_slot.get(s) or {}).get("prefix")
-        for s in ("fs", "code", "extract", "ppt", "word", "dc")
+        for s in ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero")
     }
     ws_fs = _ws_url(base_url, tenant_id, token)
     ws_code = _ws_code_url(base_url, tenant_id, token)

@@ -1462,9 +1462,11 @@ def test_preflight_slot_office_slots_use_cold_fetch_budget(monkeypatch):
     """24b6cb5d — the Office slots (ppt/word) uvx-download their inner server on
     first spawn, exactly like DC's npx fetch, so they must get the SAME larger
     cold-fetch pre-flight budget. Before this fix only dc did, and ppt failed the
-    standard ~23s budget on a cold cache ('tunnel:ppt: pre-flight ... FAILED')."""
-    # Both office slots are declared cold-fetch alongside dc.
-    assert tc._COLD_FETCH_SLOTS == frozenset({"dc", "ppt", "word"})
+    standard ~23s budget on a cold cache ('tunnel:ppt: pre-flight ... FAILED').
+    105e56b9 — docs/zotero also added to the cold-fetch set (uvx --from <local-path>
+    / uvx zotero-mcp can take 30-150s on a cold cache, same root cause)."""
+    # All cold-fetch slots are declared; the original dc/ppt/word trio plus docs/zotero.
+    assert frozenset({"dc", "ppt", "word"}).issubset(tc._COLD_FETCH_SLOTS)
 
     calls: list[dict] = []
 
