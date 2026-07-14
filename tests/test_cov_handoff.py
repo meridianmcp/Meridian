@@ -371,6 +371,23 @@ def test_build_quick_start_goal_xml_escapes_untrusted_manual_title():
     assert "alert(1)" in tags["exclusions"]
 
 
+def test_build_quick_start_goal_test_gate_note_is_xml_escaped():
+    """Regression for c6c63b0/b6a3f7c1 — the <test_gate_note> block's guidance
+    text contained literal `<path>::<test>` placeholder angle brackets, which a
+    real XML parser reads as unclosed tags ("mismatched tag") and broke every
+    consumer that parses the generated /goal as XML. The content must go through
+    _xml_escape like every other dynamic block in this function."""
+    from meridian.handoff import _build_quick_start_goal
+    goal = _build_quick_start_goal([{"id": "c1", "title": "FEAT real"}])
+    # The raw, unescaped placeholder must never appear directly.
+    assert "<path>::<test>" not in goal
+    # The escaped form must be present instead.
+    assert "&lt;path&gt;::&lt;test&gt;" in goal
+    tags, _ = _parse_goal_xml(goal)  # asserts well-formed XML end-to-end
+    assert "test_gate_note" in tags
+    assert "INTERNALERROR" in tags["test_gate_note"]
+
+
 def test_resolve_graph_searcher_uses_registered_resolver():
     """4cfaecc2 — _resolve_graph_searcher consults the injectable resolver and is
     guarded so a resolver that raises can never break the mandatory handoff."""

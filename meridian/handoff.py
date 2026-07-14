@@ -559,17 +559,22 @@ def _build_quick_start_goal(
         # gwN>)") is a parallel-execution flake, not a real regression. Codifies
         # the ad-hoc triage a prior executor had to improvise so future executors
         # don't misattribute infra noise as a code bug.
-        "\n<test_gate_note>If `pixi run test -n auto` produces an INTERNALERROR "
-        "or worker crash (a line starting with 'INTERNALERROR>' rather than a "
-        "normal 'FAILED tests/...' line), this is very likely a parallel-execution "
-        "flake, not a regression in your code. Before concluding your change broke "
-        "something: (1) stash your changes (`git stash`), (2) run the specific "
-        "crashed test in isolation (`pixi run python -m pytest <path>::<test> -q "
-        "--timeout=60 -p no:xdist`), (3) if it passes standalone, your change is "
-        "very likely fine — restore your changes (`git stash pop`) and re-run the "
-        "full suite WITHOUT -n auto (`pixi run python -m pytest tests/ -q "
-        "--timeout=60`) for a clean, honest count before deciding pass/fail."
-        "</test_gate_note>"
+        # b6a3f7c1 — the body MUST go through _xml_escape: it previously contained
+        # literal `<path>::<test>` placeholder angle brackets, which XML parsers
+        # read as unclosed tags ("mismatched tag") and broke every consumer that
+        # parses the generated /goal as XML (3 real test_cov_handoff.py failures).
+        "\n<test_gate_note>" + _xml_escape(
+            "If `pixi run test -n auto` produces an INTERNALERROR "
+            "or worker crash (a line starting with 'INTERNALERROR>' rather than a "
+            "normal 'FAILED tests/...' line), this is very likely a parallel-execution "
+            "flake, not a regression in your code. Before concluding your change broke "
+            "something: (1) stash your changes (`git stash`), (2) run the specific "
+            "crashed test in isolation (`pixi run python -m pytest <path>::<test> -q "
+            "--timeout=60 -p no:xdist`), (3) if it passes standalone, your change is "
+            "very likely fine — restore your changes (`git stash pop`) and re-run the "
+            "full suite WITHOUT -n auto (`pixi run python -m pytest tests/ -q "
+            "--timeout=60`) for a clean, honest count before deciding pass/fail."
+        ) + "</test_gate_note>"
         f"{_not_done_until}\n"
         f"<stop_conditions>Stop after {_turns} turns "
         f"{_xml_escape(_hitl_clause)}</stop_conditions>"
