@@ -5451,6 +5451,118 @@ async def test_generate_handoff_persists_pending_goal(db, tmp_path):
     assert "/goal" in stored
 
 
+@pytest.mark.asyncio
+async def test_pop_pending_goal_with_meta_fresh(db):
+    """590dcdd5: pop_pending_goal_with_meta returns goal + age_hours + stale=False
+    for a freshly-set goal."""
+    p = await db_module.create_project(db, "pgmeta-fresh")
+    # Nothing pending → None.
+    assert await db_module.pop_pending_goal_with_meta(db, p["id"]) is None
+    await db_module.set_pending_goal(db, p["id"], "/goal do X now")
+    meta = await db_module.pop_pending_goal_with_meta(db, p["id"])
+    assert meta is not None
+    assert meta["goal"] == "/goal do X now"
+    # A freshly-set goal must not be stale.
+    assert meta["stale"] is False
+    assert meta["age_hours"] < 1.0  # written seconds ago
+    # Read-once: cleared after pop.
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+    assert await db_module.pop_pending_goal_with_meta(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_pop_pending_goal_with_meta_stale(db):
+    """590dcdd5: pop_pending_goal_with_meta flags as stale when pending_goal_at
+    is older than PENDING_GOAL_STALE_HOURS hours."""
+    import datetime as dt
+    p = await db_module.create_project(db, "pgmeta-stale")
+    await db_module.set_pending_goal(db, p["id"], "/goal old work")
+    # Backdate pending_goal_at to simulate a goal written 30 hours ago.
+    stale_ts = (
+        dt.datetime.utcnow() - dt.timedelta(hours=30)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await db.execute(
+        "UPDATE projects SET pending_goal_at = ? WHERE id = ?",
+        (stale_ts, p["id"]),
+    )
+    await db.commit()
+    meta = await db_module.pop_pending_goal_with_meta(db, p["id"])
+    assert meta is not None
+    assert meta["goal"] == "/goal old work"
+    assert meta["stale"] is True
+    assert meta["age_hours"] >= 29.9  # ≈ 30 hours
+    # Still read-once.
+    assert await db_module.get_pending_goal(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_pop_pending_goal_with_meta_missing_at_column(db):
+    """590dcdd5: pop_pending_goal_with_meta treats a NULL pending_goal_at as
+    age_hours=0 (not stale), e.g. rows written before this migration."""
+    p = await db_module.create_project(db, "pgmeta-noat")
+    # Manually write pending_goal with no pending_goal_at (pre-migration row).
+    await db.execute(
+        "UPDATE projects SET pending_goal = ?, pending_goal_at = NULL WHERE id = ?",
+        ("/goal legacy", p["id"]),
+    )
+    await db.commit()
+    meta = await db_module.pop_pending_goal_with_meta(db, p["id"])
+    assert meta is not None
+    assert meta["goal"] == "/goal legacy"
+    assert meta["stale"] is False   # NULL timestamp → treated as age=0
+    assert meta["age_hours"] == 0.0
+
+
+def test_start_session_surfaces_stale_flag_when_goal_is_old(tmp_path):
+    """590dcdd5: start_session includes pending_goal_stale=True and
+    pending_goal_age_hours in the result when the stored goal is stale."""
+    import asyncio
+    import datetime as dt
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        proj = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "pg-stale"}, db, out))
+        pid = proj["id"]
+        asyncio.run(db_module.set_pending_goal(db, pid, "/goal old objective"))
+        # Backdate the timestamp to make it stale.
+        stale_ts = (
+            dt.datetime.utcnow() - dt.timedelta(hours=30)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        asyncio.run(db.execute(
+            "UPDATE projects SET pending_goal_at = ? WHERE id = ?",
+            (stale_ts, pid),
+        ))
+        asyncio.run(db.commit())
+        sess = asyncio.run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, out))
+        assert sess.get("pending_goal") == "/goal old objective"
+        assert sess.get("pending_goal_stale") is True
+        assert sess.get("pending_goal_age_hours", 0) >= 29.9
+        # Still read-once.
+        assert asyncio.run(db_module.get_pending_goal(db, pid)) is None
+    finally:
+        asyncio.run(db.close())
+
+
+def test_start_session_no_stale_flag_for_fresh_goal(tmp_path):
+    """590dcdd5: start_session does NOT include pending_goal_stale for a
+    freshly-written goal (written seconds ago)."""
+    import asyncio
+    from meridian import server as mh
+    db = asyncio.run(db_module.init_db(":memory:"))
+    out = str(tmp_path)
+    try:
+        proj = asyncio.run(mh._dispatch_mcp_tool("create_project", {"name": "pg-fresh"}, db, out))
+        pid = proj["id"]
+        asyncio.run(db_module.set_pending_goal(db, pid, "/goal fresh objective"))
+        sess = asyncio.run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, out))
+        assert sess.get("pending_goal") == "/goal fresh objective"
+        # Fresh goal: stale flag must be absent (or False).
+        assert not sess.get("pending_goal_stale")
+    finally:
+        asyncio.run(db.close())
+
+
 def test_start_session_delivers_and_clears_pending_goal(tmp_path):
     """start_session surfaces the stored /goal via the trusted MCP tool result
     (keyed on project_id) and clears it read-once — a second start_session no
@@ -7247,10 +7359,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_dependency",
         "_migrate_pg_mcp_rate_counters",
         "_migrate_pg_workspace_proposals",
+        "_migrate_pg_pending_goal_at",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 93
+    assert len(allnames) == len(set(allnames)) == 94
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

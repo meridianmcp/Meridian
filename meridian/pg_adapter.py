@@ -2705,6 +2705,16 @@ async def _migrate_pg_workspace_proposals(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_pending_goal_at(conn: PostgresConnection) -> None:
+    """590dcdd5 — projects.pending_goal_at: ISO-8601 UTC timestamp written
+    alongside pending_goal by set_pending_goal so pop_pending_goal_with_meta
+    can flag goals older than PENDING_GOAL_STALE_HOURS as possibly-stale.
+    Mirrors db._migrate_pending_goal_at."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS pending_goal_at TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2767,4 +2777,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_dependency,
     _migrate_pg_mcp_rate_counters,
     _migrate_pg_workspace_proposals,
+    _migrate_pg_pending_goal_at,
 )
