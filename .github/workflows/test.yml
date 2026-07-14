@@ -41,6 +41,20 @@ jobs:
       # up-front chunking leaves some workers idle while others queue. worksteal
       # dynamically redistributes remaining tests, which only helps under that
       # kind of imbalance and can't hurt evenly-distributed runs.
+      #
+      # e71ecf27 — real CI timing data collected 2026-07-14 (GitHub Actions,
+      # ubuntu-latest, the actual target platform):
+      #   PRE-change (7 runs, no --dist=worksteal):
+      #     test-core: 386 389 392 402 403 418 433s  median=402s  avg=403s
+      #   POST-change (1 run, --dist=worksteal):
+      #     test-core: 437s
+      # The single post-change run lands above the pre-change median (+35s, ~8.7%),
+      # but with n=1 this is NOT statistically conclusive — the pre-change range
+      # itself spans 386–433s (47s spread), so 437s could be noise. Sample size is
+      # too small for a confident verdict. Keeping the change: it is correctness-
+      # neutral, theoretically justified by the documented load imbalance, and the
+      # data does not clearly show a regression. Revisit if additional CI runs
+      # consistently land above the pre-change range.
       - run: pixi run python -m pytest tests/ -n auto --dist=worksteal -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=82
 
   test-postgres:
@@ -101,6 +115,13 @@ jobs:
       # database (meridian_test_gw0, _gw1, … — created on demand by conftest) and
       # drops/recreates the public schema per test, so workers stay fully isolated
       # even though every test rebuilds the schema.
+      #
+      # e71ecf27 — real CI timing data collected 2026-07-14:
+      #   PRE-change (7 runs): 445 445 466 485 502 510 690s  median=485s  avg=506s
+      #   POST-change (1 run): 519s  (job failed due to pre-existing PG failures,
+      #     not worksteal; continue-on-error is intentional per 98aa7eb7)
+      # Single post-change run is within the pre-change spread (445–690s range).
+      # Sample size too small for a confident verdict; keeping --dist=worksteal.
       - run: pixi run python -m pytest tests/ -n auto --dist=worksteal -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --timeout=60
 
   test-ux:
