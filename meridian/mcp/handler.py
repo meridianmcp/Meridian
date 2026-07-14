@@ -3207,6 +3207,82 @@ async def _handle_notes_decisions(
             "document_id": doc_row["id"],
             "matches": matches,
         }
+    if name == "ingest_document_structure":
+        # db42acce — receive pre-parsed structural data (headings/figures/tables)
+        # forwarded from the tunnel-local side (where the real .docx lives) and
+        # persist it into the doc-structure store so find_similar_figure /
+        # index_figure / index_table / index_equation all see the right document_id.
+        #
+        # The tunnel-local function ``ingest_local_document_structure`` (in the
+        # meridian-docs extension) calls document_content_tree on the REAL file
+        # (which it CAN read locally), serializes the ``blocks`` list from the
+        # tree as JSON, and forwards it here.  The hosted server receives the raw
+        # blocks, converts them to structured elements via
+        # ``elements_from_docx_content_tree`` (which lives server-side in
+        # meridian.doc_store), and stores them via put_document — keyed on the
+        # SAME source string that ingest_document(content=...) already used, so
+        # get_document() resolves the same document_id for both the flat note and
+        # the structural rows.
+        validate_input_size(args.get("source"), "document source", 2_000)
+        validate_input_size(args.get("title"), "document title", 500)
+        if not args.get("project_id"):
+            return {"error": "project_id is required"}
+        _struct_source = (args.get("source") or "").strip()
+        if not _struct_source:
+            return {
+                "error": (
+                    "source is required — must match the source used for "
+                    "ingest_document (usually the local file path)"
+                )
+            }
+        _blocks_raw = args.get("blocks")
+        if not _blocks_raw:
+            return {
+                "error": (
+                    "blocks is required — JSON-encoded list of body blocks from "
+                    "document_content_tree (the 'blocks' key of its return value)"
+                )
+            }
+        try:
+            if isinstance(_blocks_raw, str):
+                _blocks: list[Any] = json.loads(_blocks_raw)
+            elif isinstance(_blocks_raw, list):
+                _blocks = _blocks_raw
+            else:
+                return {"error": "blocks must be a JSON array"}
+        except (json.JSONDecodeError, TypeError) as exc:
+            return {"error": f"blocks is not valid JSON: {exc}"}
+        if not isinstance(_blocks, list):
+            return {"error": "blocks must be a JSON array"}
+        _struct_doc_type = (args.get("doc_type") or "docx").strip() or "docx"
+        # Convert raw blocks to structured elements using the server-side mapper.
+        try:
+            from ..doc_store import elements_from_docx_content_tree  # noqa: PLC0415
+            _struct_elements: list[Any] = elements_from_docx_content_tree(
+                {"blocks": _blocks}
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not convert blocks to elements: {exc}"}
+        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+        if store is None:
+            return {"error": "document-structure store unavailable"}
+        try:
+            doc = await store.put_document(
+                args["project_id"],
+                _struct_doc_type,
+                _struct_elements,
+                source=_struct_source,
+                title=args.get("title"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not persist document structure: {exc}"}
+        return {
+            "project_id": args["project_id"],
+            "document_id": doc["id"],
+            "source": _struct_source,
+            "doc_type": _struct_doc_type,
+            "element_count": doc.get("element_count", len(_struct_elements)),
+        }
     if name == "add_insight":
         # 0b711a9d — durable strategic insight (dedicated table, not a note).
         validate_input_size(args.get("title"), "insight title", 500)

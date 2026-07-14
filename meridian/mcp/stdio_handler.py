@@ -1133,6 +1133,31 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="ingest_document_structure",
+                description=(
+                    "db42acce — persist pre-parsed structural data "
+                    "(headings/figures/tables) into the doc-structure store, keyed "
+                    "on the SAME source as ingest_document(content=...) so "
+                    "find_similar_figure / index_figure / index_table all see the "
+                    "correct document_id. Use the tunnel-side "
+                    "ingest_local_document_structure tool (meridian-docs extension) "
+                    "to parse a local .docx and forward the blocks JSON here. "
+                    "Returns {document_id, source, doc_type, element_count}."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — alternative to project_id."},
+                        "source": {"type": "string", "description": "Source key matching what ingest_document stored (usually the local file path)."},
+                        "blocks": {"type": "string", "description": "JSON-encoded list of body blocks from document_content_tree ('blocks' key). Server converts to elements via elements_from_docx_content_tree."},
+                        "doc_type": {"type": "string", "description": "Document type: 'docx' (default) or 'latex'."},
+                        "title": {"type": "string", "description": "Document title (optional)."},
+                    },
+                    "required": ["source", "blocks"],
+                },
+            ),
+            Tool(
                 name="search_outputs",
                 description=(
                     "a0e9133e — READ-ONLY BM25 full-text search over a run's "

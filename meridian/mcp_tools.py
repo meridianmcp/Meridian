@@ -689,6 +689,25 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "description": {"type": "string", "description": "A free-text description to fuzzy-match against this document's indexed tables."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "description"]}},
+    {"name": "ingest_document_structure", "description":
+        "db42acce — persist pre-parsed structural data (headings/figures/tables) "
+        "into the doc-structure store, keyed on the SAME source as "
+        "ingest_document(content=...) so find_similar_figure / index_figure / "
+        "index_table / index_equation see the correct document_id.\n\n"
+        "Use this when the .docx lives on the caller's local machine (not on the "
+        "Meridian server): call the tunnel-side ingest_local_document_structure "
+        "tool (from the meridian-docs extension) which parses the file locally and "
+        "forwards the blocks JSON here. The source must exactly match the source "
+        "that ingest_document stored the flat note under (default: the local file "
+        "path). Returns {document_id, source, doc_type, element_count}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "source": {"type": "string", "description": "The source key (usually the local file path) matching what ingest_document stored the flat note under."},
+         "blocks": {"type": "string", "description": "JSON-encoded list of body blocks from document_content_tree (the 'blocks' key) — headings, paragraphs, tables in document order. The server converts these to structural elements via elements_from_docx_content_tree."},
+         "doc_type": {"type": "string", "description": "Document type: 'docx' (default) or 'latex'."},
+         "title": {"type": "string", "description": "Document title (optional; stored for display)."}},
+         "required": ["source", "blocks"]}},
     {"name": "search_outputs", "description":
         "a0e9133e — READ-ONLY full-text search over a run's OUTPUTS tree "
         "(numeric/tabular/array artifacts), backed by DuckDB native FTS (Okapi "
@@ -1939,11 +1958,12 @@ _TOOL_CATEGORY: dict[str, str] = {
     "insert_equation":        "docx",
     "update_paragraph":       "docx",
     "find_symbol_usages":     "docx",
-    "index_figure":           "docx",
-    "find_similar_figure":    "docx",
-    "link_figure_caption":    "docx",
-    "index_table":            "docx",
-    "find_similar_table":     "docx",
+    "index_figure":                   "docx",
+    "find_similar_figure":            "docx",
+    "link_figure_caption":            "docx",
+    "index_table":                    "docx",
+    "find_similar_table":             "docx",
+    "ingest_document_structure":      "docx",
     # file locking
     "claim_file":               "file-locking",
     "release_file":             "file-locking",
@@ -1995,6 +2015,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "index_figure":              "executor",
     "link_figure_caption":       "executor",
     "index_table":               "executor",
+    "ingest_document_structure": "executor",
     "annotate_outputs":          "executor",
     "log_task":                  "executor",
     "generate_handoff":          "executor",
