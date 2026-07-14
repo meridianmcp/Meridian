@@ -186,3 +186,68 @@ describe("_renderStaleOverrideWarning wires the populate handler", () => {
     expect(input.value).toBe("uvx docx-mcp");
   });
 });
+
+// 678ec121 — enabled (stored config) and active (this session's live tunnel
+// connection) are independently tracked and can genuinely disagree (confirmed
+// live: word/desktop-commander showed enabled:false while active:true from one
+// client). _pluginLifecycleState/_renderLifecycleBadge must surface that
+// mismatch explicitly rather than silently rendering "active" next to an
+// unchecked toggle with no explanation.
+describe("_pluginLifecycleState / _renderLifecycleBadge — enabled/active mismatch", () => {
+  const _pluginLifecycleState = (window as any)._pluginLifecycleState as (
+    plugin: any,
+    active: any,
+    slotStatus?: any,
+  ) => string;
+  const _renderLifecycleBadge = (window as any)._renderLifecycleBadge as (
+    plugin: any,
+    lifecycleState: any,
+    installCmd: any,
+  ) => string;
+
+  it("connected + enabled is plain active (unchanged baseline)", () => {
+    const state = _pluginLifecycleState({ slot: "word", enabled: true }, { word: true });
+    expect(state).toBe("active");
+  });
+
+  it("connected + explicitly disabled is a distinct active_disabled state, not plain active", () => {
+    const state = _pluginLifecycleState({ slot: "word", enabled: false }, { word: true });
+    expect(state).toBe("active_disabled");
+  });
+
+  it("connected + enabled unset (undefined, not explicitly false) stays plain active", () => {
+    // Core/legacy rows may omit `enabled` entirely; only an explicit false
+    // means "the user turned this off" — must not misfire on omission.
+    const state = _pluginLifecycleState({ slot: "word" }, { word: true });
+    expect(state).toBe("active");
+  });
+
+  it("unhealthy still takes priority over the enabled/active mismatch", () => {
+    const state = _pluginLifecycleState(
+      { slot: "word", enabled: false },
+      { word: true },
+      { word: { reason: "preflight_failed" } },
+    );
+    expect(state).toBe("unhealthy");
+  });
+
+  it("not connected + disabled is not_installed (unchanged baseline)", () => {
+    const state = _pluginLifecycleState({ slot: "word", enabled: false }, { word: false });
+    expect(state).toBe("not_installed");
+  });
+
+  it("renders a distinct label + explanatory hint for active_disabled, not the plain active badge", () => {
+    const html = _renderLifecycleBadge({ slot: "word" }, "active_disabled", "");
+    expect(html).toContain("active (disabled)");
+    expect(html).toContain("disabled — still connected");
+    expect(html).not.toContain(">active<"); // must not read as the plain "active" label
+  });
+
+  it("active_disabled keeps the same green connected dot as plain active", () => {
+    const activeHtml = _renderLifecycleBadge({ slot: "word" }, "active", "");
+    const mismatchHtml = _renderLifecycleBadge({ slot: "word" }, "active_disabled", "");
+    const dotColor = "var(--success, #3fb950)";
+    expect(activeHtml).toContain(dotColor);
+    expect(mismatchHtml).toContain(dotColor);
+  });
+});

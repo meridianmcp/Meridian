@@ -966,6 +966,15 @@ function _pluginLifecycleState(plugin: any, active: any, slotStatus?: any) {
     // a898710a — connected but a plugin_status marked it unhealthy (failed
     // pre-flight / dead inner server): surface 'unhealthy', not 'active'.
     if (slotStatus && slotStatus[plugin.slot]) return 'unhealthy';
+    // 678ec121 — enabled (stored config) and active (this session's live
+    // connection) are genuinely, independently tracked and can disagree: a
+    // slot's live state is per-client/per-session (confirmed live — a slot
+    // can be connected for one client and down for another at the same
+    // moment), so it doesn't necessarily flip the instant the `enabled`
+    // toggle is saved. Surfacing plain 'active' here left the toggle
+    // unchecked right next to a green "active" dot with no explanation.
+    // Distinguish the mismatch explicitly instead of hiding it.
+    if (plugin.enabled === false) return 'active_disabled';
     return 'active';
   }
   if (plugin.enabled !== false) return 'installed_inactive';
@@ -982,6 +991,10 @@ window._pluginLifecycleState = _pluginLifecycleState;
 function _renderLifecycleBadge(plugin: any, lifecycleState: any, installCmd: any) {
   const styles = {
     active:             { dot: 'var(--success, #3fb950)', label: 'active',    labelColor: 'var(--success, #3fb950)' },
+    // 678ec121 — same green "connected" dot as active (it genuinely is
+    // connected right now), but the label + amber text call out the
+    // enabled/active mismatch instead of silently agreeing with the toggle.
+    active_disabled:    { dot: 'var(--success, #3fb950)', label: 'active (disabled)', labelColor: '#f59e0b' },
     unhealthy:          { dot: 'var(--danger, #f85149)',  label: 'unhealthy', labelColor: 'var(--danger, #f85149)' },
     installed_inactive: { dot: '#f59e0b',                 label: 'inactive',  labelColor: '#f59e0b' },
     not_installed:      { dot: 'var(--muted)',             label: 'not installed', labelColor: 'var(--muted)' },
@@ -996,6 +1009,8 @@ function _renderLifecycleBadge(plugin: any, lifecycleState: any, installCmd: any
     actionBtn = `<button class="secondary tp-install-btn" data-install-cmd="${safeCmd}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Copy the install command to run in your terminal">Copy command</button>`;
   } else if (lifecycleState === 'installed_inactive') {
     actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">start tunnel to activate</span>`;
+  } else if (lifecycleState === 'active_disabled') {
+    actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic" title="Still connected from an earlier session even though it's toggled off. Live connection state is per-session and does not update until the tunnel restarts or this slot idles out.">disabled — still connected</span>`;
   } else if (lifecycleState === 'unhealthy') {
     actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">recovering…</span>`;
   }
