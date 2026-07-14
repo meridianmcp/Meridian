@@ -519,3 +519,222 @@ def test_parse_docx_perf_benchmark_under_realtime_threshold():
     assert tree_elapsed < 1.0, (
         f"content-tree of {n} paragraphs took {tree_elapsed:.3f}s"
     )
+
+
+# ---------------------------------------------------------------------------
+# 7a98286b — check_document_structure_issues: read-only structural linter
+# consuming document_content_tree's existing output. Verified separately
+# against the real staging document (Meridian sprint item evidence); these
+# are the synthetic-fixture unit tests for each of the 5 check classes.
+# ---------------------------------------------------------------------------
+
+_LINT_DOCUMENT_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="20000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Untitled Report</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000002">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>[&#167;1.5] Later Section</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000003">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>[&#167;1.2] Earlier Section, Out Of Order</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000004">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>[&#167;2.3.4] Deep Subsection Styled As Heading1</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000005">
+      <w:r><w:t></w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000006">
+      <w:r><w:t>Figure 1: first image, correctly captioned below it.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000007">
+      <w:r><w:t>Some non-blank paragraph right before caption two.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000008">
+      <w:r><w:t>Figure 2: second image, caption precedes the image slot.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000009">
+      <w:r><w:t></w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000010">
+      <w:r><w:t>Figure 1: duplicate label reused by mistake.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000011">
+      <w:r><w:t>As defined in Section 9.9, the term is used throughout.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="20000012">
+      <w:r><w:t>See Section 1.5 for the full derivation.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
+def _lint_docx() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", _LINT_DOCUMENT_XML)
+    return buf.getvalue()
+
+
+def _issues_of_type(result, type_name):
+    return [i for i in result["issues"] if i["type"] == type_name]
+
+
+def test_check_document_structure_issues_flags_heading_order_vs_tag():
+    result = docs_intel.check_document_structure_issues(_lint_docx())
+    order_issues = _issues_of_type(result, "heading_order_vs_tag")
+    assert len(order_issues) == 1
+    assert order_issues[0]["tag"] == "1.2"
+    assert order_issues[0]["previous_tag"] == "1.5"
+    assert order_issues[0]["para_id"] == "20000003"
+
+
+def test_check_document_structure_issues_flags_heading_depth_mismatch():
+    result = docs_intel.check_document_structure_issues(_lint_docx())
+    depth_issues = _issues_of_type(result, "heading_depth_mismatch")
+    assert len(depth_issues) == 1
+    assert depth_issues[0]["tag"] == "2.3.4"
+    assert depth_issues[0]["style_level"] == 1
+    assert depth_issues[0]["implied_depth"] == 3
+    assert depth_issues[0]["para_id"] == "20000004"
+
+
+def test_check_document_structure_issues_flags_caption_before_image():
+    result = docs_intel.check_document_structure_issues(_lint_docx())
+    cbi_issues = _issues_of_type(result, "caption_before_image")
+    assert len(cbi_issues) == 1
+    assert cbi_issues[0]["label"] == "Figure 2"
+    assert cbi_issues[0]["para_id"] == "20000008"
+    # Figure 1 has blank-before/blank-after spacing (routine), not an
+    # inversion, so it must NOT be flagged.
+    assert all(i["label"] != "Figure 1" for i in cbi_issues)
+
+
+def test_check_document_structure_issues_flags_duplicate_labels():
+    result = docs_intel.check_document_structure_issues(_lint_docx())
+    dup_issues = _issues_of_type(result, "duplicate_label")
+    assert len(dup_issues) == 1
+    assert dup_issues[0]["label"] == "Figure 1"
+    assert len(dup_issues[0]["occurrences"]) == 2
+    assert {o["para_id"] for o in dup_issues[0]["occurrences"]} == {"20000006", "20000010"}
+
+
+def test_check_document_structure_issues_flags_dangling_cross_reference():
+    result = docs_intel.check_document_structure_issues(_lint_docx())
+    xref_issues = _issues_of_type(result, "dangling_cross_reference")
+    assert len(xref_issues) == 1
+    assert xref_issues[0]["referenced_tag"] == "9.9"
+    assert xref_issues[0]["para_id"] == "20000011"
+    # A reference to a tag that DOES exist (1.5) must not be flagged.
+    assert all(i["referenced_tag"] != "1.5" for i in xref_issues)
+
+
+def test_check_document_structure_issues_untagged_headings_excluded():
+    """The document title (no [§...] tag) must not participate in any check
+    -- no crash, no spurious flag, no false 'dangling reference' target."""
+    result = docs_intel.check_document_structure_issues(_lint_docx())
+    assert all(i.get("tag") != "" for i in result["issues"] if "tag" in i)
+    # Sanity: the title's own para_id never appears as a flagged heading.
+    tagged_flags = [i for i in result["issues"] if "tag" in i]
+    assert all(i["para_id"] != "20000001" for i in tagged_flags)
+
+
+def test_check_document_structure_issues_multi_tag_heading_all_tags_resolve_refs():
+    """A multi-tag heading like '[§5.1.1 + §5.1.2]' must register BOTH tags as
+    known section numbers, so a cross-reference to either resolves cleanly."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="30000001">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>[&#167;5.1.1 + &#167;5.1.2] Merged Heading</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="30000002">
+      <w:r><w:t>See Section 5.1.2 for the secondary metric.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    result = docs_intel.check_document_structure_issues(buf.getvalue())
+    assert _issues_of_type(result, "dangling_cross_reference") == []
+
+
+def test_check_document_structure_issues_clean_document_zero_issues():
+    """A well-formed, correctly-ordered document must report zero issues --
+    the check must not fire on documents with nothing wrong."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="40000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>[&#167;1] Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="40000002">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>[&#167;1.1] Background</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="40000003">
+      <w:r><w:t>Ordinary body text with no cross-references.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    result = docs_intel.check_document_structure_issues(buf.getvalue())
+    assert result == {"issue_count": 0, "issues": []}
+
+
+def test_check_document_structure_issues_appendix_letter_tag_extracted():
+    """Regression: an appendix tag like 'C.5' is the letter as its OWN
+    dot-separated component (not fused to the first digit as 'C5') -- an
+    earlier version of the extraction regex silently dropped every
+    letter-prefixed tag, which meant NEITHER the C.2.5-stranded-mid-chapter
+    NOR the C.5-before-C.1 real ordering issues in the actual staging
+    document were ever caught. This pins that the extraction actually finds
+    appendix tags and orders them correctly against numeric chapter tags."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="50000001">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>[&#167;4.2.2] Chapter Four Subsection</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="50000002">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>[&#167;C.2.5] Appendix Entry Stranded Here</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="50000003">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>[&#167;4.2.3] Chapter Four Continues</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    result = docs_intel.check_document_structure_issues(buf.getvalue())
+    order_issues = _issues_of_type(result, "heading_order_vs_tag")
+    assert len(order_issues) == 1
+    assert order_issues[0]["tag"] == "4.2.3"
+    assert order_issues[0]["previous_tag"] == "C.2.5"
