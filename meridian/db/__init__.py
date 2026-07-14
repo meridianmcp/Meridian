@@ -6080,7 +6080,14 @@ async def send_message(
     from_session_id: str | None = None,
     kind: str | None = None,
 ) -> dict[str, Any]:
-    """d3a3a01d — enqueue an actor-model message to another session."""
+    """d3a3a01d — enqueue an actor-model message to another session.
+
+    0bfde7ad — after the durable DB write (still the source of truth), best-
+    effort publishes the row to Redis (meridian/redis_bridge.py) so a live
+    subscriber gets pushed instead of having to poll receive_messages. Purely
+    additive: publish failures / no Redis configured never affect this
+    function's return value or the persisted message.
+    """
     mid = _new_id()
     await db.execute(
         "INSERT INTO session_messages "
@@ -6092,7 +6099,15 @@ async def send_message(
     async with db.execute(
         "SELECT * FROM session_messages WHERE id = ?", (mid,)
     ) as cur:
-        return _row_to_dict(await cur.fetchone()) or {}
+        row = _row_to_dict(await cur.fetchone()) or {}
+    if row:
+        from .. import redis_bridge as _redis_bridge  # noqa: PLC0415 — lazy, optional dep
+
+        try:
+            await _redis_bridge.publish_session_message(to_session_id, row)
+        except Exception:  # noqa: BLE001
+            pass  # never let a push-augmentation failure affect the DB write above
+    return row
 
 
 async def receive_messages(
