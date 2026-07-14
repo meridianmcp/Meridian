@@ -3934,11 +3934,16 @@ async def _find_continuation_session(
         if not last_seen_raw:
             continue
         try:
-            seen = datetime.strptime(last_seen_raw, "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=timezone.utc,
-            )
+            seen = datetime.strptime(
+                last_seen_raw[:26], "%Y-%m-%d %H:%M:%S.%f"
+            ).replace(tzinfo=timezone.utc)
         except ValueError:
-            continue
+            try:
+                seen = datetime.strptime(last_seen_raw[:19], "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc,
+                )
+            except ValueError:
+                continue
         if seen >= cutoff:
             return s
     return None
@@ -4658,6 +4663,19 @@ async def _start_session_composite(
                 {**_t, "description": ((_t.get("description") or "")[:200])}
                 for _t in recent_tasks[:3]
             ],
+            # 77a29c8b — separately surface recent blocked/found diagnostic entries
+            # so gate-failure context is not silently dropped from the compact path.
+            # Bounded to 3 entries and 200-char descriptions — won't defeat the
+            # compact size goal but ensures known failures reach a resumed executor.
+            "recent_diagnostic_tasks": [
+                {
+                    "kind": (_t.get("kind") or ""),
+                    "description": ((_t.get("description") or "")[:200]),
+                    "created_at": (_t.get("created_at") or ""),
+                }
+                for _t in recent_tasks
+                if (_t.get("kind") or "") in ("blocked", "found")
+            ][:3],
             "board_change": _c_board_change,
             "note": (
                 "Compact orientation. For full goal/decisions/instructions call "

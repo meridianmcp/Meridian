@@ -1270,6 +1270,100 @@ def _infer_touches_resources(title: str) -> list[str]:
     return [f"inferred:file:{path}" for path in _suggest_files_for_title(title or "")]
 
 
+def _check_file_only_resources_warning(
+    touches_resources: Any,
+    title: str,
+    description: str = "",
+) -> str | None:
+    """7fe57cea — surface a non-blocking hint when a caller declares a bare
+    ``file:path.py`` resource without a symbol suffix, even though a
+    ``file:path.py:symbol_name`` (or ``symbol:`` form) would give finer-grained
+    parallelism control.
+
+    Algorithm:
+    1. Walk every ``touches_resources`` entry and collect file-only entries
+       (prefix ``file:`` with exactly one path component, no trailing ``:symbol``).
+       Entries already scoped to a symbol (``file:path.py:sym`` or ``symbol:...``)
+       and inferred/db/route entries are skipped.
+    2. Extract likely Python identifier tokens from the title + description using a
+       light regex (snake_case / CamelCase with length >= 3) that are plausible
+       symbol names in the affected files.
+    3. If there are file-only entries, return an informational warning string
+       listing them and suggesting the symbol-scoped form. When identifiers were
+       extracted from the text, include the top candidates as concrete examples.
+
+    Non-fatal by construction — callers add this to a ``symbol_scope_hint`` field
+    only; filing never blocks. Returns ``None`` when everything is already
+    symbol-scoped or no file: entries are present.
+    """
+    import re as _re  # noqa: PLC0415 — lazy import keeps module-level clean
+
+    entries = _parse_touches_files(touches_resources)
+    file_only: list[str] = []
+    for entry in entries:
+        raw = entry
+        # Skip inferred: entries entirely — they are auto-generated server-side,
+        # not caller declarations, so warning would be noise.
+        if raw.startswith("inferred:"):
+            continue
+        # Only care about explicit file: entries
+        if not raw.startswith("file:"):
+            continue
+        path_part = raw[len("file:"):]
+        # Split on ":" — if there's a second segment, the symbol is already declared
+        segments = path_part.split(":", 1)
+        if len(segments) == 1 or not segments[1]:
+            # Bare file:path.py — no symbol declared
+            file_only.append(raw)
+
+    if not file_only:
+        return None  # All resources are already symbol-scoped (or no file: entries)
+
+    # Extract plausible symbol names from title + description
+    combined = f"{title} {description}".strip()
+    # Capture snake_case (likely functions/methods) and PascalCase (classes).
+    # Require length >= 3 to skip noise; exclude pure lowercase common words by
+    # requiring an underscore OR uppercase letter OR digit inside the token.
+    candidates: list[str] = []
+    seen_cands: set[str] = set()
+    for tok in _re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]{2,})\b", combined):
+        low = tok.lower()
+        # Skip stopwords already used elsewhere
+        if low in _PROSPECT_STOPWORDS:
+            continue
+        # Require the token to look like a code identifier:
+        # contains underscore OR has uppercase after first char OR has digit
+        if not ("_" in tok or any(c.isupper() for c in tok[1:]) or any(c.isdigit() for c in tok)):
+            continue
+        if tok not in seen_cands:
+            seen_cands.add(tok)
+            candidates.append(tok)
+        if len(candidates) >= 5:
+            break
+
+    affected = ", ".join(f"``{e}``" for e in file_only)
+    if candidates:
+        examples = " or ".join(
+            f"``{e}:{c}``" for e, c in zip(file_only[:2], candidates[:2])
+        )
+        hint = (
+            f"SYMBOL_SCOPE_HINT: {affected} declared at file level. "
+            f"Prefer symbol-scoped ids when items touch different functions in the "
+            f"same file — e.g. {examples}. "
+            f"This allows co-batching in the same parallel wave. "
+            f"(Non-fatal: item filed as-is. Use file:path.py:symbol_name format.)"
+        )
+    else:
+        hint = (
+            f"SYMBOL_SCOPE_HINT: {affected} declared at file level. "
+            f"Prefer symbol-scoped ids (file:path.py:symbol_name or symbol:path::Name) "
+            f"when two items touch different functions in the same file — "
+            f"this allows them to co-batch in the same parallel wave. "
+            f"(Non-fatal: item filed as-is.)"
+        )
+    return hint
+
+
 # 84d255af — tokens stripped before keyword extraction: sprint-item labels,
 # punctuation-glue, and generic filler that would produce useless search queries.
 _PROSPECT_STOPWORDS = frozenset({
@@ -4375,6 +4469,17 @@ async def _handle_sprint_tools(
         )
         if _ptr:
             _extra["prospected_pointer"] = _ptr
+        # 7fe57cea — when the caller declared explicit touches_resources at file-only
+        # granularity (file:path.py, no :symbol), emit a non-blocking informational
+        # hint suggesting symbol-scoped form instead.  Only fires for explicit caller
+        # declarations — inferred: and symbol: entries are already handled or fine.
+        _sym_hint = _check_file_only_resources_warning(
+            args.get("touches_resources"),
+            args.get("title") or "",
+            args.get("notes") or "",
+        )
+        if _sym_hint:
+            _extra["symbol_scope_hint"] = _sym_hint
         if _extra:
             _new_item = {**_new_item, **_extra}
         return _new_item
@@ -4405,6 +4510,22 @@ async def _handle_sprint_tools(
                 "WARNING: " + "; ".join(_fo_warnings)
                 + " — items added but may not be picked up until next session start."
             )
+        # 7fe57cea — same symbol-scope hint as add_sprint_item: collect per-item
+        # file-only resource warnings so the planner can upgrade them before
+        # executors claim and parallelize.
+        _fo_sym_hints: list[str] = []
+        for _spec in items:
+            if not isinstance(_spec, dict):
+                continue
+            _sh = _check_file_only_resources_warning(
+                _spec.get("touches_resources"),
+                _spec.get("title") or "",
+                _spec.get("description") or "",
+            )
+            if _sh:
+                _fo_sym_hints.append(_sh)
+        if _fo_sym_hints:
+            _result["symbol_scope_hints"] = _fo_sym_hints
         return _result
     if name == "update_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)

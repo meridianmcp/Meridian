@@ -92,8 +92,11 @@ def test_build_quick_start_goal_with_and_without_items():
     assert "<role>You are an executor. Claim and execute" in full
     # 4cfaecc2 — the items /goal instructs a live board query up front, and the
     # test floor tracks the real suite size (524 -> 2150).
+    # 0d5453bc — full suite runs ONCE at the end of the megasprint, not per item.
     assert 'get_sprint_items(status="pending")' in full
     assert "pixi run test passes 2150+" in full
+    assert "ONCE at the very end of the entire" in full
+    assert "not per item" in full
     assert handoff_module._DEFAULT_GOAL_TEST_FLOOR == 2150
 
 
@@ -324,8 +327,11 @@ def test_build_quick_start_goal_xml_structure_preserves_constraints():
     assert "code1" in tags["sprint_items"] and "code2" in tags["sprint_items"]
     assert "m1" not in tags["sprint_items"]
     # <completion_criteria> — the three done-conditions, verbatim semantics.
+    # 0d5453bc — wording must be explicit: full suite once at end of megasprint.
     assert "complete_sprint_item()" in tags["completion_criteria"]
     assert "pixi run test passes 350+" in tags["completion_criteria"]
+    assert "ONCE at the very end of the entire" in tags["completion_criteria"]
+    assert "not per item" in tags["completion_criteria"]
     assert "generate_handoff()" in tags["completion_criteria"]
     # <not_done_until> — the anti-stop constraint (re-expressed from the threat).
     assert "every listed item" in tags["not_done_until"]

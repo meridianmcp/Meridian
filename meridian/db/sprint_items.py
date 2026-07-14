@@ -1089,7 +1089,7 @@ def _parse_deferral_ts(value: Any) -> "datetime | None":  # noqa: F821
         try:
             dt = datetime.fromisoformat(s)
         except ValueError:
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
                 try:
                     dt = datetime.strptime(s, fmt)
                     break

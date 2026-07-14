@@ -150,7 +150,7 @@ jobs:
       - name: Install Playwright Chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: pixi run python -m playwright install chromium --with-deps
-      - run: pixi run python -m pytest tests/test_demo_ux.py -q --tb=short
+      - run: pixi run python -m pytest tests/test_demo_ux.py -n auto -q --tb=short
 
   lint:
     runs-on: ubuntu-latest
