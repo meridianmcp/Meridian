@@ -4783,6 +4783,17 @@ async def _handle_sprint_tools(
                 "item_id": args["item_id"],
                 "message": str(exc),
             }
+        except db_module.SprintItemStatusRace as exc:
+            # fa3e3331 — another caller already moved this item out of an
+            # active state (e.g. a concurrent skip/fail/complete won the
+            # race). Surface it distinctly rather than a misleading
+            # "not found".
+            return {
+                "error": "STATUS_RACE",
+                "item_id": exc.item_id,
+                "current_status": exc.current_status,
+                "message": str(exc),
+            }
         if item is None:
             raise ValueError("sprint item not found")
         if _merge_warning:

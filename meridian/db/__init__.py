@@ -2890,24 +2890,38 @@ async def requeue_or_fail_stalled_item(
             f"{'y' if new_count - 1 == 1 else 'ies'} "
             f"(worker closed without completing). Last session log: {last_log}"
         )
-        await db.execute(
+        # fa3e3331 — atomic from-state guard: the pre-check at line 2881 read
+        # 'in_progress', but a concurrent complete/claim/skip/fail could commit
+        # between that read and this UPDATE. Without "AND status = 'in_progress'"
+        # here, a stall-recovery pass could silently clobber a status a
+        # concurrent caller just legitimately set (e.g. re-fail an item that was
+        # just completed). If the guard trips, this stall pass is simply stale —
+        # no-op rather than raise, since stall recovery runs unattended with no
+        # caller positioned to react to a race-lost exception.
+        cursor = await db.execute(
             "UPDATE sprint_items SET status = 'failed', stall_count = ?, "
-            "claimed_at = NULL, notes = ? WHERE id = ? AND project_id = ?",
+            "claimed_at = NULL, notes = ? "
+            "WHERE id = ? AND project_id = ? AND status = 'in_progress'",
             (new_count, reason, item_id, project_id),
         )
         await db.commit()
+        if cursor.rowcount == 0:
+            return None
         _invalidate_sprint_items_cache(project_id)
         _publish_project_event(
             project_id, "sprint_item_updated", {"item_id": item_id, "status": "failed"}
         )
         updated = await get_sprint_item(db, item_id)
         return {"action": "failed", "item": updated, "stall_count": new_count}
-    await db.execute(
+    cursor = await db.execute(
         "UPDATE sprint_items SET status = 'pending', stall_count = ?, "
-        "claimed_at = NULL, completed_at = NULL WHERE id = ? AND project_id = ?",
+        "claimed_at = NULL, completed_at = NULL "
+        "WHERE id = ? AND project_id = ? AND status = 'in_progress'",
         (new_count, item_id, project_id),
     )
     await db.commit()
+    if cursor.rowcount == 0:
+        return None
     _invalidate_sprint_items_cache(project_id)
     _publish_project_event(
         project_id, "sprint_item_updated", {"item_id": item_id, "status": "pending"}
@@ -4614,6 +4628,7 @@ async def _update_sprint_item_status(
     notes: str | None = None,
     pushed_to: str | None = None,
     actor: str | None = None,
+    expected_statuses: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Internal: flip a sprint item's status and optionally link a task.
 
@@ -4621,9 +4636,21 @@ async def _update_sprint_item_status(
     ``completed_at``; non-terminal statuses clear it. ``pushed_to``
     records the target version when status == 'pushed'. ``actor`` (5823db0b)
     records the executor id/name that made this transition.
+
+    fa3e3331 — ``expected_statuses``, when given, adds an atomic from-state
+    condition to the UPDATE's WHERE clause so two concurrent transitions on
+    the same item cannot both "win" (a read-then-write race). If the guard
+    trips (item exists but its current status isn't in ``expected_statuses``),
+    raises :class:`SprintItemStatusRace` rather than silently no-op'ing —
+    genuine "item doesn't exist" still returns ``None``, unchanged.
     """
     if status not in _VALID_SPRINT_STATUSES:
         raise ValueError(f"invalid sprint-item status: {status!r}")
+    if expected_statuses is not None and not expected_statuses:
+        # An empty set would render "AND status IN ()" — invalid SQL — and
+        # semantically could never match anything, so it's always a caller bug
+        # rather than a legitimate "never match" request.
+        raise ValueError("expected_statuses must be non-empty or None")
     fields = ["status = ?"]
     values: list[Any] = [status]
     if status in {"done", "skipped", "failed", "pushed"}:
@@ -4646,13 +4673,21 @@ async def _update_sprint_item_status(
         values.append(actor)
     values.append(item_id)
     values.append(project_id)
+    where = "WHERE id = ? AND project_id = ?"
+    if expected_statuses is not None:
+        ordered_expected = sorted(expected_statuses)
+        where += f" AND status IN ({', '.join('?' for _ in ordered_expected)})"
+        values.extend(ordered_expected)
     cursor = await db.execute(
-        f"UPDATE sprint_items SET {', '.join(fields)} "
-        f"WHERE id = ? AND project_id = ?",
+        f"UPDATE sprint_items SET {', '.join(fields)} {where}",
         values,
     )
     await db.commit()
     if cursor.rowcount == 0:
+        if expected_statuses is not None:
+            _raced = await get_sprint_item(db, item_id)
+            if _raced is not None and _raced.get("project_id") == project_id:
+                raise SprintItemStatusRace(item_id, _raced.get("status"), expected_statuses)
         return None
     _invalidate_sprint_items_cache(project_id)
     result = await get_sprint_item(db, item_id)
@@ -4691,6 +4726,26 @@ async def _maybe_rollup_parent(db: aiosqlite.Connection, project_id: str, item_i
 class SprintItemEvidenceRequired(ValueError):
     """Raised when complete_sprint_item is blocked by the required_notes gate
     (5823db0b) — the item is flagged required_notes but has no evidence."""
+
+
+class SprintItemStatusRace(ValueError):
+    """Raised by _update_sprint_item_status (fa3e3331) when an ``expected_statuses``
+    guard rejects a transition — the item exists but is no longer in an expected
+    from-state, because a concurrent transition committed first. Distinguishes
+    this from ``cursor.rowcount == 0`` meaning "item not found", which a bare
+    ``None`` return could not — a caller could not previously tell "doesn't
+    exist" from "lost a race" and could not react correctly to either."""
+
+    def __init__(self, item_id: str, current_status: str | None, expected_statuses: set[str]):
+        self.item_id = item_id
+        self.current_status = current_status
+        self.expected_statuses = expected_statuses
+        super().__init__(
+            f"sprint item {item_id} is no longer in an expected state for this "
+            f"transition (current status: {current_status!r}, expected one of "
+            f"{sorted(expected_statuses)}) — another caller already changed it. "
+            "Re-fetch the item before retrying."
+        )
 
 
 # 6a17e735 — the ONLY statuses patch_sprint_item may set directly. These are
@@ -4751,7 +4806,8 @@ async def complete_sprint_item(
                     "task_id. This item was flagged required_notes."
                 )
     result = await _update_sprint_item_status(
-        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor
+        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
@@ -4774,7 +4830,8 @@ async def provisional_complete_sprint_item(
     complete_sprint_item once the change is verified/shipped.
     """
     return await _update_sprint_item_status(
-        db, project_id, item_id, "provisional_complete", task_id=task_id
+        db, project_id, item_id, "provisional_complete", task_id=task_id,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
 
 
@@ -4786,7 +4843,8 @@ async def skip_sprint_item(
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``skipped`` (intentionally not shipped)."""
     result = await _update_sprint_item_status(
-        db, project_id, item_id, "skipped", notes=reason
+        db, project_id, item_id, "skipped", notes=reason,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
@@ -4800,7 +4858,8 @@ async def start_sprint_item(
 ) -> dict[str, Any] | None:
     """Flip a sprint item from ``pending``/``todo`` to ``in_progress``."""
     return await _update_sprint_item_status(
-        db, project_id, item_id, "in_progress"
+        db, project_id, item_id, "in_progress",
+        expected_statuses={"pending", "todo"},
     )
 
 
@@ -4891,15 +4950,33 @@ async def claim_sprint_item(
         raise ValueError(
             f"cannot claim item with status '{item.get('status')}'"
         )
+    # fa3e3331 — the pre-check above (read, then this UPDATE) is a classic
+    # TOCTOU race: two concurrent claims can both pass the pre-check before
+    # either commits. The "AND status NOT IN (...)" clause makes the actual
+    # write atomic — only one concurrent caller's UPDATE can match — so at
+    # most one claim ever succeeds even when both callers observed 'pending'.
     cursor = await db.execute(
         "UPDATE sprint_items SET status = 'in_progress', "
         "claimed_at = datetime('now'), actor = COALESCE(?, actor) "
-        "WHERE id = ? AND project_id = ?",
+        "WHERE id = ? AND project_id = ? "
+        "AND status NOT IN ('in_progress', 'done', 'failed', 'skipped')",
         (actor, item_id, project_id),
     )
     await db.commit()
     if cursor.rowcount == 0:
-        return None
+        # The pre-check passed but a concurrent claim committed first between
+        # that read and this UPDATE (or the item vanished/moved project in
+        # between). Re-fetch and raise the SAME ValueError shape the pre-check
+        # above uses, so this race-lost case is indistinguishable to callers
+        # (including the MCP handler's existing except-ValueError handling)
+        # from a claim that was rejected up front — no separate handling
+        # needed for the race case specifically.
+        _raced = await get_sprint_item(db, item_id)
+        if _raced is None or _raced.get("project_id") != project_id:
+            return None
+        raise ValueError(
+            f"cannot claim item with status '{_raced.get('status')}'"
+        )
     updated = await get_sprint_item(db, item_id)
     _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": "in_progress"})
     return updated
@@ -4913,7 +4990,8 @@ async def fail_sprint_item(
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``failed``. ``reason`` stored in ``notes``."""
     result = await _update_sprint_item_status(
-        db, project_id, item_id, "failed", notes=reason
+        db, project_id, item_id, "failed", notes=reason,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
@@ -4934,7 +5012,8 @@ async def push_sprint_item(
     if not to_version:
         raise ValueError("to_version is required for push_sprint_item")
     return await _update_sprint_item_status(
-        db, project_id, item_id, "pushed", pushed_to=to_version
+        db, project_id, item_id, "pushed", pushed_to=to_version,
+        expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
 
 
@@ -5255,8 +5334,19 @@ async def split_sprint_item(
         )
     if not titles:
         raise ValueError("titles must not be empty")
-    # Close the original
-    await _update_sprint_item_status(db, project_id, item_id, "skipped")
+    # Close the original. fa3e3331 — atomic from-state guard: the pre-check
+    # above is a read-then-write race like every other transition; a
+    # concurrent status change between that read and this call must not
+    # silently close an item mid-transition. Re-raise as the same ValueError
+    # shape the pre-check above already uses, for caller consistency.
+    try:
+        await _update_sprint_item_status(
+            db, project_id, item_id, "skipped", expected_statuses=allowed,
+        )
+    except SprintItemStatusRace as exc:
+        raise ValueError(
+            f"can only split pending or in_progress items, got '{exc.current_status}'"
+        ) from exc
     # Create new items
     new_items = []
     for t in titles:
@@ -5310,13 +5400,27 @@ async def merge_sprint_items(
         "VALUES (?, ?, ?, ?, ?, 'task')",
         (survivor_id, project_id, version, new_title, merged_from_json),
     )
-    # Close all sources
+    # Close all sources. fa3e3331 — atomic from-state guard: the pre-check
+    # loop above is a read-then-write race like every other transition. A
+    # source item that a concurrent caller completed/failed/skipped between
+    # that pre-check and this UPDATE must not be silently overwritten to
+    # 'skipped' — roll back the whole merge (including the survivor insert
+    # above) rather than leave a half-merged state, since a merge is only
+    # meaningful as an all-or-nothing operation.
     for iid in item_ids:
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE sprint_items SET status = 'skipped', completed_at = datetime('now'), "
-            "merged_into = ? WHERE id = ? AND project_id = ?",
+            "merged_into = ? WHERE id = ? AND project_id = ? "
+            "AND status IN ('pending', 'in_progress')",
             (survivor_id, iid, project_id),
         )
+        if cursor.rowcount == 0:
+            _raced = await get_sprint_item(db, iid)
+            await db.rollback()
+            raise ValueError(
+                f"cannot merge item '{iid}': status changed to "
+                f"'{(_raced or {}).get('status')}' before the merge could complete"
+            )
     await db.commit()
     _publish_project_event(project_id, "sprint_item_updated", {"merged_into": survivor_id})
     survivor = await get_sprint_item(db, survivor_id)

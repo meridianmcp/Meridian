@@ -2354,29 +2354,38 @@ def build_mcp_server():
                 )
                 result = item or {"error": "sprint item not found"}
             elif name == "complete_sprint_item":
-                item = await db_module.complete_sprint_item(
-                    db,
-                    arguments["project_id"],
-                    arguments["item_id"],
-                    task_id=arguments.get("task_id"),
-                )
-                result = item or {"error": "sprint item not found"}
+                try:
+                    item = await db_module.complete_sprint_item(
+                        db,
+                        arguments["project_id"],
+                        arguments["item_id"],
+                        task_id=arguments.get("task_id"),
+                    )
+                    result = item or {"error": "sprint item not found"}
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "skip_sprint_item":
-                item = await db_module.skip_sprint_item(
-                    db,
-                    arguments["project_id"],
-                    arguments["item_id"],
-                    reason=arguments.get("reason"),
-                )
-                result = item or {"error": "sprint item not found"}
+                try:
+                    item = await db_module.skip_sprint_item(
+                        db,
+                        arguments["project_id"],
+                        arguments["item_id"],
+                        reason=arguments.get("reason"),
+                    )
+                    result = item or {"error": "sprint item not found"}
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "fail_sprint_item":
-                item = await db_module.fail_sprint_item(
-                    db,
-                    arguments["project_id"],
-                    arguments["item_id"],
-                    reason=arguments.get("reason"),
-                )
-                result = item or {"error": "sprint item not found"}
+                try:
+                    item = await db_module.fail_sprint_item(
+                        db,
+                        arguments["project_id"],
+                        arguments["item_id"],
+                        reason=arguments.get("reason"),
+                    )
+                    result = item or {"error": "sprint item not found"}
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "push_sprint_item":
                 try:
                     item = await db_module.push_sprint_item(
