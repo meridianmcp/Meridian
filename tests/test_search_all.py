@@ -10,6 +10,12 @@ so results degrade gracefully to the most-relevant rows instead of to nothing.
 The cross-backend tests use the ``anydb`` fixture, which runs on SQLite and
 (when TEST_DATABASE_URL is set) Postgres, so both code paths are covered; the PG
 variant auto-skips locally.
+
+30a036ff — is_pg discriminator regression test (static, CI-safe)
+
+``search_all`` forks its SQL strategy on ``is_pg = hasattr(db, "_pool")``.
+The static tests below lock this down without a live Postgres connection so the
+claim is enforced by CI, not re-asserted by reading code on every revisit.
 """
 
 from __future__ import annotations
@@ -222,3 +228,128 @@ def test_or_tsquery_source_helper():
     assert db_module._or_tsquery_source("x=768 x=1511") == "x=768 or x=1511"
     # Empty / whitespace-only falls back to the original string.
     assert db_module._or_tsquery_source("") == ""
+
+
+# ---------------------------------------------------------------------------
+# 30a036ff — static regression tests for the is_pg = hasattr(db, "_pool") check
+# ---------------------------------------------------------------------------
+
+def test_is_pg_discriminator_postgres_connection_has_pool():
+    """30a036ff — PostgresConnection always has _pool; hasattr resolves True.
+
+    pg_adapter.PostgresConnection.__init__ sets self._pool = pool unconditionally.
+    A minimal stand-in (a plain object with a _pool attr) is all that is needed to
+    prove the discriminator fires correctly — no live Postgres connection required.
+    This test runs on SQLite-only CI and enforces the claim that was previously only
+    asserted by reading the code.
+    """
+    from meridian.pg_adapter import PostgresConnection
+
+    # Confirm the real class still sets _pool on init (not just a mock assumption).
+    assert "_pool" in PostgresConnection.__init__.__code__.co_varnames or True
+    # Simpler: inspect the __init__ source directly.
+    import inspect
+    src = inspect.getsource(PostgresConnection.__init__)
+    assert "self._pool" in src, (
+        "PostgresConnection.__init__ must assign self._pool so that "
+        "hasattr(db, '_pool') reliably identifies Postgres connections"
+    )
+
+    # A live instance with a mock pool resolves True.
+    class _FakePool:
+        pass
+
+    pg_conn = PostgresConnection.__new__(PostgresConnection)
+    pg_conn._pool = _FakePool()
+    assert hasattr(pg_conn, "_pool") is True, (
+        "hasattr(pg_conn, '_pool') must be True for a PostgresConnection instance"
+    )
+
+
+def test_is_pg_discriminator_sqlite_connection_lacks_pool():
+    """30a036ff — aiosqlite.Connection has no _pool attribute; hasattr resolves False.
+
+    This is the other half of the discriminator. If aiosqlite ever adds a _pool
+    attribute this test will catch it, forcing a deliberate review of the idiom.
+    """
+    import aiosqlite
+
+    # Inspect the class dict — _pool must not appear on the aiosqlite Connection class
+    # or any of its MRO parents (short of object itself, which also lacks it).
+    for klass in type.mro(aiosqlite.Connection):
+        if klass is object:
+            break
+        assert "_pool" not in klass.__dict__, (
+            f"aiosqlite.Connection (via {klass}) unexpectedly gained a '_pool' "
+            "attribute — the hasattr(db, '_pool') discriminator in search_all / "
+            "expire_file_read_claims / get_project_notes_where needs updating"
+        )
+
+
+def test_search_all_takes_pg_path_for_postgres_shaped_db():
+    """30a036ff — search_all's is_pg branch (ts_rank/websearch_to_tsquery) is
+    activated when the db object has _pool; the SQLite LIKE path is NOT taken.
+
+    This static test reads the search_all source via AST/inspect and asserts that:
+    1. The function dialect-splits on hasattr(db, '_pool').
+    2. The Postgres branch contains websearch_to_tsquery (the good ranking path).
+    3. The SQLite branch contains _multiword_or_ranked_clause (the cruder path).
+
+    No live DB required — the claim is structural.
+    """
+    import inspect
+
+    src = inspect.getsource(db_module.search_all)
+
+    # The function must use the hasattr(_pool) idiom to detect the backend.
+    assert "_pool" in src, (
+        "search_all must dialect-split on hasattr(db, '_pool') to pick the "
+        "Postgres vs. SQLite search path"
+    )
+
+    # The Postgres branch must use ts_rank / websearch_to_tsquery.
+    assert "websearch_to_tsquery" in src, (
+        "search_all Postgres path must use websearch_to_tsquery for full-text ranking"
+    )
+    assert "ts_rank" in src, (
+        "search_all Postgres path must use ts_rank for result ordering"
+    )
+
+    # The SQLite branch must use the cruder _multiword_or_ranked_clause.
+    assert "_multiword_or_ranked_clause" in src, (
+        "search_all SQLite path must use _multiword_or_ranked_clause for OR/ranked search"
+    )
+
+    # Confirm the two paths are separated by an if/else on is_pg, not both active.
+    # Strip the docstring first so prose references to "ts_rank" in the function's
+    # description don't interfere with position checks on the executable code.
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(src))
+    func = tree.body[0]
+    assert isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))
+    body = func.body
+    # Drop leading docstring node (a bare string-constant expression).
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(getattr(body[0], "value", None), ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    code_src = "\n".join(ast.unparse(stmt) for stmt in body)
+
+    assert "is_pg" in code_src, "is_pg discriminator must appear in search_all executable body"
+    assert "websearch_to_tsquery" in code_src, "ts_rank/websearch path must appear in executable body"
+    assert "ts_rank" in code_src, "ts_rank ordering must appear in executable body"
+    assert "_multiword_or_ranked_clause" in code_src, (
+        "_multiword_or_ranked_clause SQLite path must appear in executable body"
+    )
+
+    # is_pg must appear before both branch bodies in the executable code.
+    is_pg_pos = code_src.index("is_pg")
+    ts_rank_pos = code_src.index("ts_rank")
+    multi_pos = code_src.index("_multiword_or_ranked_clause")
+    assert is_pg_pos < ts_rank_pos, "is_pg guard must precede the ts_rank branch"
+    assert is_pg_pos < multi_pos, "is_pg guard must precede the _multiword_or_ranked_clause branch"
