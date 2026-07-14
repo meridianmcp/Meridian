@@ -2715,6 +2715,30 @@ async def _migrate_pg_pending_goal_at(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_file_patch_counters(conn: PostgresConnection) -> None:
+    """356d6ac8 — file_patch_counters: structural-degradation early-warning signal.
+
+    Tracks per-(session, file) write-claim counts within a session so
+    get_structural_degradation_warnings can flag files patched N times without a
+    deliberate refactor (refactor_flagged). Idempotent (CREATE TABLE IF NOT EXISTS
+    + CREATE INDEX IF NOT EXISTS). Mirrors db._migrate_file_patch_counters.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS file_patch_counters ("
+        "    id TEXT PRIMARY KEY,"
+        "    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        "    file_path TEXT NOT NULL,"
+        "    patch_count INTEGER NOT NULL DEFAULT 0,"
+        "    refactor_flagged INTEGER NOT NULL DEFAULT 0,"
+        f"   first_patched_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"   last_patched_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (session_id, file_path)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_file_patch_counters_session "
+        "ON file_patch_counters(session_id)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2778,4 +2802,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_mcp_rate_counters,
     _migrate_pg_workspace_proposals,
     _migrate_pg_pending_goal_at,
+    _migrate_pg_file_patch_counters,
 )

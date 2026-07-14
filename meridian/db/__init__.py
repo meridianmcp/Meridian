@@ -800,6 +800,27 @@ CREATE TABLE IF NOT EXISTS workspace_proposals (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 356d6ac8 — file_patch_counters: structural-degradation early-warning signal.
+-- Tracks how many times (session_id, file_path) has been write-claimed within a
+-- session, approximating "how many patch cycles hit this file without a refactor."
+-- refactor_flagged is set by the executor when the session contains a deliberate
+-- refactor of this file (resets the degradation signal). patch_count is
+-- incremented on every exclusive write claim. get_structural_degradation_warnings
+-- queries rows where patch_count >= threshold AND refactor_flagged = 0.
+-- idx_file_patch_counters_session is created ONLY inside the guarded
+-- _migrate_file_patch_counters migration, never inline here (2026-07-04
+-- inline-index outage rule).
+CREATE TABLE IF NOT EXISTS file_patch_counters (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    patch_count INTEGER NOT NULL DEFAULT 0,
+    refactor_flagged INTEGER NOT NULL DEFAULT 0,
+    first_patched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_patched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (session_id, file_path)
+);
 """
 
 
@@ -994,6 +1015,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_proposals(db)
     await _migrate_docx_region_claims(db)
     await _migrate_pending_goal_at(db)
+    await _migrate_file_patch_counters(db)
     return db
 
 
@@ -9547,6 +9569,11 @@ from .locks import (  # noqa: F401
     check_docx_region_write_conflict,
     # Session file claims view
     get_session_file_claims,
+    # 356d6ac8 — structural-degradation signal
+    _PATCH_DEGRADATION_THRESHOLD,
+    _increment_file_patch_counter,
+    get_structural_degradation_warnings,
+    flag_file_refactor,
 )
 
 
