@@ -1667,6 +1667,7 @@ def _render_starter_handoff(
     pending_items: list[dict[str, Any]],
     quick_start_goal: str,
     identity: str | None = None,
+    diagnostic_tasks: list[dict[str, Any]] | None = None,
 ) -> str:
     """Return a ≤20-line starter block for pasting into a fresh session.
 
@@ -1674,6 +1675,8 @@ def _render_starter_handoff(
     start_session() and know what to work on next. ``identity`` (bdc251ec), when
     known, is substituted as the start_session ``human_id`` so the caller isn't
     re-typing a generic placeholder.
+    ``diagnostic_tasks`` (77a29c8b), when non-empty, surfaces recent blocked/found
+    entries so a post-/compact session is not blind to known gate failures.
     """
     pid = project["id"]
     name = project["name"]
@@ -1699,6 +1702,14 @@ def _render_starter_handoff(
         lines.append(f"{i}. [{it['id'][:8]}] {short_title}")
     if not pending_items:
         lines.append("(none)")
+    # 77a29c8b — surface recent diagnostic entries (blocked/found) so a post-/compact
+    # session sees known gate failures without having to fetch the full task log.
+    if diagnostic_tasks:
+        lines += ["", "# Recent diagnostics (blocked/found):"]
+        for t in diagnostic_tasks:
+            kind = (t.get("kind") or "").upper()
+            desc = (t.get("description") or "").strip()[:200]
+            lines.append(f"- [{kind}] {desc}")
     lines += ["", quick_start_goal]
     return "\n".join(lines) + "\n"
 
@@ -1929,6 +1940,25 @@ def _completed_after(
     return _parse(completed_at) >= _parse(since_ts)
 
 
+def _collect_diagnostic_tasks(
+    tasks: list[dict[str, Any]],
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """77a29c8b — Return up to ``limit`` recent task-log entries whose ``kind``
+    is 'blocked' or 'found', newest first.
+
+    These entries carry diagnostic signal (gate failures, discovered gotchas,
+    test failures, etc.) that must be visible even in compact/delta/starter
+    paths to prevent executors from repeating work already known to fail.
+    The list is intentionally small and bounded so it does not defeat the
+    size-reduction purpose of those paths.
+    """
+    _DIAGNOSTIC_KINDS = {"blocked", "found"}
+    return [
+        t for t in tasks if (t.get("kind") or "") in _DIAGNOSTIC_KINDS
+    ][:limit]
+
+
 def _render_delta_handoff(
     project: dict[str, Any],
     *,
@@ -1938,10 +1968,13 @@ def _render_delta_handoff(
     pending_sprint_items: list[dict[str, Any]],
     quick_start_goal: str,
     identity: str | None = None,
+    diagnostic_tasks: list[dict[str, Any]] | None = None,
 ) -> str:
     """Return a compact handoff for back-to-back goal runs in one session.
 
     ``identity`` (bdc251ec), when known, pre-fills the start_session ``human_id``.
+    ``diagnostic_tasks`` (77a29c8b), when non-empty, surfaces recent blocked/found
+    entries so repeated gate failures are not silently dropped from delta mode.
     """
     # 04f03ee4 — one-liner start instruction at very top of delta output
     lines = [
@@ -1977,6 +2010,14 @@ def _render_delta_handoff(
             )
     else:
         lines.append("- none")
+    # 77a29c8b — surface recent diagnostic entries (blocked/found) so a resumed
+    # session sees known failures and gotchas even in the compact delta path.
+    if diagnostic_tasks:
+        lines += ["", "Recent diagnostics (blocked/found):"]
+        for t in diagnostic_tasks:
+            kind = (t.get("kind") or "").upper()
+            desc = (t.get("description") or "").strip()[:200]
+            lines.append(f"- [{kind}] {desc}")
     lines += ["", "Next:", quick_start_goal]
     return "\n".join(lines) + "\n"
 
@@ -2911,6 +2952,9 @@ async def generate_handoff(
         completed_items = _ts_safe_items(completed_items)
         delta_in_progress = _ts_safe_items(in_progress_items)
         delta_pending = _ts_safe_items(pending_sprint_items)
+        # 77a29c8b — collect diagnostic tasks from the full task list so gate
+        # failures are visible even in the compact delta path.
+        delta_diagnostic = _collect_diagnostic_tasks(tasks)
         content = _render_delta_handoff(
             project,
             generated_at=generated_at,
@@ -2919,6 +2963,7 @@ async def generate_handoff(
             pending_sprint_items=delta_pending,
             quick_start_goal=quick_start_goal,
             identity=identity,
+            diagnostic_tasks=delta_diagnostic,
         )
     else:
         # v1.1 — per-user handoff template. When workspace_settings.handoff_template
@@ -3351,12 +3396,21 @@ async def _generate_starter_handoff(
         loop_enabled=_loop_enabled_from_settings(settings, _s_ws_settings),
         parallel_groups=_s_parallel_groups,
     )
+    # 77a29c8b — fetch recent tasks so blocked/found diagnostic entries are
+    # visible even in the minimal starter path (guarded: never break handoff).
+    _s_tasks: list[dict[str, Any]] = []
+    try:
+        _s_tasks = await db_module.get_tasks(db, project_id, limit=20)
+    except Exception:  # noqa: BLE001
+        pass
+    _s_diagnostic = _collect_diagnostic_tasks(_s_tasks)
     content = _render_starter_handoff(
         project,
         completed_items=completed,
         pending_items=pending,
         quick_start_goal=quick_start_goal,
         identity=identity,
+        diagnostic_tasks=_s_diagnostic,
     )
     if has_executor_config(executor_config):
         content = f"{build_executor_config_block(executor_config)}\n\n{content}"
