@@ -1491,6 +1491,42 @@ async def update_project_settings(
     return await get_project_settings(db, project_id)
 
 
+async def get_tenant_id_for_project(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the tenant id that owns this project, or None.
+
+    81b10dec — used by the slot-readiness endpoint so the code-intel guard
+    hook can probe the Serena/code-intel tunnel slot without knowing the
+    tenant id directly. Resolves via creator_human_id (project creator email)
+    -> tenants.id JOIN. Returns None for self-hosted installs where the
+    tenants table is absent or the project has no creator_human_id.
+    """
+    # Get the creator email from the project.
+    async with db.execute(
+        "SELECT creator_human_id FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    creator_email = (row["creator_human_id"] if isinstance(row, dict) else row[0])
+    if not creator_email:
+        return None
+    # Look up the tenant by email (self-hosted SQLite: tenants table exists).
+    # On hosted Neon DBs the tenants table lives in a separate control-plane DB
+    # that this per-project db connection doesn't reach, so we tolerate the miss.
+    try:
+        async with db.execute(
+            "SELECT id FROM tenants WHERE email = ?", (creator_email,)
+        ) as cur2:
+            trow = await cur2.fetchone()
+    except Exception:  # noqa: BLE001 — tenants table absent (hosted per-project DB)
+        return None
+    if trow is None:
+        return None
+    return trow["id"] if isinstance(trow, dict) else trow[0]
+
+
 async def get_executor_config(
     db: aiosqlite.Connection, project_id: str
 ) -> dict[str, Any]:
