@@ -1031,6 +1031,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_docx_region_claims(db)
     await _migrate_pending_goal_at(db)
     await _migrate_file_patch_counters(db)
+    await _migrate_sprint_item_resources_amended(db)
     await _migrate_session_activity(db)
     return db
 
@@ -9633,6 +9634,8 @@ from .locks import (  # noqa: F401
     _ranges_overlap,
     _live_docx_region_claims_for_file,
     _migrate_docx_region_claims,
+    # 2593a5fe — resource-amendment helper
+    _amend_sprint_item_resources_for_session,
     # Public file-lock functions
     expire_file_locks,
     expire_stale_symbol_claims,

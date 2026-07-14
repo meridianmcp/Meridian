@@ -161,6 +161,108 @@ async def expire_stale_symbol_claims(db: aiosqlite.Connection) -> int:
     return cursor.rowcount
 
 
+async def _amend_sprint_item_resources_for_session(
+    db: aiosqlite.Connection,
+    session_id: str,
+    new_resource_id: str,
+) -> dict[str, Any] | None:
+    """2593a5fe — append a newly-claimed resource to the active sprint item's
+    touches_resources if it is not already declared, and set resources_amended=1.
+
+    Called as a best-effort side-effect of claim_file and claim_symbol when the
+    claim succeeds. Finds the sprint item this session currently holds in_progress
+    (via sprint_items.actor = session_id) and checks whether ``new_resource_id``
+    is already in its touches_resources declaration.
+
+    If the resource IS already declared — no-op (returns None).
+    If the resource is NEW:
+      - Appends it to touches_resources (GROW, never replace — the original
+        declaration may still be partially accurate).
+      - Sets resources_amended = 1, marking that the item's resource footprint
+        changed after its wave label was computed (so a human / planner can see
+        the drift and decide whether to re-run assign_sprint_waves).
+
+    Returns a dict ``{"wave_assignment_hint": ..., "amended_resource": ...,
+    "item_id": ..., "item_wave": ...}`` when an amendment was made AND the item
+    has an existing wave label, so the caller can include this as a visible signal
+    in the claim response. Returns None when no amendment was needed (resource
+    already present) or when there is no active sprint item for this session.
+
+    Never raises — all errors are swallowed so this side-effect never blocks
+    a file/symbol claim.
+    """
+    try:
+        from meridian.db import (  # noqa: PLC0415
+            parse_touches_resources,
+            serialize_touches_resources,
+        )
+        # Find the sprint item this session currently holds in_progress.
+        async with db.execute(
+            "SELECT id, touches_resources, wave FROM sprint_items "
+            "WHERE actor = ? AND status = 'in_progress' "
+            "ORDER BY claimed_at DESC LIMIT 1",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        item = _row_to_dict(row)
+        if not item or not item.get("id"):
+            return None
+        item_id = item["id"]
+        current_wave = item.get("wave")
+        # Normalize the incoming resource id so the comparison is canonical.
+        try:
+            from meridian.db import normalize_resource_id  # noqa: PLC0415
+            canonical = normalize_resource_id(new_resource_id)
+        except (ValueError, ImportError):
+            return None  # malformed resource id — don't amend
+        # Check whether the resource is already declared.
+        existing = parse_touches_resources(item.get("touches_resources"))
+        # Compare against canonical forms of existing resources, stripping
+        # any "inferred:" prefix.
+        existing_canonical = set()
+        for r in existing:
+            body = r[len("inferred:"):].strip() if r.lower().startswith("inferred:") else r
+            try:
+                existing_canonical.add(normalize_resource_id(body))
+            except ValueError:
+                existing_canonical.add(body)
+        if canonical in existing_canonical:
+            return None  # already declared — no amendment needed
+        # Resource is new: append it (grow, don't replace).
+        amended = existing + [canonical]
+        new_json = serialize_touches_resources(amended)
+        await db.execute(
+            "UPDATE sprint_items SET touches_resources = ?, resources_amended = 1 "
+            "WHERE id = ?",
+            (new_json, item_id),
+        )
+        await db.commit()
+        hint: dict[str, Any] | None = None
+        if current_wave:
+            hint = {
+                "wave_assignment_hint": (
+                    f"WAVE_STALE: sprint item {item_id[:8]} (wave {current_wave!r}) "
+                    f"claimed resource {canonical!r} which was NOT in its original "
+                    "touches_resources declaration. The stored wave label may no "
+                    "longer reflect the item's true resource footprint. Consider "
+                    "re-running assign_sprint_waves after this item completes."
+                ),
+                "amended_resource": canonical,
+                "item_id": item_id,
+                "item_wave": current_wave,
+            }
+        else:
+            hint = {
+                "wave_assignment_hint": None,
+                "amended_resource": canonical,
+                "item_id": item_id,
+                "item_wave": None,
+            }
+        return hint
+    except Exception:  # noqa: BLE001 — never wedge a claim on an amendment error
+        return None
+
+
 async def claim_file(
     db: aiosqlite.Connection,
     file_path: str,
@@ -296,7 +398,13 @@ async def claim_file(
     # 356d6ac8 — increment the structural-degradation patch counter for this
     # write claim (best-effort; counter errors never block the claim response).
     await _increment_file_patch_counter(db, session_id, normalized)
-    return {
+    # 2593a5fe — amend the active sprint item's touches_resources if this file
+    # was not in the original declaration (mid-execution pivot detection).
+    # Best-effort: errors never block the claim. Use "file:<path>" as resource id.
+    _resource_hint = await _amend_sprint_item_resources_for_session(
+        db, session_id, f"file:{normalized}"
+    )
+    result: dict[str, Any] = {
         "claimed": True,
         "claim_mode": "write",
         "file_path": normalized,
@@ -311,6 +419,9 @@ async def claim_file(
             db, session_id, normalized
         ),
     }
+    if _resource_hint and _resource_hint.get("wave_assignment_hint"):
+        result["wave_assignment_hint"] = _resource_hint["wave_assignment_hint"]
+    return result
 
 
 async def expire_file_read_claims(db: aiosqlite.Connection) -> None:
@@ -931,7 +1042,13 @@ async def claim_symbol(
          target["line_start"], target["line_end"]),
     )
     await db.commit()
-    return {
+    # 2593a5fe — amend the active sprint item's touches_resources if this symbol
+    # was not in the original declaration (mid-execution pivot detection).
+    # Use "symbol:<path>::<symbol>" as resource id for symbol-level precision.
+    _sym_resource_hint = await _amend_sprint_item_resources_for_session(
+        db, session_id, f"symbol:{normalized}::{symbol}"
+    )
+    sym_result: dict[str, Any] = {
         "claimed": True,
         "file_path": normalized,
         "session_id": session_id,
@@ -940,6 +1057,9 @@ async def claim_symbol(
         "line_start": target["line_start"],
         "line_end": target["line_end"],
     }
+    if _sym_resource_hint and _sym_resource_hint.get("wave_assignment_hint"):
+        sym_result["wave_assignment_hint"] = _sym_resource_hint["wave_assignment_hint"]
+    return sym_result
 
 
 async def get_symbol_claims(
