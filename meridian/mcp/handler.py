@@ -3855,9 +3855,19 @@ async def _handle_session_tools(
         active_only = args.get("status", "active") != "all"
         return await db_module.get_sessions(db, args["project_id"], active_only=active_only)
     if name == "get_session_log":
-        run = await db_module.get_executor_run_by_session(db, args.get("session_id", ""))
+        _log_sid = args.get("session_id", "")
+        run = await db_module.get_executor_run_by_session(db, _log_sid)
         if run is None:
             return {"error": "no run found for session"}
+        # 8c147109 — include the ring-buffer activity feed so a remote planner
+        # sees real signs of life even before the executor calls log_task().
+        _activity: list[dict] = []
+        try:
+            _activity = await db_module.get_session_activity(
+                db, _log_sid, limit=args.get("activity_limit", 20)
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {
             "run_id": run["id"],
             "session_id": run["session_id"],
@@ -3866,6 +3876,27 @@ async def _handle_session_tools(
             "status": run["status"],
             "task_count": run["task_count"],
             "transcript": run["transcript"],
+            "recent_activity": _activity,
+            "activity_note": (
+                "recent_activity is a ring-buffer of the last tool calls made by "
+                "this executor session (newest first, max 50 entries). It is "
+                "populated automatically by the MCP dispatcher — no explicit "
+                "log_task() call is needed."
+            ),
+        }
+    if name == "get_session_activity":
+        # 8c147109 — standalone tool so planners can fetch just the heartbeat
+        # feed without the full transcript when polling for liveness.
+        _ga_sid = args.get("session_id", "")
+        _ga_limit = min(int(args.get("limit", 20)), 50)
+        try:
+            _ga_entries = await db_module.get_session_activity(db, _ga_sid, limit=_ga_limit)
+        except Exception:  # noqa: BLE001
+            _ga_entries = []
+        return {
+            "session_id": _ga_sid,
+            "activity": _ga_entries,
+            "count": len(_ga_entries),
         }
     if name == "get_agent_instructions":
         instructions = await db_module.get_agent_instructions(db, args["project_id"])
@@ -6267,6 +6298,38 @@ async def _dispatch_mcp_tool(
     for _grp in _groups:
         _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
         if _result is not _MISS:
+            # 8c147109 — activity heartbeat: record a compact one-liner into the
+            # session_activity ring-buffer so a remote planner session can observe
+            # signs of life via get_session_log even before the executor calls
+            # log_task(). Only fires for executor sessions; never for the observer
+            # tools (get_session_log/get_session_activity/heartbeat) themselves.
+            _ACTIVITY_SKIP_TOOLS = frozenset({
+                "heartbeat", "get_session_log", "get_session_activity",
+                "update_session_seen",
+            })
+            try:
+                _act_sid = args.get("session_id")
+                if (
+                    _act_sid
+                    and _act_sid in _EXECUTOR_SESSIONS
+                    and name not in _ACTIVITY_SKIP_TOOLS
+                ):
+                    # Build a compact one-line summary from the tool args.
+                    _act_parts: list[str] = []
+                    for _k in ("project_id", "item_id", "file_path", "path",
+                               "description", "title", "query"):
+                        _v = args.get(_k)
+                        if _v and isinstance(_v, str):
+                            _act_parts.append(f"{_k}={_v[:60]}")
+                            break  # one key is enough
+                    _act_summary = (
+                        (", ".join(_act_parts)) if _act_parts else name
+                    )
+                    await db_module.record_session_activity(
+                        db, _act_sid, name, _act_summary
+                    )
+            except Exception:  # noqa: BLE001 — activity recording must never fail a call
+                pass
             # bf51b12e — planner context-refresh nudge. Fully defensive: any error
             # falls through to the untouched _result. In-memory turn tracking +
             # gating (best-effort, per-process). Skips executor sessions entirely.

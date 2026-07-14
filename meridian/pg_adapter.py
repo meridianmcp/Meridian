@@ -837,6 +837,21 @@ CREATE TABLE IF NOT EXISTS workspace_proposals (
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
+
+-- 8c147109 — session_activity: lightweight ring-buffer heartbeat feed.
+-- Records one row per significant MCP tool call in an executor session so a
+-- remote planner can see signs of life via get_session_log even before the
+-- executor calls log_task(). Bounded to the last 50 entries per session
+-- (enforced by record_session_activity at write time — no DB trigger needed).
+-- idx_session_activity_session is created by _migrate_pg_session_activity
+-- (guarded migration), never inline here (2026-07-04 inline-index outage rule).
+CREATE TABLE IF NOT EXISTS session_activity (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tool_name TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT ({_TS})
+);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -2750,6 +2765,27 @@ async def _migrate_pg_file_patch_counters(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_session_activity(conn: PostgresConnection) -> None:
+    """8c147109 — session_activity: lightweight ring-buffer heartbeat feed.
+
+    Creates the session_activity table so a remote planner can see signs of
+    life in an executor session even before the executor calls log_task().
+    Mirrors db._migrate_session_activity. Idempotent via CREATE TABLE IF NOT
+    EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS session_activity ("
+        "    id TEXT PRIMARY KEY,"
+        "    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        "    tool_name TEXT NOT NULL,"
+        "    summary TEXT NOT NULL,"
+        f"    recorded_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_session_activity_session "
+        "ON session_activity(session_id, recorded_at DESC)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2814,4 +2850,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_proposals,
     _migrate_pg_pending_goal_at,
     _migrate_pg_file_patch_counters,
+    _migrate_pg_session_activity,
 )

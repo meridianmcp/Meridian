@@ -87,6 +87,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "release_file": 'release_file(session_id="session-uuid", file_path="meridian/server.py")',
     "idle_until_session_done": 'idle_until_session_done(watching_session_id="session-uuid")',
     "get_session_log": 'get_session_log(session_id="session-uuid")',
+    "get_session_activity": 'get_session_activity(session_id="session-uuid")',
     "set_active_repo": 'set_active_repo(repo_path="C:\\\\Users\\\\me\\\\project")',
     "analyze_model_efficiency": 'analyze_model_efficiency(title="Refactor auth across 12 files + migration", file_count=12, touches_resources=["auth_db", "sessions_table"], size="xl")',
     "run_verification": 'run_verification(project_id="abc-123")  # runs stored test_cmd on your local machine via tunnel',
@@ -1420,10 +1421,24 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": []}},
     {"name": "get_session_log", "description":
         "Read-only: Return the full task log for the given session. "
-        "Returns every log_task description logged during the session, "
-        "with timestamps. Useful for post-session review or handoff.",
+        "Returns every log_task description logged during the session "
+        "(transcript/task_count) PLUS a recent_activity ring-buffer of the "
+        "last tool calls the executor made — even before log_task() was called. "
+        "Use recent_activity to check signs of life in a running executor. "
+        "Useful for post-session review, handoff, or remote planner polling.",
      "inputSchema": {"type": "object", "properties": {
-         "session_id": {"type": "string"}},
+         "session_id": {"type": "string"},
+         "activity_limit": {"type": "integer", "description": "Max recent_activity entries to return (default 20, max 50)."}},
+         "required": ["session_id"]}},
+    {"name": "get_session_activity", "description":
+        "Read-only: Return the raw MCP-tool-call heartbeat feed for the given "
+        "executor session — a ring-buffer of the last tool calls (newest first, "
+        "up to 50 entries). Populated automatically by the MCP dispatcher on "
+        "every executor tool call, no log_task() needed. Use this to check "
+        "whether an executor is still running when task_count is 0.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "limit": {"type": "integer", "description": "Max entries to return (default 20, max 50)."}},
          "required": ["session_id"]}},
     {"name": "search_all", "description":
         "Read-only: Universal search across all project content: tasks, notes, pinned decisions, "
@@ -1788,7 +1803,7 @@ _READ_ONLY_TOOLS = {
     "paper_search",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
-    "get_session_log", "idle_until_session_done", "generate_handoff", "load_handoff",
+    "get_session_log", "get_session_activity", "idle_until_session_done", "generate_handoff", "load_handoff",
     "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_blog_posts",
