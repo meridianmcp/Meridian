@@ -22,6 +22,7 @@ returns None, unchanged.
 import pytest
 
 from meridian import db as db_module
+import meridian.db.sprint_items as _sprint_items_mod  # for monkeypatching after module split
 
 
 async def _project_with_item(db):
@@ -97,7 +98,12 @@ async def test_complete_sprint_item_race_raises_status_race_not_silent_none(db, 
             await db_module.skip_sprint_item(db_conn, project_id, item_id, reason="raced out")
         return await real_update(db_conn, project_id, item_id, status, **kwargs)
 
+    # Patch both db_module and the sprint_items submodule: after the module split,
+    # complete_sprint_item's actual call to _update_sprint_item_status goes through
+    # sprint_items.py's local namespace, not db_module's. Both patches are needed
+    # to intercept the call.
     monkeypatch.setattr(db_module, "_update_sprint_item_status", _racy_update)
+    monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _racy_update)
 
     with pytest.raises(db_module.SprintItemStatusRace) as excinfo:
         await db_module.complete_sprint_item(db, p["id"], item["id"])
@@ -202,7 +208,12 @@ async def test_split_sprint_item_rejects_race_lost_close(db, monkeypatch):
             await db_module.complete_sprint_item(db_conn, project_id, item_id)
         return await real_update(db_conn, project_id, item_id, status, **kwargs)
 
+    # Patch both db_module and the sprint_items submodule: after the module split,
+    # split_sprint_item's actual call to _update_sprint_item_status goes through
+    # sprint_items.py's local namespace, not db_module's. Both patches are needed
+    # to intercept the call.
     monkeypatch.setattr(db_module, "_update_sprint_item_status", _racy_update)
+    monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _racy_update)
 
     with pytest.raises(ValueError, match="can only split pending or in_progress items, got 'done'"):
         await db_module.split_sprint_item(db, p["id"], item["id"], ["a", "b"])
