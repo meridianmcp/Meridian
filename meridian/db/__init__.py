@@ -821,6 +821,21 @@ CREATE TABLE IF NOT EXISTS file_patch_counters (
     last_patched_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (session_id, file_path)
 );
+
+-- 8c147109 — session_activity: lightweight ring-buffer heartbeat feed.
+-- Records one row per significant MCP tool call in an executor session so a
+-- remote planner can see signs of life via get_session_log even before the
+-- executor calls log_task(). Bounded to the last 50 entries per session
+-- (enforced by record_session_activity at write time — no DB trigger needed).
+-- idx_session_activity_session is created by _migrate_session_activity
+-- (guarded migration), never inline here (2026-07-04 inline-index outage rule).
+CREATE TABLE IF NOT EXISTS session_activity (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tool_name TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -1016,6 +1031,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_docx_region_claims(db)
     await _migrate_pending_goal_at(db)
     await _migrate_file_patch_counters(db)
+    await _migrate_session_activity(db)
     return db
 
 
@@ -7304,6 +7320,68 @@ async def get_executor_run_by_session(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
+# 8c147109 — session_activity: lightweight ring-buffer heartbeat feed
+# ---------------------------------------------------------------------------
+
+_SESSION_ACTIVITY_RING_SIZE = 50  # max entries retained per session
+
+
+async def record_session_activity(
+    db: aiosqlite.Connection,
+    session_id: str,
+    tool_name: str,
+    summary: str,
+) -> None:
+    """Append one activity entry and prune the oldest rows beyond the ring size.
+
+    Called by the MCP tool dispatcher on every executor tool call so a remote
+    planner session can observe signs of life via get_session_log even before
+    the executor calls log_task(). Best-effort: callers must wrap in try/except.
+
+    Ordering tie-break: rowid (SQLite implicit integer PK) increases with each
+    INSERT, so ORDER BY recorded_at DESC, rowid DESC is stable under concurrent
+    sub-second inserts where timestamps collide.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+    entry_id = _new_id()
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "INSERT INTO session_activity (id, session_id, tool_name, summary, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (entry_id, session_id, tool_name, summary[:200], now_ts),
+    )
+    # Prune rows beyond the ring-size limit — delete all but the most recent N.
+    # Use rowid as tie-breaker so sub-second batches are pruned deterministically.
+    await db.execute(
+        "DELETE FROM session_activity WHERE session_id = ? AND rowid NOT IN ("
+        "  SELECT rowid FROM session_activity WHERE session_id = ? "
+        "  ORDER BY recorded_at DESC, rowid DESC LIMIT ?"
+        ")",
+        (session_id, session_id, _SESSION_ACTIVITY_RING_SIZE),
+    )
+    await db.commit()
+
+
+async def get_session_activity(
+    db: aiosqlite.Connection,
+    session_id: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Return the most recent activity entries for a session, newest first.
+
+    Uses rowid as a secondary sort key so sub-second inserts (same recorded_at)
+    are returned in stable insertion order (newest = highest rowid first).
+    """
+    async with db.execute(
+        "SELECT * FROM session_activity WHERE session_id = ? "
+        "ORDER BY recorded_at DESC, rowid DESC LIMIT ?",
+        (session_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
 async def get_project_by_token(
