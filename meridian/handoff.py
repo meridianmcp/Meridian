@@ -22,7 +22,8 @@ import functools
 import json
 import os
 import re
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from xml.sax.saxutils import escape as _xml_escape  # 5abf3e12 — XML-safe /goal
@@ -42,6 +43,95 @@ _env = Environment(
 _DEFAULT_GOAL_TEST_FLOOR = 2150
 _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
+
+# dd07ece0 — provenance token store: short-lived, single-use tokens that let a
+# receiving session independently verify a /goal block came from a real
+# generate_handoff call (not injected/spoofed text shaped like one).
+# In-process dict is sufficient: tokens are consumed immediately on first
+# verification and are only valid for a handful of minutes — they don't need
+# to survive a process restart. Keyed by token → {project_id, expires_at,
+# consumed}. Prefer this over a DB table/migration for something this ephemeral.
+_HANDOFF_TOKENS: dict[str, dict[str, Any]] = {}
+
+# TTL for handoff tokens — short enough to thwart replay of recorded tokens,
+# long enough that a human paste-and-verify flow always succeeds.
+_HANDOFF_TOKEN_TTL_SECONDS = 300  # 5 minutes
+
+
+def mint_handoff_token(project_id: str) -> str:
+    """dd07ece0 — Mint a short-lived, single-use provenance token for a handoff.
+
+    The token is a URL-safe random hex string (16 bytes = 32 hex chars, trimmed
+    to 8+8 for readability). It is stored in the module-level ``_HANDOFF_TOKENS``
+    dict with the project_id and an expiry timestamp, and must be consumed within
+    ``_HANDOFF_TOKEN_TTL_SECONDS`` by a single call to ``verify_handoff_token``.
+
+    Returns the token string to embed in the /goal block.
+    """
+    token = secrets.token_hex(8)  # 16-char hex, unambiguous, paste-friendly
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=_HANDOFF_TOKEN_TTL_SECONDS
+    )
+    _HANDOFF_TOKENS[token] = {
+        "project_id": project_id,
+        "expires_at": expires_at,
+        "consumed": False,
+    }
+    # Opportunistic cleanup: evict expired tokens so the dict doesn't grow
+    # unbounded in long-lived processes (sessions that call generate_handoff many
+    # times). We do this at mint time rather than a background task so there are
+    # no threading/event-loop concerns.
+    _evict_expired_tokens()
+    return token
+
+
+def verify_handoff_token(
+    token: str,
+    project_id: str,
+) -> dict[str, Any]:
+    """dd07ece0 — Verify and consume a handoff provenance token.
+
+    A receiving session calls this to independently confirm that a /goal block's
+    ``<goal_token>`` line was produced by a real generate_handoff call on the
+    Meridian server (not injected/spoofed text). The token is consumed on first
+    successful verification (single-use) and rejected after expiry.
+
+    Returns ``{valid: bool, reason: str}``:
+    - ``{valid: True, reason: "ok"}`` — token is genuine and project matches;
+      it is now consumed and cannot be verified again.
+    - ``{valid: False, reason: "not_found"}`` — token was never minted.
+    - ``{valid: False, reason: "expired"}`` — token existed but TTL has passed.
+    - ``{valid: False, reason: "already_consumed"}`` — token was already verified.
+    - ``{valid: False, reason: "wrong_project"}`` — token is real but was minted
+      for a different project_id.
+    """
+    entry = _HANDOFF_TOKENS.get(token)
+    if entry is None:
+        return {"valid": False, "reason": "not_found"}
+    now = datetime.now(timezone.utc)
+    if now > entry["expires_at"]:
+        # Clean up the expired entry.
+        _HANDOFF_TOKENS.pop(token, None)
+        return {"valid": False, "reason": "expired"}
+    if entry["consumed"]:
+        return {"valid": False, "reason": "already_consumed"}
+    if entry["project_id"] != project_id:
+        return {"valid": False, "reason": "wrong_project"}
+    # Consume: mark so a second verification attempt is rejected.
+    entry["consumed"] = True
+    return {"valid": True, "reason": "ok"}
+
+
+def _evict_expired_tokens() -> None:
+    """Remove expired tokens from the in-process store (dd07ece0).
+
+    Called opportunistically at mint time; also callable from tests for
+    deterministic cleanup.
+    """
+    now = datetime.now(timezone.utc)
+    expired = [t for t, e in _HANDOFF_TOKENS.items() if now > e["expires_at"]]
+    for t in expired:
+        _HANDOFF_TOKENS.pop(t, None)
 
 
 # 2d932f60 — lightweight keyword detector for "this reads like a decision/insight
@@ -2894,6 +2984,23 @@ async def generate_handoff(
         loop_enabled=_loop_enabled_from_settings(proj_settings, _ws_settings_for_loop),
         parallel_groups=_parallel_groups,
     )
+    # dd07ece0 — embed a provenance token near the top of the /goal block so a
+    # receiving session can call verify_handoff_token(project_id, token) to
+    # independently confirm this /goal came from a real generate_handoff call
+    # (not injected/spoofed text shaped like one). The token is single-use and
+    # expires in _HANDOFF_TOKEN_TTL_SECONDS. It is inserted after the first line
+    # ("/goal" or "/loop /goal") so it is visible but does not displace the role
+    # directive or other structured tags.
+    try:
+        _provenance_token = mint_handoff_token(project_id)
+        _goal_lines = quick_start_goal.split("\n", 1)
+        quick_start_goal = (
+            _goal_lines[0]
+            + f"\n<goal_token>{_provenance_token}</goal_token>"
+            + ("\n" + _goal_lines[1] if len(_goal_lines) > 1 else "")
+        )
+    except Exception:  # noqa: BLE001 — provenance is best-effort; never break handoff
+        pass
 
     # Split tasks into L1 (last 10) and L2 (older).
     l1_tasks = tasks[:10]

@@ -2012,7 +2012,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, verify_handoff_token."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -2177,6 +2177,15 @@ async def _handle_task_tools(
             ),
             "has_handoff": bool(_latest) or bool(_pending),
         }
+    if name == "verify_handoff_token":
+        # dd07ece0 — verify a provenance token extracted from a pasted /goal block.
+        # Delegates to the in-process token store in handoff.py; no DB access needed.
+        from .. import handoff as handoff_module_local  # noqa: PLC0415
+        _token = (args.get("token") or "").strip()
+        if not _token:
+            return {"valid": False, "reason": "not_found"}
+        _pid = args.get("project_id") or ""
+        return handoff_module_local.verify_handoff_token(_token, _pid)
     return _MISS
 
 

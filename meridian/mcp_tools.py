@@ -216,6 +216,23 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
          "required": []}},
+    {"name": "verify_handoff_token", "description":
+        "Read-only: Verify a handoff provenance token (dd07ece0). When a /goal block "
+        "is copy-pasted into chat rather than delivered via the trusted MCP channel "
+        "(start_session pending_goal / load_handoff), a receiving session can call "
+        "this tool to independently confirm the <goal_token> line was produced by a "
+        "real generate_handoff call on this server — not injected or spoofed text. "
+        "The token is single-use and short-lived (a few minutes); verify immediately "
+        "on receipt. Returns {valid: bool, reason: str}. reason is 'ok' on success; "
+        "on failure: 'not_found', 'expired', 'already_consumed', or 'wrong_project'.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string",
+             "description": "The project_id the /goal block claims to be for."},
+         "project_name": {"type": "string",
+             "description": "Project name — an alternative to project_id; resolved to the id internally."},
+         "token": {"type": "string",
+             "description": "The token value from the <goal_token>…</goal_token> line in the /goal block."}},
+         "required": ["token"]}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact plain-text project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions). "
@@ -1804,6 +1821,7 @@ _READ_ONLY_TOOLS = {
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "idle_until_session_done", "generate_handoff", "load_handoff",
+    "verify_handoff_token",
     "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_blog_posts",
@@ -1865,6 +1883,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "log_task":                "session",
     "generate_handoff":        "session",
     "load_handoff":            "session",
+    "verify_handoff_token":    "session",
     "checkpoint":              "session",
     "get_session_brief":       "session",
     "get_context_block":       "session",
@@ -2077,6 +2096,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "start_session":             "both",
     "register_session":          "both",
     "load_handoff":              "both",
+    "verify_handoff_token":      "both",
     "refresh_context":           "both",
     "get_context_block":         "both",
     "get_session_brief":         "both",
