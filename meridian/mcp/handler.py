@@ -1471,6 +1471,64 @@ def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
     return _keyword_prospect_fallback(item.get("title") or "")
 
 
+async def _code_notes_for_item_resources(
+    db: "Any",
+    project_id: str,
+    item: "dict[str, Any]",
+) -> "list[dict[str, Any]]":
+    """c37ea630 — proactively surface code-anchored notes for a claimed item's files.
+
+    When ``claim_sprint_item`` succeeds, this helper looks up project notes with
+    ``note_kind='code'`` for every ``file:`` entry in the item's
+    ``touches_resources``.  The result mirrors the ``code_notes`` list already
+    returned by ``claim_file`` / ``get_file_claims`` (same shape, same
+    :func:`get_code_notes_for_file` call) so executors see the same warnings at
+    claim time rather than only when they later call ``claim_file`` per-file.
+
+    Returns a list of dicts, each with a ``file_path`` key and a ``notes`` list::
+
+        [
+            {"file_path": "meridian/db/__init__.py", "notes": [{...}, ...]},
+            ...
+        ]
+
+    Only files that actually have code-anchored notes appear in the list; files
+    with zero notes are omitted so the field stays compact.  Fail-open: any
+    per-file DB error is suppressed and that file is silently skipped — the claim
+    itself is never blocked.
+    """
+    if not project_id or not isinstance(item, dict):
+        return []
+    file_paths: list[str] = []
+    for entry in _parse_touches_files(item.get("touches_resources")):
+        if entry.startswith("file:"):
+            file_paths.append(entry[len("file:"):])
+        elif entry.startswith("inferred:file:"):
+            file_paths.append(entry[len("inferred:file:"):])
+    # Also extract symbol paths so the file portion can be included.
+    for entry in _parse_touches_files(item.get("touches_resources")):
+        if entry.startswith("symbol:"):
+            # symbol entries are "file_path::symbol_name" — extract the file
+            sym_val = entry[len("symbol:"):]
+            if "::" in sym_val:
+                sym_file = sym_val.split("::")[0]
+            else:
+                sym_file = sym_val
+            if sym_file and sym_file not in file_paths:
+                file_paths.append(sym_file)
+    if not file_paths:
+        return []
+    results: list[dict[str, Any]] = []
+    for fp in file_paths:
+        try:
+            notes = await db_module.get_code_notes_for_file(db, project_id, fp)
+        except Exception:  # noqa: BLE001 — never block the claim
+            notes = []
+        if notes:
+            results.append({"file_path": fp, "notes": notes})
+    return results
+
+
 def _prospecting_result(
     item: "dict[str, Any] | None",
 ) -> "tuple[dict[str, Any] | None, str]":
@@ -4943,6 +5001,22 @@ async def _handle_sprint_tools(
         if _code_ctx:
             item = dict(item)
             item["code_context"] = _code_ctx
+
+        # c37ea630 — proactively surface code-anchored notes for the item's
+        # declared files/symbols at claim time. Mirrors the code_notes field
+        # already returned by claim_file / get_file_claims, so executors see
+        # relevant per-file warnings before they even decide which files to touch,
+        # rather than only reactively when they call claim_file/get_file_claims
+        # for a specific path later. Fail-open: empty list on error.
+        try:
+            _resource_code_notes = await _code_notes_for_item_resources(
+                db, args["project_id"], item
+            )
+        except Exception:  # noqa: BLE001
+            _resource_code_notes = []
+        if _resource_code_notes:
+            item = dict(item)
+            item["touches_resources_code_notes"] = _resource_code_notes
 
         return item
     if name == "add_subtask":
