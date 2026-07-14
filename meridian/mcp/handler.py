@@ -1864,6 +1864,28 @@ async def _handle_project_tools(
                         result["pending_goal_age_hours"] = _pg_meta["age_hours"]
         except Exception:  # noqa: BLE001
             pass
+        # a749f87c — PUSH active_tool_set: deterministic, role/context-based
+        # tool pre-selection. Injected here (into the start_session response
+        # itself) so an executor never has to remember to call a separate
+        # tool-search — the right narrow subset is already present at session
+        # start. Best-effort: a failure here must NEVER break orientation.
+        try:
+            if isinstance(result, dict) and "continuation" not in result:
+                _goal_text: str | None = None
+                try:
+                    _goal_row = await db_module.get_goal(db, args["project_id"])
+                    if _goal_row:
+                        _goal_text = " ".join(
+                            str(_goal_row.get(f) or "")
+                            for f in ("sprint", "north_star", "content")
+                        )
+                except Exception:  # noqa: BLE001 — non-fatal
+                    pass
+                result["active_tool_set"] = _select_active_tool_set(
+                    args.get("role"), _goal_text
+                )
+        except Exception:  # noqa: BLE001 — orientation must not break
+            pass
         return result
     if name == "list_projects":
         return await db_module.list_project_summaries(db)
@@ -5332,6 +5354,13 @@ def _classify_task_tier(descriptor: dict[str, Any]) -> dict[str, Any]:
         "rationale": rationale,
         "mode": "mechanical",
     }
+
+
+# a749f87c — _select_active_tool_set lives in mcp_tools.py (pure, no I/O,
+# importable without server.py's circular-import chain). Re-export here so
+# the handler dispatch can call it, and so any handler-level caller works
+# without changing its import path.
+from ..mcp_tools import _select_active_tool_set  # noqa: E402
 
 
 # 8eea5a9a — Deferral/blocker language in notes without matching structured
