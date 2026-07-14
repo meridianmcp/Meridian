@@ -43,7 +43,38 @@ other's task log, and resume from a compressed handoff when context fills up.
 - **Hosted** at [usemeridian.us](https://usemeridian.us) — 30 days free (no card), then $20/mo Standard.
 
 <!-- MERIDIAN:ANCHOR:START quickstart -->
-## Quickstart — from source
+## Quickstart
+
+### Option 1 — binary release (recommended)
+
+Signed binaries for Windows, macOS (Apple Silicon), and Linux are attached to
+every [GitHub release](https://github.com/meridianmcp/Meridian/releases) (current: v0.1.9).
+
+**Linux / macOS (one-liner via uv):**
+```bash
+uv tool install meridian-server
+meridian --tunnel --repo .
+```
+
+**Linux / macOS (manual binary download):**
+```bash
+curl -fsSL https://usemeridian.us/install.sh | sh
+```
+
+**Windows (PowerShell, one-liner via uv):**
+```powershell
+uv tool install meridian-server
+meridian --tunnel --repo .
+```
+
+**Windows (PowerShell, manual binary download):**
+```powershell
+irm https://usemeridian.us/install-windows.ps1 | iex
+```
+
+Dashboard opens at **http://localhost:7878**. Data persists in `~/.meridian/` by default.
+
+### Option 2 — from source (dev setup / self-host)
 
 **Linux / macOS:**
 ```bash
@@ -215,7 +246,6 @@ No more manual `start_session()` calls. No lost work when context fills.
 | **Price** | $20/mo | $49/mo (waitlist) |
 | **Storage** | 1 GB included | 10 GB included |
 | **Compute** | 2 CU · 100 hrs/mo | 4 CU · 300 hrs/mo |
-| **Environments** | 1 | prod / staging / dev |
 | **Bring your own Postgres** | ✓ | ✓ |
 | **OAuth + email magic link** | ✓ | ✓ |
 | **Extra storage** | $0.50 / GB-month | $0.50 / GB-month |
