@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from unittest.mock import AsyncMock
 
 import httpx
@@ -1716,6 +1717,166 @@ def test_kill_stale_port_occupant_never_raises_on_internal_error(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
 
     tc._kill_stale_port_occupant(8809, "code")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# aaddb273 — per-client session-to-process liveness: slot-claim helpers and
+# the live-client guard in _kill_stale_port_occupant.
+# ---------------------------------------------------------------------------
+
+
+def test_write_and_clear_slot_claim_roundtrip(tmp_path, monkeypatch):
+    """_write_slot_claim writes a readable JSON claim; _clear_slot_claim removes it."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    tc._write_slot_claim(9001, "client-abc")
+    claim_path = tc._slot_claim_path(9001)
+    assert claim_path.exists()
+    data = json.loads(claim_path.read_text())
+    assert data["client_id"] == "client-abc"
+    assert data["tunnel_pid"] == os.getpid()
+    tc._clear_slot_claim(9001)
+    assert not claim_path.exists()
+
+
+def test_is_slot_claimed_by_live_client_live_different_client(tmp_path, monkeypatch):
+    """Returns True when the claim names a DIFFERENT client whose PID is still alive."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    # Write a claim from a "different" client — use os.getpid() as the tunnel_pid
+    # (it is definitely alive) but a different client_id.
+    tc._write_slot_claim(9002, "other-client-xyz")
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    fake_psutil.pid_exists = lambda pid: True  # the other tunnel is still alive
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    assert tc._is_slot_claimed_by_live_client(9002, "my-client-abc") is True
+
+
+def test_is_slot_claimed_by_live_client_dead_tunnel_pid(tmp_path, monkeypatch):
+    """Returns False when the claiming tunnel PID is no longer alive (orphan)."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    tc._write_slot_claim(9003, "other-client-xyz")
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    fake_psutil.pid_exists = lambda pid: False  # the other tunnel is DEAD
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    assert tc._is_slot_claimed_by_live_client(9003, "my-client-abc") is False
+
+
+def test_is_slot_claimed_by_live_client_same_client_id(tmp_path, monkeypatch):
+    """Returns False when the claim belongs to THIS run (same client_id)."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    tc._write_slot_claim(9004, "same-client")
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    fake_psutil.pid_exists = lambda pid: True
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    # Same client_id — treat as orphan from a prior incomplete teardown.
+    assert tc._is_slot_claimed_by_live_client(9004, "same-client") is False
+
+
+def test_is_slot_claimed_by_live_client_no_claim_file(tmp_path, monkeypatch):
+    """Returns False when there is no claim file (pre-feature orphan)."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    # No claim written — missing file must return False.
+    assert tc._is_slot_claimed_by_live_client(9005, "my-client") is False
+
+
+def test_kill_stale_port_occupant_spares_live_client_process(tmp_path, monkeypatch):
+    """aaddb273 scenario 1: a live second client's process is NOT killed.
+
+    A port is held by a process that belongs to a DIFFERENT, still-running
+    tunnel client.  Even though the port is occupied and our launcher handle is
+    None, the live-client guard must prevent the kill.
+    """
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+
+    # Write a claim for the OTHER client (different client_id, PID still alive).
+    tc._write_slot_claim(8809, "live-other-client")
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    fake_psutil.CONN_LISTEN = "LISTEN"
+    fake_psutil.net_connections = lambda kind="inet": [_FakeConn(port=8809, pid=888)]
+    fake_psutil.pid_exists = lambda pid: True   # the other tunnel is still alive
+
+    killed = {}
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+        def wait(self, timeout=None):
+            pass
+
+    fake_psutil.Process = _FakeProc
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_stale_port_occupant(8809, "fs", current_client_id="my-new-client")
+
+    # The live-client guard fired — process must NOT have been killed.
+    assert killed == {}
+
+
+def test_kill_stale_port_occupant_kills_genuinely_orphaned_process(tmp_path, monkeypatch):
+    """aaddb273 scenario 2: a genuinely orphaned process IS killed as 963d0bd does.
+
+    A port is occupied by a process from a PRIOR tunnel generation whose PID
+    is no longer alive.  The live-client check returns False (dead tunnel) so
+    the kill proceeds exactly as before.
+    """
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+
+    # Write a claim for a prior client whose tunnel process is now dead.
+    tc._write_slot_claim(8810, "prior-dead-client")
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    fake_psutil.CONN_LISTEN = "LISTEN"
+    fake_psutil.net_connections = lambda kind="inet": [_FakeConn(port=8810, pid=777)]
+    fake_psutil.pid_exists = lambda pid: False  # dead tunnel
+
+    killed = {}
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+        def wait(self, timeout=None):
+            pass
+
+    fake_psutil.Process = _FakeProc
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_stale_port_occupant(8810, "code", current_client_id="my-new-client")
+
+    # Dead tunnel == orphan; must have been killed.
+    assert killed.get("terminate") == [777]
+
+
+def test_slot_proxy_client_id_stored_on_init():
+    """SlotProxy stores the passed client_id."""
+    proxy = tc.SlotProxy(["cmd"], 9100, "test", client_id="abc-123")
+    assert proxy.client_id == "abc-123"
+
+
+def test_slot_proxy_client_id_defaults_to_empty():
+    """SlotProxy client_id defaults to empty string when not provided."""
+    proxy = tc.SlotProxy(["cmd"], 9101, "test")
+    assert proxy.client_id == ""
 
 
 def test_dc_default_command_wraps_cmd_on_windows(monkeypatch):
