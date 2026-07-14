@@ -65,6 +65,7 @@ import difflib
 import io
 import os
 import re
+import shutil
 import uuid
 import hashlib
 import logging
@@ -1007,6 +1008,15 @@ def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
     write atomic-ish (a mid-write crash can't half-truncate the original when
     ``dest`` differs, and even for an in-place overwrite the new bytes are fully
     materialised before the file is opened for writing).
+
+    c034fa24 -- when ``dest`` already exists (the common in-place-overwrite case
+    every docx-mutating tool routes through: update_paragraph, link_figure_caption,
+    ...), the current on-disk bytes are copied to ``dest + ".bak"`` first. A single
+    most-recent backup, overwritten on each subsequent save (not unbounded
+    per-edit history) -- enough to recover from a bad edit or a corrupted write,
+    without indefinitely growing disk usage on a document edited many times.
+    Best-effort: a failure to write the backup is logged but never blocks the
+    actual save -- a doc write must not fail because backup housekeeping did.
     """
     new_document = _LET.tostring(
         root, xml_declaration=True, encoding="UTF-8", standalone=True
@@ -1021,6 +1031,12 @@ def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
                     data = new_document
                 # Preserve each entry's original compression type.
                 dst.writestr(info, data)
+    if os.path.exists(dest):
+        backup_path = dest + ".bak"
+        try:
+            shutil.copy2(dest, backup_path)
+        except OSError as exc:
+            _log.warning("could not write backup %r before overwriting %r: %s", backup_path, dest, exc)
     with open(dest, "wb") as fh:
         fh.write(out.getvalue())
 

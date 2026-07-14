@@ -14,6 +14,7 @@ Exercises:
 from __future__ import annotations
 
 import asyncio
+import os
 import zipfile
 
 from lxml import etree as LET
@@ -97,6 +98,80 @@ def test_load_and_find_paragraph_by_id(tmp_path):
     # An unknown id resolves to None (both accessors).
     assert doc_store._find_paragraph_by_id(root, "NOPE") is None
     assert doc_store._find_paragraph_with_index(root, "NOPE") is None
+
+
+# ---------------------------------------------------------------------------
+# c034fa24 — _save_docx_xml backup-before-overwrite
+# ---------------------------------------------------------------------------
+
+
+def test_save_docx_xml_writes_bak_of_prior_content_before_overwrite(tmp_path):
+    docx = _write_docx(str(tmp_path / "d.docx"))
+    original_bytes = _read_document_xml(docx)
+    raw, root = doc_store._load_docx_xml(docx)
+    p = doc_store._find_paragraph_by_id(root, "AAAA0002")
+    doc_store._set_paragraph_runs(p, [{"text": "Edited body sentence."}])
+
+    doc_store._save_docx_xml(raw, root, docx)
+
+    backup_path = docx + ".bak"
+    assert os.path.exists(backup_path)
+    # The backup holds the PRE-edit content, not the new content.
+    assert _read_document_xml(backup_path) == original_bytes
+    # The real file holds the new content.
+    assert b"Edited body sentence." in _read_document_xml(docx)
+    assert b"The original body sentence." not in _read_document_xml(docx)
+
+
+def test_save_docx_xml_bak_is_overwritten_not_accumulated_across_saves(tmp_path):
+    """A single most-recent backup, not unbounded per-edit history."""
+    docx = _write_docx(str(tmp_path / "d.docx"))
+    raw, root = doc_store._load_docx_xml(docx)
+    p = doc_store._find_paragraph_by_id(root, "AAAA0002")
+    doc_store._set_paragraph_runs(p, [{"text": "First edit."}])
+    doc_store._save_docx_xml(raw, root, docx)
+    backup_path = docx + ".bak"
+    assert b"The original body sentence." in _read_document_xml(backup_path)
+
+    # Second save: the .bak now holds what was on disk before THIS save
+    # (the first edit), not the original content, and there is still only
+    # ever the one backup file.
+    raw2, root2 = doc_store._load_docx_xml(docx)
+    p2 = doc_store._find_paragraph_by_id(root2, "AAAA0002")
+    doc_store._set_paragraph_runs(p2, [{"text": "Second edit."}])
+    doc_store._save_docx_xml(raw2, root2, docx)
+    assert b"First edit." in _read_document_xml(backup_path)
+    assert b"Second edit." in _read_document_xml(docx)
+
+
+def test_save_docx_xml_no_backup_when_dest_does_not_exist_yet(tmp_path):
+    """A brand-new dest (never existed on disk) has nothing to back up."""
+    docx_source = _write_docx(str(tmp_path / "source.docx"))
+    raw, root = doc_store._load_docx_xml(docx_source)
+    new_dest = str(tmp_path / "brand_new.docx")
+
+    doc_store._save_docx_xml(raw, root, new_dest)
+
+    assert os.path.exists(new_dest)
+    assert not os.path.exists(new_dest + ".bak")
+
+
+def test_save_docx_xml_backup_failure_does_not_block_the_save(tmp_path, monkeypatch):
+    """Backup housekeeping is best-effort -- a failure to write it must never
+    prevent the real save from completing."""
+    docx = _write_docx(str(tmp_path / "d.docx"))
+    raw, root = doc_store._load_docx_xml(docx)
+    p = doc_store._find_paragraph_by_id(root, "AAAA0002")
+    doc_store._set_paragraph_runs(p, [{"text": "Edited despite backup failure."}])
+
+    def _boom(*args, **kwargs):
+        raise OSError("simulated backup failure")
+
+    monkeypatch.setattr(doc_store.shutil, "copy2", _boom)
+    doc_store._save_docx_xml(raw, root, docx)  # must not raise
+
+    assert b"Edited despite backup failure." in _read_document_xml(docx)
+    assert not os.path.exists(docx + ".bak")
 
 
 def test_normalize_runs_string_and_list_and_none():
