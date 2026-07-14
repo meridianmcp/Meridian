@@ -4,7 +4,6 @@ build-backend = "hatchling.build"
 
 [project]
 name = "meridian-docs"
-version = "0.1.1"
 description = "Standalone, stdlib-only OOXML (DOCX) intelligence as an MCP server — the parser layer extracted from Meridian."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
