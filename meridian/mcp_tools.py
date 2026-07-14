@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -1788,6 +1789,319 @@ _READ_ONLY_TOOLS = {
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer"}
 
+# ---------------------------------------------------------------------------
+# a749f87c — Deterministic tool pre-selection metadata.
+#
+# Each tool carries two declared tags (authored once at definition time, not
+# inferred at runtime):
+#
+#   category        — functional domain the tool belongs to.
+#   role_relevance  — which session role primarily uses this tool:
+#                       "executor"  — code-execution, file-claiming, sprint-item flow
+#                       "planner"   — planning, research, high-level orchestration
+#                       "both"      — universally useful
+#
+# These are used by _select_active_tool_set (mcp/handler.py) to produce a
+# curated "active_tool_set" pushed to the agent in the start_session response —
+# zero LLM calls, same deterministic pattern as _classify_task_tier and
+# _infer_sprint_type.
+#
+# Category vocabulary (add new categories here as the tool set grows):
+#   "session"            — session lifecycle (start, register, log, handoff, checkpoint)
+#   "sprint-management"  — sprint items, board operations, planning briefs
+#   "project"            — project CRUD and settings
+#   "notes"              — project notes, wiki, insights, findings, research
+#   "decisions"          — pinned decisions, workspace decisions
+#   "hitl"               — human-in-the-loop requests/answers
+#   "workspace"          — workspace-level notes, proposals, sprint items, settings, blog
+#   "code-intel"         — semantic code search, prospect_symbol, graph metrics
+#   "docx"               — Word/LaTeX document ingestion, equations, figures, tables
+#   "file-locking"       — file/symbol claiming, locking, docx region claims
+#   "parallel-coord"     — multi-session coordination (messages, findings, barriers)
+#   "analysis"           — read-only analysis/synthesis (analyze_sprint, model efficiency)
+#   "plugin"             — tunnel plugin management
+#   "config"             — executor config, active repo, workspace settings
+#   "research"           — paper search, web-captured findings
+# ---------------------------------------------------------------------------
+
+_TOOL_CATEGORY: dict[str, str] = {
+    # session lifecycle
+    "start_session":           "session",
+    "register_session":        "session",
+    "log_task":                "session",
+    "generate_handoff":        "session",
+    "load_handoff":            "session",
+    "checkpoint":              "session",
+    "get_session_brief":       "session",
+    "get_context_block":       "session",
+    "get_session_log":         "session",
+    "list_sessions":           "session",
+    "refresh_context":         "session",
+    "heartbeat":               "session",
+    "add_sprint_note":         "session",
+    "get_sprint_notes":        "session",
+    "idle_until_session_done": "session",
+    # sprint management
+    "add_sprint_item":               "sprint-management",
+    "fan_out_sprint_items":          "sprint-management",
+    "update_sprint_item":            "sprint-management",
+    "complete_sprint_item":          "sprint-management",
+    "claim_sprint_item":             "sprint-management",
+    "get_sprint_items":              "sprint-management",
+    "get_sprint_progress":           "sprint-management",
+    "reconcile_sprint_drift":        "sprint-management",
+    "get_planning_brief":            "sprint-management",
+    "get_parallelizable_groups":     "sprint-management",
+    "assign_sprint_waves":           "sprint-management",
+    "analyze_sprint":                "sprint-management",
+    "split_sprint_item":             "sprint-management",
+    "merge_sprint_items":            "sprint-management",
+    "add_subtask":                   "sprint-management",
+    "add_sprint_item_pointer":       "sprint-management",
+    "get_sprint_item_pointers":      "sprint-management",
+    "resolve_sprint_item_pointers":  "sprint-management",
+    "delete_sprint_item_pointer":    "sprint-management",
+    # project CRUD
+    "create_project":      "project",
+    "set_parent_project":  "project",
+    "rename_project":      "project",
+    "merge_project":       "project",
+    "list_projects":       "project",
+    "get_project_by_name": "project",
+    "get_goal":            "project",
+    "set_goal":            "project",
+    "set_north_star":      "project",
+    "set_sprint":          "project",
+    # notes / knowledge
+    "add_note":               "notes",
+    "get_notes":              "notes",
+    "read_note":              "notes",
+    "delete_note":            "notes",
+    "get_agent_instructions": "notes",
+    "set_agent_instructions": "notes",
+    "add_insight":            "notes",
+    "get_insights":           "notes",
+    "save_finding":           "notes",
+    "capture_research_finding": "notes",
+    "ingest_document":        "notes",
+    "search_all":             "notes",
+    "search_tasks":           "notes",
+    "search_synthesis":       "notes",
+    "get_tasks":              "notes",
+    "store_finding":          "notes",
+    "get_findings":           "notes",
+    # decisions
+    "pin_decision":        "decisions",
+    "update_decision":     "decisions",
+    "validate_assumption": "decisions",
+    "get_pinned_decisions": "decisions",
+    "archive_decision":    "decisions",
+    # hitl
+    "request_hitl":     "hitl",
+    "get_hitl_request": "hitl",
+    "list_hitl_requests": "hitl",
+    "answer_hitl":      "hitl",
+    "dismiss_hitl":     "hitl",
+    # workspace-level
+    "add_workspace_note":              "workspace",
+    "get_workspace_notes":             "workspace",
+    "pin_workspace_decision":          "workspace",
+    "get_workspace_decisions":         "workspace",
+    "get_workspace_settings":          "workspace",
+    "update_workspace_settings":       "workspace",
+    "add_workspace_sprint_item":       "workspace",
+    "get_workspace_sprint_items":      "workspace",
+    "update_workspace_sprint_item":    "workspace",
+    "complete_workspace_sprint_item":  "workspace",
+    "add_workspace_proposal":          "workspace",
+    "get_workspace_proposals":         "workspace",
+    "advance_proposal_status":         "workspace",
+    "promote_proposal":                "workspace",
+    "save_blog_post":                  "workspace",
+    "get_blog_posts":                  "workspace",
+    "update_md_section":               "workspace",
+    "refresh_tool_manifest":           "workspace",
+    # code-intel
+    "search_code_semantic": "code-intel",
+    "prospect_symbol":      "code-intel",
+    "search_outputs":       "code-intel",
+    "annotate_outputs":     "code-intel",
+    "snapshot_graph_metrics": "code-intel",
+    "get_graph_diff":       "code-intel",
+    "get_symbol_hotspots":  "code-intel",
+    # docx / document editing
+    "get_document_structure": "docx",
+    "get_latex_structure":    "docx",
+    "get_citation_edges":     "docx",
+    "resolve_citations":      "docx",
+    "index_equation":         "docx",
+    "find_similar_equation":  "docx",
+    "insert_equation":        "docx",
+    "update_paragraph":       "docx",
+    "find_symbol_usages":     "docx",
+    "index_figure":           "docx",
+    "find_similar_figure":    "docx",
+    "link_figure_caption":    "docx",
+    "index_table":            "docx",
+    "find_similar_table":     "docx",
+    # file locking
+    "claim_file":               "file-locking",
+    "release_file":             "file-locking",
+    "get_file_claims":          "file-locking",
+    "get_symbol_claims":        "file-locking",
+    "claim_docx_region":        "file-locking",
+    "get_docx_region_claims":   "file-locking",
+    "release_docx_region_claims": "file-locking",
+    # parallel coordination
+    "send_message":      "parallel-coord",
+    "receive_messages":  "parallel-coord",
+    "idle_until_all_done": "parallel-coord",
+    # analysis
+    "analyze_model_efficiency": "analysis",
+    # plugin management
+    "list_plugins":      "plugin",
+    "get_plugin_details": "plugin",
+    # config / infra
+    "set_executor_config": "config",
+    "set_active_repo":     "config",
+    "run_verification":    "config",
+    # research
+    "paper_search": "research",
+}
+
+_TOOL_ROLE_RELEVANCE: dict[str, str] = {
+    # ---- executor-focused ----
+    "claim_sprint_item":         "executor",
+    "complete_sprint_item":      "executor",
+    "add_sprint_item":           "executor",
+    "update_sprint_item":        "executor",
+    "split_sprint_item":         "executor",
+    "merge_sprint_items":        "executor",
+    "add_subtask":               "executor",
+    "add_sprint_item_pointer":       "executor",
+    "get_sprint_item_pointers":      "executor",
+    "resolve_sprint_item_pointers":  "executor",
+    "delete_sprint_item_pointer":    "executor",
+    "claim_file":                "executor",
+    "release_file":              "executor",
+    "get_file_claims":           "executor",
+    "get_symbol_claims":         "executor",
+    "claim_docx_region":         "executor",
+    "get_docx_region_claims":    "executor",
+    "release_docx_region_claims": "executor",
+    "insert_equation":           "executor",
+    "update_paragraph":          "executor",
+    "index_equation":            "executor",
+    "index_figure":              "executor",
+    "link_figure_caption":       "executor",
+    "index_table":               "executor",
+    "annotate_outputs":          "executor",
+    "log_task":                  "executor",
+    "generate_handoff":          "executor",
+    "checkpoint":                "executor",
+    "add_sprint_note":           "executor",
+    "heartbeat":                 "executor",
+    "run_verification":          "executor",
+    "set_active_repo":           "executor",
+    # ---- planner-focused ----
+    "get_planning_brief":        "planner",
+    "assign_sprint_waves":       "planner",
+    "get_parallelizable_groups": "planner",
+    "analyze_sprint":            "planner",
+    "reconcile_sprint_drift":    "planner",
+    "analyze_model_efficiency":  "planner",
+    "set_sprint":                "planner",
+    "set_goal":                  "planner",
+    "set_north_star":            "planner",
+    "pin_decision":              "planner",
+    "update_decision":           "planner",
+    "validate_assumption":       "planner",
+    "archive_decision":          "planner",
+    "add_workspace_proposal":    "planner",
+    "get_workspace_proposals":   "planner",
+    "advance_proposal_status":   "planner",
+    "promote_proposal":          "planner",
+    "update_md_section":         "planner",
+    "save_blog_post":            "planner",
+    "paper_search":              "planner",
+    "capture_research_finding":  "planner",
+    "add_insight":               "planner",
+    "get_insights":              "planner",
+    "save_finding":              "planner",
+    "add_workspace_sprint_item":       "planner",
+    "update_workspace_sprint_item":    "planner",
+    "complete_workspace_sprint_item":  "planner",
+    "get_workspace_sprint_items":      "planner",
+    "snapshot_graph_metrics":    "planner",
+    "get_graph_diff":            "planner",
+    "get_symbol_hotspots":       "planner",
+    "pin_workspace_decision":    "planner",
+    "update_workspace_settings": "planner",
+    # ---- both ----
+    "start_session":             "both",
+    "register_session":          "both",
+    "load_handoff":              "both",
+    "refresh_context":           "both",
+    "get_context_block":         "both",
+    "get_session_brief":         "both",
+    "get_session_log":           "both",
+    "list_sessions":             "both",
+    "idle_until_session_done":   "both",
+    "get_sprint_notes":          "both",
+    "create_project":            "both",
+    "set_parent_project":        "both",
+    "rename_project":            "both",
+    "merge_project":             "both",
+    "list_projects":             "both",
+    "get_project_by_name":       "both",
+    "get_goal":                  "both",
+    "get_sprint_items":          "both",
+    "get_sprint_progress":       "both",
+    "get_agent_instructions":    "both",
+    "set_agent_instructions":    "both",
+    "set_executor_config":       "both",
+    "add_note":                  "both",
+    "get_notes":                 "both",
+    "read_note":                 "both",
+    "delete_note":               "both",
+    "get_tasks":                 "both",
+    "search_tasks":              "both",
+    "search_all":                "both",
+    "search_synthesis":          "both",
+    "get_pinned_decisions":      "both",
+    "get_workspace_decisions":   "both",
+    "get_workspace_notes":       "both",
+    "add_workspace_note":        "both",
+    "get_workspace_settings":    "both",
+    "get_blog_posts":            "both",
+    "request_hitl":              "both",
+    "get_hitl_request":          "both",
+    "list_hitl_requests":        "both",
+    "answer_hitl":               "both",
+    "dismiss_hitl":              "both",
+    "search_code_semantic":      "both",
+    "prospect_symbol":           "both",
+    "search_outputs":            "both",
+    "get_document_structure":    "both",
+    "get_latex_structure":       "both",
+    "get_citation_edges":        "both",
+    "resolve_citations":         "both",
+    "find_similar_equation":     "both",
+    "find_symbol_usages":        "both",
+    "find_similar_figure":       "both",
+    "find_similar_table":        "both",
+    "store_finding":             "both",
+    "get_findings":              "both",
+    "send_message":              "both",
+    "receive_messages":          "both",
+    "idle_until_all_done":       "both",
+    "list_plugins":              "both",
+    "get_plugin_details":        "both",
+    "refresh_tool_manifest":     "both",
+    "ingest_document":           "both",
+    "fan_out_sprint_items":      "both",  # orchestrators also use it; keep "both"
+}
+
 _TITLE_OVERRIDES: dict[str, str] = {
     "request_hitl": "Request HITL",
     "get_hitl_request": "Get HITL Request",
@@ -1867,4 +2181,194 @@ for _tool in _MCP_TOOLS_LIST:
         "destructiveHint": _is_destructive,
         "openWorldHint": False,
         "idempotentHint": _is_read_only,
+    }
+    # a749f87c — stamp declared category + role_relevance onto every tool entry
+    # so callers (e.g. _select_active_tool_set) can filter without re-declaring tags.
+    _tool["category"] = _TOOL_CATEGORY.get(_tool["name"], "other")
+    _tool["role_relevance"] = _TOOL_ROLE_RELEVANCE.get(_tool["name"], "both")
+
+
+# ---------------------------------------------------------------------------
+# a749f87c — Deterministic tool pre-selection (pure function, no I/O)
+# ---------------------------------------------------------------------------
+
+# Keyword → category affinity: when a keyword appears in the /goal text, its
+# mapped category is added to the active set (keyword expansion).
+_KEYWORD_CATEGORY_AFFINITY: dict[str, str] = {
+    "code":        "code-intel",
+    "codebase":    "code-intel",
+    "grep":        "code-intel",
+    "search":      "code-intel",
+    "semantic":    "code-intel",
+    "symbol":      "code-intel",
+    "refactor":    "code-intel",
+    "extract":     "code-intel",
+    "analyze":     "code-intel",
+    "graph":       "code-intel",
+    "docx":        "docx",
+    "word":        "docx",
+    "latex":       "docx",
+    "equation":    "docx",
+    "figure":      "docx",
+    "table":       "docx",
+    "paragraph":   "docx",
+    "thesis":      "docx",
+    "document":    "docx",
+    "paper":       "research",
+    "arxiv":       "research",
+    "literature":  "research",
+    "survey":      "research",
+    "citation":    "research",
+    "plan":        "sprint-management",
+    "sprint":      "sprint-management",
+    "backlog":     "sprint-management",
+    "orchestrate": "sprint-management",
+    "wave":        "sprint-management",
+    "fan":         "sprint-management",
+    "workspace":   "workspace",
+    "proposal":    "workspace",
+    "blog":        "workspace",
+}
+
+# Categories whose tools are always included regardless of role.
+# Keep this minimal — it only covers the HITL primitives (every session needs
+# to surface questions to humans). session and project are included via the
+# per-role default sets below, not here, so that role_relevance on individual
+# tools (e.g. set_goal=planner, log_task=executor) still applies correctly.
+_CORE_CATEGORIES: frozenset[str] = frozenset({"hitl"})
+
+# Base active categories by role.  Both sets include session + project so that
+# role_relevance on individual tools filters them correctly (planner-only tools
+# in those categories are excluded from executor and vice versa).
+_EXECUTOR_DEFAULT_CATEGORIES: frozenset[str] = frozenset({
+    "session", "project", "sprint-management", "file-locking",
+    "parallel-coord", "hitl", "notes", "decisions", "config", "plugin",
+})
+_PLANNER_DEFAULT_CATEGORIES: frozenset[str] = frozenset({
+    "session", "project", "sprint-management", "decisions", "notes",
+    "workspace", "analysis", "research", "hitl", "plugin",
+})
+
+# Minimal stop-word set (mirrors handoff._extract_keywords) — inlined here to
+# keep mcp_tools.py self-contained (no cross-module import at module level).
+_KW_STOP: frozenset[str] = frozenset({
+    "a", "an", "the", "and", "or", "in", "on", "at", "to", "for",
+    "of", "is", "it", "fix", "add", "update", "remove", "change",
+    "with", "from", "by", "via", "use", "set", "get", "put", "new",
+    "this", "that", "into", "as", "be", "has", "was", "not", "no",
+})
+
+
+def _extract_kws(text: str) -> set[str]:
+    """Minimal keyword extractor — same logic as handoff._extract_keywords."""
+    words = re.findall(r"[a-z0-9_/-]{3,}", text.lower())
+    return {w for w in words if w not in _KW_STOP}
+
+
+def _select_active_tool_set(
+    role: "str | None",
+    goal_text: "str | None" = None,
+) -> "dict[str, Any]":
+    """a749f87c — Deterministically select a curated tool subset for a session.
+
+    Pure function — NO model call, NO DB, NO network.  Mirrors
+    ``_classify_task_tier`` (handler.py) and ``_infer_sprint_type``
+    (handoff.py): rule/keyword-based, deterministic, zero-LLM.
+
+    ``role``      — "executor", "planner", or None/other (returns all tools).
+    ``goal_text`` — optional /goal string scanned for keyword → category
+                    affinity signals to expand the active set.
+
+    Returns::
+
+        {
+          "role": str,
+          "active_categories": [str, ...],
+          "active_tools": [str, ...],
+          "excluded_tools": [str, ...],
+          "keyword_signals": [str, ...],
+          "mode": "deterministic",
+        }
+    """
+    effective_role = (role or "").strip().lower()
+
+    # Fast path: no role or unrecognised role → return everything.
+    if effective_role not in ("executor", "planner"):
+        all_names = [t["name"] for t in _MCP_TOOLS_LIST]
+        return {
+            "role": effective_role or "unset",
+            "active_categories": sorted({
+                _TOOL_CATEGORY.get(n, "other") for n in all_names
+            }),
+            "active_tools": all_names,
+            "excluded_tools": [],
+            "keyword_signals": [],
+            "mode": "deterministic",
+        }
+
+    # Choose base category set by role.
+    base_cats: set[str] = set(
+        _EXECUTOR_DEFAULT_CATEGORIES
+        if effective_role == "executor"
+        else _PLANNER_DEFAULT_CATEGORIES
+    )
+
+    # Keyword expansion: scan goal text for category affinity signals.
+    keyword_signals: list[str] = []
+    if goal_text:
+        for kw in _extract_kws(goal_text):
+            matched_cat = _KEYWORD_CATEGORY_AFFINITY.get(kw)
+            if matched_cat and matched_cat not in base_cats:
+                base_cats.add(matched_cat)
+                keyword_signals.append(kw)
+
+    # Filter tool list.
+    #
+    # Priority:
+    #  1. If the tool's category is in base_cats (default or keyword-expanded):
+    #     include IF role_relevance is not explicitly the opposite role.
+    #     Exception: core-category tools are always included regardless of
+    #     role_relevance (hitl tools are universally required).
+    #  2. If the tool's category is NOT in base_cats: exclude.
+    #
+    # This ordering means keyword expansion wins over role_relevance for
+    # keyword-matched categories: if the /goal explicitly mentions "arxiv",
+    # paper_search (normally planner-only) is included for an executor too.
+    active: list[str] = []
+    excluded: list[str] = []
+    opposite = "planner" if effective_role == "executor" else "executor"
+    for tool in _MCP_TOOLS_LIST:
+        name = tool["name"]
+        cat = _TOOL_CATEGORY.get(name, "other")
+        rel = _TOOL_ROLE_RELEVANCE.get(name, "both")
+
+        # Core categories: always include regardless of role_relevance.
+        if cat in _CORE_CATEGORIES:
+            active.append(name)
+            continue
+
+        if cat in base_cats:
+            # Category is active; include UNLESS role is explicitly the opposite.
+            # Exception: if the category was keyword-expanded (not in the role's
+            # default set), include anyway — the user explicitly asked for it.
+            in_role_default = cat in (
+                _EXECUTOR_DEFAULT_CATEGORIES
+                if effective_role == "executor"
+                else _PLANNER_DEFAULT_CATEGORIES
+            )
+            if rel == opposite and in_role_default:
+                # Planner/executor-only tool in a default category: exclude.
+                excluded.append(name)
+            else:
+                active.append(name)
+        else:
+            excluded.append(name)
+
+    return {
+        "role": effective_role,
+        "active_categories": sorted(base_cats),
+        "active_tools": active,
+        "excluded_tools": excluded,
+        "keyword_signals": keyword_signals,
+        "mode": "deterministic",
     }
