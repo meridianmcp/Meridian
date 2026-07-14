@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 from typing import Any
 
 import aiosqlite
@@ -28,7 +30,80 @@ from meridian.db import (  # noqa: PLC0415
     normalize_execution_mode,
     get_project,
     add_project_note,
+    serialize_touches_resources,
 )
+
+
+# ---------------------------------------------------------------------------
+# a56f0951 — touches_resources inference for promote_workspace_proposal.
+#
+# When a workspace proposal is promoted to a sprint item the created item had
+# zero touches_resources by construction — same gap class as fba94f1a. This
+# helper mirrors the keyword-match logic in handoff._annotate_touches_files:
+# extract significant words from the proposal title + body, then match them
+# against recently-changed files (git diff --name-only HEAD~3) to produce
+# inferred:file:<path> resource identifiers.
+#
+# Returns a list of inferred resource strings (may be empty on no match or
+# error). Safe to call from any context — never raises.
+# ---------------------------------------------------------------------------
+
+_PROPOSAL_STOP_WORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "and", "or", "in", "on", "at", "to", "for",
+    "of", "is", "it", "fix", "add", "update", "remove", "change",
+    "with", "from", "by", "via", "use", "set", "get", "put", "new",
+    "this", "that", "into", "as", "be", "has", "was", "not", "no",
+})
+
+
+def _proposal_keywords(text: str) -> set[str]:
+    """Extract significant lowercase keywords from a proposal title or body.
+
+    Mirrors handoff._extract_keywords without its extra_stop parameter:
+    returns 3+-char alphanumeric/underscore/dash/slash tokens excluding the
+    common English stop-words."""
+    words = re.findall(r"[a-z0-9_/-]{3,}", text.lower())
+    return {w for w in words if w not in _PROPOSAL_STOP_WORDS}
+
+
+def _infer_touches_resources_from_proposal(title: str, body: str) -> list[str]:
+    """Infer inferred:file:<path> resource identifiers for a workspace proposal.
+
+    Queries ``git diff --name-only HEAD~3`` for recently changed files, then
+    keyword-matches the proposal's title+body against each path. Returns at
+    most 10 ``inferred:file:<path>`` strings, or an empty list when no match
+    is found or git is unavailable. Never raises."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD~3"],
+            capture_output=True, text=True, timeout=5,
+        )
+        changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+    except Exception:  # noqa: BLE001
+        return []
+    if not changed_files:
+        return []
+
+    combined_text = f"{title} {body}"
+    title_kws = _proposal_keywords(combined_text)
+    if len(title_kws) < 2:
+        return []
+
+    matched: list[str] = []
+    seen: set[str] = set()
+    for fpath in changed_files:
+        if fpath in seen:
+            continue
+        fname = os.path.basename(fpath)
+        fname_stem = os.path.splitext(fname)[0]
+        path_kws = _proposal_keywords(fpath.replace("/", " ").replace(".", " "))
+        if fname_stem and len(fname_stem) >= 3 and fname_stem in title_kws:
+            matched.append(fpath)
+            seen.add(fpath)
+        elif len(title_kws & path_kws) >= 2:
+            matched.append(fpath)
+            seen.add(fpath)
+    return [f"inferred:file:{fpath}" for fpath in matched[:10]]
 
 
 # ---------------------------------------------------------------------------
@@ -401,12 +476,33 @@ async def promote_workspace_proposal(
         raise ValueError(f"Project '{project_id}' not found")
     title = sprint_item_title or proposal["title"]
     version = sprint_item_version or "current"
-    # Create the sprint item (bare-bones; caller can update it further).
+    # a56f0951 — infer touches_resources from proposal content so the created
+    # sprint item is not silently bare (same gap class as fba94f1a).
+    proposal_body = proposal.get("body") or ""
+    inferred = _infer_touches_resources_from_proposal(title, proposal_body)
+    resources_json: str | None = None
+    item_notes: str | None = None
+    if inferred:
+        try:
+            resources_json = serialize_touches_resources(inferred)
+        except Exception:  # noqa: BLE001 — never block promotion
+            resources_json = None
+    if not resources_json:
+        # No file match from git history. Flag the item explicitly so it
+        # doesn't ship with a silently-empty touches_resources — mirrors the
+        # pattern used for under-specified items that need manual scoping.
+        item_notes = (
+            "[resource-scope:unset] touches_resources could not be inferred "
+            "from this proposal's content. Update touches_resources manually "
+            "before claiming (e.g. file:meridian/... or db:migrations)."
+        )
+    # Create the sprint item with inferred resources (or a note flagging the gap).
     si_id = _new_id()
     await db.execute(
-        "INSERT INTO sprint_items (id, project_id, version, title, status) "
-        "VALUES (?, ?, ?, ?, 'pending')",
-        (si_id, project_id, version, title),
+        "INSERT INTO sprint_items "
+        "(id, project_id, version, title, status, touches_resources, notes) "
+        "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+        (si_id, project_id, version, title, resources_json, item_notes),
     )
     # Mark the proposal promoted.
     await db.execute(
@@ -426,6 +522,8 @@ async def promote_workspace_proposal(
         "sprint_item_id": si_id,
         "sprint_item_title": title,
         "project_id": project_id,
+        "sprint_item_touches_resources": resources_json,
+        "sprint_item_notes": item_notes,
     }
 
 
