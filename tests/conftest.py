@@ -16,13 +16,15 @@ pinned decision f70b731a):
 Fixtures:
 
 * ``db``    — Meridian's schema on the active backend.  In-memory aiosqlite by
-              default; a fresh Postgres schema per test when ``TEST_DATABASE_URL``
-              is set.
+              default; on Postgres (``TEST_DATABASE_URL`` set), the worker's
+              schema is built once and each test gets its own transaction on
+              a dedicated connection, rolled back at teardown (8a52dd26).
 * ``db_pg`` — Postgres connection.  Skipped unless ``TEST_DATABASE_URL`` is set.
 * ``anydb`` — parametrized fixture that yields both ``db`` (SQLite) and ``db_pg``
               (useful for tests that should pass on both backends).
 * ``client`` — FastAPI TestClient.  Backed by in-memory SQLite by default, or the
-               ``TEST_DATABASE_URL`` Postgres DB when that env var is set.
+               ``TEST_DATABASE_URL`` Postgres DB (same per-test-transaction
+               isolation as ``db``) when that env var is set.
 """
 
 from __future__ import annotations
@@ -189,13 +191,173 @@ async def _reset_pg_schema(url: str) -> None:
         await conn.execute("CREATE SCHEMA public")
 
 
-async def _open_fresh_pg_db(url: str):
-    """Reset the Postgres schema, then build Meridian's schema and return the conn."""
-    from meridian import db as db_module
+# Postgres URLs whose schema has already been reset + rebuilt this worker
+# process (8a52dd26). The schema only needs building ONCE per worker (mirrors
+# _worker_db_name's per-worker-database design); per-test isolation then comes
+# from _open_transactional_pg_conn's BEGIN/ROLLBACK instead of a second
+# DROP/CREATE SCHEMA per test (confirmed root cause of the 8-minute
+# test-postgres run).
+_pg_schema_ready: set[str] = set()
 
+
+class _SavepointCursor:
+    """Cursor wrapper: each execute() runs inside its own SAVEPOINT, serialized
+    by a per-connection lock (8a52dd26).
+
+    Two things a real connection pool gave for free that ONE shared connection
+    doesn't:
+
+    1. Error isolation -- without a SAVEPOINT, one query's error poisons the
+       whole test's outer transaction (Postgres refuses every further
+       statement until ROLLBACK), unlike the old per-statement autocommit
+       behaviour. That breaks any test that deliberately triggers a SQL error
+       (e.g. a constraint violation to test conflict handling) and then
+       checks state afterward -- confirmed via a real local Postgres run
+       (psycopg.errors.InFailedSqlTransaction on ~70 tests). Wrapping each
+       execute() in psycopg3's transaction() context manager creates a
+       SAVEPOINT (nested, since we're already inside the outer BEGIN),
+       released on success or rolled back to on error.
+    2. Concurrency safety -- a single psycopg connection cannot run
+       interleaved commands from concurrent coroutines (tests that simulate
+       "two sessions racing" via asyncio.gather do exactly this on the old
+       pool, where each coroutine got its OWN connection). Confirmed via the
+       same run: interleaved SAVEPOINT enter/exit from concurrent callers
+       raised psycopg.transaction.OutOfOrderTransactionNesting. The lock
+       below fully serializes query execution on the shared connection --
+       logically equivalent to a real connection's own single-command-at-a-
+       time behaviour, just without a second real connection backing it.
+    """
+
+    __slots__ = ("_conn", "_lock", "_cursor")
+
+    def __init__(self, conn, lock, cursor) -> None:
+        self._conn = conn
+        self._lock = lock
+        self._cursor = cursor
+
+    async def execute(self, *args, **kwargs):
+        async with self._lock, self._conn.transaction():
+            return await self._cursor.execute(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _SavepointCursorCM:
+    """Async context manager wrapping a real cursor CM in a _SavepointCursor."""
+
+    __slots__ = ("_conn", "_lock", "_cursor_cm")
+
+    def __init__(self, conn, lock, cursor_cm) -> None:
+        self._conn = conn
+        self._lock = lock
+        self._cursor_cm = cursor_cm
+
+    async def __aenter__(self) -> _SavepointCursor:
+        real_cursor = await self._cursor_cm.__aenter__()
+        return _SavepointCursor(self._conn, self._lock, real_cursor)
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self._cursor_cm.__aexit__(*exc)
+
+
+class _SavepointConn:
+    """Connection wrapper: cursor() returns a savepoint-wrapping cursor (8a52dd26)."""
+
+    __slots__ = ("_conn", "_lock")
+
+    def __init__(self, conn, lock) -> None:
+        self._conn = conn
+        self._lock = lock
+
+    def cursor(self, *args, **kwargs) -> _SavepointCursorCM:
+        return _SavepointCursorCM(self._conn, self._lock, self._conn.cursor(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class _SingleConnPool:
+    """Minimal AsyncConnectionPool-compatible wrapper around ONE live psycopg
+    connection with an already-open transaction (8a52dd26).
+
+    PostgresConnection.execute() calls self._pool.getconn()/putconn() per
+    query, and self._pool.connection() for executescript()/_table_info().
+    Handing it one of these instead of a real pool means every query in a
+    test reuses the SAME connection/transaction; the fixture rolls that
+    transaction back at teardown (via close()) instead of the pool
+    discarding/recreating real connections and the schema being rebuilt.
+    getconn()/__aenter__ return a _SavepointConn so each individual query
+    still gets its own error-isolation savepoint and is serialized against
+    concurrent callers (see _SavepointCursor).
+    """
+
+    __slots__ = ("_conn", "_lock")
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+        self._lock = asyncio.Lock()
+
+    async def getconn(self):
+        return _SavepointConn(self._conn, self._lock)
+
+    async def putconn(self, conn) -> None:
+        pass  # the one connection lives for the whole test -- never released early
+
+    def connection(self) -> "_SingleConnPool":
+        return self  # reused as its own async context manager below
+
+    async def __aenter__(self):
+        return _SavepointConn(self._conn, self._lock)
+
+    async def __aexit__(self, *_exc: object) -> None:
+        pass  # no auto-commit -- the fixture owns the outer transaction/rollback
+
+    async def close(self) -> None:
+        """Roll back the test's transaction and close the real connection."""
+        try:
+            await self._conn.execute("ROLLBACK")
+        finally:
+            await self._conn.close()
+
+
+async def _open_transactional_pg_conn(url: str) -> PostgresConnection:
+    """Open ONE psycopg3 connection to the (already schema-built) worker DB and
+    start an explicit transaction, wrapped as a drop-in ``PostgresConnection``.
+
+    All queries during the test reuse this single connection/transaction;
+    closing the returned connection rolls the transaction back -- this is the
+    per-test isolation, replacing the old per-test DROP/CREATE SCHEMA.
+    """
+    import psycopg  # local import: keeps the SQLite path free of psycopg
+
+    from meridian.pg_adapter import PostgresConnection, _strip_unsupported_pg_query_params
+
+    clean_url = _strip_unsupported_pg_query_params(url)
+    raw_conn = await psycopg.AsyncConnection.connect(
+        clean_url, autocommit=True, prepare_threshold=None,
+    )
+    await raw_conn.execute("BEGIN")
+    return PostgresConnection(_SingleConnPool(raw_conn))
+
+
+async def _ensure_pg_schema_built(url: str) -> None:
+    """Reset + rebuild the Postgres schema ONCE per worker process, not per test.
+
+    The first call for a given (per-worker) url does the real DROP/CREATE
+    SCHEMA + full init_db rebuild (same as before -- full schema parity with
+    prod). Subsequent calls are a no-op; per-test isolation comes from
+    _open_transactional_pg_conn's transaction instead.
+    """
+    if url in _pg_schema_ready:
+        return
     await _ensure_worker_db_exists()
     await _reset_pg_schema(url)
-    return await db_module.init_db(url)
+    from meridian import db as db_module
+
+    conn = await db_module.init_db(url)
+    await conn.close()
+    _pg_schema_ready.add(url)
 
 
 @pytest.fixture
@@ -229,14 +391,16 @@ async def db():
     """Meridian's schema on the active backend, isolated per test.
 
     Default: a fresh in-memory SQLite connection.  When ``TEST_DATABASE_URL``
-    (or ``DATABASE_URL``) points at Postgres, the schema is dropped/recreated and
-    rebuilt via ``init_db`` so the entire suite exercises the real prod backend.
+    (or ``DATABASE_URL``) points at Postgres, the worker's schema is built
+    once (see ``_ensure_pg_schema_built``) and each test gets its own
+    transaction on a dedicated connection, rolled back at teardown (8a52dd26).
     """
     from meridian import db as db_module
 
     pg_url = _pg_test_url()
     if pg_url:
-        conn = await _open_fresh_pg_db(pg_url)
+        await _ensure_pg_schema_built(pg_url)
+        conn = await _open_transactional_pg_conn(pg_url)
     else:
         conn = await db_module.init_db(":memory:")
     try:
@@ -252,7 +416,8 @@ async def db_pg():
     if not url:
         pytest.skip("TEST_DATABASE_URL not set — skipping Postgres test")
 
-    conn = await _open_fresh_pg_db(url)
+    await _ensure_pg_schema_built(url)
+    conn = await _open_transactional_pg_conn(url)
     try:
         yield conn
     finally:
@@ -279,7 +444,8 @@ async def anydb(request):
         url = _pg_test_url()
         if not url:
             pytest.skip("TEST_DATABASE_URL not set — skipping Postgres variant")
-        conn = await _open_fresh_pg_db(url)
+        await _ensure_pg_schema_built(url)
+        conn = await _open_transactional_pg_conn(url)
         try:
             yield conn
         finally:
@@ -290,23 +456,34 @@ async def anydb(request):
 def client(tmp_path, monkeypatch):
     """FastAPI TestClient backed by SQLite (default) or Postgres (TEST_DATABASE_URL).
 
-    When ``TEST_DATABASE_URL`` (or ``DATABASE_URL``) targets Postgres, the schema
-    is reset and the server lifespan is pointed at that URL via ``MERIDIAN_DB_URL``
-    so the whole app — routes, MCP handlers, lifespan — runs on real Postgres in
-    CI.  Otherwise it uses an in-memory SQLite DB and a temp data dir, unchanged.
+    When ``TEST_DATABASE_URL`` (or ``DATABASE_URL``) targets Postgres, the
+    worker's schema is built once (``_ensure_pg_schema_built``) and this
+    test's app boots against a dedicated transactional connection
+    (``_open_transactional_pg_conn``) instead of a fresh DROP/CREATE SCHEMA +
+    real pool -- the lifespan's own ``db.close()`` on shutdown rolls that
+    transaction back, giving full per-test isolation (8a52dd26). Otherwise it
+    uses an in-memory SQLite DB and a temp data dir, unchanged.
     """
     pg_url = _pg_test_url()
 
     if pg_url:
-        # Reset the schema on a throwaway loop before the app boots so the server
-        # lifespan sees a fresh, current schema (init_db is idempotent, but a
-        # DROP/CREATE guarantees isolation from the previous client test). Ensure
-        # this worker's database exists first (no-op if already created).
-        async def _prepare() -> None:
-            await _ensure_worker_db_exists()
-            await _reset_pg_schema(pg_url)
+        asyncio.run(_ensure_pg_schema_built(pg_url))
 
-        asyncio.run(_prepare())
+        import meridian.pg_adapter as pg_adapter_module
+
+        _real_init_pg_db = pg_adapter_module.init_pg_db
+
+        async def _fake_init_pg_db(url: str):
+            # Only the app's OWN configured DB gets the transactional
+            # single-connection treatment; any other Postgres URL (e.g. a
+            # per-tenant DB opened by _deps._open_tenant_db_by_id) goes
+            # through the real pool-based path unchanged.
+            if url == pg_url:
+                return await _open_transactional_pg_conn(url)
+            return await _real_init_pg_db(url)
+
+        monkeypatch.setattr(pg_adapter_module, "init_pg_db", _fake_init_pg_db)
+
         # Point the lifespan at Postgres. MERIDIAN_DB_URL wins over MERIDIAN_DB.
         monkeypatch.setenv("MERIDIAN_DB_URL", pg_url)
         # MERIDIAN_DB must not be ":memory:" or the toml-profile block is skipped;
@@ -336,14 +513,24 @@ def client(tmp_path, monkeypatch):
     # commit) never touch — or commit — the real repo docs during tests.
     monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
 
-    # Import after env vars are set so the module sees them.
+    # Import after env vars are set so the module sees them. Imported once and
+    # reused for every test -- no more per-test importlib.reload (8a52dd26):
+    # lifespan already reads every env var fresh on each TestClient enter, so
+    # the reload was never needed for that; it was confirmed as the dominant
+    # cost driver in tests/PERF_test_core_durations.md (~390/946 tests in
+    # test_core.py use this fixture, each paying a ~0.5-1s full module
+    # re-execution). The module-level caches a reload incidentally reset are
+    # reset explicitly below instead.
     from fastapi.testclient import TestClient
-
-    # Force a fresh import so lifespan picks up the env vars cleanly.
-    import importlib
     import meridian.server as server_module
 
-    server_module = importlib.reload(server_module)
+    server_module._CONNECTED_SESSIONS.clear()
+    from meridian._deps import _reset_limiter_counts
+
+    _reset_limiter_counts()
+    from meridian.mcp.handler import _recent_commits_cache
+
+    _recent_commits_cache.clear()
 
     with TestClient(server_module.app) as c:
         yield c
