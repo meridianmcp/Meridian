@@ -6646,6 +6646,7 @@ project_id = "${displayPid}"`;
   function _pluginLifecycleState(plugin, active, slotStatus) {
     if (active && active[plugin.slot]) {
       if (slotStatus && slotStatus[plugin.slot]) return "unhealthy";
+      if (plugin.enabled === false) return "active_disabled";
       return "active";
     }
     if (plugin.enabled !== false) return "installed_inactive";
@@ -6655,6 +6656,10 @@ project_id = "${displayPid}"`;
   function _renderLifecycleBadge(plugin, lifecycleState, installCmd) {
     const styles = {
       active: { dot: "var(--success, #3fb950)", label: "active", labelColor: "var(--success, #3fb950)" },
+      // 678ec121 — same green "connected" dot as active (it genuinely is
+      // connected right now), but the label + amber text call out the
+      // enabled/active mismatch instead of silently agreeing with the toggle.
+      active_disabled: { dot: "var(--success, #3fb950)", label: "active (disabled)", labelColor: "#f59e0b" },
       unhealthy: { dot: "var(--danger, #f85149)", label: "unhealthy", labelColor: "var(--danger, #f85149)" },
       installed_inactive: { dot: "#f59e0b", label: "inactive", labelColor: "#f59e0b" },
       not_installed: { dot: "var(--muted)", label: "not installed", labelColor: "var(--muted)" }
@@ -6668,6 +6673,8 @@ project_id = "${displayPid}"`;
       actionBtn = `<button class="secondary tp-install-btn" data-install-cmd="${safeCmd}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Copy the install command to run in your terminal">Copy command</button>`;
     } else if (lifecycleState === "installed_inactive") {
       actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">start tunnel to activate</span>`;
+    } else if (lifecycleState === "active_disabled") {
+      actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic" title="Still connected from an earlier session even though it's toggled off. Live connection state is per-session and does not update until the tunnel restarts or this slot idles out.">disabled \u2014 still connected</span>`;
     } else if (lifecycleState === "unhealthy") {
       actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">recovering\u2026</span>`;
     }
@@ -7631,7 +7638,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // node_modules/preact/dist/preact.module.js
+  // ../../../node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -7890,7 +7897,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // node_modules/preact/hooks/dist/hooks.module.js
+  // ../../../node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8031,7 +8038,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -8884,7 +8891,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // node_modules/zustand/esm/vanilla.mjs
+  // ../../../node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();
