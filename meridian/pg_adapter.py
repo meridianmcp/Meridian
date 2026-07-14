@@ -99,7 +99,17 @@ def _strip_unsupported_pg_query_params(url: str) -> str:
 # SQL translation  (? → %s for psycopg3)
 # ---------------------------------------------------------------------------
 
-_DATETIME_NOW_EXPR = "to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')"
+# 8a52dd26 -- clock_timestamp(), not now(): now()/CURRENT_TIMESTAMP is frozen at
+# transaction START for the whole transaction, not evaluated per statement. In
+# prod this is invisible (autocommit=True means every statement is its own
+# transaction, so now() is already fresh per call). But tests/conftest.py's
+# transactional test-isolation wraps a whole test in ONE transaction, so with
+# now() every row a test inserts gets the IDENTICAL timestamp -- breaking any
+# "newest first" ordering or elapsed-time check across rows created in the same
+# test. clock_timestamp() always returns the actual current time regardless of
+# transaction/savepoint boundaries, matching what callers actually mean by
+# "record when this happened."
+_DATETIME_NOW_EXPR = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')"
 
 
 def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
@@ -434,7 +444,8 @@ class PostgresConnection:
 # Postgres-compatible CREATE TABLE DDL
 # ---------------------------------------------------------------------------
 
-_TS = "to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')"
+# 8a52dd26 -- clock_timestamp(), not now(): see _DATETIME_NOW_EXPR above for why.
+_TS = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')"
 
 # Tables that go in every Postgres DB — customer DBs and the main auth DB.
 CREATE_TABLES_CORE = f"""
