@@ -4,14 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "meridian-docs"
-version = "0.1.0"
+version = "0.1.1"
 description = "Standalone, stdlib-only OOXML (DOCX) intelligence as an MCP server — the parser layer extracted from Meridian."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Adam Camerer" }]
 keywords = ["mcp", "docx", "ooxml", "documents", "thesis"]
-# The DOCX parser (docs_intel) is stdlib-only; the only runtime dep is the MCP SDK.
+# The DOCX parser (docs_intel) is stdlib-only; the only runtime dep is the
+# MCP SDK. document_content_tree for ingest_local_document_structure is a
+# vendored local copy (meridian_docs/_vendored_content_tree.py), not a
+# cross-package docparse dependency -- uvx's isolated --from <path>
+# environments do not reliably resolve path-based [tool.uv.sources]
+# dependencies (confirmed live, 2026-07-14).
+version = "0.1.2"
 dependencies = ["mcp>=1.0"]
 
 [project.scripts]

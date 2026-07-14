@@ -10,18 +10,6 @@
         "--mcp"
       ],
       "cwd": "${workspaceFolder}"
-    },
-    "meridian-fs": {
-      "type": "http",
-      "url": "https://usemeridian.us/fs/mcp/9819f043-8d83-4cad-a4f0-ca258fcc4983/mcp"
-    },
-    "meridian-code": {
-      "type": "http",
-      "url": "https://usemeridian.us/code/mcp/9819f043-8d83-4cad-a4f0-ca258fcc4983/mcp"
-    },
-    "meridian-extractor": {
-      "type": "http",
-      "url": "https://usemeridian.us/extract/mcp/9819f043-8d83-4cad-a4f0-ca258fcc4983/mcp"
     }
   }
 }

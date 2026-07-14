@@ -552,7 +552,7 @@ def ingest_local_document_structure(
         )
 
     try:
-        from docparse.docs_intel import document_content_tree  # noqa: PLC0415
+        from meridian_docs._vendored_content_tree import document_content_tree  # noqa: PLC0415
     except ImportError as exc:
         raise DocExtractionError(
             "docparse is not installed in this environment — install it with "
