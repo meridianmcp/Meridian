@@ -4130,7 +4130,12 @@ def test_build_sprint_items_xml_layout():
         }
     ])
     assert '<sprint_items cache="false">' in xml
-    assert '<item id="id-1" version="v0.6.4" status="pending">Dashboard save</item>' in xml
+    # fba94f1a — plain DB item has no prospecting evidence, so unprospected="true" is emitted.
+    assert 'id="id-1"' in xml
+    assert 'version="v0.6.4"' in xml
+    assert 'status="pending"' in xml
+    assert 'unprospected="true"' in xml
+    assert "Dashboard save" in xml
     assert xml.endswith("</sprint_items>")
 
 

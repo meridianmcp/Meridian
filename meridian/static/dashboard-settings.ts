@@ -176,11 +176,75 @@ function _applyActiveTabVisibility(projectId: any) {
   });
 }
 
+// 116e0245 — per-tab data cache so account/workspace tab fetches are lazy and
+// each tab's data is only loaded once (re-clicking a loaded tab never re-fetches).
+// Keys: "<projectId>:<tabKey>". Exported for vitest assertions.
+export const _settingsTabDataCache = new Map<string, any>();
+window._settingsTabDataCache = _settingsTabDataCache;
+
+// Load and render the Account tab's lazy-loaded sections (notifications card +
+// prefs). Called on first Account tab activation; skipped if already cached.
+export async function _loadSettingsAccountPane(projectId: any) {
+  const cacheKey = `${projectId}:account`;
+  if (_settingsTabDataCache.has(cacheKey)) {
+    // Already fetched — no re-fetch, just ensure DOM is populated (idempotent).
+    _applySettingsAccountPaneData(projectId, _settingsTabDataCache.get(cacheKey));
+    return;
+  }
+
+  const PREFS = [
+    { key: 'hitl',   label: 'HITL — get notified when a session needs your input' },
+    { key: 'sprint', label: 'Sprint done — all items completed' },
+  ];
+
+  // Show loading state inside the lazy placeholder containers.
+  const ntfyPlaceholder = document.getElementById(`settings-ntfy-lazy-${projectId}`);
+  const prefsPlaceholder = document.getElementById(`settings-prefs-lazy-${projectId}`);
+  if (ntfyPlaceholder) ntfyPlaceholder.innerHTML = '<div style="color:var(--muted);font-size:10px">loading…</div>';
+  if (prefsPlaceholder) prefsPlaceholder.innerHTML = '<div style="color:var(--muted);font-size:10px">loading…</div>';
+
+  try {
+    const [notifResult, ntfyResult, mcpResult] = await Promise.allSettled([
+      api('/settings/notifications'),
+      api(`/projects/${projectId}/ntfy`),
+      api('/settings/mcp-config'),
+    ]);
+
+    const data = { notifResult, ntfyResult, mcpResult, PREFS };
+    _settingsTabDataCache.set(cacheKey, data);
+    _applySettingsAccountPaneData(projectId, data);
+  } catch (e: any) {
+    if (ntfyPlaceholder) ntfyPlaceholder.innerHTML = '<div style="color:var(--muted);font-size:10px">Could not load notification settings.</div>';
+    if (prefsPlaceholder) prefsPlaceholder.innerHTML = '';
+  }
+}
+window._loadSettingsAccountPane = _loadSettingsAccountPane;
+
+function _applySettingsAccountPaneData(projectId: any, data: any) {
+  const { notifResult, ntfyResult, mcpResult, PREFS } = data;
+  const prefs = (notifResult.status === 'fulfilled') ? (notifResult.value.prefs || {}) : null;
+  const mcpData = (mcpResult.status === 'fulfilled') ? mcpResult.value : null;
+
+  const ntfyPlaceholder = document.getElementById(`settings-ntfy-lazy-${projectId}`);
+  if (ntfyPlaceholder) ntfyPlaceholder.outerHTML = _settingsNotificationsCardHtml(projectId, ntfyResult);
+
+  const prefsPlaceholder = document.getElementById(`settings-prefs-lazy-${projectId}`);
+  if (prefsPlaceholder) prefsPlaceholder.outerHTML = _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
+}
+window._applySettingsAccountPaneData = _applySettingsAccountPaneData;
+
 function _activateSettingsTab(projectId: any, key: any) {
   const body = document.getElementById(`settings-body-${projectId}`);
   if (!body) return;
   body.dataset.activeStab = key;
   _applyActiveTabVisibility(projectId);
+  // 116e0245 — lazy-load account tab data only when the Account tab is first clicked.
+  if (key === 'account') {
+    const cacheKey = `${projectId}:account`;
+    if (!_settingsTabDataCache.has(cacheKey)) {
+      _loadSettingsAccountPane(projectId).catch(() => {});
+    }
+  }
 }
 window._activateSettingsTab = _activateSettingsTab;
 
@@ -564,37 +628,23 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
   const _canInvite = _activeRole === 'owner' || _activeRole === 'admin';
 
 
-  const PREFS = [
-
-    { key: 'hitl',    label: 'HITL — get notified when a session needs your input' },
-
-    { key: 'sprint',  label: 'Sprint done — all items completed' },
-
-  ];
-
-
-
-  // Fetch both in parallel; mcp-config 404 = self-hosted (skip section).
+  // 116e0245 — lazy-load per-tab data: only fetch what the initial (project) tab
+  // needs. Account-tab data (notifications, ntfy) is deferred until the Account
+  // tab is first clicked. mcp-config 404 = self-hosted (skip section).
 
   try {
 
-  const [notifResult, mcpResult, settingsResult, ntfyResult, ghResult] = await Promise.allSettled([
-
-    api('/settings/notifications'),
+  const [mcpResult, settingsResult, ghResult] = await Promise.allSettled([
 
     api('/settings/mcp-config'),
 
     loadProjectSettings(projectId),
-
-    api(`/projects/${projectId}/ntfy`),
 
     api(`/projects/${projectId}/github/status`),
 
   ]);
 
 
-
-  const prefs = (notifResult.status === 'fulfilled') ? (notifResult.value.prefs || {}) : null;
 
   const mcpData = (mcpResult.status === 'fulfilled') ? mcpResult.value : null;
 
@@ -3707,11 +3757,12 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  html += _settingsNotificationsCardHtml(projectId, ntfyResult);
+  // 116e0245 — notifications card and prefs are lazy-loaded when Account tab
+  // is first clicked. Placeholder elements are replaced in-place by
+  // _applySettingsAccountPaneData once the fetch completes.
+  html += `<div id="settings-ntfy-lazy-${projectId}" style="color:var(--muted);font-size:10px">Notifications load when you open the Account tab.</div>`;
 
-
-
-  html += _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
+  html += `<div id="settings-prefs-lazy-${projectId}"></div>`;
 
   html += '</div></details>';  // close Account section
   html += '</div></details>';  // close ACCOUNT & WORKSPACE group

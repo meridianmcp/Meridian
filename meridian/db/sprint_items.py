@@ -1933,6 +1933,39 @@ async def get_sprint_items(
     return result
 
 
+def _item_is_unprospected(it: dict[str, Any]) -> bool:
+    """fba94f1a — return True when a sprint item has no prospecting evidence.
+
+    An item is considered prospected when ANY of the following hold:
+    - ``prospect_status`` is 'prospected' or 'cached' (set by
+      ``_annotate_code_pointers`` in handoff.py when a real match was found
+      or a prior pointer was reused).
+    - ``code_pointers`` is non-empty (code-graph match attached by the handoff
+      enrichment path or a prior ``claim_sprint_item`` prospecting step).
+    - ``pointers`` is non-empty (generic pointer attached for non-code source
+      types such as docs/citations).
+
+    Items that were intentionally skipped (``skipped_manual`` — human/MANUAL
+    items, ``skipped_cap`` — beyond the enrichment cap, ``no_backend`` — no
+    searcher wired for this source type) are NOT flagged unprospected: the
+    skip was deliberate and the flag would be misleading. Items with no
+    ``prospect_status`` at all (plain DB rows, never run through enrichment)
+    ARE flagged — that is the primary gap this function surfaces.
+    """
+    ps = it.get("prospect_status") or ""
+    # Intentional skips are not flagged.
+    if ps in ("skipped_manual", "skipped_cap", "no_backend"):
+        return False
+    # Confirmed prospected or reused cached pointer.
+    if ps in ("prospected", "cached"):
+        return False
+    # Non-empty code or generic pointer means real evidence exists.
+    if it.get("code_pointers") or it.get("pointers"):
+        return False
+    # Everything else: no evidence, flag it.
+    return True
+
+
 def build_sprint_items_xml(items: list[dict[str, Any]]) -> str:
     """Serialise sprint items as a ``<sprint_items>`` XML block.
 
@@ -1943,6 +1976,12 @@ def build_sprint_items_xml(items: list[dict[str, Any]]) -> str:
 
     Mirrors the get_goal XML envelope (v0.6.1) so cold sessions render
     the checklist alongside the goal text in a single prompt.
+
+    fba94f1a — items with no prospecting evidence (no code_pointers,
+    no pointers, no confirmed prospect_status) gain an
+    ``unprospected="true"`` attribute so an executor reading the /goal
+    can see explicitly which items lack real code grounding, rather than
+    silently treating a guess the same as a confirmed finding.
     """
     from xml.sax.saxutils import escape, quoteattr
     from collections import OrderedDict
@@ -1969,6 +2008,10 @@ def build_sprint_items_xml(items: list[dict[str, Any]]) -> str:
             attrs = f"id={iid} version={ver} status={status}"
             if pushed_to:
                 attrs += f" pushed_to={quoteattr(str(pushed_to))}"
+            # fba94f1a — emit unprospected="true" for items with no code grounding
+            # so an executor can distinguish confirmed findings from pure guesswork.
+            if _item_is_unprospected(it):
+                attrs += ' unprospected="true"'
             indent = "    " if group_name else "  "
             out.append(f"{indent}<item {attrs}>{title}</item>")
         if group_name:

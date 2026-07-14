@@ -2474,11 +2474,59 @@
       b2.style.fontWeight = active ? "600" : "400";
     });
   }
+  var _settingsTabDataCache = /* @__PURE__ */ new Map();
+  window._settingsTabDataCache = _settingsTabDataCache;
+  async function _loadSettingsAccountPane(projectId) {
+    const cacheKey = `${projectId}:account`;
+    if (_settingsTabDataCache.has(cacheKey)) {
+      _applySettingsAccountPaneData(projectId, _settingsTabDataCache.get(cacheKey));
+      return;
+    }
+    const PREFS = [
+      { key: "hitl", label: "HITL \u2014 get notified when a session needs your input" },
+      { key: "sprint", label: "Sprint done \u2014 all items completed" }
+    ];
+    const ntfyPlaceholder = document.getElementById(`settings-ntfy-lazy-${projectId}`);
+    const prefsPlaceholder = document.getElementById(`settings-prefs-lazy-${projectId}`);
+    if (ntfyPlaceholder) ntfyPlaceholder.innerHTML = '<div style="color:var(--muted);font-size:10px">loading\u2026</div>';
+    if (prefsPlaceholder) prefsPlaceholder.innerHTML = '<div style="color:var(--muted);font-size:10px">loading\u2026</div>';
+    try {
+      const [notifResult, ntfyResult, mcpResult] = await Promise.allSettled([
+        api("/settings/notifications"),
+        api(`/projects/${projectId}/ntfy`),
+        api("/settings/mcp-config")
+      ]);
+      const data = { notifResult, ntfyResult, mcpResult, PREFS };
+      _settingsTabDataCache.set(cacheKey, data);
+      _applySettingsAccountPaneData(projectId, data);
+    } catch (e3) {
+      if (ntfyPlaceholder) ntfyPlaceholder.innerHTML = '<div style="color:var(--muted);font-size:10px">Could not load notification settings.</div>';
+      if (prefsPlaceholder) prefsPlaceholder.innerHTML = "";
+    }
+  }
+  window._loadSettingsAccountPane = _loadSettingsAccountPane;
+  function _applySettingsAccountPaneData(projectId, data) {
+    const { notifResult, ntfyResult, mcpResult, PREFS } = data;
+    const prefs = notifResult.status === "fulfilled" ? notifResult.value.prefs || {} : null;
+    const mcpData = mcpResult.status === "fulfilled" ? mcpResult.value : null;
+    const ntfyPlaceholder = document.getElementById(`settings-ntfy-lazy-${projectId}`);
+    if (ntfyPlaceholder) ntfyPlaceholder.outerHTML = _settingsNotificationsCardHtml(projectId, ntfyResult);
+    const prefsPlaceholder = document.getElementById(`settings-prefs-lazy-${projectId}`);
+    if (prefsPlaceholder) prefsPlaceholder.outerHTML = _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
+  }
+  window._applySettingsAccountPaneData = _applySettingsAccountPaneData;
   function _activateSettingsTab(projectId, key) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
     body.dataset.activeStab = key;
     _applyActiveTabVisibility(projectId);
+    if (key === "account") {
+      const cacheKey = `${projectId}:account`;
+      if (!_settingsTabDataCache.has(cacheKey)) {
+        _loadSettingsAccountPane(projectId).catch(() => {
+        });
+      }
+    }
   }
   window._activateSettingsTab = _activateSettingsTab;
   function _organizeSettingsIntoTabs(projectId) {
@@ -2753,10 +2801,6 @@
     const _activeRole = await getActiveWorkspaceRole();
     const _guest = _activeRole === "viewer" || _activeRole === "member";
     const _canInvite = _activeRole === "owner" || _activeRole === "admin";
-    const PREFS = [
-      { key: "hitl", label: "HITL \u2014 get notified when a session needs your input" },
-      { key: "sprint", label: "Sprint done \u2014 all items completed" }
-    ];
     try {
       let buildHookCurlHeaders2 = function(token) {
         const headers = [];
@@ -2795,14 +2839,11 @@ session_start = ${JSON.stringify(start)}
 stop = ${JSON.stringify(stop)}`;
       };
       var buildHookCurlHeaders = buildHookCurlHeaders2, buildHookCurlCommand = buildHookCurlCommand2, buildHookPowerShellCommand = buildHookPowerShellCommand2, buildClaudeHookSnippet = buildClaudeHookSnippet2, buildCodexHookSnippet = buildCodexHookSnippet2;
-      const [notifResult, mcpResult, settingsResult, ntfyResult, ghResult] = await Promise.allSettled([
-        api("/settings/notifications"),
+      const [mcpResult, settingsResult, ghResult] = await Promise.allSettled([
         api("/settings/mcp-config"),
         loadProjectSettings(projectId),
-        api(`/projects/${projectId}/ntfy`),
         api(`/projects/${projectId}/github/status`)
       ]);
-      const prefs = notifResult.status === "fulfilled" ? notifResult.value.prefs || {} : null;
       const mcpData = mcpResult.status === "fulfilled" ? mcpResult.value : null;
       const projectSettings = settingsResult.status === "fulfilled" ? settingsResult.value : { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
       const ghData = ghResult.status === "fulfilled" ? ghResult.value : null;
@@ -5085,8 +5126,8 @@ project_id = "${displayPid}"`;
           }
         }, 0);
       }
-      html += _settingsNotificationsCardHtml(projectId, ntfyResult);
-      html += _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
+      html += `<div id="settings-ntfy-lazy-${projectId}" style="color:var(--muted);font-size:10px">Notifications load when you open the Account tab.</div>`;
+      html += `<div id="settings-prefs-lazy-${projectId}"></div>`;
       html += "</div></details>";
       html += "</div></details>";
       if ((window.state.tenantPlan || "") === "admin" || !isHostedMode()) {
@@ -7638,7 +7679,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // ../../../node_modules/preact/dist/preact.module.js
+  // node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -7897,7 +7938,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // ../../../node_modules/preact/hooks/dist/hooks.module.js
+  // node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8038,7 +8079,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -8891,7 +8932,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // ../../../node_modules/zustand/esm/vanilla.mjs
+  // node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();
