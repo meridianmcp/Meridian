@@ -1652,6 +1652,48 @@ async def _active_executor_session_warnings(db: Any, project_id: str) -> list[st
     return warnings
 
 
+async def _wave_assignment_hint(db: Any, project_id: str) -> str | None:
+    """a389b95d — nudge callers to run assign_sprint_waves when unassigned items exist.
+
+    Returns a non-blocking ``wave_assignment_hint`` string when:
+      1. One or more pending/todo items have ``wave IS NULL`` (no wave label assigned), AND
+      2. No executor session has been seen active in the last 10 minutes (i.e. it is safe
+         to re-run assign_sprint_waves without risking desync against a mid-flight /goal
+         that already references specific wave labels).
+
+    Returns ``None`` when waves are fully assigned or an active session is in-flight
+    (in which case automatic mutation would be unsafe).
+
+    Non-fatal by design — any error returns ``None`` so the calling add/fan-out path
+    is never blocked.  Mirrors the ``drift_warning`` / ``symbol_scope_hint`` /
+    ``active_session_warning`` response-field pattern already used by ``add_sprint_item``.
+    """
+    try:
+        # Count pending/todo items with no wave label yet.
+        async with db.execute(
+            "SELECT COUNT(*) FROM sprint_items "
+            "WHERE project_id = ? AND wave IS NULL AND status IN ('todo', 'pending')",
+            (project_id,),
+        ) as _cur:
+            _row = await _cur.fetchone()
+        _unassigned = (_row[0] if _row else 0) if _row is not None else 0
+        if not _unassigned:
+            return None
+        # Only emit the nudge when no executor is currently mid-flight — if sessions
+        # are active we stay silent (auto-mutation could desync them from their /goal).
+        _active = await _active_executor_session_warnings(db, project_id)
+        if _active:
+            return None
+        return (
+            f"WAVE_ASSIGNMENT_HINT: {_unassigned} pending/todo item(s) have no wave "
+            "label (wave IS NULL). Run assign_sprint_waves() to assign parallelization "
+            "waves before executors start claiming — labels cannot safely be reassigned "
+            "once sessions are in-flight."
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never block add/fan-out
+        return None
+
+
 async def _unclaimed_file_warnings(
     db: Any,
     session_id: str,
@@ -4538,6 +4580,12 @@ async def _handle_sprint_tools(
         )
         if _sym_hint:
             _extra["symbol_scope_hint"] = _sym_hint
+        # a389b95d — nudge callers to run assign_sprint_waves when unassigned items
+        # exist and no session is in-flight (safe to re-label). Mirrors the
+        # drift_warning / symbol_scope_hint pattern: non-blocking, info-only field.
+        _wave_hint = await _wave_assignment_hint(db, args["project_id"])
+        if _wave_hint:
+            _extra["wave_assignment_hint"] = _wave_hint
         if _extra:
             _new_item = {**_new_item, **_extra}
         return _new_item
@@ -4584,6 +4632,11 @@ async def _handle_sprint_tools(
                 _fo_sym_hints.append(_sh)
         if _fo_sym_hints:
             _result["symbol_scope_hints"] = _fo_sym_hints
+        # a389b95d — same wave-assignment nudge as add_sprint_item: after a batch
+        # fan-out, the newly-filed items almost certainly have wave IS NULL.
+        _fo_wave_hint = await _wave_assignment_hint(db, args["project_id"])
+        if _fo_wave_hint:
+            _result["wave_assignment_hint"] = _fo_wave_hint
         return _result
     if name == "update_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
