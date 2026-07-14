@@ -19,6 +19,11 @@ jobs:
     # worker) can never keep the job "in progress" indefinitely. --timeout=60
     # below kills the individual test first; this is the backstop for the job.
     timeout-minutes: 15
+    env:
+      # 61f891b0 — sys.monitoring, Python 3.12+: 53% relative reduction in
+      # coverage overhead at comparable scale (documented, Warehouse/PyPI).
+      # Scoped to test-core only -- test-postgres runs no --cov flag.
+      COVERAGE_CORE: sysmon
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.8.1
