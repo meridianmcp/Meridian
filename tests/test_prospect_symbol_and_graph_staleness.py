@@ -539,3 +539,327 @@ def test_prospect_symbol_schema_requires_symbol():
     tool = next(t for t in _MCP_TOOLS_LIST if t["name"] == "prospect_symbol")
     schema = tool.get("inputSchema", {})
     assert "symbol" in schema.get("required", [])
+
+
+# ---------------------------------------------------------------------------
+# Part 3 — 9033914e: graph_empty after fresh index_repository
+# ---------------------------------------------------------------------------
+#
+# Regression tests for the confirmed bug: prospect_symbol reported
+# "graph_empty" immediately after index_repository returned a populated
+# graph.  Root causes:
+#
+#  (A) When search_graph with a project_id returns zero results but the
+#      SAME graph has results WITHOUT a project_id (project_id slug mismatch
+#      between caller and what index_repository auto-assigned), the system
+#      should retry without project_id and surface those results instead of
+#      silently reporting graph_empty.
+#
+#  (B) When search_graph returns an application-level error object inside the
+#      MCP content envelope (e.g. {"error": "unknown project"}) rather than a
+#      JSON-RPC error, prospect_symbol must NOT treat it as zero results and
+#      report "graph_empty" — it should report "graph_error: ...".
+#
+#  (C) _annotate_graph_result_staleness must fall back to the wildcard
+#      "{tenant_id}:*" fingerprint key when no project-specific key exists,
+#      so that a fingerprint stored by index_repository (which has no
+#      project_id argument) is visible to a later search_graph call that
+#      carries a project_id.
+
+class TestGraphEmptyAfterFreshIndex:
+    """9033914e — regression tests for graph_empty immediately after index."""
+
+    @pytest.mark.asyncio
+    async def test_project_id_mismatch_falls_back_to_broad_search(self, monkeypatch):
+        """When search_graph with project_id returns zero hits but the same
+        graph has hits WITHOUT project_id, the broad fallback succeeds and
+        the rung is 'graph' (not 'none') with an informative fallback_reason."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        hits_payload = {"results": [
+            {"file": "analysis.py", "line": 42, "name": "dominant_segments_from_group"},
+        ]}
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                # With project_id → empty (slug mismatch).
+                if args.get("project_id"):
+                    return _text_result({"results": []})
+                # Without project_id → real hits.
+                return _text_result(hits_payload)
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-mismatch"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="dominant_segments_from_group",
+            project_id="C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        # The broad fallback must succeed and land on graph rung.
+        assert result["rung"] == "graph", f"expected graph rung, got {result['rung']!r}"
+        assert len(result["hits"]) == 1
+        assert result["hits"][0]["name"] == "dominant_segments_from_group"
+        # fallback_reason must describe the project_id mismatch (not "graph_empty").
+        assert result.get("fallback_reason") is not None
+        assert "project_id" in str(result["fallback_reason"]).lower() or \
+               "mismatch" in str(result["fallback_reason"]).lower() or \
+               "broad" in str(result["fallback_reason"]).lower(), \
+               f"fallback_reason should describe mismatch: {result.get('fallback_reason')!r}"
+
+    @pytest.mark.asyncio
+    async def test_app_level_error_in_content_sets_graph_error_reason(self, monkeypatch):
+        """When search_graph returns an application-level error dict inside the
+        MCP content envelope (not a JSON-RPC error), prospect_symbol must NOT
+        report 'graph_empty' — it must report 'graph_error: ...' so the caller
+        knows the real cause."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        # Application-level error returned as text content (not JSON-RPC error).
+        error_result = _text_result({"error": "unknown project", "code": 404})
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                return error_result
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-app-err"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="dominant_segments_from_group",
+            project_id="some-project",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        # Must NOT be "graph_empty" — the real cause is an app-level error.
+        assert result["rung"] == "none"
+        fr = str(result.get("fallback_reason") or "")
+        assert "graph_error" in fr, (
+            f"expected fallback_reason to contain 'graph_error', got {fr!r}"
+        )
+        assert "unknown project" in fr, (
+            f"expected error message in fallback_reason, got {fr!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_json_text_error_sets_graph_error_reason(self, monkeypatch):
+        """When search_graph returns a non-JSON text block (e.g. a raw error
+        string), prospect_symbol must report 'graph_error: ...' not 'graph_empty'."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        # Non-JSON text response (raw error string from the server).
+        raw_error_result = {"content": [{"type": "text", "text": "Error: project not found"}]}
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                return raw_error_result
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-raw-err"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="dominant_segments_from_group",
+            project_id="some-project",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        assert result["rung"] == "none"
+        fr = str(result.get("fallback_reason") or "")
+        # Raw text error must surface as graph_error, not graph_empty.
+        assert "graph_error" in fr, (
+            f"expected 'graph_error' in fallback_reason, got {fr!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_both_broad_searches_empty_falls_through(self, monkeypatch):
+        """When search_graph returns empty both with AND without project_id,
+        fall through to Serena and report the right fallback_reason."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        serena_result = _text_result([
+            {"file": "analysis.py", "line": 10, "name": "dominant_segments_from_group"},
+        ])
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                return _text_result({"results": []})
+            if name == "extractor__find_symbol":
+                return serena_result
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-both-empty"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="dominant_segments_from_group",
+            project_id="C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        # Fell through to Serena (graph was empty for both attempts).
+        assert result["rung"] == "serena"
+        assert len(result["hits"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_project_id_no_broad_retry(self, monkeypatch):
+        """When no project_id is passed, there is no second search_graph call
+        (nothing to retry without), and graph_empty is reported correctly."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        call_count = [0]
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                call_count[0] += 1
+                return _text_result({"results": []})
+            if name in ("extractor__find_symbol", "extractor__find_declaration"):
+                return _text_result([])
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-nopid"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="something",
+            project_id="",  # no project_id
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        assert result["rung"] == "none"
+        # Only ONE search_graph call when no project_id — no broad retry.
+        assert call_count[0] == 1, f"expected 1 call, got {call_count[0]}"
+        assert result.get("fallback_reason") == "graph_empty"
+
+
+class TestFingerprintWildcardFallback:
+    """9033914e — staleness fingerprint wildcard fallback for project-specific
+    search_graph calls after a project_id-less index_repository run."""
+
+    @pytest.mark.asyncio
+    async def test_wildcard_key_used_when_project_specific_absent(self, monkeypatch):
+        """When a search_graph call has a project_id but only a wildcard
+        fingerprint exists (stored by index_repository), the wildcard is used
+        as the staleness baseline so the comparison fires correctly."""
+        tenant_id = "tenant-wildcard-fb"
+        wildcard_key = f"{tenant_id}:*"
+        project_key = f"{tenant_id}:C-Users-13144-Documents-Masters_Thesis"
+
+        # Simulate: index_repository ran and stored under wildcard.
+        tunnel._code_graph_fingerprints[wildcard_key] = "INDEX-COMMIT"
+        # No project-specific key.
+        tunnel._code_graph_fingerprints.pop(project_key, None)
+
+        async def _fake_fetch(tid, args):
+            return "NEWER-COMMIT"  # Graph has changed since index.
+
+        monkeypatch.setattr(tunnel, "_fetch_graph_current_fingerprint", _fake_fetch)
+
+        result = _text_result({"results": [{"file": "foo.py", "line": 1}]})
+        enriched = await tunnel._annotate_graph_result_staleness(
+            tenant_id,
+            "codebase__search_graph",
+            {"project_id": "C-Users-13144-Documents-Masters_Thesis", "query": "foo"},
+            result,
+        )
+        # Must have detected staleness via wildcard fallback.
+        stale = enriched.get("_graph_staleness")
+        assert stale is not None, (
+            "expected staleness annotation when wildcard key exists and "
+            "fingerprints differ, but got none"
+        )
+        assert stale["stale"] is True
+        assert "INDEX-COMMIT" in stale["warning"]
+        assert "NEWER-COMMIT" in stale["warning"]
+
+        # Cleanup.
+        tunnel._code_graph_fingerprints.pop(wildcard_key, None)
+        tunnel._code_graph_fingerprints.pop(project_key, None)
+
+    @pytest.mark.asyncio
+    async def test_project_specific_key_takes_precedence_over_wildcard(self, monkeypatch):
+        """When BOTH a project-specific and a wildcard key exist, the
+        project-specific key is used (it takes precedence)."""
+        tenant_id = "tenant-proj-precedence"
+        wildcard_key = f"{tenant_id}:*"
+        project_key = f"{tenant_id}:myrepo"
+
+        tunnel._code_graph_fingerprints[wildcard_key] = "WILDCARD-COMMIT"
+        tunnel._code_graph_fingerprints[project_key] = "PROJECT-COMMIT"
+
+        fetch_args_seen: list = []
+
+        async def _fake_fetch(tid, args):
+            fetch_args_seen.append(args)
+            return "PROJECT-COMMIT"  # Same → no staleness.
+
+        monkeypatch.setattr(tunnel, "_fetch_graph_current_fingerprint", _fake_fetch)
+
+        result = _text_result({"results": []})
+        out = await tunnel._annotate_graph_result_staleness(
+            tenant_id,
+            "codebase__search_graph",
+            {"project_id": "myrepo", "query": "x"},
+            result,
+        )
+        # Fingerprints match → no staleness annotation.
+        assert "_graph_staleness" not in out
+        # Must have fetched ONCE (for the project-specific key comparison).
+        assert len(fetch_args_seen) == 1
+
+        tunnel._code_graph_fingerprints.pop(wildcard_key, None)
+        tunnel._code_graph_fingerprints.pop(project_key, None)
+
+    @pytest.mark.asyncio
+    async def test_no_wildcard_and_no_project_key_skips_fetch(self, monkeypatch):
+        """When neither a wildcard nor a project-specific fingerprint exists,
+        no fetch is performed and the result passes through unchanged."""
+        tenant_id = "tenant-no-keys"
+        tunnel._code_graph_fingerprints.pop(f"{tenant_id}:*", None)
+        tunnel._code_graph_fingerprints.pop(f"{tenant_id}:myrepo", None)
+
+        fetch_called = [False]
+
+        async def _fake_fetch(tid, args):
+            fetch_called[0] = True
+            return "SOME-COMMIT"
+
+        monkeypatch.setattr(tunnel, "_fetch_graph_current_fingerprint", _fake_fetch)
+
+        result = _text_result({"results": [{"file": "x.py"}]})
+        out = await tunnel._annotate_graph_result_staleness(
+            tenant_id,
+            "codebase__search_graph",
+            {"project_id": "myrepo"},
+            result,
+        )
+        assert "_graph_staleness" not in out
+        assert not fetch_called[0], "fetch should not be called when no baseline exists"

@@ -3243,6 +3243,14 @@ async def _annotate_graph_result_staleness(
     cross-check with Serena. When fingerprints match (or either is unknown),
     the result passes through unchanged. Fail-open — any error returns the
     original result untouched.
+
+    9033914e — when a project-specific fingerprint is absent, fall back to the
+    wildcard ``{tenant_id}:*`` key.  ``index_repository`` is always called
+    without a ``project_id`` argument (it takes ``repo_path`` instead), so it
+    always stores the fingerprint under the wildcard key regardless of which
+    project_id a subsequent ``search_graph`` call uses.  Without this fallback,
+    the staleness guard silently fires when fingerprints DO diverge because the
+    project-specific key is never populated from the index_repository run.
     """
     bare = name.split("__", 1)[1] if "__" in name else name
     if bare != "search_graph":
@@ -3252,6 +3260,15 @@ async def _annotate_graph_result_staleness(
     try:
         fkey = _graph_fingerprint_key(tenant_id, arguments)
         stored = _code_graph_fingerprints.get(fkey)
+        # 9033914e — if no project-specific fingerprint, fall back to the
+        # wildcard key that index_repository always writes to.  This bridges
+        # the index_repository (no project_id → "*" key) → search_graph (has
+        # project_id → project-specific key) gap so staleness detection fires
+        # correctly instead of silently doing nothing.
+        if not stored:
+            wildcard_key = f"{tenant_id}:*"
+            if wildcard_key != fkey:
+                stored = _code_graph_fingerprints.get(wildcard_key)
         # Only fetch the current fingerprint when we have a stored baseline to
         # compare against. Without a stored fingerprint there's nothing to diff,
         # and we avoid an extra codebase__index_status round-trip on every
