@@ -3643,550 +3643,62 @@ async def _handle_session_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log, get_agent_instructions, set_agent_instructions, set_executor_config, idle_until_session_done, search_all, get_session_brief."""
+    """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log,
+    get_session_activity, get_agent_instructions, set_agent_instructions,
+    set_executor_config, idle_until_session_done, search_all, search_synthesis,
+    paper_search, get_session_brief.
+
+    81abd31f — the original if/elif chain has been replaced with a per-tool
+    dispatch table (dict mapping tool name -> handler function).  Each tool's
+    logic lives in its own named function in
+    ``meridian.mcp.handlers.session_tools``.  This is a PURELY MECHANICAL
+    extraction: zero behaviour change, same tool names, same arguments, same
+    return values.
+    """
+    from .handlers.session_tools import (  # noqa: PLC0415
+        handle_checkpoint,
+        handle_get_context_block,
+        handle_list_sessions,
+        handle_get_session_log,
+        handle_get_session_activity,
+        handle_get_agent_instructions,
+        handle_set_agent_instructions,
+        handle_set_executor_config,
+        handle_idle_until_session_done,
+        handle_search_all,
+        handle_search_synthesis,
+        handle_paper_search,
+        handle_get_session_brief,
+    )
+
+    # Tools that need no extra context beyond the standard five parameters.
+    _standard_dispatch: dict[str, Any] = {
+        "get_context_block": handle_get_context_block,
+        "list_sessions": handle_list_sessions,
+        "get_session_log": handle_get_session_log,
+        "get_session_activity": handle_get_session_activity,
+        "get_agent_instructions": handle_get_agent_instructions,
+        "set_agent_instructions": handle_set_agent_instructions,
+        "set_executor_config": handle_set_executor_config,
+        "idle_until_session_done": handle_idle_until_session_done,
+        "search_all": handle_search_all,
+        "search_synthesis": handle_search_synthesis,
+        "paper_search": handle_paper_search,
+        "get_session_brief": handle_get_session_brief,
+    }
+
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+
+    # checkpoint needs handler-level _fetch_recent_commits and
+    # _resolve_caller_identity passed explicitly to keep the import graph acyclic.
     if name == "checkpoint":
-        session_id = args["session_id"]
-        project_id = args["project_id"]
-        await db_module.auto_capture_session(db, project_id, session_id)
-        await _server._finalize_session_md(db, project_id, session_id)
-        from .. import handoff as handoff_module_local
-        # Fetch recent commits for reconcile annotations (non-fatal)
-        _ckpt_project = await db_module.get_project(db, project_id)
-        _commits = await _fetch_recent_commits(_ckpt_project or {}, tenant)
-        try:
-            _, content, _ = await asyncio.wait_for(
-                handoff_module_local.generate_handoff(
-                    db, project_id, data_dir, mode="delta", session_id=session_id,
-                    commit_messages=[c["message"] for c in _commits],
-                    identity=_resolve_caller_identity(tenant),
-                ),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            content = "delta handoff timed out"
-        pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
-        # Log drift warnings for high-confidence reconcile matches (non-fatal)
-        if _commits and pending_items:
-            try:
-                _matches = handoff_module_local.reconcile_sprint_items(
-                    pending_items, _commits
-                )
-                for _m in _matches:
-                    if _m.get("confidence") == "high":
-                        _first_sha = (_m["matching_commits"][0].get("sha") or "")[:8]
-                        await db_module.log_task(
-                            db, session_id, project_id,
-                            f"Sprint board drift detected: {_m['item_id'][:8]} "
-                            f"may already be done (matches commit {_first_sha})",
-                            status="pending",
-                        )
-            except Exception:  # noqa: BLE001
-                pass
-        ids_str = ", ".join(it["id"][:8] for it in pending_items[:8])
-        next_goal = (
-            f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
-            f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
-        ) if pending_items else "/goal Continue work — all sprint items done."
-        # 04f03ee4 — include start_session one-liner so next session can resume immediately
-        # 11a91d31 — default to project_name (idiomatic per 8a449ec0); project_id as a comment.
-        try:
-            _ck_proj = await db_module.get_project(db, project_id)
-            _ck_pname = (_ck_proj or {}).get("name") or project_id
-        except Exception:  # noqa: BLE001
-            _ck_pname = project_id
-        start_fresh = (
-            f'start_session(project_name="{_ck_pname}", session_name="describe-what-youre-doing")'
-            f'  # project_id={project_id}'
+        return await handle_checkpoint(
+            args, db, data_dir, tenant, _mcp_tenant_id,
+            fetch_recent_commits=_fetch_recent_commits,
+            resolve_caller_identity=_resolve_caller_identity,
         )
-        # fa595ad8 — store snapshot for Recent Sessions dashboard panel (non-fatal)
-        # v3.1 — snapshot now lives on sessions.checkpoint_data, not a checkpoint:* note.
-        try:
-            from datetime import datetime as _ckpt_dt, timezone as _ckpt_tz
-            async with db.execute(
-                "SELECT name FROM sessions WHERE id = ?", (session_id,)
-            ) as _sc:
-                _sr = await _sc.fetchone()
-            _session_name = (_sr["name"] if _sr else None) or session_id[:8]
-            async with db.execute(
-                "SELECT COUNT(*) AS n FROM task_log "
-                "WHERE session_id = ? AND status = 'done'",
-                (session_id,),
-            ) as _tc:
-                _tr = await _tc.fetchone()
-            _items_done = int(_tr["n"]) if _tr else 0
-            _summary_line = (content or "").split("\n")[0][:140]
-            await db_module.set_session_checkpoint(
-                db, session_id,
-                {
-                    "session_id": session_id,
-                    "session_name": _session_name,
-                    "items_done": _items_done,
-                    "summary_line": _summary_line,
-                    "next_goal": next_goal,
-                    "start_fresh": start_fresh,
-                    "checkpointed_at": _ckpt_dt.now(_ckpt_tz.utc).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                },
-            )
-        except Exception:
-            pass  # non-fatal — checkpoint still returns normally
-        # Write plain-text session_summary for RECENT RUNS panel display
-        try:
-            _shipped_titles: list[str] = []
-            async with db.execute(
-                "SELECT si.title FROM sprint_items si "
-                "JOIN task_log tl ON tl.id = si.task_id "
-                "WHERE tl.session_id = ? AND si.status = 'done'",
-                (session_id,),
-            ) as _si_cur:
-                for _si_row in await _si_cur.fetchall():
-                    _t = _si_row["title"] if hasattr(_si_row, "__getitem__") else _si_row[0]
-                    if _t not in _shipped_titles:
-                        _shipped_titles.append(_t)
-            async with db.execute(
-                "SELECT DISTINCT si.title FROM sprint_items si "
-                "JOIN task_log tl ON tl.sprint_item_id = si.id "
-                "WHERE tl.session_id = ? AND tl.status = 'done' AND si.status = 'done'",
-                (session_id,),
-            ) as _si_cur2:
-                for _si_row2 in await _si_cur2.fetchall():
-                    _t2 = _si_row2["title"] if hasattr(_si_row2, "__getitem__") else _si_row2[0]
-                    if _t2 not in _shipped_titles:
-                        _shipped_titles.append(_t2)
-            _shipped_str = ", ".join(_shipped_titles) if _shipped_titles else "none"
-            _plain_summary = (
-                f"Shipped: {_shipped_str}. "
-                f"Tasks done: {_items_done}. "
-                f"Deploy: no."
-            )
-            await db.execute(
-                "UPDATE sessions SET session_summary = ? WHERE id = ?",
-                (_plain_summary, session_id),
-            )
-        except Exception:
-            pass  # non-fatal
-        # 1c4fdd6c — sprint-drift guard: sweep in_progress items and surface them
-        # so the executor confirms done/not-done before the handoff is final
-        # (the #1 cause of board drift is forgetting complete_sprint_item).
-        _in_progress = await db_module.get_sprint_items(
-            db, project_id, status="in_progress"
-        )
-        _ckpt_resp = {
-            "summary": content,
-            "pending_count": len(pending_items),
-            "pending_ids": ids_str,
-            "next_goal": next_goal,
-            "start_fresh": start_fresh,
-        }
-        if _in_progress:
-            _ckpt_resp["in_progress_items"] = [
-                {"id": it["id"], "title": (it.get("title") or "")[:80]}
-                for it in _in_progress
-            ]
-            _n = len(_in_progress)
-            _ckpt_resp["action_required"] = (
-                f"You have {_n} in_progress sprint item{'s' if _n != 1 else ''}. "
-                "Before this handoff is final, confirm each: call "
-                "complete_sprint_item(item_id) for any that shipped, or leave it "
-                "in_progress / fail_sprint_item(item_id, reason) if not done. "
-                "These are NOT auto-reconciled from git — you must mark them."
-            )
-        return _ckpt_resp
-    if name == "get_context_block":
-        # v2.3 — assemble the same shape as /projects/{id}/context-block but
-        # return both the rendered text AND the source dict so MCP clients
-        # can choose to render their own variant.
-        # v2.5 — wrap in semantic XML for better Claude Code parsing.
-        project_id = args["project_id"]
-        mode = args.get("mode", "full")
-        project = await db_module.get_project(db, project_id)
-        if project is None:
-            raise ValueError("project not found")
-        goal = await db_module.get_goal(db, project_id)
-        sprint_items = await db_module.get_sprint_items(
-            db, project_id, status="pending"
-        )
-        all_tasks = await db_module.get_tasks(db, project_id, limit=20)
-        pending_tasks = [
-            t for t in all_tasks if t.get("status") in ("pending", "in_progress", "done")
-        ][:10]
-        sessions = await db_module.get_sessions(db, project_id, active_only=True)
-        decisions_raw = (project.get("decisions") or "").strip()
-        recent_decisions = [
-            l.strip() for l in decisions_raw.splitlines() if l.strip()
-        ][-5:]
-        text = _server._render_context_block(
-            project, goal, sprint_items, pending_tasks, sessions, recent_decisions,
-            mode=mode,
-        )
-        # v3.1 — workspace decisions + notes apply across all projects; surface
-        # them at the very top so a fresh session sees org-wide truth first.
-        ws_decisions = await db_module.get_workspace_decisions(db, tenant_id=_mcp_tenant_id)
-        ws_notes = await db_module.get_workspace_notes(db, tenant_id=_mcp_tenant_id)
-        ws_block = _server._render_workspace_block(ws_decisions, ws_notes)
-        if ws_block:
-            text = f"{ws_block}\n\n{text}"
-        xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
-        return {"mode": mode, "text": xml_text, "project_id": project_id}
-    if name == "list_sessions":
-        active_only = args.get("status", "active") != "all"
-        return await db_module.get_sessions(db, args["project_id"], active_only=active_only)
-    if name == "get_session_log":
-        _log_sid = args.get("session_id", "")
-        run = await db_module.get_executor_run_by_session(db, _log_sid)
-        if run is None:
-            return {"error": "no run found for session"}
-        # 8c147109 — include the ring-buffer activity feed so a remote planner
-        # sees real signs of life even before the executor calls log_task().
-        _activity: list[dict] = []
-        try:
-            _activity = await db_module.get_session_activity(
-                db, _log_sid, limit=args.get("activity_limit", 20)
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return {
-            "run_id": run["id"],
-            "session_id": run["session_id"],
-            "started_at": run["started_at"],
-            "ended_at": run.get("ended_at"),
-            "status": run["status"],
-            "task_count": run["task_count"],
-            "transcript": run["transcript"],
-            "recent_activity": _activity,
-            "activity_note": (
-                "recent_activity is a ring-buffer of the last tool calls made by "
-                "this executor session (newest first, max 50 entries). It is "
-                "populated automatically by the MCP dispatcher — no explicit "
-                "log_task() call is needed."
-            ),
-        }
-    if name == "get_session_activity":
-        # 8c147109 — standalone tool so planners can fetch just the heartbeat
-        # feed without the full transcript when polling for liveness.
-        _ga_sid = args.get("session_id", "")
-        _ga_limit = min(int(args.get("limit", 20)), 50)
-        try:
-            _ga_entries = await db_module.get_session_activity(db, _ga_sid, limit=_ga_limit)
-        except Exception:  # noqa: BLE001
-            _ga_entries = []
-        return {
-            "session_id": _ga_sid,
-            "activity": _ga_entries,
-            "count": len(_ga_entries),
-        }
-    if name == "get_agent_instructions":
-        instructions = await db_module.get_agent_instructions(db, args["project_id"])
-        return {"project_id": args["project_id"], "agent_instructions": instructions}
-    if name == "set_agent_instructions":
-        validate_input_size(args.get("instructions"), "agent_instructions", 100_000)
-        instructions = (args.get("instructions") or "").strip() or None
-        return await db_module.set_agent_instructions(db, args["project_id"], instructions)
-    if name == "set_executor_config":
-        from ..executor_config import merge_repo_paths  # local — avoid import cycle
-        # Merge onto the existing config so we never wipe other keys (repo_paths,
-        # hostnames, filesystem_roots, …). repo_paths is merged entry-by-entry so
-        # a manual {cwd, hostname} coexists with hook-registered ones.
-        existing = await db_module.get_executor_config(db, args["project_id"])
-        cfg = dict(existing) if isinstance(existing, dict) else {}
-        # 3adbc954 — filesystem_roots, hostnames, context_threshold and isolation
-        # were missing from this copy list, so passing them was silently dropped
-        # (the call returned filesystem_roots: []). All scalar/list keys overwrite;
-        # repo_paths alone is merged entry-by-entry below.
-        for k in ("repo_path", "env_file", "test_cmd", "test_min",
-                  "deploy_cmd", "shell_type", "branch",
-                  "filesystem_roots", "hostnames", "context_threshold",
-                  "isolation", "max_turns",
-                  # b970fe07 — dashboard-configurable Serena default repo + code-intel
-                  # index dirs (mirror filesystem_roots: scalar/list overwrite).
-                  "serena_repo_path", "codebase_code_dirs"):
-            if k in args:
-                cfg[k] = args[k]
-        if "repo_paths" in args:
-            cfg["repo_paths"] = merge_repo_paths(cfg.get("repo_paths"), args["repo_paths"])
-        return await db_module.set_executor_config(db, args["project_id"], cfg)
-    if name == "idle_until_session_done":
-        _idle_kwargs: dict[str, Any] = {}
-        if args.get("timeout_seconds") is not None:
-            _idle_kwargs["timeout_seconds"] = float(args["timeout_seconds"])
-        return await _server._idle_until_session_done(
-            db, args["watching_session_id"], **_idle_kwargs
-        )
-    if name == "search_all":
-        return await db_module.search_all(
-            db, args["project_id"], args["query"],
-            limit=args.get("limit", 10),
-        )
-    if name == "search_synthesis":
-        # ebc242ad — a natural-language query gets a short, CITED answer on top of
-        # the same tsvector/LIKE retrieval as search_all, not just a list of hits.
-        # Reuses the Haiku-tier pattern (deterministic fallback to raw results when
-        # ANTHROPIC_API_KEY is unset or the call fails).
-        if not args.get("query"):
-            return {"error": "query is required"}
-        results = await db_module.search_all(
-            db, args["project_id"], args["query"], limit=args.get("limit", 10),
-        )
-        from ..handoff import synthesize_search_answer  # noqa: PLC0415
-        synth = await synthesize_search_answer(args["query"], results)
-        return {"query": args["query"], **synth, "results": results}
-    if name == "paper_search":
-        # 811881c6 — real callable arXiv search so the research-routing protocol's
-        # "use the paper-search MCP first" finally points at a tool that exists (it was
-        # instruction-only before). Keyless external lookup; degrades to {error}, never
-        # raises. No project scope needed — it's an external search.
-        # f65f6111 — 'source' routes between two keyless sources: arxiv (default) and
-        # openalex. Both return the same {query, count, results} shape.
-        from ..paper_search import arxiv_search, openalex_search  # noqa: PLC0415
-        source = str(args.get("source", "arxiv") or "arxiv").strip().lower()
-        search = openalex_search if source == "openalex" else arxiv_search
-        return await search(
-            args.get("query", ""),
-            limit=args.get("limit", 10),
-            sort_by=args.get("sort_by", "relevance"),
-        )
-    if name == "get_session_brief":
-        # v2.5 — single-call orientation, <500 tokens, XML output.
-        project_id = args["project_id"]
-        role = args.get("role", "worker")
-        session_id_for_notes = args.get("session_id")
-        goal = await db_module.get_goal(db, project_id)
-        tasks = await db_module.get_tasks(db, project_id, limit=5)
-        # dcf1e428 — use 'recent' to surface pending + answered last 24h for planning sessions
-        hitl_rows = await db_module.list_hitl_requests(db, project_id, status="recent")
-        sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
-        # 0507f4a1 — sprint progress summary for session brief
-        _all_items_for_progress = await db_module.get_sprint_items(db, project_id)
-        _done_count = sum(1 for it in _all_items_for_progress if it.get("status") == "done")
-        _total_count = len(_all_items_for_progress)
-        _pct = round(100 * _done_count / _total_count) if _total_count else 0
-        blocking = [t for t in tasks if t.get("status") == "failed"]
-        sprint_str = (goal.get("sprint") or "") if goal else ""
-        tasks_xml = "\n".join(
-            f'  <task status="{t.get("status","?")}">{(t.get("description") or "")[:80]}</task>'
-            for t in tasks
-        )
-        sprint_items_xml = "\n".join(
-            f'  <item version="{it.get("version","")}">{(it.get("title") or "")[:80]}</item>'
-            for it in sprint_items[:5]
-        )
-        # 277567dc — surface pending HITLs so session sees what needs a human decision.
-        # dcf1e428 — also surface recently answered HITLs so planning sessions can see what was decided.
-        _pending_hitls = [h for h in hitl_rows if h.get("status") == "pending"]
-        _answered_hitls = [h for h in hitl_rows if h.get("status") != "pending"]
-        if _pending_hitls:
-            hitl_xml = (
-                f'<hitl_pending count="{len(_pending_hitls)}">\n'
-                + "\n".join(
-                    f'  <request id="{h.get("id","")}" urgency="{h.get("urgency","normal")}">'
-                    f'{(h.get("question") or "")[:140]}</request>'
-                    for h in _pending_hitls[:5]
-                )
-                + "\n</hitl_pending>"
-            )
-        else:
-            hitl_xml = ""
-        if _answered_hitls:
-            hitl_xml += (
-                f'\n<hitl_recent count="{len(_answered_hitls)}">\n'
-                + "\n".join(
-                    f'  <request status="{h.get("status","?")}">'
-                    f'Q: {(h.get("question") or "")[:80]} '
-                    f'A: {(h.get("answer") or "")[:80]}</request>'
-                    for h in _answered_hitls[:3]
-                )
-                + "\n</hitl_recent>"
-            )
-        blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
-        # v2.6 — include session scratch-pad notes at top of brief
-        notes_xml = ""
-        new_items_xml = ""
-        if session_id_for_notes:
-            try:
-                session_notes = await db_module.get_session_notes(db, session_id_for_notes)
-                if session_notes:
-                    notes_xml = "<session_notes>\n" + "\n".join(
-                        f'  <note title="{n.get("title","")}">{(n.get("body") or "")[:120]}</note>'
-                        for n in session_notes
-                    ) + "\n</session_notes>\n"
-            except Exception:
-                pass
-            # fd86aacc — show items added to the board since this session started
-            try:
-                _all_sess = await db_module.get_sessions(db, project_id, active_only=False)
-                _curr_sess = next(
-                    (s for s in _all_sess if s.get("id") == session_id_for_notes), None
-                )
-                if _curr_sess and _curr_sess.get("created_at"):
-                    _sess_started = str(_curr_sess["created_at"])
-                    _all_items = await db_module.get_sprint_items(db, project_id)
-                    _new_count = sum(
-                        1 for it in _all_items
-                        if (it.get("added_at") or "") >= _sess_started
-                    )
-                    if _new_count > 0:
-                        new_items_xml = (
-                            f'<board_change>{_new_count} item{"s" if _new_count != 1 else ""}'
-                            f' added since this session started</board_change>\n'
-                        )
-            except Exception:
-                pass
-        _progress_xml = (
-            f'<progress done="{_done_count}" total="{_total_count}" pct="{_pct}%"/>\n'
-            if _total_count else ""
-        )
-        # Sprint-4: planner role gets richer context — all decisions + all notes + active sessions.
-        planner_extra_xml = ""
-        if role == "planner":
-            try:
-                _decisions = await db_module.get_pinned_decisions(db, project_id, include_superseded=False)
-                if _decisions:
-                    # 366317e9 — already ordered urgent → normal → low by the DB
-                    # layer; surface the priority so the planner weights them.
-                    planner_extra_xml += "<decisions>\n" + "\n".join(
-                        f'  <decision priority="{d.get("priority","normal")}" category="{d.get("category","")}">{(d.get("title") or "")}: {(d.get("body") or "")[:120]}</decision>'
-                        for d in _decisions[:20]
-                    ) + "\n</decisions>\n"
-            except Exception:
-                pass
-            try:
-                # 5a5bba43 — planner context renders note bodies, so ask for them.
-                _wiki_notes = await db_module.get_project_notes(db, project_id, bodies=True)
-                # High-priority notes first
-                _wiki_notes = sorted(_wiki_notes, key=lambda n: {"high": 0, "normal": 1, "low": 2}.get(n.get("priority", "normal"), 1))
-                if _wiki_notes:
-                    planner_extra_xml += "<project_notes>\n" + "\n".join(
-                        f'  <note priority="{n.get("priority","normal")}" kind="{n.get("note_kind","wiki")}" tags="{n.get("tags","")}">'
-                        f'{(n.get("title") or "")}: {(n.get("body") or "")[:120]}</note>'
-                        for n in _wiki_notes[:30]
-                    ) + "\n</project_notes>\n"
-            except Exception:
-                pass
-            try:
-                _active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
-                if _active_sessions:
-                    planner_extra_xml += "<active_sessions>\n" + "\n".join(
-                        f'  <session id="{s.get("id","")}" name="{s.get("name","")}" human="{s.get("human_id","")}" last_seen="{s.get("last_seen","")[:19]}"/>'
-                        for s in _active_sessions[:10]
-                    ) + "\n</active_sessions>\n"
-            except Exception:
-                pass
-        # 1750dccf — role-specific enrichment so executor and planner briefs differ.
-        role_extra_xml = ""
-        if role == "executor":
-            # Version-scoped pending items + this session's file claims + the
-            # decisions code-anchored to the files it holds.
-            _sess_row = None
-            if session_id_for_notes:
-                _sess_all_x = await db_module.get_sessions(
-                    db, project_id, active_only=False
-                )
-                _sess_row = next(
-                    (s for s in _sess_all_x if s.get("id") == session_id_for_notes),
-                    None,
-                )
-            _ver = (_sess_row or {}).get("sprint_version")
-            if _ver:
-                _scoped = [it for it in sprint_items if it.get("version") == _ver]
-                role_extra_xml += (
-                    f'<version_scope version="{_ver}" pending="{len(_scoped)}">\n'
-                    + "\n".join(
-                        f'  <item>{(it.get("title") or "")[:80]}</item>'
-                        for it in _scoped[:5]
-                    )
-                    + "\n</version_scope>\n"
-                )
-            if session_id_for_notes:
-                try:
-                    _claimed = await db_module.get_session_file_claims(
-                        db, session_id_for_notes
-                    )
-                except Exception:
-                    _claimed = []
-                if _claimed:
-                    role_extra_xml += (
-                        "<my_file_claims>\n"
-                        + "\n".join(f"  <file>{c}</file>" for c in _claimed[:20])
-                        + "\n</my_file_claims>\n"
-                    )
-                    _rel: list[dict[str, Any]] = []
-                    _seen_dec: set[Any] = set()
-                    for _fp in _claimed[:20]:
-                        try:
-                            for _d in await db_module.get_decisions_for_file(
-                                db, project_id, _fp
-                            ):
-                                if _d.get("id") not in _seen_dec:
-                                    _seen_dec.add(_d.get("id"))
-                                    _rel.append(_d)
-                        except Exception:
-                            pass
-                    if _rel:
-                        role_extra_xml += (
-                            "<relevant_decisions>\n"
-                            + "\n".join(
-                                f'  <decision anchor="{d.get("code_anchor","")}">'
-                                f'{(d.get("title") or "")}: '
-                                f'{(d.get("body") or "")[:100]}</decision>'
-                                for d in _rel[:10]
-                            )
-                            + "\n</relevant_decisions>\n"
-                        )
-        elif role == "planner":
-            # Last session summary + decisions sitting on unconfirmed assumptions
-            # (what needs revisiting).
-            try:
-                _ls = await db_module.get_last_session_brief(
-                    db, project_id, exclude_session_id=session_id_for_notes
-                )
-            except Exception:
-                _ls = None
-            if _ls:
-                role_extra_xml += (
-                    f'<last_session name="{_ls.get("name","")}" '
-                    f'status="{_ls.get("status","")}">\n'
-                    + "".join(
-                        f'  <completed>{(ci.get("title") or "")[:80]}</completed>\n'
-                        for ci in (_ls.get("completed_items") or [])[:8]
-                    )
-                    + "</last_session>\n"
-                )
-            try:
-                _pin_r = await db_module.get_pinned_decisions(db, project_id)
-                _revisit = [
-                    d for d in _pin_r
-                    if d.get("assumption")
-                    and d.get("assumption_status") != "confirmed"
-                ]
-                if _revisit:
-                    role_extra_xml += (
-                        "<decisions_needing_revisit>\n"
-                        + "\n".join(
-                            f'  <decision status="{d.get("assumption_status")}">'
-                            f'{(d.get("title") or "")}: assumption='
-                            f'{(d.get("assumption") or "")[:80]}</decision>'
-                            for d in _revisit[:10]
-                        )
-                        + "\n</decisions_needing_revisit>\n"
-                    )
-            except Exception:
-                pass
-        brief = (
-            f'<session_brief project_id="{project_id}" role="{role}">\n'
-            f'{notes_xml}'
-            f'{new_items_xml}'
-            f'{_progress_xml}'
-            f'<sprint>{sprint_str[:200]}</sprint>\n'
-            f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
-            f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
-            f'{blocking_xml}\n'
-            f'{hitl_xml}\n'
-            f'{planner_extra_xml}'
-            f'{role_extra_xml}'
-            f'</session_brief>'
-        )
-        return {"text": brief, "project_id": project_id, "role": role}
+
     return _MISS
 
 
