@@ -298,6 +298,105 @@ async def patch_project_settings(
 
 
 # ---------------------------------------------------------------------------
+# 81b10dec — slot-readiness probe for the code-intel guard hook
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/slot-readiness")
+async def get_slot_readiness(project_id: str, request: Request) -> dict[str, Any]:
+    """Probe whether the code/Serena tunnel slot is ready for this project.
+
+    Called by the code_intel_guard hook after it confirms code_intel_enabled=1.
+    Performs an actual tools/list round-trip to the code slot (which wakes up
+    an idle-killed Serena daemon via the tunnel's lazy-spawn mechanism) and
+    returns the readiness result.
+
+    Response shape:
+      {
+        "slot": "code",
+        "ready": bool,          # True when the slot answered tools/list
+        "has_tunnel": bool,     # False on self-hosted (no tunnel = fail-open)
+        "probed": bool,         # True when a live probe was attempted
+        "fallback_reason": str  # present only when ready=False (visible log hint)
+      }
+
+    Fails open (ready=true, has_tunnel=false) when no tunnel is connected so
+    the hook never blocks an executor that has no tunnel (the enabled flag is
+    still the primary gate; this is only a secondary readiness gate).
+    """
+    db = await _db(request)
+
+    # Verify project exists.
+    settings = await db_module.get_project_settings(db, project_id)
+    if settings is None:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    # Resolve the tenant so we can check its tunnel slot.
+    tenant_id = await db_module.get_tenant_id_for_project(db, project_id)
+
+    # Try to import the tunnel module. On minimal self-hosted installs the
+    # routes.tunnel module still exists but may have no active sockets.
+    try:
+        from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+        has_tunnel_module = True
+    except Exception:  # noqa: BLE001
+        has_tunnel_module = False
+
+    if not has_tunnel_module or not tenant_id:
+        # No tunnel infrastructure or no resolvable tenant — fail-open.
+        return {
+            "slot": "code",
+            "ready": True,
+            "has_tunnel": False,
+            "probed": False,
+        }
+
+    # Check if there's any active tunnel at all for this tenant.
+    if not _tunnel_mod.has_active_tunnel(tenant_id):
+        return {
+            "slot": "code",
+            "ready": True,
+            "has_tunnel": False,
+            "probed": False,
+        }
+
+    # Tunnel is active. Probe the code slot directly — this is also the warmup:
+    # a tools/list to the slot wakes the Serena daemon if it was idle-killed.
+    try:
+        import asyncio as _asyncio  # noqa: PLC0415
+        _label, _tools = await _asyncio.wait_for(
+            _tunnel_mod._fetch_slot_tools(tenant_id, "code"),  # type: ignore[attr-defined]
+            timeout=5.0,
+        )
+        ready = bool(_tools)
+    except Exception:  # noqa: BLE001 — probe failed; fail-open
+        return {
+            "slot": "code",
+            "ready": True,
+            "has_tunnel": True,
+            "probed": True,
+            "fallback_reason": (
+                "slot-readiness probe raised an exception; failing open "
+                "so the executor is not blocked (81b10dec)"
+            ),
+        }
+
+    result: dict[str, Any] = {
+        "slot": "code",
+        "ready": ready,
+        "has_tunnel": True,
+        "probed": True,
+    }
+    if not ready:
+        result["fallback_reason"] = (
+            "code slot answered 0 tools after warmup probe; the Serena daemon "
+            "may still be starting (cold spawn). Failing open so the executor "
+            "is not blocked — retry or wait a moment (81b10dec)."
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Notification / ntfy routes
 # ---------------------------------------------------------------------------
 

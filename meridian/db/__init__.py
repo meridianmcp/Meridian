@@ -800,6 +800,27 @@ CREATE TABLE IF NOT EXISTS workspace_proposals (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 356d6ac8 — file_patch_counters: structural-degradation early-warning signal.
+-- Tracks how many times (session_id, file_path) has been write-claimed within a
+-- session, approximating "how many patch cycles hit this file without a refactor."
+-- refactor_flagged is set by the executor when the session contains a deliberate
+-- refactor of this file (resets the degradation signal). patch_count is
+-- incremented on every exclusive write claim. get_structural_degradation_warnings
+-- queries rows where patch_count >= threshold AND refactor_flagged = 0.
+-- idx_file_patch_counters_session is created ONLY inside the guarded
+-- _migrate_file_patch_counters migration, never inline here (2026-07-04
+-- inline-index outage rule).
+CREATE TABLE IF NOT EXISTS file_patch_counters (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    patch_count INTEGER NOT NULL DEFAULT 0,
+    refactor_flagged INTEGER NOT NULL DEFAULT 0,
+    first_patched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_patched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (session_id, file_path)
+);
 """
 
 
@@ -994,6 +1015,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_proposals(db)
     await _migrate_docx_region_claims(db)
     await _migrate_pending_goal_at(db)
+    await _migrate_file_patch_counters(db)
     return db
 
 
@@ -1489,6 +1511,42 @@ async def update_project_settings(
         )
         await db.commit()
     return await get_project_settings(db, project_id)
+
+
+async def get_tenant_id_for_project(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the tenant id that owns this project, or None.
+
+    81b10dec — used by the slot-readiness endpoint so the code-intel guard
+    hook can probe the Serena/code-intel tunnel slot without knowing the
+    tenant id directly. Resolves via creator_human_id (project creator email)
+    -> tenants.id JOIN. Returns None for self-hosted installs where the
+    tenants table is absent or the project has no creator_human_id.
+    """
+    # Get the creator email from the project.
+    async with db.execute(
+        "SELECT creator_human_id FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    creator_email = (row["creator_human_id"] if isinstance(row, dict) else row[0])
+    if not creator_email:
+        return None
+    # Look up the tenant by email (self-hosted SQLite: tenants table exists).
+    # On hosted Neon DBs the tenants table lives in a separate control-plane DB
+    # that this per-project db connection doesn't reach, so we tolerate the miss.
+    try:
+        async with db.execute(
+            "SELECT id FROM tenants WHERE email = ?", (creator_email,)
+        ) as cur2:
+            trow = await cur2.fetchone()
+    except Exception:  # noqa: BLE001 — tenants table absent (hosted per-project DB)
+        return None
+    if trow is None:
+        return None
+    return trow["id"] if isinstance(trow, dict) else trow[0]
 
 
 async def get_executor_config(
@@ -9511,6 +9569,11 @@ from .locks import (  # noqa: F401
     check_docx_region_write_conflict,
     # Session file claims view
     get_session_file_claims,
+    # 356d6ac8 — structural-degradation signal
+    _PATCH_DEGRADATION_THRESHOLD,
+    _increment_file_patch_counter,
+    get_structural_degradation_warnings,
+    flag_file_refactor,
 )
 
 

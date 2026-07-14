@@ -27,6 +27,17 @@ from meridian.db import (  # noqa: PLC0415
     get_decisions_for_file,
 )
 
+# ---------------------------------------------------------------------------
+# 356d6ac8 — structural-degradation patch threshold.
+#
+# When a session write-claims a file >= this many times without the executor
+# flagging a deliberate refactor (refactor_flagged), get_structural_degradation_warnings
+# surfaces the file as a degradation risk. The heuristic is intentionally blunt:
+# many small patches on the same file within one session = likely symptom-chasing.
+# A higher count means fewer false positives but later detection.
+# ---------------------------------------------------------------------------
+_PATCH_DEGRADATION_THRESHOLD = 3
+
 
 # ---------------------------------------------------------------------------
 # v3.1 — file lock coordination
@@ -282,6 +293,9 @@ async def claim_file(
                 db, session_id, normalized
             ),
         }
+    # 356d6ac8 — increment the structural-degradation patch counter for this
+    # write claim (best-effort; counter errors never block the claim response).
+    await _increment_file_patch_counter(db, session_id, normalized)
     return {
         "claimed": True,
         "claim_mode": "write",
@@ -1066,6 +1080,146 @@ async def get_session_file_claims(
     ) as cur:
         rows = await cur.fetchall()
     return [r["file_path"] for r in rows if r is not None]
+
+
+# ---------------------------------------------------------------------------
+# 356d6ac8 — structural-degradation patch-counter helpers
+# ---------------------------------------------------------------------------
+
+
+async def _increment_file_patch_counter(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+) -> None:
+    """Increment the write-claim count for (session_id, file_path).
+
+    356d6ac8 — called on every successful exclusive write claim. Uses
+    INSERT OR IGNORE + UPDATE so the upsert is a single pair of statements
+    (SQLite supports ON CONFLICT DO UPDATE but the two-statement form is
+    cleaner to read and works on both SQLite and Postgres without dialect
+    gymnastics). Best-effort: a DB error is silently swallowed so a counter
+    glitch never blocks a file claim.
+    """
+    try:
+        await db.execute(
+            "INSERT OR IGNORE INTO file_patch_counters "
+            "(id, session_id, file_path, patch_count, refactor_flagged, "
+            "first_patched_at, last_patched_at) "
+            "VALUES (?, ?, ?, 0, 0, datetime('now'), datetime('now'))",
+            (_new_id(), session_id, file_path),
+        )
+        await db.execute(
+            "UPDATE file_patch_counters "
+            "SET patch_count = patch_count + 1, last_patched_at = datetime('now') "
+            "WHERE session_id = ? AND file_path = ?",
+            (session_id, file_path),
+        )
+        await db.commit()
+    except Exception:  # noqa: BLE001 — never wedge a claim on a counter error
+        pass
+
+
+async def get_structural_degradation_warnings(
+    db: aiosqlite.Connection,
+    session_id: str,
+    *,
+    threshold: int = _PATCH_DEGRADATION_THRESHOLD,
+) -> list[dict[str, Any]]:
+    """Return files flagged as structural-degradation risks for a session.
+
+    356d6ac8 — a file is flagged when its write-claim count within the session
+    is >= ``threshold`` AND refactor_flagged is 0 (the executor has not
+    signalled a deliberate refactor of this file). The heuristic: many small
+    patches on the same file within one session, without a refactor checkpoint,
+    is the documented AI-agent symptom-chasing pattern.
+
+    Returns a list of dicts::
+
+        {
+            "file_path": str,
+            "patch_count": int,
+            "refactor_flagged": bool,
+            "first_patched_at": str,
+            "last_patched_at": str,
+            "warning": str,           # human-readable explanation
+        }
+
+    An empty list means no degradation signals detected. The caller can use
+    this in generate_handoff, analyze_sprint, or any pre-commit gate.
+    """
+    async with db.execute(
+        "SELECT file_path, patch_count, refactor_flagged, "
+        "first_patched_at, last_patched_at "
+        "FROM file_patch_counters "
+        "WHERE session_id = ? AND patch_count >= ? AND refactor_flagged = 0 "
+        "ORDER BY patch_count DESC, last_patched_at DESC",
+        (session_id, int(threshold)),
+    ) as cur:
+        rows = await cur.fetchall()
+    results = []
+    for row in rows:
+        r = _row_to_dict(row)
+        if not r:
+            continue
+        count = int(r.get("patch_count") or 0)
+        results.append({
+            "file_path": r.get("file_path", ""),
+            "patch_count": count,
+            "refactor_flagged": bool(r.get("refactor_flagged")),
+            "first_patched_at": r.get("first_patched_at"),
+            "last_patched_at": r.get("last_patched_at"),
+            "warning": (
+                f"Structural-degradation risk: {r.get('file_path', '')} has been "
+                f"write-claimed {count} times this session without a refactor checkpoint. "
+                "This may indicate symptom-patching rather than root-cause fixes. "
+                "Consider a deliberate refactor pass, or call flag_file_refactor to "
+                "acknowledge this is intentional incremental work."
+            ),
+        })
+    return results
+
+
+async def flag_file_refactor(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+) -> dict[str, Any]:
+    """Signal that this session intentionally refactored ``file_path``.
+
+    356d6ac8 — sets refactor_flagged=1 on the (session_id, file_path) counter
+    row so get_structural_degradation_warnings no longer surfaces it as a risk.
+    A refactor flag means: "the repeated writes on this file are deliberate
+    structural work, not symptom-patching."
+
+    Creates the row if absent (idempotent). Returns the updated counter row.
+    """
+    normalized = (file_path or "").strip()
+    if not normalized:
+        raise ValueError("file_path is required")
+    await db.execute(
+        "INSERT OR IGNORE INTO file_patch_counters "
+        "(id, session_id, file_path, patch_count, refactor_flagged, "
+        "first_patched_at, last_patched_at) "
+        "VALUES (?, ?, ?, 0, 1, datetime('now'), datetime('now'))",
+        (_new_id(), session_id, normalized),
+    )
+    await db.execute(
+        "UPDATE file_patch_counters SET refactor_flagged = 1 "
+        "WHERE session_id = ? AND file_path = ?",
+        (session_id, normalized),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM file_patch_counters WHERE session_id = ? AND file_path = ?",
+        (session_id, normalized),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {
+        "session_id": session_id,
+        "file_path": normalized,
+        "refactor_flagged": True,
+    }
 
 
 # ---------------------------------------------------------------------------

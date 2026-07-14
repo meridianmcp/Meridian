@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # aeba8a80 -- PreToolUse code-intel guard (structural, not text).
+# 81b10dec -- extended: proactive slot warmup + visible fallback logging.
 #
 # Prose guidance in DEFAULT_AGENT_INSTRUCTIONS has been strengthened to v10 and
 # has still not held: a live session tonight used raw grep exclusively rather than
@@ -8,6 +9,12 @@
 # project settings), blocks (exit 2) and redirects to the code-intel tools instead.
 # If code-intel is not enabled, or the status check fails for ANY reason, FAILS OPEN
 # (exit 0) -- never block a session that has nothing to redirect to.
+#
+# 81b10dec extension: after confirming code_intel_enabled=1, also probe slot
+# readiness via /projects/{id}/slot-readiness. If the code/Serena slot is cold
+# (idle-killed after 30min), that endpoint triggers a warmup tools/list. We do
+# one brief retry (up to 3s) before falling back to fail-open with a VISIBLE
+# stderr log -- the fallback is never silent.
 #
 # Mirrors the structural pattern of hitl_guard.sh (PreToolUse, exit 2 to block,
 # tolerant JSON extraction) and sprint_guard.sh (curl the live Meridian server, fail
@@ -34,7 +41,37 @@ resp="$(curl -sf --max-time 5 "$MERIDIAN_URL/projects/$PROJECT_ID/settings" 2>/d
 ci_val="$(printf '%s' "$resp" | grep -oE '"code_intel_enabled"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
 [ -z "$ci_val" ] && exit 0
 if [ "$ci_val" -eq 1 ] 2>/dev/null; then
-    # exit 2 blocks the tool call; stderr is fed back to Claude as the reason.
+    # 81b10dec -- probe slot readiness; warm up an idle-killed Serena daemon.
+    # The /slot-readiness endpoint calls _fetch_slot_tools("code") which sends a
+    # tools/list to the slot -- waking the lazy-spawn proxy if it was idle-killed.
+    # Fail open (exit 0) with a VISIBLE log when the slot is not yet ready after
+    # one retry, rather than silently passing through.
+    slot_resp="$(curl -sf --max-time 6 "$MERIDIAN_URL/projects/$PROJECT_ID/slot-readiness" 2>/dev/null || true)"
+    if [ -n "$slot_resp" ]; then
+        # Extract "ready": true/false tolerantly.
+        slot_ready="$(printf '%s' "$slot_resp" | grep -oE '"ready"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
+        # Extract "has_tunnel": true/false tolerantly.
+        has_tunnel="$(printf '%s' "$slot_resp" | grep -oE '"has_tunnel"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
+        if [ "$slot_ready" = "false" ]; then
+            # Slot is not ready yet -- brief retry (warmup may be in progress).
+            sleep 3
+            slot_resp2="$(curl -sf --max-time 6 "$MERIDIAN_URL/projects/$PROJECT_ID/slot-readiness" 2>/dev/null || true)"
+            if [ -n "$slot_resp2" ]; then
+                slot_ready="$(printf '%s' "$slot_resp2" | grep -oE '"ready"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
+            fi
+            if [ "$slot_ready" != "true" ]; then
+                # Still not ready after retry -- fail open with a VISIBLE warning.
+                echo "Meridian code-intel guard (81b10dec): code-intel slot NOT ready after warmup probe. The Serena/code-intel daemon may still be starting. Failing open -- $tool is allowed this time. Retry in a moment or check 'meridian --tunnel' status." >&2
+                exit 0
+            fi
+        elif [ "$has_tunnel" = "false" ]; then
+            # No tunnel active (self-hosted or tunnel not connected) -- fail open.
+            # The enabled flag alone isn't enough; a live slot is needed to block.
+            echo "Meridian code-intel guard (81b10dec): code-intel enabled but no tunnel slot is connected. Failing open -- $tool is allowed. Connect the meridian tunnel to enable slot-based enforcement." >&2
+            exit 0
+        fi
+    fi
+    # Slot is ready (or probe was skipped due to no-tunnel) -- block the tool call.
     echo "Meridian code-intel guard (aeba8a80): this project has a code-intel index. Use code-intel tools INSTEAD of $tool:
   - find_symbol / extractor__find_symbol        -- exact symbol lookup (fastest, most accurate)
   - search_graph / codebase__search_graph       -- structural graph queries (callers, callees, paths)

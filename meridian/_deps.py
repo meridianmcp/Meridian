@@ -559,6 +559,26 @@ def _reset_limiter_storage() -> None:
         pass
 
 
+def _reset_limiter_counts() -> None:
+    """Clear only in-memory rate-limit COUNTERS, not route registrations.
+
+    8a52dd26 -- for callers that reuse the same `app`/`_limiter` across tests
+    without importlib.reload(server) between them. Route-limit registrations
+    (`_route_limits`/`_dynamic_route_limits`) only happen once, at decorator
+    time, and must stay intact; unlike _reset_limiter_storage() (which clears
+    them because a reload will re-populate them), clearing them here would
+    permanently disable rate limiting after the first test.
+    """
+    _reset_tenant_rate_limit()
+    if _limiter is None:
+        return
+    try:
+        if hasattr(_limiter, "_storage"):
+            _limiter._storage.reset()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Authenticated tenant helper (session cookie or Bearer token)
 # ---------------------------------------------------------------------------
