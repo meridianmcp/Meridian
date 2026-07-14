@@ -2765,6 +2765,19 @@ async def _migrate_pg_file_patch_counters(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_resources_amended(conn: PostgresConnection) -> None:
+    """2593a5fe — resources_amended flag on sprint_items (mirrors SQLite).
+
+    Nullable INTEGER default 0; set to 1 when claim_file/claim_symbol appends
+    a post-declaration resource to the item's touches_resources (mid-execution
+    pivot). ADD COLUMN IF NOT EXISTS → idempotent.
+    Mirrors db._migrate_sprint_item_resources_amended.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS resources_amended INTEGER DEFAULT 0"
+    )
+
+
 async def _migrate_pg_session_activity(conn: PostgresConnection) -> None:
     """8c147109 — session_activity: lightweight ring-buffer heartbeat feed.
 
@@ -2850,5 +2863,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_proposals,
     _migrate_pg_pending_goal_at,
     _migrate_pg_file_patch_counters,
+    _migrate_pg_sprint_item_resources_amended,
     _migrate_pg_session_activity,
 )
