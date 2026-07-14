@@ -1197,6 +1197,73 @@ def _terminate_proc_tree(proc: "subprocess.Popen | None") -> None:
             pass
 
 
+def _kill_stale_port_occupant(port: int, label: str) -> None:
+    """Kill whatever process is already listening on ``port``, if any (44892730).
+
+    Root cause: each ``SlotProxy`` starts life with ``_proc = None``, and its
+    ``is_running`` check deliberately skips the port probe in that state
+    (c8e6b61c — so a never-started slot isn't falsely "revived" by an unrelated
+    process that happens to be squatting on the port). That's correct for a
+    genuinely unrelated process, but wrong for the actual common case behind
+    the confirmed duplicate-process bug: a PRIOR GENERATION of this same
+    ``meridian --tunnel`` invocation whose child subprocess survived the parent
+    exiting (crash, Ctrl+C race, or a restart that didn't wait for full
+    teardown) and is still bound to the slot's port. The new generation's fresh
+    ``SlotProxy`` has no handle to that orphan, so ``ensure_running`` spawns a
+    second live process for the same logical slot.
+
+    Calling this once per slot at tunnel startup, before the first
+    ``ensure_running``, closes that gap directly: if anything is already
+    listening on the slot's port, kill it first so the fresh spawn gets a
+    clean port. Best-effort and silent on any failure (missing psutil,
+    permission error, etc.) — this must never block tunnel startup.
+
+    Note: this intentionally does NOT attempt the fuller per-client
+    session-to-process liveness/routing distinction the underlying item
+    describes (whether an existing process is genuinely still serving another
+    live, active client vs. orphaned) — that needs the tunnel to track client
+    identity per process instance, which does not exist anywhere in this
+    module today and is real, separate follow-up work. This fix only handles
+    the narrower, confirmed trigger: leftover processes from a previous
+    tunnel-client generation.
+    """
+    try:
+        import psutil  # type: ignore
+    except Exception:  # noqa: BLE001 - psutil unavailable; nothing we can do
+        return
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if (
+                conn.status == psutil.CONN_LISTEN
+                and conn.laddr
+                and conn.laddr.port == port
+                and conn.pid
+            ):
+                pid = conn.pid
+                print(
+                    f"tunnel:{label}: killing stale prior-generation process "
+                    f"(pid {pid}) still bound to port {port} before spawning fresh",
+                    flush=True,
+                )
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, check=False,
+                    )
+                else:
+                    try:
+                        stale = psutil.Process(pid)
+                        stale.terminate()
+                        stale.wait(timeout=5)
+                    except Exception:  # noqa: BLE001
+                        try:
+                            psutil.Process(pid).kill()
+                        except Exception:  # noqa: BLE001
+                            pass
+    except Exception:  # noqa: BLE001 - best-effort, never block tunnel startup
+        pass
+
+
 def _dc_default_command() -> list[str]:
     """Default Desktop Commander launcher, shell-wrapped per OS.
 
@@ -3308,6 +3375,14 @@ async def run_tunnel(
         if _persistent:
             persistent_slots.add(slot)
 
+    # 44892730 — before anything spawns, clear any stale prior-generation
+    # process still bound to each registered slot's port (see
+    # _kill_stale_port_occupant's docstring for the full root-cause). Every
+    # slot registered above is lazy-spawn (ensure_running fires on first
+    # request), so this always runs well before any of them actually launch.
+    for _sp in slot_proxies:
+        _kill_stale_port_occupant(_sp.port, _sp.label)
+
     # 4c. Custom plugins (LOCAL-ONLY) — still eagerly spawned because they serve
     #     the local .mcp.json directly without a server relay route.
     custom_plugins = resolve_custom_plugins(me.get("tunnel_plugins_config"))
@@ -3326,6 +3401,10 @@ async def run_tunnel(
         # 194a7776 — merge the plugin's optional env over the parent env at spawn
         # (e.g. a local Zotero MCP needs ZOTERO_LOCAL=true). None inherits parent.
         spawn_env = _plugin_spawn_env(cp.get("env"))
+        # 44892730 — custom plugins spawn eagerly (unlike the lazy SlotProxy
+        # slots above), so the same stale-prior-generation-process gap applies
+        # here too, right before the Popen below.
+        _kill_stale_port_occupant(cport, f"custom:{cname}")
         print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
         try:
             proc_custom = subprocess.Popen(cmd_custom, env=spawn_env, **_spawn_kwargs())

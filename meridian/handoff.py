@@ -562,6 +562,153 @@ def _build_quick_start_goal(
     )
 
 
+def build_item_briefing(
+    item: dict[str, Any],
+    *,
+    test_floor: int = _DEFAULT_GOAL_TEST_FLOOR,
+    max_turns: int = _DEFAULT_GOAL_MAX_TURNS,
+    hitl_auto_answer_mode: int = 0,
+) -> str:
+    """Generate a deterministic, XML-tagged briefing for a SINGLE sprint item.
+
+    Mirrors ``_build_quick_start_goal``'s structural approach — same XML-tag
+    vocabulary (role / first_step / task / resources / completion_criteria /
+    stop_conditions) but scoped to one item row instead of a batch.  Intended
+    to replace the ad-hoc, hand-written per-item briefings that were previously
+    pasted into planning chat.
+
+    Parameters
+    ----------
+    item:
+        A sprint_item row dict (as returned by ``db.get_sprint_item``).
+    test_floor:
+        Minimum passing test count required for completion (default 2150).
+    max_turns:
+        Maximum turns ceiling — same semantics as ``_build_quick_start_goal``.
+    hitl_auto_answer_mode:
+        0 = stop if HITL triggered; 1/2 = skip blocked items (auto-answer on).
+
+    Returns a ``/goal``-prefixed XML string ready to paste as a session goal.
+    """
+    try:
+        _turns = int(max_turns)
+        if _turns <= 0:
+            _turns = _DEFAULT_GOAL_MAX_TURNS
+        else:
+            _turns = min(500, _turns)
+    except (TypeError, ValueError):
+        _turns = _DEFAULT_GOAL_MAX_TURNS
+
+    _hitl_clause = (
+        "Do NOT file HITLs — auto-answer is on, skip blocked items and continue."
+        if int(hitl_auto_answer_mode or 0) >= 1
+        else "or if HITL triggered."
+    )
+
+    iid = (item.get("id") or "").strip()
+    title = (item.get("title") or "").strip()
+    item_group = (item.get("item_group") or "").strip()
+    notes = (item.get("notes") or "").strip()
+    wave = (item.get("wave") or "").strip()
+    priority = (item.get("priority") or "normal").strip()
+    depends_on = (item.get("depends_on") or "").strip()
+    blocker_kind = (item.get("blocker_kind") or "").strip()
+    milestone_type = (item.get("milestone_type") or "task").strip()
+
+    # Render the touches_resources field as a readable list of paths/identifiers.
+    raw_resources = item.get("touches_resources")
+    resources_lines: list[str] = []
+    if raw_resources:
+        import json as _json  # noqa: PLC0415 — used only here
+        ids: list[Any] = []
+        if isinstance(raw_resources, str) and raw_resources.strip():
+            try:
+                parsed = _json.loads(raw_resources)
+                ids = parsed if isinstance(parsed, list) else [raw_resources]
+            except Exception:  # noqa: BLE001
+                ids = [raw_resources]
+        elif isinstance(raw_resources, list):
+            ids = raw_resources
+        for ident in ids:
+            s = str(ident).strip()
+            if not s:
+                continue
+            if s.startswith("inferred:"):
+                s = s[len("inferred:"):]
+            head, sep, tail = s.partition(":")
+            resources_lines.append(tail.strip() if sep and head.isalpha() else s)
+
+    # --- Build each XML section ---
+
+    # <role> — same directive as the autonomous executor /goal.
+    role_text = (
+        "You are an executor. Claim and execute the following sprint item "
+        "immediately without asking for direction or confirmation."
+    )
+
+    # <first_step> — always start by reloading the live board.
+    first_step_text = (
+        'First call get_sprint_items(status="pending") to confirm this item is '
+        "still pending and unclaimed, then claim it with claim_sprint_item()."
+    )
+
+    # <task> — core item description.
+    task_parts: list[str] = []
+    if iid:
+        task_parts.append(f"Item: {iid}")
+    if title:
+        task_parts.append(f"Title: {title}")
+    if item_group:
+        task_parts.append(f"Group: {item_group}")
+    if wave:
+        task_parts.append(f"Wave: {wave}")
+    if priority and priority != "normal":
+        task_parts.append(f"Priority: {priority}")
+    if milestone_type and milestone_type != "task":
+        task_parts.append(f"Milestone type: {milestone_type}")
+    if depends_on:
+        task_parts.append(f"Depends on: {depends_on}")
+    if blocker_kind:
+        task_parts.append(f"Blocker kind: {blocker_kind}")
+    if notes:
+        task_parts.append(f"Notes: {notes}")
+    task_text = "; ".join(task_parts) if task_parts else "(no item details)"
+
+    # <resources> — files/symbols declared on the item.
+    resources_text = ", ".join(resources_lines) if resources_lines else ""
+
+    # <completion_criteria> — item marked done + tests pass.
+    completion_text = (
+        f"Done when complete_sprint_item({iid!r}) is called, "
+        f"pixi run test passes {test_floor}+, "
+        "and generate_handoff() is called at the end."
+    )
+
+    # <not_done_until> — single-item equivalent.
+    not_done_text = (
+        "complete_sprint_item() has been called for this item. "
+        "Do not stop or hand off while the item is still pending."
+    )
+
+    # <stop_conditions>
+    stop_text = f"Stop after {_turns} turns {_xml_escape(_hitl_clause)}"
+
+    parts = [
+        "/goal",
+        f"<role>{_xml_escape(role_text)}</role>",
+        f"<first_step>{_xml_escape(first_step_text)}</first_step>",
+        f"<task>{_xml_escape(task_text)}</task>",
+    ]
+    if resources_text:
+        parts.append(f"<resources>{_xml_escape(resources_text)}</resources>")
+    parts += [
+        f"<completion_criteria>{_xml_escape(completion_text)}</completion_criteria>",
+        f"<not_done_until>{_xml_escape(not_done_text)}</not_done_until>",
+        f"<stop_conditions>{stop_text}</stop_conditions>",
+    ]
+    return "\n".join(parts)
+
+
 def _extract_keywords(
     text: str, extra_stop: "frozenset[str] | set[str] | None" = None
 ) -> set[str]:

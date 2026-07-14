@@ -13,6 +13,7 @@ SQLite's ``datetime('now')`` or the Postgres equivalent in pg_adapter.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import logging
 import os
@@ -992,6 +993,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_mcp_rate_counters(db)
     await _migrate_workspace_proposals(db)
     await _migrate_docx_region_claims(db)
+    await _migrate_pending_goal_at(db)
     return db
 
 
@@ -11981,8 +11983,15 @@ async def pop_queued_session(
 
 
 # ---------------------------------------------------------------------------
-# 5efe254b — trusted handoff channel (projects.pending_goal)
+# 5efe254b / 590dcdd5 — trusted handoff channel (projects.pending_goal)
 # ---------------------------------------------------------------------------
+
+# 590dcdd5 — goals older than this many hours are flagged as possibly-stale
+# when surfaced by pop_pending_goal_with_meta.  A fresh /goal from a human in
+# chat makes the persisted pending_goal obsolete, but the server has no way to
+# detect it server-side; the staleness flag lets executors recognise they should
+# defer to any direct /goal instruction they received in chat.
+PENDING_GOAL_STALE_HOURS: int = 24
 
 
 async def set_pending_goal(
@@ -11990,10 +11999,17 @@ async def set_pending_goal(
 ) -> None:
     """Persist the handoff /goal so the next start_session can surface it through
     a trusted MCP tool result (keyed on project_id) instead of a copy-pasted,
-    spoofable chat string. Empty/None clears it. Read-once via pop_pending_goal."""
+    spoofable chat string. Empty/None clears it. Read-once via pop_pending_goal.
+
+    590dcdd5: also writes pending_goal_at (UTC ISO-8601) so pop_pending_goal_with_meta
+    can expose the goal's age and flag it as possibly-stale when it is older than
+    PENDING_GOAL_STALE_HOURS hours."""
+    now_iso: str | None = (
+        _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ") if goal else None
+    )
     await db.execute(
-        "UPDATE projects SET pending_goal = ? WHERE id = ?",
-        ((goal or None), project_id),
+        "UPDATE projects SET pending_goal = ?, pending_goal_at = ? WHERE id = ?",
+        ((goal or None), now_iso, project_id),
     )
     await db.commit()
 
@@ -12021,10 +12037,62 @@ async def pop_pending_goal(
     goal = await get_pending_goal(db, project_id)
     if goal:
         await db.execute(
-            "UPDATE projects SET pending_goal = NULL WHERE id = ?", (project_id,)
+            "UPDATE projects SET pending_goal = NULL, pending_goal_at = NULL"
+            " WHERE id = ?",
+            (project_id,),
         )
         await db.commit()
     return goal
+
+
+async def pop_pending_goal_with_meta(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, object] | None:
+    """590dcdd5 — read-once pop with staleness metadata.
+
+    Returns a dict ``{"goal": str, "age_hours": float, "stale": bool}`` when a
+    pending_goal exists, or ``None`` when nothing is pending.
+
+    ``stale`` is ``True`` when the goal is older than PENDING_GOAL_STALE_HOURS.
+    Executors SHOULD treat a stale pending_goal as advisory only and defer to
+    any direct /goal instruction received in chat, because the human may have
+    started the session with a completely different intent since the handoff was
+    written.  The goal is still cleared read-once regardless of staleness.
+    """
+    async with db.execute(
+        "SELECT pending_goal, pending_goal_at FROM projects WHERE id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        raw_goal = row.get("pending_goal")
+        raw_at = row.get("pending_goal_at")
+    else:
+        raw_goal = row[0]
+        raw_at = row[1] if len(row) > 1 else None
+    if not raw_goal:
+        return None
+    # Compute age in hours; treat missing/malformed timestamp as 0 (unknown age).
+    age_hours: float = 0.0
+    if raw_at:
+        try:
+            written = _dt.datetime.strptime(raw_at, "%Y-%m-%dT%H:%M:%SZ")
+            age_hours = (
+                _dt.datetime.utcnow() - written
+            ).total_seconds() / 3600.0
+        except (ValueError, TypeError):
+            age_hours = 0.0
+    stale = age_hours >= PENDING_GOAL_STALE_HOURS
+    # Clear read-once regardless of staleness.
+    await db.execute(
+        "UPDATE projects SET pending_goal = NULL, pending_goal_at = NULL"
+        " WHERE id = ?",
+        (project_id,),
+    )
+    await db.commit()
+    return {"goal": raw_goal, "age_hours": round(age_hours, 2), "stale": stale}
 
 
 # ---------------------------------------------------------------------------

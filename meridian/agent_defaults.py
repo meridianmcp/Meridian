@@ -47,7 +47,13 @@ import re
 #        returned content field verbatim (f318c7e3): the server already returns
 #        paste-ready plain text, but a calling session could narrate success
 #        without ever pasting it — purely a behavioral gap, not a server bug.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 9
+#   v10 — MANDATORY CODE INTEL PROTOCOL gets a concrete before/after example
+#         (443aa32a): a live executor session used raw grep exclusively, including
+#         4 consecutive failed grep patterns before locating a dispatch branch that
+#         a single find_symbol call would have found immediately. Added an explicit
+#         "grep/glob NEVER as first step" rule and a before/after illustration so
+#         the anti-pattern is unambiguous.
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 10
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -145,15 +151,37 @@ in the Meridian dashboard → Settings → Executor Rules.
 
 ## MANDATORY CODE INTEL PROTOCOL
 When the task involves source code files, use code-intel tools (`search_graph`,
-`get_function_tool` / `get_code_snippet`) BEFORE any `read_file` or
-`read_multiple_files` call: `search_graph` to locate symbols, `get_function_tool`
-to extract specific functions. Reading whole source files when code-intel tools
-are reachable is a protocol violation. If these tools are not in your current tool
-list, do NOT skip the protocol — clients with deferred / tool-search loading
-(claude.ai, Desktop) hide a tool until it is searched for, so run one tool-search /
-discovery query for them first; only fall back to plain file reads if that search
-genuinely surfaces nothing. For non-code files (documents, presentations,
-spreadsheets, config, data), use filesystem tools directly.
+`get_function_tool` / `get_code_snippet`, Serena `find_symbol`) BEFORE any
+`read_file`, `read_multiple_files`, grep, or glob call: `search_graph` to locate
+symbols, `get_function_tool` / `find_symbol` to extract specific functions.
+Reading whole source files or running grep/glob when code-intel tools are reachable
+is a protocol violation. If these tools are not in your current tool list, do NOT
+skip the protocol — clients with deferred / tool-search loading (claude.ai, Desktop)
+hide a tool until it is searched for, so run one tool-search / discovery query for
+them first; only fall back to plain file reads if that search genuinely surfaces
+nothing. For non-code files (documents, presentations, spreadsheets, config, data),
+use filesystem tools directly.
+
+**grep/glob NEVER as first step for code search (443aa32a):** Raw bash `grep`,
+`rg`, `find`, and glob patterns are a last resort for code search — not a default.
+A live executor session ran 4 consecutive failing grep patterns looking for a
+dispatch branch that a single `find_symbol` call would have found immediately.
+This is the anti-pattern this protocol exists to prevent.
+
+WRONG (what that session did):
+  grep -r "handle_webhook" .          # 0 results
+  grep -r "webhook_dispatch" .        # 0 results
+  grep -r "process_event" .           # 0 results
+  grep -r "dispatch" src/             # eventually found it, 4 tries later
+
+RIGHT (one call, immediate result):
+  find_symbol("dispatch_webhook_event")   # or search_graph("dispatch")
+  → returns exact file, line, and body in one shot
+
+If you find yourself writing a grep/glob command to locate a symbol or function,
+STOP — use `find_symbol`, `search_graph`, or `search_code_semantic` instead.
+grep/glob may be used AFTER code-intel tools confirm a file path, or for
+non-symbol content (log output, data files, config values).
 
 **search_graph cross-check rule (b2d312b1):** `codebase__search_graph` indexes can
 go stale and have been observed producing actively wrong results — zero hits for
@@ -197,7 +225,7 @@ source FIRST — do not default to a generic web search:
 Retrieval beats recall: look it up. Do not answer a decision-relevant factual
 question from memory when a source can be checked.
 
-<!-- meridian-executor-standard: v9 -->
+<!-- meridian-executor-standard: v10 -->
 """
 
 

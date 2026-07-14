@@ -1840,16 +1840,28 @@ async def _handle_project_tools(
                         )
             except Exception:  # noqa: BLE001 — orientation must not break
                 pass
-        # 5efe254b — deliver any pending handoff /goal through this trusted tool
-        # result (keyed on project_id) rather than as a spoofable copy-pasted
-        # chat string. Read-once: pop clears it so it surfaces exactly once.
-        # Outside the tenant gate so self-hosted sessions receive it too.
+        # 5efe254b / 590dcdd5 — deliver any pending handoff /goal through this
+        # trusted tool result (keyed on project_id) rather than as a spoofable
+        # copy-pasted chat string. Read-once: pop clears it so it surfaces exactly
+        # once. Outside the tenant gate so self-hosted sessions receive it too.
         # Guarded so a pre-migration DB never breaks the orientation.
+        #
+        # 590dcdd5: use pop_pending_goal_with_meta so we can flag goals that are
+        # older than PENDING_GOAL_STALE_HOURS as possibly-stale. A stale goal was
+        # written by a prior session; the human may have started this session with
+        # a completely different /goal in chat. The executor SHOULD defer to any
+        # direct /goal instruction it received and treat pending_goal as advisory
+        # only when pending_goal_stale is True.
         try:
             if isinstance(result, dict):
-                _pg = await db_module.pop_pending_goal(db, args["project_id"])
-                if _pg:
-                    result["pending_goal"] = _pg
+                _pg_meta = await db_module.pop_pending_goal_with_meta(
+                    db, args["project_id"]
+                )
+                if _pg_meta:
+                    result["pending_goal"] = _pg_meta["goal"]
+                    if _pg_meta["stale"]:
+                        result["pending_goal_stale"] = True
+                        result["pending_goal_age_hours"] = _pg_meta["age_hours"]
         except Exception:  # noqa: BLE001
             pass
         return result
