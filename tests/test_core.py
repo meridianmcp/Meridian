@@ -304,6 +304,8 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     # <role> body now, not inline after "/goal ".
     assert "<role>Verify remaining work is complete.</role>" in content
     assert "pixi run test passes 2150+" in content
+    # 0d5453bc — empty-board goal must also state the single-run constraint.
+    assert "run once at the end, not per item" in content
     assert "## Resume Instructions" in content
     on_disk = tmp_path / "alpha_handoff.md"
     assert on_disk.exists()

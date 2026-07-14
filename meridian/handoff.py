@@ -443,8 +443,11 @@ def _build_quick_start_goal(
         return (
             f"{_loop_prefix}/goal\n"
             "<role>Verify remaining work is complete.</role>\n"
+            # 0d5453bc — explicit single-run wording: full suite runs once,
+            # at the end of the megasprint, not per item.
             "<completion_criteria>Done when pixi run test passes "
-            f"{test_floor}+, and generate_handoff() is called at the end."
+            f"{test_floor}+ (run once at the end, not per item), "
+            "and generate_handoff() is called at the end."
             "</completion_criteria>\n"
             f"<stop_conditions>Stop after {_turns} turns "
             f"{_xml_escape(_hitl_clause)}</stop_conditions>"
@@ -550,9 +553,16 @@ def _build_quick_start_goal(
         "live board (the ids below are a snapshot and may have shifted)."
         "</first_step>\n"
         f"<sprint_items>{_xml_escape(items_clause.strip())}</sprint_items>\n"
+        # 0d5453bc — explicit per-item vs end-of-megasprint split: targeted tests
+        # only per item; the full suite is a single gate at the very end. This
+        # prevents the anti-pattern of running the full suite 6x for one item.
         "<completion_criteria>Done when all listed sprint items are marked "
-        "complete via complete_sprint_item(), pixi run test passes "
-        f"{test_floor}+, and generate_handoff() is called at the end."
+        "complete via complete_sprint_item(), "
+        "pixi run test passes "
+        f"{test_floor}+ (run the full suite ONCE at the very end of the entire "
+        "megasprint as the single deploy gate -- not per item; "
+        "per-item verification uses targeted tests for that item only), "
+        "and generate_handoff() is called at the end."
         "</completion_criteria>"
         # 2a06a840 — xdist worker-crash guidance: an INTERNALERROR produced by
         # pytest-xdist (e.g. "AssertionError: ('tests/…::test_name', <WorkerController
@@ -698,10 +708,16 @@ def build_item_briefing(
     # <resources> — files/symbols declared on the item.
     resources_text = ", ".join(resources_lines) if resources_lines else ""
 
-    # <completion_criteria> — item marked done + tests pass.
+    # <completion_criteria> — item marked done + targeted tests pass.
+    # 0d5453bc — per-item verification uses targeted tests only; the full
+    # suite (pixi run test {test_floor}+) runs once at the end of the whole
+    # megasprint, not after each individual item. For timing/comparative
+    # questions prefer CI history over repeated local runs.
     completion_text = (
         f"Done when complete_sprint_item({iid!r}) is called, "
-        f"pixi run test passes {test_floor}+, "
+        f"targeted tests for this item pass (run pixi run test passes {test_floor}+ "
+        "only ONCE at the very end of the whole megasprint -- not after each item; "
+        "per-item verification: run only the specific tests relevant to this change), "
         "and generate_handoff() is called at the end."
     )
 
