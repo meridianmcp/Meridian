@@ -8,6 +8,9 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # baead5fa — skip .pyc writes for the throwaway CI filesystem; pure overhead
+  # when the runner is destroyed after the job anyway.
+  PYTHONDONTWRITEBYTECODE: 1
 
 jobs:
   test-core:
@@ -32,7 +35,13 @@ jobs:
       # is per-test `client`-fixture setup (importlib.reload(meridian.server) on
       # ~390/946 tests), not any single slow test. Keep --durations so the fix's
       # before/after is measurable.
-      - run: pixi run python -m pytest tests/ -n auto -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=82
+      # baead5fa — worksteal instead of default load-scope: duration data (see
+      # tests/PERF_test_core_durations.md) shows uneven per-test cost (the
+      # client-fixture reload tax hits ~390/946 tests unevenly), so static
+      # up-front chunking leaves some workers idle while others queue. worksteal
+      # dynamically redistributes remaining tests, which only helps under that
+      # kind of imbalance and can't hurt evenly-distributed runs.
+      - run: pixi run python -m pytest tests/ -n auto --dist=worksteal -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=82
 
   test-postgres:
     # KEYSTONE 98aa7eb7 (pinned decision f70b731a — Postgres correctness is
@@ -92,7 +101,7 @@ jobs:
       # database (meridian_test_gw0, _gw1, … — created on demand by conftest) and
       # drops/recreates the public schema per test, so workers stay fully isolated
       # even though every test rebuilds the schema.
-      - run: pixi run python -m pytest tests/ -n auto -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --timeout=60
+      - run: pixi run python -m pytest tests/ -n auto --dist=worksteal -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --timeout=60
 
   test-ux:
     runs-on: ubuntu-latest
