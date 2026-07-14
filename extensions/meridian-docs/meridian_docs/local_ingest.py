@@ -11,14 +11,27 @@ The manual workaround -- read the file with a local tool, then hand-copy the
 text into a separate ``ingest_document(content=...)`` call -- is error-prone
 and may be lossy when an LLM condenses the text before forwarding it.
 
-Fix: this module provides a single :func:`ingest_local_document` function that
-(1) reads a local file programmatically, (2) extracts its full plain text via
-the same stdlib-only logic Meridian uses server-side, and (3) forwards the
-complete extracted text to the hosted ``ingest_document`` tool via an HTTP
-JSON-RPC call.  The caller makes ONE tool call; the two-step manual workaround
-goes away.
+Fix (fdbd4296): :func:`ingest_local_document` reads a local file programmatically,
+extracts its full plain text, and forwards the complete extracted text to the
+hosted ``ingest_document`` tool via an HTTP JSON-RPC call.  This populates the
+FLAT note store (searchable via search_all / search_synthesis) only.
 
-Text extraction support (stdlib only, no third-party deps):
+Limitation (db42acce): the flat note store and the STRUCTURAL doc-store
+(headings tree, doc_figures, doc_tables, doc_equations) are SEPARATE.
+:func:`ingest_local_document` can only populate the flat note store because
+structural elements (heading level, image position, table shape) are not
+recoverable from a plain text string — they require parsing the actual .docx
+binary (its real XML tree).  To also populate the structural doc-store (so
+find_similar_figure / index_figure / index_table / index_equation work on a
+locally-stored .docx), use :func:`ingest_local_document_structure`, which:
+  1. Parses the real .docx binary locally via ``docparse.docs_intel.document_content_tree``.
+  2. Forwards the resulting structural blocks to the hosted
+     ``ingest_document_structure`` MCP tool, which stores them into the
+     doc-structure store (doc_documents / doc_elements / doc_figures rows)
+     keyed on the SAME source as the flat note — so find_similar_figure's
+     get_document() lookup resolves the correct document_id.
+
+Text extraction support for :func:`ingest_local_document` (stdlib only):
   - ``.docx`` -- unzipped via ``zipfile``; paragraphs joined from ``<w:t>`` runs.
   - ``.txt`` / ``.md`` / ``.markdown`` / common source extensions -- read as UTF-8
     (errors replaced).
@@ -51,6 +64,8 @@ __all__ = [
     "extract_text",
     "call_hosted_ingest",
     "ingest_local_document",
+    "call_hosted_ingest_structure",
+    "ingest_local_document_structure",
 ]
 
 # ---------------------------------------------------------------------------
@@ -203,39 +218,22 @@ def _resolve_token() -> str:
     return token
 
 
-def call_hosted_ingest(
-    project_id: str,
-    content: str,
-    title: str | None = None,
-    source: str | None = None,
-    tags: str | None = None,
+def _call_mcp_tool(
+    tool_name: str,
+    params: dict[str, Any],
     base_url: str | None = None,
     token: str | None = None,
+    timeout: int = 60,
 ) -> dict[str, Any]:
-    """POST an ``ingest_document`` JSON-RPC call to the hosted Meridian /mcp endpoint.
+    """POST a ``tools/call`` JSON-RPC call to the hosted Meridian /mcp endpoint.
 
     Uses stdlib ``urllib.request`` only (no httpx/requests dependency).
 
-    ``base_url`` defaults to ``MERIDIAN_URL`` env var (falls back to
-    ``https://usemeridian.us``). ``token`` defaults to ``MERIDIAN_API_KEY`` or
-    ``BEARER_TOKEN`` env vars.
-
-    Returns the ``result`` dict from the JSON-RPC response, or raises a
-    :class:`DocExtractionError` describing the server-side failure.
+    Returns the unwrapped result dict, or raises :class:`DocExtractionError`
+    describing the server-side failure.
     """
     url = (base_url or _resolve_base_url()) + "/mcp"
     tok = token if token is not None else _resolve_token()
-
-    params: dict[str, Any] = {
-        "project_id": project_id,
-        "content": content,
-    }
-    if title is not None:
-        params["title"] = title
-    if source is not None:
-        params["source"] = source
-    if tags is not None:
-        params["tags"] = tags
 
     payload = json.dumps(
         {
@@ -243,7 +241,7 @@ def call_hosted_ingest(
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "ingest_document",
+                "name": tool_name,
                 "arguments": params,
             },
         }
@@ -258,7 +256,7 @@ def call_hosted_ingest(
 
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         try:
@@ -266,7 +264,7 @@ def call_hosted_ingest(
         except Exception:  # noqa: BLE001
             body = str(exc)
         raise DocExtractionError(
-            f"hosted ingest_document returned HTTP {exc.code}: {body}"
+            f"hosted {tool_name} returned HTTP {exc.code}: {body}"
         ) from exc
     except urllib.error.URLError as exc:
         raise DocExtractionError(
@@ -274,10 +272,8 @@ def call_hosted_ingest(
         ) from exc
 
     # The /mcp endpoint may return Streamable HTTP (SSE) or plain JSON.
-    # For a tools/call response it typically returns JSON; handle both.
     result_data: Any = None
     if "data:" in raw:
-        # SSE stream -- extract the last non-empty data line's JSON.
         for line in raw.splitlines():
             line = line.strip()
             if line.startswith("data:"):
@@ -300,13 +296,10 @@ def call_hosted_ingest(
             f"no parseable result in hosted Meridian response: {raw[:500]}"
         )
 
-    # JSON-RPC error object.
     if isinstance(result_data, dict) and "error" in result_data:
         err = result_data["error"]
-        raise DocExtractionError(f"hosted ingest_document error: {err}")
+        raise DocExtractionError(f"hosted {tool_name} error: {err}")
 
-    # JSON-RPC success: the MCP result may be nested under result.content[0].text
-    # (MCP SDK wraps tool results in a content array) or directly as result.
     rpc_result: Any = result_data.get("result", result_data) if isinstance(result_data, dict) else result_data
 
     # Unwrap MCP tool-result envelope: {content: [{type: "text", text: "<json>"}]}
@@ -321,17 +314,94 @@ def call_hosted_ingest(
                 except json.JSONDecodeError:
                     rpc_result = {"text": text_val}
 
-    # Propagate server-side ingest errors surfaced as {"error": "..."} in result.
     if isinstance(rpc_result, dict) and rpc_result.get("error"):
         raise DocExtractionError(
-            f"hosted ingest_document returned error: {rpc_result['error']}"
+            f"hosted {tool_name} returned error: {rpc_result['error']}"
         )
 
     return rpc_result if isinstance(rpc_result, dict) else {"result": rpc_result}
 
 
+def call_hosted_ingest(
+    project_id: str,
+    content: str,
+    title: str | None = None,
+    source: str | None = None,
+    tags: str | None = None,
+    base_url: str | None = None,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """POST an ``ingest_document`` JSON-RPC call to the hosted Meridian /mcp endpoint.
+
+    Uses stdlib ``urllib.request`` only (no httpx/requests dependency).
+
+    ``base_url`` defaults to ``MERIDIAN_URL`` env var (falls back to
+    ``https://usemeridian.us``). ``token`` defaults to ``MERIDIAN_API_KEY`` or
+    ``BEARER_TOKEN`` env vars.
+
+    Returns the ``result`` dict from the JSON-RPC response, or raises a
+    :class:`DocExtractionError` describing the server-side failure.
+
+    NOTE (db42acce): this populates the FLAT note store only (searchable via
+    search_all / search_synthesis).  To also populate the structural doc-store
+    (headings tree, doc_figures, doc_tables) so find_similar_figure returns a
+    real document_id, call :func:`call_hosted_ingest_structure` separately with
+    the same ``source`` value.
+    """
+    params: dict[str, Any] = {
+        "project_id": project_id,
+        "content": content,
+    }
+    if title is not None:
+        params["title"] = title
+    if source is not None:
+        params["source"] = source
+    if tags is not None:
+        params["tags"] = tags
+    return _call_mcp_tool("ingest_document", params, base_url=base_url, token=token)
+
+
+def call_hosted_ingest_structure(
+    project_id: str,
+    source: str,
+    blocks: list[dict[str, Any]],
+    title: str | None = None,
+    doc_type: str = "docx",
+    base_url: str | None = None,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """POST an ``ingest_document_structure`` JSON-RPC call to hosted Meridian.
+
+    db42acce — forwards the raw ``blocks`` list from
+    ``docparse.docs_intel.document_content_tree`` to the hosted server, which
+    converts them to structural elements (via ``elements_from_docx_content_tree``)
+    and stores them in the doc-structure store (doc_documents / doc_elements /
+    doc_figures / doc_tables rows) keyed on ``source``.
+
+    ``source`` MUST match the source used for the corresponding
+    ``ingest_document(content=...)`` call (default: the local file path) so that
+    ``get_document(project_id, source)`` resolves the same ``document_id`` for
+    both the flat note and the structural rows — which is the key that makes
+    ``find_similar_figure`` return a real (non-null) document_id.
+
+    Returns ``{document_id, source, doc_type, element_count}``, or raises
+    :class:`DocExtractionError` on network/server errors.
+    """
+    params: dict[str, Any] = {
+        "project_id": project_id,
+        "source": source,
+        "blocks": json.dumps(blocks),
+        "doc_type": doc_type,
+    }
+    if title is not None:
+        params["title"] = title
+    return _call_mcp_tool(
+        "ingest_document_structure", params, base_url=base_url, token=token
+    )
+
+
 # ---------------------------------------------------------------------------
-# Combined extract-then-ingest
+# Combined extract-then-ingest (flat note only — fdbd4296)
 # ---------------------------------------------------------------------------
 
 def ingest_local_document(
@@ -345,8 +415,9 @@ def ingest_local_document(
 ) -> dict[str, Any]:
     """Read a local file, extract its full text, and ingest it into Meridian.
 
-    This is the single-call replacement for the two-step manual workaround
-    (local-read tool + separate ``ingest_document(content=...)`` call).
+    fdbd4296 — this is the single-call replacement for the two-step manual
+    workaround (local-read tool + separate ``ingest_document(content=...)``
+    call).
 
     Steps:
       1. ``path`` is opened locally and its text extracted programmatically
@@ -355,6 +426,19 @@ def ingest_local_document(
          ``ingest_document`` tool via an HTTP call with ``content=<text>``.
       3. The hosted tool's response (the created note id/slug/title/source) is
          returned.
+
+    SCOPE LIMITATION (db42acce): this function populates the FLAT note store
+    ONLY (searchable via search_all / search_synthesis). The structural doc-store
+    (headings tree, doc_figures, doc_tables, doc_equations) is NOT populated by
+    this function, because structural elements (heading level, image position,
+    table shape) are not recoverable from a plain text string — they require
+    parsing the actual .docx binary.
+
+    For the FULL two-step ingest (flat note + structural rows) call BOTH:
+      1. ``ingest_local_document(path, ...)`` — populates the flat note store.
+      2. ``ingest_local_document_structure(path, ...)`` — populates the
+         structural doc-store.  Use the SAME ``source`` value for both (the
+         default is ``path`` in both cases).
 
     Args:
       path:        Absolute or relative path to a local file.
@@ -391,4 +475,109 @@ def ingest_local_document(
     # Augment the result with local metadata useful to the caller.
     result["chars_extracted"] = len(text)
     result["local_path"] = path
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Structural ingest — headings/figures/tables (db42acce)
+# ---------------------------------------------------------------------------
+
+def ingest_local_document_structure(
+    path: str,
+    project_id: str,
+    title: str | None = None,
+    source: str | None = None,
+    base_url: str | None = None,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """Parse a local .docx's structural content and persist it to hosted Meridian.
+
+    db42acce — this is the structural complement to :func:`ingest_local_document`.
+    Where that function can only forward plain text (populating the flat note
+    store), this function parses the REAL .docx binary locally (where the file
+    actually lives) to extract its structural tree (headings, figures, tables)
+    and forwards the structural rows to the hosted server's doc-structure store.
+
+    Steps:
+      1. The .docx at ``path`` is parsed via
+         ``docparse.docs_intel.document_content_tree`` — the same stdlib-only
+         OOXML parser used by the 7a98286b structural linter.  This extracts
+         headings (level, text, para_id), tables (rows/cells), and figure
+         caption paragraphs (SEQ-field captions) in true document order.
+      2. The ``blocks`` list from the parse result is forwarded to the hosted
+         ``ingest_document_structure`` MCP tool via an HTTP call.  The hosted
+         server converts the blocks to structured elements (headings/figures/
+         tables with parent relationships) via ``elements_from_docx_content_tree``
+         and stores them in doc_documents / doc_elements rows.
+      3. The result (document_id, source, element_count) is returned.
+
+    The ``source`` used MUST match the source used in any prior
+    :func:`ingest_local_document` call for the same file (default: ``path`` for
+    both), so that ``find_similar_figure`` / ``index_figure`` / ``index_table``
+    can look up the same ``document_id`` via ``get_document(project_id, source)``.
+
+    Args:
+      path:        Absolute or relative path to a local .docx file.
+      project_id:  Meridian project UUID to ingest into.
+      title:       Document title (optional; stored for display in doc-store).
+      source:      Source key (defaults to ``path``).  Must match the source
+                   used for :func:`ingest_local_document`.
+      base_url:    Override the Meridian server URL.
+      token:       Override the API token.
+
+    Returns:
+      ``{document_id, source, doc_type, element_count, local_path}``.
+
+    Raises:
+      FileNotFoundError:         if ``path`` does not exist.
+      DocExtractionError:        if the file is not a valid .docx, or on
+                                 network/server errors.
+      UnsupportedDocumentError:  if ``docparse`` is not installed (raised by the
+                                 import; add ``docparse`` to your environment).
+    """
+    if not path or not str(path).strip():
+        raise DocExtractionError("path must be a non-empty string")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"no such file: {path}")
+    if not os.path.isfile(path):
+        raise DocExtractionError(f"not a file: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext != ".docx":
+        raise UnsupportedDocumentError(
+            f"ingest_local_document_structure only supports .docx files "
+            f"(structural parsing requires OOXML binary, got '{ext}'). "
+            "For .tex LaTeX documents, use ingest_document with file_path on a "
+            "self-hosted Meridian instance."
+        )
+
+    try:
+        from meridian_docs._vendored_content_tree import document_content_tree  # noqa: PLC0415
+    except ImportError as exc:
+        raise DocExtractionError(
+            "docparse is not installed in this environment — install it with "
+            "'pip install docparse' or 'pip install -e packages/docparse' "
+            "(from the Meridian repo root)"
+        ) from exc
+
+    try:
+        tree = document_content_tree(path)
+    except Exception as exc:  # noqa: BLE001
+        raise DocExtractionError(
+            f"could not parse .docx structural content: {exc}"
+        ) from exc
+
+    blocks = tree.get("blocks") or []
+    resolved_source = source if source is not None else path
+    result = call_hosted_ingest_structure(
+        project_id=project_id,
+        source=resolved_source,
+        blocks=blocks,
+        title=title,
+        doc_type="docx",
+        base_url=base_url,
+        token=token,
+    )
+    result["local_path"] = path
+    result["blocks_forwarded"] = len(blocks)
     return result
