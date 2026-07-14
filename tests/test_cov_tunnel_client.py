@@ -1087,6 +1087,18 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
 
     monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, *a, **k: FakeProc(cmd))
 
+    # aaddb273 — _kill_stale_port_occupant scans REAL system ports via
+    # psutil.net_connections() and (on Windows) shells out to taskkill, which
+    # goes through the same tc.subprocess.Popen patched above. On a dev machine
+    # that happens to have a real process bound to one of the test's slot ports
+    # (e.g. an actual meridian tunnel session running elsewhere), this silently
+    # inflates the `procs` list the tests assert against, making the test's
+    # pass/fail depend on ambient system state. This helper is about the
+    # spawn/config-writing path, not stale-occupant handling (which has its own
+    # dedicated, thorough coverage in test_tunnel_client.py) — no-op it here so
+    # these tests are hermetic regardless of what happens to be running locally.
+    monkeypatch.setattr(tc, "_kill_stale_port_occupant", lambda *a, **k: None)
+
     # Lazy spawn (3649a61a): built-in slots are SlotProxy objects whose proxy is
     # NOT Popen'd at startup — it spawns on the first request via ensure_running().
     # Patch ensure_running to spawn synchronously (no 1s port-bind sleep, no real
