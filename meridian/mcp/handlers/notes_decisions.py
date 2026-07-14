@@ -1,0 +1,1651 @@
+"""Per-tool handlers extracted from _handle_notes_decisions (ac4df52f).
+
+Each function corresponds to exactly one MCP tool from the
+``_handle_notes_decisions`` dispatch group in ``meridian/mcp/handler.py``.
+The extraction is PURELY MECHANICAL: zero behaviour change, same tool names,
+same arguments, same return values.  All comments and citations are
+preserved verbatim from the original.
+
+Callers (handler.py) assemble these into a dispatch table
+(dict[str, Callable]) and invoke the matched function instead of walking
+the original if/elif chain.
+
+Helper functions that are shared by multiple handlers
+(``_resolve_ingest_doc_store``, ``_persist_ingest_structure``,
+``_workspace_scope_warning``) are imported from ``meridian.mcp.handler``
+itself (where they live and are not part of the extracted set) via a
+localised import inside each handler that needs them, keeping the import
+graph acyclic and matching the ``# noqa: PLC0415`` pattern already
+established by the project_tools extraction.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from typing import Any
+
+import meridian.server as _server
+from meridian import db as db_module
+from meridian._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
+
+
+# ---------------------------------------------------------------------------
+# Section 1: Decisions
+# ---------------------------------------------------------------------------
+
+async def handle_pin_decision(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: pin_decision."""
+    validate_input_size(args.get("title"), "decision title", 500)
+    validate_input_size(args.get("body"), "decision body", 100_000)
+    category = args.get("category", "TECHNICAL")
+    result = await db_module.pin_decision(
+        db, args["project_id"], args["title"], args["body"], category,
+        priority=args.get("priority", "normal"),
+        assumption=args.get("assumption"),
+    )
+    await _server._append_decision_to_md(args["title"], args["body"], category)
+    return result
+
+
+async def handle_update_decision(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: update_decision."""
+    new_title = args.get("new_title")
+    new_body = args.get("new_body")
+    if new_title and new_body:
+        return await db_module.supersede_pinned_decision(
+            db, args["decision_id"], new_title, new_body, args.get("category"),
+            priority=args.get("priority"),
+        )
+    result = await db_module.update_pinned_decision(
+        db, args["decision_id"],
+        body=args.get("body"),
+        title=args.get("title"),
+        category=args.get("category"),
+        status=args.get("status"),
+        superseded_by=args.get("superseded_by"),
+        priority=args.get("priority"),
+        assumption=args.get("assumption"),
+        assumption_status=args.get("assumption_status"),
+    )
+    if result is None:
+        raise ValueError("decision not found")
+    return result
+
+
+async def handle_validate_assumption(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: validate_assumption.
+
+    8ec5493b — one-call assumption validation: stamp the decision's
+    assumption_status, save a code-anchored finding note, and fire a
+    blocking HITL on invalidation.
+    """
+    if "confirmed" not in args:
+        return {"error": "validate_assumption requires 'confirmed' (bool)"}
+    validate_input_size(args.get("finding"), "finding", 100_000)
+    validate_input_size(args.get("file_path"), "file_path", 2_000)
+    validate_input_size(args.get("symbol"), "symbol", 500)
+    try:
+        return await db_module.validate_assumption(
+            db, args["decision_id"], args.get("finding") or "",
+            bool(args.get("confirmed")),
+            file_path=args.get("file_path"), symbol=args.get("symbol"),
+            session_id=args.get("session_id"),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_pinned_decisions(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_pinned_decisions."""
+    return await db_module.get_pinned_decisions(
+        db, args["project_id"],
+        include_superseded=bool(args.get("include_superseded", False)),
+    )
+
+
+async def handle_archive_decision(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: archive_decision."""
+    deleted = await db_module.delete_pinned_decision(db, args["decision_id"])
+    if not deleted:
+        raise ValueError("decision not found")
+    return {"deleted": True, "decision_id": args["decision_id"]}
+
+
+# ---------------------------------------------------------------------------
+# Section 2: Notes
+# ---------------------------------------------------------------------------
+
+async def handle_add_note(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: add_note."""
+    validate_input_size(args.get("title"), "note title", 500)
+    validate_input_size(args.get("body"), "note body", 10_000_000)
+    validate_input_size(args.get("file_path"), "note file_path", 2_000)
+    validate_input_size(args.get("symbol"), "note symbol", 500)
+    validate_input_size(args.get("source"), "note source", 2_000)
+    # 41b8a927 — recognise #hashtags in the title/body as tags so a note is
+    # searchable by tag without a separate tags argument.
+    import re as _re_ht  # noqa: PLC0415
+    _ht = _re_ht.findall(
+        r"(?<!\w)#([A-Za-z][\w-]{1,40})",
+        f"{args.get('title') or ''} {args.get('body') or ''}",
+    )
+    _tags_arg = args.get("tags")
+    if _ht:
+        _have = {t.strip().lower() for t in (_tags_arg or "").split(",") if t.strip()}
+        _add = [h for h in _ht if h.lower() not in _have]
+        if _add:
+            _tags_arg = ", ".join(
+                [p for p in [(_tags_arg or "").strip()] if p] + _add
+            )
+    try:
+        result = await db_module.add_project_note(
+            db, args["project_id"], args["title"], args["body"],
+            _tags_arg, kind=args.get("kind"),
+            priority=args.get("priority", "normal"),
+            file_path=args.get("file_path"), symbol=args.get("symbol"),
+            source=args.get("source"),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    await _server._append_note_to_roadmap(
+        args["title"], args["body"], args.get("tags"), args.get("category"),
+    )
+    # e5592013 — lint: "MANUAL" notes are usually human tasks, not wiki.
+    if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
+        result = {**result, "lint": _MANUAL_NOTE_LINT}
+    # 6e4e2371 — warn (never block) when a near-duplicate note already exists,
+    # so notes don't accumulate repetitive near-copies. Advisory: any failure
+    # here must not fail the write.
+    if isinstance(result, dict) and not result.get("error"):
+        try:
+            import difflib as _difflib  # noqa: PLC0415
+            _new_title = (args.get("title") or "").strip().lower()
+            if _new_title:
+                _new_id = result.get("id")
+                _new_slug = result.get("slug")
+                _existing = await db_module.get_project_notes(
+                    db, args["project_id"], limit=200
+                )
+                _similar = []
+                for _n in (_existing or []):
+                    if (_new_id and _n.get("id") == _new_id) or (
+                        _new_slug and _n.get("slug") == _new_slug
+                    ):
+                        continue  # skip the note we just created
+                    _et = (_n.get("title") or "").strip().lower()
+                    if not _et:
+                        continue
+                    _ratio = _difflib.SequenceMatcher(None, _new_title, _et).ratio()
+                    if _ratio >= 0.82:
+                        _similar.append({
+                            "slug": _n.get("slug"),
+                            "title": _n.get("title"),
+                            "similarity": round(_ratio, 2),
+                        })
+                if _similar:
+                    _similar.sort(key=lambda s: s["similarity"], reverse=True)
+                    result = {
+                        **result,
+                        "similar_notes": _similar[:3],
+                        "similar_notes_warning": (
+                            "A similar note already exists — consider updating it "
+                            "instead of accumulating near-duplicates."
+                        ),
+                    }
+        except Exception:  # noqa: BLE001 — dedup is advisory
+            pass
+    return result
+
+
+async def handle_get_notes(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_notes.
+
+    5a5bba43 — pull model: default to the lightweight list (no bodies) so
+    bulk note injection can't overflow context. Agents fetch one body via
+    read_note(slug). Pass bodies=true to opt back into full rows.
+    9fa119dd — cursor pagination, opt-in (mirrors get_sprint_items, whose
+    MCP tool stays a bare list while the HTTP route paginates): pass
+    ``cursor`` and/or ``limit`` to get the {notes, has_more, next_cursor}
+    envelope, then re-call with cursor=next_cursor for the next page.
+    Without either arg the legacy bare list is returned for back-compat.
+    98890df1 — relevance sort (reference_count/recency/decision-link) takes
+    precedence over cursor/limit paging.
+    """
+    if args.get("sort") == "relevance":
+        return await db_module.get_project_notes_ranked(
+            db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+            bodies=bool(args.get("bodies", False)),
+            limit=(int(args["limit"]) if "limit" in args else None),
+        )
+    if "cursor" in args or "limit" in args:
+        return await db_module.get_project_notes_page(
+            db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+            bodies=bool(args.get("bodies", False)),
+            limit=int(args.get("limit", 100)),
+            cursor=int(args.get("cursor", 0)),
+        )
+    return await db_module.get_project_notes(
+        db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+        bodies=bool(args.get("bodies", False)),
+    )
+
+
+async def handle_read_note(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: read_note.
+
+    5a5bba43 — the pull half of the list→read model: fetch one note's full
+    body by its per-project slug (returned in the get_notes list).
+    """
+    note = await db_module.get_project_note_by_slug(
+        db, args["project_id"], args["slug"],
+    )
+    if note is None:
+        return {"error": f"note '{args['slug']}' not found in project {args['project_id']}"}
+    return note
+
+
+async def handle_delete_note(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: delete_note."""
+    ok = await db_module.delete_project_note(db, args["note_id"])
+    return {"deleted": ok}
+
+
+# ---------------------------------------------------------------------------
+# Section 3: Document ingestion and structure
+# ---------------------------------------------------------------------------
+
+async def handle_ingest_document(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: ingest_document.
+
+    e3f150d0 — extract a Word/PDF/text document into a kind='document'
+    note. Extraction (.txt/.md/.docx) is stdlib-only and server-side;
+    PDFs/unsupported types must be pre-extracted by the caller and passed
+    as `content`. The body cap is applied inside db.ingest_document.
+    """
+    validate_input_size(args.get("title"), "document title", 500)
+    validate_input_size(args.get("file_path"), "document file_path", 2_000)
+    validate_input_size(args.get("source"), "document source", 2_000)
+    validate_input_size(args.get("content"), "document content", 50_000_000)
+    # 832d67af — when only a file_path is given (no inline content) the server
+    # extracts the text from its OWN filesystem (doc_ingest.extract_text), so on
+    # hosted Meridian (Fly.io) it has ZERO access to a caller's local path and
+    # the open fails with a misleading "[Errno 2] No such file or directory".
+    # Mirror get_document_structure's honest guard: fail clearly, telling the
+    # caller why and what to do. `content` (pre-extracted text) needs no
+    # filesystem and DOES work hosted, so only guard the path-only case.
+    _fp = args.get("file_path")
+    _content = args.get("content")
+    _has_content = _content is not None and str(_content).strip() != ""
+    if _hosted_mode() and _fp and not _has_content:
+        return {
+            "error": (
+                "ingest_document reads the file from the Meridian server's own "
+                "filesystem, so on hosted Meridian it cannot open a path on your "
+                "machine (that is what surfaces as a misleading '[Errno 2] No "
+                "such file or directory'). Run Meridian self-hosted so the server "
+                "shares a filesystem with the file, pass the already-extracted "
+                "text as `content` instead of a `file_path`, or read the document "
+                "through your tunnel's local document tools, which proxy to your "
+                "machine."
+            ),
+            "hosted": True,
+            "file_path": _fp,
+        }
+    from meridian.doc_ingest import DocExtractionError  # noqa: PLC0415
+    try:
+        _ingest_result = await db_module.ingest_document(
+            db, args["project_id"],
+            file_path=args.get("file_path"),
+            content=args.get("content"),
+            title=args.get("title"),
+            source=args.get("source"),
+            tags=args.get("tags"),
+        )
+    except (ValueError, DocExtractionError, FileNotFoundError) as exc:
+        return {"error": str(exc)}
+    # 9ee6d2ec — best-effort: persist the parsed docx/latex STRUCTURE into the
+    # tiered doc-structure store. Fully guarded inside — a persistence failure
+    # never touches _ingest_result (no regression to the flat-note ingest).
+    from meridian.mcp.handler import _persist_ingest_structure  # noqa: PLC0415
+    await _persist_ingest_structure(
+        db,
+        data_dir,
+        tenant,
+        args["project_id"],
+        args.get("file_path"),
+        args.get("source"),
+        args.get("title"),
+    )
+    return _ingest_result
+
+
+async def handle_get_document_structure(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_document_structure.
+
+    13462df2 — stateless docs_intel: heading outline of a server-side .docx
+    (no sidecar index). Same server-side file access as ingest_document
+    (self-hosted / tunnel).
+    """
+    validate_input_size(args.get("file_path"), "document file_path", 2_000)
+    fp = args.get("file_path")
+    if not fp:
+        return {"error": "file_path is required"}
+    # 79ee73e8 — record this stateless peek in the tenant-scoped "recently
+    # viewed (not saved)" log so the Documents tab can surface it. Peeks were
+    # invisible there (only ingested docs showed), silently conflating the two.
+    _peek_scope = (tenant or {}).get("id") if tenant else None
+
+    def _record_peek(ok: bool) -> None:
+        try:
+            from meridian import doc_peeks  # noqa: PLC0415
+            doc_peeks.record_peek(_peek_scope, fp, ok=ok)
+        except Exception:  # noqa: BLE001 — the recent-peeks log is best-effort
+            pass
+
+    # b43bab91 — this reads the .docx from the SERVER's own filesystem
+    # (zipfile.ZipFile), so it only works self-hosted, where the server and the
+    # files share a machine. On hosted Meridian (Fly.io) the server has ZERO
+    # access to a caller's local path, so the read would fail with a misleading
+    # "file not found" regardless of tunnel/file state. Fail honestly instead:
+    # tell the caller why and what to do (self-host, or read via the tunnel's
+    # word-document tools, which proxy to their machine — unlike this native
+    # tool, which does not).
+    if _hosted_mode():
+        _record_peek(ok=False)
+        return {
+            "error": (
+                "get_document_structure reads the .docx from the Meridian "
+                "server's own filesystem, so on hosted Meridian it cannot open a "
+                "path on your machine (that is what surfaces as a misleading "
+                "'file not found'). Run Meridian self-hosted so the server shares "
+                "a filesystem with the file, or read the document through your "
+                "tunnel's word-document tools, which proxy to your machine."
+            ),
+            "hosted": True,
+            "file_path": fp,
+        }
+    try:
+        from meridian.docs_intel import document_outline  # noqa: PLC0415
+        from meridian import hardening as _hardening  # noqa: PLC0415
+        # document_outline is a synchronous zipfile/OOXML parse — previously
+        # run directly on the event loop with no deadline, so a huge/malformed
+        # .docx could block the whole loop (e5f96adf). Run it in the bulkhead
+        # under a hard timeout: fail fast + keep the loop responsive.
+        _outline = await _hardening.run_in_bulkhead(
+            document_outline, fp, label="get_document_structure",
+        )
+    except _hardening.HeavyToolTimeout as exc:
+        _record_peek(ok=False)
+        return {"error": str(exc), "timed_out": True, "file_path": fp}
+    except FileNotFoundError:
+        return {"error": f"file not found: {fp}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not parse document: {exc}"}
+    _record_peek(ok=True)
+    return _outline
+
+
+async def handle_get_latex_structure(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_latex_structure.
+
+    106118cd — docs_intel Phase 3: native LaTeX (.tex) structure + biblio,
+    no PDF intermediary. Accepts a server-side file_path (like
+    get_document_structure) OR raw `source` inline. latex_intel never
+    raises — malformed LaTeX yields a partial/empty tree, not a crash.
+    """
+    validate_input_size(args.get("file_path"), "latex file_path", 2_000)
+    validate_input_size(args.get("source"), "latex source", 5_000_000)
+    fp = args.get("file_path")
+    src = args.get("source")
+    if not fp and not src:
+        return {"error": "file_path or source is required"}
+    # b43bab91 — a file_path is read from the SERVER filesystem and is
+    # unreadable on hosted Meridian (same root cause as get_document_structure).
+    # But get_latex_structure ALSO accepts inline `source`, which DOES work
+    # hosted — so on hosted prefer source, and fail honestly when only an
+    # unreadable path was given.
+    if _hosted_mode() and fp:
+        if src:
+            fp = None  # server can't open the caller's path; use inline source
+        else:
+            return {
+                "error": (
+                    "get_latex_structure reads the .tex from the Meridian "
+                    "server's filesystem, so on hosted Meridian it cannot open a "
+                    "path on your machine. Pass the file contents inline via "
+                    "`source`, or run Meridian self-hosted."
+                ),
+                "hosted": True,
+                "file_path": fp,
+            }
+    from meridian.latex_intel import analyze_latex  # noqa: PLC0415
+    try:
+        if fp:
+            if not os.path.isfile(fp):
+                return {"error": f"file not found: {fp}"}
+            return analyze_latex(fp)
+        return analyze_latex(src)
+    except Exception as exc:  # noqa: BLE001 — defense in depth; analyze_latex is already safe
+        return {"error": f"could not parse latex: {exc}"}
+
+
+async def handle_ingest_document_structure(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: ingest_document_structure.
+
+    db42acce — receive pre-parsed structural data (headings/figures/tables)
+    forwarded from the tunnel-local side (where the real .docx lives) and
+    persist it into the doc-structure store so find_similar_figure /
+    index_figure / index_table / index_equation all see the right document_id.
+
+    The tunnel-local function ``ingest_local_document_structure`` (in the
+    meridian-docs extension) calls document_content_tree on the REAL file
+    (which it CAN read locally), serializes the ``blocks`` list from the
+    tree as JSON, and forwards it here.  The hosted server receives the raw
+    blocks, converts them to structured elements via
+    ``elements_from_docx_content_tree`` (which lives server-side in
+    meridian.doc_store), and stores them via put_document — keyed on the
+    SAME source string that ingest_document(content=...) already used, so
+    get_document() resolves the same document_id for both the flat note and
+    the structural rows.
+    """
+    validate_input_size(args.get("source"), "document source", 2_000)
+    validate_input_size(args.get("title"), "document title", 500)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    _struct_source = (args.get("source") or "").strip()
+    if not _struct_source:
+        return {
+            "error": (
+                "source is required — must match the source used for "
+                "ingest_document (usually the local file path)"
+            )
+        }
+    _blocks_raw = args.get("blocks")
+    if not _blocks_raw:
+        return {
+            "error": (
+                "blocks is required — JSON-encoded list of body blocks from "
+                "document_content_tree (the 'blocks' key of its return value)"
+            )
+        }
+    try:
+        if isinstance(_blocks_raw, str):
+            _blocks: list[Any] = json.loads(_blocks_raw)
+        elif isinstance(_blocks_raw, list):
+            _blocks = _blocks_raw
+        else:
+            return {"error": "blocks must be a JSON array"}
+    except (json.JSONDecodeError, TypeError) as exc:
+        return {"error": f"blocks is not valid JSON: {exc}"}
+    if not isinstance(_blocks, list):
+        return {"error": "blocks must be a JSON array"}
+    _struct_doc_type = (args.get("doc_type") or "docx").strip() or "docx"
+    # Convert raw blocks to structured elements using the server-side mapper.
+    try:
+        from meridian.doc_store import elements_from_docx_content_tree  # noqa: PLC0415
+        _struct_elements: list[Any] = elements_from_docx_content_tree(
+            {"blocks": _blocks}
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not convert blocks to elements: {exc}"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        doc = await store.put_document(
+            args["project_id"],
+            _struct_doc_type,
+            _struct_elements,
+            source=_struct_source,
+            title=args.get("title"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not persist document structure: {exc}"}
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc["id"],
+        "source": _struct_source,
+        "doc_type": _struct_doc_type,
+        "element_count": doc.get("element_count", len(_struct_elements)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section 4: Citation graph
+# ---------------------------------------------------------------------------
+
+async def handle_get_citation_edges(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_citation_edges.
+
+    fefb596a — read the citation graph: every kind='citation' marker in a
+    project (optionally scoped to one document via source/document_id) with
+    its intra-doc bibentry edges AND cross-doc zotero_item edges. Reads the
+    tier-resolved doc-structure store; returns an empty graph (never an
+    error) when no structure has been persisted yet.
+    """
+    validate_input_size(args.get("source"), "citation source", 2_000)
+    validate_input_size(args.get("document_id"), "citation document_id", 200)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"project_id": args["project_id"], "markers": []}
+    try:
+        graph = await store.get_citation_graph(
+            args["project_id"],
+            source=args.get("source"),
+            document_id=args.get("document_id"),
+        )
+    except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+        return {"error": f"could not read citation graph: {exc}"}
+    return {"project_id": args["project_id"], **graph}
+
+
+async def handle_resolve_citations(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: resolve_citations.
+
+    fefb596a — opt-in cross-document resolve pass: walk unresolved citation
+    markers and link each to a canonical Zotero item via Zotero's LOCAL API
+    (zotero_client.resolve_citation_ref). NETWORK — deliberately a separate
+    tool, never in ingest/put_document. Idempotent: only fills gaps. When
+    Zotero is closed / its local API is disabled every marker just stays
+    unresolved (the resolver returns None, never raises).
+    """
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    _max = args.get("max_items")
+    try:
+        _max = int(_max) if _max is not None else None
+    except (TypeError, ValueError):
+        _max = None
+    try:
+        summary = await store.resolve_zotero_edges(
+            args["project_id"], max_items=_max,
+        )
+    except Exception as exc:  # noqa: BLE001 — the pass is best-effort
+        return {"error": f"could not resolve citations: {exc}"}
+    return {"project_id": args["project_id"], **summary}
+
+
+# ---------------------------------------------------------------------------
+# Section 5: Equation index
+# ---------------------------------------------------------------------------
+
+async def handle_index_equation(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: index_equation.
+
+    06df6ab3 — index ONE Word equation (OMML) against a document already
+    stored in the doc-structure store. Mirrors get_citation_edges' shape
+    (resolve the store, then look up the document by its stored source).
+    """
+    validate_input_size(args.get("doc"), "equation doc", 2_000)
+    validate_input_size(args.get("omml_or_latex"), "omml_or_latex", 100_000)
+    validate_input_size(args.get("semantic_label"), "semantic_label", 500)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    omml_or_latex = args.get("omml_or_latex")
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not omml_or_latex:
+        return {"error": "omml_or_latex is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {
+            "error": (
+                f"no stored document for doc={doc_source!r} — ingest_document "
+                "it first (that MCP tool populates the doc-structure store; "
+                "there is no separate reindex_document tool)"
+            ),
+        }
+    try:
+        result = await store.add_equation(
+            doc_row["id"], omml_or_latex,
+            semantic_label=args.get("semantic_label"),
+        )
+    except Exception as exc:  # noqa: BLE001 — indexing is best-effort
+        return {"error": f"could not index equation: {exc}"}
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        **result,
+    }
+
+
+async def handle_find_similar_equation(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: find_similar_equation.
+
+    06df6ab3 — fuzzy-match a LaTeX string against a document's already-
+    stored equations (read-only counterpart of index_equation).
+    """
+    validate_input_size(args.get("doc"), "equation doc", 2_000)
+    validate_input_size(args.get("latex"), "latex", 100_000)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    latex = args.get("latex")
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not latex:
+        return {"error": "latex is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"project_id": args["project_id"], "document_id": None, "matches": []}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {"project_id": args["project_id"], "document_id": None, "matches": []}
+    _limit = args.get("limit")
+    try:
+        _limit = int(_limit) if _limit is not None else 5
+    except (TypeError, ValueError):
+        _limit = 5
+    try:
+        matches = await store.find_similar_equations(
+            doc_row["id"], latex, limit=_limit,
+        )
+    except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+        return {"error": f"could not find similar equations: {exc}"}
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        "matches": matches,
+    }
+
+
+async def handle_insert_equation(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: insert_equation.
+
+    51a595e7 — write an OMML equation straight into a stored document's
+    source .docx (direct OOXML write-back), then resync the sidecar
+    equation index. Mirrors index_equation's shape (resolve the store, then
+    the document by its stored source) but MUTATES the underlying file.
+    """
+    validate_input_size(args.get("doc"), "equation doc", 2_000)
+    validate_input_size(args.get("para_id"), "para_id", 500)
+    validate_input_size(
+        args.get("equation_id_or_omml"), "equation_id_or_omml", 100_000
+    )
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    para_id = args.get("para_id")
+    equation_id_or_omml = args.get("equation_id_or_omml")
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not para_id:
+        return {"error": "para_id is required"}
+    if not equation_id_or_omml:
+        return {"error": "equation_id_or_omml is required"}
+    position = args.get("position") or "append"
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        result = await store.insert_equation(
+            args["project_id"], doc_source, para_id, equation_id_or_omml,
+            position=position,
+        )
+    except Exception as exc:  # noqa: BLE001 — write-back is best-effort
+        return {"error": f"could not insert equation: {exc}"}
+    if "error" in result:
+        return result
+    return {"project_id": args["project_id"], **result}
+
+
+# ---------------------------------------------------------------------------
+# Section 6: Paragraph update
+# ---------------------------------------------------------------------------
+
+async def handle_update_paragraph(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: update_paragraph.
+
+    f978e588 — ID-addressable docx WRITE (the write counterpart of the
+    get_element_by_id read primitive). Mirrors index_equation's resolution:
+    resolve the tier store, look up the stored document by its source, then
+    rewrite ONE paragraph in the on-disk .docx by its w14:paraId (never by
+    text match) and resync the doc_elements row.
+    f7ee1ba7 — Model B scoped-region enforcement: before writing, consult
+    docx-region claims and REJECT the write when another session owns the
+    target element (or holds a whole-file lock). Fail-open: a claim-lookup
+    error degrades to allow so a missing db never wedges a legitimate write.
+    """
+    validate_input_size(args.get("doc"), "doc", 2_000)
+    validate_input_size(args.get("para_id"), "para_id", 500)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    para_id = args.get("para_id")
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not para_id:
+        return {"error": "para_id is required"}
+    # new_text_or_runs: EITHER a plain string OR a list of runs. Exactly one
+    # of new_text / runs must be provided.
+    new_text = args.get("new_text")
+    runs = args.get("runs")
+    if new_text is None and runs is None:
+        return {"error": "provide either new_text (string) or runs (list)"}
+    if new_text is not None and runs is not None:
+        return {"error": "provide only one of new_text or runs, not both"}
+    new_text_or_runs: Any = runs if runs is not None else new_text
+    if new_text is not None:
+        validate_input_size(new_text, "new_text", 1_000_000)
+    elif not isinstance(runs, list):
+        return {"error": "runs must be a list of strings or run objects"}
+    # f7ee1ba7 — scoped-region claim enforcement gate.
+    _up_session_id = (args.get("session_id") or "").strip() or None
+    if db is not None:
+        _region_conflict = await db_module.check_docx_region_write_conflict(
+            db, _up_session_id, doc_source, para_id,
+        )
+        if _region_conflict is not None and _region_conflict.get("blocked"):
+            return {
+                "error": "docx_region_conflict",
+                "blocked": True,
+                "reason": _region_conflict.get("reason"),
+                "holder": _region_conflict.get("holder"),
+                "message": _region_conflict.get("message"),
+            }
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        result = await store.update_paragraph(
+            args["project_id"], doc_source, para_id, new_text_or_runs,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — the write is best-effort
+        return {"error": f"could not update paragraph: {exc}"}
+    return {"project_id": args["project_id"], **result}
+
+
+# ---------------------------------------------------------------------------
+# Section 7: Symbol usages
+# ---------------------------------------------------------------------------
+
+async def handle_find_symbol_usages(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: find_symbol_usages.
+
+    9605edb0 — READ-ONLY cross-reference tracking: resolve a symbol /
+    normalized-LaTeX string OR a doc_equations id to one target and return
+    every paragraph/equation where it reappears, classified definition vs
+    reuse (earliest ordinal = definition). Mirrors find_similar_equation's
+    shape (resolve the store, then look up the document by its stored source).
+    """
+    validate_input_size(args.get("doc"), "symbol usages doc", 2_000)
+    validate_input_size(args.get("symbol_or_equation_id"), "symbol_or_equation_id", 100_000)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    symbol_or_equation_id = args.get("symbol_or_equation_id")
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not symbol_or_equation_id:
+        return {"error": "symbol_or_equation_id is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"project_id": args["project_id"], "document_id": None, "target": "", "hits": []}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {"project_id": args["project_id"], "document_id": None, "target": "", "hits": []}
+    try:
+        usages = await store.find_symbol_usages(
+            doc_row["id"], symbol_or_equation_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+        return {"error": f"could not find symbol usages: {exc}"}
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        **usages,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section 8: Figure index
+# ---------------------------------------------------------------------------
+
+async def handle_index_figure(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: index_figure.
+
+    c623e648 — index ONE figure into the SEMANTIC figure index (dedup +
+    similarity on a normalized caption), the direct parallel of
+    index_equation. Complementary to the structural kind='figure'
+    doc_elements placement, not a duplicate of it.
+    """
+    validate_input_size(args.get("doc"), "figure doc", 2_000)
+    validate_input_size(args.get("file_path"), "file_path", 4_000)
+    validate_input_size(args.get("caption"), "caption", 10_000)
+    validate_input_size(args.get("semantic_label"), "semantic_label", 500)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    file_path = args.get("file_path")
+    caption = args.get("caption")
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not file_path and not caption:
+        return {"error": "at least one of file_path or caption is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {
+            "error": (
+                f"no stored document for doc={doc_source!r} — ingest_document "
+                "it first (that MCP tool populates the doc-structure store; "
+                "there is no separate reindex_document tool)"
+            ),
+        }
+    try:
+        result = await store.add_figure(
+            doc_row["id"], file_path,
+            caption=caption,
+            semantic_label=args.get("semantic_label"),
+        )
+    except Exception as exc:  # noqa: BLE001 — indexing is best-effort
+        return {"error": f"could not index figure: {exc}"}
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        **result,
+    }
+
+
+async def handle_find_similar_figure(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: find_similar_figure.
+
+    c623e648 — fuzzy-match a description OR a path against a document's
+    already-indexed figures (read-only counterpart of index_figure).
+    """
+    validate_input_size(args.get("doc"), "figure doc", 2_000)
+    validate_input_size(args.get("description_or_path"), "description_or_path", 10_000)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    query = args.get("description_or_path")
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not query:
+        return {"error": "description_or_path is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"project_id": args["project_id"], "document_id": None, "matches": []}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {"project_id": args["project_id"], "document_id": None, "matches": []}
+    _limit = args.get("limit")
+    try:
+        _limit = int(_limit) if _limit is not None else 5
+    except (TypeError, ValueError):
+        _limit = 5
+    # d2a3537a — cross-store resolve-through: when the caller names an
+    # outputs_dir, each matched figure that carries a file_path is resolved
+    # THROUGH to its outputs_index row (linked_output). Building the DuckDB
+    # index is CPU-bound, so do it once off the event loop and hand the store
+    # a resolver closure over the built index; skipped entirely when no
+    # outputs_dir is given (the tool stays a pure fuzzy match by default).
+    outputs_dir = str(args.get("outputs_dir") or "").strip()
+    _resolver = None
+    _index = None
+    # Workspace decision 0dedff91 — the outputs resolve-through stats/walks
+    # `outputs_dir` on THIS process's own filesystem (os.path.isdir + a
+    # DuckDB rebuild over the tree). On hosted Meridian that path is on the
+    # caller's machine, which the server can never reach, so skip the
+    # resolve-through entirely (the figure match itself is DB-only and
+    # still works). Never touch a caller's local dir server-side hosted.
+    if _hosted_mode():
+        outputs_dir = ""
+    if outputs_dir and os.path.isdir(outputs_dir):
+        from meridian import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+        _index = _outputs_indexer.OutputsFtsIndex(outputs_dir)
+        try:
+            await asyncio.to_thread(_index.rebuild)
+            _resolver = _index.resolve_output
+        except Exception:  # noqa: BLE001 — resolve-through is advisory glue
+            _resolver = None
+    try:
+        matches = await store.find_similar_figures(
+            doc_row["id"], query, limit=_limit, output_resolver=_resolver,
+        )
+    except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+        return {"error": f"could not find similar figures: {exc}"}
+    finally:
+        if _index is not None:
+            _index.close()
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        "matches": matches,
+    }
+
+
+async def handle_link_figure_caption(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: link_figure_caption.
+
+    0ff8b982 — durably link an already-indexed doc_figures row to its
+    caption paragraph by stable doc_elements id (not proximity). Confirmation
+    primitive for the advisory suggestion from index_figure, and the
+    backfill mechanism for figures indexed before caption linkage was added.
+    """
+    validate_input_size(args.get("doc"), "figure doc", 2_000)
+    validate_input_size(args.get("figure_id"), "figure_id", 200)
+    validate_input_size(args.get("caption_element_id"), "caption_element_id", 200)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    figure_id = (args.get("figure_id") or "").strip()
+    caption_element_id = (args.get("caption_element_id") or "").strip()
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not figure_id:
+        return {"error": "figure_id is required"}
+    if not caption_element_id:
+        return {"error": "caption_element_id is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {
+            "error": (
+                f"no stored document for doc={doc_source!r} — ingest_document "
+                "it first (that MCP tool populates the doc-structure store; "
+                "there is no separate reindex_document tool)"
+            ),
+        }
+    try:
+        updated = await store.set_figure_caption_link(figure_id, caption_element_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not set caption link: {exc}"}
+    if updated is None:
+        return {
+            "error": (
+                f"no doc_figures row found for figure_id={figure_id!r} "
+                "— use find_similar_figure to locate the correct figure_id"
+            ),
+        }
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        "figure": updated,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section 9: Table index
+# ---------------------------------------------------------------------------
+
+async def handle_index_table(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: index_table.
+
+    2622182d — index ONE table into the SEMANTIC table index (dedup +
+    similarity on a normalized caption), the direct parallel of
+    index_figure. Complementary to the structural kind='table'
+    doc_elements placement, not a duplicate of it.
+    """
+    validate_input_size(args.get("doc"), "table doc", 2_000)
+    validate_input_size(args.get("caption"), "caption", 10_000)
+    validate_input_size(args.get("semantic_label"), "semantic_label", 500)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    caption = args.get("caption")
+    table_index_raw = args.get("table_index")
+    table_index: int | None = None
+    if table_index_raw is not None:
+        try:
+            table_index = int(table_index_raw)
+        except (TypeError, ValueError):
+            return {"error": f"table_index must be an integer, got {table_index_raw!r}"}
+    if not doc_source:
+        return {"error": "doc is required"}
+    if table_index is None and not caption:
+        return {"error": "at least one of table_index or caption is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {
+            "error": (
+                f"no stored document for doc={doc_source!r} — ingest_document "
+                "it first (that MCP tool populates the doc-structure store; "
+                "there is no separate reindex_document tool)"
+            ),
+        }
+    try:
+        result = await store.add_table(
+            doc_row["id"], table_index,
+            caption=caption,
+            semantic_label=args.get("semantic_label"),
+            paired_figure_id=args.get("paired_figure_id"),
+        )
+    except Exception as exc:  # noqa: BLE001 — indexing is best-effort
+        return {"error": f"could not index table: {exc}"}
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        **result,
+    }
+
+
+async def handle_find_similar_table(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: find_similar_table.
+
+    2622182d — fuzzy-match a description against a document's
+    already-indexed tables (read-only counterpart of index_table).
+    """
+    validate_input_size(args.get("doc"), "table doc", 2_000)
+    validate_input_size(args.get("description"), "description", 10_000)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    query = args.get("description")
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not query:
+        return {"error": "description is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"project_id": args["project_id"], "document_id": None, "matches": []}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {"project_id": args["project_id"], "document_id": None, "matches": []}
+    _limit = args.get("limit")
+    try:
+        _limit = int(_limit) if _limit is not None else 5
+    except (TypeError, ValueError):
+        _limit = 5
+    try:
+        matches = await store.find_similar_tables(
+            doc_row["id"], query, limit=_limit,
+        )
+    except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+        return {"error": f"could not find similar tables: {exc}"}
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        "matches": matches,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section 10: Insights and findings
+# ---------------------------------------------------------------------------
+
+async def handle_add_insight(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: add_insight.
+
+    0b711a9d — durable strategic insight (dedicated table, not a note).
+    """
+    validate_input_size(args.get("title"), "insight title", 500)
+    validate_input_size(args.get("body"), "insight body", 1_000_000)
+    return await db_module.create_insight(
+        db, args["project_id"], args["title"], args.get("body") or "",
+        horizon=args.get("horizon", "quarter"),
+        tags=args.get("tags"),
+    )
+
+
+async def handle_get_insights(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_insights."""
+    return await db_module.get_insights(
+        db, args["project_id"], horizon=args.get("horizon")
+    )
+
+
+async def handle_save_finding(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: save_finding.
+
+    e1f43ee7 — phase-agnostic capture primitive (decoupled from search).
+    """
+    validate_input_size(args.get("summary"), "finding summary", 1_000_000)
+    validate_input_size(args.get("source_url"), "source_url", 2_000)
+    if not (args.get("summary") or "").strip():
+        return {"error": "save_finding requires a non-empty summary"}
+    try:
+        return await db_module.save_finding(
+            db, args["project_id"], args.get("summary") or "",
+            source_url=args.get("source_url"),
+            source_type=args.get("source_type", "web"),
+            decision_id=args.get("decision_id"),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_capture_research_finding(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: capture_research_finding.
+
+    b1d36e93 — web/paper-shaped wrapper over save_finding; arXiv URLs are
+    auto-tagged source_type=arxiv.
+    """
+    validate_input_size(args.get("summary"), "finding summary", 1_000_000)
+    validate_input_size(args.get("url"), "url", 2_000)
+    _url = (args.get("url") or "").strip()
+    if not _url:
+        return {"error": "capture_research_finding requires a url"}
+    if not (args.get("summary") or "").strip():
+        return {"error": "capture_research_finding requires a non-empty summary"}
+    _st = "arxiv" if "arxiv.org" in _url.lower() else "web"
+    try:
+        return await db_module.save_finding(
+            db, args["project_id"], args.get("summary") or "",
+            source_url=_url, source_type=_st,
+            decision_id=args.get("related_decision_id"),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Section 11: Workspace notes, decisions, settings
+# ---------------------------------------------------------------------------
+
+async def handle_add_workspace_note(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: add_workspace_note."""
+    validate_input_size(args.get("title"), "note title", 500)
+    validate_input_size(args.get("body"), "note body", 10_000_000)
+    result = await db_module.add_workspace_note(
+        db, args["title"], args["body"], args.get("tags"),
+        tenant_id=_mcp_tenant_id,
+    )
+    # 22c274bd — soft scope nudge; never blocks the write.
+    from meridian.mcp.handler import _workspace_scope_warning  # noqa: PLC0415
+    warning = _workspace_scope_warning(args.get("title"), args.get("body"))
+    if warning and isinstance(result, dict):
+        result["scope_warning"] = warning
+    return result
+
+
+async def handle_get_workspace_notes(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_workspace_notes."""
+    return await db_module.get_workspace_notes(
+        db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
+    )
+
+
+async def handle_pin_workspace_decision(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: pin_workspace_decision."""
+    validate_input_size(args.get("title"), "decision title", 500)
+    validate_input_size(args.get("body"), "decision body", 100_000)
+    result = await db_module.pin_workspace_decision(
+        db, args["title"], args["body"],
+        category=args.get("category", "TECHNICAL"),
+        tenant_id=_mcp_tenant_id,
+    )
+    # 22c274bd — soft scope nudge; never blocks the write.
+    from meridian.mcp.handler import _workspace_scope_warning  # noqa: PLC0415
+    warning = _workspace_scope_warning(args.get("title"), args.get("body"))
+    if warning and isinstance(result, dict):
+        result["scope_warning"] = warning
+    return result
+
+
+async def handle_get_workspace_decisions(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_workspace_decisions."""
+    return await db_module.get_workspace_decisions(
+        db, include_superseded=args.get("include_superseded", False),
+        tenant_id=_mcp_tenant_id,
+    )
+
+
+async def handle_get_workspace_settings(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_workspace_settings."""
+    return await db_module.get_workspace_settings(db, tenant_id=_mcp_tenant_id)
+
+
+async def handle_update_workspace_settings(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: update_workspace_settings."""
+    return await db_module.update_workspace_settings(
+        db,
+        hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
+        sprint_name_default=args.get("sprint_name_default"),
+        handoff_template=args.get("handoff_template"),
+        # 0bf67524 — cascade defaults for new projects.
+        execution_mode_default=args.get("execution_mode_default"),
+        code_intel_enabled_default=args.get("code_intel_enabled_default"),
+        # 76cf8bda — /loop auto-continue workspace default.
+        loop_enabled_default=args.get("loop_enabled_default"),
+        # 36fea6ca — inline resolved sprint-item pointers in the handoff.
+        handoff_inline_pointers=args.get("handoff_inline_pointers"),
+        tenant_id=_mcp_tenant_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section 12: Blog posts
+# ---------------------------------------------------------------------------
+
+async def handle_save_blog_post(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: save_blog_post."""
+    validate_input_size(args.get("title"), "blog title", 500)
+    validate_input_size(args.get("body"), "blog body", 1_000_000)
+    return await db_module.save_blog_post(
+        db, args["title"], args.get("body", ""),
+        status=args.get("status", "draft"),
+        slug=args.get("slug"),
+        post_id=args.get("id"),
+        tenant_id=_mcp_tenant_id,
+    )
+
+
+async def handle_get_blog_posts(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_blog_posts."""
+    return await db_module.get_blog_posts(
+        db, tenant_id=_mcp_tenant_id, status=args.get("status"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section 13: Workspace sprint items
+# ---------------------------------------------------------------------------
+
+async def handle_add_workspace_sprint_item(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: add_workspace_sprint_item."""
+    validate_input_size(args.get("title"), "sprint item title", 500)
+    return await db_module.add_workspace_sprint_item(
+        db, args["title"],
+        item_group=args.get("group"),
+        human_id=args.get("human_id"),
+        tenant_id=_mcp_tenant_id,
+    )
+
+
+async def handle_get_workspace_sprint_items(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_workspace_sprint_items."""
+    return await db_module.get_workspace_sprint_items(
+        db, status=args.get("status"), item_group=args.get("group"),
+        tenant_id=_mcp_tenant_id,
+    )
+
+
+async def handle_update_workspace_sprint_item(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: update_workspace_sprint_item."""
+    validate_input_size(args.get("title"), "sprint item title", 500)
+    item = await db_module.update_workspace_sprint_item(
+        db, args["item_id"],
+        title=args.get("title"),
+        status=args.get("status"),
+        item_group=args.get("group"),
+        human_id=args.get("human_id"),
+        tenant_id=_mcp_tenant_id,
+    )
+    return item or {"error": "workspace sprint item not found"}
+
+
+async def handle_complete_workspace_sprint_item(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: complete_workspace_sprint_item."""
+    item = await db_module.complete_workspace_sprint_item(
+        db, args["item_id"], tenant_id=_mcp_tenant_id,
+    )
+    return item or {"error": "workspace sprint item not found"}
+
+
+# ---------------------------------------------------------------------------
+# Section 14: Workspace proposals (5c4dcc0f)
+# ---------------------------------------------------------------------------
+
+async def handle_add_workspace_proposal(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: add_workspace_proposal (5c4dcc0f — workspace proposals lifecycle)."""
+    validate_input_size(args.get("title"), "proposal title", 500)
+    validate_input_size(args.get("body"), "proposal body", 100_000)
+    return await db_module.add_workspace_proposal(
+        db, args["title"], args["body"],
+        tags=args.get("tags"),
+        tenant_id=_mcp_tenant_id,
+    )
+
+
+async def handle_get_workspace_proposals(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_workspace_proposals."""
+    return await db_module.get_workspace_proposals(
+        db, status=args.get("status"), tag=args.get("tag"),
+        tenant_id=_mcp_tenant_id,
+    )
+
+
+async def handle_advance_proposal_status(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: advance_proposal_status."""
+    try:
+        result = await db_module.advance_workspace_proposal_status(
+            db, args["proposal_id"], args["status"],
+            tenant_id=_mcp_tenant_id,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return result or {"error": "proposal not found"}
+
+
+async def handle_promote_proposal(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: promote_proposal."""
+    _promo_project_id = args.get("project_id") or ""
+    if not _promo_project_id:
+        return {"error": "project_id (or project_name) is required for promote_proposal"}
+    try:
+        result = await db_module.promote_workspace_proposal(
+            db, args["proposal_id"], _promo_project_id,
+            sprint_item_title=args.get("sprint_item_title"),
+            sprint_item_version=args.get("sprint_item_version"),
+            tenant_id=_mcp_tenant_id,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return result
