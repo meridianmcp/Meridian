@@ -44,6 +44,11 @@ anthropic = ">=0.40"
 python-dotenv = ">=1.0"
 psycopg = {version = ">=3.1", extras = ["binary"]}
 psycopg-pool = ">=3.2"
+# 0bfde7ad — Redis push augmentation for session_messages (meridian/redis_bridge.py).
+# Deployed-app path only (MERIDIAN_REDIS_URL, a Fly-provisioned Redis reachable
+# over Fly's private network); every redis_bridge function no-ops safely when
+# it's unset, so this has zero effect on local/self-hosted installs.
+redis = ">=5.0"
 websockets = ">=12.0"
 watchfiles = ">=0.21"
 authlib = ">=1.3"
