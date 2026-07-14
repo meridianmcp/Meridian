@@ -1598,6 +1598,126 @@ def test_terminate_proc_tree_none_is_noop():
     tc._terminate_proc_tree(None)
 
 
+# ---------------------------------------------------------------------------
+# 44892730 — _kill_stale_port_occupant: kill a prior-generation process still
+# bound to a slot's port before the fresh tunnel-client generation spawns its
+# own, closing the confirmed duplicate-process bug.
+# ---------------------------------------------------------------------------
+
+
+class _FakeAddr:
+    def __init__(self, port):
+        self.port = port
+
+
+class _FakeConn:
+    def __init__(self, port, pid, status="LISTEN"):
+        self.laddr = _FakeAddr(port)
+        self.pid = pid
+        self.status = status
+
+
+def _install_fake_psutil(monkeypatch, connections, *, sentinel_listen="LISTEN"):
+    import types
+
+    fake_psutil = types.ModuleType("psutil")
+    fake_psutil.CONN_LISTEN = sentinel_listen
+    fake_psutil.net_connections = lambda kind="inet": connections
+    killed = {}
+
+    class _FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+        def wait(self, timeout=None):
+            pass
+
+        def kill(self):
+            killed.setdefault("kill", []).append(self.pid)
+
+    fake_psutil.Process = _FakeProcess
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+    return killed
+
+
+def test_kill_stale_port_occupant_kills_matching_listener_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    conns = [_FakeConn(port=8809, pid=999), _FakeConn(port=8810, pid=111)]
+    _install_fake_psutil(monkeypatch, conns)
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+
+    tc._kill_stale_port_occupant(8809, "code")
+
+    assert calls == [["taskkill", "/F", "/T", "/PID", "999"]]
+
+
+def test_kill_stale_port_occupant_kills_matching_listener_posix(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    conns = [_FakeConn(port=8809, pid=999)]
+    killed = _install_fake_psutil(monkeypatch, conns)
+
+    tc._kill_stale_port_occupant(8809, "code")
+
+    assert killed.get("terminate") == [999]
+
+
+def test_kill_stale_port_occupant_noop_when_no_listener_on_port(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    conns = [_FakeConn(port=9999, pid=999)]  # different port
+    _install_fake_psutil(monkeypatch, conns)
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+
+    tc._kill_stale_port_occupant(8809, "code")
+
+    assert calls == []
+
+
+def test_kill_stale_port_occupant_ignores_non_listen_connections(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    conns = [_FakeConn(port=8809, pid=999, status="ESTABLISHED")]
+    _install_fake_psutil(monkeypatch, conns)
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+
+    tc._kill_stale_port_occupant(8809, "code")
+
+    assert calls == []
+
+
+def test_kill_stale_port_occupant_survives_missing_psutil(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _fail_psutil_import(name, *a, **kw):
+        if name == "psutil":
+            raise ImportError("no psutil")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _fail_psutil_import)
+    tc._kill_stale_port_occupant(8809, "code")  # must not raise
+
+
+def test_kill_stale_port_occupant_never_raises_on_internal_error(monkeypatch):
+    import types
+
+    fake_psutil = types.ModuleType("psutil")
+    fake_psutil.CONN_LISTEN = "LISTEN"
+
+    def _boom(kind="inet"):
+        raise OSError("permission denied")
+
+    fake_psutil.net_connections = _boom
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_stale_port_occupant(8809, "code")  # must not raise
+
+
 def test_dc_default_command_wraps_cmd_on_windows(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "win32")
     assert tc._dc_default_command() == [
