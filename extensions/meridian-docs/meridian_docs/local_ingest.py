@@ -390,7 +390,7 @@ def call_hosted_ingest_structure(
     params: dict[str, Any] = {
         "project_id": project_id,
         "source": source,
-        "blocks": json.dumps(blocks),
+        "blocks": blocks,
         "doc_type": doc_type,
     }
     if title is not None:
