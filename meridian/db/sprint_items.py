@@ -853,6 +853,99 @@ class SprintItemStatusRace(ValueError):
 _PATCH_SPRINT_ITEM_ALLOWED_STATUSES = {"pending", "todo", "indeterminate"}
 
 
+def _check_evidence_quality(evidence_text: str) -> str | None:
+    """fd2800ae — lightweight heuristic for over-fit evidence in required_notes completions.
+
+    Returns a warning string when the submitted evidence text looks suspiciously
+    narrow — a signal that the "fix" may be over-fitted to a single test case
+    rather than a genuine structural change. Returns None when the evidence looks
+    plausibly substantive.
+
+    This check is intentionally CONSERVATIVE. False positives here would block
+    legitimate autonomous workflows, so the thresholds are kept high and the
+    patterns are restricted to clear structural red-flags:
+
+    1. **Too short**: evidence shorter than 30 characters (after stripping) cannot
+       meaningfully describe what changed or how it was verified. A bare "done" or
+       "test passed" tells the reader nothing structural.
+
+    2. **Single-test-only pattern**: evidence that only mentions a single test
+       function name (``test_*``) with no accompanying mention of a file path, a
+       function/method name outside the test itself, or a module name — e.g.
+       "test_foo_bar passes" — is a strong signal that the fixer ran exactly one
+       test and stopped, which is the canonical over-fit symptom.
+
+    3. **Explicit single-test pass claim with no broader context**: phrases like
+       "1 test passed", "one test passed", or "the test passed" with no mention
+       of a file, module, or changed function. A real fix should cite the suite
+       run count or name the thing that was changed.
+
+    This function is NOT a NLP classifier and deliberately avoids any ML or fuzzy
+    scoring. The three rules above are each independently verifiable by reading
+    this function. Easy to disable one rule if it proves too noisy.
+
+    Called only when ``required_notes`` is set; the heuristic is silent (returns
+    None) for non-gated completions where evidence was not required at all.
+    """
+    text = (evidence_text or "").strip()
+    if not text:
+        # No evidence at all — the hard gate above already refused; this branch
+        # is unreachable in normal flow but is safe to return None for anyway.
+        return None
+
+    # Rule 1 — too short to describe a mechanism.
+    _MIN_EVIDENCE_LENGTH = 30
+    if len(text) < _MIN_EVIDENCE_LENGTH:
+        return (
+            f"Evidence text is very short ({len(text)} chars). "
+            "A genuine fix should describe what was changed and how it was verified, "
+            "not just confirm a test ran. Consider adding the file/function changed "
+            "and a brief description of the fix mechanism."
+        )
+
+    text_lower = text.lower()
+
+    # Rule 2 — single test function name with no structural context.
+    # Pattern: one or more "test_<name>" references but no mention of a file path
+    # (foo.py / foo/bar.py) or a non-test function/method name (word followed by
+    # an open paren, or "def <name>"). We check for exactly one test_ mention and
+    # no other structural keywords.
+    _test_refs = re.findall(r"\btest_[a-z0-9_]+", text_lower)
+    _has_file_ref = bool(re.search(r"\b\w+\.py\b", text_lower))
+    _has_func_ref = bool(re.search(r"\bdef\s+\w+|\b\w+\(", text_lower))
+    _has_module_ref = bool(re.search(r"\bmeridian\b|\bdb\b|\bserver\b|\bhandler\b", text_lower))
+    if (
+        len(_test_refs) == 1
+        and not _has_file_ref
+        and not _has_func_ref
+        and not _has_module_ref
+    ):
+        return (
+            f"Evidence only references a single test function ({_test_refs[0]}) "
+            "with no mention of the file, module, or function that was actually changed. "
+            "A structural fix should describe WHAT was changed (file/function), not only "
+            "WHICH test now passes — a hardcoded return value can satisfy a single test "
+            "without fixing the underlying problem."
+        )
+
+    # Rule 3 — explicit single-test-pass claim with no broader context.
+    # Matches "1 test passed", "one test passed", "the test passed",
+    # "a test passed", "test passed" (bare), all case-insensitively.
+    _single_pass_pattern = re.compile(
+        r"\b(1|one|the|a)\s+test\s+pass(ed|es)|\btest\s+pass(ed|es)\b",
+        re.IGNORECASE,
+    )
+    if _single_pass_pattern.search(text) and not _has_file_ref and not _has_module_ref:
+        return (
+            "Evidence claims a single test passed with no mention of what changed "
+            "structurally (file, module, or function). Completing an item by making "
+            "exactly one test pass is a known over-fit risk — a real fix should be "
+            "verifiable across the broader suite."
+        )
+
+    return None
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -872,8 +965,17 @@ async def complete_sprint_item(
     to complete unless evidence exists — an existing ``notes`` value, a linked
     ``task_id``, or a ``notes`` argument on this call (which is persisted).
     ``actor`` records which executor completed the item.
+
+    fd2800ae — evidence quality heuristic: when ``required_notes`` is set and
+    evidence passes the existence gate, run :func:`_check_evidence_quality` over
+    the combined evidence text. If the heuristic fires, the returned item dict
+    gains an ``evidence_quality_warning`` key with an explanation. This is
+    ADVISORY ONLY — it never blocks completion and never raises. The heuristic
+    is conservative (high thresholds, three simple structural rules) to avoid
+    false positives on legitimate autonomous workflows.
     """
     item = await get_sprint_item(db, item_id)
+    _evidence_quality_warning: str | None = None
     if item is not None and item.get("project_id") == project_id:
         if item.get("required_notes"):
             has_evidence = bool(
@@ -888,6 +990,20 @@ async def complete_sprint_item(
                     "notes=... (what shipped / how it was verified) or link a "
                     "task_id. This item was flagged required_notes."
                 )
+            # fd2800ae — evidence exists; now check its quality.  Combine the
+            # caller-supplied notes with any notes already stored on the item so
+            # the heuristic sees the full evidence picture.  A linked task_id is
+            # treated as substantive evidence (the task log is the mechanism
+            # description) and skips the text heuristic entirely.
+            if not task_id and not item.get("task_id"):
+                _combined_evidence = " ".join(filter(None, [
+                    (notes or "").strip(),
+                    (item.get("notes") or "").strip(),
+                ]))
+                try:
+                    _evidence_quality_warning = _check_evidence_quality(_combined_evidence)
+                except Exception:  # noqa: BLE001 — heuristic must never block completion
+                    _evidence_quality_warning = None
     result = await _update_sprint_item_status(
         db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
         expected_statuses=_ACTIVE_SPRINT_STATUSES,
@@ -895,6 +1011,9 @@ async def complete_sprint_item(
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
         await _advance_task_chain(db, project_id, item_id)
+        if _evidence_quality_warning:
+            result = dict(result)
+            result["evidence_quality_warning"] = _evidence_quality_warning
     return result
 
 
