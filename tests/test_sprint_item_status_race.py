@@ -314,3 +314,53 @@ async def test_requeue_or_fail_stalled_item_noop_when_race_lost_to_completion(db
     assert result is None
     final = await db_module.get_sprint_item(db, item["id"])
     assert final["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Smoke test for ARCH 1A module split (7e20868a): assert that all sprint-item
+# functions are accessible both via meridian.db.sprint_items (canonical home)
+# and via meridian.db (re-exported for backward compat).
+# ---------------------------------------------------------------------------
+
+
+def test_sprint_items_module_exports_expected_functions():
+    """Smoke test: meridian.db.sprint_items exports all key functions, and
+    meridian.db re-exports them so existing call sites are unaffected."""
+    import meridian.db.sprint_items as si
+    import meridian.db as db
+
+    public_functions = [
+        "add_sprint_item",
+        "claim_sprint_item",
+        "complete_sprint_item",
+        "fail_sprint_item",
+        "push_sprint_item",
+        "skip_sprint_item",
+        "patch_sprint_item",
+        "split_sprint_item",
+        "merge_sprint_items",
+        "add_sprint_item_pointer",
+        "get_sprint_item_pointers",
+        "delete_sprint_item_pointer",
+        "assign_sprint_waves",
+        "get_sprint_items",
+        "get_sprint_items_for_resource",
+        "get_parallelizable_groups",
+        "analyze_sprint",
+        "requeue_or_fail_stalled_item",
+        "handle_session_stall",
+        "fan_out_sprint_items",
+        "add_subtask",
+        "build_sprint_items_xml",
+    ]
+    classes = ["SprintItemEvidenceRequired", "SprintItemStatusRace"]
+
+    for name in public_functions + classes:
+        # Must exist in the submodule (canonical home)
+        assert hasattr(si, name), f"meridian.db.sprint_items missing: {name}"
+        # Must be re-exported via db.__init__ (backward compat)
+        assert hasattr(db, name), f"meridian.db missing re-export of: {name}"
+        # Both references must point to the same object (not copies)
+        assert getattr(si, name) is getattr(db, name), (
+            f"meridian.db.{name} is not the same object as meridian.db.sprint_items.{name}"
+        )
