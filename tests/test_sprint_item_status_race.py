@@ -364,3 +364,210 @@ def test_sprint_items_module_exports_expected_functions():
         assert getattr(si, name) is getattr(db, name), (
             f"meridian.db.{name} is not the same object as meridian.db.sprint_items.{name}"
         )
+
+
+# ---------------------------------------------------------------------------
+# ARCH 1B (e0f8f4da) — _transition_status chokepoint tests
+#
+# These tests verify:
+# (a) _transition_status from-state guard is atomic under concurrent callers
+# (b) each rewired public function still enforces its own validation
+# (c) rowcount-0 (race-lost) returns None, matching fa3e3331's no-raise intent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transition_status_from_state_guard_returns_none_on_race(db):
+    """_transition_status returns None (not raises) when from_statuses guard
+    fails — the row exists but its status changed before this UPDATE committed.
+    This is the atomic no-op contract: callers (not the chokepoint) decide
+    whether to raise or silently discard a lost race."""
+    p, item = await _project_with_item(db)
+    # Claim the item to put it in_progress.
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+
+    # Attempt transition from 'pending' — but item is now 'in_progress'.
+    result = await _sprint_items_mod._transition_status(
+        db, p["id"], item["id"], "done",
+        from_statuses=["pending"],  # guard will fail
+    )
+    assert result is None, (
+        "_transition_status must return None (not raise) when from_statuses "
+        "guard rejects the transition (rowcount == 0 with item present)"
+    )
+    # Item must not have been mutated.
+    unchanged = await db_module.get_sprint_item(db, item["id"])
+    assert unchanged["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_transition_status_no_from_statuses_always_succeeds(db):
+    """_transition_status with from_statuses=None succeeds regardless of current
+    status — used by patch_sprint_item for unconditional admin resets."""
+    p, item = await _project_with_item(db)
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+    # No from_statuses guard; item is in_progress but we transition to pending.
+    result = await _sprint_items_mod._transition_status(
+        db, p["id"], item["id"], "pending",
+        from_statuses=None,
+    )
+    assert result is not None
+    assert result["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_transition_status_invalidates_cache_on_success(db):
+    """_transition_status busts _SPRINT_ITEMS_CACHE on every successful write.
+    Verifies the shared side-effect that was previously missing from
+    claim_sprint_item (pre-ARCH 1B, claim wrote its own UPDATE but never
+    called _invalidate_sprint_items_cache)."""
+    p, item = await _project_with_item(db)
+    # Prime the cache by calling get_sprint_items_cached.
+    cached_before = await _sprint_items_mod.get_sprint_items_cached(db, p["id"])
+    assert len(cached_before) == 1
+
+    # Claim invalidates via _transition_status.
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+
+    # Cache must have been busted: if we inspect _SPRINT_ITEMS_CACHE the entry
+    # should be gone.
+    assert p["id"] not in _sprint_items_mod._SPRINT_ITEMS_CACHE, (
+        "claim_sprint_item via _transition_status must bust _SPRINT_ITEMS_CACHE; "
+        "old code called its own raw UPDATE without calling "
+        "_invalidate_sprint_items_cache — this was a pre-ARCH 1B guard gap"
+    )
+
+
+@pytest.mark.asyncio
+async def test_transition_status_rejects_empty_from_statuses(db):
+    """from_statuses=[] is a caller bug (would render AND status IN ()) and
+    must raise ValueError, same as the old expected_statuses=set() guard."""
+    p, item = await _project_with_item(db)
+    with pytest.raises(ValueError, match="non-empty"):
+        await _sprint_items_mod._transition_status(
+            db, p["id"], item["id"], "done",
+            from_statuses=[],
+        )
+
+
+@pytest.mark.asyncio
+async def test_transition_status_claim_sets_claimed_at(db):
+    """claimed_at_now=True must stamp claimed_at = datetime('now') so
+    claim_sprint_item's contract is preserved through the chokepoint."""
+    p, item = await _project_with_item(db)
+    result = await _sprint_items_mod._transition_status(
+        db, p["id"], item["id"], "in_progress",
+        from_statuses=["pending", "todo", "indeterminate", "provisional_complete"],
+        claimed_at_now=True,
+    )
+    assert result is not None
+    assert result["status"] == "in_progress"
+    assert result.get("claimed_at") is not None, (
+        "claimed_at must be set when claimed_at_now=True"
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_via_chokepoint_still_raises_on_blocked_status(db):
+    """claim_sprint_item must still raise ValueError with the same message when
+    the item is in a blocked status (in_progress/done/failed/skipped) — the
+    _transition_status rewire must not change the public error contract."""
+    p, item = await _project_with_item(db)
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+
+    with pytest.raises(ValueError, match="in_progress"):
+        await db_module.claim_sprint_item(db, p["id"], item["id"], actor="second")
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_raises_status_race_on_transition_none(db):
+    """complete_sprint_item must raise SprintItemStatusRace when _transition_status
+    returns None (lost race) — the chokepoint returns None but the caller
+    converts it to the appropriate exception."""
+    p, item = await _project_with_item(db)
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+    await db_module.skip_sprint_item(db, p["id"], item["id"], reason="raced")
+
+    with pytest.raises(db_module.SprintItemStatusRace) as exc_info:
+        await db_module.complete_sprint_item(db, p["id"], item["id"])
+    assert exc_info.value.current_status == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_patch_sprint_item_status_routes_through_transition(db):
+    """patch_sprint_item with a status arg must route through _transition_status
+    so cache + live event are guaranteed (6a17e735 fix). Verify that after a
+    patch with status='pending', _SPRINT_ITEMS_CACHE is busted."""
+    p, item = await _project_with_item(db)
+    # Prime the cache.
+    await _sprint_items_mod.get_sprint_items_cached(db, p["id"])
+
+    # Patch with a status change.
+    result = await db_module.patch_sprint_item(
+        db, p["id"], item["id"], status="indeterminate"
+    )
+    assert result is not None
+    assert result["status"] == "indeterminate"
+    # Cache must be busted by the chokepoint.
+    assert p["id"] not in _sprint_items_mod._SPRINT_ITEMS_CACHE
+
+
+@pytest.mark.asyncio
+async def test_patch_sprint_item_non_status_fields_still_work(db):
+    """Regression: patch_sprint_item without status must still update non-status
+    fields and return the updated item."""
+    p, item = await _project_with_item(db)
+    result = await db_module.patch_sprint_item(
+        db, p["id"], item["id"], notes="updated notes", priority="urgent"
+    )
+    assert result is not None
+    assert result["notes"] == "updated notes"
+    assert result["priority"] == "urgent"
+    # Status must be unchanged.
+    assert result["status"] == item["status"]
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_evidence_gate_still_enforced(db):
+    """required_notes gate must still fire even though complete_sprint_item now
+    routes through _transition_status — the gate runs BEFORE the chokepoint."""
+    p, item = await _project_with_item(db)
+    # Mark it required_notes.
+    await db_module.patch_sprint_item(db, p["id"], item["id"], required_notes=True)
+
+    with pytest.raises(db_module.SprintItemEvidenceRequired):
+        await db_module.complete_sprint_item(db, p["id"], item["id"])
+
+    # Providing evidence must succeed.
+    result = await db_module.complete_sprint_item(
+        db, p["id"], item["id"], notes="shipped in #123"
+    )
+    assert result["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_transition_status_not_found_returns_none(db):
+    """_transition_status must return None (not raise) when the item doesn't
+    exist at all — 'not found' and 'race-lost' both return None; callers
+    distinguish them by re-fetching if needed."""
+    p, _ = await _project_with_item(db)
+    result = await _sprint_items_mod._transition_status(
+        db, p["id"], "no-such-item", "done",
+        from_statuses=["pending"],
+    )
+    assert result is None
+
+
+def test_transition_status_exported_on_both_modules():
+    """_transition_status must be importable from both the submodule and db.*
+    re-export so callers and tests can reference it consistently."""
+    import meridian.db.sprint_items as si
+    import meridian.db as db_pkg
+
+    assert hasattr(si, "_transition_status"), (
+        "meridian.db.sprint_items must expose _transition_status"
+    )
+    assert hasattr(db_pkg, "_transition_status"), (
+        "meridian.db must re-export _transition_status"
+    )
+    assert si._transition_status is db_pkg._transition_status

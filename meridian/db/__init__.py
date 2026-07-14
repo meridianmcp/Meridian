@@ -9461,6 +9461,7 @@ from .sprint_items import (  # noqa: F401
     _title_word_set,
     _unique_sprint_nickname,
     _unique_sprint_slug,
+    _transition_status,
     _update_sprint_item_status,
 )
 
