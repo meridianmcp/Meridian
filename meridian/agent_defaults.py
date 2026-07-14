@@ -59,7 +59,19 @@ import re
 #         before the tool call reaches the executor and exits 2 (block) with a
 #         redirect message naming the code-intel alternatives. Fail-open: only
 #         blocks when the project settings endpoint confirms a live index.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 11
+#   v12 — MANDATORY CODE INTEL PROTOCOL now names `prospect_symbol` as the
+#         PRIMARY tool for symbol/function/class lookups, not `search_graph`
+#         directly (e8e7fded). prospect_symbol_impl (meridian/prospect.py)
+#         already implements the exact three-rung fallback chain (graph →
+#         Serena extractor__* → search_code_semantic) that the b2d312b1
+#         cross-check rule asked executors to perform BY HAND — but the
+#         injected protocol text never told callers prospect_symbol existed,
+#         so executors kept calling search_graph directly and manually
+#         remembering (or forgetting) to cross-check on a miss. Routing
+#         through prospect_symbol first makes the fallback automatic instead
+#         of memory-dependent; the manual cross-check rule stays as guidance
+#         for the rare case prospect_symbol itself is unavailable.
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 12
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -134,8 +146,9 @@ in the Meridian dashboard → Settings → Executor Rules.
   you explicitly search for it. Before concluding a code-intel tool is missing,
   issue one tool-search / discovery query for it (`trace_path`, `search_graph`,
   `get_architecture`, `detect_changes`, `get_code_snippet`).
-- Prefer structural graph queries (`trace_path`, `search_graph`, `get_architecture`,
-  `detect_changes`) over raw file reads — they are faster and use far fewer tokens.
+- Prefer structural graph queries (`prospect_symbol` for symbol/function/class
+  lookups, `trace_path`, `get_architecture`, `detect_changes`) over raw file
+  reads — they are faster and use far fewer tokens.
 - Fall back to reading files only when a graph query is insufficient, or when a
   discovery search genuinely surfaces no code-intel tool.
 - At session start, if `index_repository` is available (search for it first if your
@@ -156,17 +169,21 @@ in the Meridian dashboard → Settings → Executor Rules.
   permanently unavailable.
 
 ## MANDATORY CODE INTEL PROTOCOL
-When the task involves source code files, use code-intel tools (`search_graph`,
-`get_function_tool` / `get_code_snippet`, Serena `find_symbol`) BEFORE any
-`read_file`, `read_multiple_files`, grep, or glob call: `search_graph` to locate
-symbols, `get_function_tool` / `find_symbol` to extract specific functions.
-Reading whole source files or running grep/glob when code-intel tools are reachable
-is a protocol violation. If these tools are not in your current tool list, do NOT
-skip the protocol — clients with deferred / tool-search loading (claude.ai, Desktop)
-hide a tool until it is searched for, so run one tool-search / discovery query for
-them first; only fall back to plain file reads if that search genuinely surfaces
-nothing. For non-code files (documents, presentations, spreadsheets, config, data),
-use filesystem tools directly.
+When the task involves source code files, use code-intel tools BEFORE any
+`read_file`, `read_multiple_files`, grep, or glob call. For locating a symbol,
+function, or class by name, call **`prospect_symbol` FIRST, not `search_graph`
+directly** — prospect_symbol already runs the graph → Serena extractor__* →
+search_code_semantic fallback chain automatically (e8e7fded), so a miss on the
+graph rung never silently becomes a dead end the way a bare `search_graph` call
+can. Use `get_function_tool` / `get_code_snippet` to then extract the full body
+once you have the location. Reading whole source files or running grep/glob when
+code-intel tools are reachable is a protocol violation. If these tools are not in
+your current tool list, do NOT skip the protocol — clients with deferred /
+tool-search loading (claude.ai, Desktop) hide a tool until it is searched for, so
+run one tool-search / discovery query for them first; only fall back to plain
+file reads if that search genuinely surfaces nothing. For non-code files
+(documents, presentations, spreadsheets, config, data), use filesystem tools
+directly.
 
 **grep/glob NEVER as first step for code search (443aa32a):** Raw bash `grep`,
 `rg`, `find`, and glob patterns are a last resort for code search — not a default.
@@ -181,13 +198,14 @@ WRONG (what that session did):
   grep -r "dispatch" src/             # eventually found it, 4 tries later
 
 RIGHT (one call, immediate result):
-  find_symbol("dispatch_webhook_event")   # or search_graph("dispatch")
-  → returns exact file, line, and body in one shot
+  prospect_symbol("dispatch_webhook_event")   # runs graph → Serena → semantic automatically
+  → returns exact file, line, and body in one shot, with the rung that succeeded
 
 If you find yourself writing a grep/glob command to locate a symbol or function,
-STOP — use `find_symbol`, `search_graph`, or `search_code_semantic` instead.
-grep/glob may be used AFTER code-intel tools confirm a file path, or for
-non-symbol content (log output, data files, config values).
+STOP — use `prospect_symbol` (preferred), `find_symbol`, `search_graph`, or
+`search_code_semantic` instead. grep/glob may be used AFTER code-intel tools
+confirm a file path, or for non-symbol content (log output, data files, config
+values).
 
 **Structural enforcement (aeba8a80):** When code-intel is enabled for this project,
 a PreToolUse hook (`code_intel_guard`) fires on every Grep and Glob call and blocks
@@ -195,15 +213,25 @@ it (exit 2) with a redirect to the alternatives above. This is not a soft warnin
 the tool call will be cancelled. The only way past it is to use a code-intel tool
 first, then fall back to grep/glob once a file path is confirmed.
 
+**Prefer `prospect_symbol` over calling `search_graph` directly (e8e7fded):**
+`prospect_symbol` wraps exactly the fallback chain the rule below asks you to
+perform by hand — call it first for any "find this symbol/function/class"
+question and you get the cross-check automatically, labelled with which rung
+(`graph` / `serena` / `semantic`) actually answered. Reach for bare `search_graph`
+directly only when you specifically need its raw graph-relationship features
+(`trace_path`, `get_architecture`, connected-node traversal) that prospect_symbol
+does not expose.
+
 **search_graph cross-check rule (b2d312b1):** `codebase__search_graph` indexes can
 go stale and have been observed producing actively wrong results — zero hits for
 symbols that exist, and line spans off by hundreds of lines. The Serena
 `extractor__*` tools (extractor__get_symbols_overview, extractor__find_declaration)
-use live LSP-based parsing and are a separate, more reliable source. When
-`search_graph` returns ZERO results for a symbol you have reason to believe exists,
-or when you have independent reason to doubt a returned line span, you MUST
-cross-check with `extractor__get_symbols_overview` or `extractor__find_declaration`
-BEFORE concluding the symbol does not exist or trusting the span. Do NOT silently
+use live LSP-based parsing and are a separate, more reliable source. When calling
+`search_graph` directly (rather than via `prospect_symbol`) and it returns ZERO
+results for a symbol you have reason to believe exists, or when you have
+independent reason to doubt a returned line span, you MUST cross-check with
+`extractor__get_symbols_overview` or `extractor__find_declaration` BEFORE
+concluding the symbol does not exist or trusting the span. Do NOT silently
 fall back to a raw grep or whole-file read as the FIRST recourse — the Serena
 cross-check is still structured, fast, and more accurate. If extractor__* tools
 appear unavailable despite list_plugins confirming the plugin is active server-side,
@@ -237,7 +265,7 @@ source FIRST — do not default to a generic web search:
 Retrieval beats recall: look it up. Do not answer a decision-relevant factual
 question from memory when a source can be checked.
 
-<!-- meridian-executor-standard: v11 -->
+<!-- meridian-executor-standard: v12 -->
 """
 
 
