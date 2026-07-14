@@ -6129,9 +6129,18 @@ async def receive_messages(
     if mark_read and rows:
         ids = [r["id"] for r in rows]
         placeholders = ",".join("?" for _ in ids)
+        # 6adba18c — pass now as a parameter (%s / ?) rather than embedding
+        # datetime('now') in SQL.  The pg_adapter converts datetime('now') to
+        # to_char(clock_timestamp()...) which returns TEXT — but session_messages
+        # .read_at is TIMESTAMPTZ in Postgres, so assigning TEXT directly inside
+        # the SQL expression fails with "expression is of type text".  Passing a
+        # formatted ISO string as a bound parameter avoids the type mismatch:
+        # psycopg3 sends it as a typed parameter and Postgres applies the
+        # implicit TEXT→TIMESTAMPTZ cast; SQLite stores it as-is (TEXT column).
+        now_ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         await db.execute(
-            f"UPDATE session_messages SET read_at = datetime('now') WHERE id IN ({placeholders})",
-            ids,
+            f"UPDATE session_messages SET read_at = ? WHERE id IN ({placeholders})",
+            [now_ts, *ids],
         )
         await db.commit()
     return rows
