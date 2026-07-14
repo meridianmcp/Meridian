@@ -1,4 +1,4 @@
-﻿"""Coverage tests for meridian.handoff and meridian.routes.handoff.
+"""Coverage tests for meridian.handoff and meridian.routes.handoff.
 
 Exercises generate_handoff in every mode (full, delta, starter, planner),
 the readiness-warning / empty-state branches, the L0 fallback, the custom
