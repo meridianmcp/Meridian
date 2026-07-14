@@ -33,9 +33,13 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import pytest_asyncio
+
+if TYPE_CHECKING:
+    from meridian.pg_adapter import PostgresConnection
 
 
 # ---------------------------------------------------------------------------
