@@ -7450,12 +7450,20 @@ async def get_session_activity(
 ) -> list[dict[str, Any]]:
     """Return the most recent activity entries for a session, newest first.
 
-    Uses rowid as a secondary sort key so sub-second inserts (same recorded_at)
-    are returned in stable insertion order (newest = highest rowid first).
+    Uses the backend-appropriate pseudo-column as a secondary sort key so
+    sub-second inserts (same recorded_at) are returned in stable insertion
+    order (newest = highest rowid/ctid first). rowid is SQLite's implicit
+    integer PK; ctid is Postgres's physical row location — this table is
+    INSERT-only so ctid order tracks insertion order identically.
+
+    8c147109 / ordering fix: the companion record_session_activity already
+    uses ctid/rowid in the pruning DELETE; get_session_activity now mirrors
+    that so both paths agree on ordering across backends.
     """
+    tiebreak = "ctid" if hasattr(db, "_pool") else "rowid"
     async with db.execute(
-        "SELECT * FROM session_activity WHERE session_id = ? "
-        "ORDER BY recorded_at DESC, rowid DESC LIMIT ?",
+        f"SELECT * FROM session_activity WHERE session_id = ? "
+        f"ORDER BY recorded_at DESC, {tiebreak} DESC LIMIT ?",
         (session_id, limit),
     ) as cur:
         rows = await cur.fetchall()
@@ -9350,13 +9358,31 @@ async def record_handoff(
 
     ``mode`` is the rendered handoff mode (full/delta/…). ``session_id`` links
     the handoff to the session that produced it (NULL for project-level renders).
+
+    00dbeed0 — durable since_ts: the handoff's created_at is the anchor used
+    by the next delta call to scope "Completed since last handoff". On Postgres
+    the table DEFAULT is NOW() which is frozen at transaction-start, so two
+    calls within one transaction would get the same timestamp — making the
+    anchor useless for ordering relative to clock_timestamp()-stamped completions
+    (and breaking tests that rely on real-time ordering with asyncio.sleep).
+    Explicitly pass clock_timestamp() on Postgres to guarantee a monotonically
+    advancing value regardless of the surrounding transaction.
     """
     hid = _new_id()
-    await db.execute(
-        "INSERT INTO handoffs (id, project_id, session_id, mode, body) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (hid, project_id, session_id, mode, body),
-    )
+    is_pg = hasattr(db, "_pool")
+    if is_pg:
+        now_expr = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')"
+        await db.execute(
+            f"INSERT INTO handoffs (id, project_id, session_id, mode, body, created_at) "
+            f"VALUES (?, ?, ?, ?, ?, ({now_expr}))",
+            (hid, project_id, session_id, mode, body),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO handoffs (id, project_id, session_id, mode, body) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (hid, project_id, session_id, mode, body),
+        )
     await db.commit()
     return (await get_handoff(db, hid)) or {"id": hid}
 

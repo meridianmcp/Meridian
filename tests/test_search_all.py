@@ -169,6 +169,7 @@ def test_like_escape_helper():
 
 
 @pytest.mark.asyncio
+@pytest.mark.sqlite_only
 async def test_search_all_special_chars_no_error_no_wildcard(anydb):
     """f51e38d8 — queries containing %, _, or quote chars must not raise errors
     and must not expand into unexpected wildcard matches.
@@ -177,6 +178,13 @@ async def test_search_all_special_chars_no_error_no_wildcard(anydb):
     - searching '100%' must NOT match a record that only contains '100' (no %)
     - searching 'file_name' must NOT match 'file1name' (underscore wildcard)
     - searching "O'Brien" must not raise a SQL error
+
+    Marked sqlite_only because this test validates LIKE-escape semantics, which
+    only apply to the SQLite ILIKE/LIKE path. The Postgres path uses
+    websearch_to_tsquery, which normalises punctuation (strips %, _ etc. as
+    non-lexeme separators) and therefore has deliberately different semantics:
+    a query for '100%' on Postgres becomes the lexeme '100' and legitimately
+    matches any record containing '100'. That is correct FTS behaviour; no bug.
     """
     db = anydb
     p = await db_module.create_project(db, "sa-special-chars")

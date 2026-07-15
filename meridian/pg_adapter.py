@@ -117,6 +117,29 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
 
     Returns ``(pg_sql, pg_params_list)``.  Uses %s placeholders (psycopg3).
     """
+    # 0. Translate SQLite-only INSERT OR IGNORE / INSERT OR REPLACE to PG equivalents
+    #    BEFORE any other rewriting so downstream steps never see the SQLite syntax.
+    #
+    #    INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
+    #    INSERT OR REPLACE → INSERT ... ON CONFLICT DO NOTHING
+    #
+    #    Both forms are "best-effort upserts" in the codebase (locked behind try/except);
+    #    DO NOTHING is always correct for OR IGNORE, and for OR REPLACE we fall back to
+    #    DO NOTHING too since the tables that use it (oauth_codes, oauth_clients, file_patch_counters)
+    #    have a primary-key constraint — the conflict target is the primary key, and a plain
+    #    DO NOTHING is semantically equivalent to "skip if already present", which matches
+    #    the caller intent (idempotent insert / re-use existing row is fine).
+    #    For a true upsert, callers should use explicit ON CONFLICT DO UPDATE.
+    _had_or_ignore = bool(re.search(r"\bINSERT\s+OR\s+IGNORE\b", sql, re.IGNORECASE))
+    _had_or_replace = bool(re.search(r"\bINSERT\s+OR\s+REPLACE\b", sql, re.IGNORECASE))
+    if _had_or_ignore:
+        sql = re.sub(r"\bINSERT\s+OR\s+IGNORE\b", "INSERT", sql, flags=re.IGNORECASE)
+    if _had_or_replace:
+        sql = re.sub(r"\bINSERT\s+OR\s+REPLACE\b", "INSERT", sql, flags=re.IGNORECASE)
+    if _had_or_ignore or _had_or_replace:
+        # Append ON CONFLICT DO NOTHING before any trailing semicolon / whitespace
+        sql = re.sub(r";?\s*$", " ON CONFLICT DO NOTHING", sql.rstrip())
+
     # 1. Escape literal % used in LIKE patterns BEFORE replacing ? → %s
     #    so LIKE '%foo%' becomes LIKE '%%foo%%' (psycopg3 treats % as placeholder)
     sql = re.sub(r"'([^']*%[^']*)'", lambda m: "'" + m.group(1).replace("%", "%%") + "'", sql)
@@ -424,7 +447,12 @@ class PostgresConnection:
             conn = await self._pool.getconn()
             async with conn.cursor(row_factory=_dict_row_factory) as cur:
                 await cur.execute(pg_sql, pg_params if pg_params else None)
-                if q_upper.startswith(("SELECT", "WITH")):
+                # Fetch rows when the statement returns data: SELECTs and
+                # any DML (UPDATE/INSERT/DELETE) with a RETURNING clause.
+                _returns_rows = q_upper.startswith(("SELECT", "WITH")) or (
+                    "RETURNING" in pg_sql.upper()
+                )
+                if _returns_rows:
                     rows = await cur.fetchall()
                     result = _PgCursor(rows, len(rows))
                 else:
