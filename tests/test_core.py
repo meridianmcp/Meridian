@@ -7307,6 +7307,8 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_tunnel_active",
         "_migrate_pg_tunnel_plugins",
         "_migrate_pg_tunnel_plugins_by_host",
+        "_migrate_pg_feedback",
+        "_migrate_pg_registered_hostnames",
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
@@ -7373,10 +7375,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_file_patch_counters",
         "_migrate_pg_sprint_item_resources_amended",
         "_migrate_pg_session_activity",
+        "_migrate_pg_file_docx_region_claims",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 97
+    assert len(allnames) == len(set(allnames)) == 100
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
