@@ -23,6 +23,7 @@ Security requirements (non-negotiable, tested):
 """
 from __future__ import annotations
 
+import concurrent.futures
 import csv as csv_mod
 import fnmatch
 import hashlib
@@ -651,6 +652,46 @@ def build_output_rows(
 
 
 # ---------------------------------------------------------------------------
+# Per-file pre-analysis result (used by parallel rebuild pipeline)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _FileAnalysis:
+    """Pre-computed, read-only analysis for one stale output file.
+
+    Populated by worker threads (before the write lock is taken) so that the
+    locked DB-write path can build an :class:`OutputRow` without doing any I/O.
+    All fields are safe to read from any thread; no DB access is performed.
+    """
+
+    path: str
+    fingerprint: FileFingerprint
+    mtime: float | None
+    size: int | None
+    sha256: str | None
+
+
+def _analyse_file(path: str, hasher: Callable[[str], str | None]) -> "_FileAnalysis":
+    """Read-only per-file analysis: stat + fingerprint + hash.
+
+    Designed to run in a :class:`concurrent.futures.ThreadPoolExecutor` worker.
+    Pure I/O + CPU with no shared mutable state -- safe to call concurrently
+    for different paths.  The GIL is released during the file-read portions,
+    so hashing a large file (e.g. a 5.9 MB sweep_results.json) overlaps with
+    hashing and parsing other files.
+    """
+    fp = file_fingerprint(path)
+    try:
+        st = os.stat(path)
+        size: int | None = st.st_size
+        mtime: float | None = st.st_mtime
+    except OSError:
+        size = mtime = None
+    sha = hasher(path)
+    return _FileAnalysis(path=path, fingerprint=fp, mtime=mtime, size=size, sha256=sha)
+
+
+# ---------------------------------------------------------------------------
 # Persistent DuckDB FTS index with write locking
 # ---------------------------------------------------------------------------
 
@@ -837,54 +878,54 @@ class OutputsFtsIndex:
     def rebuild(
         self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
     ) -> int:
-        """Incrementally rebuild the table + FTS index.  Returns row count."""
-        with self._write_lock:
-            deadline = (None if max_seconds is None
-                        else time.monotonic() + max_seconds)
-            all_paths = (
-                _iter_safe_output_files(self.outputs_dir)
-                if os.path.isdir(self.outputs_dir) else []
-            )
-            self._ingest_meridian_notes(all_paths)
-            rows, changed = self._compute_rows_incremental(deadline)
-            if changed:
-                try:
-                    con = self._connect()
-                    self._ensure_schema(con)
-                    con.execute("DELETE FROM outputs_index")
-                    for r in rows:
-                        con.execute(
-                            "INSERT INTO outputs_index VALUES "
-                            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            [
-                                r.path, r.content, r.mtime, r.sha256, r.size,
-                                r.generating_script, r.kind, r.is_archival,
-                                r.canonical_path,
-                                json.dumps(r.csv_columns) if r.csv_columns else None,
-                                json.dumps(r.json_keys) if r.json_keys else None,
-                            ],
-                        )
-                    self._rebuild_fts(con)
-                except Exception:  # noqa: BLE001
-                    _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
-            return len(rows)
+        """Incrementally rebuild the table + FTS index.  Returns row count.
 
-    def _compute_rows_incremental(
-        self, deadline: float | None,
-    ) -> tuple[list[OutputRow], bool]:
-        self.last_rebuild_partial = False
-        paths = _iter_safe_output_files(self.outputs_dir)
-        path_set = set(paths)
-        changed = False
+        Performance design (two-phase):
 
-        removed = set(self._manifest) - path_set
-        for p in removed:
-            self._manifest.pop(p, None)
-            self._row_cache.pop(p, None)
-            changed = True
+        Phase 1 -- parallel analysis, NO lock held:
+          * Walk files and determine which are stale (mtime/size changed or
+            absent from cache).
+          * Run :func:`_analyse_file` for every stale path concurrently via a
+            :class:`~concurrent.futures.ThreadPoolExecutor`.  Each worker does
+            only read-only I/O (stat + read + hash) -- no DB access, no shared
+            mutable state.  Results are collected and sorted by path for
+            deterministic ordering.
+          * Run :func:`classify_canonical_archival` on all paths (also
+            read-only) once the worker results are in.
 
+        Phase 2 -- targeted write, write_lock held:
+          * Update ``_manifest`` / ``_row_cache`` from the pre-computed results.
+          * DELETE only the specific paths that were removed or changed.
+          * INSERT only the new/changed rows as a single batch via
+            ``executemany`` (much faster than one ``execute`` per row).
+          * Rebuild the FTS index.
+
+        The ``IndexFileLock`` (``self._write_lock``) is NOT reentrant.
+        ``_ingest_meridian_notes`` -- called inside the lock -- must therefore
+        use ``_add_annotation_locked`` (not ``add_annotation``).  That
+        invariant is preserved here.
+        """
+        deadline = (None if max_seconds is None
+                    else time.monotonic() + max_seconds)
+
+        # ------------------------------------------------------------------
+        # Phase 1: read-only pre-analysis (no lock, may run in parallel)
+        # ------------------------------------------------------------------
+        all_paths: list[str] = (
+            _iter_safe_output_files(self.outputs_dir)
+            if os.path.isdir(self.outputs_dir) else []
+        )
+
+        path_set = set(all_paths)
+
+        # Determine which paths are removed or stale (mtime/size changed).
+        # We read _manifest without the lock here.  _manifest is only mutated
+        # inside the write lock (Phase 2), so reading it here is safe as long
+        # as no concurrent rebuild() is running -- which IndexFileLock prevents.
+        removed_paths: set[str] = set(self._manifest) - path_set
         stale: list[str] = []
-        for p in paths:
+        stale_sigs: dict[str, tuple[float | None, int | None]] = {}
+        for p in all_paths:
             try:
                 st = os.stat(p)
                 sig: tuple[float | None, int | None] = (st.st_mtime, st.st_size)
@@ -892,40 +933,177 @@ class OutputsFtsIndex:
                 sig = (None, None)
             if self._manifest.get(p) != sig or p not in self._row_cache:
                 stale.append(p)
+                stale_sigs[p] = sig
 
+        # Parallel per-file analysis for stale paths (fingerprint + hash + stat).
+        # Workers run before the write lock is taken so heavy I/O (e.g. hashing
+        # a 5.9 MB file) overlaps across files.  Results are collected into a
+        # dict and processed in sorted order to guarantee determinism.
+        precomputed: dict[str, _FileAnalysis] = {}
         if stale:
-            classifications = classify_canonical_archival(paths,
-                                                          hasher=self._hasher)
-            for p in stale:
-                if deadline is not None and time.monotonic() > deadline:
-                    self.last_rebuild_partial = True
-                    break
-                fp = file_fingerprint(p)
-                try:
-                    st = os.stat(p)
-                    size: int | None = st.st_size
-                    mtime: float | None = st.st_mtime
-                except OSError:
-                    size = mtime = None
-                cls = classifications.get(p)
-                row = OutputRow(
-                    path=p,
-                    content=_content_for_fts(p, fp),
-                    mtime=mtime,
-                    sha256=self._hasher(p),
-                    size=size,
-                    generating_script=fp.generating_script,
-                    kind=fp.kind,
-                    is_archival=bool(cls and cls.is_archival),
-                    canonical_path=(cls.canonical_path if cls else None),
-                    csv_columns=fp.csv_columns,
-                    json_keys=fp.json_keys,
+            # Cap workers at 8 to avoid spawning hundreds of threads for a huge
+            # outputs tree; I/O is the bottleneck, not CPU count.
+            max_workers = min(8, len(stale))
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="meridian_outputs_analyse",
+            ) as pool:
+                futures = {
+                    pool.submit(_analyse_file, p, self._hasher): p
+                    for p in stale
+                }
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        analysis = fut.result()
+                        precomputed[analysis.path] = analysis
+                    except Exception:  # noqa: BLE001
+                        p = futures[fut]
+                        _log.debug("_analyse_file failed for %r", p, exc_info=True)
+
+        # classify_canonical_archival needs all paths (not just stale ones) to
+        # detect archival twins correctly.  It is read-only, so it runs here
+        # before the lock.  Only computed when there are stale or removed paths
+        # (i.e. when something actually changed) to avoid unnecessary hashing.
+        classifications: dict[str, ArchivalClassification] = {}
+        if stale or removed_paths:
+            # Reuse hashes already computed by workers where possible so
+            # classify_canonical_archival doesn't read the same file twice.
+            _precomp_hashes: dict[str, str | None] = {
+                p: a.sha256 for p, a in precomputed.items()
+            }
+
+            def _cached_hasher(path: str) -> str | None:
+                if path in _precomp_hashes:
+                    return _precomp_hashes[path]
+                return self._hasher(path)
+
+            classifications = classify_canonical_archival(
+                all_paths, hasher=_cached_hasher,
+            )
+
+        # ------------------------------------------------------------------
+        # Phase 2: targeted write (write_lock held)
+        # ------------------------------------------------------------------
+        with self._write_lock:
+            self._ingest_meridian_notes(all_paths)
+            rows, changed, paths_to_delete, new_rows = (
+                self._apply_precomputed(
+                    all_paths, path_set, removed_paths, stale, stale_sigs,
+                    precomputed, classifications, deadline,
                 )
-                self._row_cache[p] = row
-                self._manifest[p] = (mtime, size)
-                changed = True
-            for p in paths:
-                if p in stale:
+            )
+            if changed:
+                try:
+                    con = self._connect()
+                    self._ensure_schema(con)
+                    # Delete only the paths that were removed or re-computed.
+                    if paths_to_delete:
+                        con.executemany(
+                            "DELETE FROM outputs_index WHERE path = ?",
+                            [[p] for p in paths_to_delete],
+                        )
+                    # Batch-insert only the new/changed rows.
+                    if new_rows:
+                        con.executemany(
+                            "INSERT INTO outputs_index VALUES "
+                            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                [
+                                    r.path, r.content, r.mtime, r.sha256, r.size,
+                                    r.generating_script, r.kind, r.is_archival,
+                                    r.canonical_path,
+                                    json.dumps(r.csv_columns) if r.csv_columns else None,
+                                    json.dumps(r.json_keys) if r.json_keys else None,
+                                ]
+                                for r in new_rows
+                            ],
+                        )
+                    self._rebuild_fts(con)
+                except Exception:  # noqa: BLE001
+                    _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
+            return len(rows)
+
+    def _apply_precomputed(
+        self,
+        all_paths: list[str],
+        path_set: set[str],
+        removed_paths: set[str],
+        stale: list[str],
+        stale_sigs: dict[str, tuple[float | None, int | None]],
+        precomputed: dict[str, "_FileAnalysis"],
+        classifications: dict[str, ArchivalClassification],
+        deadline: float | None,
+    ) -> tuple[list[OutputRow], bool, list[str], list[OutputRow]]:
+        """Apply pre-computed per-file analysis to the in-memory cache.
+
+        Called from inside :meth:`rebuild`'s ``with self._write_lock:`` block.
+        Returns ``(all_rows, changed, paths_to_delete, new_rows)`` where:
+        - ``all_rows`` -- the full current row list for all indexed paths
+        - ``changed``  -- True if any DB write is needed
+        - ``paths_to_delete`` -- paths to DELETE from the DB (removed + stale)
+        - ``new_rows`` -- OutputRow objects to INSERT (stale paths with fresh data)
+
+        The split between ``paths_to_delete`` and ``new_rows`` enables the
+        targeted delete + batched insert that replaces the old DELETE-all /
+        reinsert-all pattern.
+        """
+        self.last_rebuild_partial = False
+        changed = False
+        paths_to_delete: list[str] = []
+        stale_set = set(stale)
+
+        # Apply removals.
+        for p in sorted(removed_paths):  # sorted for determinism
+            self._manifest.pop(p, None)
+            self._row_cache.pop(p, None)
+            paths_to_delete.append(p)
+            changed = True
+
+        # Apply stale results from precomputed analysis, honouring the deadline.
+        # Process in sorted path order so that partial (deadline-expired) rebuilds
+        # produce a deterministic prefix.
+        new_rows: list[OutputRow] = []
+        for p in sorted(stale):
+            if deadline is not None and time.monotonic() > deadline:
+                self.last_rebuild_partial = True
+                break
+            analysis = precomputed.get(p)
+            if analysis is None:
+                # Worker failed for this path; fall back to synchronous analysis.
+                try:
+                    analysis = _analyse_file(p, self._hasher)
+                except Exception:  # noqa: BLE001
+                    _log.debug("_apply_precomputed: fallback _analyse_file failed for %r", p,
+                                exc_info=True)
+                    continue
+            fp = analysis.fingerprint
+            mtime = analysis.mtime
+            size = analysis.size
+            cls = classifications.get(p)
+            row = OutputRow(
+                path=p,
+                content=_content_for_fts(p, fp),
+                mtime=mtime,
+                sha256=analysis.sha256,
+                size=size,
+                generating_script=fp.generating_script,
+                kind=fp.kind,
+                is_archival=bool(cls and cls.is_archival),
+                canonical_path=(cls.canonical_path if cls else None),
+                csv_columns=fp.csv_columns,
+                json_keys=fp.json_keys,
+            )
+            self._row_cache[p] = row
+            self._manifest[p] = stale_sigs.get(p, (mtime, size))
+            paths_to_delete.append(p)  # delete old row (if any) before reinserting
+            new_rows.append(row)
+            changed = True
+
+        # Update archival metadata on non-stale cached rows when the archival
+        # classification changed (e.g. a twin file was added or removed).
+        if classifications:
+            for p in all_paths:
+                if p in stale_set:
                     continue
                 row = self._row_cache.get(p)
                 if row is None:
@@ -937,10 +1115,13 @@ class OutputsFtsIndex:
                         or row.canonical_path != new_canonical):
                     row.is_archival = new_is_archival
                     row.canonical_path = new_canonical
+                    # This row changed -- include it in the targeted update.
+                    paths_to_delete.append(p)
+                    new_rows.append(row)
                     changed = True
 
-        rows = [self._row_cache[p] for p in paths if p in self._row_cache]
-        return rows, changed
+        all_rows = [self._row_cache[p] for p in all_paths if p in self._row_cache]
+        return all_rows, changed, paths_to_delete, new_rows
 
     def invalidate(self, path: str) -> None:
         """Force ``path`` to be re-hashed on next rebuild."""
@@ -960,10 +1141,19 @@ class OutputsFtsIndex:
     def search(
         self, query: str, *, limit: int = 10, include_archival: bool = True,
     ) -> list[dict[str, Any]]:
-        """BM25 search over the FTS index.  Best-effort: errors yield []."""
+        """BM25 search over the FTS index.  Best-effort: errors yield [].
+
+        Filtering (``bm25 IS NOT NULL``), ordering (``ORDER BY bm25 DESC``), and
+        row-count limiting (``LIMIT``) are all pushed into the SQL query so that
+        only the top-N matching rows are transferred from DuckDB to Python.  A
+        Python sort is still applied afterwards to honour the archival score
+        penalty (archival rows get bm25 * 0.5) without adding complexity to the
+        SQL.
+        """
         q = (query or "").strip()
         if not q:
             return []
+        safe_limit = max(1, int(limit))
         with self._read_lock:
             try:
                 con = self._connect()
@@ -974,9 +1164,12 @@ class OutputsFtsIndex:
                     "SELECT path, content, mtime, sha256, size, generating_script, "
                     "kind, is_archival, canonical_path, csv_columns, json_keys, "
                     "fts_main_outputs_index.match_bm25(path, ?) AS bm25 "
-                    "FROM outputs_index"
+                    "FROM outputs_index "
+                    "WHERE fts_main_outputs_index.match_bm25(path, ?) IS NOT NULL "
+                    "ORDER BY bm25 DESC "
+                    "LIMIT ?"
                 )
-                relation = con.execute(sql, [q])
+                relation = con.execute(sql, [q, q, safe_limit])
                 columns = [c[0] for c in relation.description]
                 fetched = relation.fetchall()
             except Exception:  # noqa: BLE001
@@ -1010,48 +1203,69 @@ class OutputsFtsIndex:
                 "mtime": rec.get("mtime"),
             })
         hits.sort(key=lambda h: h["score"], reverse=True)
-        return hits[: max(1, int(limit))]
+        return hits
 
     def resolve_output(self, file_path: str) -> dict[str, Any] | None:
-        """Exact-match lookup of an output row by file path."""
+        """Exact-match lookup of an output row by file path.
+
+        The WHERE clause is pushed into SQL to avoid a full-table scan.
+        ``_normalize_output_path`` lowercases and forward-slash-normalizes on
+        Windows (``os.path.normcase`` + backslash replacement), so on Windows we
+        apply the same transformation in SQL:
+        ``lower(replace(path, '\\', '/')) = ?`` with the already-normalised
+        target.  On POSIX the stored paths already use forward slashes and are
+        case-sensitive, so a plain equality check suffices.
+        """
         target = _normalize_output_path(file_path)
         if not target:
             return None
+        import sys as _sys
         with self._read_lock:
             try:
                 con = self._connect()
                 self._ensure_schema(con)
-                relation = con.execute(
-                    "SELECT path, content, mtime, sha256, size, generating_script, "
-                    "kind, is_archival, canonical_path, csv_columns, json_keys "
-                    "FROM outputs_index"
-                )
+                if _sys.platform == "win32":
+                    # stored paths have backslashes + mixed case; target is
+                    # already forward-slash + lowercase from normcase.
+                    sql = (
+                        "SELECT path, content, mtime, sha256, size, generating_script, "
+                        "kind, is_archival, canonical_path, csv_columns, json_keys "
+                        "FROM outputs_index "
+                        "WHERE lower(replace(path, '\\', '/')) = ?"
+                    )
+                else:
+                    sql = (
+                        "SELECT path, content, mtime, sha256, size, generating_script, "
+                        "kind, is_archival, canonical_path, csv_columns, json_keys "
+                        "FROM outputs_index "
+                        "WHERE path = ?"
+                    )
+                relation = con.execute(sql, [target])
                 columns = [c[0] for c in relation.description]
-                fetched = relation.fetchall()
+                row = relation.fetchone()
             except Exception:  # noqa: BLE001
                 _log.debug("OutputsFtsIndex.resolve_output failed",
                             exc_info=True)
                 return None
-        for row in fetched:
-            rec = dict(zip(columns, row))
-            if _normalize_output_path(rec.get("path")) == target:
-                return {
-                    "path": rec["path"],
-                    "generating_script": rec.get("generating_script"),
-                    "is_archival": bool(rec.get("is_archival")),
-                    "canonical_path": rec.get("canonical_path"),
-                    "sha256": rec.get("sha256"),
-                    "kind": rec.get("kind"),
-                    "size": rec.get("size"),
-                    "mtime": rec.get("mtime"),
-                    "csv_columns": (
-                        json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
-                    ),
-                    "json_keys": (
-                        json.loads(rec["json_keys"]) if rec.get("json_keys") else None
-                    ),
-                }
-        return None
+        if row is None:
+            return None
+        rec = dict(zip(columns, row))
+        return {
+            "path": rec["path"],
+            "generating_script": rec.get("generating_script"),
+            "is_archival": bool(rec.get("is_archival")),
+            "canonical_path": rec.get("canonical_path"),
+            "sha256": rec.get("sha256"),
+            "kind": rec.get("kind"),
+            "size": rec.get("size"),
+            "mtime": rec.get("mtime"),
+            "csv_columns": (
+                json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+            ),
+            "json_keys": (
+                json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+            ),
+        }
 
     def close(self) -> None:
         with self._write_lock:
