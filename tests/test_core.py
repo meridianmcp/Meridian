@@ -7377,10 +7377,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_resources_amended",
         "_migrate_pg_session_activity",
         "_migrate_pg_file_docx_region_claims",
+        "_migrate_pg_connection_events",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 100
+    assert len(allnames) == len(set(allnames)) == 101
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -17723,3 +17724,156 @@ def test_build_item_briefing_minimal_item():
     assert "/goal" in brief
     assert "min1" in brief
     assert "Minimal" in brief
+
+
+# ---------------------------------------------------------------------------
+# b12cc29f — connection_events: per-/mcp-request auth+method event log
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migrate_connection_events_idempotent(db):
+    """_migrate_connection_events is idempotent — re-running it never raises."""
+    from meridian.db.migrations import _migrate_connection_events
+
+    # init_db already ran it once; a second call must be a no-op.
+    await _migrate_connection_events(db)
+    # Table must be usable after the redundant migration.
+    await db_module.record_connection_event(
+        db,
+        tenant_id="idem-test",
+        method="initialize",
+        auth_result="success",
+        response_status=200,
+    )
+    rows = await db_module.get_connection_log(db, tenant_id="idem-test")
+    assert len(rows) == 1
+    assert rows[0]["method"] == "initialize"
+
+
+@pytest.mark.asyncio
+async def test_record_connection_event_basic(db):
+    """record_connection_event writes a retrievable row."""
+    await db_module.record_connection_event(
+        db,
+        tenant_id="t-basic",
+        method="tools/list",
+        auth_result="success",
+        tools_returned=42,
+        client_user_agent="Claude-Desktop/1.0",
+        response_status=200,
+    )
+    rows = await db_module.get_connection_log(db, tenant_id="t-basic")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["tenant_id"] == "t-basic"
+    assert r["method"] == "tools/list"
+    assert r["auth_result"] == "success"
+    assert r["tools_returned"] == 42
+    assert r["client_user_agent"] == "Claude-Desktop/1.0"
+    assert r["response_status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_record_connection_event_null_tenant(db):
+    """record_connection_event accepts tenant_id=None (unauthenticated attempts)."""
+    await db_module.record_connection_event(
+        db,
+        tenant_id=None,
+        method="initialize",
+        auth_result="invalid_token",
+        response_status=401,
+    )
+    # Fetch with no tenant filter — returns all rows including NULL tenant.
+    rows = await db_module.get_connection_log(db, tenant_id=None)
+    found = [r for r in rows if r["auth_result"] == "invalid_token"]
+    assert len(found) >= 1
+
+
+@pytest.mark.asyncio
+async def test_get_connection_log_since_filter(db):
+    """get_connection_log since= filter correctly excludes older events."""
+    import asyncio as _aio
+
+    # Write two events with distinct timestamps (sleep not needed — insert
+    # order is enough since we use recorded_at DESC and the DB writes real
+    # wall-clock time; just ensure the since= string is deterministic).
+    await db_module.record_connection_event(
+        db, tenant_id="t-since", method="initialize", auth_result="success",
+        response_status=200,
+    )
+    # The second event is effectively the same second; query with a future
+    # since= to confirm the filter works (returns 0 rows).
+    future_since = "2099-01-01 00:00:00"
+    rows_future = await db_module.get_connection_log(
+        db, tenant_id="t-since", since=future_since
+    )
+    assert rows_future == []
+
+    # Past since= returns the row we wrote.
+    rows_all = await db_module.get_connection_log(
+        db, tenant_id="t-since", since="2000-01-01 00:00:00"
+    )
+    assert len(rows_all) >= 1
+
+
+@pytest.mark.asyncio
+async def test_get_connection_log_limit(db):
+    """get_connection_log caps at the provided limit."""
+    for i in range(5):
+        await db_module.record_connection_event(
+            db, tenant_id="t-limit", method="tools/call",
+            auth_result="success", response_status=200,
+        )
+    rows = await db_module.get_connection_log(db, tenant_id="t-limit", limit=3)
+    assert len(rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_connection_log_mcp_tool(db):
+    """The get_connection_log MCP tool returns events for the current tenant."""
+    from meridian.mcp.handlers.session_tools import handle_get_connection_log
+
+    # Write one event for this (fake) tenant.
+    await db_module.record_connection_event(
+        db,
+        tenant_id="mcp-tenant-1",
+        method="tools/list",
+        auth_result="success",
+        tools_returned=10,
+        response_status=200,
+    )
+    # Call the handler with the matching tenant id.
+    result = await handle_get_connection_log(
+        args={},
+        db=db,
+        data_dir="",
+        tenant={"id": "mcp-tenant-1"},
+        _mcp_tenant_id="mcp-tenant-1",
+    )
+    assert result["tenant_id"] == "mcp-tenant-1"
+    assert result["count"] >= 1
+    assert result["events"][0]["method"] == "tools/list"
+    assert result["events"][0]["tools_returned"] == 10
+
+
+@pytest.mark.asyncio
+async def test_get_connection_log_ring_buffer(db):
+    """Ring buffer caps at _CONNECTION_EVENTS_RING_SIZE per tenant.
+
+    This test uses a small ring size via monkey-patching to avoid writing 1000
+    rows in the test suite; the pruning logic is the same regardless of N.
+    """
+    import meridian.db as _db_mod
+    original = _db_mod._CONNECTION_EVENTS_RING_SIZE
+    _db_mod._CONNECTION_EVENTS_RING_SIZE = 5
+    try:
+        for i in range(8):
+            await _db_mod.record_connection_event(
+                db, tenant_id="t-ring", method="tools/call",
+                auth_result="success", response_status=200,
+            )
+        rows = await _db_mod.get_connection_log(db, tenant_id="t-ring", limit=500)
+        assert len(rows) == 5
+    finally:
+        _db_mod._CONNECTION_EVENTS_RING_SIZE = original

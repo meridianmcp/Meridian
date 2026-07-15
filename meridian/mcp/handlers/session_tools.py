@@ -310,6 +310,38 @@ async def handle_get_session_activity(
     }
 
 
+async def handle_get_connection_log(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_connection_log.
+
+    b12cc29f — returns the /mcp connection-event log for this tenant.
+    Scoped to the calling tenant's id so a tenant can only read their own log.
+    Self-hosted (no tenant) callers get the full log (no tenant filter).
+    """
+    _since = (args.get("since") or "").strip() or None
+    _limit = min(int(args.get("limit", 100)), 200)
+    try:
+        _events = await db_module.get_connection_log(
+            db,
+            tenant_id=_mcp_tenant_id,
+            since=_since,
+            limit=_limit,
+        )
+    except Exception:  # noqa: BLE001 — degrade gracefully, never surface a DB error here
+        _events = []
+    return {
+        "tenant_id": _mcp_tenant_id,
+        "since": _since,
+        "count": len(_events),
+        "events": _events,
+    }
+
+
 async def handle_get_agent_instructions(
     args: dict[str, Any],
     db: Any,

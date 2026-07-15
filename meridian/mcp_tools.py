@@ -1457,6 +1457,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string"},
          "limit": {"type": "integer", "description": "Max entries to return (default 20, max 50)."}},
          "required": ["session_id"]}},
+    {"name": "get_connection_log", "description":
+        "Read-only: Return the recent /mcp connection-event log for this tenant "
+        "(newest first, up to 200 entries). Every HTTP /mcp request Meridian "
+        "receives is recorded: timestamp, MCP method (initialize/tools/list/"
+        "tools/call/...), auth_result (success/oauth/no_token/invalid_token/"
+        "expired), tools_returned (tool count for tools/list responses), "
+        "client_user_agent, and HTTP response_status. Use this to diagnose "
+        "client-side outages (zero tools returned, auth failures, unexpected "
+        "User-Agents) in real time or after the fact without needing raw "
+        "Fly.io log access.",
+     "inputSchema": {"type": "object", "properties": {
+         "since": {"type": "string", "description": "ISO timestamp (UTC). Only return events at or after this time. Example: '2026-07-15 03:00:00'"},
+         "limit": {"type": "integer", "description": "Max entries to return (default 100, max 200)."}},
+         "required": []}},
     {"name": "search_all", "description":
         "Read-only: Universal search across all project content: tasks, notes, pinned decisions, "
         "and sprint items. Uses LIKE matching (SQLite) or ILIKE (Postgres). "
@@ -1820,7 +1834,8 @@ _READ_ONLY_TOOLS = {
     "paper_search",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
-    "get_session_log", "get_session_activity", "idle_until_session_done", "generate_handoff", "load_handoff",
+    "get_session_log", "get_session_activity", "get_connection_log",
+    "idle_until_session_done", "generate_handoff", "load_handoff",
     "verify_handoff_token",
     "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
@@ -1888,6 +1903,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_session_brief":       "session",
     "get_context_block":       "session",
     "get_session_log":         "session",
+    "get_connection_log":      "session",
     "list_sessions":           "session",
     "refresh_context":         "session",
     "heartbeat":               "session",
@@ -2101,6 +2117,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_context_block":         "both",
     "get_session_brief":         "both",
     "get_session_log":           "both",
+    "get_connection_log":        "both",
     "list_sessions":             "both",
     "idle_until_session_done":   "both",
     "get_sprint_notes":          "both",

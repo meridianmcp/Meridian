@@ -836,6 +836,24 @@ CREATE TABLE IF NOT EXISTS session_activity (
     summary TEXT NOT NULL,
     recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- b12cc29f — connection_events: per-/mcp-request auth+method event log.
+-- Every real HTTP /mcp request is written here with the auth outcome, MCP
+-- method, tool count (for tools/list), User-Agent, and response status so a
+-- live or post-mortem client-side outage can be diagnosed without raw log
+-- access. Capped at 1000 rows per tenant_id (enforced at write time).
+-- idx_connection_events_tenant is created by _migrate_connection_events
+-- (guarded migration), never inline here.
+CREATE TABLE IF NOT EXISTS connection_events (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    method TEXT NOT NULL DEFAULT '',
+    auth_result TEXT NOT NULL DEFAULT 'unknown',
+    tools_returned INTEGER,
+    client_user_agent TEXT,
+    response_status INTEGER NOT NULL DEFAULT 200,
+    recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -1033,6 +1051,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_file_patch_counters(db)
     await _migrate_sprint_item_resources_amended(db)
     await _migrate_session_activity(db)
+    await _migrate_connection_events(db)
     return db
 
 
@@ -7427,6 +7446,111 @@ async def get_session_activity(
         "SELECT * FROM session_activity WHERE session_id = ? "
         "ORDER BY recorded_at DESC, rowid DESC LIMIT ?",
         (session_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# b12cc29f — connection_events: per-/mcp-request auth+method event log.
+#
+# Every HTTP POST /mcp the server actually receives gets written here so a
+# live or post-mortem client-side outage (Claude Desktop showing zero tools,
+# auth failures) can be diagnosed without raw Fly.io log access or guessing
+# by elimination.
+# ---------------------------------------------------------------------------
+
+_CONNECTION_EVENTS_RING_SIZE = 1000  # max entries retained per tenant_id
+
+
+async def record_connection_event(
+    db: aiosqlite.Connection,
+    *,
+    tenant_id: str | None,
+    method: str,
+    auth_result: str,
+    tools_returned: int | None = None,
+    client_user_agent: str | None = None,
+    response_status: int = 200,
+) -> None:
+    """Write one connection-event row and prune the oldest beyond the ring size.
+
+    Best-effort: callers must wrap in try/except so a logging failure never
+    breaks a real /mcp response. Pruning is per-(tenant_id IS NOT NULL) bucket;
+    unauthenticated events (tenant_id=NULL) use a separate NULL bucket capped
+    at the same size.
+
+    auth_result vocabulary:
+      success        — valid API token or OAuth token accepted
+      oauth          — OAuth bearer token accepted (sub-type of success)
+      no_token       — no Authorization header present
+      invalid_token  — bearer present but not found in DB
+      expired        — OAuth token found but past expiry
+      parse_error    — request body was unparseable JSON
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+    entry_id = _new_id()
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ua = (client_user_agent or "")[:200] or None
+    await db.execute(
+        "INSERT INTO connection_events "
+        "(id, tenant_id, method, auth_result, tools_returned, client_user_agent, "
+        " response_status, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (entry_id, tenant_id, method[:100], auth_result[:40],
+         tools_returned, ua, response_status, now_ts),
+    )
+    # Prune: keep only the most recent N rows for this tenant bucket.
+    # NULL tenant_id is a valid bucket (unauthenticated/failed attempts).
+    tiebreak = "ctid" if hasattr(db, "_pool") else "rowid"
+    if tenant_id is not None:
+        await db.execute(
+            f"DELETE FROM connection_events "
+            f"WHERE tenant_id = ? AND {tiebreak} NOT IN ("
+            f"  SELECT {tiebreak} FROM connection_events WHERE tenant_id = ? "
+            f"  ORDER BY recorded_at DESC, {tiebreak} DESC LIMIT ?"
+            f")",
+            (tenant_id, tenant_id, _CONNECTION_EVENTS_RING_SIZE),
+        )
+    else:
+        await db.execute(
+            f"DELETE FROM connection_events "
+            f"WHERE tenant_id IS NULL AND {tiebreak} NOT IN ("
+            f"  SELECT {tiebreak} FROM connection_events WHERE tenant_id IS NULL "
+            f"  ORDER BY recorded_at DESC, {tiebreak} DESC LIMIT ?"
+            f")",
+            (_CONNECTION_EVENTS_RING_SIZE,),
+        )
+    await db.commit()
+
+
+async def get_connection_log(
+    db: aiosqlite.Connection,
+    tenant_id: str | None = None,
+    since: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return recent connection events, newest first.
+
+    When ``tenant_id`` is given, scopes to that tenant's events only.
+    ``since`` is an ISO timestamp string — only events at or after this time
+    are returned. ``limit`` caps the result set (max 500).
+    """
+    limit = min(limit, 500)
+    params: list[Any] = []
+    clauses: list[str] = []
+    if tenant_id is not None:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    if since:
+        clauses.append("recorded_at >= ?")
+        params.append(since)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+    async with db.execute(
+        f"SELECT * FROM connection_events {where} "
+        f"ORDER BY recorded_at DESC LIMIT ?",
+        params,
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]

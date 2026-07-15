@@ -2900,6 +2900,31 @@ async def _migrate_pg_session_activity(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_connection_events(conn: PostgresConnection) -> None:
+    """b12cc29f — connection_events: per-/mcp-request auth+method event log.
+
+    Every HTTP POST /mcp the server actually receives is recorded here so a
+    live or post-mortem client-side outage (Claude Desktop showing zero tools,
+    auth failures) can be diagnosed without raw Fly.io log access.
+    Mirrors db._migrate_connection_events. Idempotent via CREATE TABLE IF NOT
+    EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS connection_events ("
+        "    id TEXT PRIMARY KEY,"
+        "    tenant_id TEXT,"
+        "    method TEXT NOT NULL DEFAULT '',"
+        "    auth_result TEXT NOT NULL DEFAULT 'unknown',"
+        "    tools_returned INTEGER,"
+        "    client_user_agent TEXT,"
+        "    response_status INTEGER NOT NULL DEFAULT 200,"
+        f"    recorded_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_connection_events_tenant "
+        "ON connection_events(tenant_id, recorded_at DESC)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2967,4 +2992,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_resources_amended,
     _migrate_pg_session_activity,
     _migrate_pg_file_docx_region_claims,
+    _migrate_pg_connection_events,
 )
