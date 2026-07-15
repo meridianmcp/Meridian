@@ -1022,3 +1022,126 @@ class TestParallelRebuildCorrectness:
         # The file should still get indexed via the fallback path.
         assert count >= 0  # may be 0 if fallback also failed; main check is no raise
         idx.close()
+
+
+# ---------------------------------------------------------------------------
+# DuckDB FTS capability probe (sprint item b8314850)
+#
+# Sprint item b8314850 asked us to switch _rebuild_fts() from overwrite=1 to
+# incremental=true.  Before implementing, we empirically verify what the
+# installed DuckDB version actually supports.
+#
+# Finding (2026-07-15): DuckDB 1.5.4 does NOT support the "incremental"
+# parameter for create_fts_index.  The valid named parameters are:
+#   ignore, lower, overwrite, stemmer, stopwords, strip_accents
+# The only FTS DDL functions available are create_fts_index and drop_fts_index.
+# There is no incremental/append/update path -- a full rebuild (overwrite=1) is
+# the only supported mechanism.  The sprint item explicitly authorises a
+# documented-blocked outcome over a forced implementation, so _rebuild_fts()
+# is left unchanged.  This test pins the empirical evidence so it will fail
+# (and prompt re-evaluation) if a future DuckDB upgrade adds incremental support.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _DUCKDB_AVAILABLE, reason="duckdb not installed")
+class TestDuckDbFtsCapabilityProbe:
+    """Empirical probe for DuckDB FTS incremental-rebuild capability.
+
+    These tests document exactly what the installed DuckDB version exposes.
+    They are intentionally written to PASS against an older DuckDB that lacks
+    incremental support, and to FAIL (loudly) if a future version adds it --
+    at which point sprint item b8314850 should be re-opened and implemented.
+    """
+
+    def test_duckdb_version_is_recorded(self) -> None:
+        """Ensure DuckDB is importable and its version is visible in CI logs."""
+        import duckdb  # noqa: PLC0415
+        version = duckdb.__version__
+        # Log clearly so the CI artifact captures it.
+        print(f"\nInstalled DuckDB version: {version}")
+        # Basic sanity: version string is non-empty.
+        assert version and version.strip()
+
+    def test_fts_functions_available(self) -> None:
+        """The FTS extension exposes exactly create_fts_index and drop_fts_index."""
+        import duckdb  # noqa: PLC0415
+        con = duckdb.connect(":memory:")
+        try:
+            con.execute("INSTALL fts")
+            con.execute("LOAD fts")
+            rows = con.execute(
+                "SELECT function_name FROM duckdb_functions() "
+                "WHERE function_name ILIKE '%fts%' ORDER BY function_name"
+            ).fetchall()
+            names = {r[0] for r in rows}
+            assert "create_fts_index" in names
+            assert "drop_fts_index" in names
+        finally:
+            con.close()
+
+    def test_incremental_param_not_supported(self) -> None:
+        """create_fts_index does NOT accept an 'incremental' parameter.
+
+        If this test starts failing (i.e. the call STOPS raising a BinderError),
+        it means the installed DuckDB has gained incremental FTS support and
+        sprint item b8314850 should be re-evaluated and implemented.
+        """
+        import duckdb  # noqa: PLC0415
+        con = duckdb.connect(":memory:")
+        try:
+            con.execute("INSTALL fts")
+            con.execute("LOAD fts")
+            con.execute(
+                "CREATE TABLE probe_docs (path VARCHAR PRIMARY KEY, content VARCHAR)"
+            )
+            con.execute("INSERT INTO probe_docs VALUES ('a.py', 'hello world')")
+            # First do a valid full build so the index exists.
+            con.execute(
+                "PRAGMA create_fts_index('probe_docs', 'path', 'content', "
+                "stemmer = 'porter', stopwords = 'none', overwrite = 1)"
+            )
+            # Now insert a new row and attempt incremental rebuild.
+            con.execute("INSERT INTO probe_docs VALUES ('b.py', 'new document')")
+            raised = False
+            try:
+                con.execute(
+                    "PRAGMA create_fts_index('probe_docs', 'path', 'content', "
+                    "incremental = true)"
+                )
+            except Exception as exc:  # noqa: BLE001
+                raised = True
+                # Confirm it is the "invalid named parameter" error, not some other issue.
+                assert "incremental" in str(exc).lower() or "invalid" in str(exc).lower(), (
+                    f"Unexpected error (not the expected BinderError): {exc}"
+                )
+            assert raised, (
+                "create_fts_index accepted 'incremental=true' -- DuckDB now supports "
+                "incremental FTS rebuild.  Re-open sprint item b8314850 and implement "
+                "the switch from overwrite=1 to incremental=true in _rebuild_fts()."
+            )
+        finally:
+            con.close()
+
+    def test_valid_fts_params_include_overwrite(self) -> None:
+        """Verify overwrite=1 (the current implementation) still works correctly."""
+        import duckdb  # noqa: PLC0415
+        con = duckdb.connect(":memory:")
+        try:
+            con.execute("INSTALL fts")
+            con.execute("LOAD fts")
+            con.execute(
+                "CREATE TABLE overwrite_docs (path VARCHAR PRIMARY KEY, content VARCHAR)"
+            )
+            con.execute("INSERT INTO overwrite_docs VALUES ('x.py', 'alpha beta gamma')")
+            con.execute(
+                "PRAGMA create_fts_index('overwrite_docs', 'path', 'content', "
+                "stemmer = 'porter', stopwords = 'none', overwrite = 1)"
+            )
+            # Confirm search works after overwrite build.
+            rows = con.execute(
+                "SELECT fts_main_overwrite_docs.match_bm25(path, 'alpha') AS score, path "
+                "FROM overwrite_docs"
+            ).fetchall()
+            hits = [r for r in rows if r[0] is not None]
+            assert hits, "Expected at least one BM25 hit for 'alpha' after overwrite build"
+        finally:
+            con.close()
