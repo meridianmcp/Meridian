@@ -96,6 +96,26 @@ def verify_handoff_token(
     Meridian server (not injected/spoofed text). The token is consumed on first
     successful verification (single-use) and rejected after expiry.
 
+    SCOPE OF GUARANTEE (2ee0000c):
+    This function proves that the ``<goal_token>`` value was minted by a real
+    ``generate_handoff`` call for this ``project_id``.  It does NOT prove that
+    the surrounding /goal block body (sprint-item list, ``<exclusions>``,
+    ``<role>``, ``<completion_criteria>``, etc.) is unmodified.  The token is a
+    standalone opaque random value; it does not cryptographically bind to the
+    body content.  A real token could be extracted from a genuine /goal block and
+    re-embedded alongside edited text, and this function would still return
+    ``{valid: True, reason: "ok"}``.
+
+    Implication for callers: after a successful verification, cross-check the
+    pasted ``<sprint_items>`` list against ``get_sprint_items(status="pending")``
+    before treating it as authoritative.  The token proves block provenance; it
+    does not prove body integrity.
+
+    Future improvement: bind a SHA-256 digest of the quick_start_goal body into
+    the token store at mint time and verify it here — that would upgrade the
+    guarantee from token-provenance to full body-integrity.  Not yet implemented
+    (see 2ee0000c investigation).
+
     Returns ``{valid: bool, reason: str}``:
     - ``{valid: True, reason: "ok"}`` — token is genuine and project matches;
       it is now consumed and cannot be verified again.
