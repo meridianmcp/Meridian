@@ -2012,7 +2012,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, verify_handoff_token."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -2177,6 +2177,15 @@ async def _handle_task_tools(
             ),
             "has_handoff": bool(_latest) or bool(_pending),
         }
+    if name == "verify_handoff_token":
+        # dd07ece0 — verify a provenance token extracted from a pasted /goal block.
+        # Delegates to the in-process token store in handoff.py; no DB access needed.
+        from .. import handoff as handoff_module_local  # noqa: PLC0415
+        _token = (args.get("token") or "").strip()
+        if not _token:
+            return {"valid": False, "reason": "not_found"}
+        _pid = args.get("project_id") or ""
+        return handoff_module_local.verify_handoff_token(_token, _pid)
     return _MISS
 
 
@@ -2377,1108 +2386,130 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, get_document_structure, get_latex_structure, get_citation_edges, resolve_citations, index_equation, find_similar_equation, insert_equation, update_paragraph, find_symbol_usages, index_figure, find_similar_figure, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, save_blog_post, get_blog_posts, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item, add_workspace_proposal, get_workspace_proposals, advance_proposal_status, promote_proposal."""
-    if name == "pin_decision":
-        validate_input_size(args.get("title"), "decision title", 500)
-        validate_input_size(args.get("body"), "decision body", 100_000)
-        category = args.get("category", "TECHNICAL")
-        result = await db_module.pin_decision(
-            db, args["project_id"], args["title"], args["body"], category,
-            priority=args.get("priority", "normal"),
-            assumption=args.get("assumption"),
-        )
-        await _server._append_decision_to_md(args["title"], args["body"], category)
-        return result
-    if name == "update_decision":
-        new_title = args.get("new_title")
-        new_body = args.get("new_body")
-        if new_title and new_body:
-            return await db_module.supersede_pinned_decision(
-                db, args["decision_id"], new_title, new_body, args.get("category"),
-                priority=args.get("priority"),
-            )
-        result = await db_module.update_pinned_decision(
-            db, args["decision_id"],
-            body=args.get("body"),
-            title=args.get("title"),
-            category=args.get("category"),
-            status=args.get("status"),
-            superseded_by=args.get("superseded_by"),
-            priority=args.get("priority"),
-            assumption=args.get("assumption"),
-            assumption_status=args.get("assumption_status"),
-        )
-        if result is None:
-            raise ValueError("decision not found")
-        return result
-    if name == "validate_assumption":
-        # 8ec5493b — one-call assumption validation: stamp the decision's
-        # assumption_status, save a code-anchored finding note, and fire a
-        # blocking HITL on invalidation.
-        if "confirmed" not in args:
-            return {"error": "validate_assumption requires 'confirmed' (bool)"}
-        validate_input_size(args.get("finding"), "finding", 100_000)
-        validate_input_size(args.get("file_path"), "file_path", 2_000)
-        validate_input_size(args.get("symbol"), "symbol", 500)
-        try:
-            return await db_module.validate_assumption(
-                db, args["decision_id"], args.get("finding") or "",
-                bool(args.get("confirmed")),
-                file_path=args.get("file_path"), symbol=args.get("symbol"),
-                session_id=args.get("session_id"),
-            )
-        except ValueError as exc:
-            return {"error": str(exc)}
-    if name == "get_pinned_decisions":
-        return await db_module.get_pinned_decisions(
-            db, args["project_id"],
-            include_superseded=bool(args.get("include_superseded", False)),
-        )
-    if name == "archive_decision":
-        deleted = await db_module.delete_pinned_decision(db, args["decision_id"])
-        if not deleted:
-            raise ValueError("decision not found")
-        return {"deleted": True, "decision_id": args["decision_id"]}
-    if name == "add_note":
-        validate_input_size(args.get("title"), "note title", 500)
-        validate_input_size(args.get("body"), "note body", 10_000_000)
-        validate_input_size(args.get("file_path"), "note file_path", 2_000)
-        validate_input_size(args.get("symbol"), "note symbol", 500)
-        validate_input_size(args.get("source"), "note source", 2_000)
-        # 41b8a927 — recognise #hashtags in the title/body as tags so a note is
-        # searchable by tag without a separate tags argument.
-        import re as _re_ht  # noqa: PLC0415
-        _ht = _re_ht.findall(
-            r"(?<!\w)#([A-Za-z][\w-]{1,40})",
-            f"{args.get('title') or ''} {args.get('body') or ''}",
-        )
-        _tags_arg = args.get("tags")
-        if _ht:
-            _have = {t.strip().lower() for t in (_tags_arg or "").split(",") if t.strip()}
-            _add = [h for h in _ht if h.lower() not in _have]
-            if _add:
-                _tags_arg = ", ".join(
-                    [p for p in [(_tags_arg or "").strip()] if p] + _add
-                )
-        try:
-            result = await db_module.add_project_note(
-                db, args["project_id"], args["title"], args["body"],
-                _tags_arg, kind=args.get("kind"),
-                priority=args.get("priority", "normal"),
-                file_path=args.get("file_path"), symbol=args.get("symbol"),
-                source=args.get("source"),
-            )
-        except ValueError as exc:
-            return {"error": str(exc)}
-        await _server._append_note_to_roadmap(
-            args["title"], args["body"], args.get("tags"), args.get("category"),
-        )
-        # e5592013 — lint: "MANUAL" notes are usually human tasks, not wiki.
-        if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
-            result = {**result, "lint": _MANUAL_NOTE_LINT}
-        # 6e4e2371 — warn (never block) when a near-duplicate note already exists,
-        # so notes don't accumulate repetitive near-copies. Advisory: any failure
-        # here must not fail the write.
-        if isinstance(result, dict) and not result.get("error"):
-            try:
-                import difflib as _difflib  # noqa: PLC0415
-                _new_title = (args.get("title") or "").strip().lower()
-                if _new_title:
-                    _new_id = result.get("id")
-                    _new_slug = result.get("slug")
-                    _existing = await db_module.get_project_notes(
-                        db, args["project_id"], limit=200
-                    )
-                    _similar = []
-                    for _n in (_existing or []):
-                        if (_new_id and _n.get("id") == _new_id) or (
-                            _new_slug and _n.get("slug") == _new_slug
-                        ):
-                            continue  # skip the note we just created
-                        _et = (_n.get("title") or "").strip().lower()
-                        if not _et:
-                            continue
-                        _ratio = _difflib.SequenceMatcher(None, _new_title, _et).ratio()
-                        if _ratio >= 0.82:
-                            _similar.append({
-                                "slug": _n.get("slug"),
-                                "title": _n.get("title"),
-                                "similarity": round(_ratio, 2),
-                            })
-                    if _similar:
-                        _similar.sort(key=lambda s: s["similarity"], reverse=True)
-                        result = {
-                            **result,
-                            "similar_notes": _similar[:3],
-                            "similar_notes_warning": (
-                                "A similar note already exists — consider updating it "
-                                "instead of accumulating near-duplicates."
-                            ),
-                        }
-            except Exception:  # noqa: BLE001 — dedup is advisory
-                pass
-        return result
-    if name == "ingest_document":
-        # e3f150d0 — extract a Word/PDF/text document into a kind='document'
-        # note. Extraction (.txt/.md/.docx) is stdlib-only and server-side;
-        # PDFs/unsupported types must be pre-extracted by the caller and passed
-        # as `content`. The body cap is applied inside db.ingest_document.
-        validate_input_size(args.get("title"), "document title", 500)
-        validate_input_size(args.get("file_path"), "document file_path", 2_000)
-        validate_input_size(args.get("source"), "document source", 2_000)
-        validate_input_size(args.get("content"), "document content", 50_000_000)
-        # 832d67af — when only a file_path is given (no inline content) the server
-        # extracts the text from its OWN filesystem (doc_ingest.extract_text), so on
-        # hosted Meridian (Fly.io) it has ZERO access to a caller's local path and
-        # the open fails with a misleading "[Errno 2] No such file or directory".
-        # Mirror get_document_structure's honest guard: fail clearly, telling the
-        # caller why and what to do. `content` (pre-extracted text) needs no
-        # filesystem and DOES work hosted, so only guard the path-only case.
-        _fp = args.get("file_path")
-        _content = args.get("content")
-        _has_content = _content is not None and str(_content).strip() != ""
-        if _hosted_mode() and _fp and not _has_content:
-            return {
-                "error": (
-                    "ingest_document reads the file from the Meridian server's own "
-                    "filesystem, so on hosted Meridian it cannot open a path on your "
-                    "machine (that is what surfaces as a misleading '[Errno 2] No "
-                    "such file or directory'). Run Meridian self-hosted so the server "
-                    "shares a filesystem with the file, pass the already-extracted "
-                    "text as `content` instead of a `file_path`, or read the document "
-                    "through your tunnel's local document tools, which proxy to your "
-                    "machine."
-                ),
-                "hosted": True,
-                "file_path": _fp,
-            }
-        from ..doc_ingest import DocExtractionError  # local import: optional dep-free
-        try:
-            _ingest_result = await db_module.ingest_document(
-                db, args["project_id"],
-                file_path=args.get("file_path"),
-                content=args.get("content"),
-                title=args.get("title"),
-                source=args.get("source"),
-                tags=args.get("tags"),
-            )
-        except (ValueError, DocExtractionError, FileNotFoundError) as exc:
-            return {"error": str(exc)}
-        # 9ee6d2ec — best-effort: persist the parsed docx/latex STRUCTURE into the
-        # tiered doc-structure store. Fully guarded inside — a persistence failure
-        # never touches _ingest_result (no regression to the flat-note ingest).
-        await _persist_ingest_structure(
-            db,
-            data_dir,
-            tenant,
-            args["project_id"],
-            args.get("file_path"),
-            args.get("source"),
-            args.get("title"),
-        )
-        return _ingest_result
-    if name == "get_document_structure":
-        # 13462df2 — stateless docs_intel: heading outline of a server-side .docx
-        # (no sidecar index). Same server-side file access as ingest_document
-        # (self-hosted / tunnel).
-        validate_input_size(args.get("file_path"), "document file_path", 2_000)
-        fp = args.get("file_path")
-        if not fp:
-            return {"error": "file_path is required"}
-        # 79ee73e8 — record this stateless peek in the tenant-scoped "recently
-        # viewed (not saved)" log so the Documents tab can surface it. Peeks were
-        # invisible there (only ingested docs showed), silently conflating the two.
-        _peek_scope = (tenant or {}).get("id") if tenant else None
+    """Dispatch group: pin_decision, update_decision, validate_assumption,
+    get_pinned_decisions, archive_decision, add_note, ingest_document,
+    get_document_structure, get_latex_structure, get_citation_edges,
+    resolve_citations, index_equation, find_similar_equation, insert_equation,
+    update_paragraph, find_symbol_usages, index_figure, find_similar_figure,
+    link_figure_caption, index_table, find_similar_table,
+    ingest_document_structure, add_insight, get_insights, save_finding,
+    capture_research_finding, get_notes, read_note, delete_note,
+    add_workspace_note, get_workspace_notes, pin_workspace_decision,
+    get_workspace_decisions, get_workspace_settings, update_workspace_settings,
+    save_blog_post, get_blog_posts, add_workspace_sprint_item,
+    get_workspace_sprint_items, update_workspace_sprint_item,
+    complete_workspace_sprint_item, add_workspace_proposal,
+    get_workspace_proposals, advance_proposal_status, promote_proposal.
 
-        def _record_peek(ok: bool) -> None:
-            try:
-                from .. import doc_peeks  # noqa: PLC0415
-                doc_peeks.record_peek(_peek_scope, fp, ok=ok)
-            except Exception:  # noqa: BLE001 — the recent-peeks log is best-effort
-                pass
+    ac4df52f — the original if/elif chain has been replaced with a per-tool
+    dispatch table (dict mapping tool name -> handler function).  Each tool's
+    logic lives in its own named function in
+    ``meridian.mcp.handlers.notes_decisions``.  This is a PURELY MECHANICAL
+    extraction: zero behaviour change, same tool names, same arguments, same
+    return values.
+    """
+    from .handlers.notes_decisions import (  # noqa: PLC0415
+        handle_pin_decision,
+        handle_update_decision,
+        handle_validate_assumption,
+        handle_get_pinned_decisions,
+        handle_archive_decision,
+        handle_add_note,
+        handle_get_notes,
+        handle_read_note,
+        handle_delete_note,
+        handle_ingest_document,
+        handle_get_document_structure,
+        handle_get_latex_structure,
+        handle_ingest_document_structure,
+        handle_get_citation_edges,
+        handle_resolve_citations,
+        handle_index_equation,
+        handle_find_similar_equation,
+        handle_insert_equation,
+        handle_update_paragraph,
+        handle_find_symbol_usages,
+        handle_index_figure,
+        handle_find_similar_figure,
+        handle_link_figure_caption,
+        handle_index_table,
+        handle_find_similar_table,
+        handle_add_insight,
+        handle_get_insights,
+        handle_save_finding,
+        handle_capture_research_finding,
+        handle_add_workspace_note,
+        handle_get_workspace_notes,
+        handle_pin_workspace_decision,
+        handle_get_workspace_decisions,
+        handle_get_workspace_settings,
+        handle_update_workspace_settings,
+        handle_save_blog_post,
+        handle_get_blog_posts,
+        handle_add_workspace_sprint_item,
+        handle_get_workspace_sprint_items,
+        handle_update_workspace_sprint_item,
+        handle_complete_workspace_sprint_item,
+        handle_add_workspace_proposal,
+        handle_get_workspace_proposals,
+        handle_advance_proposal_status,
+        handle_promote_proposal,
+    )
 
-        # b43bab91 — this reads the .docx from the SERVER's own filesystem
-        # (zipfile.ZipFile), so it only works self-hosted, where the server and the
-        # files share a machine. On hosted Meridian (Fly.io) the server has ZERO
-        # access to a caller's local path, so the read would fail with a misleading
-        # "file not found" regardless of tunnel/file state. Fail honestly instead:
-        # tell the caller why and what to do (self-host, or read via the tunnel's
-        # word-document tools, which proxy to their machine — unlike this native
-        # tool, which does not).
-        if _hosted_mode():
-            _record_peek(ok=False)
-            return {
-                "error": (
-                    "get_document_structure reads the .docx from the Meridian "
-                    "server's own filesystem, so on hosted Meridian it cannot open a "
-                    "path on your machine (that is what surfaces as a misleading "
-                    "'file not found'). Run Meridian self-hosted so the server shares "
-                    "a filesystem with the file, or read the document through your "
-                    "tunnel's word-document tools, which proxy to your machine."
-                ),
-                "hosted": True,
-                "file_path": fp,
-            }
-        try:
-            from ..docs_intel import document_outline  # noqa: PLC0415
-            from .. import hardening as _hardening  # noqa: PLC0415
-            # document_outline is a synchronous zipfile/OOXML parse — previously
-            # run directly on the event loop with no deadline, so a huge/malformed
-            # .docx could block the whole loop (e5f96adf). Run it in the bulkhead
-            # under a hard timeout: fail fast + keep the loop responsive.
-            _outline = await _hardening.run_in_bulkhead(
-                document_outline, fp, label="get_document_structure",
-            )
-        except _hardening.HeavyToolTimeout as exc:
-            _record_peek(ok=False)
-            return {"error": str(exc), "timed_out": True, "file_path": fp}
-        except FileNotFoundError:
-            return {"error": f"file not found: {fp}"}
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not parse document: {exc}"}
-        _record_peek(ok=True)
-        return _outline
-    if name == "get_latex_structure":
-        # 106118cd — docs_intel Phase 3: native LaTeX (.tex) structure + biblio,
-        # no PDF intermediary. Accepts a server-side file_path (like
-        # get_document_structure) OR raw `source` inline. latex_intel never
-        # raises — malformed LaTeX yields a partial/empty tree, not a crash.
-        validate_input_size(args.get("file_path"), "latex file_path", 2_000)
-        validate_input_size(args.get("source"), "latex source", 5_000_000)
-        fp = args.get("file_path")
-        src = args.get("source")
-        if not fp and not src:
-            return {"error": "file_path or source is required"}
-        # b43bab91 — a file_path is read from the SERVER filesystem and is
-        # unreadable on hosted Meridian (same root cause as get_document_structure).
-        # But get_latex_structure ALSO accepts inline `source`, which DOES work
-        # hosted — so on hosted prefer source, and fail honestly when only an
-        # unreadable path was given.
-        if _hosted_mode() and fp:
-            if src:
-                fp = None  # server can't open the caller's path; use inline source
-            else:
-                return {
-                    "error": (
-                        "get_latex_structure reads the .tex from the Meridian "
-                        "server's filesystem, so on hosted Meridian it cannot open a "
-                        "path on your machine. Pass the file contents inline via "
-                        "`source`, or run Meridian self-hosted."
-                    ),
-                    "hosted": True,
-                    "file_path": fp,
-                }
-        from ..latex_intel import analyze_latex  # noqa: PLC0415
-        try:
-            if fp:
-                if not os.path.isfile(fp):
-                    return {"error": f"file not found: {fp}"}
-                return analyze_latex(fp)
-            return analyze_latex(src)
-        except Exception as exc:  # noqa: BLE001 — defense in depth; analyze_latex is already safe
-            return {"error": f"could not parse latex: {exc}"}
-    if name == "get_citation_edges":
-        # fefb596a — read the citation graph: every kind='citation' marker in a
-        # project (optionally scoped to one document via source/document_id) with
-        # its intra-doc bibentry edges AND cross-doc zotero_item edges. Reads the
-        # tier-resolved doc-structure store; returns an empty graph (never an
-        # error) when no structure has been persisted yet.
-        validate_input_size(args.get("source"), "citation source", 2_000)
-        validate_input_size(args.get("document_id"), "citation document_id", 200)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"project_id": args["project_id"], "markers": []}
-        try:
-            graph = await store.get_citation_graph(
-                args["project_id"],
-                source=args.get("source"),
-                document_id=args.get("document_id"),
-            )
-        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
-            return {"error": f"could not read citation graph: {exc}"}
-        return {"project_id": args["project_id"], **graph}
-    if name == "resolve_citations":
-        # fefb596a — opt-in cross-document resolve pass: walk unresolved citation
-        # markers and link each to a canonical Zotero item via Zotero's LOCAL API
-        # (zotero_client.resolve_citation_ref). NETWORK — deliberately a separate
-        # tool, never in ingest/put_document. Idempotent: only fills gaps. When
-        # Zotero is closed / its local API is disabled every marker just stays
-        # unresolved (the resolver returns None, never raises).
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"error": "document-structure store unavailable"}
-        _max = args.get("max_items")
-        try:
-            _max = int(_max) if _max is not None else None
-        except (TypeError, ValueError):
-            _max = None
-        try:
-            summary = await store.resolve_zotero_edges(
-                args["project_id"], max_items=_max,
-            )
-        except Exception as exc:  # noqa: BLE001 — the pass is best-effort
-            return {"error": f"could not resolve citations: {exc}"}
-        return {"project_id": args["project_id"], **summary}
-    if name == "index_equation":
-        # 06df6ab3 — index ONE Word equation (OMML) against a document already
-        # stored in the doc-structure store. Mirrors get_citation_edges' shape
-        # (resolve the store, then look up the document by its stored source).
-        validate_input_size(args.get("doc"), "equation doc", 2_000)
-        validate_input_size(args.get("omml_or_latex"), "omml_or_latex", 100_000)
-        validate_input_size(args.get("semantic_label"), "semantic_label", 500)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        omml_or_latex = args.get("omml_or_latex")
-        if not doc_source:
-            return {"error": "doc is required"}
-        if not omml_or_latex:
-            return {"error": "omml_or_latex is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"error": "document-structure store unavailable"}
-        try:
-            doc_row = await store.get_document(args["project_id"], doc_source)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not resolve doc: {exc}"}
-        if doc_row is None:
-            return {
-                "error": (
-                    f"no stored document for doc={doc_source!r} — ingest_document "
-                    "it first (that MCP tool populates the doc-structure store; "
-                    "there is no separate reindex_document tool)"
-                ),
-            }
-        try:
-            result = await store.add_equation(
-                doc_row["id"], omml_or_latex,
-                semantic_label=args.get("semantic_label"),
-            )
-        except Exception as exc:  # noqa: BLE001 — indexing is best-effort
-            return {"error": f"could not index equation: {exc}"}
-        return {
-            "project_id": args["project_id"],
-            "document_id": doc_row["id"],
-            **result,
-        }
-    if name == "find_similar_equation":
-        # 06df6ab3 — fuzzy-match a LaTeX string against a document's already-
-        # stored equations (read-only counterpart of index_equation).
-        validate_input_size(args.get("doc"), "equation doc", 2_000)
-        validate_input_size(args.get("latex"), "latex", 100_000)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        latex = args.get("latex")
-        if not doc_source:
-            return {"error": "doc is required"}
-        if not latex:
-            return {"error": "latex is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"project_id": args["project_id"], "document_id": None, "matches": []}
-        try:
-            doc_row = await store.get_document(args["project_id"], doc_source)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not resolve doc: {exc}"}
-        if doc_row is None:
-            return {"project_id": args["project_id"], "document_id": None, "matches": []}
-        _limit = args.get("limit")
-        try:
-            _limit = int(_limit) if _limit is not None else 5
-        except (TypeError, ValueError):
-            _limit = 5
-        try:
-            matches = await store.find_similar_equations(
-                doc_row["id"], latex, limit=_limit,
-            )
-        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
-            return {"error": f"could not find similar equations: {exc}"}
-        return {
-            "project_id": args["project_id"],
-            "document_id": doc_row["id"],
-            "matches": matches,
-        }
-    if name == "insert_equation":
-        # 51a595e7 — write an OMML equation straight into a stored document's
-        # source .docx (direct OOXML write-back), then resync the sidecar
-        # equation index. Mirrors index_equation's shape (resolve the store, then
-        # the document by its stored source) but MUTATES the underlying file.
-        validate_input_size(args.get("doc"), "equation doc", 2_000)
-        validate_input_size(args.get("para_id"), "para_id", 500)
-        validate_input_size(
-            args.get("equation_id_or_omml"), "equation_id_or_omml", 100_000
-        )
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        para_id = args.get("para_id")
-        equation_id_or_omml = args.get("equation_id_or_omml")
-        if not doc_source:
-            return {"error": "doc is required"}
-        if not para_id:
-            return {"error": "para_id is required"}
-        if not equation_id_or_omml:
-            return {"error": "equation_id_or_omml is required"}
-        position = args.get("position") or "append"
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"error": "document-structure store unavailable"}
-        try:
-            result = await store.insert_equation(
-                args["project_id"], doc_source, para_id, equation_id_or_omml,
-                position=position,
-            )
-        except Exception as exc:  # noqa: BLE001 — write-back is best-effort
-            return {"error": f"could not insert equation: {exc}"}
-        if "error" in result:
-            return result
-        return {"project_id": args["project_id"], **result}
-    if name == "update_paragraph":
-        # f978e588 — ID-addressable docx WRITE (the write counterpart of the
-        # get_element_by_id read primitive). Mirrors index_equation's resolution:
-        # resolve the tier store, look up the stored document by its source, then
-        # rewrite ONE paragraph in the on-disk .docx by its w14:paraId (never by
-        # text match) and resync the doc_elements row.
-        # f7ee1ba7 — Model B scoped-region enforcement: before writing, consult
-        # docx-region claims and REJECT the write when another session owns the
-        # target element (or holds a whole-file lock). Fail-open: a claim-lookup
-        # error degrades to allow so a missing db never wedges a legitimate write.
-        validate_input_size(args.get("doc"), "doc", 2_000)
-        validate_input_size(args.get("para_id"), "para_id", 500)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        para_id = args.get("para_id")
-        if not doc_source:
-            return {"error": "doc is required"}
-        if not para_id:
-            return {"error": "para_id is required"}
-        # new_text_or_runs: EITHER a plain string OR a list of runs. Exactly one
-        # of new_text / runs must be provided.
-        new_text = args.get("new_text")
-        runs = args.get("runs")
-        if new_text is None and runs is None:
-            return {"error": "provide either new_text (string) or runs (list)"}
-        if new_text is not None and runs is not None:
-            return {"error": "provide only one of new_text or runs, not both"}
-        new_text_or_runs: Any = runs if runs is not None else new_text
-        if new_text is not None:
-            validate_input_size(new_text, "new_text", 1_000_000)
-        elif not isinstance(runs, list):
-            return {"error": "runs must be a list of strings or run objects"}
-        # f7ee1ba7 — scoped-region claim enforcement gate.
-        _up_session_id = (args.get("session_id") or "").strip() or None
-        if db is not None:
-            _region_conflict = await db_module.check_docx_region_write_conflict(
-                db, _up_session_id, doc_source, para_id,
-            )
-            if _region_conflict is not None and _region_conflict.get("blocked"):
-                return {
-                    "error": "docx_region_conflict",
-                    "blocked": True,
-                    "reason": _region_conflict.get("reason"),
-                    "holder": _region_conflict.get("holder"),
-                    "message": _region_conflict.get("message"),
-                }
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"error": "document-structure store unavailable"}
-        try:
-            result = await store.update_paragraph(
-                args["project_id"], doc_source, para_id, new_text_or_runs,
-            )
-        except ValueError as exc:
-            return {"error": str(exc)}
-        except Exception as exc:  # noqa: BLE001 — the write is best-effort
-            return {"error": f"could not update paragraph: {exc}"}
-        return {"project_id": args["project_id"], **result}
-    if name == "find_symbol_usages":
-        # 9605edb0 — READ-ONLY cross-reference tracking: resolve a symbol /
-        # normalized-LaTeX string OR a doc_equations id to one target and return
-        # every paragraph/equation where it reappears, classified definition vs
-        # reuse (earliest ordinal = definition). Mirrors find_similar_equation's
-        # shape (resolve the store, then look up the document by its stored source).
-        validate_input_size(args.get("doc"), "symbol usages doc", 2_000)
-        validate_input_size(args.get("symbol_or_equation_id"), "symbol_or_equation_id", 100_000)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        symbol_or_equation_id = args.get("symbol_or_equation_id")
-        if not doc_source:
-            return {"error": "doc is required"}
-        if not symbol_or_equation_id:
-            return {"error": "symbol_or_equation_id is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"project_id": args["project_id"], "document_id": None, "target": "", "hits": []}
-        try:
-            doc_row = await store.get_document(args["project_id"], doc_source)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not resolve doc: {exc}"}
-        if doc_row is None:
-            return {"project_id": args["project_id"], "document_id": None, "target": "", "hits": []}
-        try:
-            usages = await store.find_symbol_usages(
-                doc_row["id"], symbol_or_equation_id,
-            )
-        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
-            return {"error": f"could not find symbol usages: {exc}"}
-        return {
-            "project_id": args["project_id"],
-            "document_id": doc_row["id"],
-            **usages,
-        }
-    if name == "index_figure":
-        # c623e648 — index ONE figure into the SEMANTIC figure index (dedup +
-        # similarity on a normalized caption), the direct parallel of
-        # index_equation. Complementary to the structural kind='figure'
-        # doc_elements placement, not a duplicate of it.
-        validate_input_size(args.get("doc"), "figure doc", 2_000)
-        validate_input_size(args.get("file_path"), "file_path", 4_000)
-        validate_input_size(args.get("caption"), "caption", 10_000)
-        validate_input_size(args.get("semantic_label"), "semantic_label", 500)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        file_path = args.get("file_path")
-        caption = args.get("caption")
-        if not doc_source:
-            return {"error": "doc is required"}
-        if not file_path and not caption:
-            return {"error": "at least one of file_path or caption is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"error": "document-structure store unavailable"}
-        try:
-            doc_row = await store.get_document(args["project_id"], doc_source)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not resolve doc: {exc}"}
-        if doc_row is None:
-            return {
-                "error": (
-                    f"no stored document for doc={doc_source!r} — ingest_document "
-                    "it first (that MCP tool populates the doc-structure store; "
-                    "there is no separate reindex_document tool)"
-                ),
-            }
-        try:
-            result = await store.add_figure(
-                doc_row["id"], file_path,
-                caption=caption,
-                semantic_label=args.get("semantic_label"),
-            )
-        except Exception as exc:  # noqa: BLE001 — indexing is best-effort
-            return {"error": f"could not index figure: {exc}"}
-        return {
-            "project_id": args["project_id"],
-            "document_id": doc_row["id"],
-            **result,
-        }
-    if name == "find_similar_figure":
-        # c623e648 — fuzzy-match a description OR a path against a document's
-        # already-indexed figures (read-only counterpart of index_figure).
-        validate_input_size(args.get("doc"), "figure doc", 2_000)
-        validate_input_size(args.get("description_or_path"), "description_or_path", 10_000)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        query = args.get("description_or_path")
-        if not doc_source:
-            return {"error": "doc is required"}
-        if not query:
-            return {"error": "description_or_path is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"project_id": args["project_id"], "document_id": None, "matches": []}
-        try:
-            doc_row = await store.get_document(args["project_id"], doc_source)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not resolve doc: {exc}"}
-        if doc_row is None:
-            return {"project_id": args["project_id"], "document_id": None, "matches": []}
-        _limit = args.get("limit")
-        try:
-            _limit = int(_limit) if _limit is not None else 5
-        except (TypeError, ValueError):
-            _limit = 5
-        # d2a3537a — cross-store resolve-through: when the caller names an
-        # outputs_dir, each matched figure that carries a file_path is resolved
-        # THROUGH to its outputs_index row (linked_output). Building the DuckDB
-        # index is CPU-bound, so do it once off the event loop and hand the store
-        # a resolver closure over the built index; skipped entirely when no
-        # outputs_dir is given (the tool stays a pure fuzzy match by default).
-        outputs_dir = str(args.get("outputs_dir") or "").strip()
-        _resolver = None
-        _index = None
-        # Workspace decision 0dedff91 — the outputs resolve-through stats/walks
-        # `outputs_dir` on THIS process's own filesystem (os.path.isdir + a
-        # DuckDB rebuild over the tree). On hosted Meridian that path is on the
-        # caller's machine, which the server can never reach, so skip the
-        # resolve-through entirely (the figure match itself is DB-only and
-        # still works). Never touch a caller's local dir server-side hosted.
-        if _hosted_mode():
-            outputs_dir = ""
-        if outputs_dir and os.path.isdir(outputs_dir):
-            from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
-            _index = _outputs_indexer.OutputsFtsIndex(outputs_dir)
-            try:
-                await asyncio.to_thread(_index.rebuild)
-                _resolver = _index.resolve_output
-            except Exception:  # noqa: BLE001 — resolve-through is advisory glue
-                _resolver = None
-        try:
-            matches = await store.find_similar_figures(
-                doc_row["id"], query, limit=_limit, output_resolver=_resolver,
-            )
-        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
-            return {"error": f"could not find similar figures: {exc}"}
-        finally:
-            if _index is not None:
-                _index.close()
-        return {
-            "project_id": args["project_id"],
-            "document_id": doc_row["id"],
-            "matches": matches,
-        }
-    if name == "link_figure_caption":
-        # 0ff8b982 — durably link an already-indexed doc_figures row to its
-        # caption paragraph by stable doc_elements id (not proximity). Confirmation
-        # primitive for the advisory suggestion from index_figure, and the
-        # backfill mechanism for figures indexed before caption linkage was added.
-        validate_input_size(args.get("doc"), "figure doc", 2_000)
-        validate_input_size(args.get("figure_id"), "figure_id", 200)
-        validate_input_size(args.get("caption_element_id"), "caption_element_id", 200)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        figure_id = (args.get("figure_id") or "").strip()
-        caption_element_id = (args.get("caption_element_id") or "").strip()
-        if not doc_source:
-            return {"error": "doc is required"}
-        if not figure_id:
-            return {"error": "figure_id is required"}
-        if not caption_element_id:
-            return {"error": "caption_element_id is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"error": "document-structure store unavailable"}
-        try:
-            doc_row = await store.get_document(args["project_id"], doc_source)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not resolve doc: {exc}"}
-        if doc_row is None:
-            return {
-                "error": (
-                    f"no stored document for doc={doc_source!r} — ingest_document "
-                    "it first (that MCP tool populates the doc-structure store; "
-                    "there is no separate reindex_document tool)"
-                ),
-            }
-        try:
-            updated = await store.set_figure_caption_link(figure_id, caption_element_id)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not set caption link: {exc}"}
-        if updated is None:
-            return {
-                "error": (
-                    f"no doc_figures row found for figure_id={figure_id!r} "
-                    "— use find_similar_figure to locate the correct figure_id"
-                ),
-            }
-        return {
-            "project_id": args["project_id"],
-            "document_id": doc_row["id"],
-            "figure": updated,
-        }
-    if name == "index_table":
-        # 2622182d — index ONE table into the SEMANTIC table index (dedup +
-        # similarity on a normalized caption), the direct parallel of
-        # index_figure. Complementary to the structural kind='table'
-        # doc_elements placement, not a duplicate of it.
-        validate_input_size(args.get("doc"), "table doc", 2_000)
-        validate_input_size(args.get("caption"), "caption", 10_000)
-        validate_input_size(args.get("semantic_label"), "semantic_label", 500)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        caption = args.get("caption")
-        table_index_raw = args.get("table_index")
-        table_index: int | None = None
-        if table_index_raw is not None:
-            try:
-                table_index = int(table_index_raw)
-            except (TypeError, ValueError):
-                return {"error": f"table_index must be an integer, got {table_index_raw!r}"}
-        if not doc_source:
-            return {"error": "doc is required"}
-        if table_index is None and not caption:
-            return {"error": "at least one of table_index or caption is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"error": "document-structure store unavailable"}
-        try:
-            doc_row = await store.get_document(args["project_id"], doc_source)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not resolve doc: {exc}"}
-        if doc_row is None:
-            return {
-                "error": (
-                    f"no stored document for doc={doc_source!r} — ingest_document "
-                    "it first (that MCP tool populates the doc-structure store; "
-                    "there is no separate reindex_document tool)"
-                ),
-            }
-        try:
-            result = await store.add_table(
-                doc_row["id"], table_index,
-                caption=caption,
-                semantic_label=args.get("semantic_label"),
-                paired_figure_id=args.get("paired_figure_id"),
-            )
-        except Exception as exc:  # noqa: BLE001 — indexing is best-effort
-            return {"error": f"could not index table: {exc}"}
-        return {
-            "project_id": args["project_id"],
-            "document_id": doc_row["id"],
-            **result,
-        }
-    if name == "find_similar_table":
-        # 2622182d — fuzzy-match a description against a document's
-        # already-indexed tables (read-only counterpart of index_table).
-        validate_input_size(args.get("doc"), "table doc", 2_000)
-        validate_input_size(args.get("description"), "description", 10_000)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        doc_source = args.get("doc")
-        query = args.get("description")
-        if not doc_source:
-            return {"error": "doc is required"}
-        if not query:
-            return {"error": "description is required"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"project_id": args["project_id"], "document_id": None, "matches": []}
-        try:
-            doc_row = await store.get_document(args["project_id"], doc_source)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not resolve doc: {exc}"}
-        if doc_row is None:
-            return {"project_id": args["project_id"], "document_id": None, "matches": []}
-        _limit = args.get("limit")
-        try:
-            _limit = int(_limit) if _limit is not None else 5
-        except (TypeError, ValueError):
-            _limit = 5
-        try:
-            matches = await store.find_similar_tables(
-                doc_row["id"], query, limit=_limit,
-            )
-        except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
-            return {"error": f"could not find similar tables: {exc}"}
-        return {
-            "project_id": args["project_id"],
-            "document_id": doc_row["id"],
-            "matches": matches,
-        }
-    if name == "ingest_document_structure":
-        # db42acce — receive pre-parsed structural data (headings/figures/tables)
-        # forwarded from the tunnel-local side (where the real .docx lives) and
-        # persist it into the doc-structure store so find_similar_figure /
-        # index_figure / index_table / index_equation all see the right document_id.
-        #
-        # The tunnel-local function ``ingest_local_document_structure`` (in the
-        # meridian-docs extension) calls document_content_tree on the REAL file
-        # (which it CAN read locally), serializes the ``blocks`` list from the
-        # tree as JSON, and forwards it here.  The hosted server receives the raw
-        # blocks, converts them to structured elements via
-        # ``elements_from_docx_content_tree`` (which lives server-side in
-        # meridian.doc_store), and stores them via put_document — keyed on the
-        # SAME source string that ingest_document(content=...) already used, so
-        # get_document() resolves the same document_id for both the flat note and
-        # the structural rows.
-        validate_input_size(args.get("source"), "document source", 2_000)
-        validate_input_size(args.get("title"), "document title", 500)
-        if not args.get("project_id"):
-            return {"error": "project_id is required"}
-        _struct_source = (args.get("source") or "").strip()
-        if not _struct_source:
-            return {
-                "error": (
-                    "source is required — must match the source used for "
-                    "ingest_document (usually the local file path)"
-                )
-            }
-        _blocks_raw = args.get("blocks")
-        if not _blocks_raw:
-            return {
-                "error": (
-                    "blocks is required — JSON-encoded list of body blocks from "
-                    "document_content_tree (the 'blocks' key of its return value)"
-                )
-            }
-        try:
-            if isinstance(_blocks_raw, str):
-                _blocks: list[Any] = json.loads(_blocks_raw)
-            elif isinstance(_blocks_raw, list):
-                _blocks = _blocks_raw
-            else:
-                return {"error": "blocks must be a JSON array"}
-        except (json.JSONDecodeError, TypeError) as exc:
-            return {"error": f"blocks is not valid JSON: {exc}"}
-        if not isinstance(_blocks, list):
-            return {"error": "blocks must be a JSON array"}
-        _struct_doc_type = (args.get("doc_type") or "docx").strip() or "docx"
-        # Convert raw blocks to structured elements using the server-side mapper.
-        try:
-            from ..doc_store import elements_from_docx_content_tree  # noqa: PLC0415
-            _struct_elements: list[Any] = elements_from_docx_content_tree(
-                {"blocks": _blocks}
-            )
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not convert blocks to elements: {exc}"}
-        store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-        if store is None:
-            return {"error": "document-structure store unavailable"}
-        try:
-            doc = await store.put_document(
-                args["project_id"],
-                _struct_doc_type,
-                _struct_elements,
-                source=_struct_source,
-                title=args.get("title"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not persist document structure: {exc}"}
-        return {
-            "project_id": args["project_id"],
-            "document_id": doc["id"],
-            "source": _struct_source,
-            "doc_type": _struct_doc_type,
-            "element_count": doc.get("element_count", len(_struct_elements)),
-        }
-    if name == "add_insight":
-        # 0b711a9d — durable strategic insight (dedicated table, not a note).
-        validate_input_size(args.get("title"), "insight title", 500)
-        validate_input_size(args.get("body"), "insight body", 1_000_000)
-        return await db_module.create_insight(
-            db, args["project_id"], args["title"], args.get("body") or "",
-            horizon=args.get("horizon", "quarter"),
-            tags=args.get("tags"),
-        )
-    if name == "get_insights":
-        return await db_module.get_insights(
-            db, args["project_id"], horizon=args.get("horizon")
-        )
-    if name == "save_finding":
-        # e1f43ee7 — phase-agnostic capture primitive (decoupled from search).
-        validate_input_size(args.get("summary"), "finding summary", 1_000_000)
-        validate_input_size(args.get("source_url"), "source_url", 2_000)
-        if not (args.get("summary") or "").strip():
-            return {"error": "save_finding requires a non-empty summary"}
-        try:
-            return await db_module.save_finding(
-                db, args["project_id"], args.get("summary") or "",
-                source_url=args.get("source_url"),
-                source_type=args.get("source_type", "web"),
-                decision_id=args.get("decision_id"),
-            )
-        except ValueError as exc:
-            return {"error": str(exc)}
-    if name == "capture_research_finding":
-        # b1d36e93 — web/paper-shaped wrapper over save_finding; arXiv URLs are
-        # auto-tagged source_type=arxiv.
-        validate_input_size(args.get("summary"), "finding summary", 1_000_000)
-        validate_input_size(args.get("url"), "url", 2_000)
-        _url = (args.get("url") or "").strip()
-        if not _url:
-            return {"error": "capture_research_finding requires a url"}
-        if not (args.get("summary") or "").strip():
-            return {"error": "capture_research_finding requires a non-empty summary"}
-        _st = "arxiv" if "arxiv.org" in _url.lower() else "web"
-        try:
-            return await db_module.save_finding(
-                db, args["project_id"], args.get("summary") or "",
-                source_url=_url, source_type=_st,
-                decision_id=args.get("related_decision_id"),
-            )
-        except ValueError as exc:
-            return {"error": str(exc)}
-    if name == "get_notes":
-        # 5a5bba43 — pull model: default to the lightweight list (no bodies) so
-        # bulk note injection can't overflow context. Agents fetch one body via
-        # read_note(slug). Pass bodies=true to opt back into full rows.
-        # 9fa119dd — cursor pagination, opt-in (mirrors get_sprint_items, whose
-        # MCP tool stays a bare list while the HTTP route paginates): pass
-        # ``cursor`` and/or ``limit`` to get the {notes, has_more, next_cursor}
-        # envelope, then re-call with cursor=next_cursor for the next page.
-        # Without either arg the legacy bare list is returned for back-compat.
-        # 98890df1 — relevance sort (reference_count/recency/decision-link) takes
-        # precedence over cursor/limit paging.
-        if args.get("sort") == "relevance":
-            return await db_module.get_project_notes_ranked(
-                db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
-                bodies=bool(args.get("bodies", False)),
-                limit=(int(args["limit"]) if "limit" in args else None),
-            )
-        if "cursor" in args or "limit" in args:
-            return await db_module.get_project_notes_page(
-                db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
-                bodies=bool(args.get("bodies", False)),
-                limit=int(args.get("limit", 100)),
-                cursor=int(args.get("cursor", 0)),
-            )
-        return await db_module.get_project_notes(
-            db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
-            bodies=bool(args.get("bodies", False)),
-        )
-    if name == "read_note":
-        # 5a5bba43 — the pull half of the list→read model: fetch one note's full
-        # body by its per-project slug (returned in the get_notes list).
-        note = await db_module.get_project_note_by_slug(
-            db, args["project_id"], args["slug"],
-        )
-        if note is None:
-            return {"error": f"note '{args['slug']}' not found in project {args['project_id']}"}
-        return note
-    if name == "delete_note":
-        ok = await db_module.delete_project_note(db, args["note_id"])
-        return {"deleted": ok}
-    if name == "add_workspace_note":
-        validate_input_size(args.get("title"), "note title", 500)
-        validate_input_size(args.get("body"), "note body", 10_000_000)
-        result = await db_module.add_workspace_note(
-            db, args["title"], args["body"], args.get("tags"),
-            tenant_id=_mcp_tenant_id,
-        )
-        # 22c274bd — soft scope nudge; never blocks the write.
-        warning = _workspace_scope_warning(args.get("title"), args.get("body"))
-        if warning and isinstance(result, dict):
-            result["scope_warning"] = warning
-        return result
-    if name == "get_workspace_notes":
-        return await db_module.get_workspace_notes(
-            db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
-        )
-    if name == "pin_workspace_decision":
-        validate_input_size(args.get("title"), "decision title", 500)
-        validate_input_size(args.get("body"), "decision body", 100_000)
-        result = await db_module.pin_workspace_decision(
-            db, args["title"], args["body"],
-            category=args.get("category", "TECHNICAL"),
-            tenant_id=_mcp_tenant_id,
-        )
-        # 22c274bd — soft scope nudge; never blocks the write.
-        warning = _workspace_scope_warning(args.get("title"), args.get("body"))
-        if warning and isinstance(result, dict):
-            result["scope_warning"] = warning
-        return result
-    if name == "get_workspace_decisions":
-        return await db_module.get_workspace_decisions(
-            db, include_superseded=args.get("include_superseded", False),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_workspace_settings":
-        return await db_module.get_workspace_settings(db, tenant_id=_mcp_tenant_id)
-    if name == "update_workspace_settings":
-        return await db_module.update_workspace_settings(
-            db,
-            hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
-            sprint_name_default=args.get("sprint_name_default"),
-            handoff_template=args.get("handoff_template"),
-            # 0bf67524 — cascade defaults for new projects.
-            execution_mode_default=args.get("execution_mode_default"),
-            code_intel_enabled_default=args.get("code_intel_enabled_default"),
-            # 76cf8bda — /loop auto-continue workspace default.
-            loop_enabled_default=args.get("loop_enabled_default"),
-            # 36fea6ca — inline resolved sprint-item pointers in the handoff.
-            handoff_inline_pointers=args.get("handoff_inline_pointers"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "save_blog_post":
-        validate_input_size(args.get("title"), "blog title", 500)
-        validate_input_size(args.get("body"), "blog body", 1_000_000)
-        return await db_module.save_blog_post(
-            db, args["title"], args.get("body", ""),
-            status=args.get("status", "draft"),
-            slug=args.get("slug"),
-            post_id=args.get("id"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_blog_posts":
-        return await db_module.get_blog_posts(
-            db, tenant_id=_mcp_tenant_id, status=args.get("status"),
-        )
-    if name == "add_workspace_sprint_item":
-        validate_input_size(args.get("title"), "sprint item title", 500)
-        return await db_module.add_workspace_sprint_item(
-            db, args["title"],
-            item_group=args.get("group"),
-            human_id=args.get("human_id"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_workspace_sprint_items":
-        return await db_module.get_workspace_sprint_items(
-            db, status=args.get("status"), item_group=args.get("group"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "update_workspace_sprint_item":
-        validate_input_size(args.get("title"), "sprint item title", 500)
-        item = await db_module.update_workspace_sprint_item(
-            db, args["item_id"],
-            title=args.get("title"),
-            status=args.get("status"),
-            item_group=args.get("group"),
-            human_id=args.get("human_id"),
-            tenant_id=_mcp_tenant_id,
-        )
-        return item or {"error": "workspace sprint item not found"}
-    if name == "complete_workspace_sprint_item":
-        item = await db_module.complete_workspace_sprint_item(
-            db, args["item_id"], tenant_id=_mcp_tenant_id,
-        )
-        return item or {"error": "workspace sprint item not found"}
-    # 5c4dcc0f — workspace proposals lifecycle
-    if name == "add_workspace_proposal":
-        validate_input_size(args.get("title"), "proposal title", 500)
-        validate_input_size(args.get("body"), "proposal body", 100_000)
-        return await db_module.add_workspace_proposal(
-            db, args["title"], args["body"],
-            tags=args.get("tags"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_workspace_proposals":
-        return await db_module.get_workspace_proposals(
-            db, status=args.get("status"), tag=args.get("tag"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "advance_proposal_status":
-        try:
-            result = await db_module.advance_workspace_proposal_status(
-                db, args["proposal_id"], args["status"],
-                tenant_id=_mcp_tenant_id,
-            )
-        except ValueError as exc:
-            return {"error": str(exc)}
-        return result or {"error": "proposal not found"}
-    if name == "promote_proposal":
-        _promo_project_id = args.get("project_id") or ""
-        if not _promo_project_id:
-            return {"error": "project_id (or project_name) is required for promote_proposal"}
-        try:
-            result = await db_module.promote_workspace_proposal(
-                db, args["proposal_id"], _promo_project_id,
-                sprint_item_title=args.get("sprint_item_title"),
-                sprint_item_version=args.get("sprint_item_version"),
-                tenant_id=_mcp_tenant_id,
-            )
-        except ValueError as exc:
-            return {"error": str(exc)}
-        return result
+    # All 45 tools map directly to handler functions with the standard five
+    # parameters — no extra context needed beyond (args, db, data_dir, tenant,
+    # _mcp_tenant_id).
+    _standard_dispatch: dict[str, Any] = {
+        "pin_decision": handle_pin_decision,
+        "update_decision": handle_update_decision,
+        "validate_assumption": handle_validate_assumption,
+        "get_pinned_decisions": handle_get_pinned_decisions,
+        "archive_decision": handle_archive_decision,
+        "add_note": handle_add_note,
+        "get_notes": handle_get_notes,
+        "read_note": handle_read_note,
+        "delete_note": handle_delete_note,
+        "ingest_document": handle_ingest_document,
+        "get_document_structure": handle_get_document_structure,
+        "get_latex_structure": handle_get_latex_structure,
+        "ingest_document_structure": handle_ingest_document_structure,
+        "get_citation_edges": handle_get_citation_edges,
+        "resolve_citations": handle_resolve_citations,
+        "index_equation": handle_index_equation,
+        "find_similar_equation": handle_find_similar_equation,
+        "insert_equation": handle_insert_equation,
+        "update_paragraph": handle_update_paragraph,
+        "find_symbol_usages": handle_find_symbol_usages,
+        "index_figure": handle_index_figure,
+        "find_similar_figure": handle_find_similar_figure,
+        "link_figure_caption": handle_link_figure_caption,
+        "index_table": handle_index_table,
+        "find_similar_table": handle_find_similar_table,
+        "add_insight": handle_add_insight,
+        "get_insights": handle_get_insights,
+        "save_finding": handle_save_finding,
+        "capture_research_finding": handle_capture_research_finding,
+        "add_workspace_note": handle_add_workspace_note,
+        "get_workspace_notes": handle_get_workspace_notes,
+        "pin_workspace_decision": handle_pin_workspace_decision,
+        "get_workspace_decisions": handle_get_workspace_decisions,
+        "get_workspace_settings": handle_get_workspace_settings,
+        "update_workspace_settings": handle_update_workspace_settings,
+        "save_blog_post": handle_save_blog_post,
+        "get_blog_posts": handle_get_blog_posts,
+        "add_workspace_sprint_item": handle_add_workspace_sprint_item,
+        "get_workspace_sprint_items": handle_get_workspace_sprint_items,
+        "update_workspace_sprint_item": handle_update_workspace_sprint_item,
+        "complete_workspace_sprint_item": handle_complete_workspace_sprint_item,
+        "add_workspace_proposal": handle_add_workspace_proposal,
+        "get_workspace_proposals": handle_get_workspace_proposals,
+        "advance_proposal_status": handle_advance_proposal_status,
+        "promote_proposal": handle_promote_proposal,
+    }
+
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+
     return _MISS
 
 
@@ -3643,550 +2674,62 @@ async def _handle_session_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log, get_agent_instructions, set_agent_instructions, set_executor_config, idle_until_session_done, search_all, get_session_brief."""
+    """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log,
+    get_session_activity, get_agent_instructions, set_agent_instructions,
+    set_executor_config, idle_until_session_done, search_all, search_synthesis,
+    paper_search, get_session_brief.
+
+    81abd31f — the original if/elif chain has been replaced with a per-tool
+    dispatch table (dict mapping tool name -> handler function).  Each tool's
+    logic lives in its own named function in
+    ``meridian.mcp.handlers.session_tools``.  This is a PURELY MECHANICAL
+    extraction: zero behaviour change, same tool names, same arguments, same
+    return values.
+    """
+    from .handlers.session_tools import (  # noqa: PLC0415
+        handle_checkpoint,
+        handle_get_context_block,
+        handle_list_sessions,
+        handle_get_session_log,
+        handle_get_session_activity,
+        handle_get_agent_instructions,
+        handle_set_agent_instructions,
+        handle_set_executor_config,
+        handle_idle_until_session_done,
+        handle_search_all,
+        handle_search_synthesis,
+        handle_paper_search,
+        handle_get_session_brief,
+    )
+
+    # Tools that need no extra context beyond the standard five parameters.
+    _standard_dispatch: dict[str, Any] = {
+        "get_context_block": handle_get_context_block,
+        "list_sessions": handle_list_sessions,
+        "get_session_log": handle_get_session_log,
+        "get_session_activity": handle_get_session_activity,
+        "get_agent_instructions": handle_get_agent_instructions,
+        "set_agent_instructions": handle_set_agent_instructions,
+        "set_executor_config": handle_set_executor_config,
+        "idle_until_session_done": handle_idle_until_session_done,
+        "search_all": handle_search_all,
+        "search_synthesis": handle_search_synthesis,
+        "paper_search": handle_paper_search,
+        "get_session_brief": handle_get_session_brief,
+    }
+
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+
+    # checkpoint needs handler-level _fetch_recent_commits and
+    # _resolve_caller_identity passed explicitly to keep the import graph acyclic.
     if name == "checkpoint":
-        session_id = args["session_id"]
-        project_id = args["project_id"]
-        await db_module.auto_capture_session(db, project_id, session_id)
-        await _server._finalize_session_md(db, project_id, session_id)
-        from .. import handoff as handoff_module_local
-        # Fetch recent commits for reconcile annotations (non-fatal)
-        _ckpt_project = await db_module.get_project(db, project_id)
-        _commits = await _fetch_recent_commits(_ckpt_project or {}, tenant)
-        try:
-            _, content, _ = await asyncio.wait_for(
-                handoff_module_local.generate_handoff(
-                    db, project_id, data_dir, mode="delta", session_id=session_id,
-                    commit_messages=[c["message"] for c in _commits],
-                    identity=_resolve_caller_identity(tenant),
-                ),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            content = "delta handoff timed out"
-        pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
-        # Log drift warnings for high-confidence reconcile matches (non-fatal)
-        if _commits and pending_items:
-            try:
-                _matches = handoff_module_local.reconcile_sprint_items(
-                    pending_items, _commits
-                )
-                for _m in _matches:
-                    if _m.get("confidence") == "high":
-                        _first_sha = (_m["matching_commits"][0].get("sha") or "")[:8]
-                        await db_module.log_task(
-                            db, session_id, project_id,
-                            f"Sprint board drift detected: {_m['item_id'][:8]} "
-                            f"may already be done (matches commit {_first_sha})",
-                            status="pending",
-                        )
-            except Exception:  # noqa: BLE001
-                pass
-        ids_str = ", ".join(it["id"][:8] for it in pending_items[:8])
-        next_goal = (
-            f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
-            f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
-        ) if pending_items else "/goal Continue work — all sprint items done."
-        # 04f03ee4 — include start_session one-liner so next session can resume immediately
-        # 11a91d31 — default to project_name (idiomatic per 8a449ec0); project_id as a comment.
-        try:
-            _ck_proj = await db_module.get_project(db, project_id)
-            _ck_pname = (_ck_proj or {}).get("name") or project_id
-        except Exception:  # noqa: BLE001
-            _ck_pname = project_id
-        start_fresh = (
-            f'start_session(project_name="{_ck_pname}", session_name="describe-what-youre-doing")'
-            f'  # project_id={project_id}'
+        return await handle_checkpoint(
+            args, db, data_dir, tenant, _mcp_tenant_id,
+            fetch_recent_commits=_fetch_recent_commits,
+            resolve_caller_identity=_resolve_caller_identity,
         )
-        # fa595ad8 — store snapshot for Recent Sessions dashboard panel (non-fatal)
-        # v3.1 — snapshot now lives on sessions.checkpoint_data, not a checkpoint:* note.
-        try:
-            from datetime import datetime as _ckpt_dt, timezone as _ckpt_tz
-            async with db.execute(
-                "SELECT name FROM sessions WHERE id = ?", (session_id,)
-            ) as _sc:
-                _sr = await _sc.fetchone()
-            _session_name = (_sr["name"] if _sr else None) or session_id[:8]
-            async with db.execute(
-                "SELECT COUNT(*) AS n FROM task_log "
-                "WHERE session_id = ? AND status = 'done'",
-                (session_id,),
-            ) as _tc:
-                _tr = await _tc.fetchone()
-            _items_done = int(_tr["n"]) if _tr else 0
-            _summary_line = (content or "").split("\n")[0][:140]
-            await db_module.set_session_checkpoint(
-                db, session_id,
-                {
-                    "session_id": session_id,
-                    "session_name": _session_name,
-                    "items_done": _items_done,
-                    "summary_line": _summary_line,
-                    "next_goal": next_goal,
-                    "start_fresh": start_fresh,
-                    "checkpointed_at": _ckpt_dt.now(_ckpt_tz.utc).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                },
-            )
-        except Exception:
-            pass  # non-fatal — checkpoint still returns normally
-        # Write plain-text session_summary for RECENT RUNS panel display
-        try:
-            _shipped_titles: list[str] = []
-            async with db.execute(
-                "SELECT si.title FROM sprint_items si "
-                "JOIN task_log tl ON tl.id = si.task_id "
-                "WHERE tl.session_id = ? AND si.status = 'done'",
-                (session_id,),
-            ) as _si_cur:
-                for _si_row in await _si_cur.fetchall():
-                    _t = _si_row["title"] if hasattr(_si_row, "__getitem__") else _si_row[0]
-                    if _t not in _shipped_titles:
-                        _shipped_titles.append(_t)
-            async with db.execute(
-                "SELECT DISTINCT si.title FROM sprint_items si "
-                "JOIN task_log tl ON tl.sprint_item_id = si.id "
-                "WHERE tl.session_id = ? AND tl.status = 'done' AND si.status = 'done'",
-                (session_id,),
-            ) as _si_cur2:
-                for _si_row2 in await _si_cur2.fetchall():
-                    _t2 = _si_row2["title"] if hasattr(_si_row2, "__getitem__") else _si_row2[0]
-                    if _t2 not in _shipped_titles:
-                        _shipped_titles.append(_t2)
-            _shipped_str = ", ".join(_shipped_titles) if _shipped_titles else "none"
-            _plain_summary = (
-                f"Shipped: {_shipped_str}. "
-                f"Tasks done: {_items_done}. "
-                f"Deploy: no."
-            )
-            await db.execute(
-                "UPDATE sessions SET session_summary = ? WHERE id = ?",
-                (_plain_summary, session_id),
-            )
-        except Exception:
-            pass  # non-fatal
-        # 1c4fdd6c — sprint-drift guard: sweep in_progress items and surface them
-        # so the executor confirms done/not-done before the handoff is final
-        # (the #1 cause of board drift is forgetting complete_sprint_item).
-        _in_progress = await db_module.get_sprint_items(
-            db, project_id, status="in_progress"
-        )
-        _ckpt_resp = {
-            "summary": content,
-            "pending_count": len(pending_items),
-            "pending_ids": ids_str,
-            "next_goal": next_goal,
-            "start_fresh": start_fresh,
-        }
-        if _in_progress:
-            _ckpt_resp["in_progress_items"] = [
-                {"id": it["id"], "title": (it.get("title") or "")[:80]}
-                for it in _in_progress
-            ]
-            _n = len(_in_progress)
-            _ckpt_resp["action_required"] = (
-                f"You have {_n} in_progress sprint item{'s' if _n != 1 else ''}. "
-                "Before this handoff is final, confirm each: call "
-                "complete_sprint_item(item_id) for any that shipped, or leave it "
-                "in_progress / fail_sprint_item(item_id, reason) if not done. "
-                "These are NOT auto-reconciled from git — you must mark them."
-            )
-        return _ckpt_resp
-    if name == "get_context_block":
-        # v2.3 — assemble the same shape as /projects/{id}/context-block but
-        # return both the rendered text AND the source dict so MCP clients
-        # can choose to render their own variant.
-        # v2.5 — wrap in semantic XML for better Claude Code parsing.
-        project_id = args["project_id"]
-        mode = args.get("mode", "full")
-        project = await db_module.get_project(db, project_id)
-        if project is None:
-            raise ValueError("project not found")
-        goal = await db_module.get_goal(db, project_id)
-        sprint_items = await db_module.get_sprint_items(
-            db, project_id, status="pending"
-        )
-        all_tasks = await db_module.get_tasks(db, project_id, limit=20)
-        pending_tasks = [
-            t for t in all_tasks if t.get("status") in ("pending", "in_progress", "done")
-        ][:10]
-        sessions = await db_module.get_sessions(db, project_id, active_only=True)
-        decisions_raw = (project.get("decisions") or "").strip()
-        recent_decisions = [
-            l.strip() for l in decisions_raw.splitlines() if l.strip()
-        ][-5:]
-        text = _server._render_context_block(
-            project, goal, sprint_items, pending_tasks, sessions, recent_decisions,
-            mode=mode,
-        )
-        # v3.1 — workspace decisions + notes apply across all projects; surface
-        # them at the very top so a fresh session sees org-wide truth first.
-        ws_decisions = await db_module.get_workspace_decisions(db, tenant_id=_mcp_tenant_id)
-        ws_notes = await db_module.get_workspace_notes(db, tenant_id=_mcp_tenant_id)
-        ws_block = _server._render_workspace_block(ws_decisions, ws_notes)
-        if ws_block:
-            text = f"{ws_block}\n\n{text}"
-        xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
-        return {"mode": mode, "text": xml_text, "project_id": project_id}
-    if name == "list_sessions":
-        active_only = args.get("status", "active") != "all"
-        return await db_module.get_sessions(db, args["project_id"], active_only=active_only)
-    if name == "get_session_log":
-        _log_sid = args.get("session_id", "")
-        run = await db_module.get_executor_run_by_session(db, _log_sid)
-        if run is None:
-            return {"error": "no run found for session"}
-        # 8c147109 — include the ring-buffer activity feed so a remote planner
-        # sees real signs of life even before the executor calls log_task().
-        _activity: list[dict] = []
-        try:
-            _activity = await db_module.get_session_activity(
-                db, _log_sid, limit=args.get("activity_limit", 20)
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return {
-            "run_id": run["id"],
-            "session_id": run["session_id"],
-            "started_at": run["started_at"],
-            "ended_at": run.get("ended_at"),
-            "status": run["status"],
-            "task_count": run["task_count"],
-            "transcript": run["transcript"],
-            "recent_activity": _activity,
-            "activity_note": (
-                "recent_activity is a ring-buffer of the last tool calls made by "
-                "this executor session (newest first, max 50 entries). It is "
-                "populated automatically by the MCP dispatcher — no explicit "
-                "log_task() call is needed."
-            ),
-        }
-    if name == "get_session_activity":
-        # 8c147109 — standalone tool so planners can fetch just the heartbeat
-        # feed without the full transcript when polling for liveness.
-        _ga_sid = args.get("session_id", "")
-        _ga_limit = min(int(args.get("limit", 20)), 50)
-        try:
-            _ga_entries = await db_module.get_session_activity(db, _ga_sid, limit=_ga_limit)
-        except Exception:  # noqa: BLE001
-            _ga_entries = []
-        return {
-            "session_id": _ga_sid,
-            "activity": _ga_entries,
-            "count": len(_ga_entries),
-        }
-    if name == "get_agent_instructions":
-        instructions = await db_module.get_agent_instructions(db, args["project_id"])
-        return {"project_id": args["project_id"], "agent_instructions": instructions}
-    if name == "set_agent_instructions":
-        validate_input_size(args.get("instructions"), "agent_instructions", 100_000)
-        instructions = (args.get("instructions") or "").strip() or None
-        return await db_module.set_agent_instructions(db, args["project_id"], instructions)
-    if name == "set_executor_config":
-        from ..executor_config import merge_repo_paths  # local — avoid import cycle
-        # Merge onto the existing config so we never wipe other keys (repo_paths,
-        # hostnames, filesystem_roots, …). repo_paths is merged entry-by-entry so
-        # a manual {cwd, hostname} coexists with hook-registered ones.
-        existing = await db_module.get_executor_config(db, args["project_id"])
-        cfg = dict(existing) if isinstance(existing, dict) else {}
-        # 3adbc954 — filesystem_roots, hostnames, context_threshold and isolation
-        # were missing from this copy list, so passing them was silently dropped
-        # (the call returned filesystem_roots: []). All scalar/list keys overwrite;
-        # repo_paths alone is merged entry-by-entry below.
-        for k in ("repo_path", "env_file", "test_cmd", "test_min",
-                  "deploy_cmd", "shell_type", "branch",
-                  "filesystem_roots", "hostnames", "context_threshold",
-                  "isolation", "max_turns",
-                  # b970fe07 — dashboard-configurable Serena default repo + code-intel
-                  # index dirs (mirror filesystem_roots: scalar/list overwrite).
-                  "serena_repo_path", "codebase_code_dirs"):
-            if k in args:
-                cfg[k] = args[k]
-        if "repo_paths" in args:
-            cfg["repo_paths"] = merge_repo_paths(cfg.get("repo_paths"), args["repo_paths"])
-        return await db_module.set_executor_config(db, args["project_id"], cfg)
-    if name == "idle_until_session_done":
-        _idle_kwargs: dict[str, Any] = {}
-        if args.get("timeout_seconds") is not None:
-            _idle_kwargs["timeout_seconds"] = float(args["timeout_seconds"])
-        return await _server._idle_until_session_done(
-            db, args["watching_session_id"], **_idle_kwargs
-        )
-    if name == "search_all":
-        return await db_module.search_all(
-            db, args["project_id"], args["query"],
-            limit=args.get("limit", 10),
-        )
-    if name == "search_synthesis":
-        # ebc242ad — a natural-language query gets a short, CITED answer on top of
-        # the same tsvector/LIKE retrieval as search_all, not just a list of hits.
-        # Reuses the Haiku-tier pattern (deterministic fallback to raw results when
-        # ANTHROPIC_API_KEY is unset or the call fails).
-        if not args.get("query"):
-            return {"error": "query is required"}
-        results = await db_module.search_all(
-            db, args["project_id"], args["query"], limit=args.get("limit", 10),
-        )
-        from ..handoff import synthesize_search_answer  # noqa: PLC0415
-        synth = await synthesize_search_answer(args["query"], results)
-        return {"query": args["query"], **synth, "results": results}
-    if name == "paper_search":
-        # 811881c6 — real callable arXiv search so the research-routing protocol's
-        # "use the paper-search MCP first" finally points at a tool that exists (it was
-        # instruction-only before). Keyless external lookup; degrades to {error}, never
-        # raises. No project scope needed — it's an external search.
-        # f65f6111 — 'source' routes between two keyless sources: arxiv (default) and
-        # openalex. Both return the same {query, count, results} shape.
-        from ..paper_search import arxiv_search, openalex_search  # noqa: PLC0415
-        source = str(args.get("source", "arxiv") or "arxiv").strip().lower()
-        search = openalex_search if source == "openalex" else arxiv_search
-        return await search(
-            args.get("query", ""),
-            limit=args.get("limit", 10),
-            sort_by=args.get("sort_by", "relevance"),
-        )
-    if name == "get_session_brief":
-        # v2.5 — single-call orientation, <500 tokens, XML output.
-        project_id = args["project_id"]
-        role = args.get("role", "worker")
-        session_id_for_notes = args.get("session_id")
-        goal = await db_module.get_goal(db, project_id)
-        tasks = await db_module.get_tasks(db, project_id, limit=5)
-        # dcf1e428 — use 'recent' to surface pending + answered last 24h for planning sessions
-        hitl_rows = await db_module.list_hitl_requests(db, project_id, status="recent")
-        sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
-        # 0507f4a1 — sprint progress summary for session brief
-        _all_items_for_progress = await db_module.get_sprint_items(db, project_id)
-        _done_count = sum(1 for it in _all_items_for_progress if it.get("status") == "done")
-        _total_count = len(_all_items_for_progress)
-        _pct = round(100 * _done_count / _total_count) if _total_count else 0
-        blocking = [t for t in tasks if t.get("status") == "failed"]
-        sprint_str = (goal.get("sprint") or "") if goal else ""
-        tasks_xml = "\n".join(
-            f'  <task status="{t.get("status","?")}">{(t.get("description") or "")[:80]}</task>'
-            for t in tasks
-        )
-        sprint_items_xml = "\n".join(
-            f'  <item version="{it.get("version","")}">{(it.get("title") or "")[:80]}</item>'
-            for it in sprint_items[:5]
-        )
-        # 277567dc — surface pending HITLs so session sees what needs a human decision.
-        # dcf1e428 — also surface recently answered HITLs so planning sessions can see what was decided.
-        _pending_hitls = [h for h in hitl_rows if h.get("status") == "pending"]
-        _answered_hitls = [h for h in hitl_rows if h.get("status") != "pending"]
-        if _pending_hitls:
-            hitl_xml = (
-                f'<hitl_pending count="{len(_pending_hitls)}">\n'
-                + "\n".join(
-                    f'  <request id="{h.get("id","")}" urgency="{h.get("urgency","normal")}">'
-                    f'{(h.get("question") or "")[:140]}</request>'
-                    for h in _pending_hitls[:5]
-                )
-                + "\n</hitl_pending>"
-            )
-        else:
-            hitl_xml = ""
-        if _answered_hitls:
-            hitl_xml += (
-                f'\n<hitl_recent count="{len(_answered_hitls)}">\n'
-                + "\n".join(
-                    f'  <request status="{h.get("status","?")}">'
-                    f'Q: {(h.get("question") or "")[:80]} '
-                    f'A: {(h.get("answer") or "")[:80]}</request>'
-                    for h in _answered_hitls[:3]
-                )
-                + "\n</hitl_recent>"
-            )
-        blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
-        # v2.6 — include session scratch-pad notes at top of brief
-        notes_xml = ""
-        new_items_xml = ""
-        if session_id_for_notes:
-            try:
-                session_notes = await db_module.get_session_notes(db, session_id_for_notes)
-                if session_notes:
-                    notes_xml = "<session_notes>\n" + "\n".join(
-                        f'  <note title="{n.get("title","")}">{(n.get("body") or "")[:120]}</note>'
-                        for n in session_notes
-                    ) + "\n</session_notes>\n"
-            except Exception:
-                pass
-            # fd86aacc — show items added to the board since this session started
-            try:
-                _all_sess = await db_module.get_sessions(db, project_id, active_only=False)
-                _curr_sess = next(
-                    (s for s in _all_sess if s.get("id") == session_id_for_notes), None
-                )
-                if _curr_sess and _curr_sess.get("created_at"):
-                    _sess_started = str(_curr_sess["created_at"])
-                    _all_items = await db_module.get_sprint_items(db, project_id)
-                    _new_count = sum(
-                        1 for it in _all_items
-                        if (it.get("added_at") or "") >= _sess_started
-                    )
-                    if _new_count > 0:
-                        new_items_xml = (
-                            f'<board_change>{_new_count} item{"s" if _new_count != 1 else ""}'
-                            f' added since this session started</board_change>\n'
-                        )
-            except Exception:
-                pass
-        _progress_xml = (
-            f'<progress done="{_done_count}" total="{_total_count}" pct="{_pct}%"/>\n'
-            if _total_count else ""
-        )
-        # Sprint-4: planner role gets richer context — all decisions + all notes + active sessions.
-        planner_extra_xml = ""
-        if role == "planner":
-            try:
-                _decisions = await db_module.get_pinned_decisions(db, project_id, include_superseded=False)
-                if _decisions:
-                    # 366317e9 — already ordered urgent → normal → low by the DB
-                    # layer; surface the priority so the planner weights them.
-                    planner_extra_xml += "<decisions>\n" + "\n".join(
-                        f'  <decision priority="{d.get("priority","normal")}" category="{d.get("category","")}">{(d.get("title") or "")}: {(d.get("body") or "")[:120]}</decision>'
-                        for d in _decisions[:20]
-                    ) + "\n</decisions>\n"
-            except Exception:
-                pass
-            try:
-                # 5a5bba43 — planner context renders note bodies, so ask for them.
-                _wiki_notes = await db_module.get_project_notes(db, project_id, bodies=True)
-                # High-priority notes first
-                _wiki_notes = sorted(_wiki_notes, key=lambda n: {"high": 0, "normal": 1, "low": 2}.get(n.get("priority", "normal"), 1))
-                if _wiki_notes:
-                    planner_extra_xml += "<project_notes>\n" + "\n".join(
-                        f'  <note priority="{n.get("priority","normal")}" kind="{n.get("note_kind","wiki")}" tags="{n.get("tags","")}">'
-                        f'{(n.get("title") or "")}: {(n.get("body") or "")[:120]}</note>'
-                        for n in _wiki_notes[:30]
-                    ) + "\n</project_notes>\n"
-            except Exception:
-                pass
-            try:
-                _active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
-                if _active_sessions:
-                    planner_extra_xml += "<active_sessions>\n" + "\n".join(
-                        f'  <session id="{s.get("id","")}" name="{s.get("name","")}" human="{s.get("human_id","")}" last_seen="{s.get("last_seen","")[:19]}"/>'
-                        for s in _active_sessions[:10]
-                    ) + "\n</active_sessions>\n"
-            except Exception:
-                pass
-        # 1750dccf — role-specific enrichment so executor and planner briefs differ.
-        role_extra_xml = ""
-        if role == "executor":
-            # Version-scoped pending items + this session's file claims + the
-            # decisions code-anchored to the files it holds.
-            _sess_row = None
-            if session_id_for_notes:
-                _sess_all_x = await db_module.get_sessions(
-                    db, project_id, active_only=False
-                )
-                _sess_row = next(
-                    (s for s in _sess_all_x if s.get("id") == session_id_for_notes),
-                    None,
-                )
-            _ver = (_sess_row or {}).get("sprint_version")
-            if _ver:
-                _scoped = [it for it in sprint_items if it.get("version") == _ver]
-                role_extra_xml += (
-                    f'<version_scope version="{_ver}" pending="{len(_scoped)}">\n'
-                    + "\n".join(
-                        f'  <item>{(it.get("title") or "")[:80]}</item>'
-                        for it in _scoped[:5]
-                    )
-                    + "\n</version_scope>\n"
-                )
-            if session_id_for_notes:
-                try:
-                    _claimed = await db_module.get_session_file_claims(
-                        db, session_id_for_notes
-                    )
-                except Exception:
-                    _claimed = []
-                if _claimed:
-                    role_extra_xml += (
-                        "<my_file_claims>\n"
-                        + "\n".join(f"  <file>{c}</file>" for c in _claimed[:20])
-                        + "\n</my_file_claims>\n"
-                    )
-                    _rel: list[dict[str, Any]] = []
-                    _seen_dec: set[Any] = set()
-                    for _fp in _claimed[:20]:
-                        try:
-                            for _d in await db_module.get_decisions_for_file(
-                                db, project_id, _fp
-                            ):
-                                if _d.get("id") not in _seen_dec:
-                                    _seen_dec.add(_d.get("id"))
-                                    _rel.append(_d)
-                        except Exception:
-                            pass
-                    if _rel:
-                        role_extra_xml += (
-                            "<relevant_decisions>\n"
-                            + "\n".join(
-                                f'  <decision anchor="{d.get("code_anchor","")}">'
-                                f'{(d.get("title") or "")}: '
-                                f'{(d.get("body") or "")[:100]}</decision>'
-                                for d in _rel[:10]
-                            )
-                            + "\n</relevant_decisions>\n"
-                        )
-        elif role == "planner":
-            # Last session summary + decisions sitting on unconfirmed assumptions
-            # (what needs revisiting).
-            try:
-                _ls = await db_module.get_last_session_brief(
-                    db, project_id, exclude_session_id=session_id_for_notes
-                )
-            except Exception:
-                _ls = None
-            if _ls:
-                role_extra_xml += (
-                    f'<last_session name="{_ls.get("name","")}" '
-                    f'status="{_ls.get("status","")}">\n'
-                    + "".join(
-                        f'  <completed>{(ci.get("title") or "")[:80]}</completed>\n'
-                        for ci in (_ls.get("completed_items") or [])[:8]
-                    )
-                    + "</last_session>\n"
-                )
-            try:
-                _pin_r = await db_module.get_pinned_decisions(db, project_id)
-                _revisit = [
-                    d for d in _pin_r
-                    if d.get("assumption")
-                    and d.get("assumption_status") != "confirmed"
-                ]
-                if _revisit:
-                    role_extra_xml += (
-                        "<decisions_needing_revisit>\n"
-                        + "\n".join(
-                            f'  <decision status="{d.get("assumption_status")}">'
-                            f'{(d.get("title") or "")}: assumption='
-                            f'{(d.get("assumption") or "")[:80]}</decision>'
-                            for d in _revisit[:10]
-                        )
-                        + "\n</decisions_needing_revisit>\n"
-                    )
-            except Exception:
-                pass
-        brief = (
-            f'<session_brief project_id="{project_id}" role="{role}">\n'
-            f'{notes_xml}'
-            f'{new_items_xml}'
-            f'{_progress_xml}'
-            f'<sprint>{sprint_str[:200]}</sprint>\n'
-            f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
-            f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
-            f'{blocking_xml}\n'
-            f'{hitl_xml}\n'
-            f'{planner_extra_xml}'
-            f'{role_extra_xml}'
-            f'</session_brief>'
-        )
-        return {"text": brief, "project_id": project_id, "role": role}
+
     return _MISS
 
 
@@ -4237,939 +2780,70 @@ async def _handle_sprint_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: add_sprint_note, get_sprint_notes, add_sprint_item, fan_out_sprint_items, update_sprint_item, set_sprint, get_sprint_progress, get_sprint_items, claim_sprint_item, add_subtask, split_sprint_item, merge_sprint_items, complete_sprint_item."""
-    if name == "add_sprint_note":
-        validate_input_size(args.get("title"), "note title", 500)
-        validate_input_size(args.get("body"), "note body", 10_000_000)
-        return await db_module.add_session_note(
-            db, args["session_id"], args["title"], args["body"],
-            note_kind=args.get("note_kind"),
-        )
-    if name == "get_sprint_notes":
-        return await db_module.get_session_notes(
-            db, args["session_id"], note_kind=args.get("note_kind")
-        )
-    if name == "add_sprint_item":
-        # 8f01cdfe — project_name is an accepted alternative to project_id (the
-        # dispatcher resolver at _dispatch_mcp_tool resolves a present, resolvable
-        # project_name → project_id before we get here). If neither a project_id
-        # nor a resolvable project_name reached us, return a clean, descriptive
-        # error instead of letting the direct args["project_id"] reads below raise
-        # a raw KeyError that leaks as a cryptic JSON-RPC -32603.
-        if not args.get("project_id"):
-            return {"error": "project_id is required (or pass project_name)"}
-        validate_input_size(args.get("title"), "sprint item title", 500)
-        # 7e212375 — codebase drift check: if the title looks already-implemented
-        # (3+ keyword overlap with a specific migration or a recent commit),
-        # block with a warning unless force=true. Closes the "adding items for
-        # already-shipped work" gap. Migration check is offline (cached file);
-        # the commit check degrades to empty if git isn't reachable.
-        if not bool(args.get("force", False)):
-            from .. import handoff as _handoff_drift
-            try:
-                _proj_for_drift = await db_module.get_project(db, args["project_id"])
-                _drift_commits = (
-                    await _fetch_recent_commits(_proj_for_drift, tenant)
-                    if _proj_for_drift else []
-                )
-            except Exception:  # noqa: BLE001
-                _drift_commits = []
-            _drift = _handoff_drift.detect_sprint_item_drift(
-                args.get("title") or "", _drift_commits,
-            )
-            if _drift:
-                return {
-                    "drift_warning": True,
-                    "title": args.get("title"),
-                    "matches": _drift[:5],
-                    "message": (
-                        "This may already be implemented — "
-                        + "; ".join(f"{m['kind']}:{m['ref']}" for m in _drift[:3])
-                        + ". Pass force=true to add it anyway."
-                    ),
-                }
-        # fd86aacc — warn if active executor sessions exist when adding a new item
-        _active_session_warnings = await _active_executor_session_warnings(db, args["project_id"])
-        # 07bdfdbb — auto-infer touches_resources from the title when the caller
-        # supplied none, so the item can parallelize instead of falling into its
-        # own sequential undeclared group (de730a25).
-        _touches = args.get("touches_resources")
-        if not _touches:
-            _touches = _infer_touches_resources(args.get("title") or "") or None
-        try:
-            _new_item = await db_module.add_sprint_item(
-                db, args["project_id"], args["version"], args["title"],
-                group=args.get("group"),
-                human_id=args.get("human_id"),
-                depends_on=args.get("depends_on"),
-                failure_mode=args.get("failure_mode"),
-                milestone_type=args.get("milestone_type", "task"),
-                touches_resources=_touches,
-                force=bool(args.get("force", False)),
-                deferred_until=args.get("deferred_until"),
-                track=args.get("track"),
-                priority=args.get("priority"),
-                blocker_kind=args.get("blocker_kind"),
-                wave=args.get("wave"),
-            )
-        except ValueError as exc:
-            # 501ec93f — malformed touches_resources identifier; also e08fee30 /
-            # 2282a636 bad priority / blocker_kind. Surface, don't crash.
-            return {"error": str(exc)}
-        # b0d42ef6 — duplicate guard blocked the insert: surface the error as-is
-        # (no item was created, so the warnings below don't apply).
-        if isinstance(_new_item, dict) and _new_item.get("error") == "duplicate":
-            return _new_item
-        _extra: dict[str, Any] = {}
-        if _active_session_warnings:
-            _extra["active_session_warning"] = (
-                "WARNING: " + "; ".join(_active_session_warnings)
-                + " — new item added but may not be picked up until next session start."
-            )
-        # 2d932f60 — if the title reads like a decision/insight, propose capturing
-        # it (no auto-write; the planner confirms).
-        from .. import handoff as _handoff_ins  # noqa: PLC0415
-        _ins_sig = _handoff_ins.detect_insight_candidate(args.get("title") or "")
-        if _ins_sig:
-            _extra["insight_hint"] = (
-                f"The wording ('{_ins_sig}') looks like a decision/insight — consider "
-                "add_insight() or pin_decision() so it isn't lost at session end."
-            )
-        # a8550238 — surface code-prospecting context INLINE at add time, so the
-        # planner sees which real files/symbols the item touches (and can prospect
-        # them) while the sprint is still being shaped — not only later at claim
-        # time. 926bf221 — always report an explicit prospecting_status so the
-        # caller can distinguish prospected / no-targets / skipped / errored.
-        _pc_ctx, _pc_status = _prospecting_result(_new_item)
-        _extra["prospecting_status"] = _pc_status
-        if _pc_ctx:
-            _extra["code_context"] = _pc_ctx
-        # 691f4e1c — persist a DURABLE symbol pointer (not just the inline hint) when
-        # the item declares real symbols, so prospecting is queryable later via
-        # get_sprint_item_pointers / resolvable through the tunnel, instead of a
-        # one-shot code_context the caller has to act on manually. Fully guarded.
-        _ptr = await _persist_prospected_pointer(
-            db, args["project_id"], _new_item, _pc_status
-        )
-        if _ptr:
-            _extra["prospected_pointer"] = _ptr
-        # 7fe57cea — when the caller declared explicit touches_resources at file-only
-        # granularity (file:path.py, no :symbol), emit a non-blocking informational
-        # hint suggesting symbol-scoped form instead.  Only fires for explicit caller
-        # declarations — inferred: and symbol: entries are already handled or fine.
-        _sym_hint = _check_file_only_resources_warning(
-            args.get("touches_resources"),
-            args.get("title") or "",
-            args.get("notes") or "",
-        )
-        if _sym_hint:
-            _extra["symbol_scope_hint"] = _sym_hint
-        # a389b95d — nudge callers to run assign_sprint_waves when unassigned items
-        # exist and no session is in-flight (safe to re-label). Mirrors the
-        # drift_warning / symbol_scope_hint pattern: non-blocking, info-only field.
-        _wave_hint = await _wave_assignment_hint(db, args["project_id"])
-        if _wave_hint:
-            _extra["wave_assignment_hint"] = _wave_hint
-        if _extra:
-            _new_item = {**_new_item, **_extra}
-        return _new_item
-    if name == "fan_out_sprint_items":
-        items = args.get("items")
-        if not isinstance(items, list) or not items:
-            return {"error": "items must be a non-empty list of {title, ...} dicts"}
-        _enriched: list[dict] = []
-        for spec in items:
-            validate_input_size(spec.get("title"), "sprint item title", 500)
-            validate_input_size(spec.get("description"), "sprint item description", 10_000)
-            # 07bdfdbb — auto-infer per-item touches_resources when none supplied,
-            # so a fanned-out batch doesn't become an all-undeclared pile-up.
-            if isinstance(spec, dict) and not spec.get("touches_resources"):
-                _inf = _infer_touches_resources(spec.get("title") or "")
-                if _inf:
-                    spec = {**spec, "touches_resources": _inf}
-            _enriched.append(spec)
-        ids = await db_module.fan_out_sprint_items(
-            db, args["project_id"], _enriched
-        )
-        _result: dict[str, Any] = {"item_ids": ids, "count": len(ids)}
-        # 586eeda9 — same active-session warning as add_sprint_item: a fanned-out
-        # batch injected mid-run is a board change executors should know about.
-        _fo_warnings = await _active_executor_session_warnings(db, args["project_id"])
-        if _fo_warnings:
-            _result["active_session_warning"] = (
-                "WARNING: " + "; ".join(_fo_warnings)
-                + " — items added but may not be picked up until next session start."
-            )
-        # 7fe57cea — same symbol-scope hint as add_sprint_item: collect per-item
-        # file-only resource warnings so the planner can upgrade them before
-        # executors claim and parallelize.
-        _fo_sym_hints: list[str] = []
-        for _spec in items:
-            if not isinstance(_spec, dict):
-                continue
-            _sh = _check_file_only_resources_warning(
-                _spec.get("touches_resources"),
-                _spec.get("title") or "",
-                _spec.get("description") or "",
-            )
-            if _sh:
-                _fo_sym_hints.append(_sh)
-        if _fo_sym_hints:
-            _result["symbol_scope_hints"] = _fo_sym_hints
-        # a389b95d — same wave-assignment nudge as add_sprint_item: after a batch
-        # fan-out, the newly-filed items almost certainly have wave IS NULL.
-        _fo_wave_hint = await _wave_assignment_hint(db, args["project_id"])
-        if _fo_wave_hint:
-            _result["wave_assignment_hint"] = _fo_wave_hint
-        return _result
-    if name == "update_sprint_item":
-        validate_input_size(args.get("title"), "sprint item title", 500)
-        validate_input_size(args.get("notes"), "sprint item notes", 50_000)
-        # 586eeda9 — hard-block mutating an in_progress item: an executor owns it
-        # and a concurrent title/notes/resources change is undefined behaviour.
-        # force=true overrides (destructive). Mirrors the set_sprint force guard.
-        if not (args.get("force") in (True, 1, "true", "1", "yes")):
-            _cur = await db_module.get_sprint_item(db, args["item_id"])
-            if _cur is not None and _cur.get("status") == "in_progress":
-                _owner = ""
-                _ca = _cur.get("claimed_at")
-                if _ca:
-                    _owner = f" (claimed {_ca})"
-                return {
-                    "error": "IN_PROGRESS",
-                    "message": (
-                        f"Item is in_progress and owned by an active session{_owner} — "
-                        "cannot mutate while claimed. Wait for completion, call "
-                        "fail_sprint_item first, or pass force=true to override."
-                    ),
-                    "item_id": args["item_id"],
-                    "claimed_at": _ca,
-                }
-        _patch_kwargs: dict[str, Any] = dict(
-            title=args.get("title"),
-            version=args.get("version"),
-            notes=args.get("notes"),
-            human_id=args.get("human_id"),
-            item_group=args.get("group"),
-        )
-        # 501ec93f — only forward touches_resources when the caller supplied it,
-        # so omitting the key leaves the stored value untouched (_UNSET sentinel).
-        if "touches_resources" in args:
-            _patch_kwargs["touches_resources"] = args.get("touches_resources")
-        # 5823db0b — allow flagging an item as requiring completion evidence.
-        if "required_notes" in args:
-            _patch_kwargs["required_notes"] = args.get("required_notes")
-        # dec69708 — set/clear the enforced deferral + track. Only forward when the
-        # caller supplied the key, so omitting it leaves the stored value untouched
-        # (patch_sprint_item uses the _UNSET sentinel); pass "" / null to clear.
-        if "deferred_until" in args:
-            _patch_kwargs["deferred_until"] = args.get("deferred_until")
-        if "track" in args:
-            _patch_kwargs["track"] = args.get("track")
-        # e08fee30 — set the priority enum. Only forward when supplied (None leaves
-        # the stored value untouched in patch_sprint_item).
-        if args.get("priority") is not None:
-            _patch_kwargs["priority"] = args.get("priority")
-        # 2282a636 — set/clear blocker_kind. Only forward when the caller supplied
-        # the key, so omitting it leaves the stored value untouched (_UNSET
-        # sentinel); pass "" / null to clear (ordinary item), or 'manual' to set.
-        if "blocker_kind" in args:
-            _patch_kwargs["blocker_kind"] = args.get("blocker_kind")
-        # 58a45b92 — set/clear the stored wave label. Only forward when the caller
-        # supplied the key (_UNSET sentinel), so omitting it leaves the stored value
-        # untouched; pass "" / null to clear (unassigned).
-        if "wave" in args:
-            _patch_kwargs["wave"] = args.get("wave")
-        try:
-            item = await db_module.patch_sprint_item(
-                db, args["project_id"], args["item_id"], **_patch_kwargs
-            )
-        except ValueError as exc:
-            return {"error": str(exc)}
-        if not item:
-            return {"error": "sprint item not found"}
-        # 926bf221 — update_sprint_item now auto-prospects too (previously only
-        # add/claim did), so a substantive edit that names real files re-derives
-        # code context instead of staying null. Explicit prospecting_status keeps
-        # success / no-targets / skipped distinguishable to the caller.
-        _u_ctx, _u_status = _prospecting_result(item)
-        item = {**item, "prospecting_status": _u_status}
-        if _u_ctx:
-            item["code_context"] = _u_ctx
-        # 691f4e1c — persist the durable symbol pointer on update too (skips if the
-        # item already carries a code/symbol pointer, so re-editing doesn't stack
-        # duplicates). Guarded; a persist failure never breaks the update.
-        _u_ptr = await _persist_prospected_pointer(
-            db, args["project_id"], item, _u_status
-        )
-        if _u_ptr:
-            item["prospected_pointer"] = _u_ptr
-        return item
-    if name == "set_sprint":
-        # 62d321dd — guard: warn if pending items were never started before rolling sprint
-        if not args.get("force"):
-            _unstarted = [
-                it for it in await db_module.get_sprint_items(db, args["project_id"], status="pending")
-                if it.get("claimed_at") is None
-            ]
-            if _unstarted:
-                _list = "\n".join(
-                    f'  [{it["id"][:8]}] {it.get("title","")[:100]}'
-                    for it in _unstarted[:10]
-                )
-                return {
-                    "warning": (
-                        f"WARNING: {len(_unstarted)} item(s) from the current sprint were never "
-                        f"started:\n{_list}\n"
-                        "Proceeding will leave these orphaned. Move them to the new sprint version "
-                        "or push to backlog first. Call set_sprint again with force=true to override."
-                    ),
-                    "unstarted_count": len(_unstarted),
-                    "unstarted_ids": [it["id"] for it in _unstarted],
-                    "sprint_not_updated": True,
-                }
-        result = await db_module.set_sprint(db, args["project_id"], args["sprint"])
-        await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
-        return result
-    if name == "get_sprint_progress":
-        # 0507f4a1 — sprint progress summary
-        _version_filter = args.get("version")
-        _group_filter = args.get("item_group")
-        # 10s cache: parallel executors polling between tasks share one DB query.
-        _all = await db_module.get_sprint_items_cached(db, args["project_id"])
-        if _version_filter:
-            _all = [it for it in _all if it.get("version") == _version_filter]
-        if _group_filter:
-            _all = [it for it in _all if it.get("item_group") == _group_filter]
-        _counts: dict[str, int] = {}
-        for _it in _all:
-            _st = _it.get("status") or "pending"
-            _counts[_st] = _counts.get(_st, 0) + 1
-        _done_n = _counts.get("done", 0)
-        _total = len(_all)
-        _pct = round(100 * _done_n / _total) if _total else 0
-        _resp_progress = {
-            "total": _total,
-            "done": _done_n,
-            "in_progress": _counts.get("in_progress", 0),
-            "provisional_complete": _counts.get("provisional_complete", 0),
-            "pending": _counts.get("pending", 0),
-            "failed": _counts.get("failed", 0),
-            "skipped": _counts.get("skipped", 0),
-            "percent_complete": _pct,
-            "by_status": _counts,
-        }
-        # 1da83459 — summary-only: the per-item list scaled ~100 chars/item and
-        # bloated every between-item progress poll on a large board. Counts +
-        # by_status + board_change are what an executor needs; call
-        # get_sprint_items(status="pending") for the live item list.
-        _bc = await _board_change_for_session(db, args["project_id"], args.get("session_id"))
-        if _bc:
-            _resp_progress["board_change"] = _bc
-        # 5abf3e12 — when scoped to a session, report that session's live goal
-        # compliance (N items it took on via actor= vs M complete_sprint_item()'d)
-        # so an executor can see mid-run whether it's on track to fully complete
-        # its /goal list. Guarded: never break the progress poll.
-        _sess_id = args.get("session_id")
-        if _sess_id:
-            try:
-                _resp_progress["goal_compliance"] = (
-                    await db_module.compute_session_goal_compliance(
-                        db, args["project_id"], _sess_id
-                    )
-                )
-            except Exception:  # noqa: BLE001
-                pass
-        return _resp_progress
-    if name == "get_sprint_items":
-        include_human = args.get("human", True)
-        if isinstance(include_human, bool):
-            pass
-        else:
-            include_human = str(include_human).lower() not in ("false", "0", "no")
-        _items = await db_module.get_sprint_items(
-            db, args["project_id"],
-            status=args.get("status"),
-            include_human=include_human,
-        )
-        # 10c0f6a0 — stale-session warning: in_progress items claimed >2h ago
-        from datetime import datetime as _dt_cls
-        _now_utc = _dt_cls.utcnow()
-        for _i, _it in enumerate(_items):
-            if _it.get("status") == "in_progress" and _it.get("claimed_at"):
-                try:
-                    _ca = _dt_cls.fromisoformat(_it["claimed_at"].split(".")[0].replace("Z", ""))
-                    _age_h = (_now_utc - _ca).total_seconds() / 3600
-                    if _age_h > 2:
-                        _items[_i] = {**_it, "stale_warning": True, "stale_age_hours": round(_age_h, 1)}
-                except Exception:  # noqa: BLE001
-                    pass
-        return _items
-    if name == "get_parallelizable_groups":
-        # 255096d9 — cluster pending items safe to fan out simultaneously.
-        _grp = await db_module.get_parallelizable_groups(
-            db, args["project_id"], version=args.get("version")
-        )
-        # de730a25 — flag undeclared items prominently. They each run in their own
-        # sequential group now, but the orchestrator should know parallel safety
-        # couldn't be proven for them.
-        _und = _grp.get("undeclared_count", 0)
-        if _und:
-            _grp["warning"] = (
-                f"{_und} item(s) lack resource declarations — parallel safety not "
-                "guaranteed; each is scheduled in its own sequential group. Add "
-                "touches_resources to let them parallelize."
-            )
-        return _grp
-    if name == "assign_sprint_waves":
-        # 58a45b92 — persist the parallelizable grouping onto each eligible item's
-        # stored `wave` field so parallelism is deterministic + inspectable, then
-        # hand-editable via update_sprint_item(wave=...).
-        _wave_result = await db_module.assign_sprint_waves(
-            db, args["project_id"], version=args.get("version")
-        )
-        # 605ca2c4 — warn if active executor sessions exist when re-running
-        # assign_sprint_waves: greedy coloring order can shift if the pending set
-        # changed since the last assignment, silently relabeling still-pending items
-        # to different wave numbers and desyncing a mid-flight /goal that already
-        # references specific wave labels.
-        _wave_warnings = await _active_executor_session_warnings(db, args["project_id"])
-        if _wave_warnings:
-            _wave_result["active_session_warning"] = (
-                "WARNING: " + "; ".join(_wave_warnings)
-                + " — re-labeling wave numbers while a session is mid-flight can"
-                " desync it from a /goal string that already references specific wave labels."
-            )
-        return _wave_result
-    if name == "analyze_sprint":
-        # e77f09d1 — one-call planning brief: parallelism + dependency chains +
-        # resource conflicts + stalls synthesized for a planning session.
-        return await db_module.analyze_sprint(
-            db, args["project_id"], version=args.get("version")
-        )
-    if name == "claim_sprint_item":
-        # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
-        # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.
-        _force = args.get("force") in (True, 1, "true", "1", "yes")
-        if not _force:
-            _pitem = await db_module.get_sprint_item(db, args["item_id"])
-            if _pitem is not None:
-                _touched = [p.lower() for p in _parse_touches_files(_pitem.get("touches_files"))]
-                _hits = sorted({fn for fn in ("hooks.ps1", "hooks.sh")
-                                if any(t == fn or t.endswith("/" + fn) for t in _touched)})
-                if _hits:
-                    return {
-                        "error": "PROTECTED",
-                        "message": ("Sprint item touches protected installer scripts "
-                                    f"({', '.join(_hits)}). Pass force=true to override."),
-                        "protected_files": _hits,
-                    }
+    """Dispatch group: add_sprint_note, get_sprint_notes, add_sprint_item,
+    fan_out_sprint_items, update_sprint_item, set_sprint, get_sprint_progress,
+    get_sprint_items, get_parallelizable_groups, assign_sprint_waves,
+    analyze_sprint, claim_sprint_item, add_subtask, split_sprint_item,
+    merge_sprint_items, complete_sprint_item, add_sprint_item_pointer,
+    get_sprint_item_pointers, resolve_sprint_item_pointers,
+    delete_sprint_item_pointer.
 
-        # 0716c9e0 — parallel safety: load project settings once for both
-        # auto_worktrees (suggest worktree by default) and isolation=worktree.
-        _suggest_worktree = False
-        _exec_cfg: dict[str, Any] = {}
-        _proj_settings_claim: dict[str, Any] = {}
-        try:
-            _ps = await db_module.get_project_settings(db, args["project_id"])
-            _proj_settings_claim = _ps or {}
-            _raw_cfg = _proj_settings_claim.get("executor_config")
-            if _raw_cfg:
-                _exec_cfg = json.loads(_raw_cfg) if isinstance(_raw_cfg, str) else (_raw_cfg or {})
-        except Exception:  # noqa: BLE001
-            pass
-        _isolation = (_exec_cfg or {}).get("isolation", "")
-        _aw_raw = _proj_settings_claim.get("auto_worktrees")
-        _auto_worktrees = bool(int(_aw_raw) if _aw_raw is not None else 1)
-        # Compute file-claim overlaps once. In worktree mode they're a soft
-        # informational warning (worktrees isolate the edit); otherwise a hard
-        # block. (d01a74bf part 2)
-        _file_conflicts = await _sprint_item_file_claim_conflicts(
-            db,
-            args["project_id"],
-            args["item_id"],
-            exclude_session_id=args.get("session_id"),
-        )
-        if _isolation == "worktree" or _auto_worktrees:
-            _suggest_worktree = True
-        else:
-            if _file_conflicts:
-                return {
-                    "error": "CONFLICT",
-                    "message": "Cannot claim sprint item: active session has overlapping claimed files.",
-                    "conflicts": _file_conflicts,
-                }
+    ba4f879b — the original if/elif chain has been replaced with a per-tool
+    dispatch table (dict mapping tool name -> handler function).  Each tool's
+    logic lives in its own named function in
+    ``meridian.mcp.handlers.sprint_tools``.  This is a PURELY MECHANICAL
+    extraction: zero behaviour change, same tool names, same arguments, same
+    return values.
+    """
+    from .handlers.sprint_tools import (  # noqa: PLC0415
+        handle_add_sprint_note,
+        handle_get_sprint_notes,
+        handle_add_sprint_item,
+        handle_fan_out_sprint_items,
+        handle_update_sprint_item,
+        handle_set_sprint,
+        handle_get_sprint_progress,
+        handle_get_sprint_items,
+        handle_get_parallelizable_groups,
+        handle_assign_sprint_waves,
+        handle_analyze_sprint,
+        handle_claim_sprint_item,
+        handle_add_subtask,
+        handle_split_sprint_item,
+        handle_merge_sprint_items,
+        handle_complete_sprint_item,
+        handle_add_sprint_item_pointer,
+        handle_get_sprint_item_pointers,
+        handle_resolve_sprint_item_pointers,
+        handle_delete_sprint_item_pointer,
+    )
 
-        try:
-            # 5823db0b — actor attribution: record who claimed the item (explicit
-            # actor arg, else the claiming session id).
-            _claim_actor = args.get("actor") or args.get("session_id")
-            item = await db_module.claim_sprint_item(
-                db, args["project_id"], args["item_id"], actor=_claim_actor
-            )
-        except ValueError:
-            # 10c0f6a0 — if already in_progress, check for stale claim and surface info
-            _stale_item = await db_module.get_sprint_item(db, args["item_id"])
-            if _stale_item and _stale_item.get("status") == "in_progress" and _stale_item.get("claimed_at"):
-                from datetime import datetime as _dt_cls
-                try:
-                    _ca = _dt_cls.fromisoformat(_stale_item["claimed_at"].split(".")[0].replace("Z", ""))
-                    _age_h = (_dt_cls.utcnow() - _ca).total_seconds() / 3600
-                    if _age_h > 2:
-                        return {
-                            "error": "STALE_CLAIM",
-                            "message": (
-                                f"Item is in_progress but claimed {round(_age_h, 1)}h ago with no recent "
-                                "activity — the claiming session may have ended. Safe to force-reclaim "
-                                "by updating status to 'pending' first via update_sprint_item."
-                            ),
-                            "stale_age_hours": round(_age_h, 1),
-                            "claimed_at": _stale_item["claimed_at"],
-                            "item": _stale_item,
-                        }
-                except Exception:  # noqa: BLE001
-                    pass
-            # df573218 — claim race: another session grabbed this item between
-            # planning and claiming. Instead of crashing the worker with a hard
-            # error, point it at the next claimable item so it can keep going.
-            _next_item = None
-            try:
-                _grp = await db_module.get_parallelizable_groups(
-                    db, args["project_id"], version=_stale_item.get("version") if _stale_item else None
-                )
-                for _group in _grp.get("groups", []):
-                    for _cand in _group:
-                        if _cand.get("id") != args["item_id"]:
-                            _next_item = _cand
-                            break
-                    if _next_item is not None:
-                        break
-            except Exception:  # noqa: BLE001
-                pass
-            return {
-                "status": "already_claimed",
-                "item_id": args["item_id"],
-                "current_status": (_stale_item or {}).get("status"),
-                "next_available_id": (_next_item or {}).get("id"),
-                "next_available_title": (_next_item or {}).get("title"),
-                "message": (
-                    "Item was already claimed by another session. "
-                    + (
-                        f"Claim next_available_id ({(_next_item or {}).get('id')}) instead."
-                        if _next_item else
-                        "No other claimable items remain in this version."
-                    )
-                ),
-            }
-        # dec69708 — ENFORCED deferral: claim_sprint_item returns a blocked dict
-        # (not a real item) when deferred_until is in the future. Surface it as-is
-        # and stop; the item was NOT claimed, so the worktree plumbing below (which
-        # assumes a real item row) must be skipped.
-        if isinstance(item, dict) and item.get("blocked"):
-            return item
-        if item is None:
-            raise ValueError("sprint item not found")
+    _standard_dispatch: dict[str, Any] = {
+        "add_sprint_note": handle_add_sprint_note,
+        "get_sprint_notes": handle_get_sprint_notes,
+        "add_sprint_item": handle_add_sprint_item,
+        "fan_out_sprint_items": handle_fan_out_sprint_items,
+        "update_sprint_item": handle_update_sprint_item,
+        "set_sprint": handle_set_sprint,
+        "get_sprint_progress": handle_get_sprint_progress,
+        "get_sprint_items": handle_get_sprint_items,
+        "get_parallelizable_groups": handle_get_parallelizable_groups,
+        "assign_sprint_waves": handle_assign_sprint_waves,
+        "analyze_sprint": handle_analyze_sprint,
+        "claim_sprint_item": handle_claim_sprint_item,
+        "add_subtask": handle_add_subtask,
+        "split_sprint_item": handle_split_sprint_item,
+        "merge_sprint_items": handle_merge_sprint_items,
+        "complete_sprint_item": handle_complete_sprint_item,
+        "add_sprint_item_pointer": handle_add_sprint_item_pointer,
+        "get_sprint_item_pointers": handle_get_sprint_item_pointers,
+        "resolve_sprint_item_pointers": handle_resolve_sprint_item_pointers,
+        "delete_sprint_item_pointer": handle_delete_sprint_item_pointer,
+    }
 
-        if _suggest_worktree:
-            item_id_short = item["id"][:8]
-            _session_id_claim = args.get("session_id") or ""
-            if _auto_worktrees and _isolation != "worktree" and _session_id_claim:
-                # Default path: .claude/worktrees/{session_id_short} (gitignored)
-                wt_branch = f"worktree/{item_id_short}"
-                wt_path = f".claude/worktrees/{_session_id_claim[:8]}"
-            else:
-                # Legacy isolation=worktree path: repo-relative sibling dir
-                repo_path = ""
-                _repo_paths = _exec_cfg.get("repo_paths")
-                if _repo_paths and isinstance(_repo_paths, list) and _repo_paths:
-                    _first = _repo_paths[0]
-                    repo_path = (_first.get("cwd") or "") if isinstance(_first, dict) else str(_first)
-                if not repo_path:
-                    repo_path = _exec_cfg.get("repo_path") or ""
-                repo_name = os.path.basename(repo_path.rstrip("/\\")) if repo_path else "repo"
-                wt_branch = f"worktree/{item_id_short}"
-                wt_path = f"../{repo_name}-worktree-{item_id_short}"
-            item = dict(item)
-            item.update({
-                "worktree_suggested": True,
-                "worktree_branch": wt_branch,
-                "worktree_path": wt_path,
-                "worktree_setup_cmd": f"git worktree add {wt_path} -b {wt_branch}",
-                "worktree_cleanup_cmd": f"git worktree remove {wt_path} --force",
-                "worktree_merge_cmd": (
-                    f"git checkout dev && git merge {wt_branch} --no-edit "
-                    f"&& git branch -d {wt_branch}"
-                ),
-            })
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
 
-        # Soft, non-blocking overlap warning (e.g. in worktree mode where the
-        # hard CONFLICT check is intentionally skipped). (d01a74bf part 2)
-        if _file_conflicts:
-            item = dict(item)
-            _paths = ", ".join(sorted({c["file_path"] for c in _file_conflicts}))
-            item["file_overlap_warning"] = {
-                "message": (
-                    f"Heads up: {_paths} also claimed by another live session. "
-                    "Your worktree isolates the edit, but coordinate before merging."
-                ),
-                "conflicts": _file_conflicts,
-            }
-
-        _bc_claim = await _board_change_for_session(
-            db, args["project_id"], args.get("session_id")
-        )
-        if _bc_claim:
-            item = dict(item)
-            item["board_change"] = _bc_claim
-
-        # f5726fd0 — suggest files to claim based on item title keywords.
-        _sug = _suggest_files_for_title(item.get("title") or "")
-        if _sug:
-            item = dict(item)
-            item["suggested_files"] = _sug
-
-        # 04a15d3f — auto-prospect: surface the code-intel targets (files/symbols)
-        # the executor should search before editing, derived from touches_resources
-        # (or inferred from the title). Best-effort; never blocks the claim.
-        try:
-            _code_ctx = _prospect_code_context(item)
-        except Exception:  # noqa: BLE001
-            _code_ctx = None
-        if _code_ctx:
-            item = dict(item)
-            item["code_context"] = _code_ctx
-
-        # c37ea630 — proactively surface code-anchored notes for the item's
-        # declared files/symbols at claim time. Mirrors the code_notes field
-        # already returned by claim_file / get_file_claims, so executors see
-        # relevant per-file warnings before they even decide which files to touch,
-        # rather than only reactively when they call claim_file/get_file_claims
-        # for a specific path later. Fail-open: empty list on error.
-        try:
-            _resource_code_notes = await _code_notes_for_item_resources(
-                db, args["project_id"], item
-            )
-        except Exception:  # noqa: BLE001
-            _resource_code_notes = []
-        if _resource_code_notes:
-            item = dict(item)
-            item["touches_resources_code_notes"] = _resource_code_notes
-
-        return item
-    if name == "add_subtask":
-        return await db_module.add_subtask(
-            db, args["project_id"], args["parent_id"], args["title"],
-            owner=args.get("owner"),
-        )
-    if name == "split_sprint_item":
-        return await db_module.split_sprint_item(
-            db, args["project_id"], args["item_id"], args["titles"]
-        )
-    if name == "merge_sprint_items":
-        return await db_module.merge_sprint_items(
-            db, args["project_id"], args["item_ids"], args["new_title"]
-        )
-    if name == "complete_sprint_item":
-        # 0716c9e0 — check active worktree before marking done.
-        _complete_session_id = args.get("session_id") or ""
-        _merge_warning: dict[str, Any] | None = None
-        if _complete_session_id:
-            try:
-                _ps_complete = await db_module.get_project_settings(db, args["project_id"])
-                _req_merge = bool(int((_ps_complete or {}).get("require_merge_approval") or 1))
-                if _req_merge:
-                    _wt = await db_module.get_active_worktree_for_session(db, _complete_session_id)
-                    if _wt:
-                        _hitl = await db_module.request_hitl(
-                            db, args["project_id"],
-                            f"Session has active worktree on branch '{_wt['branch']}' "
-                            f"at '{_wt['path']}'. Merge to main before closing. "
-                            f"Run: git checkout dev && git merge {_wt['branch']} --no-edit",
-                            session_id=_complete_session_id,
-                            urgency="normal", kind="correction",
-                        )
-                        _merge_warning = {
-                            "worktree_branch": _wt["branch"],
-                            "worktree_path": _wt["path"],
-                            "hitl_id": (_hitl or {}).get("id"),
-                            "message": "Merge reminder filed — see HITL queue.",
-                        }
-            except Exception:  # noqa: BLE001
-                pass
-
-        # 427b7902 — HARD CI GATE: refuse to complete when GitHub Actions CI for the
-        # commit named in the notes is GENUINELY FAILING. This upgrades the b121348e
-        # advisory (which only WARNED post-completion) to a real gate, mirroring the
-        # EVIDENCE_REQUIRED refusal: computed BEFORE marking done, returns a clean
-        # error, and does NOT flip the item to done. Guardrails:
-        #   * ONLY a real "failure" state blocks. "unknown" (no repo configured, no
-        #     check-runs yet, self-hosted / no-GitHub) and "pending" (CI still
-        #     running — the normal push-then-complete race) are ALWAYS allowed
-        #     through, so this never blocks on absent/unknown CI.
-        #   * Escape hatch consistent with existing force= patterns: pass
-        #     override_ci=true to complete anyway (records that the failing CI was
-        #     acknowledged). The result is cached so the advisory block below reuses
-        #     it without a second GitHub round-trip.
-        _ci_pre: dict[str, Any] | None = None
-        _ci_checked = False
-        _override_ci = bool(args.get("override_ci"))
-        try:
-            _pre_item = await db_module.get_sprint_item(db, args["item_id"])
-        except Exception:  # noqa: BLE001
-            _pre_item = None
-        if _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
-            _ci_text = f"{args.get('notes') or ''} {(_pre_item.get('notes') or '')}"
-            _ci_pre = await _verify_item_ci(db, args["project_id"], tenant, _ci_text)
-            _ci_checked = True
-            if (
-                not _override_ci
-                and _ci_pre is not None
-                and _ci_pre.get("state") == "failure"
-            ):
-                return {
-                    "error": "CI_FAILING",
-                    "item_id": args["item_id"],
-                    "ci_verification": _ci_pre,
-                    "message": (
-                        f"Refusing to complete {args['item_id']}: GitHub Actions CI "
-                        f"is FAILING for commit {_ci_pre.get('sha')} "
-                        f"({_ci_pre.get('failed')}/{_ci_pre.get('total')} checks failed). "
-                        "Fix CI and re-push, or pass override_ci=true to acknowledge "
-                        "and complete anyway. (Unknown/pending CI is never blocked — "
-                        "only a real failing status.)"
-                    ),
-                }
-
-        # 5823db0b — quality gate + actor attribution. Pass evidence notes and
-        # the completing actor; surface the required_notes gate as a clean error.
-        _complete_actor = args.get("actor") or _complete_session_id or None
-        try:
-            item = await db_module.complete_sprint_item(
-                db, args["project_id"], args["item_id"],
-                task_id=args.get("task_id"),
-                notes=args.get("notes"),
-                actor=_complete_actor,
-            )
-        except db_module.SprintItemEvidenceRequired as exc:
-            return {
-                "error": "EVIDENCE_REQUIRED",
-                "item_id": args["item_id"],
-                "message": str(exc),
-            }
-        except db_module.SprintItemStatusRace as exc:
-            # fa3e3331 — another caller already moved this item out of an
-            # active state (e.g. a concurrent skip/fail/complete won the
-            # race). Surface it distinctly rather than a misleading
-            # "not found".
-            return {
-                "error": "STATUS_RACE",
-                "item_id": exc.item_id,
-                "current_status": exc.current_status,
-                "message": str(exc),
-            }
-        if item is None:
-            raise ValueError("sprint item not found")
-        if _merge_warning:
-            item = dict(item)
-            item["merge_warning"] = _merge_warning
-        # 02cd3992 — unclaimed-file warning: flag files modified without a lock.
-        # Non-blocking; surfaces the open-door problem so the executor can act.
-        if _complete_session_id:
-            try:
-                _unclaimed_warnings = await _unclaimed_file_warnings(
-                    db, _complete_session_id
-                )
-                if _unclaimed_warnings:
-                    item = dict(item)
-                    item["unclaimed_file_warnings"] = _unclaimed_warnings
-            except Exception:  # noqa: BLE001
-                pass
-        # d01a74bf — surface board additions at the item boundary so a planner's
-        # mid-run injections get picked up before the next claim.
-        _bc_complete = await _board_change_for_session(
-            db, args["project_id"], args.get("session_id")
-        )
-        if _bc_complete:
-            item = dict(item)
-            item["board_change"] = _bc_complete
-        # b121348e / 427b7902 — INDEPENDENT CI verification. The 427b7902 hard gate
-        # above already looked this up (and REFUSED completion on a real failing
-        # state unless override_ci=true), so reuse that result — no second GitHub
-        # round-trip. Attach ``ci_verification`` for transparency, and when CI is
-        # genuinely FAILING (i.e. this was an acknowledged override_ci completion),
-        # attach a ``ci_warning`` so the closed-on-red item stays visible.
-        try:
-            _ci = _ci_pre if _ci_checked else await _verify_item_ci(
-                db, args["project_id"], tenant,
-                f"{args.get('notes') or ''} {item.get('notes') or ''}",
-            )
-            if _ci is not None:
-                item = dict(item)
-                item["ci_verification"] = _ci
-                if _ci.get("state") == "failure":
-                    item["ci_warning"] = (
-                        f"⚠ GitHub Actions CI is FAILING for commit {_ci.get('sha')} "
-                        f"({_ci.get('failed')}/{_ci.get('total')} checks) — this item "
-                        f"was closed on a commit whose CI did not pass"
-                        + (" (override_ci=true)." if _override_ci else ".")
-                        + " Verify before trusting 'done'."
-                    )
-        except Exception:  # noqa: BLE001 — advisory only; completion already succeeded
-            pass
-        # bb29a06f — ADVISORY completion sanity-check. Extends the required_notes
-        # gate (evidence EXISTS) with a check that evidence is PLAUSIBLE: when the
-        # completion looks weakly-supported (no linked task, no notes anywhere) and
-        # no recent commit/migration shares keywords with the title, add a soft
-        # nudge. NEVER blocks, never raises — the completion already succeeded. The
-        # drift heuristic is noisy, so this is a hint, not a gate.
-        try:
-            _weakly_supported = not (
-                args.get("task_id")
-                or (args.get("notes") or "").strip()
-                or (item.get("notes") or "").strip()
-                or item.get("task_id")
-            )
-            if _weakly_supported:
-                from .. import handoff as _handoff_advisory
-                try:
-                    _adv_project = await db_module.get_project(db, args["project_id"])
-                    _adv_commits = (
-                        await _fetch_recent_commits(_adv_project, tenant)
-                        if _adv_project else []
-                    )
-                except Exception:  # noqa: BLE001 — never let commit-fetch break completion
-                    _adv_commits = []
-                _adv_matches = _handoff_advisory.detect_sprint_item_drift(
-                    item.get("title") or "", _adv_commits,
-                )
-                if not _adv_matches:
-                    item = dict(item)
-                    item["completion_advisory"] = (
-                        "No recent commit or linked evidence appears to reference "
-                        "this item — double-check it actually shipped (this is a "
-                        "heuristic; ignore if you completed it via docs/config/decision)."
-                    )
-        except Exception:  # noqa: BLE001 — advisory must never affect completion
-            pass
-        # Notify only when the sprint is fully complete.
-        active_statuses = {"pending", "todo", "in_progress"}
-        remaining_items = await db_module.get_sprint_items(db, args["project_id"])
-        if not any((it.get("status") or "") in active_statuses for it in remaining_items):
-            await _server._maybe_notify(
-                db, args["project_id"],
-                "Sprint done ✓",
-                "All sprint items are complete.",
-                event="sprint_done",
-                tenant=tenant,
-                pref_key="sprint",
-            )
-        return item
-    if name == "add_sprint_item_pointer":
-        # 2976e168 — attach a GENERIC POINTER to a sprint item. Validation lives in
-        # db.add_sprint_item_pointer (via meridian.pointers.validate_pointer); a
-        # malformed pointer raises ValueError, surfaced here as a clean {error}.
-        if not args.get("project_id"):
-            return {"error": "project_id is required (or pass project_name)"}
-        if not args.get("sprint_item_id"):
-            return {"error": "sprint_item_id is required"}
-        validate_input_size(args.get("label"), "pointer label", 500)
-        source_type = args.get("source_type") or ""
-        targets = args.get("targets") or []
-        if source_type == "web" and isinstance(targets, list):
-            # 1d3f6e71 — archive the exact cited passage at CITATION TIME so it
-            # survives link-rot / content-drift. Best-effort + guarded: an archiving
-            # failure must NEVER block pointer creation — the pointer still stores the
-            # live URL + exact quote, and drift is detected on resolve regardless.
-            from .. import web_archive  # noqa: PLC0415
-            for t in targets:
-                if not isinstance(t, dict):
-                    continue
-                sel = t.get("selector")
-                uri = t.get("uri")
-                if not (
-                    isinstance(sel, dict)
-                    and sel.get("type") == "text_quote"
-                    and isinstance(uri, str) and uri
-                    and not sel.get("archived_url")
-                ):
-                    continue
-                try:
-                    res = await web_archive.save_page_now(uri)
-                except Exception:  # noqa: BLE001 — belt-and-suspenders
-                    res = None
-                if isinstance(res, dict) and res.get("archived_url"):
-                    sel["archived_url"] = res["archived_url"]
-                    if res.get("archived_at"):
-                        sel["archived_at"] = res["archived_at"]
-                else:
-                    # Fallback: the deterministic Wayback "latest snapshot" URL.
-                    sel["archived_url"] = web_archive.wayback_latest_url(uri)
-        try:
-            return await db_module.add_sprint_item_pointer(
-                db,
-                args["project_id"],
-                args["sprint_item_id"],
-                source_type,
-                targets,
-                label=args.get("label"),
-            )
-        except ValueError as exc:
-            return {"error": str(exc)}
-    if name == "get_sprint_item_pointers":
-        if not args.get("sprint_item_id"):
-            return {"error": "sprint_item_id is required"}
-        pointers = await db_module.get_sprint_item_pointers(
-            db, args["sprint_item_id"]
-        )
-        return {"sprint_item_id": args["sprint_item_id"], "pointers": pointers}
-    if name == "resolve_sprint_item_pointers":
-        # 2976e168 — resolve EVERY pointer on an item, dispatching by selector.type.
-        # Best-effort + guarded: unresolvable targets become {resolved:false}; the
-        # pass NEVER raises. node_id targets need the doc-structure store, resolved
-        # via the same tier-aware helper the citation tools use; symbol/zotero use
-        # the pointers module's default seams (db.search_graph_entities /
-        # zotero_client). project_id scopes the code-graph search.
-        if not args.get("project_id"):
-            return {"error": "project_id is required (or pass project_name)"}
-        if not args.get("sprint_item_id"):
-            return {"error": "sprint_item_id is required"}
-        from ..pointers import resolve_pointer  # noqa: PLC0415
-
-        # Resolve the doc-structure store once for node_id lookups (best-effort;
-        # None → node_id targets degrade to {resolved:false}).
-        _ptr_store = await _resolve_ingest_doc_store(db, data_dir, tenant)
-
-        async def _node_resolver(element_id: str) -> Any:
-            if _ptr_store is None:
-                return None
-            try:
-                return await _ptr_store.get_element_by_id(element_id)
-            except Exception:  # noqa: BLE001 — resolver seam must never raise
-                return None
-
-        pointers = await db_module.get_sprint_item_pointers(
-            db, args["sprint_item_id"]
-        )
-        resolved: list[dict[str, Any]] = []
-        for ptr in pointers:
-            resolved.append(
-                await resolve_pointer(
-                    db, ptr,
-                    project_id=args["project_id"],
-                    node_resolver=_node_resolver,
-                )
-            )
-        return {"sprint_item_id": args["sprint_item_id"], "pointers": resolved}
-    if name == "delete_sprint_item_pointer":
-        # 98c71a42 — the DELETE (edit-via-replace) half of the pointer CRUD. The DB
-        # layer (db.delete_sprint_item_pointer) has existed since 2976e168, but no
-        # MCP tool wrapped it — a pointer could be created / listed / resolved yet
-        # never removed. Idempotent: {deleted:false} when no pointer had that id,
-        # rather than an error.
-        if not args.get("pointer_id"):
-            return {"error": "pointer_id is required"}
-        removed = await db_module.delete_sprint_item_pointer(db, args["pointer_id"])
-        return {"pointer_id": args["pointer_id"], "deleted": removed}
     return _MISS
 
 
