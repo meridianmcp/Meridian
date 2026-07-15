@@ -236,23 +236,52 @@ class _ExecProxy:
     Can be awaited (``cursor = await db.execute(sql)``) *or* used as an
     async context manager (``async with db.execute(sql) as cur:``).
     Mimics the aiosqlite cursor proxy so db.py callers are unchanged.
+
+    Also implements the Coroutine protocol (send/throw/close) so that
+    ``asyncio.run(db.execute(sql))`` works — asyncio.run() calls
+    ``asyncio.coroutines.iscoroutine()`` which requires send/throw/close to
+    be present (mirrors aiosqlite's own Result class approach).
     """
 
-    __slots__ = ("_coro", "_cursor")
+    __slots__ = ("_coro", "_cursor", "_resolve_coro")
 
     def __init__(self, coro) -> None:
         self._coro = coro
         self._cursor: _PgCursor | None = None
+        self._resolve_coro = None  # lazily initialised; shared by __await__ + send/throw
 
     async def _resolve(self) -> _PgCursor:
         if self._cursor is None:
             self._cursor = await self._coro
         return self._cursor
 
+    def _get_resolve_coro(self):
+        """Return the single shared _resolve() coroutine, creating it once."""
+        if self._resolve_coro is None:
+            self._resolve_coro = self._resolve()
+        return self._resolve_coro
+
+    # ---- Coroutine protocol (send / throw / close) -------------------------
+    # Required so asyncio.run(db.execute(sql)) works: asyncio.Runner.run()
+    # calls asyncio.coroutines.iscoroutine() which checks for these methods.
+
+    def send(self, value):  # type: ignore[override]
+        return self._get_resolve_coro().send(value)
+
+    def throw(self, typ, val=None, tb=None):  # type: ignore[override]
+        if val is None:
+            return self._get_resolve_coro().throw(typ)
+        if tb is None:
+            return self._get_resolve_coro().throw(typ, val)
+        return self._get_resolve_coro().throw(typ, val, tb)
+
+    def close(self):  # type: ignore[override]
+        return self._get_resolve_coro().close()
+
     # ---- Awaitable interface -----------------------------------------------
 
     def __await__(self):  # type: ignore[override]
-        return self._resolve().__await__()
+        return self._get_resolve_coro().__await__()
 
     @property
     def rowcount(self) -> int:
@@ -334,6 +363,16 @@ class PostgresConnection:
 
     async def commit(self) -> None:
         """No-op: psycopg3 autocommit handles this."""
+
+    async def rollback(self) -> None:
+        """No-op: psycopg3 autocommit=True means each statement is its own
+        transaction; there is no pending transaction to roll back.
+
+        Callers that need atomicity on Postgres must use compensating actions
+        instead of relying on this no-op.  The method exists only so callers
+        written for aiosqlite (which has a real rollback) don't raise
+        AttributeError when running against the Postgres backend.
+        """
 
     async def close(self) -> None:
         await self._pool.close()
