@@ -256,10 +256,13 @@ data/chinampa_churchill.md
 .env.local
 CLAUDE.local.md
 
-meridian.toml
-*.toml
-!pixi.toml
-!.cliff.toml
+# Anchored to repo root only -- the previous bare `meridian.toml` + blanket
+# `*.toml` (with !pixi.toml/!.cliff.toml exceptions) silently blocked every
+# NEW .toml file anywhere in the repo (e.g. a new extension's pyproject.toml)
+# from being committed without -f, while already-tracked toml files were
+# unaffected (git doesn't retroactively ignore tracked files). The real
+# credentials file is only ever at the repo root.
+/meridian.toml
 CONNECT.txt
 
 # Local integration test artifacts (results only)
