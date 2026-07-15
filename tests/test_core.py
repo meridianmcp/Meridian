@@ -3782,6 +3782,7 @@ def test_http_set_sprint_writes_back_goal_md(client, tmp_path):
 # v0.6.5 — MERIDIAN_HOST / MERIDIAN_PORT env vars + /config endpoint
 # ---------------------------------------------------------------------------
 
+@pytest.mark.sqlite_only  # checks db=="memory"; on PG run MERIDIAN_DB_URL is set so db=="postgres"
 def test_config_endpoint_returns_version(client):
     r = client.get("/config")
     assert r.status_code == 200
@@ -4251,6 +4252,7 @@ def test_http_sprint_items_with_counts(client):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.sqlite_only  # checks db in {"memory","sqlite"}; on PG run MERIDIAN_DB_URL is set so db=="postgres"
 def test_config_endpoint_shape(client, monkeypatch):
     """GET /config exposes server_url + host + port + version + db."""
     monkeypatch.setenv("MERIDIAN_HOST", "127.0.0.1")
@@ -6827,6 +6829,7 @@ def test_admin_restart_requires_confirm(client):
     assert "disconnect all active sessions" in body.get("warning", "")
 
 
+@pytest.mark.sqlite_only  # guard only fires when MERIDIAN_DB_URL is absent; PG run sets it so no 400
 def test_admin_snapshot_memory_db_returns_400(client):
     """GET /admin/snapshot on an in-memory DB returns 400."""
     r = client.get("/admin/snapshot")
@@ -9063,6 +9066,7 @@ def test_demo_write_blocked_with_cookie(client):
     assert r.status_code == 403
 
 
+@pytest.mark.sqlite_only  # fallback to main DB only allowed when db_is_remote==False (SQLite); PG run returns 503
 def test_demo_read_returns_200_without_demo_db(client):
     """GET with meridian_demo cookie falls back to the regular DB when internal."""
     r = client.get("/projects", cookies={"meridian_demo": "1"})
