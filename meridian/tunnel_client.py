@@ -77,7 +77,7 @@ _PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
 # were failing the standard ~23s budget on a cold cache (live symptom:
 # "tunnel:ppt: pre-flight health check FAILED"). Give them the same extended budget.
 # 105e56b9 — docs/zotero also use uvx and trigger a cold venv build from a local
-# path (`uvx --from <local-path> meridian-docs` / `uvx zotero-mcp`), so they need
+# path (`uvx --from <local-path> meridian-docs-mcp` / `uvx zotero-mcp`), so they need
 # the same larger budget on a cold cache to avoid a spurious preflight FAILED.
 _COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc", "ppt", "word", "docs", "zotero"})
 

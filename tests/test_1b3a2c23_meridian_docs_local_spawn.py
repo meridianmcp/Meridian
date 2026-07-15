@@ -2,9 +2,16 @@
 
 meridian-docs is NOT published to PyPI. The bare `uvx meridian-docs` spawn
 command therefore fails immediately because uvx tries to fetch a nonexistent
-package from PyPI. Fix: use `uvx --from <local-path> meridian-docs` where
+package from PyPI. Fix: use `uvx --from <local-path> meridian-docs-mcp` where
 <local-path> is the extensions/meridian-docs directory in this repo, resolved
 relative to the meridian package via Path(__file__).parent.parent.
+
+58a044c7 — the entry-point is "meridian-docs-mcp" (not "meridian-docs") to avoid
+a second uvx failure mode: when the command name matches the package name exactly,
+uvx attempts a PyPI package registry lookup for the command after installing from
+the local path, which fails because "meridian-docs" is not on PyPI. A distinct
+entry-point name ("meridian-docs-mcp") is unambiguously a local script, not a
+package to fetch.
 
 Tests:
   (a) the command is a local-path uvx invocation, not bare `uvx meridian-docs`.
@@ -27,12 +34,18 @@ from meridian import tunnel_plugins as tp
 
 
 # ---------------------------------------------------------------------------
-# (a) Command form: must be uvx --from <path> meridian-docs, not bare uvx pkg
+# (a) Command form: must be uvx --from <path> meridian-docs-mcp, not bare uvx pkg
 # ---------------------------------------------------------------------------
 
 def test_meridian_docs_command_is_local_path_uvx():
-    """The meridian-docs spawn command must use --from <local-path>, not the bare
-    `uvx meridian-docs` form, because the package is not on PyPI (1b3a2c23)."""
+    """The meridian-docs spawn command must use --from <local-path> with the
+    'meridian-docs-mcp' entry point name (1b3a2c23, 58a044c7).
+
+    Two failure modes are avoided:
+    - bare `uvx meridian-docs` fails because the package is not on PyPI.
+    - `uvx --from <path> meridian-docs` fails because uvx treats the trailing
+      command name as a PyPI registry lookup when it matches the package name
+      exactly. Using 'meridian-docs-mcp' (a distinct name) fixes this."""
     by_name = {p["name"]: p for p in tp.BUILTIN_PLUGINS}
     assert "meridian-docs" in by_name
     cmd = by_name["meridian-docs"]["command"]
@@ -40,13 +53,20 @@ def test_meridian_docs_command_is_local_path_uvx():
     # Must be a list of strings (not a bare string).
     assert isinstance(cmd, list) and all(isinstance(t, str) for t in cmd)
 
-    # Form: ["uvx", "--from", "<path>", "meridian-docs"]
+    # Form: ["uvx", "--from", "<path>", "meridian-docs-mcp"]
     assert cmd[0] == "uvx", f"launcher must be uvx, got {cmd[0]!r}"
     assert cmd[1] == "--from", (
         "bare `uvx meridian-docs` fails (package not on PyPI); "
         f"expected '--from' at index 1, got {cmd[1]!r}"
     )
-    assert cmd[3] == "meridian-docs", f"entry-point must be 'meridian-docs', got {cmd[3]!r}"
+    # 58a044c7 — entry-point must be "meridian-docs-mcp", NOT "meridian-docs":
+    # the name-collision between package and command causes uvx to attempt a
+    # PyPI lookup for the command, which fails since the package is not on PyPI.
+    assert cmd[3] == "meridian-docs-mcp", (
+        f"entry-point must be 'meridian-docs-mcp' (not 'meridian-docs'); "
+        f"got {cmd[3]!r}. A name matching the package triggers a uvx PyPI lookup "
+        "that fails with 'meridian-docs was not found in the package registry'."
+    )
 
     # The --from value (cmd[2]) must reference the local extensions directory,
     # NOT a bare PyPI package name.
@@ -95,13 +115,19 @@ def test_meridian_docs_local_path_exists_on_disk():
 
 
 def test_meridian_docs_pyproject_declares_entry_point():
-    """The extensions/meridian-docs pyproject.toml must declare the meridian-docs
-    console script so `uvx --from <path> meridian-docs` resolves to an executable."""
+    """The extensions/meridian-docs pyproject.toml must declare the meridian-docs-mcp
+    console script so `uvx --from <path> meridian-docs-mcp` resolves to an executable.
+
+    58a044c7 — the entry-point was renamed from 'meridian-docs' to 'meridian-docs-mcp'
+    to avoid the uvx name-collision bug where a command name matching the package name
+    triggers a PyPI registry lookup."""
     pyproject = Path(tp._MERIDIAN_DOCS_LOCAL_PATH) / "pyproject.toml"
     text = pyproject.read_text(encoding="utf-8")
-    # [project.scripts] meridian-docs = "..."
-    assert "meridian-docs" in text, (
-        "pyproject.toml does not declare a 'meridian-docs' console script entry point"
+    # [project.scripts] meridian-docs-mcp = "..."
+    assert "meridian-docs-mcp" in text, (
+        "pyproject.toml does not declare a 'meridian-docs-mcp' console script entry point; "
+        "58a044c7 renamed the entry-point from 'meridian-docs' to 'meridian-docs-mcp' to "
+        "prevent the uvx package-name/command-name collision"
     )
 
 
@@ -157,4 +183,4 @@ def test_meridian_docs_enabled_true_resolves_to_installed_inactive():
     # Assert the command still uses the local --from form (override preserved shape).
     cmd = docs["command"]
     assert isinstance(cmd, list)
-    assert cmd[0] == "uvx" and cmd[1] == "--from" and cmd[3] == "meridian-docs"
+    assert cmd[0] == "uvx" and cmd[1] == "--from" and cmd[3] == "meridian-docs-mcp"

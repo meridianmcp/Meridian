@@ -20,7 +20,15 @@ version = "0.1.2"
 dependencies = ["mcp>=1.0"]
 
 [project.scripts]
-meridian-docs = "meridian_docs.server:main"
+# 58a044c7 — renamed from "meridian-docs" to "meridian-docs-mcp" to avoid the
+# uvx name-collision bug: `uvx --from <local-path> meridian-docs` fails with
+# "meridian-docs was not found in the package registry" because the command name
+# matches the package name exactly, causing uvx to attempt a PyPI lookup for the
+# command after installing from the local path. Using a distinct entry-point name
+# (`meridian-docs-mcp`) breaks the ambiguity: the `--from` still installs from
+# the local path, but `meridian-docs-mcp` is unambiguously a local script name,
+# not a PyPI package to fetch. The tunnel_client command is updated in lockstep.
+meridian-docs-mcp = "meridian_docs.server:main"
 
 [project.urls]
 Homepage = "https://usemeridian.us"
