@@ -1638,7 +1638,14 @@ async def merge_sprint_items(
     # 'skipped' — roll back the whole merge (including the survivor insert
     # above) rather than leave a half-merged state, since a merge is only
     # meaningful as an all-or-nothing operation.
-    for iid in item_ids:
+    #
+    # For SQLite (aiosqlite, autocommit=False): db.rollback() undoes everything
+    # atomically.  For Postgres (PostgresConnection, autocommit=True): rollback()
+    # is a no-op, so we apply compensating actions first — undo the source
+    # closures already committed and delete the survivor — then call rollback()
+    # (which is harmless on Postgres) for the SQLite path.
+    closed_so_far: list[tuple[str, str]] = []  # (item_id, original_status) pairs
+    for src, iid in zip(sources, item_ids):
         cursor = await db.execute(
             "UPDATE sprint_items SET status = 'skipped', completed_at = datetime('now'), "
             "merged_into = ? WHERE id = ? AND project_id = ? "
@@ -1647,11 +1654,28 @@ async def merge_sprint_items(
         )
         if cursor.rowcount == 0:
             _raced = await get_sprint_item(db, iid)
+            # Compensating actions for Postgres (autocommit=True): undo the
+            # source closures that already committed before this race was found,
+            # and delete the survivor that was inserted above.
+            if hasattr(db, "_pool"):
+                # Postgres path: each prior execute() already auto-committed.
+                for prev_iid, orig_status in closed_so_far:
+                    await db.execute(
+                        "UPDATE sprint_items SET status = ?, merged_into = NULL, "
+                        "completed_at = NULL WHERE id = ? AND project_id = ?",
+                        (orig_status, prev_iid, project_id),
+                    )
+                await db.execute(
+                    "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
+                    (survivor_id, project_id),
+                )
+            # SQLite path: rollback() undoes everything atomically.
             await db.rollback()
             raise ValueError(
                 f"cannot merge item '{iid}': status changed to "
                 f"'{(_raced or {}).get('status')}' before the merge could complete"
             )
+        closed_so_far.append((iid, src.get("status") or "pending"))
     await db.commit()
     _publish_project_event(project_id, "sprint_item_updated", {"merged_into": survivor_id})
     survivor = await get_sprint_item(db, survivor_id)
@@ -2076,16 +2100,24 @@ async def add_sprint_item_pointer(
 async def get_sprint_item_pointers(
     db: aiosqlite.Connection, sprint_item_id: str
 ) -> list[dict[str, Any]]:
-    """2976e168 — return all pointers on a sprint item (oldest first).
+    """2976e168 — return all pointers on a sprint item, ordered by id ASC.
 
     Each row's JSON ``targets`` column is deserialized back into a list, so the
     caller gets the full pointer shape plus its id / source_type / label /
     created_at.
+
+    Ordering note: we sort by ``id`` only (not ``created_at``) so that the
+    result order is byte-stable on *both* SQLite (second-granularity
+    ``datetime('now')``, where two inserts within one second produce identical
+    timestamps) and Postgres (microsecond ``clock_timestamp()``, where
+    ``created_at`` is never tied).  Using only ``id ASC`` gives a single
+    deterministic sort key across both dialects; tests can assert
+    ``ids == sorted(ids)`` unconditionally.
     """
     from ..pointers import row_to_pointer  # noqa: PLC0415
     async with db.execute(
         "SELECT * FROM sprint_item_pointers WHERE sprint_item_id = ? "
-        "ORDER BY created_at ASC, id ASC",
+        "ORDER BY id ASC",
         (sprint_item_id,),
     ) as cur:
         rows = await cur.fetchall()

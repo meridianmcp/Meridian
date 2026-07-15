@@ -3378,9 +3378,18 @@ async def search_tasks(
         # 82e0b887 — additively widen the candidate set with tsvector full-text
         # match so stemmed / morphological queries ("authenticating users" vs a
         # task "authentication for the user") also match. websearch_to_tsquery
-        # tolerates arbitrary user input without raising. similarity() still
-        # drives ordering (trigram score); ts_rank is a secondary tiebreak so
-        # rows matched purely by FTS (similarity 0) still order sensibly.
+        # tolerates arbitrary user input without raising. similarity() drives
+        # ordering (trigram score); ts_rank is a secondary tiebreak so rows
+        # matched purely by FTS still order sensibly.
+        #
+        # NOTE: similarity() is intentionally NOT used in the WHERE predicate.
+        # A low threshold (e.g. 0.05) caused false-positive matches for queries
+        # whose terms partially overlap the description — e.g. "authentication
+        # payments" matched "Fix the authentication bug in the login flow"
+        # because "authentication" contributes enough shared trigrams to exceed
+        # 0.05 even though "payments" is absent. The tsvector (AND) and ILIKE
+        # (per-term AND) predicates correctly enforce that the query terms must
+        # actually appear in the description; similarity is a ranking signal only.
         sql = (
             "SELECT t.id, t.description, t.status, t.created_at, "
             "s.name AS session_name, "
@@ -3388,8 +3397,7 @@ async def search_tasks(
             "FROM task_log t "
             "LEFT JOIN sessions s ON s.id = t.session_id "
             "WHERE t.project_id = ? "
-            "AND (similarity(t.description, ?) > 0.05 "
-            "OR to_tsvector('english', coalesce(t.description,'')) "
+            "AND (to_tsvector('english', coalesce(t.description,'')) "
             "@@ websearch_to_tsquery('english', ?) "
             f"OR {match_sql}) "
             "ORDER BY similarity DESC, "
@@ -3398,7 +3406,7 @@ async def search_tasks(
             "t.created_at DESC LIMIT ?"
         )
         params: tuple = (
-            query, project_id, query, query, *match_params, query, limit)
+            query, project_id, query, *match_params, query, limit)
     else:
         match_sql, match_params = _multiword_match_clause(["t.description"], query)
         sql = (
@@ -9155,14 +9163,18 @@ async def update_agent_task_status(
 ) -> dict[str, Any] | None:
     """Update the status (and optionally output) of an agent task."""
     output_json = json.dumps(output) if output is not None else None
+    # agent_tasks.updated_at is TIMESTAMPTZ on Postgres; the shared datetime('now')
+    # form is adapter-rewritten to a to_char(...) *text* expression, which Postgres
+    # refuses to implicitly cast into a timestamptz column. Same class as 6adba18c.
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
     if output_json is not None:
         await db.execute(
-            "UPDATE agent_tasks SET status=?, output=?, updated_at=datetime('now') WHERE id=?",
+            f"UPDATE agent_tasks SET status=?, output=?, updated_at={now_expr} WHERE id=?",
             (status, output_json, task_id),
         )
     else:
         await db.execute(
-            "UPDATE agent_tasks SET status=?, updated_at=datetime('now') WHERE id=?",
+            f"UPDATE agent_tasks SET status=?, updated_at={now_expr} WHERE id=?",
             (status, task_id),
         )
     await db.commit()
@@ -9217,8 +9229,11 @@ async def amend_handoff(
     if not rows:
         return None
     hid = rows[0]["id"]
+    # handoffs.created_at is TIMESTAMPTZ on Postgres; see update_agent_task_status
+    # for why the shared datetime('now') form breaks there.
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
     await db.execute(
-        "UPDATE handoffs SET body = ?, mode = ?, created_at = datetime('now') WHERE id = ?",
+        f"UPDATE handoffs SET body = ?, mode = ?, created_at = {now_expr} WHERE id = ?",
         (body, mode, hid),
     )
     await db.commit()

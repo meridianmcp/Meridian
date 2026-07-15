@@ -806,6 +806,7 @@ def test_admin_snapshot_missing_file_returns_500(client, monkeypatch, tmp_path):
     assert r.status_code == 500
 
 
+@pytest.mark.sqlite_only  # guard only fires when MERIDIAN_DB_URL is absent; PG run sets it so no 400
 def test_admin_snapshot_rejects_memory_db(client):
     """GET /admin/snapshot returns 400 for an in-memory DB (no file to read)."""
     r = client.get("/admin/snapshot")

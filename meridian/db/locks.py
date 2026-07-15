@@ -503,18 +503,37 @@ async def _claim_file_read(
         (normalized, session_id),
     ) as cur:
         existing = _row_to_dict(await cur.fetchone())
-    if existing:
-        await db.execute(
-            "UPDATE file_read_claims SET claimed_at = datetime('now'), "
-            "expires_at = datetime('now', ? || ' hours') WHERE id = ?",
-            (str(ttl_hours), existing["id"]),
-        )
-    else:
-        await db.execute(
-            "INSERT INTO file_read_claims (id, file_path, session_id, claimed_at, expires_at) "
-            "VALUES (?, ?, ?, datetime('now'), datetime('now', ? || ' hours'))",
-            (_new_id(), normalized, session_id, str(ttl_hours)),
-        )
+    # 949cf1e5 — file_read_claims.claimed_at/expires_at are TIMESTAMPTZ on
+    # Postgres (unlike every sibling lock table's TEXT columns), so the shared
+    # datetime('now', ...) form -- adapter-rewritten to a to_char(...) *text*
+    # expression -- fails with "column ... is of type timestamp with time zone
+    # but expression is of type text". Dialect-split like expire_file_read_claims.
+    if hasattr(db, "_pool"):  # Postgres — TIMESTAMPTZ columns
+        if existing:
+            await db.execute(
+                "UPDATE file_read_claims SET claimed_at = now(), "
+                "expires_at = now() + (? || ' hours')::interval WHERE id = ?",
+                (str(ttl_hours), existing["id"]),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO file_read_claims (id, file_path, session_id, claimed_at, expires_at) "
+                "VALUES (?, ?, ?, now(), now() + (? || ' hours')::interval)",
+                (_new_id(), normalized, session_id, str(ttl_hours)),
+            )
+    else:  # SQLite — TEXT columns
+        if existing:
+            await db.execute(
+                "UPDATE file_read_claims SET claimed_at = datetime('now'), "
+                "expires_at = datetime('now', ? || ' hours') WHERE id = ?",
+                (str(ttl_hours), existing["id"]),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO file_read_claims (id, file_path, session_id, claimed_at, expires_at) "
+                "VALUES (?, ?, ?, datetime('now'), datetime('now', ? || ' hours'))",
+                (_new_id(), normalized, session_id, str(ttl_hours)),
+            )
     await db.commit()
     readers = await _all_read_claims(db, normalized)
     return {
