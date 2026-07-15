@@ -250,6 +250,13 @@ def _call_mcp_tool(
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
+        # Cloudflare WAF (error 1010 / browser_signature_banned) blocks requests
+        # carrying Python's default "Python-urllib/3.x" User-Agent.  Every other
+        # Meridian client that hits usemeridian.us (meridian_connect.py,
+        # smoke_test_signup.py, test_live.py) explicitly sets a non-Python UA for
+        # exactly this reason.  This constant mirrors that pattern so that the
+        # ingest_local_document path is not blocked by the WAF.
+        "User-Agent": "meridian-local-ingest/1.0",
     }
     if tok:
         headers["Authorization"] = f"Bearer {tok}"

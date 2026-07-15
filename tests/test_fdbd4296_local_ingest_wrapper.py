@@ -185,6 +185,7 @@ class _FakeIngestHandler(BaseHTTPRequestHandler):
             "body": json.loads(body) if body else {},
             "auth": self.headers.get("Authorization", ""),
             "content_type": self.headers.get("Content-Type", ""),
+            "user_agent": self.headers.get("User-Agent", ""),
         })
         self.send_response(_FakeIngestHandler.response_status)
         self.send_header("Content-Type", "application/json")
@@ -346,6 +347,110 @@ class TestCallHostedIngest:
             server.shutdown()
         args = _FakeIngestHandler.received[0]["body"]["params"]["arguments"]
         assert args["source"] == "/path/to/file.docx"
+
+
+# ---------------------------------------------------------------------------
+# (b2) e40bc575 — User-Agent header must NOT be Python's default urllib string
+#
+# Cloudflare WAF (error 1010 / browser_signature_banned) blocks requests that
+# arrive with Python's default "Python-urllib/3.x" User-Agent.  The fix adds
+# "meridian-local-ingest/1.0" to _call_mcp_tool's headers so every call from
+# ingest_local_document / call_hosted_ingest / call_hosted_ingest_structure
+# passes the WAF.  Tests here use a real fake HTTP server (not a monkeypatched
+# urlopen) so the request's actual User-Agent header is captured and asserted.
+# ---------------------------------------------------------------------------
+
+class TestUserAgentHeader:
+    """e40bc575 — _call_mcp_tool must send a non-Python User-Agent to pass Cloudflare WAF."""
+
+    def test_call_hosted_ingest_sends_non_python_user_agent(self):
+        """call_hosted_ingest must NOT send Python's default urllib User-Agent.
+
+        Cloudflare's browser_signature_banned (error 1010) blocks requests carrying
+        "Python-urllib/..." — confirmed in scripts/smoke_test_signup.py comment.
+        The fixed _call_mcp_tool sets User-Agent: meridian-local-ingest/1.0.
+        """
+        _FakeIngestHandler.response_body = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "result": {"id": "note-ua-test"},
+        }).encode()
+        _FakeIngestHandler.response_status = 200
+        server, base_url = _start_fake_server()
+        try:
+            local_ingest.call_hosted_ingest(
+                project_id="p1", content="test content",
+                base_url=base_url, token="t",
+            )
+        finally:
+            server.shutdown()
+
+        assert len(_FakeIngestHandler.received) == 1
+        ua = _FakeIngestHandler.received[0]["user_agent"]
+        assert ua, "User-Agent header must be set (was empty)"
+        assert not ua.lower().startswith("python-urllib"), (
+            f"User-Agent must NOT be Python's default urllib string "
+            f"(Cloudflare WAF blocks it); got: {ua!r}"
+        )
+        assert "meridian" in ua.lower(), (
+            f"User-Agent should identify as a Meridian client; got: {ua!r}"
+        )
+
+    def test_call_hosted_ingest_structure_sends_non_python_user_agent(self):
+        """call_hosted_ingest_structure (the ingest_document_structure sibling)
+        also routes through _call_mcp_tool and must send the same non-Python UA."""
+        _FakeIngestHandler.response_body = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "document_id": "doc-ua-test",
+                        "source": "/path/to/test.docx",
+                        "doc_type": "docx",
+                        "element_count": 1,
+                    }),
+                }],
+            },
+        }).encode()
+        _FakeIngestHandler.response_status = 200
+        server, base_url = _start_fake_server()
+        try:
+            local_ingest.call_hosted_ingest_structure(
+                project_id="p1",
+                source="/path/to/test.docx",
+                blocks=[{"kind": "heading", "level": 1, "text": "Title"}],
+                base_url=base_url,
+                token="t",
+            )
+        finally:
+            server.shutdown()
+
+        assert len(_FakeIngestHandler.received) == 1
+        ua = _FakeIngestHandler.received[0]["user_agent"]
+        assert ua, "User-Agent header must be set (was empty)"
+        assert not ua.lower().startswith("python-urllib"), (
+            f"User-Agent must NOT be Python's default urllib string; got: {ua!r}"
+        )
+
+    def test_user_agent_value_is_meridian_local_ingest(self):
+        """Exact string check: the User-Agent must be 'meridian-local-ingest/1.0'
+        so Cloudflare does not WAF-block it (error 1010 / browser_signature_banned)."""
+        _FakeIngestHandler.response_body = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "result": {"id": "note-ua-exact"},
+        }).encode()
+        _FakeIngestHandler.response_status = 200
+        server, base_url = _start_fake_server()
+        try:
+            local_ingest.call_hosted_ingest(
+                project_id="p1", content="content", base_url=base_url, token="t"
+            )
+        finally:
+            server.shutdown()
+
+        ua = _FakeIngestHandler.received[0]["user_agent"]
+        assert ua == "meridian-local-ingest/1.0", (
+            f"Expected User-Agent 'meridian-local-ingest/1.0', got {ua!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
