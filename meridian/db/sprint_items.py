@@ -2076,16 +2076,24 @@ async def add_sprint_item_pointer(
 async def get_sprint_item_pointers(
     db: aiosqlite.Connection, sprint_item_id: str
 ) -> list[dict[str, Any]]:
-    """2976e168 — return all pointers on a sprint item (oldest first).
+    """2976e168 — return all pointers on a sprint item, ordered by id ASC.
 
     Each row's JSON ``targets`` column is deserialized back into a list, so the
     caller gets the full pointer shape plus its id / source_type / label /
     created_at.
+
+    Ordering note: we sort by ``id`` only (not ``created_at``) so that the
+    result order is byte-stable on *both* SQLite (second-granularity
+    ``datetime('now')``, where two inserts within one second produce identical
+    timestamps) and Postgres (microsecond ``clock_timestamp()``, where
+    ``created_at`` is never tied).  Using only ``id ASC`` gives a single
+    deterministic sort key across both dialects; tests can assert
+    ``ids == sorted(ids)`` unconditionally.
     """
     from ..pointers import row_to_pointer  # noqa: PLC0415
     async with db.execute(
         "SELECT * FROM sprint_item_pointers WHERE sprint_item_id = ? "
-        "ORDER BY created_at ASC, id ASC",
+        "ORDER BY id ASC",
         (sprint_item_id,),
     ) as cur:
         rows = await cur.fetchall()
