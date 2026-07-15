@@ -260,13 +260,24 @@ def _call_mcp_tool(
 
     headers: dict[str, str] = {
         "Content-Type": "application/json",
+        # Accept: prefer JSON but also allow SSE (Streamable HTTP).
         "Accept": "application/json, text/event-stream",
+        # Accept-Language: some WAFs check for a consistent browser-like header set;
+        # an absent Accept-Language combined with a non-browser UA can trigger
+        # additional fingerprinting blocks beyond the User-Agent check alone.
+        "Accept-Language": "en-US,en;q=0.9",
         # Cloudflare WAF (error 1010 / browser_signature_banned) blocks requests
         # carrying Python's default "Python-urllib/3.x" User-Agent.  Every other
         # Meridian client that hits usemeridian.us (meridian_connect.py,
         # smoke_test_signup.py, test_live.py) explicitly sets a non-Python UA for
         # exactly this reason.  This constant mirrors that pattern so that the
         # ingest_local_document path is not blocked by the WAF.
+        #
+        # NOTE (40d93549): if Cloudflare 1010 still recurs against a verifiably fresh
+        # process after these header additions, the remaining blocker is most likely TLS
+        # fingerprinting (JA3/JA3S) which cannot be spoofed by stdlib urllib (fixed
+        # OpenSSL defaults).  The proper fix would require curl_cffi or a similar
+        # client that can impersonate browser TLS — flag as a follow-up if needed.
         "User-Agent": "meridian-local-ingest/1.0",
     }
     if tok:
@@ -597,28 +608,36 @@ def ingest_local_document_structure(
     title: str | None = None,
     source: str | None = None,
     index_db_path: str | None = None,
+    force_hosted: bool = False,
     base_url: str | None = None,
     token: str | None = None,
 ) -> dict[str, Any]:
     """Parse a local .docx's structural content and persist it.
 
-    db42acce / c39ae092 — structural complement to :func:`ingest_local_document`.
-    Where that function can only forward plain text (populating the flat note
-    store), this function parses the REAL .docx binary locally (where the file
-    actually lives) to extract its structural tree (headings, figures, tables).
+    db42acce / c39ae092 / f8c7ffdc — structural complement to
+    :func:`ingest_local_document`.  Where that function can only forward plain
+    text (populating the flat note store), this function parses the REAL .docx
+    binary locally (where the file actually lives) to extract its structural
+    tree (headings, figures, tables).
 
-    TWO PATHS (c39ae092):
+    TWO PATHS — hosted routing is OPT-IN (f8c7ffdc):
 
-    1. LOCAL SIDECAR (preferred, no network) — when ``index_db_path`` is
+    1. LOCAL SIDECAR (DEFAULT, no network) — when ``index_db_path`` is
        supplied, structural elements are stored into the sidecar SQLite DB
        via ``docs_intel.index_docx_structure``.  This requires NO hosted call
        and is immune to Cloudflare 403 blocks.  ``project_id`` is still
        accepted for API compatibility but is not used in this path.
 
-    2. HOSTED POST (legacy fallback) — when ``index_db_path`` is None, the
-       blocks are forwarded to the hosted ``ingest_document_structure`` MCP
-       tool via an HTTP call (db42acce behaviour). This path is subject to
-       Cloudflare 403 if the caller's IP is blocked.
+    2. HOSTED POST (explicit opt-in only) — when ``index_db_path`` is None AND
+       ``force_hosted=True``, the blocks are forwarded to the hosted
+       ``ingest_document_structure`` MCP tool via an HTTP call (db42acce
+       behaviour).  This path is subject to Cloudflare 403 on blocked IPs and
+       the 100 KB body cap.
+
+       If ``index_db_path`` is None and ``force_hosted`` is False (the default),
+       a :class:`DocExtractionError` is raised rather than silently hitting the
+       hosted endpoint.  Pass ``force_hosted=True`` to explicitly opt in to the
+       hosted path when you genuinely have no local index DB.
 
     The ``source`` MUST match the source used in any prior
     :func:`ingest_local_document` call for the same file (default: ``path`` for
@@ -631,8 +650,11 @@ def ingest_local_document_structure(
       title:          Document title (optional).
       source:         Source key (defaults to ``path``).
       index_db_path:  Path to the local sidecar SQLite index.  When supplied,
-                      takes the LOCAL path (no network call).  When None, falls
-                      back to the hosted POST.
+                      the local-only path is taken (no network call).  Strongly
+                      preferred over the hosted path.
+      force_hosted:   Set to ``True`` to explicitly use the hosted POST path
+                      when ``index_db_path`` is None.  Default ``False`` — the
+                      hosted path is NEVER used unless explicitly opted in.
       base_url:       Override the Meridian server URL (hosted path only).
       token:          Override the API token (hosted path only).
 
@@ -645,10 +667,13 @@ def ingest_local_document_structure(
     Raises:
       FileNotFoundError:         if ``path`` does not exist.
       DocExtractionError:        if the file is not a valid .docx, or on
-                                 network/server errors (hosted path).
+                                 network/server errors (hosted path), or if
+                                 ``index_db_path`` is None and ``force_hosted``
+                                 is False (hosted routing not opted in).
       UnsupportedDocumentError:  for non-.docx inputs.
     """
-    # c39ae092: prefer local sidecar when index_db_path is supplied.
+    # c39ae092 / f8c7ffdc: local sidecar is the DEFAULT — take it whenever
+    # index_db_path is supplied.
     if index_db_path is not None:
         return ingest_local_document_structure_sidecar(
             path=path,
@@ -657,7 +682,21 @@ def ingest_local_document_structure(
             source=source,
         )
 
-    # Legacy hosted-POST path (db42acce).
+    # f8c7ffdc: hosted routing is NEVER the silent default.  The caller must
+    # explicitly opt in by passing force_hosted=True, otherwise we raise rather
+    # than silently hitting the hosted endpoint (which risks Cloudflare 1010,
+    # the 100 KB body cap, and unintended hosted-API usage from a local session).
+    if not force_hosted:
+        raise DocExtractionError(
+            "ingest_local_document_structure: hosted routing is opt-in only "
+            "(f8c7ffdc).  Supply index_db_path to use the local sidecar path "
+            "(recommended, no network call), or pass force_hosted=True to "
+            "explicitly use the hosted POST path.  Silently defaulting to the "
+            "hosted endpoint is intentionally blocked — it was causing "
+            "Cloudflare 1010 blocks and unexpected 100 KB body-cap errors."
+        )
+
+    # Explicit hosted-POST path (db42acce) — force_hosted=True was set.
     if not path or not str(path).strip():
         raise DocExtractionError("path must be a non-empty string")
     if not os.path.exists(path):

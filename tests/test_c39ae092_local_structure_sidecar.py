@@ -407,8 +407,30 @@ def test_ingest_local_document_structure_uses_sidecar_when_index_db_path_given(t
     assert result["local_path"] == str(docx_path)
 
 
-def test_ingest_local_document_structure_falls_back_to_hosted_when_no_index_db(tmp_path, monkeypatch):
-    """When index_db_path is None, the hosted POST path is still used (legacy)."""
+def test_ingest_local_document_structure_raises_when_no_index_db_and_no_force_hosted(tmp_path):
+    """f8c7ffdc — when index_db_path is None and force_hosted is False (default),
+    a DocExtractionError is raised rather than silently routing to hosted.
+    Hosted routing must be explicitly opted in via force_hosted=True."""
+    try:
+        from meridian_docs import local_ingest
+    except ImportError:
+        pytest.skip("meridian_docs not importable")
+
+    docx_path = tmp_path / "doc.docx"
+    docx_path.write_bytes(_make_docx())
+
+    with pytest.raises(local_ingest.DocExtractionError, match="hosted routing is opt-in only"):
+        local_ingest.ingest_local_document_structure(
+            path=str(docx_path),
+            project_id="proj-456",
+            index_db_path=None,
+            # force_hosted defaults to False — must raise
+        )
+
+
+def test_ingest_local_document_structure_uses_hosted_when_force_hosted_true(tmp_path, monkeypatch):
+    """f8c7ffdc — when force_hosted=True is explicitly set and index_db_path is None,
+    the hosted POST path IS used (explicit opt-in)."""
     try:
         from meridian_docs import local_ingest
     except ImportError:
@@ -429,9 +451,42 @@ def test_ingest_local_document_structure_falls_back_to_hosted_when_no_index_db(t
     result = local_ingest.ingest_local_document_structure(
         path=str(docx_path),
         project_id="proj-456",
-        index_db_path=None,  # no sidecar → hosted path
+        index_db_path=None,
+        force_hosted=True,  # explicit opt-in to hosted path
     )
 
-    assert len(calls) == 1, "hosted call must be made when index_db_path is None"
+    assert len(calls) == 1, "hosted call must be made when force_hosted=True"
     assert result["document_id"] == "mock-doc-id"
     assert result["blocks_forwarded"] > 0
+
+
+def test_call_mcp_tool_headers_include_accept_language(monkeypatch):
+    """40d93549 — _call_mcp_tool must include Accept-Language in its header set
+    as defensive WAF hardening (some WAFs trigger on missing standard headers
+    beyond just User-Agent)."""
+    try:
+        from meridian_docs import local_ingest
+    except ImportError:
+        pytest.skip("meridian_docs not importable")
+
+    captured_headers: list[dict] = []
+
+    def _mock_urlopen(req, timeout=None):
+        captured_headers.append(dict(req.headers))
+        raise local_ingest.DocExtractionError("mock stop")  # prevent actual network call
+
+    import unittest.mock as mock
+
+    with mock.patch("urllib.request.urlopen", side_effect=_mock_urlopen):
+        try:
+            local_ingest._call_mcp_tool("test_tool", {}, base_url="https://example.com", token="tok")
+        except local_ingest.DocExtractionError:
+            pass  # expected
+
+    assert captured_headers, "urlopen must have been called"
+    headers = captured_headers[0]
+    # Header keys are capitalised by urllib.request.Request
+    header_keys_lower = {k.lower() for k in headers}
+    assert "accept-language" in header_keys_lower, (
+        f"Accept-Language header missing from _call_mcp_tool request; got: {list(headers.keys())}"
+    )

@@ -22,6 +22,11 @@ from meridian.routes import tunnel as tn
 def _reset(tid: str) -> None:
     tn._tenant_owner_instance.pop(tid, None)
     tn._tunnel_sockets.pop(tid, None)
+    tn._tunnel_extract_sockets.pop(tid, None)
+    tn._tunnel_code_sockets.pop(tid, None)
+    tn._tunnel_ppt_sockets.pop(tid, None)
+    tn._tunnel_word_sockets.pop(tid, None)
+    tn._tunnel_dc_sockets.pop(tid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +215,102 @@ def test_do_proxy_plain_503_when_no_owner(monkeypatch):
         resp = asyncio.run(tn._do_proxy(
             tid, "POST", "/mcp", "", {}, None,
             tn._tunnel_sockets, tn._pending_reqs, "fs",
+        ))
+        assert resp.status_code == 503
+        assert resp.headers.get("fly-replay") is None
+        assert b"tunnel not connected" in resp.body
+    finally:
+        _reset(tid)
+
+
+# ---------------------------------------------------------------------------
+# 5f02a21c — extract / code / ppt / word / dc slot replay (the regression gap)
+#
+# af5b5739 only wired record_tenant_owner_instance in tunnel_ws (FS slot).
+# tunnel_extract_ws, tunnel_code_ws, and _serve_tunnel_ws (ppt/word/dc/docs/
+# zotero/custom) never populated _tenant_owner_instance, so cross-instance
+# misses on those slots fell through to a plain 503 with no fly-replay header
+# (the "connected but to a different server instance" error persisted even
+# though af5b5739 was marked done).  These tests cover the fix.
+# ---------------------------------------------------------------------------
+
+def test_extract_slot_replays_on_cross_instance_miss(monkeypatch):
+    """5f02a21c: extract slot _do_proxy emits fly-replay header when owner is a sibling."""
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    tid = "replay-extract"
+    try:
+        tn._tenant_owner_instance[tid] = "machine-sibling"
+        # No extract socket on this instance → miss.
+        resp = asyncio.run(tn._do_proxy(
+            tid, "POST", "/mcp", "", {}, None,
+            tn._tunnel_extract_sockets, tn._pending_extract_reqs, "extract",
+        ))
+        assert resp.status_code == 503
+        assert resp.headers.get("fly-replay") == "instance=machine-sibling"
+    finally:
+        _reset(tid)
+
+
+def test_code_slot_replays_on_cross_instance_miss(monkeypatch):
+    """5f02a21c: code slot _do_proxy emits fly-replay header when owner is a sibling."""
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    tid = "replay-code"
+    try:
+        tn._tenant_owner_instance[tid] = "machine-sibling"
+        resp = asyncio.run(tn._do_proxy(
+            tid, "POST", "/mcp", "", {}, None,
+            tn._tunnel_code_sockets, tn._pending_code_reqs, "code",
+        ))
+        assert resp.status_code == 503
+        assert resp.headers.get("fly-replay") == "instance=machine-sibling"
+    finally:
+        _reset(tid)
+
+
+def test_ppt_slot_replays_on_cross_instance_miss(monkeypatch):
+    """5f02a21c: ppt slot _do_proxy emits fly-replay header when owner is a sibling."""
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    tid = "replay-ppt"
+    try:
+        tn._tenant_owner_instance[tid] = "machine-sibling"
+        resp = asyncio.run(tn._do_proxy(
+            tid, "POST", "/mcp", "", {}, None,
+            tn._tunnel_ppt_sockets, tn._pending_ppt_reqs, "ppt",
+        ))
+        assert resp.status_code == 503
+        assert resp.headers.get("fly-replay") == "instance=machine-sibling"
+    finally:
+        _reset(tid)
+
+
+def test_record_owner_instance_called_by_all_slot_handlers(monkeypatch):
+    """5f02a21c: record_tenant_owner_instance sets a known owner so
+    fly_replay_target_for_id can produce a replay header for ANY slot,
+    not just the FS slot that af5b5739 originally wired."""
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    tid = "replay-multiregister"
+    try:
+        # Simulate an extract slot connect recording the owner.
+        tn.record_tenant_owner_instance(tid)
+        # _tenant_owner_instance is shared — a request for ANY slot can now replay.
+        assert tn.fly_replay_target_for_id(tid) is None  # we ARE the owner
+        # From a different (simulated) perspective: pretend the owner is a sibling.
+        tn._tenant_owner_instance[tid] = "machine-sibling"
+        assert tn.fly_replay_target_for_id(tid) == "instance=machine-sibling"
+    finally:
+        _reset(tid)
+
+
+def test_extract_slot_plain_503_when_owner_unknown(monkeypatch):
+    """5f02a21c: no fly-replay header when the extract-slot owner is unknown
+    (off Fly or no connect yet) — behaviour is unchanged for self-host."""
+    monkeypatch.delenv("FLY_MACHINE_ID", raising=False)
+    monkeypatch.delenv("FLY_ALLOC_ID", raising=False)
+    tid = "replay-extract-noowner"
+    try:
+        resp = asyncio.run(tn._do_proxy(
+            tid, "POST", "/mcp", "", {}, None,
+            tn._tunnel_extract_sockets, tn._pending_extract_reqs, "extract",
         ))
         assert resp.status_code == 503
         assert resp.headers.get("fly-replay") is None

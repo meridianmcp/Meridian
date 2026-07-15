@@ -977,7 +977,10 @@ async def test_generate_handoff_delta_with_in_progress(db, tmp_path):
     """Delta mode surfaces 'Currently running' for in_progress items."""
     p = await db_module.create_project(db, "alpha-delta-ip")
     await db_module.set_goal(db, p["id"], "delta work")
-    running = await db_module.add_sprint_item(db, p["id"], "v1", "Running item")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    running = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Running item", prospect_bypass=True
+    )
     await db_module.add_sprint_item(db, p["id"], "v1", "Pending item")
     await db_module.claim_sprint_item(db, p["id"], running["id"])
     _, content, _ = await handoff_module.generate_handoff(
@@ -1630,7 +1633,11 @@ async def _seed_session_with_items(db, project_name, n_listed, n_done):
     sid = sess["id"]
     items = []
     for i in range(n_listed):
-        it = await db_module.add_sprint_item(db, p["id"], "v1", f"item {i}")
+        # 94c26322 — prospect_bypass=True so the claim gate passes for these
+        # test-helper items which have no durable pointers (not testing the gate).
+        it = await db_module.add_sprint_item(
+            db, p["id"], "v1", f"item {i}", prospect_bypass=True
+        )
         await db_module.claim_sprint_item(db, p["id"], it["id"], actor=sid)
         items.append(it)
     for it in items[:n_done]:
@@ -1685,8 +1692,9 @@ async def test_goal_compliance_scoped_to_session(db):
     p = await db_module.create_project(db, "gc-scope")
     s1 = (await db_module.register_session(db, p["id"], "s1"))["id"]
     s2 = (await db_module.register_session(db, p["id"], "s2"))["id"]
-    a = await db_module.add_sprint_item(db, p["id"], "v1", "a")
-    b = await db_module.add_sprint_item(db, p["id"], "v1", "b")
+    # 94c26322 — prospect_bypass=True so claim gate passes (not testing the gate here)
+    a = await db_module.add_sprint_item(db, p["id"], "v1", "a", prospect_bypass=True)
+    b = await db_module.add_sprint_item(db, p["id"], "v1", "b", prospect_bypass=True)
     await db_module.claim_sprint_item(db, p["id"], a["id"], actor=s1)
     await db_module.complete_sprint_item(db, p["id"], a["id"], actor=s1)
     await db_module.claim_sprint_item(db, p["id"], b["id"], actor=s2)  # other session, still pending

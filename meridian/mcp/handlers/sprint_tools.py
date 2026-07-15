@@ -343,6 +343,12 @@ async def handle_update_sprint_item(
     # pass "" / null to clear (no name), or a non-empty string to set.
     if "sprint_name" in args:
         _patch_kwargs["sprint_name"] = args.get("sprint_name")
+    # 94c26322 — set/clear prospect_bypass. Only forward when the caller supplied
+    # the key (_UNSET sentinel). True/1 sets the bypass (human override allowing
+    # an unprospected item through the goal-generation and claim safety gates);
+    # False/0/null clears it (re-enables the structural gate).
+    if "prospect_bypass" in args:
+        _patch_kwargs["prospect_bypass"] = args.get("prospect_bypass")
     try:
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"], **_patch_kwargs

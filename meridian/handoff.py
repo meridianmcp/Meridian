@@ -32,6 +32,7 @@ import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from . import db as db_module
+from .db.sprint_items import _item_is_unprospected
 from .executor_config import build_executor_config_block, has_executor_config
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -544,6 +545,44 @@ def _build_quick_start_goal(
         it for it in pending_sprint_items if not _is_manual_sprint_item(it)
     ]
     _manual_note = _build_manual_todo_note(_manual_items)
+    # 94c26322 — STRUCTURAL PROSPECTING GATE: an item with no real prospecting
+    # evidence (no code_pointers / pointers, no confirmed prospect_status) MUST
+    # NOT be silently included in the auto-run claimable batch. The ONLY exception
+    # is an explicit human-set bypass flag (prospect_bypass=True on the item).
+    # Without evidence AND without bypass: the item is excluded here AND surfaced
+    # as a visible, structured warning in the /goal output — NOT buried prose.
+    # This is the same class of fix as dec69708 (deferred_until enforcement):
+    # a mechanism already existed (prospecting_status / code_pointers), it just
+    # wasn't wired into the one place that makes it protective (goal generation).
+    _excluded_unprospected: list[dict[str, Any]] = []
+    _included_sprint_items: list[dict[str, Any]] = []
+    for _it in pending_sprint_items:
+        _has_bypass = bool(_it.get("prospect_bypass"))
+        # 94c26322 — enrichment_failure_only=True: only exclude items that went
+        # through enrichment and got an explicit failure status. Items that have
+        # never been enriched (no prospect_status) are left in the batch — they
+        # are "not yet tried", not "confirmed failures". This prevents the gate
+        # from blocking plain DB items or items added before enrichment runs.
+        if _has_bypass or not _item_is_unprospected(_it, enrichment_failure_only=True):
+            _included_sprint_items.append(_it)
+        else:
+            _excluded_unprospected.append(_it)
+    pending_sprint_items = _included_sprint_items
+    # Build the structured exclusion note — empty string when nothing excluded.
+    _excluded_unprospected_note = ""
+    if _excluded_unprospected:
+        _exc_ids = ", ".join(it["id"] for it in _excluded_unprospected if it.get("id"))
+        _exc_n = len(_excluded_unprospected)
+        _excluded_unprospected_note = (
+            f'\n<excluded_unprospected count="{_exc_n}">'
+            f"{_xml_escape(_exc_ids)}"
+            "</excluded_unprospected>"
+            "\n<!-- These items were excluded from the auto-run claimable batch "
+            "because they have no prospecting evidence (no code_pointers, no "
+            "confirmed prospect_status). To include one anyway, a human/planning "
+            "session must call update_sprint_item(item_id=..., prospect_bypass=true). "
+            "Executors must NOT set prospect_bypass themselves. -->"
+        )
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     if not item_ids:
         # 5abf3e12 — empty-board branch: same constraints as before (verify,
@@ -562,6 +601,7 @@ def _build_quick_start_goal(
             f"<stop_conditions>Stop after {_turns} turns "
             f"{_xml_escape(_hitl_clause)}</stop_conditions>"
             f"{_manual_note}"
+            f"{_excluded_unprospected_note}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -700,6 +740,7 @@ def _build_quick_start_goal(
         f"{_xml_escape(_hitl_clause)}</stop_conditions>"
         f"{_type_clause}"
         f"{_manual_note}"
+        f"{_excluded_unprospected_note}"
     )
 
 

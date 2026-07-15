@@ -35,6 +35,47 @@ Hosted tier (no install):
 
 Project ID lives in `CLAUDE.local.md`. Docs: https://docs.usemeridian.us
 
+### Auto-scoping to a single project (64b9907a)
+
+When a repo always works on one project, configure a default project_id so
+`start_session(session_name="...")` works without repeating the id on every call.
+
+**Option A — `meridian.toml` (recommended for self-hosted repos):**
+
+```toml
+[project]
+project_id = "5787cc92-ba7d-4788-b17c-28ab7938b839"
+```
+
+Add to the existing `meridian.toml` at the repo root (or create one).  The
+`[default]`, `[connections.*]`, and `[project]` sections coexist freely.
+
+**Option B — environment variable (CI, containers, MCP env block):**
+
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
+      "env": {
+        "BEARER_TOKEN": "sk_meridian_YOUR_TOKEN",
+        "MERIDIAN_PROJECT_ID": "5787cc92-ba7d-4788-b17c-28ab7938b839"
+      }
+    }
+  }
+}
+```
+
+Once either is set, this one-liner starts a tracked session:
+
+```python
+start_session(session_name="describe-what-youre-doing")
+```
+
+The env var takes precedence over the toml value.  An explicit `project_id`
+or `project_name` argument always wins over both.
+
 ### Context7 (library/framework docs MCP)
 
 Context7 (by Upstash) indexes React, Tailwind, Next.js, and thousands of other

@@ -263,6 +263,40 @@ def get_context_refresh_config() -> dict[str, Any]:
     }
 
 
+def get_default_project_id() -> str | None:
+    """Return the workspace-default project_id for this self-host install.
+
+    Precedence (env first, same as all other toml readers):
+
+        1. ``MERIDIAN_PROJECT_ID`` env var — set in shell, container, or MCP
+           server env block to pin every unscoped session to one project.
+        2. ``[project]`` table in meridian.toml — the canonical file-based
+           config for "I work on one project and don't want to pass project_id
+           on every call":
+
+           .. code-block:: toml
+
+               [project]
+               project_id = "5787cc92-ba7d-4788-b17c-28ab7938b839"
+
+           Drop this section to revert to explicit project_id per call.
+
+    Returns the id string when found and non-empty, else None (caller decides
+    whether to surface an error or allow explicit override).
+
+    Consumed by :func:`handle_start_session` as a last-resort fallback when
+    neither ``project_id`` nor ``project_name`` are supplied by the caller.
+    """
+    env_val = os.environ.get("MERIDIAN_PROJECT_ID", "").strip()
+    if env_val:
+        return env_val
+    proj = _read_table("project")
+    toml_val = str(proj.get("project_id") or "").strip()
+    if toml_val:
+        return toml_val
+    return None
+
+
 def get_self_host_defaults() -> dict[str, Any]:
     """Return misc self-host default seeds (env > toml > hardcoded default).
 

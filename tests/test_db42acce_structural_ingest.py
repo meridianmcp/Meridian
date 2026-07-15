@@ -285,10 +285,13 @@ def test_ingest_document_structure_requires_source_and_blocks(tmp_path, monkeypa
 # ---------------------------------------------------------------------------
 
 def test_ingest_local_document_structure_parses_docx_and_calls_hosted(tmp_path, monkeypatch):
-    """Verifies the tunnel-local function:
+    """Verifies the tunnel-local function with explicit force_hosted=True (f8c7ffdc):
     1. Reads the .docx via document_content_tree.
     2. Calls call_hosted_ingest_structure with the blocks.
     Mocks out the HTTP call to avoid needing a real server.
+
+    Note (f8c7ffdc): force_hosted=True is now REQUIRED to use the hosted path;
+    callers that omit index_db_path without force_hosted=True get a DocExtractionError.
     """
     import sys
     import os
@@ -335,6 +338,7 @@ def test_ingest_local_document_structure_parses_docx_and_calls_hosted(tmp_path, 
         path=str(docx_path),
         project_id="test-project-id",
         title="Test Document",
+        force_hosted=True,  # f8c7ffdc: must explicitly opt in to hosted path
     )
 
     # Verify call was made with the right arguments.
@@ -353,7 +357,8 @@ def test_ingest_local_document_structure_parses_docx_and_calls_hosted(tmp_path, 
 
 
 def test_ingest_local_document_structure_rejects_non_docx(tmp_path):
-    """Only .docx files are supported — .pdf and .txt are rejected clearly."""
+    """Only .docx files are supported — .pdf and .txt are rejected clearly.
+    force_hosted=True is required to reach file-type validation (f8c7ffdc)."""
     import sys, os
     ext_path = os.path.join(
         os.path.dirname(__file__), "..", "extensions", "meridian-docs"
@@ -368,17 +373,22 @@ def test_ingest_local_document_structure_rejects_non_docx(tmp_path):
     pdf_path.write_bytes(b"%PDF-1.4 fake pdf content")
 
     with pytest.raises(local_ingest.UnsupportedDocumentError):
-        local_ingest.ingest_local_document_structure(str(pdf_path), "proj-id")
+        local_ingest.ingest_local_document_structure(
+            str(pdf_path), "proj-id", force_hosted=True
+        )
 
     txt_path = tmp_path / "doc.txt"
     txt_path.write_text("some text")
 
     with pytest.raises(local_ingest.UnsupportedDocumentError):
-        local_ingest.ingest_local_document_structure(str(txt_path), "proj-id")
+        local_ingest.ingest_local_document_structure(
+            str(txt_path), "proj-id", force_hosted=True
+        )
 
 
 def test_ingest_local_document_structure_raises_on_missing_file(tmp_path):
-    """FileNotFoundError when the path does not exist."""
+    """FileNotFoundError when the path does not exist.
+    force_hosted=True is required to reach file-existence validation (f8c7ffdc)."""
     import sys, os
     ext_path = os.path.join(
         os.path.dirname(__file__), "..", "extensions", "meridian-docs"
@@ -391,5 +401,5 @@ def test_ingest_local_document_structure_raises_on_missing_file(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         local_ingest.ingest_local_document_structure(
-            str(tmp_path / "nonexistent.docx"), "proj-id"
+            str(tmp_path / "nonexistent.docx"), "proj-id", force_hosted=True
         )
