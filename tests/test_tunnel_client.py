@@ -2271,3 +2271,141 @@ def test_update_notice_minor_and_major_bumps():
     assert tc._update_notice("0.1.6", "0.2.0") is not None   # minor
     assert tc._update_notice("0.9.9", "1.0.0") is not None   # major
     assert tc._update_notice("1.0.0", "1.0.1") is not None   # patch
+
+
+# ---------------------------------------------------------------------------
+# 105b5aa9 — ensure_running pre-spawn port-occupancy check
+# ---------------------------------------------------------------------------
+
+class _FakeProc:
+    """Minimal Popen stand-in for ensure_running tests."""
+    def __init__(self):
+        self.pid = 12345
+    def poll(self):
+        return None  # alive
+
+
+async def _run_ensure(proxy):
+    """Helper: run ensure_running in a fresh event loop."""
+    await proxy.ensure_running()
+
+
+def _run_sync(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def test_ensure_running_spawns_when_port_is_free(monkeypatch):
+    """105b5aa9 — when the port is free, ensure_running proceeds to Popen as
+    usual (the port-occupancy check path is transparent on a clean port)."""
+    spawned = []
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9200"], 9200, "test", client_id="cl-1")
+    _run_sync(_run_ensure(proxy))
+
+    assert len(spawned) == 1
+    assert proxy.is_running
+
+
+def test_ensure_running_kills_orphan_then_spawns(monkeypatch):
+    """105b5aa9 — when the port is occupied by an orphan (no live-client claim),
+    ensure_running calls _kill_stale_port_occupant, then spawns normally."""
+    spawned = []
+    kill_calls = []
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: True)
+    monkeypatch.setattr(tc, "_is_slot_claimed_by_live_client", lambda port, cid: False)
+    monkeypatch.setattr(
+        tc, "_kill_stale_port_occupant",
+        lambda port, label, current_client_id="": kill_calls.append((port, label)),
+    )
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9201"], 9201, "fs", client_id="cl-2")
+    _run_sync(_run_ensure(proxy))
+
+    assert kill_calls == [(9201, "fs")]
+    assert len(spawned) == 1
+
+
+def test_ensure_running_refuses_live_client_port(monkeypatch, capsys):
+    """105b5aa9 — when the port is held by a DIFFERENT still-live tunnel client,
+    ensure_running must NOT kill it and must NOT spawn; it logs an error and
+    returns without a Popen call."""
+    spawned = []
+    kill_calls = []
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: True)
+    monkeypatch.setattr(tc, "_is_slot_claimed_by_live_client", lambda port, cid: True)
+    monkeypatch.setattr(
+        tc, "_kill_stale_port_occupant",
+        lambda port, label, current_client_id="": kill_calls.append(port),
+    )
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9202"], 9202, "code", client_id="cl-3")
+    _run_sync(_run_ensure(proxy))
+
+    assert kill_calls == [], "must NOT kill a live-client-owned port"
+    assert spawned == [], "must NOT spawn when port is live-client-owned"
+    captured = capsys.readouterr()
+    assert "live tunnel client" in captured.err
+
+
+def test_ensure_running_no_double_spawn_under_concurrent_requests(monkeypatch):
+    """105b5aa9 / lock semantics — if two coroutines race to ensure_running on a
+    free port, only one Popen is issued (the asyncio.Lock prevents double-spawn)."""
+    import asyncio as _asyncio
+
+    spawn_count = [0]
+
+    def fake_popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        return _FakeProc()
+
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9203"], 9203, "test2", client_id="cl-4")
+
+    async def _run_two():
+        await _asyncio.gather(proxy.ensure_running(), proxy.ensure_running())
+
+    loop = _asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_run_two())
+    finally:
+        loop.close()
+
+    assert spawn_count[0] == 1, f"expected 1 spawn, got {spawn_count[0]}"
+
+
+def test_ensure_running_noop_when_already_running(monkeypatch):
+    """105b5aa9 / regression — a slot that is_running skips the port check and
+    Popen entirely (no spurious kills on a healthy slot)."""
+    kill_calls = []
+    spawned = []
+    monkeypatch.setattr(
+        tc, "_kill_stale_port_occupant",
+        lambda port, label, current_client_id="": kill_calls.append(port),
+    )
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9204"], 9204, "fs2")
+    # Seed a fake live proc so is_running is True from the start.
+    proxy._proc = _FakeProc()
+    proxy.holder["proc"] = proxy._proc
+
+    _run_sync(_run_ensure(proxy))
+
+    assert kill_calls == []
+    assert spawned == []

@@ -346,6 +346,33 @@ class SlotProxy:
         Uses an asyncio.Lock to avoid double-spawning under concurrent first
         requests. Prints a startup message so the user can see when the lazy
         spawn fires. Non-blocking if the process is already alive.
+
+        105b5aa9 — port-occupancy check before every Popen.  The startup
+        scan in ``run_tunnel`` calls ``_kill_stale_port_occupant`` once, up
+        front, for each registered slot. But there is a window between that
+        scan and the first lazy spawn (and again after every idle-kill) where
+        a previously-unseen process can re-occupy the port. Without a check
+        here, ``Popen`` silently succeeds (it is spawning mcp-proxy, NOT the
+        inner MCP server), the inner server later fails to bind, and the slot
+        ends up in an EADDRINUSE-loop that never self-heals.
+
+        The pre-spawn logic is:
+
+        1. If the port is already open AND the occupant is legitimately owned
+           by a DIFFERENT, still-live tunnel client → fail loud and abort the
+           spawn so the operator knows there is a real conflict. Do NOT kill a
+           process that belongs to a peer.
+
+        2. If the port is open but owned by an orphan (no live-client claim,
+           or no claim file at all) → call ``_kill_stale_port_occupant`` to
+           clear it, then proceed with the spawn as normal.
+
+        3. Port is free → proceed immediately (the common path).
+
+        All of this is best-effort: ``_kill_stale_port_occupant`` never raises
+        (it swallows psutil / permission errors gracefully), and a kill that
+        itself fails just leaves the Popen to surface the EADDRINUSE as a
+        legible exception rather than a silent zombie loop.
         """
         if self.is_running:
             return
@@ -354,6 +381,27 @@ class SlotProxy:
             # while we were waiting.
             if self.is_running:
                 return
+
+            # 105b5aa9 — check port occupancy right before spawning so we
+            # never blindly double-spawn into an already-bound port.
+            if _port_is_open(self.port):
+                if _is_slot_claimed_by_live_client(self.port, self.client_id):
+                    # Port is held by a peer tunnel — do NOT kill it; fail
+                    # loud so the operator can see the conflict clearly instead
+                    # of getting a silent EADDRINUSE-loop.
+                    print(
+                        f"tunnel:{self.label}: port {self.port} is already occupied "
+                        "by a live tunnel client — cannot spawn; resolve the port "
+                        "conflict before restarting",
+                        file=sys.stderr, flush=True,
+                    )
+                    return
+                # Orphaned occupant — clear it so the fresh Popen gets a
+                # clean port. _kill_stale_port_occupant is best-effort and
+                # never raises; if it cannot kill the occupant the Popen below
+                # will surface a legible EADDRINUSE exception.
+                _kill_stale_port_occupant(self.port, self.label, current_client_id=self.client_id)
+
             print(
                 f"tunnel:{self.label}: spawning proxy (first request / after idle kill) "
                 f"on port {self.port}",
