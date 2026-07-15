@@ -117,6 +117,29 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
 
     Returns ``(pg_sql, pg_params_list)``.  Uses %s placeholders (psycopg3).
     """
+    # 0. Translate SQLite-only INSERT OR IGNORE / INSERT OR REPLACE to PG equivalents
+    #    BEFORE any other rewriting so downstream steps never see the SQLite syntax.
+    #
+    #    INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
+    #    INSERT OR REPLACE → INSERT ... ON CONFLICT DO NOTHING
+    #
+    #    Both forms are "best-effort upserts" in the codebase (locked behind try/except);
+    #    DO NOTHING is always correct for OR IGNORE, and for OR REPLACE we fall back to
+    #    DO NOTHING too since the tables that use it (oauth_codes, oauth_clients, file_patch_counters)
+    #    have a primary-key constraint — the conflict target is the primary key, and a plain
+    #    DO NOTHING is semantically equivalent to "skip if already present", which matches
+    #    the caller intent (idempotent insert / re-use existing row is fine).
+    #    For a true upsert, callers should use explicit ON CONFLICT DO UPDATE.
+    _had_or_ignore = bool(re.search(r"\bINSERT\s+OR\s+IGNORE\b", sql, re.IGNORECASE))
+    _had_or_replace = bool(re.search(r"\bINSERT\s+OR\s+REPLACE\b", sql, re.IGNORECASE))
+    if _had_or_ignore:
+        sql = re.sub(r"\bINSERT\s+OR\s+IGNORE\b", "INSERT", sql, flags=re.IGNORECASE)
+    if _had_or_replace:
+        sql = re.sub(r"\bINSERT\s+OR\s+REPLACE\b", "INSERT", sql, flags=re.IGNORECASE)
+    if _had_or_ignore or _had_or_replace:
+        # Append ON CONFLICT DO NOTHING before any trailing semicolon / whitespace
+        sql = re.sub(r";?\s*$", " ON CONFLICT DO NOTHING", sql.rstrip())
+
     # 1. Escape literal % used in LIKE patterns BEFORE replacing ? → %s
     #    so LIKE '%foo%' becomes LIKE '%%foo%%' (psycopg3 treats % as placeholder)
     sql = re.sub(r"'([^']*%[^']*)'", lambda m: "'" + m.group(1).replace("%", "%%") + "'", sql)
@@ -424,7 +447,12 @@ class PostgresConnection:
             conn = await self._pool.getconn()
             async with conn.cursor(row_factory=_dict_row_factory) as cur:
                 await cur.execute(pg_sql, pg_params if pg_params else None)
-                if q_upper.startswith(("SELECT", "WITH")):
+                # Fetch rows when the statement returns data: SELECTs and
+                # any DML (UPDATE/INSERT/DELETE) with a RETURNING clause.
+                _returns_rows = q_upper.startswith(("SELECT", "WITH")) or (
+                    "RETURNING" in pg_sql.upper()
+                )
+                if _returns_rows:
                     rows = await cur.fetchall()
                     result = _PgCursor(rows, len(rows))
                 else:
@@ -610,7 +638,10 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- Meridian. Distinct from milestone_type='human'; excluded from executor scoping.
     blocker_kind TEXT,
     -- 58a45b92: stored, deterministic wave label (e.g. 'wave-1'); NULL = unassigned.
-    wave TEXT
+    wave TEXT,
+    -- 3d6bd938: separate human-readable sprint name from the structural version
+    -- identifier (mirrors SQLite). Nullable — legacy rows are NULL.
+    sprint_name TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -2434,6 +2465,30 @@ async def _migrate_pg_registered_hostnames(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_redis_overage_fields(conn: PostgresConnection) -> None:
+    """342dd15f — per-tenant Redis command budget for the send_message
+    push-augmentation path.
+
+    Mirrors db.migrations._migrate_redis_overage_fields for Postgres. Two new
+    tenants columns:
+      - redis_commands_used   NUMERIC(14,0)  current-month Upstash PUBLISH
+                                             counter; reset monthly alongside
+                                             compute_cu_hours_used.
+      - redis_overage_cap_usd NUMERIC(8,2)   optional operator override; NULL
+                                             means code-defined defaults apply
+                                             ($1 warn / $2 disable / $4 alert).
+
+    ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
+    Hosted-only (main auth DB, tenants table).
+    """
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+        "redis_commands_used NUMERIC(14,0) DEFAULT 0;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+        "redis_overage_cap_usd NUMERIC(8,2)"
+    )
+
+
 async def _migrate_pg_file_docx_region_claims(conn: PostgresConnection) -> None:
     """Create file_docx_region_claims table on existing Postgres DBs. Was
     missing from the PG schema entirely, so claim_docx_region/get_docx_region_
@@ -2452,6 +2507,45 @@ async def _migrate_pg_file_docx_region_claims(conn: PostgresConnection) -> None:
         f");"
         f"CREATE INDEX IF NOT EXISTS idx_docx_region_claims_file ON file_docx_region_claims (file_path);"
         f"CREATE INDEX IF NOT EXISTS idx_docx_region_claims_session ON file_docx_region_claims (session_id);"
+    )
+
+
+async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> None:
+    """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
+
+    Creates the sprint_version_descriptions table on existing Postgres DBs.
+    Each (project_id, version) pair carries an auto-generated concise description
+    summarising what that sprint bucket is about. Seeded and refreshed by
+    add_sprint_item in sprint_items.py. CREATE TABLE / CREATE UNIQUE INDEX IF NOT
+    EXISTS → idempotent. Mirrors db.migrations._migrate_sprint_version_descriptions.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sprint_version_descriptions ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    version TEXT NOT NULL,"
+        "    description TEXT NOT NULL,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sprint_version_desc_pv "
+        "ON sprint_version_descriptions(project_id, version)"
+    )
+
+
+async def _migrate_pg_workspace_settings_active_session_threshold(
+    conn: PostgresConnection,
+) -> None:
+    """6e0e5cea — configurable active-executor-session warning threshold.
+
+    Adds ``active_session_warning_minutes`` to workspace_settings on existing
+    Postgres DBs. Default 10 matches the previously hardcoded 600-second constant
+    used by _active_executor_session_warnings in handler.py.
+
+    Mirrors db.migrations._migrate_workspace_settings_active_session_threshold.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "active_session_warning_minutes INTEGER NOT NULL DEFAULT 10"
     )
 
 
@@ -2501,6 +2595,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_tunnel_plugins_by_host,
     _migrate_pg_feedback,
     _migrate_pg_registered_hostnames,
+    _migrate_pg_redis_overage_fields,
 )
 
 async def _migrate_pg_decision_code_anchor(conn: PostgresConnection) -> None:
@@ -2900,6 +2995,85 @@ async def _migrate_pg_session_activity(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_connection_events(conn: PostgresConnection) -> None:
+    """b12cc29f — connection_events: per-/mcp-request auth+method event log.
+
+    Every HTTP POST /mcp the server actually receives is recorded here so a
+    live or post-mortem client-side outage (Claude Desktop showing zero tools,
+    auth failures) can be diagnosed without raw Fly.io log access.
+    Mirrors db._migrate_connection_events. Idempotent via CREATE TABLE IF NOT
+    EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS connection_events ("
+        "    id TEXT PRIMARY KEY,"
+        "    tenant_id TEXT,"
+        "    method TEXT NOT NULL DEFAULT '',"
+        "    auth_result TEXT NOT NULL DEFAULT 'unknown',"
+        "    tools_returned INTEGER,"
+        "    client_user_agent TEXT,"
+        "    response_status INTEGER NOT NULL DEFAULT 200,"
+        f"    recorded_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_connection_events_tenant "
+        "ON connection_events(tenant_id, recorded_at DESC)"
+    )
+
+
+async def _migrate_pg_sprint_item_sprint_name(conn: PostgresConnection) -> None:
+    """3d6bd938 — separate human-readable sprint name from the structural version field.
+
+    version stays a semver-like structural identifier (e.g. 'v0.2.x');
+    sprint_name is a nullable free-text label for the bucket (e.g.
+    'docs-cloudflare'). ADD COLUMN IF NOT EXISTS -> idempotent.
+    Mirrors db._migrate_sprint_item_sprint_name.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS sprint_name TEXT"
+    )
+
+
+async def _migrate_pg_proposal_slug_nickname(conn: PostgresConnection) -> None:
+    """6fb48898 — workspace_proposals.slug + .nickname: human-referenceable
+    secondary keys derived from the proposal title at creation time.
+
+    Mirrors db._migrate_proposal_slug_nickname. ADD COLUMN IF NOT EXISTS is
+    idempotent; both columns are nullable so existing rows are unaffected.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS slug TEXT;"
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS nickname TEXT"
+    )
+
+
+async def _migrate_pg_decision_slug_nickname(conn: PostgresConnection) -> None:
+    """6fb48898 — decisions_pinned.slug + .nickname: human-referenceable
+    secondary keys derived from the decision title at creation time.
+
+    Mirrors db._migrate_decision_slug_nickname. ADD COLUMN IF NOT EXISTS is
+    idempotent; both columns are nullable so existing rows are unaffected.
+    """
+    await conn.executescript(
+        "ALTER TABLE decisions_pinned ADD COLUMN IF NOT EXISTS slug TEXT;"
+        "ALTER TABLE decisions_pinned ADD COLUMN IF NOT EXISTS nickname TEXT"
+    )
+
+
+async def _migrate_pg_note_nickname(conn: PostgresConnection) -> None:
+    """6fb48898 — project_notes.nickname: short memorable secondary key to
+    complement the existing slug column.
+
+    project_notes already has slug (added by _migrate_pg_note_slug). This adds
+    the companion nickname column matching the sprint_items pattern.
+
+    Mirrors db._migrate_note_nickname. ADD COLUMN IF NOT EXISTS is idempotent;
+    nullable so existing rows are unaffected.
+    """
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS nickname TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2967,4 +3141,11 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_resources_amended,
     _migrate_pg_session_activity,
     _migrate_pg_file_docx_region_claims,
+    _migrate_pg_connection_events,
+    _migrate_pg_sprint_version_descriptions,
+    _migrate_pg_workspace_settings_active_session_threshold,
+    _migrate_pg_sprint_item_sprint_name,
+    _migrate_pg_proposal_slug_nickname,
+    _migrate_pg_decision_slug_nickname,
+    _migrate_pg_note_nickname,
 )

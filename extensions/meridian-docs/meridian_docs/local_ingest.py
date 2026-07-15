@@ -31,6 +31,16 @@ locally-stored .docx), use :func:`ingest_local_document_structure`, which:
      keyed on the SAME source as the flat note — so find_similar_figure's
      get_document() lookup resolves the correct document_id.
 
+c39ae092 — LOCAL FALLBACK (avoids Cloudflare 403):
+The hosted ``ingest_document_structure`` POST was confirmed hitting a live
+Cloudflare 403 error 1010 (browser_signature_banned).  :func:`ingest_local_document_structure_sidecar`
+provides an entirely local alternative: it stores headings/figures/tables into
+the SAME sidecar SQLite DB that :func:`index_document` and
+:func:`search_paragraphs` already use (via ``docs_intel.index_docx_structure``),
+so zero network access is required.  The updated :func:`ingest_local_document_structure`
+tries the local sidecar path first when ``index_db_path`` is supplied, and only
+falls back to the hosted POST when it is not.
+
 Text extraction support for :func:`ingest_local_document` (stdlib only):
   - ``.docx`` -- unzipped via ``zipfile``; paragraphs joined from ``<w:t>`` runs.
   - ``.txt`` / ``.md`` / ``.markdown`` / common source extensions -- read as UTF-8
@@ -66,6 +76,7 @@ __all__ = [
     "ingest_local_document",
     "call_hosted_ingest_structure",
     "ingest_local_document_structure",
+    "ingest_local_document_structure_sidecar",
 ]
 
 # ---------------------------------------------------------------------------
@@ -250,6 +261,13 @@ def _call_mcp_tool(
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
+        # Cloudflare WAF (error 1010 / browser_signature_banned) blocks requests
+        # carrying Python's default "Python-urllib/3.x" User-Agent.  Every other
+        # Meridian client that hits usemeridian.us (meridian_connect.py,
+        # smoke_test_signup.py, test_live.py) explicitly sets a non-Python UA for
+        # exactly this reason.  This constant mirrors that pattern so that the
+        # ingest_local_document path is not blocked by the WAF.
+        "User-Agent": "meridian-local-ingest/1.0",
     }
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
@@ -480,61 +498,166 @@ def ingest_local_document(
 
 # ---------------------------------------------------------------------------
 # Structural ingest — headings/figures/tables (db42acce)
+# c39ae092 — local sidecar path added as primary fallback
 # ---------------------------------------------------------------------------
+
+def ingest_local_document_structure_sidecar(
+    path: str,
+    index_db_path: str,
+    title: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """c39ae092 — parse a local .docx and store structural elements locally.
+
+    PURE LOCAL PATH — no network call, no hosted POST.
+
+    Stores headings/figures/tables into the sidecar SQLite DB at
+    ``index_db_path`` (the same DB used by :func:`index_document` /
+    :func:`search_paragraphs`) via ``docs_intel.index_docx_structure``.
+
+    This is the correct solution when the hosted ``ingest_document_structure``
+    POST is blocked (e.g. Cloudflare 403 1010 confirmed live 2026-07-15).
+
+    Args:
+      path:           Absolute or relative path to a local .docx file.
+      index_db_path:  Path to the sidecar SQLite index (created if absent).
+                      Typically the same DB used for ``index_document`` on the
+                      same file.
+      title:          Document title (optional; stored in sidecar meta).
+      source:         Source key (defaults to ``path``).
+
+    Returns:
+      ``{index_db, source, heading_count, figure_count, table_count,
+      local_path, blocks_parsed}``.
+
+    Raises:
+      FileNotFoundError:        if ``path`` does not exist.
+      DocExtractionError:       if the file is not a valid .docx or cannot
+                                be parsed.
+      UnsupportedDocumentError: for non-.docx inputs.
+    """
+    if not path or not str(path).strip():
+        raise DocExtractionError("path must be a non-empty string")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"no such file: {path}")
+    if not os.path.isfile(path):
+        raise DocExtractionError(f"not a file: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext != ".docx":
+        raise UnsupportedDocumentError(
+            f"ingest_local_document_structure_sidecar only supports .docx files "
+            f"(structural parsing requires OOXML binary, got '{ext}'). "
+        )
+
+    from meridian_docs import docs_intel as _di  # noqa: PLC0415
+
+    try:
+        summary = _di.index_docx_structure(path, index_db_path)
+    except Exception as exc:  # noqa: BLE001
+        raise DocExtractionError(
+            f"could not index .docx structural content: {exc}"
+        ) from exc
+
+    resolved_source = source if source is not None else path
+
+    # Store title + source in sidecar meta so callers can look it up later.
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+    try:
+        conn = _sqlite3.connect(index_db_path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+                ("struct_source", resolved_source),
+            )
+            if title is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+                    ("struct_title", title),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass  # meta write failure is non-fatal
+
+    return {
+        "index_db": index_db_path,
+        "source": resolved_source,
+        "local_path": path,
+        "heading_count": summary.get("heading_count", 0),
+        "figure_count": summary.get("figure_count", 0),
+        "table_count": summary.get("table_count", 0),
+    }
+
 
 def ingest_local_document_structure(
     path: str,
     project_id: str,
     title: str | None = None,
     source: str | None = None,
+    index_db_path: str | None = None,
     base_url: str | None = None,
     token: str | None = None,
 ) -> dict[str, Any]:
-    """Parse a local .docx's structural content and persist it to hosted Meridian.
+    """Parse a local .docx's structural content and persist it.
 
-    db42acce — this is the structural complement to :func:`ingest_local_document`.
+    db42acce / c39ae092 — structural complement to :func:`ingest_local_document`.
     Where that function can only forward plain text (populating the flat note
     store), this function parses the REAL .docx binary locally (where the file
-    actually lives) to extract its structural tree (headings, figures, tables)
-    and forwards the structural rows to the hosted server's doc-structure store.
+    actually lives) to extract its structural tree (headings, figures, tables).
 
-    Steps:
-      1. The .docx at ``path`` is parsed via
-         ``docparse.docs_intel.document_content_tree`` — the same stdlib-only
-         OOXML parser used by the 7a98286b structural linter.  This extracts
-         headings (level, text, para_id), tables (rows/cells), and figure
-         caption paragraphs (SEQ-field captions) in true document order.
-      2. The ``blocks`` list from the parse result is forwarded to the hosted
-         ``ingest_document_structure`` MCP tool via an HTTP call.  The hosted
-         server converts the blocks to structured elements (headings/figures/
-         tables with parent relationships) via ``elements_from_docx_content_tree``
-         and stores them in doc_documents / doc_elements rows.
-      3. The result (document_id, source, element_count) is returned.
+    TWO PATHS (c39ae092):
 
-    The ``source`` used MUST match the source used in any prior
+    1. LOCAL SIDECAR (preferred, no network) — when ``index_db_path`` is
+       supplied, structural elements are stored into the sidecar SQLite DB
+       via ``docs_intel.index_docx_structure``.  This requires NO hosted call
+       and is immune to Cloudflare 403 blocks.  ``project_id`` is still
+       accepted for API compatibility but is not used in this path.
+
+    2. HOSTED POST (legacy fallback) — when ``index_db_path`` is None, the
+       blocks are forwarded to the hosted ``ingest_document_structure`` MCP
+       tool via an HTTP call (db42acce behaviour). This path is subject to
+       Cloudflare 403 if the caller's IP is blocked.
+
+    The ``source`` MUST match the source used in any prior
     :func:`ingest_local_document` call for the same file (default: ``path`` for
     both), so that ``find_similar_figure`` / ``index_figure`` / ``index_table``
-    can look up the same ``document_id`` via ``get_document(project_id, source)``.
+    can look up the same ``document_id`` / source key.
 
     Args:
-      path:        Absolute or relative path to a local .docx file.
-      project_id:  Meridian project UUID to ingest into.
-      title:       Document title (optional; stored for display in doc-store).
-      source:      Source key (defaults to ``path``).  Must match the source
-                   used for :func:`ingest_local_document`.
-      base_url:    Override the Meridian server URL.
-      token:       Override the API token.
+      path:           Absolute or relative path to a local .docx file.
+      project_id:     Meridian project UUID (used only on the hosted path).
+      title:          Document title (optional).
+      source:         Source key (defaults to ``path``).
+      index_db_path:  Path to the local sidecar SQLite index.  When supplied,
+                      takes the LOCAL path (no network call).  When None, falls
+                      back to the hosted POST.
+      base_url:       Override the Meridian server URL (hosted path only).
+      token:          Override the API token (hosted path only).
 
     Returns:
-      ``{document_id, source, doc_type, element_count, local_path}``.
+      Local path:  ``{index_db, source, heading_count, figure_count,
+                      table_count, local_path}``.
+      Hosted path: ``{document_id, source, doc_type, element_count,
+                      local_path, blocks_forwarded}``.
 
     Raises:
       FileNotFoundError:         if ``path`` does not exist.
       DocExtractionError:        if the file is not a valid .docx, or on
-                                 network/server errors.
-      UnsupportedDocumentError:  if ``docparse`` is not installed (raised by the
-                                 import; add ``docparse`` to your environment).
+                                 network/server errors (hosted path).
+      UnsupportedDocumentError:  for non-.docx inputs.
     """
+    # c39ae092: prefer local sidecar when index_db_path is supplied.
+    if index_db_path is not None:
+        return ingest_local_document_structure_sidecar(
+            path=path,
+            index_db_path=index_db_path,
+            title=title,
+            source=source,
+        )
+
+    # Legacy hosted-POST path (db42acce).
     if not path or not str(path).strip():
         raise DocExtractionError("path must be a non-empty string")
     if not os.path.exists(path):

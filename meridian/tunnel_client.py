@@ -77,7 +77,7 @@ _PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
 # were failing the standard ~23s budget on a cold cache (live symptom:
 # "tunnel:ppt: pre-flight health check FAILED"). Give them the same extended budget.
 # 105e56b9 — docs/zotero also use uvx and trigger a cold venv build from a local
-# path (`uvx --from <local-path> meridian-docs` / `uvx zotero-mcp`), so they need
+# path (`uvx --from <local-path> meridian-docs-mcp` / `uvx zotero-mcp`), so they need
 # the same larger budget on a cold cache to avoid a spurious preflight FAILED.
 _COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc", "ppt", "word", "docs", "zotero"})
 
@@ -346,6 +346,33 @@ class SlotProxy:
         Uses an asyncio.Lock to avoid double-spawning under concurrent first
         requests. Prints a startup message so the user can see when the lazy
         spawn fires. Non-blocking if the process is already alive.
+
+        105b5aa9 — port-occupancy check before every Popen.  The startup
+        scan in ``run_tunnel`` calls ``_kill_stale_port_occupant`` once, up
+        front, for each registered slot. But there is a window between that
+        scan and the first lazy spawn (and again after every idle-kill) where
+        a previously-unseen process can re-occupy the port. Without a check
+        here, ``Popen`` silently succeeds (it is spawning mcp-proxy, NOT the
+        inner MCP server), the inner server later fails to bind, and the slot
+        ends up in an EADDRINUSE-loop that never self-heals.
+
+        The pre-spawn logic is:
+
+        1. If the port is already open AND the occupant is legitimately owned
+           by a DIFFERENT, still-live tunnel client → fail loud and abort the
+           spawn so the operator knows there is a real conflict. Do NOT kill a
+           process that belongs to a peer.
+
+        2. If the port is open but owned by an orphan (no live-client claim,
+           or no claim file at all) → call ``_kill_stale_port_occupant`` to
+           clear it, then proceed with the spawn as normal.
+
+        3. Port is free → proceed immediately (the common path).
+
+        All of this is best-effort: ``_kill_stale_port_occupant`` never raises
+        (it swallows psutil / permission errors gracefully), and a kill that
+        itself fails just leaves the Popen to surface the EADDRINUSE as a
+        legible exception rather than a silent zombie loop.
         """
         if self.is_running:
             return
@@ -354,6 +381,27 @@ class SlotProxy:
             # while we were waiting.
             if self.is_running:
                 return
+
+            # 105b5aa9 — check port occupancy right before spawning so we
+            # never blindly double-spawn into an already-bound port.
+            if _port_is_open(self.port):
+                if _is_slot_claimed_by_live_client(self.port, self.client_id):
+                    # Port is held by a peer tunnel — do NOT kill it; fail
+                    # loud so the operator can see the conflict clearly instead
+                    # of getting a silent EADDRINUSE-loop.
+                    print(
+                        f"tunnel:{self.label}: port {self.port} is already occupied "
+                        "by a live tunnel client — cannot spawn; resolve the port "
+                        "conflict before restarting",
+                        file=sys.stderr, flush=True,
+                    )
+                    return
+                # Orphaned occupant — clear it so the fresh Popen gets a
+                # clean port. _kill_stale_port_occupant is best-effort and
+                # never raises; if it cannot kill the occupant the Popen below
+                # will surface a legible EADDRINUSE exception.
+                _kill_stale_port_occupant(self.port, self.label, current_client_id=self.client_id)
+
             print(
                 f"tunnel:{self.label}: spawning proxy (first request / after idle kill) "
                 f"on port {self.port}",
@@ -1750,6 +1798,22 @@ def _permanent_extract_url(base_url: str, tenant_id: str) -> str:
     return f"{base_url.rstrip('/')}/extract/mcp/{tenant_id}/mcp"
 
 
+def _meridian_server_url(base_url: str) -> str:
+    """The Streamable HTTP URL for the hosted Meridian MCP server (tools: start_session, etc.).
+
+    This is the main Meridian connector — distinct from the three tunnel-slot
+    connectors (filesystem / codebase-memory / serena) that relay local proxies.
+    It provides all Meridian tools (start_session, get_sprint_items,
+    generate_handoff, …) and requires a bearer token for auth.
+
+    bf31787c — previously this entry was NEVER injected by the tunnel auto-update,
+    which meant a user running ``meridian --tunnel`` got the three tool-slot
+    connectors but no Meridian server itself. ``start_session`` and friends were
+    then non-existent in Claude Code, causing sessions to stall.
+    """
+    return f"{base_url.rstrip('/')}/mcp"
+
+
 def _ws_office_url(base_url: str, tenant_id: str, token: str, slot: str) -> str:
     """Build the WebSocket URL for an Office tunnel slot (ppt/word)."""
     base = base_url.rstrip("/")
@@ -2524,12 +2588,78 @@ async def _fetch_filesystem_roots(
 # Auto-index helper (calls index_repository on codebase-memory-mcp proxy)
 # ---------------------------------------------------------------------------
 
+def _extract_jsonrpc_error(body: bytes) -> "str | None":
+    """Extract a JSON-RPC or MCP tool-level error message from a response body.
+
+    codebase-memory-mcp returns HTTP 200 even when ``index_repository`` fails
+    internally (e.g. a partial scan, a missing path, or a silently-aborted
+    pass). The failure surfaces only in the JSON-RPC body:
+
+    * A top-level ``"error"`` key  — a JSON-RPC error response.
+    * ``result.content[*].isError = true`` — an MCP-convention tool error
+      whose text is in ``result.content[0].text``.
+    * ``result.isError = true`` — older MCP tool-error convention.
+
+    Returns a short error string if any of these patterns is detected, or
+    ``None`` when the response looks clean. Best-effort: any parse failure
+    returns ``None`` (we log the happy path as before).
+
+    This is the in-repo half of the staleness/coverage gap: the HTTP-only
+    success check (``status < 400``) was the silent-failure path that allowed
+    a broken or partial index to look identical to a successful one.
+    """
+    if not body:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 — non-JSON body (SSE, plain text)
+        return None
+    if not isinstance(data, dict):
+        return None
+    # JSON-RPC error response.
+    err = data.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message") or str(err.get("code", "unknown"))
+        return f"JSON-RPC error: {msg}"
+    if isinstance(err, str) and err:
+        return f"JSON-RPC error: {err}"
+    # MCP tool-level error: result.isError.
+    result = data.get("result")
+    if isinstance(result, dict):
+        if result.get("isError"):
+            content = result.get("content")
+            if isinstance(content, list) and content:
+                first = content[0]
+                text = (first.get("text") if isinstance(first, dict) else None) or ""
+                return f"tool error: {text[:200]}" if text else "tool error (no detail)"
+            return "tool error (isError=true)"
+        # result.content[*].isError (MCP 2025-03-26 convention).
+        content = result.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("isError"):
+                    text = item.get("text") or ""
+                    return f"tool error: {text[:200]}" if text else "tool error (no detail)"
+    return None
+
+
 async def _index_code_dir(port: int, code_dir: str) -> None:
     """Wait for the code-intel proxy to start, then call index_repository on code_dir.
 
     Uses Streamable HTTP (MCP 2025-03-26): mcp-proxy handles the stdio lifecycle
     per POST, so a direct tools/call is sufficient — no client-side initialize needed.
     Failures are non-fatal (logged to stderr, tunnel continues).
+
+    Known limitation: codebase-memory-mcp (the external binary behind the code-intel
+    slot) has a known graph-index staleness/coverage gap — its ``search_graph`` and
+    ``index_repository`` can miss real files present on disk even after a fresh full
+    re-index.  This is an upstream bug in codebase-memory-mcp, not in Meridian's
+    tunnel client.  The in-repo contribution here is that we now surface JSON-RPC-
+    level errors from ``index_repository`` that previously looked like success
+    (HTTP 200 with an error body); that makes a partial/failed index diagnosable
+    rather than silent.  For reliable code-intelligence use the ``meridian-extract``
+    slot (Serena/mcp-server-code-extractor), which is LSP-based and reads the live
+    filesystem directly.
     """
     import httpx
 
@@ -2565,7 +2695,19 @@ async def _index_code_dir(port: int, code_dir: str) -> None:
             r = await c.post(local, json=payload,
                              headers={"Content-Type": "application/json"})
         if r.status_code < 400:
-            print(f"  code-intel: indexed {code_dir}", flush=True)
+            # codebase-memory-mcp returns HTTP 200 even on an internal index
+            # failure. Parse the JSON-RPC body so a silent partial/failed index
+            # is visible in the tunnel log instead of being mistaken for success.
+            body_err = _extract_jsonrpc_error(r.content)
+            if body_err:
+                print(
+                    f"  code-intel: index_repository returned an error for {code_dir}: "
+                    f"{body_err} — the graph index may be incomplete. "
+                    "Use meridian-extract (Serena) for reliable code-intel.",
+                    file=sys.stderr, flush=True,
+                )
+            else:
+                print(f"  code-intel: indexed {code_dir}", flush=True)
         else:
             print(
                 f"  code-intel: index returned HTTP {r.status_code} for {code_dir}",
@@ -2940,6 +3082,10 @@ def _is_our_mcp_entry(key: str, value: object, base_url: str, tenant_id: str) ->
     new-name key like ``filesystem`` or a collision-suffixed key). A key that is
     merely NAMED like one of our new built-ins but whose URL is NOT ours is the
     USER's own server and must never be clobbered.
+
+    bf31787c — also recognises the main Meridian server entry by its ``url``
+    (``{base_url}/mcp``) so a prior tunnel run's ``meridian`` entry is cleaned up
+    or replaced rather than accumulated.
     """
     if key in _OWN_TUNNEL_MCP_KEYS_BY_NAME or key.startswith("meridian-custom-"):
         return True
@@ -2950,12 +3096,16 @@ def _is_our_mcp_entry(key: str, value: object, base_url: str, tenant_id: str) ->
         _permanent_url(base_url, tenant_id),
         _permanent_code_url(base_url, tenant_id),
         _permanent_extract_url(base_url, tenant_id),
+        # bf31787c — main Meridian server; tenant-agnostic (shared /mcp endpoint).
+        _meridian_server_url(base_url),
     }
     return url in ours
 
 
 def _tunnel_mcp_entries(
-    base_url: str, tenant_id: str, custom: "list[dict] | None" = None,
+    base_url: str, tenant_id: str,
+    custom: "list[dict] | None" = None,
+    token: "str | None" = None,
 ) -> dict[str, dict]:
     """The HTTP MCP connector entries pointing at this tenant's tunnel.
 
@@ -2968,15 +3118,31 @@ def _tunnel_mcp_entries(
     LOCAL-ONLY and have no server route, so a co-located client reaches them
     directly, not via the relay.
 
+    bf31787c — when *token* is provided the main ``meridian`` server entry is
+    also injected, pointing at ``{base_url}/mcp`` with an ``Authorization``
+    header. Without this entry Claude Code has no Meridian tools at all
+    (start_session, get_sprint_items, generate_handoff, …) even though the three
+    tool-slot connectors are present.
+
     Collision handling and legacy-key migration happen in
     :func:`_inject_mcp_entries`, which sees the existing config; this function is
     a pure name→url map and stays trivially unit-testable.
     """
-    entries = {
+    entries: dict[str, dict] = {}
+    # bf31787c — the main Meridian server entry MUST come first so it is the
+    # first thing an agent sees in the merged mcpServers dict. The three slot
+    # connectors follow.
+    if token:
+        entries["meridian"] = {
+            "type": "http",
+            "url": _meridian_server_url(base_url),
+            "headers": {"Authorization": f"Bearer {token}"},
+        }
+    entries.update({
         _TUNNEL_MCP_SLOT_NAMES["fs"]: {"type": "http", "url": _permanent_url(base_url, tenant_id)},
         _TUNNEL_MCP_SLOT_NAMES["code"]: {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
         _TUNNEL_MCP_SLOT_NAMES["extract"]: {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
-    }
+    })
     for cp in custom or []:
         name = cp.get("name")
         port = cp.get("port")
@@ -3079,6 +3245,7 @@ def _inject_mcp_entries(
 def _install_mcp_json(
     cwd: "str | Path", base_url: str, tenant_id: str,
     custom: "list[dict] | None" = None,
+    token: "str | None" = None,
 ) -> list[tuple["Path", "str | None"]]:
     """Inject tunnel connector entries into local MCP config files.
 
@@ -3086,11 +3253,15 @@ def _install_mcp_json(
     each gets a LOCAL ``http://127.0.0.1:<port>/mcp`` connector entry alongside the
     built-in relay entries (see :func:`_tunnel_mcp_entries`).
 
+    bf31787c — *token* is the tenant's bearer token.  When provided the main
+    ``meridian`` server entry is also injected so Claude Code has access to all
+    Meridian tools (start_session, get_sprint_items, generate_handoff, …).
+
     Returns a list of ``(path, original_text_or_None)`` snapshots for restore.
     ``original_text_or_None`` is ``None`` when we created the file. Failures on
     any single file are reported and skipped — never fatal to the tunnel.
     """
-    entries = _tunnel_mcp_entries(base_url, tenant_id, custom)
+    entries = _tunnel_mcp_entries(base_url, tenant_id, custom, token=token)
     snapshots: list[tuple[Path, str | None]] = []
     for path in _mcp_json_paths(cwd):
         existed = path.exists()
@@ -3635,9 +3806,13 @@ async def run_tunnel(
     print("", flush=True)
 
     # 5b. Auto-update local MCP client config.
+    # bf31787c — pass the bearer token so _install_mcp_json can inject the main
+    # 'meridian' server entry (start_session / generate_handoff / …) alongside
+    # the three tunnel-slot connectors. Without the token the entry was silently
+    # omitted and Claude Code had no Meridian tools at all.
     mcp_snapshots: list[tuple[Path, str | None]] = []
     try:
-        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id, running_custom)
+        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id, running_custom, token=token)
     except Exception as exc:  # noqa: BLE001
         print(f"  warning: could not update local MCP config: {exc}", file=sys.stderr, flush=True)
     if mcp_snapshots:
@@ -3648,7 +3823,10 @@ async def run_tunnel(
         )
         # ef162c28 — connectors are now named by the plugin behind each slot
         # (filesystem / codebase-memory / serena) rather than by transport slot.
-        _builtin_conns = ", ".join(TUNNEL_MCP_KEYS)
+        # bf31787c — the main 'meridian' server entry (start_session / …) is
+        # always injected first when a token is available.
+        _meridian_prefix = "meridian, " if token else ""
+        _builtin_conns = _meridian_prefix + ", ".join(TUNNEL_MCP_KEYS)
         print(
             f"    added connectors: {_builtin_conns}"
             f"{_custom_conns} (removed on Ctrl+C)",

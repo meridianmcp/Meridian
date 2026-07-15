@@ -12,12 +12,20 @@ paragraph lookup → text search. The full vision (13 MCP tools, track-changes
 editing, cross-ref resolution, a standalone ``meridian-docs`` uvx package +
 tunnel plugin, LaTeX addon) builds on these primitives.
 
+c39ae092 — also exposes :func:`index_docx_structure` and
+:func:`get_local_structure_elements`, which extend the SAME sidecar SQLite DB
+(or a standalone one) to store structural elements (headings, figures, tables)
+parsed from the .docx via the vendored ``document_content_tree`` parser.
+This is the local-only fallback for :func:`ingest_local_document_structure`
+that avoids the Cloudflare-blocked hosted POST.
+
 Pure library — every function is deterministic and unit-tested against a
 synthetic in-memory .docx (see tests/test_docs_intel.py).
 """
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import sqlite3
@@ -124,6 +132,42 @@ def _connect(index_db_path: str) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS docx_index_meta (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+        """
+    )
+    # c39ae092 — structural element tables: headings, figures, tables.
+    # These extend the same sidecar DB so structural elements live alongside
+    # the paragraph index without requiring a hosted POST.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_headings (
+            para_id TEXT PRIMARY KEY,
+            idx INTEGER NOT NULL,
+            level INTEGER NOT NULL,
+            text TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_figures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idx INTEGER NOT NULL,
+            para_id TEXT,
+            caption TEXT NOT NULL,
+            seq_number TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_tables (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idx INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            col_count INTEGER NOT NULL,
+            caption TEXT,
+            rows_json TEXT NOT NULL
         )
         """
     )
@@ -289,3 +333,249 @@ def find_paragraphs(
     return [
         {"para_id": r[0], "index": r[1], "style": r[2], "text": r[3]} for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# c39ae092 — local structural element store: headings / figures / tables
+# stored in the SAME sidecar SQLite DB (or a standalone one) without any
+# hosted round-trip. This is the local-only fallback for
+# ingest_local_document_structure that avoids the Cloudflare-blocked POST.
+# ---------------------------------------------------------------------------
+
+_SEQ_FIGURE_RE = re.compile(r"\bSEQ\s+Figure\b", re.IGNORECASE)
+_SEQ_TABLE_RE = re.compile(r"\bSEQ\s+Table\b", re.IGNORECASE)
+
+
+def _is_figure_caption(block: dict[str, Any]) -> bool:
+    """Return True if a paragraph block contains a SEQ Figure field (figure caption)."""
+    for fld in block.get("fields", []):
+        if fld.get("field_type") == "SEQ" and _SEQ_FIGURE_RE.search(
+            fld.get("instruction", "")
+        ):
+            return True
+    return False
+
+
+def _is_table_caption(block: dict[str, Any]) -> bool:
+    """Return True if a paragraph block contains a SEQ Table field (table caption)."""
+    for fld in block.get("fields", []):
+        if fld.get("field_type") == "SEQ" and _SEQ_TABLE_RE.search(
+            fld.get("instruction", "")
+        ):
+            return True
+    return False
+
+
+def _seq_cached_number(block: dict[str, Any], seq_re: re.Pattern[str]) -> str | None:
+    """Extract the cached sequence number (e.g. '1') from a SEQ field."""
+    for fld in block.get("fields", []):
+        if fld.get("field_type") == "SEQ" and seq_re.search(fld.get("instruction", "")):
+            return fld.get("cached_result") or None
+    return None
+
+
+def index_docx_structure(
+    source: str | bytes | bytearray,
+    index_db_path: str,
+) -> dict[str, Any]:
+    """c39ae092 — parse a .docx and store its structural elements locally.
+
+    Extends the sidecar SQLite DB at ``index_db_path`` (created if absent) with
+    three new tables — ``docx_headings``, ``docx_figures``, ``docx_tables`` —
+    populated from the blocks produced by :func:`document_content_tree`.
+
+    This is the local-only substitute for forwarding blocks to the hosted
+    ``ingest_document_structure`` endpoint: it produces the same queryable
+    structural index without any network call.
+
+    Figure captions are detected by SEQ Figure field codes in paragraph blocks;
+    table captions by SEQ Table field codes.  Raw table blocks (``kind="table"``)
+    are stored with their cell data serialised as JSON.
+
+    Returns a summary ``{index_db, heading_count, figure_count, table_count}``.
+    Idempotent: all three structural tables are fully replaced on each run.
+    """
+    from ._vendored_content_tree import document_content_tree  # noqa: PLC0415
+
+    tree = document_content_tree(source)
+    blocks: list[dict[str, Any]] = tree.get("blocks") or []
+
+    headings: list[tuple[str, int, int, str]] = []  # (para_id, idx, level, text)
+    figures: list[tuple[int, str | None, str, str | None]] = []  # (idx, para_id, caption, seq_num)
+    tables: list[tuple[int, int, int, str]] = []  # (idx, row_count, col_count, rows_json)
+
+    # Track the most recent table block so its following SEQ Table caption
+    # can be linked back.
+    last_table_idx: int | None = None
+
+    for block in blocks:
+        kind = block.get("kind")
+        idx = block.get("index", 0)
+
+        if kind == "heading":
+            headings.append((
+                block.get("para_id", f"p{idx}"),
+                idx,
+                block.get("level", 1),
+                block.get("text", ""),
+            ))
+        elif kind == "table":
+            rows = block.get("rows") or []
+            tables.append((
+                idx,
+                block.get("row_count", len(rows)),
+                block.get("col_count", max((len(r) for r in rows), default=0)),
+                json.dumps(rows),
+            ))
+            last_table_idx = idx
+        elif kind == "paragraph":
+            if _is_figure_caption(block):
+                seq_num = _seq_cached_number(block, _SEQ_FIGURE_RE)
+                figures.append((idx, block.get("para_id"), block.get("text", ""), seq_num))
+            elif _is_table_caption(block):
+                # A table-caption paragraph immediately follows its table;
+                # store as the caption of the most recent table by updating
+                # rows list after-the-fact. (We append a separate figure-like
+                # record keyed to the table idx for easy lookup.)
+                seq_num = _seq_cached_number(block, _SEQ_TABLE_RE)
+                # Store in figures list under kind=table_caption for distinction?
+                # Keep separate: we attach caption to the table by position.
+                # Simplest: find the table with last_table_idx and update its
+                # caption row.  Since we build tables as a list we patch the
+                # last entry.
+                if tables and last_table_idx is not None:
+                    t = tables[-1]
+                    tables[-1] = (t[0], t[1], t[2], t[3])
+                    # Store caption separately in the table record below.
+                    # Use a sentinel: append a 5-tuple when there's a caption.
+                    # Instead, switch to a dict approach for clarity.
+                    pass
+
+    # Rebuild tables with caption support (5-tuple: idx, row_count, col_count, rows_json, caption).
+    # Re-parse to attach captions properly.
+    headings_out: list[tuple[str, int, int, str]] = []
+    figures_out: list[tuple[int, str | None, str, str | None]] = []
+    tables_out: list[tuple[int, int, int, str, str | None]] = []  # (..., caption)
+
+    last_table_entry_index: int | None = None
+    _SEQ_TABLE_RE2 = _SEQ_TABLE_RE
+
+    for block in blocks:
+        kind = block.get("kind")
+        idx = block.get("index", 0)
+
+        if kind == "heading":
+            headings_out.append((
+                block.get("para_id", f"p{idx}"),
+                idx,
+                block.get("level", 1),
+                block.get("text", ""),
+            ))
+        elif kind == "table":
+            rows = block.get("rows") or []
+            tables_out.append((
+                idx,
+                block.get("row_count", len(rows)),
+                block.get("col_count", max((len(r) for r in rows), default=0)),
+                json.dumps(rows),
+                None,  # caption filled in by following SEQ Table para
+            ))
+            last_table_entry_index = len(tables_out) - 1
+        elif kind == "paragraph":
+            if _is_figure_caption(block):
+                seq_num = _seq_cached_number(block, _SEQ_FIGURE_RE)
+                figures_out.append((idx, block.get("para_id"), block.get("text", ""), seq_num))
+            elif _is_table_caption(block) and last_table_entry_index is not None:
+                # Patch the caption onto the preceding table entry.
+                t = tables_out[last_table_entry_index]
+                tables_out[last_table_entry_index] = (t[0], t[1], t[2], t[3], block.get("text", ""))
+
+    conn = _connect(index_db_path)
+    try:
+        conn.execute("DELETE FROM docx_headings")
+        conn.execute("DELETE FROM docx_figures")
+        conn.execute("DELETE FROM docx_tables")
+
+        conn.executemany(
+            "INSERT OR REPLACE INTO docx_headings (para_id, idx, level, text) "
+            "VALUES (?, ?, ?, ?)",
+            headings_out,
+        )
+        conn.executemany(
+            "INSERT INTO docx_figures (idx, para_id, caption, seq_number) "
+            "VALUES (?, ?, ?, ?)",
+            figures_out,
+        )
+        conn.executemany(
+            "INSERT INTO docx_tables (idx, row_count, col_count, rows_json, caption) "
+            "VALUES (?, ?, ?, ?, ?)",
+            tables_out,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "index_db": index_db_path,
+        "heading_count": len(headings_out),
+        "figure_count": len(figures_out),
+        "table_count": len(tables_out),
+    }
+
+
+def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
+    """c39ae092 — retrieve all locally-stored structural elements from the sidecar.
+
+    Returns ``{headings, figures, tables}`` lists read from the
+    ``docx_headings``, ``docx_figures``, ``docx_tables`` tables populated by
+    :func:`index_docx_structure`.  Returns empty lists for any table that
+    does not yet exist (i.e., :func:`index_docx_structure` was never called on
+    this sidecar).
+    """
+    conn = _connect(index_db_path)
+    try:
+        heading_rows = conn.execute(
+            "SELECT para_id, idx, level, text FROM docx_headings ORDER BY idx"
+        ).fetchall()
+        figure_rows = conn.execute(
+            "SELECT id, idx, para_id, caption, seq_number FROM docx_figures ORDER BY idx"
+        ).fetchall()
+        table_rows = conn.execute(
+            "SELECT id, idx, row_count, col_count, rows_json, caption FROM docx_tables ORDER BY idx"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    headings = [
+        {"para_id": r[0], "index": r[1], "level": r[2], "text": r[3]}
+        for r in heading_rows
+    ]
+    figures = [
+        {
+            "id": r[0],
+            "index": r[1],
+            "para_id": r[2],
+            "caption": r[3],
+            "seq_number": r[4],
+        }
+        for r in figure_rows
+    ]
+    tables = [
+        {
+            "id": r[0],
+            "index": r[1],
+            "row_count": r[2],
+            "col_count": r[3],
+            "rows": json.loads(r[4]) if r[4] else [],
+            "caption": r[5],
+        }
+        for r in table_rows
+    ]
+    return {
+        "headings": headings,
+        "figures": figures,
+        "tables": tables,
+        "heading_count": len(headings),
+        "figure_count": len(figures),
+        "table_count": len(tables),
+    }

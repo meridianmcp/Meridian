@@ -58,6 +58,32 @@ def get_structure(index_db_path: str) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
+def index_document_structure(path: str, index_db_path: str) -> dict[str, Any]:
+    """c39ae092 — parse a .docx and store structural elements (headings/figures/tables)
+    into the sidecar SQLite index at index_db_path (local, no network call).
+
+    Extends the same sidecar DB used by index_document / search_paragraphs with
+    three new tables: docx_headings, docx_figures, docx_tables.  Figures are
+    detected by SEQ Figure field codes; tables by raw <w:tbl> blocks plus optional
+    SEQ Table captions.
+
+    Returns {index_db, heading_count, figure_count, table_count}.
+    """
+    return docs_intel.index_docx_structure(path, index_db_path)
+
+
+@mcp.tool()
+def get_structure_elements(index_db_path: str) -> dict[str, Any]:
+    """c39ae092 — retrieve all locally-stored structural elements from the sidecar.
+
+    Returns {headings, figures, tables} lists from the docx_headings,
+    docx_figures, docx_tables tables populated by index_document_structure.
+    Returns empty lists for any table not yet populated.
+    """
+    return docs_intel.get_local_structure_elements(index_db_path)
+
+
+@mcp.tool()
 def get_paragraph(index_db_path: str, para_id: str) -> dict[str, Any] | None:
     """Fetch one paragraph by its para_id from a previously-built index."""
     return docs_intel.get_paragraph(index_db_path, para_id)
@@ -125,52 +151,50 @@ def ingest_local_document_structure(
     project_id: str,
     title: str | None = None,
     source: str | None = None,
+    index_db_path: str | None = None,
 ) -> dict[str, Any]:
-    """db42acce — parse a local .docx's structural content and persist it to Meridian.
+    """db42acce/c39ae092 — parse a local .docx's structural content and persist it.
 
-    This is the structural complement to ``ingest_local_document``.  Where that
-    tool can only forward plain text (populating the flat note store), this tool
-    parses the REAL .docx binary locally (where the file actually lives) to
-    extract its structural tree (headings/figures/tables in true document order)
-    and forwards the structural rows to the hosted server's doc-structure store.
+    TWO PATHS:
 
-    Steps:
-      1. The .docx at ``path`` is parsed via
-         ``docparse.docs_intel.document_content_tree`` — the same stdlib-only
-         OOXML parser used by the 7a98286b structural linter.
-      2. The ``blocks`` list from the parse result is forwarded to the hosted
-         ``ingest_document_structure`` MCP tool.  The hosted server converts
-         the blocks to structured elements (headings/figures/tables) via
-         ``elements_from_docx_content_tree`` and stores them in
-         doc_documents / doc_elements rows.
+    1. LOCAL SIDECAR (c39ae092, preferred) — supply ``index_db_path`` to store
+       headings/figures/tables into a local SQLite sidecar (same DB used by
+       ``index_document`` / ``search_paragraphs``).  NO network call — immune to
+       Cloudflare 403 blocks that affect the hosted POST path.
+
+    2. HOSTED POST (db42acce, legacy fallback) — when ``index_db_path`` is
+       omitted, blocks are forwarded to the hosted ``ingest_document_structure``
+       MCP tool.  Subject to Cloudflare 403 on blocked IPs.
+
+    The structural complement to ``ingest_local_document``.  Where that tool can
+    only forward plain text (populating the flat note store), this tool parses
+    the REAL .docx binary locally to extract its structural tree
+    (headings/figures/tables in true document order).
 
     The ``source`` MUST match the source used in any prior
     ``ingest_local_document`` call for the same file (default: ``path`` for
     both), so that ``find_similar_figure`` / ``index_figure`` / ``index_table``
-    can look up the same ``document_id`` via ``get_document(project_id, source)``.
-
-    This is the fix for the root cause confirmed live (db42acce): after a
-    successful ``ingest_local_document(content=...)`` call, ``find_similar_figure``
-    returned ``document_id: null`` because the structural doc-store was never
-    populated.  Calling THIS tool after ``ingest_local_document`` for the same
-    file resolves the document_id correctly.
+    can look up the same ``document_id`` / source key.
 
     Args:
-      path:        Local .docx file path.
-      project_id:  Meridian project UUID to ingest into.
-      title:       Document title (optional; stored for display in doc-store).
-      source:      Source key (defaults to ``path``).  Must match the source
-                   used for ``ingest_local_document``.
+      path:           Local .docx file path.
+      project_id:     Meridian project UUID (used only on hosted path).
+      title:          Document title (optional).
+      source:         Source key (defaults to ``path``).
+      index_db_path:  Path to the local sidecar SQLite index (enables local
+                      storage path — no network call).
 
-    Returns:
-      ``{document_id, source, doc_type, element_count, local_path,
-      blocks_forwarded}``.
+    Returns (local path):  ``{index_db, source, heading_count, figure_count,
+                              table_count, local_path}``.
+    Returns (hosted path): ``{document_id, source, doc_type, element_count,
+                              local_path, blocks_forwarded}``.
     """
     return local_ingest.ingest_local_document_structure(
         path=path,
         project_id=project_id,
         title=title,
         source=source,
+        index_db_path=index_db_path,
     )
 
 

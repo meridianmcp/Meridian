@@ -24,7 +24,10 @@ from typing import Any
 
 # 1b3a2c23 — meridian-docs lives in the local extensions/ directory; it is NOT
 # published to PyPI, so `uvx meridian-docs` (bare package name) fails to install.
-# Use `uvx --from <local-path> meridian-docs` to run from the checked-out source.
+# Use `uvx --from <local-path> meridian-docs-mcp` to run from the checked-out source.
+# 58a044c7 — entry-point renamed to "meridian-docs-mcp" (not "meridian-docs"):
+# when command name == package name, uvx looks up the command as a PyPI package
+# after installing from --from, failing with "not found in the package registry".
 # Path(__file__).parent.parent is the repo root (meridian/ → repo root).
 _MERIDIAN_DOCS_LOCAL_PATH: str = str(
     Path(__file__).parent.parent / "extensions" / "meridian-docs"
@@ -43,7 +46,7 @@ DEFAULT_WORD_PORT = 8812
 DEFAULT_DC_PORT = 8813
 # 9665538a — the meridian-docs slot: the extracted stdlib-only OOXML (DOCX)
 # parser living at extensions/meridian-docs and launched as an MCP server via
-# `uvx --from <local-path> meridian-docs`. Distinct from the `word` slot
+# `uvx --from <local-path> meridian-docs-mcp`. Distinct from the `word` slot
 # (docx-mcp, authoring): this is fast, dependency-free document *intelligence*
 # — outline/parse/index/search. (1b3a2c23: NOT on PyPI; spawn from local path.)
 # Port 8818 sits just after the dc slot (8813) and the 4 pre-allocated custom
@@ -213,11 +216,15 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
     {
         # 9665538a — meridian-docs: the extracted stdlib-only OOXML doc parser
         # (extensions/meridian-docs), launched via `uvx --from <local-path>
-        # meridian-docs`. Opt-in like the Office slots. Complements the `word`
+        # meridian-docs-mcp`. Opt-in like the Office slots. Complements the `word`
         # slot (docx-mcp authoring) with read-only document intelligence.
         # 1b3a2c23 — NOT published to PyPI; spawn from the local extensions/
         # meridian-docs directory via `uvx --from` so this works out-of-the-box
         # without a separate PyPI publish step.
+        # 58a044c7 — entry-point is "meridian-docs-mcp" (not "meridian-docs"): the
+        # name-match between package and command caused uvx to attempt a PyPI lookup
+        # for the command after installing from the local path, failing with
+        # "meridian-docs was not found in the package registry".
         "name": "meridian-docs",
         "slot": "docs",
         "port": DEFAULT_DOCS_PORT,
@@ -225,7 +232,11 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs"],
+        # 58a044c7 — entry-point renamed to "meridian-docs-mcp" (distinct from the
+        # package name "meridian-docs") to prevent uvx from treating the trailing
+        # command argument as a PyPI package lookup. See extensions/meridian-docs/
+        # pyproject.toml for the full rationale.
+        "command": ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp"],
         "env": {},
         # meridian-docs exposes bare tool names (document_outline, parse_document,
         # …) — no self-prefix, so the server bridge namespaces them via

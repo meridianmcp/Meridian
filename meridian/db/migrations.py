@@ -1,4 +1,4 @@
-"""SQLite / Postgres migration functions for Meridian.
+﻿"""SQLite / Postgres migration functions for Meridian.
 
 All functions are pure append-only schema migrations called once at startup
 by :func:.  Extracted from db/__init__.py to keep
@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended', '_migrate_connection_events', '_migrate_redis_overage_fields', '_migrate_sprint_version_descriptions', '_migrate_workspace_settings_active_session_threshold', '_migrate_sprint_item_sprint_name', '_migrate_proposal_slug_nickname', '_migrate_decision_slug_nickname', '_migrate_note_nickname']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -2630,3 +2630,186 @@ async def _migrate_sprint_item_resources_amended(db: aiosqlite.Connection) -> No
     await _migrate_add_column_if_missing(
         db, "sprint_items", "resources_amended", "INTEGER DEFAULT 0"
     )
+
+
+async def _migrate_connection_events(db: aiosqlite.Connection) -> None:
+    """b12cc29f — connection_events: per-/mcp-request auth+method event log.
+
+    Every real HTTP /mcp request that Meridian's server receives is recorded
+    here with enough context to diagnose client-side outages (zero tools, broken
+    auth, unexpected UA) without needing raw Fly.io log access or guessing by
+    elimination. A capped ring-buffer (last 1000 rows per tenant_id) prevents
+    unbounded growth.
+
+    Fields:
+      tenant_id        — hashed or resolved tenant id (NULL for OAuth flow)
+      method           — JSON-RPC method (initialize / tools/list / tools/call / ...)
+      auth_result      — success / no_token / invalid_token / expired / oauth
+      tools_returned   — count of tools in tools/list response (NULL otherwise)
+      client_user_agent — first 200 chars of User-Agent header (NULL if absent)
+      response_status  — HTTP status code returned (200 / 400 / 401 / 503 / ...)
+      recorded_at      — wall-clock UTC timestamp
+
+    Idempotent via CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    Mirrored in pg_adapter._migrate_pg_connection_events.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS connection_events (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            method TEXT NOT NULL DEFAULT '',
+            auth_result TEXT NOT NULL DEFAULT 'unknown',
+            tools_returned INTEGER,
+            client_user_agent TEXT,
+            response_status INTEGER NOT NULL DEFAULT 200,
+            recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_connection_events_tenant "
+        "ON connection_events(tenant_id, recorded_at DESC)"
+    )
+    await db.commit()
+
+
+async def _migrate_redis_overage_fields(db: aiosqlite.Connection) -> None:
+    """342dd15f — per-tenant Redis command budget for the send_message
+    push-augmentation path.
+
+    Mirrors the shape of _migrate_overage_fields (compute/storage). Two new
+    tenants columns:
+      - redis_commands_used  NUMERIC  current-month Upstash PUBLISH counter,
+                                      reset on the same monthly cadence as
+                                      compute_cu_hours_used / storage_gb_used.
+      - redis_overage_cap_usd NUMERIC  operator-configured hard ceiling in USD
+                                       (default NULL = use the code-defined
+                                       tier defaults: $1 warning / $2 disable /
+                                       $4 admin alert).
+
+    Idempotent (_migrate_add_column_if_missing no-ops when already present).
+    Mirrored in pg_adapter._migrate_pg_redis_overage_fields.
+    """
+    await _migrate_add_column_if_missing(
+        db, "tenants", "redis_commands_used", "NUMERIC(14,0) DEFAULT 0"
+    )
+    await _migrate_add_column_if_missing(
+        db, "tenants", "redis_overage_cap_usd", "NUMERIC(8,2)"
+    )
+
+
+async def _migrate_sprint_version_descriptions(db: aiosqlite.Connection) -> None:
+    """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
+
+    Each (project_id, version) pair carries an auto-generated, human-readable
+    description summarising what that sprint bucket is about as a whole — not
+    just a concatenation of item titles, but a concise synthesis produced by
+    _auto_generate_version_description in sprint_items.py whenever a new item
+    is added to the bucket.
+
+    The description is seeded on the first add_sprint_item call for a version
+    and refreshed on every subsequent add so it always reflects the current
+    set of items in that bucket. A human can overwrite it via
+    upsert_sprint_version_description; the next add_sprint_item call will
+    regenerate it unless the item count has not changed.
+
+    Idempotent via CREATE TABLE IF NOT EXISTS + CREATE UNIQUE INDEX IF NOT EXISTS.
+    Mirrored in pg_adapter._migrate_pg_sprint_version_descriptions.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS sprint_version_descriptions (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            version TEXT NOT NULL,
+            description TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sprint_version_desc_pv "
+        "ON sprint_version_descriptions(project_id, version)"
+    )
+    await db.commit()
+
+
+async def _migrate_workspace_settings_active_session_threshold(
+    db: aiosqlite.Connection,
+) -> None:
+    """6e0e5cea — configurable active-executor-session warning threshold.
+
+    ``active_session_warning_minutes`` controls how recently a session must have
+    been seen to be considered "active" for the add_sprint_item /
+    fan_out_sprint_items / assign_sprint_waves warning that fires when a board
+    is mutated while executors are mid-run.  Default 10 (minutes), matching
+    the previously hardcoded 600-second constant.
+
+    Idempotent (_migrate_add_column_if_missing no-ops when already present).
+    Mirrored in pg_adapter._migrate_pg_workspace_settings_active_session_threshold.
+    """
+    await _migrate_add_column_if_missing(
+        db,
+        "workspace_settings",
+        "active_session_warning_minutes",
+        "INTEGER NOT NULL DEFAULT 10",
+    )
+
+
+async def _migrate_sprint_item_sprint_name(db: aiosqlite.Connection) -> None:
+    """3d6bd938 — separate human-readable sprint name from the structural version field.
+
+    version stays a semver-like structural identifier (e.g. 'v0.2.x');
+    sprint_name is a nullable free-text label for the bucket (e.g.
+    'docs-cloudflare'). This removes the need to overload the version string
+    with a descriptive name when a genuinely separate sprint bucket is needed.
+
+    Nullable TEXT. NULL on legacy rows (no name set). Idempotent via
+    _migrate_add_column_if_missing. Mirrored in
+    pg_adapter._migrate_pg_sprint_item_sprint_name.
+    """
+    await _migrate_add_column_if_missing(db, "sprint_items", "sprint_name", "TEXT")
+
+
+async def _migrate_proposal_slug_nickname(db: aiosqlite.Connection) -> None:
+    """6fb48898 — workspace_proposals.slug + .nickname: human-referenceable
+    secondary keys derived from the proposal title at creation time.
+
+    slug is a kebab-cased 60-char handle (same algorithm as sprint_items.slug
+    via _sprint_item_slug_base / _unique_sprint_slug); guaranteed unique per
+    tenant scope. nickname is a short 1-2 word memorable alias (same algorithm
+    as sprint_items.nickname). Both nullable so existing rows are unaffected
+    (NULL = not yet backfilled).
+
+    Idempotent (_migrate_add_column_if_missing no-ops when already present).
+    Mirrored in pg_adapter._migrate_pg_proposal_slug_nickname.
+    """
+    await _migrate_add_column_if_missing(db, "workspace_proposals", "slug", "TEXT")
+    await _migrate_add_column_if_missing(db, "workspace_proposals", "nickname", "TEXT")
+
+
+async def _migrate_decision_slug_nickname(db: aiosqlite.Connection) -> None:
+    """6fb48898 — decisions_pinned.slug + .nickname: human-referenceable
+    secondary keys derived from the decision title at creation time.
+
+    Mirrors the sprint_items slug/nickname pattern (ae87699d). slug is a
+    kebab-cased handle unique per project; nickname is a short memorable alias.
+    Both nullable so existing rows are unaffected.
+
+    Idempotent (_migrate_add_column_if_missing no-ops when already present).
+    Mirrored in pg_adapter._migrate_pg_decision_slug_nickname.
+    """
+    await _migrate_add_column_if_missing(db, "decisions_pinned", "slug", "TEXT")
+    await _migrate_add_column_if_missing(db, "decisions_pinned", "nickname", "TEXT")
+
+
+async def _migrate_note_nickname(db: aiosqlite.Connection) -> None:
+    """6fb48898 — project_notes.nickname: short memorable secondary key to
+    complement the existing slug column (5a5bba43).
+
+    project_notes already has slug (added by _migrate_note_slug). This adds the
+    companion nickname column matching the sprint_items pattern (b6b0cee6):
+    1-2 distinctive words from the note title, deduped per project.
+
+    Nullable so existing rows are unaffected.
+    Idempotent (_migrate_add_column_if_missing no-ops when already present).
+    Mirrored in pg_adapter._migrate_pg_note_nickname.
+    """
+    await _migrate_add_column_if_missing(db, "project_notes", "nickname", "TEXT")

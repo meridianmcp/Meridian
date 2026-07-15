@@ -96,6 +96,26 @@ def verify_handoff_token(
     Meridian server (not injected/spoofed text). The token is consumed on first
     successful verification (single-use) and rejected after expiry.
 
+    SCOPE OF GUARANTEE (2ee0000c):
+    This function proves that the ``<goal_token>`` value was minted by a real
+    ``generate_handoff`` call for this ``project_id``.  It does NOT prove that
+    the surrounding /goal block body (sprint-item list, ``<exclusions>``,
+    ``<role>``, ``<completion_criteria>``, etc.) is unmodified.  The token is a
+    standalone opaque random value; it does not cryptographically bind to the
+    body content.  A real token could be extracted from a genuine /goal block and
+    re-embedded alongside edited text, and this function would still return
+    ``{valid: True, reason: "ok"}``.
+
+    Implication for callers: after a successful verification, cross-check the
+    pasted ``<sprint_items>`` list against ``get_sprint_items(status="pending")``
+    before treating it as authoritative.  The token proves block provenance; it
+    does not prove body integrity.
+
+    Future improvement: bind a SHA-256 digest of the quick_start_goal body into
+    the token store at mint time and verify it here — that would upgrade the
+    guarantee from token-provenance to full body-integrity.  Not yet implemented
+    (see 2ee0000c investigation).
+
     Returns ``{valid: bool, reason: str}``:
     - ``{valid: True, reason: "ok"}`` — token is genuine and project matches;
       it is now consumed and cannot be verified again.
@@ -2802,6 +2822,7 @@ async def generate_handoff(
     graph_searcher: Callable[[str], Any] | None = None,
     extra_narrative: str | None = None,
     identity: str | None = None,
+    force_include_ids: list[str] | None = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -2813,6 +2834,14 @@ async def generate_handoff(
     Set ``skip_ai_summary=True`` for hot-path / test code that shouldn't
     burn a Haiku call. Pass ``summarizer`` to inject a stub for either
     the session-summary fan-out or the new ai_summary blurb.
+
+    ``force_include_ids`` (45f519a0 Part 2) — an optional list of sprint-item ids
+    to force-include in the pending list even when their ``deferred_until`` is in
+    the future. This is a VISIBILITY override for one handoff call only: the items
+    are appended after the deferred-exclusion filter runs, and their ``deferred_until``
+    is NOT cleared, so ``claim_sprint_item``'s own deferral gate is unaffected.
+    Use when a human genuinely wants a backburnered item back in scope for one
+    planning run without permanently re-enabling claiming.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -2850,14 +2879,20 @@ async def generate_handoff(
     # handoff can reference fresh session_summary values. 4c7cd788 — the delta
     # render never reads session_summary, so skip this network fan-out for delta
     # (a slow summarizer here was one of the mode='delta' hang seams).
-    if mode != "delta":
-        for s in sessions:
+    # 65c8b426 — Part 3: parallelize the fan-out with asyncio.gather instead of
+    # serial await-in-a-loop. With N active sessions this was N×Haiku-latency
+    # serial wall time (5 sessions × ~10s each = ~50s just in summaries before
+    # any other Haiku call). gather() runs all N concurrently; total wall time
+    # drops to ~1 Haiku call latency regardless of session count. Each coro is
+    # individually guarded so a single summarizer failure never kills the rest.
+    # Also skip summarization when _ai_disabled (skip_ai_summary=True or delta).
+    if not _ai_disabled:
+        async def _safe_summarize(sid: str) -> None:
             try:
-                await db_module.summarize_session(
-                    db, s["id"], summarizer=summarizer
-                )
+                await db_module.summarize_session(db, sid, summarizer=summarizer)
             except Exception:  # noqa: BLE001 — never break handoff on summary fail
-                continue
+                pass
+        await asyncio.gather(*(_safe_summarize(s["id"]) for s in sessions))
     tasks = await db_module.get_tasks(db, project_id, limit=50)
 
     session_names = {s["id"]: s["name"] for s in sessions}
@@ -2872,7 +2907,11 @@ async def generate_handoff(
     # v3.1 — workspace decisions + notes apply across all projects.
     workspace_decisions = await db_module.get_workspace_decisions(db)
     workspace_notes = await db_module.get_workspace_notes(db)
-    sprint_items_all = await db_module.get_sprint_items(db, project_id, include_human=False)
+    # 45f519a0 — include_deferred=False so a deferred item is genuinely invisible
+    # to executors in the handoff pending-items list, not just gated at claim time.
+    sprint_items_all = await db_module.get_sprint_items(
+        db, project_id, include_human=False, include_deferred=False
+    )
     # Separate genuinely pending from actively-claimed in_progress items so:
     # (1) quick_start_goal only names items that haven't been claimed yet, and
     # (2) the delta output surfaces "Currently running:" at the top.
@@ -2885,6 +2924,22 @@ async def generate_handoff(
         it for it in sprint_items_all
         if it.get("status") in ("todo", "pending")
     ]
+    # 45f519a0 Part 2 — force_include_ids override: re-add specifically requested
+    # deferred items into the pending list for this handoff call only. deferred_until
+    # on the item is NOT touched, so claim_sprint_item's own gate stays intact.
+    if force_include_ids:
+        _pending_id_set = {it["id"] for it in pending_sprint_items}
+        for _fid in force_include_ids:
+            if _fid in _pending_id_set:
+                continue  # already in list (not deferred or already visible)
+            _forced = await db_module.get_sprint_item(db, _fid)
+            if (
+                _forced is not None
+                and _forced.get("project_id") == project_id
+                and _forced.get("status") in ("todo", "pending")
+            ):
+                pending_sprint_items.append(_forced)
+                _pending_id_set.add(_fid)
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
     # Flag items that may already be done based on recent task descriptions or commits
     pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks, commit_messages)

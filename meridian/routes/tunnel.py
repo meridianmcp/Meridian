@@ -3480,7 +3480,7 @@ def build_graph_searcher(tenant_id: str | None):
     async def _search(query: str) -> Any:
         try:
             result = await call_tunnel_tool(
-                tenant_id, "search_graph", {"query": query, "limit": 3},
+                tenant_id, "codebase__search_graph", {"query": query, "limit": 3},
             )
         except Exception:  # noqa: BLE001 — best-effort enrichment, never fatal
             return None

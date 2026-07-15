@@ -5023,6 +5023,74 @@ async def test_workspace_settings_refresh_config_roundtrip(db):
 
 
 # ---------------------------------------------------------------------------
+# 6e0e5cea — configurable active_session_warning_minutes workspace setting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_active_session_warning_minutes_default(db):
+    """active_session_warning_minutes defaults to 10 (matching the old constant)."""
+    ws = await db_module.get_workspace_settings(db)
+    assert ws["active_session_warning_minutes"] == 10
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_active_session_warning_minutes_roundtrip(db):
+    """active_session_warning_minutes can be set and re-read."""
+    ws = await db_module.update_workspace_settings(db, active_session_warning_minutes=30)
+    assert ws["active_session_warning_minutes"] == 30
+    ws2 = await db_module.get_workspace_settings(db)
+    assert ws2["active_session_warning_minutes"] == 30
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_active_session_warning_minutes_clamped(db):
+    """Values <= 0 are clamped to 1 minute minimum."""
+    ws = await db_module.update_workspace_settings(db, active_session_warning_minutes=0)
+    assert ws["active_session_warning_minutes"] == 1
+    ws2 = await db_module.update_workspace_settings(db, active_session_warning_minutes=-5)
+    assert ws2["active_session_warning_minutes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_active_executor_session_warnings_respects_configured_threshold(db):
+    """_active_executor_session_warnings uses workspace active_session_warning_minutes.
+
+    When the threshold is reduced to 1 minute, a session that was last seen
+    ~2 minutes ago should NOT trigger a warning (it falls outside the window).
+    When the threshold is 10 minutes (default), the same session IS in-window.
+    """
+    from datetime import datetime, timezone, timedelta
+    from meridian.mcp.handler import _active_executor_session_warnings
+
+    p = await db_module.create_project(db, "asw-threshold-test")
+    pid = p["id"]
+    # Register a session then backdate its last_seen to 90 seconds ago.
+    sess = await db_module.register_session(db, pid, "backdate-executor")
+    past = (datetime.now(timezone.utc) - timedelta(seconds=90)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    await db.execute(
+        "UPDATE sessions SET last_seen = ? WHERE id = ?", (past, sess["id"])
+    )
+    await db.commit()
+
+    # With default threshold (10 min = 600 s), 90 s ago is within window.
+    warns_default = await _active_executor_session_warnings(db, pid)
+    assert warns_default, "Expected warning at default 10-minute threshold"
+
+    # Set threshold to 1 minute (60 s); 90 s is now outside the window.
+    await db_module.update_workspace_settings(db, active_session_warning_minutes=1)
+    warns_narrow = await _active_executor_session_warnings(db, pid)
+    assert not warns_narrow, "Expected no warning with 1-minute threshold (session 90 s old)"
+
+    # Widen to 5 minutes (300 s); 90 s is back inside.
+    await db_module.update_workspace_settings(db, active_session_warning_minutes=5)
+    warns_wide = await _active_executor_session_warnings(db, pid)
+    assert warns_wide, "Expected warning restored at 5-minute threshold"
+
+
+# ---------------------------------------------------------------------------
 # 637dd900 — workspace layer tenant isolation
 # ---------------------------------------------------------------------------
 
@@ -7310,6 +7378,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_tunnel_plugins_by_host",
         "_migrate_pg_feedback",
         "_migrate_pg_registered_hostnames",
+        "_migrate_pg_redis_overage_fields",
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
@@ -7377,10 +7446,17 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_resources_amended",
         "_migrate_pg_session_activity",
         "_migrate_pg_file_docx_region_claims",
+        "_migrate_pg_connection_events",
+        "_migrate_pg_sprint_version_descriptions",
+        "_migrate_pg_workspace_settings_active_session_threshold",
+        "_migrate_pg_sprint_item_sprint_name",
+        "_migrate_pg_proposal_slug_nickname",
+        "_migrate_pg_decision_slug_nickname",
+        "_migrate_pg_note_nickname",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 100
+    assert len(allnames) == len(set(allnames)) == 108
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -13256,6 +13332,57 @@ async def test_patch_sprint_item_edits_notes_human_group(db):
 
 
 @pytest.mark.asyncio
+async def test_sprint_item_sprint_name(db):
+    """3d6bd938 — sprint_name is stored separately from version in sprint_items.
+
+    add_sprint_item accepts sprint_name and stores it independently of version.
+    patch_sprint_item can set, update, and clear sprint_name via the _UNSET sentinel.
+    """
+    p = await db_module.create_project(db, "sprint-name-test")
+
+    # Add item with both version and sprint_name.
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v0.2.x", "Wire docs pipeline",
+        sprint_name="docs-cloudflare",
+    )
+    assert item["version"] == "v0.2.x"
+    assert item["sprint_name"] == "docs-cloudflare"
+
+    # Add item with version only — sprint_name should be None.
+    item_no_name = await db_module.add_sprint_item(
+        db, p["id"], "v0.2.x", "Unrelated task", force=True,
+    )
+    assert item_no_name["version"] == "v0.2.x"
+    assert item_no_name.get("sprint_name") is None
+
+    # patch_sprint_item can update sprint_name.
+    patched = await db_module.patch_sprint_item(
+        db, p["id"], item["id"], sprint_name="docs-cloudflare-renamed",
+    )
+    assert patched["sprint_name"] == "docs-cloudflare-renamed"
+    # version must remain unchanged.
+    assert patched["version"] == "v0.2.x"
+
+    # patch_sprint_item can clear sprint_name with empty string or None.
+    cleared = await db_module.patch_sprint_item(
+        db, p["id"], item["id"], sprint_name="",
+    )
+    assert cleared["sprint_name"] is None
+
+    # Omitting sprint_name leaves the stored value untouched (UNSET sentinel).
+    restored = await db_module.patch_sprint_item(
+        db, p["id"], item_no_name["id"], sprint_name="wave-1-items",
+    )
+    assert restored["sprint_name"] == "wave-1-items"
+
+    # get_sprint_items returns sprint_name on each item (SELECT *).
+    items = await db_module.get_sprint_items(db, p["id"])
+    by_id = {it["id"]: it for it in items}
+    assert by_id[item["id"]]["sprint_name"] is None  # was cleared
+    assert by_id[item_no_name["id"]]["sprint_name"] == "wave-1-items"
+
+
+@pytest.mark.asyncio
 async def test_dispatch_mcp_tool_update_sprint_item(db):
     """update_sprint_item via _dispatch_mcp_tool edits fields and reports missing ids."""
     import meridian.server as srv
@@ -14801,6 +14928,72 @@ async def test_sprint_item_slug_autopopulated(db):
     # A caller-supplied slug base is slugified too.
     c = await db_module.add_sprint_item(db, pid, "v1", "Something else", slug="Custom Slug")
     assert c["slug"] == "custom-slug"
+
+
+@pytest.mark.asyncio
+async def test_split_sprint_item_generates_slug_and_nickname(db):
+    """ae87699d — split_sprint_item must populate slug+nickname on every new child,
+    not leave them null. Also verifies uniqueness when two children share a title."""
+    p = await db_module.create_project(db, "slug-split")
+    pid = p["id"]
+    orig = await db_module.add_sprint_item(db, pid, "v1", "Original task to split")
+    children = await db_module.split_sprint_item(db, pid, orig["id"], [
+        "Child One Part",
+        "Child Two Part",
+        "Child One Part",  # collision: same slug base, must get -2/-3 suffix
+    ])
+    assert len(children) == 3
+    for child in children:
+        assert child.get("slug"), f"slug missing on split child: {child['id']}"
+        assert child.get("nickname"), f"nickname missing on split child: {child['id']}"
+    slugs = [c["slug"] for c in children]
+    assert len(set(slugs)) == len(slugs), f"slug collision among split children: {slugs}"
+    nicknames = [c["nickname"] for c in children]
+    assert len(set(nicknames)) == len(nicknames), (
+        f"nickname collision among split children: {nicknames}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_sprint_items_generates_slug_and_nickname(db):
+    """ae87699d — merge_sprint_items must populate slug+nickname on the survivor."""
+    p = await db_module.create_project(db, "slug-merge")
+    pid = p["id"]
+    a = await db_module.add_sprint_item(db, pid, "v1", "Alpha work")
+    b = await db_module.add_sprint_item(db, pid, "v1", "Beta work", force=True)
+    survivor = await db_module.merge_sprint_items(db, pid, [a["id"], b["id"]], "Unified work item")
+    assert survivor.get("slug"), "slug missing on merge survivor"
+    assert survivor.get("nickname"), "nickname missing on merge survivor"
+    # slug derives from new_title
+    assert survivor["slug"].startswith("unified"), (
+        f"unexpected slug: {survivor['slug']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_generates_slug_and_nickname(db):
+    """ae87699d — fan_out_sprint_items must populate slug+nickname on every item,
+    not leave them null. Slugs+nicknames must be unique within the batch."""
+    p = await db_module.create_project(db, "slug-fanout")
+    pid = p["id"]
+    specs = [
+        {"title": "Fan Out Task Alpha"},
+        {"title": "Fan Out Task Beta"},
+        {"title": "Fan Out Task Alpha"},  # collision: same title, must get -2 slug suffix
+    ]
+    ids = await db_module.fan_out_sprint_items(db, pid, specs)
+    assert len(ids) == 3
+    items = [await db_module.get_sprint_item(db, iid) for iid in ids]
+    for item in items:
+        assert item is not None
+        assert item.get("slug"), f"slug missing on fan-out item: {item['id']}"
+        assert item.get("nickname"), f"nickname missing on fan-out item: {item['id']}"
+    slugs = [it["slug"] for it in items]
+    assert len(set(slugs)) == len(slugs), f"slug collision among fan-out items: {slugs}"
+    nicknames = [it["nickname"] for it in items]
+    assert len(set(nicknames)) == len(nicknames), (
+        f"nickname collision among fan-out items: {nicknames}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -17723,3 +17916,430 @@ def test_build_item_briefing_minimal_item():
     assert "/goal" in brief
     assert "min1" in brief
     assert "Minimal" in brief
+
+
+# ---------------------------------------------------------------------------
+# b12cc29f — connection_events: per-/mcp-request auth+method event log
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migrate_connection_events_idempotent(db):
+    """_migrate_connection_events is idempotent — re-running it never raises."""
+    from meridian.db.migrations import _migrate_connection_events
+
+    # init_db already ran it once; a second call must be a no-op.
+    await _migrate_connection_events(db)
+    # Table must be usable after the redundant migration.
+    await db_module.record_connection_event(
+        db,
+        tenant_id="idem-test",
+        method="initialize",
+        auth_result="success",
+        response_status=200,
+    )
+    rows = await db_module.get_connection_log(db, tenant_id="idem-test")
+    assert len(rows) == 1
+    assert rows[0]["method"] == "initialize"
+
+
+@pytest.mark.asyncio
+async def test_record_connection_event_basic(db):
+    """record_connection_event writes a retrievable row."""
+    await db_module.record_connection_event(
+        db,
+        tenant_id="t-basic",
+        method="tools/list",
+        auth_result="success",
+        tools_returned=42,
+        client_user_agent="Claude-Desktop/1.0",
+        response_status=200,
+    )
+    rows = await db_module.get_connection_log(db, tenant_id="t-basic")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["tenant_id"] == "t-basic"
+    assert r["method"] == "tools/list"
+    assert r["auth_result"] == "success"
+    assert r["tools_returned"] == 42
+    assert r["client_user_agent"] == "Claude-Desktop/1.0"
+    assert r["response_status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_record_connection_event_null_tenant(db):
+    """record_connection_event accepts tenant_id=None (unauthenticated attempts)."""
+    await db_module.record_connection_event(
+        db,
+        tenant_id=None,
+        method="initialize",
+        auth_result="invalid_token",
+        response_status=401,
+    )
+    # Fetch with no tenant filter — returns all rows including NULL tenant.
+    rows = await db_module.get_connection_log(db, tenant_id=None)
+    found = [r for r in rows if r["auth_result"] == "invalid_token"]
+    assert len(found) >= 1
+
+
+@pytest.mark.asyncio
+async def test_get_connection_log_since_filter(db):
+    """get_connection_log since= filter correctly excludes older events."""
+    import asyncio as _aio
+
+    # Write two events with distinct timestamps (sleep not needed — insert
+    # order is enough since we use recorded_at DESC and the DB writes real
+    # wall-clock time; just ensure the since= string is deterministic).
+    await db_module.record_connection_event(
+        db, tenant_id="t-since", method="initialize", auth_result="success",
+        response_status=200,
+    )
+    # The second event is effectively the same second; query with a future
+    # since= to confirm the filter works (returns 0 rows).
+    future_since = "2099-01-01 00:00:00"
+    rows_future = await db_module.get_connection_log(
+        db, tenant_id="t-since", since=future_since
+    )
+    assert rows_future == []
+
+    # Past since= returns the row we wrote.
+    rows_all = await db_module.get_connection_log(
+        db, tenant_id="t-since", since="2000-01-01 00:00:00"
+    )
+    assert len(rows_all) >= 1
+
+
+@pytest.mark.asyncio
+async def test_get_connection_log_limit(db):
+    """get_connection_log caps at the provided limit."""
+    for i in range(5):
+        await db_module.record_connection_event(
+            db, tenant_id="t-limit", method="tools/call",
+            auth_result="success", response_status=200,
+        )
+    rows = await db_module.get_connection_log(db, tenant_id="t-limit", limit=3)
+    assert len(rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_connection_log_mcp_tool(db):
+    """The get_connection_log MCP tool returns events for the current tenant."""
+    from meridian.mcp.handlers.session_tools import handle_get_connection_log
+
+    # Write one event for this (fake) tenant.
+    await db_module.record_connection_event(
+        db,
+        tenant_id="mcp-tenant-1",
+        method="tools/list",
+        auth_result="success",
+        tools_returned=10,
+        response_status=200,
+    )
+    # Call the handler with the matching tenant id.
+    result = await handle_get_connection_log(
+        args={},
+        db=db,
+        data_dir="",
+        tenant={"id": "mcp-tenant-1"},
+        _mcp_tenant_id="mcp-tenant-1",
+    )
+    assert result["tenant_id"] == "mcp-tenant-1"
+    assert result["count"] >= 1
+    assert result["events"][0]["method"] == "tools/list"
+    assert result["events"][0]["tools_returned"] == 10
+
+
+@pytest.mark.asyncio
+async def test_get_connection_log_ring_buffer(db):
+    """Ring buffer caps at _CONNECTION_EVENTS_RING_SIZE per tenant.
+
+    This test uses a small ring size via monkey-patching to avoid writing 1000
+    rows in the test suite; the pruning logic is the same regardless of N.
+    """
+    import meridian.db as _db_mod
+    original = _db_mod._CONNECTION_EVENTS_RING_SIZE
+    _db_mod._CONNECTION_EVENTS_RING_SIZE = 5
+    try:
+        for i in range(8):
+            await _db_mod.record_connection_event(
+                db, tenant_id="t-ring", method="tools/call",
+                auth_result="success", response_status=200,
+            )
+        rows = await _db_mod.get_connection_log(db, tenant_id="t-ring", limit=500)
+        assert len(rows) == 5
+    finally:
+        _db_mod._CONNECTION_EVENTS_RING_SIZE = original
+
+
+# ---------------------------------------------------------------------------
+# 45f519a0 — deferred-item backburner tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_include_deferred_true_returns_deferred(db):
+    """include_deferred=True (default) returns items with a future deferred_until."""
+    p = await db_module.create_project(db, "deferred-test-1")
+    future = "2099-01-01T00:00:00"
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Future work", deferred_until=future
+    )
+    items = await db_module.get_sprint_items(db, p["id"], include_deferred=True)
+    ids = [it["id"] for it in items]
+    assert item["id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_include_deferred_false_hides_deferred(db):
+    """include_deferred=False excludes items with a future deferred_until."""
+    p = await db_module.create_project(db, "deferred-test-2")
+    future = "2099-01-01T00:00:00"
+    visible = await db_module.add_sprint_item(db, p["id"], "v1", "Visible work")
+    deferred = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Backburner work", deferred_until=future
+    )
+    items = await db_module.get_sprint_items(db, p["id"], include_deferred=False)
+    ids = [it["id"] for it in items]
+    assert visible["id"] in ids
+    assert deferred["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_past_deferred_not_hidden(db):
+    """An item with a PAST deferred_until is NOT hidden by include_deferred=False."""
+    p = await db_module.create_project(db, "deferred-test-3")
+    past = "2000-01-01T00:00:00"
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Past deferred", deferred_until=past
+    )
+    items = await db_module.get_sprint_items(db, p["id"], include_deferred=False)
+    ids = [it["id"] for it in items]
+    assert item["id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_garbage_deferred_passes_through(db):
+    """A garbage deferred_until is treated as not deferred (fail-open)."""
+    p = await db_module.create_project(db, "deferred-test-4")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Garbage deferred", deferred_until="not-a-date"
+    )
+    items = await db_module.get_sprint_items(db, p["id"], include_deferred=False)
+    ids = [it["id"] for it in items]
+    assert item["id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_handoff_excludes_deferred_from_pending_list(db, tmp_path):
+    """generate_handoff pending list excludes items with future deferred_until."""
+    p = await db_module.create_project(db, "deferred-handoff-1")
+    await db_module.set_goal(db, p["id"], "ship things")
+    future = "2099-01-01T00:00:00"
+    visible = await db_module.add_sprint_item(db, p["id"], "v1", "Visible task")
+    deferred = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Backburner task", deferred_until=future
+    )
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "Visible task" in content
+    assert "Backburner task" not in content
+    # deferred item id must not appear in the /goal sprint items list
+    assert deferred["id"] not in content
+
+
+@pytest.mark.asyncio
+async def test_handoff_force_include_ids_re_adds_deferred(db, tmp_path):
+    """force_include_ids re-adds a deferred item into the handoff for one call."""
+    p = await db_module.create_project(db, "deferred-handoff-2")
+    await db_module.set_goal(db, p["id"], "ship things")
+    future = "2099-01-01T00:00:00"
+    deferred = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Backburner task", deferred_until=future
+    )
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        force_include_ids=[deferred["id"]],
+    )
+    assert "Backburner task" in content
+    # deferred_until is NOT cleared — the item is still deferred in the DB
+    refetched = await db_module.get_sprint_item(db, deferred["id"])
+    assert refetched["deferred_until"] == future
+
+
+@pytest.mark.asyncio
+async def test_handoff_force_include_ids_does_not_affect_claim_gate(db, tmp_path):
+    """force_include_ids visibility override does not bypass claim_sprint_item deferral gate."""
+    from meridian.db.sprint_items import claim_sprint_item
+    p = await db_module.create_project(db, "deferred-handoff-3")
+    await db_module.set_goal(db, p["id"], "gate test")
+    future = "2099-01-01T00:00:00"
+    deferred = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Deferred task", deferred_until=future
+    )
+    # Generate handoff with force_include_ids — item appears in handoff
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        force_include_ids=[deferred["id"]],
+    )
+    assert "Deferred task" in content
+    # But claiming the item is still blocked
+    result = await claim_sprint_item(db, p["id"], deferred["id"])
+    assert isinstance(result, dict)
+    assert result.get("blocked") is True
+    assert result.get("error") == "DEFERRED"
+
+
+def test_is_deferred_helper():
+    """_is_deferred() returns True for future timestamps and False for past/missing."""
+    from meridian.db.sprint_items import _is_deferred
+
+    assert _is_deferred({"deferred_until": "2099-01-01T00:00:00"}) is True
+    assert _is_deferred({"deferred_until": "2000-01-01T00:00:00"}) is False
+    assert _is_deferred({"deferred_until": None}) is False
+    assert _is_deferred({"deferred_until": ""}) is False
+    assert _is_deferred({"deferred_until": "garbage"}) is False
+    assert _is_deferred({}) is False
+
+
+@pytest.mark.asyncio
+async def test_handoff_force_include_ids_unknown_item_is_ignored(db, tmp_path):
+    """force_include_ids silently ignores unknown or non-pending item ids."""
+    p = await db_module.create_project(db, "deferred-handoff-4")
+    await db_module.set_goal(db, p["id"], "ignore unknowns")
+    visible = await db_module.add_sprint_item(db, p["id"], "v1", "Real task")
+    # Include a made-up id — should not raise, just ignore
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        force_include_ids=["nonexistent-id-00000000"],
+    )
+    assert "Real task" in content
+
+
+# ---------------------------------------------------------------------------
+# 6fb48898 — slug/nickname generation extended to decisions, notes, proposals
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pin_decision_generates_slug_and_nickname(db):
+    """pin_decision auto-populates slug and nickname from the title."""
+    p = await db_module.create_project(db, "dec-slug-test")
+    d = await db_module.pin_decision(
+        db, p["id"], "Use psycopg3 over asyncpg", "psycopg3 avoids DLL issues"
+    )
+    assert d.get("slug"), "slug should be set"
+    assert d.get("nickname"), "nickname should be set"
+    assert "psycopg3" in d["slug"]
+    # slug should be kebab-cased, nickname should be short (1-2 words)
+    assert d["slug"] == d["slug"].lower()
+    assert d["nickname"].count("-") <= 1
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_slug_unique_per_project(db):
+    """Duplicate title slugs in the same project get a numeric suffix."""
+    p = await db_module.create_project(db, "dec-slug-dedup")
+    d1 = await db_module.pin_decision(
+        db, p["id"], "psycopg3 choice", "reason a"
+    )
+    d2 = await db_module.pin_decision(
+        db, p["id"], "psycopg3 choice", "reason b"
+    )
+    assert d1["slug"] != d2["slug"]
+    assert d2["slug"].startswith(d1["slug"])  # collision → numeric suffix
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_nickname_unique_per_project(db):
+    """Duplicate nicknames in the same project get a numeric suffix."""
+    p = await db_module.create_project(db, "dec-nick-dedup")
+    d1 = await db_module.pin_decision(
+        db, p["id"], "psycopg3 choice", "body"
+    )
+    d2 = await db_module.pin_decision(
+        db, p["id"], "psycopg3 choice identical", "body"
+    )
+    # Both should have nicknames, and they should differ
+    assert d1["nickname"] and d2["nickname"]
+    assert d1["nickname"] != d2["nickname"]
+
+
+@pytest.mark.asyncio
+async def test_add_project_note_generates_nickname(db):
+    """add_project_note auto-populates both slug and nickname from the title."""
+    p = await db_module.create_project(db, "note-nick-test")
+    n = await db_module.add_project_note(
+        db, p["id"], "Redis connection pooling gotcha", "body"
+    )
+    assert n.get("slug"), "slug should be set"
+    assert n.get("nickname"), "nickname should be set"
+    # nickname should be short (1-2 words)
+    assert n["nickname"].count("-") <= 1
+    assert "redis" in n["slug"] or "connection" in n["slug"]
+
+
+@pytest.mark.asyncio
+async def test_add_project_note_nickname_unique_per_project(db):
+    """Duplicate nicknames in the same project get a numeric suffix."""
+    p = await db_module.create_project(db, "note-nick-dedup")
+    n1 = await db_module.add_project_note(
+        db, p["id"], "redis pooling gotcha", "body"
+    )
+    n2 = await db_module.add_project_note(
+        db, p["id"], "redis pooling gotcha identical words", "body"
+    )
+    assert n1["nickname"] and n2["nickname"]
+    assert n1["nickname"] != n2["nickname"]
+
+
+@pytest.mark.asyncio
+async def test_add_workspace_proposal_generates_slug_and_nickname(db):
+    """add_workspace_proposal auto-populates slug and nickname from the title."""
+    prop = await db_module.add_workspace_proposal(
+        db, "Add multi-tenant billing dashboard", "detailed body", tenant_id="t1"
+    )
+    assert prop.get("slug"), "slug should be set"
+    assert prop.get("nickname"), "nickname should be set"
+    assert "multi" in prop["slug"] or "billing" in prop["slug"]
+    assert prop["slug"] == prop["slug"].lower()
+    assert prop["nickname"].count("-") <= 1
+
+
+@pytest.mark.asyncio
+async def test_add_workspace_proposal_slug_unique_per_tenant(db):
+    """Duplicate title slugs for the same tenant get a numeric suffix."""
+    p1 = await db_module.add_workspace_proposal(
+        db, "batch export feature", "body", tenant_id="t2"
+    )
+    p2 = await db_module.add_workspace_proposal(
+        db, "batch export feature", "body", tenant_id="t2"
+    )
+    assert p1["slug"] != p2["slug"]
+    assert p2["slug"].startswith(p1["slug"])
+
+
+@pytest.mark.asyncio
+async def test_add_workspace_proposal_slug_isolated_across_tenants(db):
+    """The same slug can exist for different tenants without collision."""
+    p_a = await db_module.add_workspace_proposal(
+        db, "batch export feature", "body", tenant_id="ta"
+    )
+    p_b = await db_module.add_workspace_proposal(
+        db, "batch export feature", "body", tenant_id="tb"
+    )
+    # Different tenants → same base slug is fine
+    assert p_a["slug"] == p_b["slug"]
+
+
+@pytest.mark.asyncio
+async def test_supersede_pinned_decision_inherits_slug_generation(db):
+    """supersede_pinned_decision creates a new decision via pin_decision which
+    must also get a slug and nickname."""
+    p = await db_module.create_project(db, "dec-supersede-slug")
+    old = await db_module.pin_decision(
+        db, p["id"], "Use asyncpg", "reason a"
+    )
+    new = await db_module.supersede_pinned_decision(
+        db, old["id"], "Use psycopg3 instead", "asyncpg had DLL issues"
+    )
+    assert new.get("slug"), "superseding decision should have slug"
+    assert new.get("nickname"), "superseding decision should have nickname"

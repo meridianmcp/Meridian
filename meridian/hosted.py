@@ -2631,6 +2631,238 @@ async def run_trial_reminder_check(db: Any, *, now: "datetime | None" = None) ->
 
 
 # ---------------------------------------------------------------------------
+# 342dd15f — Redis command budget: warning emails + monthly counter reset
+# ---------------------------------------------------------------------------
+
+#: Upstash pricing: $0.20 / 100 000 commands → 1 command = $2e-6.
+#: Tier-1 warning threshold (~$1.00 / month).
+REDIS_BUDGET_WARN_COMMANDS: int = 500_000
+#: Tier-2 disable threshold (~$2.00 / month). publish_session_message returns
+#: False when the tenant's counter is >= this value.
+REDIS_BUDGET_DISABLE_COMMANDS: int = 1_000_000
+
+
+def compute_redis_overage_action(
+    tenant: dict[str, Any],
+) -> "str | None":
+    """Pure decision: which Redis-budget action (if any) to take for *tenant*.
+
+    Returns:
+      ``'warn'``  — tenant's redis_commands_used has crossed Tier-1 (500 000
+                    commands / ~$1.00) but has not yet been warned this month.
+                    Caller should send a warning email and record the flag.
+      ``'hard_limit'``  — tenant's counter has crossed Tier-2 (1 000 000
+                          commands / ~$2.00) but the "hard limit reached" email
+                          has not been sent yet.  The publish gate in
+                          redis_bridge already blocks new publishes at this
+                          threshold; this email is purely informational.
+      ``None``   — no action needed (counter below Tier-1, already notified,
+                   or tenant is internal).
+
+    Idempotent — which notifications were sent is stored in the tenant's
+    existing ``notification_prefs`` JSON blob (keys ``redis_warn_sent`` and
+    ``redis_hard_limit_sent``), so no new schema column is needed for the
+    idempotency flags themselves.
+    """
+    if tenant.get("is_internal"):
+        return None
+
+    used = int(tenant.get("redis_commands_used") or 0)
+    prefs = _parse_notification_prefs(tenant)
+
+    if used >= REDIS_BUDGET_DISABLE_COMMANDS:
+        if not prefs.get("redis_hard_limit_sent"):
+            return "hard_limit"
+        return None
+
+    if used >= REDIS_BUDGET_WARN_COMMANDS:
+        if not prefs.get("redis_warn_sent"):
+            return "warn"
+        return None
+
+    return None
+
+
+def _parse_notification_prefs(tenant: dict[str, Any]) -> dict[str, Any]:
+    """Return the tenant's notification_prefs dict, tolerant of missing/malformed blobs."""
+    import json as _json  # noqa: PLC0415
+    raw = tenant.get("notification_prefs")
+    if not raw:
+        return {}
+    try:
+        prefs = raw if isinstance(raw, dict) else _json.loads(raw)
+        return prefs if isinstance(prefs, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _with_redis_flag_recorded(
+    tenant: dict[str, Any], flag: str
+) -> str:
+    """Return the tenant's ``notification_prefs`` JSON with ``flag`` set to True.
+
+    Preserves every other key already in the blob.
+    """
+    import json as _json  # noqa: PLC0415
+    prefs = _parse_notification_prefs(tenant)
+    prefs[flag] = True
+    return _json.dumps(prefs)
+
+
+def _redis_warning_email(used: int, base: str) -> tuple[str, str]:
+    """Return ``(subject, html)`` for the Tier-1 Redis budget warning email."""
+    subject = "[Meridian] High real-time message volume — Redis usage notice"
+    html = (
+        f"<h2>Your Meridian real-time messaging usage is elevated</h2>"
+        f"<p>Your account has issued approximately <strong>{used:,} Redis publish "
+        f"commands</strong> this billing month (threshold: 500,000 commands / ~$1.00 "
+        f"Upstash cost).</p>"
+        f"<p>The Meridian <code>send_message</code> tool uses Redis for real-time "
+        f"push delivery. At current volume, Redis costs for your account are tracking "
+        f"above our $1.00/month per-account budget.</p>"
+        f"<p>No action is required immediately. If usage continues to increase, "
+        f"real-time push delivery will be automatically disabled at 1,000,000 commands "
+        f"(~$2.00/month). Messages will still be reliably delivered via Postgres "
+        f"polling — only the <em>real-time push</em> feature is affected.</p>"
+        f"<p>Questions? Reply to this email or contact "
+        f"<a href='mailto:hello@usemeridian.us'>hello@usemeridian.us</a>.</p>"
+    )
+    return subject, html
+
+
+def _redis_hard_limit_email(used: int, base: str) -> tuple[str, str]:
+    """Return ``(subject, html)`` for the Tier-2 Redis budget hard-limit email."""
+    subject = "[Meridian] Real-time push messaging paused — Redis limit reached"
+    html = (
+        f"<h2>Real-time push messaging has been paused for your account</h2>"
+        f"<p>Your account has reached the Redis publish command limit for this billing "
+        f"month: <strong>{used:,} commands</strong> (limit: 1,000,000 / ~$2.00 "
+        f"Upstash cost).</p>"
+        f"<p><strong>What this means:</strong> The <code>send_message</code> MCP tool "
+        f"will continue to work normally — messages are durably stored in your Postgres "
+        f"database. Only the <em>real-time push notification</em> layer has been paused. "
+        f"Recipients will receive messages via polling instead of instant delivery.</p>"
+        f"<p><strong>When does it reset?</strong> Real-time push will automatically "
+        f"resume at the start of next billing month when your counter resets.</p>"
+        f"<p>If you believe this limit was reached in error, or you need a higher limit, "
+        f"please contact "
+        f"<a href='mailto:hello@usemeridian.us'>hello@usemeridian.us</a>.</p>"
+    )
+    return subject, html
+
+
+async def run_redis_overage_check(db: Any, *, now: "datetime | None" = None) -> None:
+    """Hourly pass: send Redis-budget warning/hard-limit emails to affected tenants.
+
+    Tier-1 (500 000 commands / ~$1.00): warning email. Idempotent via the
+    tenant's notification_prefs JSON blob (``redis_warn_sent`` flag).
+
+    Tier-2 (1 000 000 commands / ~$2.00): separate "hard limit reached" email.
+    Idempotent via ``redis_hard_limit_sent`` flag. The publish gate in
+    redis_bridge.publish_session_message already enforces the hard limit at the
+    call site; this function's job is purely the informational email.
+
+    Counter reset: at the start of each calendar month (UTC), reset
+    redis_commands_used to 0 and clear the per-month idempotency flags so
+    tenants get fresh notifications next month if their pattern recurs.
+
+    ``now`` is injectable purely for testing; production calls pass nothing.
+    """
+    import httpx  # noqa: PLC0415
+
+    from . import db as db_module  # noqa: PLC0415
+
+    now = now or datetime.now(timezone.utc)
+    resend_key = _cfg("RESEND_API_KEY")
+    if not resend_key:
+        return  # dev mode — no email transport configured
+    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+
+    async with db.execute(
+        "SELECT * FROM tenants WHERE plan NOT IN ('free') OR plan IS NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+
+    def _to_d(r: Any) -> dict:
+        return r if isinstance(r, dict) else {k: r[k] for k in r.keys()}
+
+    for row in rows or []:
+        tenant = _to_d(row)
+
+        # Monthly counter reset: if overage_reset_at is from a previous month,
+        # clear redis_commands_used and the per-month notification flags.
+        reset_at_raw = tenant.get("overage_reset_at")
+        if reset_at_raw:
+            try:
+                from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
+                reset_dt = _dt.fromisoformat(reset_at_raw.replace("Z", "+00:00"))
+                if reset_dt.month != now.month or reset_dt.year != now.year:
+                    # New month — reset counter and flags.
+                    import json as _json  # noqa: PLC0415
+                    prefs = _parse_notification_prefs(tenant)
+                    prefs.pop("redis_warn_sent", None)
+                    prefs.pop("redis_hard_limit_sent", None)
+                    try:
+                        await db_module.update_tenant(
+                            db,
+                            tenant["id"],
+                            redis_commands_used=0,
+                            notification_prefs=_json.dumps(prefs),
+                        )
+                        tenant["redis_commands_used"] = 0
+                        tenant["notification_prefs"] = _json.dumps(prefs)
+                    except Exception:  # noqa: BLE001
+                        continue
+            except (ValueError, AttributeError):
+                pass
+
+        action = compute_redis_overage_action(tenant)
+        if action is None:
+            continue
+        email = tenant.get("email")
+        if not email:
+            continue
+
+        used = int(tenant.get("redis_commands_used") or 0)
+        if action == "warn":
+            subject, html = _redis_warning_email(used, base)
+            flag = "redis_warn_sent"
+        else:  # hard_limit
+            subject, html = _redis_hard_limit_email(used, base)
+            flag = "redis_hard_limit_sent"
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                resp = await http.post(
+                    "https://api.resend.com/emails",
+                    headers={
+                        "Authorization": f"Bearer {resend_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "from": from_addr,
+                        "to": [email],
+                        "subject": subject,
+                        "html": html,
+                    },
+                )
+                resp.raise_for_status()
+        except Exception:  # noqa: BLE001 — one bad send must not stall the pass
+            continue
+
+        # Persist idempotency flag only after a successful send.
+        try:
+            await db_module.update_tenant(
+                db,
+                tenant["id"],
+                notification_prefs=_with_redis_flag_recorded(tenant, flag),
+            )
+        except Exception:  # noqa: BLE001
+            continue
+
+
+# ---------------------------------------------------------------------------
 # Dunning flow — payment failure → warnings → hard delete
 # ---------------------------------------------------------------------------
 

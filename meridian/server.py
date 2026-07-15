@@ -580,6 +580,13 @@ async def lifespan(app: FastAPI):
                             await run_dunning_cleanup(db)
                         except Exception:  # noqa: BLE001
                             pass
+                        # 342dd15f — hourly Redis command budget check:
+                        # warning + hard-limit emails, monthly counter reset.
+                        try:
+                            from .hosted import run_redis_overage_check
+                            await run_redis_overage_check(db)
+                        except Exception:  # noqa: BLE001
+                            pass
                         # Daily at 3am: compute + storage overage check
                         import time as _time2
                         _local_hour = _time2.localtime().tm_hour
@@ -6452,6 +6459,31 @@ async def remote_mcp(request: Request) -> Any:
         return _JR({"jsonrpc": "2.0", "id": _req_id_from_body, "error": {"code": -32603, "message": "internal error — please retry"}})
 
 
+async def _log_connection_event(
+    db: Any,
+    *,
+    tenant_id: "str | None",
+    method: str,
+    auth_result: str,
+    tools_returned: "int | None" = None,
+    client_user_agent: "str | None" = None,
+    response_status: int = 200,
+) -> None:
+    """Fire-and-forget connection event logger. Never raises — all errors are swallowed."""
+    try:
+        await db_module.record_connection_event(
+            db,
+            tenant_id=tenant_id,
+            method=method,
+            auth_result=auth_result,
+            tools_returned=tools_returned,
+            client_user_agent=client_user_agent,
+            response_status=response_status,
+        )
+    except Exception:  # noqa: BLE001 — logging must never break a real /mcp response
+        pass
+
+
 async def _remote_mcp_inner(request: Request) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
 
@@ -6460,6 +6492,11 @@ async def _remote_mcp_inner(request: Request) -> Any:
     Accepts a single JSON-RPC 2.0 message or a batch (list).
     """
     from fastapi.responses import JSONResponse
+
+    # b12cc29f — capture UA once for connection-event logging throughout.
+    _conn_ua = (request.headers.get("user-agent", "") or "")[:200] or None
+    # The shared auth DB is used for connection-event writes on all paths.
+    _conn_db = request.app.state.db
 
     if _limiter is not None:
         try:
@@ -6482,6 +6519,20 @@ async def _remote_mcp_inner(request: Request) -> Any:
         if _tm_local.time() > _td.get("exp", 0):
             _oa_mod._oa_tokens.pop(_bearer_hash, None)  # noqa: SLF001
             _base_r = str(request.base_url).rstrip("/")
+            # b12cc29f — log expired OAuth attempt before returning 401.
+            try:
+                _exp_body = await request.json()
+                _exp_method = (_exp_body.get("method", "") if isinstance(_exp_body, dict) else "")
+            except Exception:
+                _exp_method = ""
+            await _log_connection_event(
+                _conn_db,
+                tenant_id=_td.get("tenant_id"),
+                method=_exp_method,
+                auth_result="expired",
+                client_user_agent=_conn_ua,
+                response_status=401,
+            )
             return JSONResponse(
                 {"error": "token_expired"},
                 status_code=401,
@@ -6490,6 +6541,14 @@ async def _remote_mcp_inner(request: Request) -> Any:
         try:
             _body = await request.json()
         except Exception:
+            await _log_connection_event(
+                _conn_db,
+                tenant_id=_td.get("tenant_id"),
+                method="",
+                auth_result="oauth",
+                client_user_agent=_conn_ua,
+                response_status=400,
+            )
             return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
         # In hosted mode, route to the tenant's project DB (not the shared auth DB).
         # tenant_id is stored in _oa_tokens when the OAuth flow ran in hosted mode.
@@ -6511,6 +6570,15 @@ async def _remote_mcp_inner(request: Request) -> Any:
                     "[mcp] tenant %s DB open failed (%s) — returning %s, NOT falling back to auth DB",
                     _oa_tenant_id, _db_exc.detail, _db_exc.status_code,
                 )
+                _oa_method = _body.get("method", "") if isinstance(_body, dict) else ""
+                await _log_connection_event(
+                    _conn_db,
+                    tenant_id=_oa_tenant_id,
+                    method=_oa_method,
+                    auth_result="oauth",
+                    client_user_agent=_conn_ua,
+                    response_status=_db_exc.status_code,
+                )
                 return JSONResponse(
                     _jsonrpc_err(
                         _mcp_req_id, -32000,
@@ -6524,6 +6592,15 @@ async def _remote_mcp_inner(request: Request) -> Any:
                     "[mcp] tenant %s DB routing error: %s — returning 503, NOT falling back to auth DB",
                     _oa_tenant_id, _db_err,
                 )
+                _oa_method = _body.get("method", "") if isinstance(_body, dict) else ""
+                await _log_connection_event(
+                    _conn_db,
+                    tenant_id=_oa_tenant_id,
+                    method=_oa_method,
+                    auth_result="oauth",
+                    client_user_agent=_conn_ua,
+                    response_status=503,
+                )
                 return JSONResponse(
                     _jsonrpc_err(_mcp_req_id, -32000, "tenant database unavailable"),
                     status_code=503,
@@ -6532,9 +6609,42 @@ async def _remote_mcp_inner(request: Request) -> Any:
         _oa_tenant = None
         if _oa_tenant_id and _hosted_mode():
             _oa_tenant = await db_module.get_tenant_by_id(request.app.state.db, _oa_tenant_id)
+        # b12cc29f — log the OAuth-auth'd request BEFORE dispatching so even
+        # an unhandled exception inside _handle_mcp_request produces a log row.
+        _oa_method = _body.get("method", "") if isinstance(_body, dict) else "batch"
         if isinstance(_body, list):
-            return JSONResponse([await _handle_mcp_request(i, _mdb, _mdd, tenant=_oa_tenant) for i in _body])
-        return JSONResponse(await _handle_mcp_request(_body, _mdb, _mdd, tenant=_oa_tenant))
+            _oa_results = [await _handle_mcp_request(i, _mdb, _mdd, tenant=_oa_tenant) for i in _body]
+            # Log the first (most diagnostic) item from a batch.
+            _oa_log_method = (_body[0].get("method", "") if _body and isinstance(_body[0], dict) else "batch")
+            _oa_tools_ret = None
+            if _oa_log_method == "tools/list" and _oa_results:
+                _oa_r0 = _oa_results[0].get("result") or {}
+                _oa_tools_ret = len(_oa_r0.get("tools", []))
+            await _log_connection_event(
+                _conn_db,
+                tenant_id=_oa_tenant_id,
+                method=_oa_log_method,
+                auth_result="oauth",
+                tools_returned=_oa_tools_ret,
+                client_user_agent=_conn_ua,
+                response_status=200,
+            )
+            return JSONResponse(_oa_results)
+        _oa_result = await _handle_mcp_request(_body, _mdb, _mdd, tenant=_oa_tenant)
+        _oa_tools_ret2 = None
+        if _oa_method == "tools/list":
+            _oa_r = _oa_result.get("result") or {}
+            _oa_tools_ret2 = len(_oa_r.get("tools", []))
+        await _log_connection_event(
+            _conn_db,
+            tenant_id=_oa_tenant_id,
+            method=_oa_method,
+            auth_result="oauth",
+            tools_returned=_oa_tools_ret2,
+            client_user_agent=_conn_ua,
+            response_status=200,
+        )
+        return JSONResponse(_oa_result)
 
     tenant = None
     if _bearer_hash:
@@ -6546,6 +6656,21 @@ async def _remote_mcp_inner(request: Request) -> Any:
             "[mcp_auth] unrecognised token raw=%r ua=%r",
             (_raw_auth[:60] if _raw_auth else "(none)"),
             request.headers.get("user-agent", "")[:60],
+        )
+        # b12cc29f — log auth failure (no token or invalid token).
+        _auth_fail_result = "no_token" if not _bearer_hash else "invalid_token"
+        try:
+            _auth_fail_body = await request.json()
+            _auth_fail_method = (_auth_fail_body.get("method", "") if isinstance(_auth_fail_body, dict) else "")
+        except Exception:
+            _auth_fail_method = ""
+        await _log_connection_event(
+            _conn_db,
+            tenant_id=None,
+            method=_auth_fail_method,
+            auth_result=_auth_fail_result,
+            client_user_agent=_conn_ua,
+            response_status=401,
         )
         _base = str(request.base_url).rstrip("/")
         return JSONResponse(
@@ -6563,6 +6688,7 @@ async def _remote_mcp_inner(request: Request) -> Any:
 
     # Extract token_type for read-only enforcement ('readwrite' or 'readonly').
     _token_type = (tenant.pop("_token_type", None) or "readwrite")
+    _conn_tenant_id = tenant.get("id")
 
     # d8f92669 — /mcp rate limiting is handled by the single tenant-tier limiter
     # in the _tenant_rate_limit_middleware (plan-based, _tenant_rl_hits). The
@@ -6572,6 +6698,14 @@ async def _remote_mcp_inner(request: Request) -> Any:
     try:
         body = await request.json()
     except Exception:
+        await _log_connection_event(
+            _conn_db,
+            tenant_id=_conn_tenant_id,
+            method="",
+            auth_result="success",
+            client_user_agent=_conn_ua,
+            response_status=400,
+        )
         return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
 
     db = await _db(request)
@@ -6600,11 +6734,41 @@ async def _remote_mcp_inner(request: Request) -> Any:
         except Exception:
             _scoped_pids = None
 
+    _req_method = body.get("method", "") if isinstance(body, list) else (body.get("method", "") if isinstance(body, dict) else "batch")
     if isinstance(body, list):
         results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids) for item in body]
+        # b12cc29f — log the first item of a batch (most diagnostic).
+        _log_method = (body[0].get("method", "") if body and isinstance(body[0], dict) else "batch")
+        _tools_ret = None
+        if _log_method == "tools/list" and results:
+            _r0 = results[0].get("result") or {}
+            _tools_ret = len(_r0.get("tools", []))
+        await _log_connection_event(
+            _conn_db,
+            tenant_id=_conn_tenant_id,
+            method=_log_method,
+            auth_result="success",
+            tools_returned=_tools_ret,
+            client_user_agent=_conn_ua,
+            response_status=200,
+        )
         return JSONResponse(results)
 
     result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids)
+    # b12cc29f — log every successful /mcp dispatch. tools/list captures tool count.
+    _tools_ret2: "int | None" = None
+    if _req_method == "tools/list":
+        _r = result.get("result") or {}
+        _tools_ret2 = len(_r.get("tools", []))
+    await _log_connection_event(
+        _conn_db,
+        tenant_id=_conn_tenant_id,
+        method=_req_method,
+        auth_result="success",
+        tools_returned=_tools_ret2,
+        client_user_agent=_conn_ua,
+        response_status=200,
+    )
     return JSONResponse(result)
 
 # ---------------------------------------------------------------------------

@@ -473,6 +473,188 @@ async def _unique_sprint_nickname(
         nickname = f"{base}-{n}"
 
 
+# ---------------------------------------------------------------------------
+# f9188526 — Sprint version bucket descriptions.
+#
+# Each (project_id, version) pair carries a concise auto-generated summary of
+# what that sprint bucket is about as a whole.  The description is seeded on
+# the first add_sprint_item call for a version and refreshed on every
+# subsequent add so it reflects the full item set, not just the first one.
+# A human can overwrite the description; the next add_sprint_item will
+# regenerate it unless the item set is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _auto_generate_version_description(version: str, titles: list[str]) -> str:
+    """f9188526 — synthesise a concise bucket description from item titles.
+
+    Produces a one-or-two-sentence plain-English summary of what a sprint
+    version bucket is about, derived purely from the item titles already in
+    that bucket.  Intentionally lightweight (no LLM call): the description is
+    generated synchronously at DB write time with a simple keyword-frequency
+    heuristic so it is always available and never blocks.
+
+    Strategy:
+    1. Strip boilerplate prefix words (FEAT/FIX/BUG/CHORE/…) from each title.
+    2. Build a word-frequency map over the cleaned titles, weighting longer
+       words higher (shorter words tend to be connectives / noise).
+    3. Pick the top-3 theme words and form a sentence such as:
+       "v1.2 focuses on <word1>, <word2>, and <word3>."
+    4. Append a count sentence: "Contains N item(s) covering …".
+
+    When the bucket has zero or one title, falls back to a simpler template
+    that avoids repeating the single title verbatim.
+    """
+    # Boilerplate prefixes that appear in item titles but do not describe
+    # the bucket's theme: strip them (case-insensitively) from the front.
+    _STRIP_PREFIXES = (
+        "feat", "fix", "bug", "chore", "refactor", "test", "docs", "style",
+        "perf", "security", "harden", "revert", "wip",
+    )
+    _STOP_WORDS = frozenset({
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "by", "from", "up", "as", "is", "it", "its", "this",
+        "that", "into", "via", "not", "no", "all", "any", "be", "was", "are",
+        "has", "have", "had", "do", "did", "will", "would", "could", "should",
+        "add", "adds", "added", "new", "when", "if", "so", "then", "else",
+        "use", "uses", "used", "using", "make", "makes", "made", "set", "get",
+        "let", "now", "also", "more", "each", "every", "both", "can", "may",
+        "must", "very", "just", "only", "even", "well", "back", "out", "over",
+        "after", "before", "between", "through", "across", "during", "about",
+    })
+
+    n = len(titles)
+    if n == 0:
+        label = version or "this sprint"
+        return f"Sprint bucket '{label}' has no items yet."
+
+    # Clean titles: strip leading prefix tokens.
+    cleaned: list[str] = []
+    for t in titles:
+        words = re.split(r"[\s:_\-]+", t.strip())
+        # Drop leading prefix words (case-insensitive match).
+        while words and words[0].lower().rstrip("!?.,") in _STRIP_PREFIXES:
+            words = words[1:]
+        cleaned.append(" ".join(words))
+
+    if n == 1:
+        label = version or "this sprint"
+        return (
+            f"Sprint bucket '{label}' contains 1 item: {cleaned[0][:120]}."
+        )
+
+    # Word frequency over all cleaned titles, skipping stop words and very
+    # short tokens.  Weight each occurrence by sqrt(word_length) so domain
+    # terms ("authentication", "migration") outrank short connectives.
+    import math as _math  # noqa: PLC0415 — light stdlib, lazy to keep top-level clean
+    freq: dict[str, float] = {}
+    for t in cleaned:
+        words = re.findall(r"[a-zA-Z][a-z]{2,}", t)  # 3+ char, starts uppercase/lower
+        seen_in_title: set[str] = set()
+        for w in words:
+            lw = w.lower()
+            if lw in _STOP_WORDS:
+                continue
+            # De-duplicate within one title so a title that repeats a word
+            # doesn't inflate the global count unfairly.
+            if lw in seen_in_title:
+                continue
+            seen_in_title.add(lw)
+            freq[lw] = freq.get(lw, 0.0) + _math.sqrt(max(len(lw), 1))
+
+    # Pick up to 3 top-frequency words to form the theme description.
+    top = sorted(freq, key=lambda w: (-freq[w], w))[:3]
+
+    label = version or "this sprint"
+    if not top:
+        # Fallback: no meaningful words found (all stop-words / very short).
+        return (
+            f"Sprint bucket '{label}' contains {n} item(s)."
+        )
+
+    if len(top) == 1:
+        theme = top[0]
+    elif len(top) == 2:
+        theme = f"{top[0]} and {top[1]}"
+    else:
+        theme = f"{top[0]}, {top[1]}, and {top[2]}"
+
+    return (
+        f"Sprint bucket '{label}' focuses on {theme}. "
+        f"Contains {n} item(s)."
+    )
+
+
+async def get_sprint_version_description(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str,
+) -> str | None:
+    """f9188526 — fetch the stored description for a sprint version bucket.
+
+    Returns ``None`` when no description has been stored yet.
+    """
+    async with db.execute(
+        "SELECT description FROM sprint_version_descriptions "
+        "WHERE project_id = ? AND version = ?",
+        (project_id, version),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return (row["description"] if isinstance(row, dict) else row[0]) or None
+
+
+async def upsert_sprint_version_description(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str,
+    description: str,
+) -> None:
+    """f9188526 — create or replace the description for a sprint version bucket.
+
+    Uses INSERT OR REPLACE (SQLite) so the call is always idempotent.
+    ``updated_at`` is refreshed on every upsert.
+    """
+    iid = _new_id()
+    await db.execute(
+        "INSERT INTO sprint_version_descriptions "
+        "(id, project_id, version, description, updated_at) "
+        "VALUES (?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(project_id, version) DO UPDATE SET "
+        "description = excluded.description, updated_at = datetime('now')",
+        (iid, project_id, version, description),
+    )
+    await db.commit()
+
+
+async def get_all_sprint_version_descriptions(
+    db: aiosqlite.Connection,
+    project_id: str,
+) -> dict[str, str]:
+    """f9188526 — fetch all stored version descriptions for a project.
+
+    Returns a ``{version: description}`` mapping (empty dict when none exist).
+    Used by get_sprint_progress to include version context in the progress
+    response without a per-version round-trip.
+    """
+    async with db.execute(
+        "SELECT version, description FROM sprint_version_descriptions "
+        "WHERE project_id = ?",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    result: dict[str, str] = {}
+    for row in rows:
+        if isinstance(row, dict):
+            v, d = row.get("version"), row.get("description")
+        else:
+            v, d = row[0], row[1]
+        if v and d:
+            result[str(v)] = str(d)
+    return result
+
+
 async def add_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -491,6 +673,7 @@ async def add_sprint_item(
     priority: str | None = None,
     blocker_kind: str | None = None,
     wave: str | None = None,
+    sprint_name: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -512,6 +695,9 @@ async def add_sprint_item(
     ``blocker_kind`` (2282a636) is None (ordinary) or 'manual' (blocked on a
     real-world action outside Meridian) — a manual-blocker is surfaced distinctly
     and excluded from executor scoping, like milestone_type='human'.
+    ``sprint_name`` (3d6bd938) is a nullable human-readable label for the sprint
+    bucket (e.g. 'docs-cloudflare'), kept separate from ``version`` which should
+    stay a structural/semver-like identifier. NULL means no separate name.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
     is compared (word-set overlap, see ``_title_word_overlap``) against every
@@ -585,12 +771,12 @@ async def add_sprint_item(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
-        "deferred_until, track, priority, blocker_kind, wave) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "deferred_until, track, priority, blocker_kind, wave, sprint_name) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
-         priority, blocker_kind or None, wave or None),
+         priority, blocker_kind or None, wave or None, sprint_name or None),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -598,6 +784,19 @@ async def add_sprint_item(
     _invalidate_sprint_items_cache(project_id)
     # ITEM 6 — live push so dashboards refresh the sprint board without polling.
     _publish_project_event(project_id, "sprint_item_added", {"item_id": iid})
+    # f9188526 — auto-generate (or refresh) the version bucket description.
+    # Runs after the item is committed so the full new item set is visible.
+    # Guarded: a description failure NEVER blocks or changes the returned item.
+    if version:
+        try:
+            _all_for_version = await get_sprint_items(db, project_id, version=version)
+            _ver_titles = [
+                it.get("title", "") for it in _all_for_version if it.get("title")
+            ]
+            _new_desc = _auto_generate_version_description(version, _ver_titles)
+            await upsert_sprint_version_description(db, project_id, version, _new_desc)
+        except Exception:  # noqa: BLE001 — description generation must never block
+            pass
     return item
 
 
@@ -629,11 +828,21 @@ async def fan_out_sprint_items(
         except ValueError:
             resources_json = None  # best-effort in bulk insert — skip bad values
         iid = _new_id()
+        # ae87699d — generate slug + nickname on every creation path, not just
+        # add_sprint_item. fan_out_sprint_items was leaving both null.
+        _item_slug = await _unique_sprint_slug(
+            db, project_id, _sprint_item_slug_base(title)
+        )
+        _item_nickname = await _unique_sprint_nickname(
+            db, project_id, _sprint_item_nickname_base(title, iid)
+        )
         await db.execute(
             "INSERT INTO sprint_items "
-            "(id, project_id, version, title, item_group, notes, touches_resources) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (iid, project_id, version, title, group, description, resources_json),
+            "(id, project_id, version, title, item_group, notes, touches_resources, "
+            "slug, nickname) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (iid, project_id, version, title, group, description, resources_json,
+             _item_slug, _item_nickname),
         )
         ids.append(iid)
     if ids:
@@ -1105,6 +1314,28 @@ def _parse_deferral_ts(value: Any) -> "datetime | None":  # noqa: F821
     return dt
 
 
+def _is_deferred(item: dict[str, Any]) -> bool:
+    """45f519a0 — return True when a sprint item's ``deferred_until`` is in the future.
+
+    Uses the same ``_parse_deferral_ts`` parser that ``claim_sprint_item``
+    uses, so the semantics are identical: fail-open on garbage (unparseable
+    values are treated as not deferred), and timezone-aware values are
+    normalised to naive UTC before comparison.
+
+    Callers that want to exclude backburnered items from a list should filter
+    with ``[it for it in items if not _is_deferred(it)]``.
+    """
+    from datetime import datetime as _dt_cls
+
+    raw = item.get("deferred_until")
+    if not raw:
+        return False
+    dt = _parse_deferral_ts(raw)
+    if dt is None:
+        return False
+    return dt > _dt_cls.utcnow()
+
+
 async def claim_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1246,12 +1477,13 @@ async def patch_sprint_item(
     priority: str | None = None,
     blocker_kind: Any = _UNSET,
     wave: Any = _UNSET,
+    sprint_name: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
     item_group, touches_resources, required_notes, deferred_until, track,
-    priority, blocker_kind. Only
+    priority, blocker_kind, sprint_name. Only
     fields passed as non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
@@ -1266,6 +1498,9 @@ async def patch_sprint_item(
     milestone_type). ``blocker_kind`` (2282a636) uses the ``_UNSET`` sentinel:
     omit to leave unchanged, pass an empty string / ``None`` to CLEAR it (ordinary
     item), or 'manual' to mark it blocked on a real-world action outside Meridian.
+    ``sprint_name`` (3d6bd938) uses the ``_UNSET`` sentinel: omit to leave
+    unchanged, pass an empty string / ``None`` to CLEAR it, or a non-empty
+    string to set a human-readable label (distinct from the structural ``version``).
     """
     # 6a17e735 / ARCH 1B — separate the status change (routed through
     # _transition_status for guaranteed cache bust + live event) from the
@@ -1361,6 +1596,11 @@ async def patch_sprint_item(
         # 'wave-1'), auto-filled by assign_sprint_waves or hand-set here.
         ns_fields.append("wave = ?")
         ns_values.append(wave or None)
+    if sprint_name is not _UNSET:
+        # 3d6bd938 — empty string / None CLEARS the sprint name; any other value
+        # sets a human-readable label for the bucket (distinct from version).
+        ns_fields.append("sprint_name = ?")
+        ns_values.append(sprint_name or None)
 
     if not ns_fields and status_value is None:
         return await get_sprint_item(db, item_id)
@@ -1584,12 +1824,21 @@ async def split_sprint_item(
     new_items = []
     for t in titles:
         nid = _new_id()
+        # ae87699d — generate slug + nickname on every creation path, not just
+        # add_sprint_item. split_sprint_item was leaving both null.
+        _item_slug = await _unique_sprint_slug(
+            db, project_id, _sprint_item_slug_base(t)
+        )
+        _item_nickname = await _unique_sprint_nickname(
+            db, project_id, _sprint_item_nickname_base(t, nid)
+        )
         await db.execute(
             "INSERT INTO sprint_items "
-            "(id, project_id, version, title, parent_id, split_from, milestone_type) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'task')",
+            "(id, project_id, version, title, parent_id, split_from, milestone_type, "
+            "slug, nickname) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'task', ?, ?)",
             (nid, project_id, original.get("version", ""), t,
-             original.get("parent_id"), item_id),
+             original.get("parent_id"), item_id, _item_slug, _item_nickname),
         )
         await db.commit()
         new_item = await get_sprint_item(db, nid)
@@ -1627,11 +1876,20 @@ async def merge_sprint_items(
     survivor_id = _new_id()
     version = sources[0].get("version", "")
     merged_from_json = json.dumps(item_ids)
+    # ae87699d — generate slug + nickname on every creation path, not just
+    # add_sprint_item. merge_sprint_items was leaving both null on the survivor.
+    _survivor_slug = await _unique_sprint_slug(
+        db, project_id, _sprint_item_slug_base(new_title)
+    )
+    _survivor_nickname = await _unique_sprint_nickname(
+        db, project_id, _sprint_item_nickname_base(new_title, survivor_id)
+    )
     await db.execute(
         "INSERT INTO sprint_items "
-        "(id, project_id, version, title, merged_from, milestone_type) "
-        "VALUES (?, ?, ?, ?, ?, 'task')",
-        (survivor_id, project_id, version, new_title, merged_from_json),
+        "(id, project_id, version, title, merged_from, milestone_type, slug, nickname) "
+        "VALUES (?, ?, ?, ?, ?, 'task', ?, ?)",
+        (survivor_id, project_id, version, new_title, merged_from_json,
+         _survivor_slug, _survivor_nickname),
     )
     # Close all sources. fa3e3331 — atomic from-state guard: the pre-check
     # loop above is a read-then-write race like every other transition. A
@@ -1870,6 +2128,7 @@ async def get_sprint_items(
     include_human: bool = True,
     version: str | None = None,
     include_manual_blocker: bool | None = None,
+    include_deferred: bool = True,
 ) -> list[dict[str, Any]]:
     """List sprint items for a project, highest-priority first then oldest.
 
@@ -1895,6 +2154,13 @@ async def get_sprint_items(
     ``version`` (a76cb7c0) filters to a single sprint-version bucket. ``None``
     returns every version. Used by version-scoped sessions so an executor sees
     only the items in its bucket.
+
+    ``include_deferred`` (45f519a0) controls whether items with a future
+    ``deferred_until`` timestamp are returned. Default ``True`` keeps the
+    existing behaviour (dashboard full-board view always shows all items).
+    Pass ``False`` for executor-scoped calls (generate_handoff pending-items
+    list, claim-time checks) so a deferred item is genuinely invisible to an
+    executor rather than merely gated at claim time.
 
     Ordering (e08fee30): items are returned highest-priority first
     (urgent > high > normal > low), then oldest-first within a priority, so an
@@ -1929,6 +2195,12 @@ async def get_sprint_items(
     async with db.execute(query, params) as cur:
         rows = await cur.fetchall()
     items = [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+    # 45f519a0 — apply post-query deferred filter. deferred_until is not a SQL
+    # expression (it compares a stored timestamp against "now") so we filter in
+    # Python, the same as claim_sprint_item's existing deferral gate. Fail-open:
+    # unparseable values pass through (treated as not deferred).
+    if not include_deferred:
+        items = [it for it in items if not _is_deferred(it)]
     if show_blocked:
         return items
     # Build status lookup for dependency filtering
@@ -2331,46 +2603,195 @@ async def get_parallelizable_groups(
     }
 
 
+def _topo_depth_map(items: list[dict[str, Any]]) -> dict[str, int]:
+    """Compute topological depth for each item in ``items`` by dependency.
+
+    Returns a ``{item_id: depth}`` mapping where depth 0 means "no in-set
+    dependency" and depth N means "depends on something at depth N-1". Mirrors
+    the logic in ``meridian.handoff._partition_into_waves`` but returns a plain
+    dict rather than a grouped list so callers can layer additional coloring on
+    top. Cycles are broken by treating the back-edge target as depth 0.
+
+    NOTE: This helper is intentionally self-contained in sprint_items.py because
+    meridian.handoff imports meridian.db, making a reverse import a circular
+    dependency. Keep in sync with handoff._partition_into_waves (3726cf70).
+    """
+    by_id = {it["id"]: it for it in items if it.get("id")}
+    wave_of: dict[str, int] = {}
+
+    def _depth(iid: str, seen: set[str]) -> int:
+        if iid in wave_of:
+            return wave_of[iid]
+        if iid in seen:  # dependency cycle — treat as a root
+            return 0
+        seen.add(iid)
+        it = by_id.get(iid)
+        dep = it.get("depends_on") if it else None
+        depth = (_depth(dep, seen) + 1) if (dep and dep in by_id) else 0
+        wave_of[iid] = depth
+        return depth
+
+    for iid in by_id:
+        _depth(iid, set())
+    return wave_of
+
+
 async def assign_sprint_waves(
     db: aiosqlite.Connection,
     project_id: str,
     version: str | None = None,
 ) -> dict[str, Any]:
-    """58a45b92 — persist the parallelizable grouping as a STORED, editable wave label.
+    """58a45b92 / 90955d26 — persist a full topological + conflict-free wave plan.
 
-    :func:`get_parallelizable_groups` recomputes conflict-free batches on every
-    call; this writes that plan onto each eligible item's ``wave`` column (group i →
-    ``'wave-{i+1}'``) so parallelism is deterministic and inspectable (get_sprint_items
-    surfaces ``wave``) instead of recomputed each time. An operator can then override
-    any item by hand via ``update_sprint_item(wave=...)``.
+    Previous behaviour (:func:`get_parallelizable_groups`) did a single flat pass:
+    only dependency-satisfied items were labelled; ``depends_on``-blocked items
+    were dropped into ``blocked`` and left with ``wave=NULL``.  This meant a
+    planner could never see the projected execution order for items that sit behind
+    an unfinished parent — they simply had no wave.
 
-    Only currently-ELIGIBLE items (pending/todo, dependency-satisfied, unclaimed,
-    non-manual-blocker) are labelled — the same set get_parallelizable_groups fans
-    out. Blocked / in-flight / done items are left untouched (re-run once they clear).
-    Idempotent: re-running recomputes from the live board and rewrites the labels.
+    New behaviour: project ALL pending/todo non-manual items forward through the
+    dependency graph using a two-pass algorithm:
+
+    Pass 1 — topological depth (``_topo_depth_map``):
+        Items are grouped into layers 0, 1, 2, … by how many hops separate them
+        from a root (no in-set dependency).  Layer 0 runs first; layer 1 can start
+        only after layer 0 completes; and so on.  This is the same algorithm used
+        by ``_partition_into_waves`` in ``handoff.py`` for /goal rendering.
+
+    Pass 2 — resource-conflict coloring within each layer:
+        Within a topological layer, items that share a ``touches_resources`` value
+        cannot co-schedule.  Greedy first-fit coloring (the same algorithm as
+        ``get_parallelizable_groups``) splits each layer into one or more sub-waves.
+
+    The two passes are combined: all sub-waves from layer 0 are numbered first
+    (wave-1, wave-2, …), then layer 1's sub-waves continue the numbering, and so
+    on.  The result is a monotonically numbered, globally consistent wave plan
+    where an item's wave label unambiguously encodes both its dependency position
+    AND its resource-conflict position.
+
+    Blocked (dependency-pending) items now receive a future-wave label rather than
+    ``NULL``, so ``get_sprint_items`` can surface the full execution plan even
+    before the earlier layers have completed.
+
+    Only pending/todo, non-manual-blocker items are labelled — done/failed/skipped/
+    in_progress items are left untouched.  Idempotent: re-running recomputes from
+    the live board and rewrites the labels.
 
     Returns ``{version, wave_count, assigned, waves: {'wave-1': [ids...], ...},
-    blocked_count, undeclared_count}``.
+    blocked_count, undeclared_count}``.  ``blocked_count`` now counts items whose
+    dependency is not yet DONE (they are still projected into a future wave, not
+    truly dropped).
     """
-    plan = await get_parallelizable_groups(db, project_id, version=version)
+    # ── Collect all eligible pending/todo non-manual items ─────────────────────
+    items = await get_sprint_items(db, project_id, include_manual_blocker=False)
+    items = [it for it in items if not _is_manual_sprint_item(it)]
+    if version is not None:
+        items = [it for it in items if it.get("version") == version]
+    claimable_statuses = {"pending", "todo"}
+    # Only label pending/todo items that are not already in-flight or done.
+    # In-progress items are mid-execution and must not be relabelled mid-run.
+    candidates = [
+        it for it in items
+        if (it.get("status") or "pending") in claimable_statuses
+    ]
+
+    # ── Pass 1: topological depth ───────────────────────────────────────────────
+    depth_map = _topo_depth_map(candidates)
+    if not depth_map:
+        return {
+            "version": version,
+            "wave_count": 0,
+            "assigned": 0,
+            "waves": {},
+            "blocked_count": 0,
+            "undeclared_count": 0,
+        }
+
+    max_topo = max(depth_map.values())
+    # Group candidates by their topological depth preserving input order (which
+    # inherits the DB insertion order — stable for idempotency).
+    topo_layers: list[list[dict[str, Any]]] = [[] for _ in range(max_topo + 1)]
+    for it in candidates:
+        iid = it.get("id")
+        if iid in depth_map:
+            topo_layers[depth_map[iid]].append(it)
+
+    # ── Pass 2: resource-conflict coloring within each topological layer ─────────
+    # Sort each layer highest-priority-first (e08fee30), then insertion order.
+    def _priority_key(it: dict[str, Any]) -> tuple[int, str, str]:
+        return (
+            _SPRINT_PRIORITY_RANK.get(
+                it.get("priority") or "normal", _SPRINT_PRIORITY_DEFAULT_RANK
+            ),
+            str(it.get("added_at") or ""),
+            it.get("id") or "",
+        )
+
+    wave_counter = 0
     waves: dict[str, list[str]] = {}
     assigned = 0
-    for gi, group in enumerate(plan.get("groups") or []):
-        label = f"wave-{gi + 1}"
-        ids: list[str] = []
-        for item in group:
-            await patch_sprint_item(db, project_id, item["id"], wave=label)
-            ids.append(item["id"])
-            assigned += 1
-        if ids:
-            waves[label] = ids
+    undeclared_count = 0
+
+    for layer in topo_layers:
+        if not layer:
+            continue
+        layer.sort(key=_priority_key)
+        # Attach parsed resources for conflict detection.
+        enriched = [
+            {**it, "resources": parse_touches_resources(it.get("touches_resources"))}
+            for it in layer
+        ]
+        declared = [it for it in enriched if it["resources"]]
+        undeclared_items = [it for it in enriched if not it["resources"]]
+        undeclared_count += len(undeclared_items)
+
+        # Greedy first-fit coloring on declared items (same as get_parallelizable_groups).
+        sub_groups: list[list[dict[str, Any]]] = []
+        sub_resource_sets: list[set[str]] = []
+        for it in declared:
+            res = set(it["resources"])
+            placed = False
+            for gi, used in enumerate(sub_resource_sets):
+                if not _resource_sets_conflict(res, used):
+                    sub_groups[gi].append(it)
+                    used.update(res)
+                    placed = True
+                    break
+            if not placed:
+                sub_groups.append([it])
+                sub_resource_sets.append(set(res))
+        # Each undeclared item is its own sequential sub-wave (never co-scheduled).
+        for it in undeclared_items:
+            sub_groups.append([it])
+
+        # Assign wave labels continuing from the previous topological layer's count.
+        for sub_group in sub_groups:
+            wave_counter += 1
+            label = f"wave-{wave_counter}"
+            ids: list[str] = []
+            for it in sub_group:
+                await patch_sprint_item(db, project_id, it["id"], wave=label)
+                ids.append(it["id"])
+                assigned += 1
+            if ids:
+                waves[label] = ids
+
+    # Count items whose depends_on is not yet satisfied (informational only — they
+    # now receive a projected future-wave label rather than being dropped).
+    by_id_status = {it["id"]: it.get("status") for it in items}
+    blocked_count = 0
+    for it in candidates:
+        dep = it.get("depends_on")
+        if dep and by_id_status.get(dep) not in (None, "done"):
+            blocked_count += 1
+
     return {
         "version": version,
         "wave_count": len(waves),
         "assigned": assigned,
         "waves": waves,
-        "blocked_count": len(plan.get("blocked") or []),
-        "undeclared_count": plan.get("undeclared_count", 0),
+        "blocked_count": blocked_count,
+        "undeclared_count": undeclared_count,
     }
 
 

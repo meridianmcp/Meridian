@@ -1621,17 +1621,35 @@ async def _persist_prospected_pointer(
         return None
 
 
-async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
-    """fd86aacc — names of executor sessions seen active in the last 10 minutes.
+async def _active_executor_session_warnings(
+    db: Any,
+    project_id: str,
+    threshold_minutes: int | None = None,
+) -> list[str]:
+    """fd86aacc — names of executor sessions seen active within the threshold.
 
     Used to warn when sprint items are added/fanned-out while executors are
     mid-run, so a board change isn't silently injected behind their back.
     Best-effort: any error yields an empty list. (586eeda9 — shared by
     add_sprint_item + fan_out_sprint_items.)
+
+    6e0e5cea — ``threshold_minutes`` is configurable via workspace settings
+    (``active_session_warning_minutes``); when not supplied it is read from
+    the workspace settings row (default 10, matching the old hardcoded 600 s).
     """
     warnings: list[str] = []
     try:
         from datetime import datetime, timezone as _tz
+        # 6e0e5cea — resolve threshold: explicit arg wins; otherwise read from
+        # workspace settings so the user-configurable value is always honoured.
+        _thresh_mins = threshold_minutes
+        if _thresh_mins is None:
+            try:
+                _ws = await db_module.get_workspace_settings(db)
+                _thresh_mins = _ws.get("active_session_warning_minutes", 10) or 10
+            except Exception:  # noqa: BLE001 — best-effort; fall back to default
+                _thresh_mins = 10
+        _threshold_seconds = max(60, int(_thresh_mins) * 60)
         _now = datetime.now(_tz.utc)
         for _sess in await db_module.get_sessions(db, project_id):
             _ls = _sess.get("last_seen")
@@ -1641,7 +1659,7 @@ async def _active_executor_session_warnings(db: Any, project_id: str) -> list[st
                 _dt = datetime.fromisoformat(str(_ls).replace("Z", "+00:00"))
                 if _dt.tzinfo is None:
                     _dt = _dt.replace(tzinfo=_tz.utc)
-                if (_now - _dt).total_seconds() < 600:
+                if (_now - _dt).total_seconds() < _threshold_seconds:
                     warnings.append(
                         f"session '{_sess.get('name', _sess.get('id', '?'))}' is active"
                     )
@@ -2061,7 +2079,23 @@ async def _handle_task_tools(
             )
         except Exception:  # noqa: BLE001
             _graph_searcher = None
+        # 65c8b426 — Part 2: default skip_ai_summary=True for the MCP tool path
+        # so the 3 serial Haiku calls (summarize_session fan-out, ai_summary blurb,
+        # sprint retrospective) are skipped unless the caller explicitly opts in.
+        # They are narrative sugar; the executor-critical content (goal, pending
+        # items, tasks, decisions) has no AI dependency. Callers can pass
+        # skip_ai_summary=false to get the rich version when they have budget.
+        _skip_ai = args.get("skip_ai_summary", True)
+        if isinstance(_skip_ai, str):
+            _skip_ai = _skip_ai.lower() not in ("false", "0", "no")
         _handoff_amended = False
+        # 45f519a0 — pass force_include_ids through so the caller can re-include
+        # specific deferred items in this handoff's pending list for one run.
+        _force_include_ids: list[str] | None = None
+        _raw_fii = args.get("force_include_ids")
+        if isinstance(_raw_fii, list):
+            _force_include_ids = [str(x) for x in _raw_fii if x]
+        _handoff_degraded = False
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -2073,14 +2107,25 @@ async def _handle_task_tools(
                     commit_messages=[c["message"] for c in _gh_commits],
                     graph_searcher=_graph_searcher,
                     identity=_resolve_caller_identity(tenant),
+                    force_include_ids=_force_include_ids,
+                    skip_ai_summary=_skip_ai,
                 ),
-                timeout=90.0,
+                # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
+                # margin. The real fix (skip_ai_summary=True default) eliminates the
+                # Haiku calls that caused the live timeout; the higher ceiling is a
+                # backstop for DB-heavy projects.
+                timeout=180.0,
             )
         except asyncio.TimeoutError:
             path, content = await handoff_module_local._generate_handoff_l0(
                 db, args["project_id"], data_dir
             )
-            mode = "full"
+            # 65c8b426 — Part 1: honest fallback — report the real mode so callers
+            # can detect they got the emergency 4-field version, not a full handoff.
+            # Previously "full" was hardcoded here, making a degraded handoff
+            # indistinguishable from a successful one (confirmed live 2x tonight).
+            mode = "l0_fallback"
+            _handoff_degraded = True
         # 99e50a1d — surface a machine-readable staleness flag so the dashboard /
         # caller can offer a one-click sync when the project's stored executor
         # rules predate the current standard.
@@ -2140,6 +2185,10 @@ async def _handle_task_tools(
             "file_path": path,
             "content": _plain_content,
             "mode": mode,
+            # 65c8b426 — Part 1: degraded=True when the full handoff timed out and
+            # the emergency L0 fallback was used instead. Callers should surface
+            # this visibly rather than treating it as a normal full handoff.
+            "degraded": _handoff_degraded,
             "amended": _handoff_amended,
             "template_stale": _tpl_stale,
             "insight_hints": _insight_hints[:5],
@@ -2692,6 +2741,7 @@ async def _handle_session_tools(
         handle_list_sessions,
         handle_get_session_log,
         handle_get_session_activity,
+        handle_get_connection_log,
         handle_get_agent_instructions,
         handle_set_agent_instructions,
         handle_set_executor_config,
@@ -2708,6 +2758,7 @@ async def _handle_session_tools(
         "list_sessions": handle_list_sessions,
         "get_session_log": handle_get_session_log,
         "get_session_activity": handle_get_session_activity,
+        "get_connection_log": handle_get_connection_log,
         "get_agent_instructions": handle_get_agent_instructions,
         "set_agent_instructions": handle_set_agent_instructions,
         "set_executor_config": handle_set_executor_config,
@@ -2907,6 +2958,7 @@ async def _handle_file_claims(
             db, args["project_id"], args["to_session_id"], args.get("payload", ""),
             from_session_id=args.get("from_session_id") or args.get("session_id"),
             kind=args.get("kind"),
+            tenant_id=_mcp_tenant_id,  # 342dd15f — Redis cost-guard
         )
     if name == "receive_messages":
         return await db_module.receive_messages(

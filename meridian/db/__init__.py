@@ -305,7 +305,12 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- assign_sprint_waves auto-fills it from get_parallelizable_groups, and
     -- update_sprint_item(wave=...) edits it by hand. NULL = unassigned. Nullable
     -- plain column — no inline index (guarded-migration rule).
-    wave TEXT
+    wave TEXT,
+    -- 3d6bd938: separate human-readable sprint name from the structural version
+    -- identifier. version stays a semver-like slug (e.g. 'v0.2.x'); sprint_name
+    -- is a nullable free-text label for the bucket (e.g. 'docs-cloudflare').
+    -- No inline index (guarded-migration rule). Nullable — legacy rows are NULL.
+    sprint_name TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -836,6 +841,24 @@ CREATE TABLE IF NOT EXISTS session_activity (
     summary TEXT NOT NULL,
     recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- b12cc29f — connection_events: per-/mcp-request auth+method event log.
+-- Every real HTTP /mcp request is written here with the auth outcome, MCP
+-- method, tool count (for tools/list), User-Agent, and response status so a
+-- live or post-mortem client-side outage can be diagnosed without raw log
+-- access. Capped at 1000 rows per tenant_id (enforced at write time).
+-- idx_connection_events_tenant is created by _migrate_connection_events
+-- (guarded migration), never inline here.
+CREATE TABLE IF NOT EXISTS connection_events (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    method TEXT NOT NULL DEFAULT '',
+    auth_result TEXT NOT NULL DEFAULT 'unknown',
+    tools_returned INTEGER,
+    client_user_agent TEXT,
+    response_status INTEGER NOT NULL DEFAULT 200,
+    recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -1033,6 +1056,14 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_file_patch_counters(db)
     await _migrate_sprint_item_resources_amended(db)
     await _migrate_session_activity(db)
+    await _migrate_connection_events(db)
+    await _migrate_redis_overage_fields(db)
+    await _migrate_sprint_version_descriptions(db)
+    await _migrate_workspace_settings_active_session_threshold(db)
+    await _migrate_sprint_item_sprint_name(db)
+    await _migrate_proposal_slug_nickname(db)
+    await _migrate_decision_slug_nickname(db)
+    await _migrate_note_nickname(db)
     return db
 
 
@@ -5175,6 +5206,7 @@ async def update_tenant(
         "overage_reset_at", "compute_throttled_at",
         "trial_started_at", "inactivity_expires_at",
         "github_pat", "tunnel_active", "tunnel_plugins", "tunnel_plugins_by_host",
+        "redis_commands_used", "redis_overage_cap_usd",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -6097,6 +6129,7 @@ async def send_message(
     *,
     from_session_id: str | None = None,
     kind: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """d3a3a01d — enqueue an actor-model message to another session.
 
@@ -6105,6 +6138,11 @@ async def send_message(
     subscriber gets pushed instead of having to poll receive_messages. Purely
     additive: publish failures / no Redis configured never affect this
     function's return value or the persisted message.
+
+    342dd15f — optional ``tenant_id`` is forwarded to
+    ``publish_session_message`` to enable per-tenant Upstash cost-guard
+    enforcement. When absent (self-hosted / unauthenticated), the budget check
+    is skipped entirely.
     """
     mid = _new_id()
     await db.execute(
@@ -6122,7 +6160,9 @@ async def send_message(
         from .. import redis_bridge as _redis_bridge  # noqa: PLC0415 — lazy, optional dep
 
         try:
-            await _redis_bridge.publish_session_message(to_session_id, row)
+            await _redis_bridge.publish_session_message(
+                to_session_id, row, tenant_id=tenant_id, db=db
+            )
         except Exception:  # noqa: BLE001
             pass  # never let a push-augmentation failure affect the DB write above
     return row
@@ -6577,17 +6617,29 @@ async def pin_decision(
     priority (366317e9) is one of urgent | normal | low (default normal);
     invalid values normalize to 'normal'. It weights dashboard ordering and the
     decisions injected into start_session / generate_handoff context.
+
+    6fb48898 — a kebab-cased ``slug`` and a short memorable ``nickname`` are
+    auto-generated from the title, unique per project, mirroring sprint_items.
     """
     did = _new_id()
     priority = _normalize_decision_priority(priority)
     # 2b39549d — an assumption starts life 'unvalidated'; no assumption → NULL.
     _assump = (assumption or "").strip() or None
     _assump_status = "unvalidated" if _assump else None
+    # 6fb48898 — derive human-readable secondary keys from the title.
+    _slug = await _unique_decision_slug(
+        db, project_id, _sprint_item_slug_base(title)
+    )
+    _nickname = await _unique_decision_nickname(
+        db, project_id, _sprint_item_nickname_base(title, did)
+    )
     await db.execute(
         "INSERT INTO decisions_pinned "
-        "(id, project_id, title, body, category, priority, assumption, assumption_status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (did, project_id, title, body, category, priority, _assump, _assump_status),
+        "(id, project_id, title, body, category, priority, assumption, assumption_status, "
+        "slug, nickname) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (did, project_id, title, body, category, priority, _assump, _assump_status,
+         _slug, _nickname),
     )
     await db.commit()
     # ITEM 6 — live push so the constitution view refreshes without polling.
@@ -7420,13 +7472,126 @@ async def get_session_activity(
 ) -> list[dict[str, Any]]:
     """Return the most recent activity entries for a session, newest first.
 
-    Uses rowid as a secondary sort key so sub-second inserts (same recorded_at)
-    are returned in stable insertion order (newest = highest rowid first).
+    Uses the backend-appropriate pseudo-column as a secondary sort key so
+    sub-second inserts (same recorded_at) are returned in stable insertion
+    order (newest = highest rowid/ctid first). rowid is SQLite's implicit
+    integer PK; ctid is Postgres's physical row location — this table is
+    INSERT-only so ctid order tracks insertion order identically.
+
+    8c147109 / ordering fix: the companion record_session_activity already
+    uses ctid/rowid in the pruning DELETE; get_session_activity now mirrors
+    that so both paths agree on ordering across backends.
     """
+    tiebreak = "ctid" if hasattr(db, "_pool") else "rowid"
     async with db.execute(
-        "SELECT * FROM session_activity WHERE session_id = ? "
-        "ORDER BY recorded_at DESC, rowid DESC LIMIT ?",
+        f"SELECT * FROM session_activity WHERE session_id = ? "
+        f"ORDER BY recorded_at DESC, {tiebreak} DESC LIMIT ?",
         (session_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# b12cc29f — connection_events: per-/mcp-request auth+method event log.
+#
+# Every HTTP POST /mcp the server actually receives gets written here so a
+# live or post-mortem client-side outage (Claude Desktop showing zero tools,
+# auth failures) can be diagnosed without raw Fly.io log access or guessing
+# by elimination.
+# ---------------------------------------------------------------------------
+
+_CONNECTION_EVENTS_RING_SIZE = 1000  # max entries retained per tenant_id
+
+
+async def record_connection_event(
+    db: aiosqlite.Connection,
+    *,
+    tenant_id: str | None,
+    method: str,
+    auth_result: str,
+    tools_returned: int | None = None,
+    client_user_agent: str | None = None,
+    response_status: int = 200,
+) -> None:
+    """Write one connection-event row and prune the oldest beyond the ring size.
+
+    Best-effort: callers must wrap in try/except so a logging failure never
+    breaks a real /mcp response. Pruning is per-(tenant_id IS NOT NULL) bucket;
+    unauthenticated events (tenant_id=NULL) use a separate NULL bucket capped
+    at the same size.
+
+    auth_result vocabulary:
+      success        — valid API token or OAuth token accepted
+      oauth          — OAuth bearer token accepted (sub-type of success)
+      no_token       — no Authorization header present
+      invalid_token  — bearer present but not found in DB
+      expired        — OAuth token found but past expiry
+      parse_error    — request body was unparseable JSON
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+    entry_id = _new_id()
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ua = (client_user_agent or "")[:200] or None
+    await db.execute(
+        "INSERT INTO connection_events "
+        "(id, tenant_id, method, auth_result, tools_returned, client_user_agent, "
+        " response_status, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (entry_id, tenant_id, method[:100], auth_result[:40],
+         tools_returned, ua, response_status, now_ts),
+    )
+    # Prune: keep only the most recent N rows for this tenant bucket.
+    # NULL tenant_id is a valid bucket (unauthenticated/failed attempts).
+    tiebreak = "ctid" if hasattr(db, "_pool") else "rowid"
+    if tenant_id is not None:
+        await db.execute(
+            f"DELETE FROM connection_events "
+            f"WHERE tenant_id = ? AND {tiebreak} NOT IN ("
+            f"  SELECT {tiebreak} FROM connection_events WHERE tenant_id = ? "
+            f"  ORDER BY recorded_at DESC, {tiebreak} DESC LIMIT ?"
+            f")",
+            (tenant_id, tenant_id, _CONNECTION_EVENTS_RING_SIZE),
+        )
+    else:
+        await db.execute(
+            f"DELETE FROM connection_events "
+            f"WHERE tenant_id IS NULL AND {tiebreak} NOT IN ("
+            f"  SELECT {tiebreak} FROM connection_events WHERE tenant_id IS NULL "
+            f"  ORDER BY recorded_at DESC, {tiebreak} DESC LIMIT ?"
+            f")",
+            (_CONNECTION_EVENTS_RING_SIZE,),
+        )
+    await db.commit()
+
+
+async def get_connection_log(
+    db: aiosqlite.Connection,
+    tenant_id: str | None = None,
+    since: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return recent connection events, newest first.
+
+    When ``tenant_id`` is given, scopes to that tenant's events only.
+    ``since`` is an ISO timestamp string — only events at or after this time
+    are returned. ``limit`` caps the result set (max 500).
+    """
+    limit = min(limit, 500)
+    params: list[Any] = []
+    clauses: list[str] = []
+    if tenant_id is not None:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    if since:
+        clauses.append("recorded_at >= ?")
+        params.append(since)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+    async with db.execute(
+        f"SELECT * FROM connection_events {where} "
+        f"ORDER BY recorded_at DESC LIMIT ?",
+        params,
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
@@ -7588,6 +7753,141 @@ async def _unique_note_slug(
         slug = f"{base}-{n}"
 
 
+async def _unique_note_nickname(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the nickname is taken
+    in this project. Mirrors _unique_sprint_nickname for project_notes.
+    """
+    nickname = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM project_notes WHERE project_id = ? AND nickname = ?",
+            (project_id, nickname),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return nickname
+        n += 1
+        nickname = f"{base}-{n}"
+
+
+async def _unique_decision_slug(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the slug is taken in
+    this project's decisions_pinned table. Unique per project.
+    """
+    slug = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM decisions_pinned WHERE project_id = ? AND slug = ?",
+            (project_id, slug),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
+async def _unique_decision_nickname(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the nickname is taken
+    in this project's decisions_pinned table. Unique per project.
+    """
+    nickname = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM decisions_pinned WHERE project_id = ? AND nickname = ?",
+            (project_id, nickname),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return nickname
+        n += 1
+        nickname = f"{base}-{n}"
+
+
+async def _unique_proposal_slug(
+    db: aiosqlite.Connection,
+    tenant_id: str | None,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the slug is taken in
+    this tenant's workspace_proposals table. Unique per tenant (NULL tenant
+    treated as its own scope to match the workspace_proposals tenancy model).
+    """
+    slug = base
+    n = 1
+    while True:
+        if tenant_id is not None:
+            async with db.execute(
+                "SELECT id FROM workspace_proposals WHERE tenant_id = ? AND slug = ?",
+                (tenant_id, slug),
+            ) as cur:
+                row = await cur.fetchone()
+        else:
+            async with db.execute(
+                "SELECT id FROM workspace_proposals WHERE tenant_id IS NULL AND slug = ?",
+                (slug,),
+            ) as cur:
+                row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
+async def _unique_proposal_nickname(
+    db: aiosqlite.Connection,
+    tenant_id: str | None,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the nickname is taken
+    in this tenant's workspace_proposals table. Mirrors _unique_proposal_slug.
+    """
+    nickname = base
+    n = 1
+    while True:
+        if tenant_id is not None:
+            async with db.execute(
+                "SELECT id FROM workspace_proposals WHERE tenant_id = ? AND nickname = ?",
+                (tenant_id, nickname),
+            ) as cur:
+                row = await cur.fetchone()
+        else:
+            async with db.execute(
+                "SELECT id FROM workspace_proposals WHERE tenant_id IS NULL AND nickname = ?",
+                (nickname,),
+            ) as cur:
+                row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return nickname
+        n += 1
+        nickname = f"{base}-{n}"
+
+
 async def add_project_note(
     db: aiosqlite.Connection,
     project_id: str,
@@ -7622,6 +7922,9 @@ async def add_project_note(
     5a5bba43 — a kebab-cased ``slug`` is generated from the title and stored,
     unique per project (collisions get a ``-2``/``-3``/… suffix). The slug is the
     handle ``read_note(slug)`` and the dashboard's ``mem:name`` links resolve.
+
+    6fb48898 — a short memorable ``nickname`` (1-2 words) is also generated and
+    stored, unique per project, using the same algorithm as sprint_items.nickname.
     """
     if kind not in ("wiki", "insight", "reference", "code", "document"):
         kind = None
@@ -7641,12 +7944,16 @@ async def add_project_note(
         stored_symbol = None  # a symbol is meaningless without a file anchor
     nid = _new_id()
     slug = await _unique_note_slug(db, project_id, _slugify_note(title))
+    # 6fb48898 — auto-generate a short memorable nickname alongside the slug.
+    nickname = await _unique_note_nickname(
+        db, project_id, _sprint_item_nickname_base(title, nid)
+    )
     await db.execute(
         "INSERT INTO project_notes "
-        "(id, project_id, title, body, tags, note_kind, priority, slug, "
+        "(id, project_id, title, body, tags, note_kind, priority, slug, nickname, "
         "file_path, symbol, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (nid, project_id, title, body, tags, kind, priority, slug,
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (nid, project_id, title, body, tags, kind, priority, slug, nickname,
          stored_path, stored_symbol, stored_source),
     )
     await db.commit()
@@ -9215,13 +9522,31 @@ async def record_handoff(
 
     ``mode`` is the rendered handoff mode (full/delta/…). ``session_id`` links
     the handoff to the session that produced it (NULL for project-level renders).
+
+    00dbeed0 — durable since_ts: the handoff's created_at is the anchor used
+    by the next delta call to scope "Completed since last handoff". On Postgres
+    the table DEFAULT is NOW() which is frozen at transaction-start, so two
+    calls within one transaction would get the same timestamp — making the
+    anchor useless for ordering relative to clock_timestamp()-stamped completions
+    (and breaking tests that rely on real-time ordering with asyncio.sleep).
+    Explicitly pass clock_timestamp() on Postgres to guarantee a monotonically
+    advancing value regardless of the surrounding transaction.
     """
     hid = _new_id()
-    await db.execute(
-        "INSERT INTO handoffs (id, project_id, session_id, mode, body) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (hid, project_id, session_id, mode, body),
-    )
+    is_pg = hasattr(db, "_pool")
+    if is_pg:
+        now_expr = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')"
+        await db.execute(
+            f"INSERT INTO handoffs (id, project_id, session_id, mode, body, created_at) "
+            f"VALUES (?, ?, ?, ?, ?, ({now_expr}))",
+            (hid, project_id, session_id, mode, body),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO handoffs (id, project_id, session_id, mode, body) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (hid, project_id, session_id, mode, body),
+        )
     await db.commit()
     return (await get_handoff(db, hid)) or {"id": hid}
 
@@ -9606,6 +9931,9 @@ from .sprint_items import (  # noqa: F401
     get_sprint_items_cached,
     get_sprint_items_for_resource,
     get_sprint_items_page,
+    get_sprint_version_description,
+    get_all_sprint_version_descriptions,
+    upsert_sprint_version_description,
     handle_session_stall,
     infer_active_sprint_version,
     merge_sprint_items,
@@ -9650,10 +9978,12 @@ from .sprint_items import (  # noqa: F401
     _sprint_priority_order_sql,
     _stalled_item_ids_for_session,
     _text_calls_for_test_coverage,
+    _auto_generate_version_description,
     _title_word_overlap,
     _title_word_set,
     _unique_sprint_nickname,
     _unique_sprint_slug,
+    _topo_depth_map,
     _transition_status,
     _update_sprint_item_status,
 )

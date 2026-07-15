@@ -506,6 +506,106 @@ def test_index_code_dir_gives_up_after_timeout(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _extract_jsonrpc_error — surface silent index failures (f193bbd1)
+# ---------------------------------------------------------------------------
+
+def test_extract_jsonrpc_error_clean_response_returns_none():
+    """A normal 200 tools/call response with no error signals returns None."""
+    body = b'{"jsonrpc":"2.0","id":"idx","result":{"content":[{"type":"text","text":"ok"}]}}'
+    assert tc._extract_jsonrpc_error(body) is None
+
+
+def test_extract_jsonrpc_error_jsonrpc_error_object():
+    """A JSON-RPC error object is detected and its message returned."""
+    body = b'{"jsonrpc":"2.0","id":"idx","error":{"code":-32603,"message":"internal error"}}'
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "internal error" in result
+
+
+def test_extract_jsonrpc_error_jsonrpc_error_string():
+    """A JSON-RPC error as a plain string is detected."""
+    body = b'{"jsonrpc":"2.0","id":"idx","error":"index failed"}'
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "index failed" in result
+
+
+def test_extract_jsonrpc_error_mcp_result_is_error():
+    """MCP result.isError=true with content text is surfaced."""
+    body = (
+        b'{"jsonrpc":"2.0","id":"idx","result":{"isError":true,'
+        b'"content":[{"type":"text","text":"path not found"}]}}'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "path not found" in result
+
+
+def test_extract_jsonrpc_error_mcp_content_item_is_error():
+    """MCP result.content[*].isError=true is surfaced (2025-03-26 convention)."""
+    body = (
+        b'{"jsonrpc":"2.0","id":"idx","result":{"content":['
+        b'{"type":"text","isError":true,"text":"scan aborted"}]}}'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "scan aborted" in result
+
+
+def test_extract_jsonrpc_error_non_json_body_returns_none():
+    """A non-JSON body (plain text, SSE) is silently ignored."""
+    assert tc._extract_jsonrpc_error(b"event: message\ndata: {bad json}\n\n") is None
+
+
+def test_extract_jsonrpc_error_empty_body_returns_none():
+    """Empty / None body returns None without raising."""
+    assert tc._extract_jsonrpc_error(b"") is None
+    assert tc._extract_jsonrpc_error(None) is None  # type: ignore[arg-type]
+
+
+def test_index_code_dir_logs_jsonrpc_error_body(monkeypatch, capsys):
+    """_index_code_dir warns when index_repository returns HTTP 200 with a JSON-RPC error body.
+
+    This is the silent-failure gap: the old code printed 'indexed' on any HTTP 200,
+    even when the response body carried a JSON-RPC error that means the index is
+    incomplete. The fix surfaces these in the tunnel log.
+    """
+    import httpx as _httpx
+
+    # First call (probe tools/list) returns 200 clean; second (tools/call) returns
+    # 200 but with a JSON-RPC error body — the silent-failure case.
+    _call_count = [0]
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self.status_code = 200
+            self.content = body
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            _call_count[0] += 1
+            if _call_count[0] == 1:
+                # Probe: clean 200
+                return FakeResp(b'{"jsonrpc":"2.0","id":"probe","result":{"tools":[]}}')
+            # index_repository call: HTTP 200 with JSON-RPC error body
+            return FakeResp(
+                b'{"jsonrpc":"2.0","id":"idx","error":{"code":-32603,"message":"scan partial"}}'
+            )
+
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+    asyncio.run(tc._index_code_dir(8809, "/repo"))
+
+    captured = capsys.readouterr()
+    # Must warn on stderr, not silently print "indexed"
+    assert "scan partial" in captured.err
+    assert "indexed" not in captured.out
+
+
+# ---------------------------------------------------------------------------
 # _find_codebase_memory_mcp — PATH + managed dir
 # ---------------------------------------------------------------------------
 
@@ -1137,6 +1237,123 @@ def test_install_mcp_json_updates_existing_cursor_config(tmp_path):
     assert cursor in paths
     data = json.loads(cursor.read_text(encoding="utf-8"))
     assert "filesystem" in data["mcpServers"]
+
+
+# ---------------------------------------------------------------------------
+# bf31787c — meridian server entry injection
+# ---------------------------------------------------------------------------
+
+def test_meridian_server_url():
+    # The main Meridian server URL is just {base_url}/mcp (tenant-agnostic).
+    assert tc._meridian_server_url("https://usemeridian.us") == "https://usemeridian.us/mcp"
+    assert tc._meridian_server_url("https://usemeridian.us/") == "https://usemeridian.us/mcp"
+
+
+def test_tunnel_mcp_entries_includes_meridian_when_token_provided():
+    # bf31787c — when a token is supplied, the 'meridian' server entry is
+    # injected as the first entry with the correct URL and Authorization header.
+    base, tid = "https://usemeridian.us", "tid-123"
+    tok = "sk_meridian_test"
+    entries = tc._tunnel_mcp_entries(base, tid, token=tok)
+    assert "meridian" in entries
+    assert entries["meridian"]["type"] == "http"
+    assert entries["meridian"]["url"] == "https://usemeridian.us/mcp"
+    assert entries["meridian"]["headers"] == {"Authorization": f"Bearer {tok}"}
+    # Slot connectors still present.
+    assert "filesystem" in entries
+    assert "codebase-memory" in entries
+    assert "serena" in entries
+
+
+def test_tunnel_mcp_entries_omits_meridian_without_token():
+    # bf31787c — without a token (or empty token) no 'meridian' entry is injected,
+    # preserving backward-compat for callers that don't have the token handy.
+    base, tid = "https://usemeridian.us", "tid-123"
+    assert "meridian" not in tc._tunnel_mcp_entries(base, tid)
+    assert "meridian" not in tc._tunnel_mcp_entries(base, tid, token=None)
+    assert "meridian" not in tc._tunnel_mcp_entries(base, tid, token="")
+
+
+def test_install_mcp_json_injects_meridian_server_entry(tmp_path):
+    # bf31787c — with a token, _install_mcp_json writes the 'meridian' entry.
+    base, tid, tok = "https://usemeridian.us", "tid-x", "sk_meridian_tok"
+    tc._install_mcp_json(tmp_path, base, tid, token=tok)
+    servers = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    assert "meridian" in servers
+    assert servers["meridian"]["url"] == f"{base}/mcp"
+    assert servers["meridian"]["headers"]["Authorization"] == f"Bearer {tok}"
+    # Slot connectors still present.
+    assert "filesystem" in servers
+    assert "codebase-memory" in servers
+    assert "serena" in servers
+
+
+def test_install_mcp_json_without_token_omits_meridian_entry(tmp_path):
+    # bf31787c — without a token the 'meridian' entry is absent (not a regression
+    # for callers that omit the token parameter).
+    tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid-x")
+    servers = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    assert "meridian" not in servers
+    assert set(servers) == {"filesystem", "codebase-memory", "serena"}
+
+
+def test_is_our_mcp_entry_recognises_meridian_server_url():
+    # bf31787c — an entry whose url is {base_url}/mcp is recognised as ours
+    # so restore and re-inject don't accumulate stale entries.
+    base, tid = "https://usemeridian.us", "tid-123"
+    entry = {"type": "http", "url": f"{base}/mcp", "headers": {"Authorization": "Bearer tok"}}
+    assert tc._is_our_mcp_entry("meridian", entry, base, tid)
+    # A user's own server called 'meridian' pointing elsewhere must NOT be flagged.
+    other = {"type": "http", "url": "https://example.com/mcp"}
+    assert not tc._is_our_mcp_entry("meridian", other, base, tid)
+
+
+def test_inject_mcp_entries_meridian_reinject_is_idempotent(tmp_path):
+    # bf31787c — a second tunnel run should overwrite (not duplicate) the meridian
+    # entry, and should NOT create 'meridian-meridian' due to collision handling.
+    base, tid, tok = "https://usemeridian.us", "tid-y", "sk_meridian_tok"
+    entries = tc._tunnel_mcp_entries(base, tid, token=tok)
+    first = tc._inject_mcp_entries(None, entries, base, tid)
+    second = tc._inject_mcp_entries(first, entries, base, tid)
+    servers = json.loads(second)["mcpServers"]
+    # Exactly one 'meridian' key, no 'meridian-meridian'.
+    assert "meridian" in servers
+    assert "meridian-meridian" not in servers
+    assert servers["meridian"]["url"] == f"{base}/mcp"
+
+
+def test_restore_mcp_json_removes_meridian_server_entry(tmp_path):
+    # bf31787c — restore must strip the injected 'meridian' server entry so it
+    # doesn't linger after the tunnel stops.
+    base, tid, tok = "https://usemeridian.us", "tid-z", "sk_meridian_tok"
+    mcp = tmp_path / ".mcp.json"
+    snaps = tc._install_mcp_json(tmp_path, base, tid, token=tok)
+    assert "meridian" in json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+
+    tc._restore_mcp_json(snaps, base, tid)
+    # File was created (original=None) so it is deleted on restore.
+    assert not mcp.exists()
+
+
+def test_restore_mcp_json_strips_meridian_entry_from_existing_file(tmp_path):
+    # bf31787c — if the file already existed and we merged in the meridian entry,
+    # restore must strip it and leave any user-owned entries intact.
+    base, tid, tok = "https://usemeridian.us", "tid-w", "sk_meridian_tok"
+    mcp = tmp_path / ".mcp.json"
+    original_data = {"mcpServers": {"my-server": {"command": "node"}}}
+    mcp.write_text(json.dumps(original_data), encoding="utf-8")
+
+    snaps = tc._install_mcp_json(tmp_path, base, tid, token=tok)
+    # During the session both 'meridian' and 'my-server' are present.
+    live = json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+    assert "meridian" in live
+    assert "my-server" in live
+
+    tc._restore_mcp_json(snaps, base, tid)
+    restored = json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+    assert "meridian" not in restored
+    assert "filesystem" not in restored
+    assert restored == {"my-server": {"command": "node"}}
 
 
 # ---------------------------------------------------------------------------
@@ -2154,3 +2371,141 @@ def test_update_notice_minor_and_major_bumps():
     assert tc._update_notice("0.1.6", "0.2.0") is not None   # minor
     assert tc._update_notice("0.9.9", "1.0.0") is not None   # major
     assert tc._update_notice("1.0.0", "1.0.1") is not None   # patch
+
+
+# ---------------------------------------------------------------------------
+# 105b5aa9 — ensure_running pre-spawn port-occupancy check
+# ---------------------------------------------------------------------------
+
+class _FakeProc:
+    """Minimal Popen stand-in for ensure_running tests."""
+    def __init__(self):
+        self.pid = 12345
+    def poll(self):
+        return None  # alive
+
+
+async def _run_ensure(proxy):
+    """Helper: run ensure_running in a fresh event loop."""
+    await proxy.ensure_running()
+
+
+def _run_sync(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def test_ensure_running_spawns_when_port_is_free(monkeypatch):
+    """105b5aa9 — when the port is free, ensure_running proceeds to Popen as
+    usual (the port-occupancy check path is transparent on a clean port)."""
+    spawned = []
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9200"], 9200, "test", client_id="cl-1")
+    _run_sync(_run_ensure(proxy))
+
+    assert len(spawned) == 1
+    assert proxy.is_running
+
+
+def test_ensure_running_kills_orphan_then_spawns(monkeypatch):
+    """105b5aa9 — when the port is occupied by an orphan (no live-client claim),
+    ensure_running calls _kill_stale_port_occupant, then spawns normally."""
+    spawned = []
+    kill_calls = []
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: True)
+    monkeypatch.setattr(tc, "_is_slot_claimed_by_live_client", lambda port, cid: False)
+    monkeypatch.setattr(
+        tc, "_kill_stale_port_occupant",
+        lambda port, label, current_client_id="": kill_calls.append((port, label)),
+    )
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9201"], 9201, "fs", client_id="cl-2")
+    _run_sync(_run_ensure(proxy))
+
+    assert kill_calls == [(9201, "fs")]
+    assert len(spawned) == 1
+
+
+def test_ensure_running_refuses_live_client_port(monkeypatch, capsys):
+    """105b5aa9 — when the port is held by a DIFFERENT still-live tunnel client,
+    ensure_running must NOT kill it and must NOT spawn; it logs an error and
+    returns without a Popen call."""
+    spawned = []
+    kill_calls = []
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: True)
+    monkeypatch.setattr(tc, "_is_slot_claimed_by_live_client", lambda port, cid: True)
+    monkeypatch.setattr(
+        tc, "_kill_stale_port_occupant",
+        lambda port, label, current_client_id="": kill_calls.append(port),
+    )
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9202"], 9202, "code", client_id="cl-3")
+    _run_sync(_run_ensure(proxy))
+
+    assert kill_calls == [], "must NOT kill a live-client-owned port"
+    assert spawned == [], "must NOT spawn when port is live-client-owned"
+    captured = capsys.readouterr()
+    assert "live tunnel client" in captured.err
+
+
+def test_ensure_running_no_double_spawn_under_concurrent_requests(monkeypatch):
+    """105b5aa9 / lock semantics — if two coroutines race to ensure_running on a
+    free port, only one Popen is issued (the asyncio.Lock prevents double-spawn)."""
+    import asyncio as _asyncio
+
+    spawn_count = [0]
+
+    def fake_popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        return _FakeProc()
+
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9203"], 9203, "test2", client_id="cl-4")
+
+    async def _run_two():
+        await _asyncio.gather(proxy.ensure_running(), proxy.ensure_running())
+
+    loop = _asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_run_two())
+    finally:
+        loop.close()
+
+    assert spawn_count[0] == 1, f"expected 1 spawn, got {spawn_count[0]}"
+
+
+def test_ensure_running_noop_when_already_running(monkeypatch):
+    """105b5aa9 / regression — a slot that is_running skips the port check and
+    Popen entirely (no spurious kills on a healthy slot)."""
+    kill_calls = []
+    spawned = []
+    monkeypatch.setattr(
+        tc, "_kill_stale_port_occupant",
+        lambda port, label, current_client_id="": kill_calls.append(port),
+    )
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9204"], 9204, "fs2")
+    # Seed a fake live proc so is_running is True from the start.
+    proxy._proc = _FakeProc()
+    proxy.holder["proc"] = proxy._proc
+
+    _run_sync(_run_ensure(proxy))
+
+    assert kill_calls == []
+    assert spawned == []

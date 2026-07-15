@@ -75,6 +75,34 @@ A normal self-hosted install does not need them.
 
 ---
 
+## Optional: Redis push augmentation
+
+`send_message` / `receive_messages` work via Postgres (durable, always-on). Setting
+`MERIDIAN_REDIS_URL` adds real-time push delivery on top — subscribers are woken
+instantly instead of polling.
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `MERIDIAN_REDIS_URL` | Redis connection URL (e.g. `redis://...` or `rediss://...`). When unset, push augmentation is skipped silently and all messaging falls back to Postgres polling. | No |
+
+### Per-tenant Redis command budget (hosted deployments)
+
+To protect against runaway Upstash costs from a single tenant spamming
+`send_message`, Meridian enforces a three-tier budget based on each tenant's
+monthly Redis PUBLISH command count. Upstash pricing is approximately
+$0.20 / 100,000 commands ($1.00 = 500,000 commands).
+
+| Tier | Threshold | Action |
+|------|-----------|--------|
+| **Tier 1 — Warning** | 500,000 commands (~$1.00/mo) | Dashboard notice + email to the tenant. Idempotent: sent at most once per calendar month per tenant. |
+| **Tier 2 — Disable** | 1,000,000 commands (~$2.00/mo) | Real-time push is paused for that tenant; `send_message` falls back to Postgres polling. A separate "hard limit reached" email is sent. Messages are never lost — only delivery method changes. Resets at start of next month. |
+| **Tier 3 — Admin alert** | 2,000,000 commands (~$4.00/mo) | Should be structurally unreachable if Tier 2 works. Crossing this threshold fires an admin alert via `MERIDIAN_ADMIN_NTFY_URL` / `ADMIN_EMAIL` — it signals a gate failure, not just a large tenant. |
+
+The thresholds above apply to paid tenants. Free-tier tenants receive no Redis
+push augmentation by default (they rely on Postgres polling only).
+
+---
+
 ## Example `.env`
 
 ```bash

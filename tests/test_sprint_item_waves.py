@@ -120,3 +120,141 @@ def test_assign_sprint_waves_registered_as_write_tool():
     assert "assign_sprint_waves" not in _READ_ONLY_TOOLS
     assert _TITLE_OVERRIDES["assign_sprint_waves"] == "Assign Sprint Waves"
     assert "assign_sprint_waves" in _TOOL_EXAMPLES
+
+
+# ---------------------------------------------------------------------------
+# 90955d26 — assign_sprint_waves projects depends_on-blocked items into future
+# waves rather than dropping them with wave=NULL. Covers:
+#   * a simple A→B chain (B lands in wave-2, not NULL)
+#   * a three-level chain A→B→C
+#   * resource conflicts inside the first (unblocked) wave still split into
+#     wave-1 / wave-2, and the blocked dep then lands in wave-3
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_projects_dep_into_future_wave(db):
+    """A depends_on-blocked item receives a future-wave label, not NULL."""
+    pid = await _project(db)
+    # A is a root (no dep), B depends on A.
+    a = await db_module.add_sprint_item(db, pid, "v1", "root item A")
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "dep item B", depends_on=a["id"], force=True
+    )
+    result = await db_module.assign_sprint_waves(db, pid)
+
+    ra = await db_module.get_sprint_item(db, a["id"])
+    rb = await db_module.get_sprint_item(db, b["id"])
+
+    # Both must be assigned a wave (neither NULL).
+    assert ra["wave"] is not None, "root item A should have a wave label"
+    assert rb["wave"] is not None, "dep item B should have a wave label, not NULL"
+    # B's wave must be numerically later than A's wave.
+    a_num = int(ra["wave"].split("-")[1])
+    b_num = int(rb["wave"].split("-")[1])
+    assert b_num > a_num, (
+        f"Dep item B (wave-{b_num}) must be in a later wave than root A (wave-{a_num})"
+    )
+    # assigned count includes the blocked item.
+    assert result["assigned"] == 2
+    # wave_count reflects at least 2 distinct waves.
+    assert result["wave_count"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_three_level_chain(db):
+    """A→B→C three-level chain: each level lands in a strictly later wave."""
+    pid = await _project(db)
+    a = await db_module.add_sprint_item(db, pid, "v1", "level 0 root")
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "level 1 dep", depends_on=a["id"], force=True
+    )
+    c = await db_module.add_sprint_item(
+        db, pid, "v1", "level 2 dep", depends_on=b["id"], force=True
+    )
+    await db_module.assign_sprint_waves(db, pid)
+
+    ra = await db_module.get_sprint_item(db, a["id"])
+    rb = await db_module.get_sprint_item(db, b["id"])
+    rc = await db_module.get_sprint_item(db, c["id"])
+
+    assert ra["wave"] and rb["wave"] and rc["wave"], "all three must be labelled"
+    wa = int(ra["wave"].split("-")[1])
+    wb = int(rb["wave"].split("-")[1])
+    wc = int(rc["wave"].split("-")[1])
+    assert wa < wb < wc, (
+        f"Expected wave order A<B<C but got wave-{wa}/wave-{wb}/wave-{wc}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_conflict_plus_dep(db):
+    """Resource conflict in layer 0 splits into wave-1/wave-2; blocked dep gets wave-3."""
+    pid = await _project(db)
+    # Two items share file:x.py — they'll conflict -> separate sub-waves within layer 0.
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "edit x first", touches_resources=["file:x.py"]
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "edit x second", touches_resources=["file:x.py"], force=True
+    )
+    # C depends on A and will be projected into a future layer.
+    c = await db_module.add_sprint_item(
+        db, pid, "v1", "depends on a", depends_on=a["id"], force=True
+    )
+    result = await db_module.assign_sprint_waves(db, pid)
+
+    ra = await db_module.get_sprint_item(db, a["id"])
+    rb = await db_module.get_sprint_item(db, b["id"])
+    rc = await db_module.get_sprint_item(db, c["id"])
+
+    # A and B must be in different waves (resource conflict).
+    assert ra["wave"] != rb["wave"], "conflicting items must be in different waves"
+    # C's wave must be later than A's wave (dependency).
+    wa = int(ra["wave"].split("-")[1])
+    wc = int(rc["wave"].split("-")[1])
+    assert wc > wa, (
+        f"Dep item C (wave-{wc}) must be later than A (wave-{wa})"
+    )
+    # All three are assigned.
+    assert result["assigned"] == 3
+    # At least 2 waves (layer-0 conflict + layer-1 dep).
+    assert result["wave_count"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_topo_depth_map_basic():
+    """_topo_depth_map correctly computes depth for a simple chain."""
+    items = [
+        {"id": "a", "depends_on": None},
+        {"id": "b", "depends_on": "a"},
+        {"id": "c", "depends_on": "b"},
+    ]
+    dm = db_module._topo_depth_map(items)
+    assert dm["a"] == 0
+    assert dm["b"] == 1
+    assert dm["c"] == 2
+
+
+@pytest.mark.asyncio
+async def test_topo_depth_map_cycle_safe():
+    """_topo_depth_map handles a dependency cycle without infinite recursion."""
+    items = [
+        {"id": "a", "depends_on": "b"},
+        {"id": "b", "depends_on": "a"},
+    ]
+    dm = db_module._topo_depth_map(items)
+    # Both items should have a depth (0 is fine — cycle treated as root).
+    assert "a" in dm and "b" in dm
+
+
+@pytest.mark.asyncio
+async def test_topo_depth_map_external_dep_is_root():
+    """_topo_depth_map treats an external (out-of-set) dep as depth 0 (root)."""
+    items = [
+        {"id": "a", "depends_on": "external-id-not-in-set"},
+        {"id": "b", "depends_on": "a"},
+    ]
+    dm = db_module._topo_depth_map(items)
+    assert dm["a"] == 0  # external dep → root
+    assert dm["b"] == 1  # in-set dep on a → wave 1
