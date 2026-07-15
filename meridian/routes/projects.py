@@ -497,6 +497,7 @@ async def test_project_notification(
     if not notify_url and not notify_email:
         raise HTTPException(status_code=400, detail="No notify URL or email configured for this project")
     sent_to = []
+    ntfy_full = notify_url
     if notify_url:
         ntfy_full = notify_url
         if "://" not in ntfy_full and "@" not in ntfy_full:
@@ -515,7 +516,7 @@ async def test_project_notification(
             "Test from the Meridian dashboard. If you see this, email notifications are working!",
         )
         sent_to.append(notify_email)
-    return {"ok": True, "sent_to": sent_to, "notify_url": notify_url or ""}
+    return {"ok": True, "sent_to": sent_to, "notify_url": ntfy_full or ""}
 
 
 # ---------------------------------------------------------------------------
