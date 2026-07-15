@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+# NOTE: This package is NOT yet published to PyPI.
+# The publishing steps and trusted-publisher setup required are documented in
+# packages/meridian-plugin-base/PUBLISHING.md.
+#
+# Current status: monorepo-local editable install only. The package exists to
+# lock in the right shape and version contract before the first real publish.
+# Extensions (meridian-docs, future meridian-research, meridian-figma, ...) will
+# declare `meridian-plugin-base>=0.1` as a regular dependency once it lands on
+# a resolvable index.
+name = "meridian-plugin-base"
+version = "0.1.0"
+description = "Shared OOXML/document-parse core for Meridian plugin extensions (meridian[docs], meridian[research], ...)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Adam Camerer" }]
+keywords = ["mcp", "meridian", "docx", "ooxml", "plugin", "documents"]
+# Pure stdlib — intentionally zero third-party runtime dependencies so that any
+# plugin can depend on this package without pulling in the full Meridian stack
+# (FastAPI, psycopg, anthropic, ...). The whole point of this package is to be
+# a lightweight, resolvable common base.
+dependencies = []
+
+[project.urls]
+Homepage = "https://usemeridian.us"
+Source = "https://github.com/meridianmcp/meridian"
+
+[tool.hatch.build.targets.wheel]
+packages = ["meridian_plugin_base"]
