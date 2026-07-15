@@ -2386,7 +2386,7 @@ async def test_heartbeat_session_updates_last_seen(db):
     # The freshly-stamped timestamp must be more recent than the
     # backdated one; a substring comparison on the iso string is
     # sufficient here because SQLite formats them lexicographically.
-    assert row[0] is not None
+    assert (row["last_seen"] if isinstance(row, dict) else row[0]) is not None
 
 
 @pytest.mark.asyncio
@@ -5934,7 +5934,7 @@ async def test_start_worker_session_claims_oldest_pending(db):
         (result["session_id"],),
     ) as cur:
         row = await cur.fetchone()
-    assert row[0] == "worker"
+    assert (row["session_type"] if isinstance(row, dict) else row[0]) == "worker"
 
 
 @pytest.mark.asyncio
@@ -6078,7 +6078,8 @@ async def test_summarize_session_stores_structured_output(db):
         "SELECT session_summary FROM sessions WHERE id = ?", (s["id"],)
     ) as cur:
         row = await cur.fetchone()
-    assert row[0] and "shipped three tasks" in row[0]
+    val = row["session_summary"] if isinstance(row, dict) else row[0]
+    assert val and "shipped three tasks" in val
 
 
 @pytest.mark.asyncio
@@ -6098,7 +6099,7 @@ async def test_summarize_session_rejects_malformed_output(db):
         "SELECT session_summary FROM sessions WHERE id = ?", (s["id"],)
     ) as cur:
         row = await cur.fetchone()
-    assert row[0] is None
+    assert (row["session_summary"] if isinstance(row, dict) else row[0]) is None
 
 
 @pytest.mark.asyncio
@@ -17469,8 +17470,20 @@ async def test_workspace_proposal_delete(db):
 @pytest.mark.asyncio
 async def test_workspace_proposal_schema_has_required_columns(db):
     """Verify the workspace_proposals table has the expected lifecycle columns."""
-    async with db.execute("PRAGMA table_info(workspace_proposals)") as cur:
-        cols = {row["name"] for row in await cur.fetchall()}
+    if hasattr(db, "_pool"):
+        # PRAGMA is a SQLite-only statement; the Postgres adapter no-ops it
+        # rather than translating it, so introspect via information_schema.
+        async with db.execute(
+            "SELECT column_name AS name FROM information_schema.columns "
+            "WHERE table_name = 'workspace_proposals'"
+        ) as cur:
+            cols = {
+                (row["name"] if isinstance(row, dict) else row[0])
+                for row in await cur.fetchall()
+            }
+    else:
+        async with db.execute("PRAGMA table_info(workspace_proposals)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
     assert "status" in cols
     assert "promoted_to_sprint_item_id" in cols
     assert "tenant_id" in cols

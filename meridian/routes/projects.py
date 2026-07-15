@@ -515,7 +515,7 @@ async def test_project_notification(
             "Test from the Meridian dashboard. If you see this, email notifications are working!",
         )
         sent_to.append(notify_email)
-    return {"ok": True, "sent_to": sent_to}
+    return {"ok": True, "sent_to": sent_to, "notify_url": notify_url or ""}
 
 
 # ---------------------------------------------------------------------------

@@ -5343,7 +5343,9 @@ async def count_pending_provisions(db: aiosqlite.Connection) -> int:
         "SELECT COUNT(*) FROM provision_queue WHERE status = 'pending'"
     ) as cur:
         row = await cur.fetchone()
-    return int(row[0]) if row else 0
+    if not row:
+        return 0
+    return int(row["count"] if isinstance(row, dict) else row[0])
 
 
 async def upsert_graph_entities(
@@ -5384,7 +5386,9 @@ async def count_graph_entities(db: aiosqlite.Connection, project_id: str) -> int
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
-    return int(row[0]) if row else 0
+    if not row:
+        return 0
+    return int(row["count"] if isinstance(row, dict) else row[0])
 
 
 async def search_graph_entities(
@@ -6014,7 +6018,12 @@ async def get_notes_backlinked_to(
         (project_id, pattern),
     ) as cur:
         rows = await cur.fetchall()
-    return [{"id": r[0], "slug": r[1], "title": r[2]} for r in (rows or [])]
+    return [
+        {"id": r["id"], "slug": r["slug"], "title": r["title"]}
+        if isinstance(r, dict)
+        else {"id": r[0], "slug": r[1], "title": r[2]}
+        for r in (rows or [])
+    ]
 
 
 # get_sprint_items_for_resource — moved to sprint_items.py, re-exported via *
@@ -6841,7 +6850,9 @@ async def count_decisions(db: aiosqlite.Connection, project_id: str) -> int:
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
-    return (row[0] if row else 0) or 0
+    if not row:
+        return 0
+    return (row["count"] if isinstance(row, dict) else row[0]) or 0
 
 
 async def delete_pinned_decision(
@@ -7387,12 +7398,16 @@ async def record_session_activity(
         (entry_id, session_id, tool_name, summary[:200], now_ts),
     )
     # Prune rows beyond the ring-size limit — delete all but the most recent N.
-    # Use rowid as tie-breaker so sub-second batches are pruned deterministically.
+    # Tie-break sub-second batches (recorded_at collisions) deterministically:
+    # SQLite has an implicit rowid; Postgres has no equivalent pseudo-column, so
+    # use ctid (physical row location) instead — this table is INSERT-only
+    # (never UPDATEd), so ctid order tracks insertion order just like rowid does.
+    tiebreak = "ctid" if hasattr(db, "_pool") else "rowid"
     await db.execute(
-        "DELETE FROM session_activity WHERE session_id = ? AND rowid NOT IN ("
-        "  SELECT rowid FROM session_activity WHERE session_id = ? "
-        "  ORDER BY recorded_at DESC, rowid DESC LIMIT ?"
-        ")",
+        f"DELETE FROM session_activity WHERE session_id = ? AND {tiebreak} NOT IN ("
+        f"  SELECT {tiebreak} FROM session_activity WHERE session_id = ? "
+        f"  ORDER BY recorded_at DESC, {tiebreak} DESC LIMIT ?"
+        f")",
         (session_id, session_id, _SESSION_ACTIVITY_RING_SIZE),
     )
     await db.commit()
@@ -8516,7 +8531,9 @@ async def count_recent_signup_attempts(
         (ip_hash, since_iso),
     ) as cur:
         row = await cur.fetchone()
-    return int(row[0]) if row else 0
+    if not row:
+        return 0
+    return int(row["count"] if isinstance(row, dict) else row[0])
 
 
 async def consume_magic_token(

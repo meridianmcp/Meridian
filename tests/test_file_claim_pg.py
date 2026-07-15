@@ -83,15 +83,25 @@ async def test_expire_file_read_claims_drops_expired_keeps_live(anydb):
         db, "meridian/server.py", live["id"], mode="read"
     )
     # Stale claim: insert directly with an expires_at one hour in the past.
-    # datetime('now', '-1 hours') is a text expr on SQLite and (via pg_adapter)
-    # a to_char(...) text value that Postgres implicitly casts into the
-    # TIMESTAMPTZ column on INSERT — insertion has never been the failing path.
-    await db.execute(
-        "INSERT INTO file_read_claims "
-        "(id, file_path, session_id, claimed_at, expires_at) "
-        "VALUES (?, ?, ?, datetime('now'), datetime('now', '-1 hours'))",
-        (db_module._new_id(), "meridian/server.py", stale["id"]),
-    )
+    # file_read_claims.claimed_at/expires_at are TIMESTAMPTZ on Postgres, so the
+    # shared datetime('now', ...) form -- adapter-rewritten to a text-typed
+    # to_char(...) expression -- fails with a DatatypeMismatch on INSERT there
+    # (this insertion IS a failing path on Postgres). Dialect-split like
+    # _claim_file_read (meridian/db/locks.py).
+    if hasattr(db, "_pool"):
+        await db.execute(
+            "INSERT INTO file_read_claims "
+            "(id, file_path, session_id, claimed_at, expires_at) "
+            "VALUES (?, ?, ?, now(), now() - interval '1 hour')",
+            (db_module._new_id(), "meridian/server.py", stale["id"]),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO file_read_claims "
+            "(id, file_path, session_id, claimed_at, expires_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now', '-1 hours'))",
+            (db_module._new_id(), "meridian/server.py", stale["id"]),
+        )
     await db.commit()
 
     # Run the cleanup directly (the crash site).

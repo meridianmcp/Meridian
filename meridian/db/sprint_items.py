@@ -792,7 +792,9 @@ async def _maybe_rollup_parent(db: aiosqlite.Connection, project_id: str, item_i
         (parent_id, project_id),
     ) as cur:
         rows = await cur.fetchall()
-    statuses = [r[0] or "pending" for r in rows]
+    statuses = [
+        (r["status"] if isinstance(r, dict) else r[0]) or "pending" for r in rows
+    ]
     if not statuses:
         return
     has_active = any(s in _ACTIVE_SPRINT_STATUSES for s in statuses)
