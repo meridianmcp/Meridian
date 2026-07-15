@@ -2356,6 +2356,66 @@ async def _migrate_pg_v25_admins_table(conn: PostgresConnection) -> None:
         )
 
 
+async def _migrate_pg_feedback(conn: PostgresConnection) -> None:
+    """Create feedback table on existing Postgres DBs. Was missing from the PG
+    schema entirely (only in the SQLite path), so submit-feedback 500'd on
+    hosted with 'relation feedback does not exist'. Mirrors db.CREATE_TABLES's
+    feedback table. Hosted-only (tenant-scoped, main auth DB)."""
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS feedback ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,"
+        f"    type TEXT NOT NULL,"
+        f"    message TEXT NOT NULL,"
+        f"    email TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        f");"
+        f"CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON feedback(tenant_id);"
+        f"CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at);"
+    )
+
+
+async def _migrate_pg_registered_hostnames(conn: PostgresConnection) -> None:
+    """Create registered_hostnames table on existing Postgres DBs. Was missing
+    from the PG schema entirely, so register_hostname/hostname_status/
+    revoke_hostname 500'd on hosted with 'relation registered_hostnames does
+    not exist'. Mirrors db.migrations._migrate_registered_hostnames.
+    Hosted-only (control-plane / auth DB)."""
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS registered_hostnames ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    tenant_id TEXT NOT NULL,"
+        f"    hostname TEXT NOT NULL,"
+        f"    registration_token TEXT NOT NULL,"
+        f"    registered_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    last_seen TEXT,"
+        f"    UNIQUE(tenant_id, hostname)"
+        f");"
+        f"CREATE INDEX IF NOT EXISTS idx_reg_hostnames ON registered_hostnames(hostname);"
+    )
+
+
+async def _migrate_pg_file_docx_region_claims(conn: PostgresConnection) -> None:
+    """Create file_docx_region_claims table on existing Postgres DBs. Was
+    missing from the PG schema entirely, so claim_docx_region/get_docx_region_
+    claims/release_docx_region_claims 500'd on hosted with 'relation
+    file_docx_region_claims does not exist'. Mirrors
+    db.locks._migrate_docx_region_claims. Runs on every DB (LATE, not
+    hosted-only — sessions exist on customer DBs too)."""
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS file_docx_region_claims ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        f"    file_path TEXT NOT NULL,"
+        f"    element_id TEXT NOT NULL,"
+        f"    claimed_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    released_at TEXT"
+        f");"
+        f"CREATE INDEX IF NOT EXISTS idx_docx_region_claims_file ON file_docx_region_claims (file_path);"
+        f"CREATE INDEX IF NOT EXISTS idx_docx_region_claims_session ON file_docx_region_claims (session_id);"
+    )
+
+
 # ── Migration registry ──────────────────────────────────────────────────────
 # Ordered tuples consumed by _run_pg_migrations (see init_pg_db). Order is
 # load-bearing and matches the historical call sequence exactly. Defined at
@@ -2400,6 +2460,8 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_tunnel_active,
     _migrate_pg_tunnel_plugins,
     _migrate_pg_tunnel_plugins_by_host,
+    _migrate_pg_feedback,
+    _migrate_pg_registered_hostnames,
 )
 
 async def _migrate_pg_decision_code_anchor(conn: PostgresConnection) -> None:
@@ -2865,4 +2927,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_file_patch_counters,
     _migrate_pg_sprint_item_resources_amended,
     _migrate_pg_session_activity,
+    _migrate_pg_file_docx_region_claims,
 )

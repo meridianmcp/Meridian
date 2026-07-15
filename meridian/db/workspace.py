@@ -644,6 +644,10 @@ async def update_workspace_sprint_item(
     matched (unknown id, or another tenant's item)."""
     scope, scope_params = _ws_tenant_clause(tenant_id)
     scope_sql = f" AND {scope}" if scope else ""
+    # workspace_sprint_items.completed_at/updated_at are TIMESTAMPTZ on Postgres;
+    # see update_agent_task_status for why the shared datetime('now') form breaks
+    # there (adapter-rewritten to a text-typed to_char(...) expression).
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
     fields: list[str] = []
     values: list[Any] = []
     if title is not None:
@@ -655,7 +659,7 @@ async def update_workspace_sprint_item(
         fields.append("status = ?")
         values.append(status)
         if status in {"done", "skipped", "failed"}:
-            fields.append("completed_at = datetime('now')")
+            fields.append(f"completed_at = {now_expr}")
         else:
             fields.append("completed_at = NULL")
     if item_group is not None:
@@ -671,7 +675,7 @@ async def update_workspace_sprint_item(
         ) as cur:
             row = await cur.fetchone()
         return _row_to_dict(row)
-    fields.append("updated_at = datetime('now')")
+    fields.append(f"updated_at = {now_expr}")
     cursor = await db.execute(
         f"UPDATE workspace_sprint_items SET {', '.join(fields)} "
         f"WHERE id = ?{scope_sql}",

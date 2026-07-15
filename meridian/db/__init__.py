@@ -9155,14 +9155,18 @@ async def update_agent_task_status(
 ) -> dict[str, Any] | None:
     """Update the status (and optionally output) of an agent task."""
     output_json = json.dumps(output) if output is not None else None
+    # agent_tasks.updated_at is TIMESTAMPTZ on Postgres; the shared datetime('now')
+    # form is adapter-rewritten to a to_char(...) *text* expression, which Postgres
+    # refuses to implicitly cast into a timestamptz column. Same class as 6adba18c.
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
     if output_json is not None:
         await db.execute(
-            "UPDATE agent_tasks SET status=?, output=?, updated_at=datetime('now') WHERE id=?",
+            f"UPDATE agent_tasks SET status=?, output=?, updated_at={now_expr} WHERE id=?",
             (status, output_json, task_id),
         )
     else:
         await db.execute(
-            "UPDATE agent_tasks SET status=?, updated_at=datetime('now') WHERE id=?",
+            f"UPDATE agent_tasks SET status=?, updated_at={now_expr} WHERE id=?",
             (status, task_id),
         )
     await db.commit()
@@ -9217,8 +9221,11 @@ async def amend_handoff(
     if not rows:
         return None
     hid = rows[0]["id"]
+    # handoffs.created_at is TIMESTAMPTZ on Postgres; see update_agent_task_status
+    # for why the shared datetime('now') form breaks there.
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
     await db.execute(
-        "UPDATE handoffs SET body = ?, mode = ?, created_at = datetime('now') WHERE id = ?",
+        f"UPDATE handoffs SET body = ?, mode = ?, created_at = {now_expr} WHERE id = ?",
         (body, mode, hid),
     )
     await db.commit()
