@@ -506,6 +506,106 @@ def test_index_code_dir_gives_up_after_timeout(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _extract_jsonrpc_error — surface silent index failures (f193bbd1)
+# ---------------------------------------------------------------------------
+
+def test_extract_jsonrpc_error_clean_response_returns_none():
+    """A normal 200 tools/call response with no error signals returns None."""
+    body = b'{"jsonrpc":"2.0","id":"idx","result":{"content":[{"type":"text","text":"ok"}]}}'
+    assert tc._extract_jsonrpc_error(body) is None
+
+
+def test_extract_jsonrpc_error_jsonrpc_error_object():
+    """A JSON-RPC error object is detected and its message returned."""
+    body = b'{"jsonrpc":"2.0","id":"idx","error":{"code":-32603,"message":"internal error"}}'
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "internal error" in result
+
+
+def test_extract_jsonrpc_error_jsonrpc_error_string():
+    """A JSON-RPC error as a plain string is detected."""
+    body = b'{"jsonrpc":"2.0","id":"idx","error":"index failed"}'
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "index failed" in result
+
+
+def test_extract_jsonrpc_error_mcp_result_is_error():
+    """MCP result.isError=true with content text is surfaced."""
+    body = (
+        b'{"jsonrpc":"2.0","id":"idx","result":{"isError":true,'
+        b'"content":[{"type":"text","text":"path not found"}]}}'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "path not found" in result
+
+
+def test_extract_jsonrpc_error_mcp_content_item_is_error():
+    """MCP result.content[*].isError=true is surfaced (2025-03-26 convention)."""
+    body = (
+        b'{"jsonrpc":"2.0","id":"idx","result":{"content":['
+        b'{"type":"text","isError":true,"text":"scan aborted"}]}}'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "scan aborted" in result
+
+
+def test_extract_jsonrpc_error_non_json_body_returns_none():
+    """A non-JSON body (plain text, SSE) is silently ignored."""
+    assert tc._extract_jsonrpc_error(b"event: message\ndata: {bad json}\n\n") is None
+
+
+def test_extract_jsonrpc_error_empty_body_returns_none():
+    """Empty / None body returns None without raising."""
+    assert tc._extract_jsonrpc_error(b"") is None
+    assert tc._extract_jsonrpc_error(None) is None  # type: ignore[arg-type]
+
+
+def test_index_code_dir_logs_jsonrpc_error_body(monkeypatch, capsys):
+    """_index_code_dir warns when index_repository returns HTTP 200 with a JSON-RPC error body.
+
+    This is the silent-failure gap: the old code printed 'indexed' on any HTTP 200,
+    even when the response body carried a JSON-RPC error that means the index is
+    incomplete. The fix surfaces these in the tunnel log.
+    """
+    import httpx as _httpx
+
+    # First call (probe tools/list) returns 200 clean; second (tools/call) returns
+    # 200 but with a JSON-RPC error body — the silent-failure case.
+    _call_count = [0]
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self.status_code = 200
+            self.content = body
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            _call_count[0] += 1
+            if _call_count[0] == 1:
+                # Probe: clean 200
+                return FakeResp(b'{"jsonrpc":"2.0","id":"probe","result":{"tools":[]}}')
+            # index_repository call: HTTP 200 with JSON-RPC error body
+            return FakeResp(
+                b'{"jsonrpc":"2.0","id":"idx","error":{"code":-32603,"message":"scan partial"}}'
+            )
+
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+    asyncio.run(tc._index_code_dir(8809, "/repo"))
+
+    captured = capsys.readouterr()
+    # Must warn on stderr, not silently print "indexed"
+    assert "scan partial" in captured.err
+    assert "indexed" not in captured.out
+
+
+# ---------------------------------------------------------------------------
 # _find_codebase_memory_mcp — PATH + managed dir
 # ---------------------------------------------------------------------------
 

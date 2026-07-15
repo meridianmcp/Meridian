@@ -2588,12 +2588,78 @@ async def _fetch_filesystem_roots(
 # Auto-index helper (calls index_repository on codebase-memory-mcp proxy)
 # ---------------------------------------------------------------------------
 
+def _extract_jsonrpc_error(body: bytes) -> "str | None":
+    """Extract a JSON-RPC or MCP tool-level error message from a response body.
+
+    codebase-memory-mcp returns HTTP 200 even when ``index_repository`` fails
+    internally (e.g. a partial scan, a missing path, or a silently-aborted
+    pass). The failure surfaces only in the JSON-RPC body:
+
+    * A top-level ``"error"`` key  — a JSON-RPC error response.
+    * ``result.content[*].isError = true`` — an MCP-convention tool error
+      whose text is in ``result.content[0].text``.
+    * ``result.isError = true`` — older MCP tool-error convention.
+
+    Returns a short error string if any of these patterns is detected, or
+    ``None`` when the response looks clean. Best-effort: any parse failure
+    returns ``None`` (we log the happy path as before).
+
+    This is the in-repo half of the staleness/coverage gap: the HTTP-only
+    success check (``status < 400``) was the silent-failure path that allowed
+    a broken or partial index to look identical to a successful one.
+    """
+    if not body:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 — non-JSON body (SSE, plain text)
+        return None
+    if not isinstance(data, dict):
+        return None
+    # JSON-RPC error response.
+    err = data.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message") or str(err.get("code", "unknown"))
+        return f"JSON-RPC error: {msg}"
+    if isinstance(err, str) and err:
+        return f"JSON-RPC error: {err}"
+    # MCP tool-level error: result.isError.
+    result = data.get("result")
+    if isinstance(result, dict):
+        if result.get("isError"):
+            content = result.get("content")
+            if isinstance(content, list) and content:
+                first = content[0]
+                text = (first.get("text") if isinstance(first, dict) else None) or ""
+                return f"tool error: {text[:200]}" if text else "tool error (no detail)"
+            return "tool error (isError=true)"
+        # result.content[*].isError (MCP 2025-03-26 convention).
+        content = result.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("isError"):
+                    text = item.get("text") or ""
+                    return f"tool error: {text[:200]}" if text else "tool error (no detail)"
+    return None
+
+
 async def _index_code_dir(port: int, code_dir: str) -> None:
     """Wait for the code-intel proxy to start, then call index_repository on code_dir.
 
     Uses Streamable HTTP (MCP 2025-03-26): mcp-proxy handles the stdio lifecycle
     per POST, so a direct tools/call is sufficient — no client-side initialize needed.
     Failures are non-fatal (logged to stderr, tunnel continues).
+
+    Known limitation: codebase-memory-mcp (the external binary behind the code-intel
+    slot) has a known graph-index staleness/coverage gap — its ``search_graph`` and
+    ``index_repository`` can miss real files present on disk even after a fresh full
+    re-index.  This is an upstream bug in codebase-memory-mcp, not in Meridian's
+    tunnel client.  The in-repo contribution here is that we now surface JSON-RPC-
+    level errors from ``index_repository`` that previously looked like success
+    (HTTP 200 with an error body); that makes a partial/failed index diagnosable
+    rather than silent.  For reliable code-intelligence use the ``meridian-extract``
+    slot (Serena/mcp-server-code-extractor), which is LSP-based and reads the live
+    filesystem directly.
     """
     import httpx
 
@@ -2629,7 +2695,19 @@ async def _index_code_dir(port: int, code_dir: str) -> None:
             r = await c.post(local, json=payload,
                              headers={"Content-Type": "application/json"})
         if r.status_code < 400:
-            print(f"  code-intel: indexed {code_dir}", flush=True)
+            # codebase-memory-mcp returns HTTP 200 even on an internal index
+            # failure. Parse the JSON-RPC body so a silent partial/failed index
+            # is visible in the tunnel log instead of being mistaken for success.
+            body_err = _extract_jsonrpc_error(r.content)
+            if body_err:
+                print(
+                    f"  code-intel: index_repository returned an error for {code_dir}: "
+                    f"{body_err} — the graph index may be incomplete. "
+                    "Use meridian-extract (Serena) for reliable code-intel.",
+                    file=sys.stderr, flush=True,
+                )
+            else:
+                print(f"  code-intel: indexed {code_dir}", flush=True)
         else:
             print(
                 f"  code-intel: index returned HTTP {r.status_code} for {code_dir}",
