@@ -638,7 +638,10 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- Meridian. Distinct from milestone_type='human'; excluded from executor scoping.
     blocker_kind TEXT,
     -- 58a45b92: stored, deterministic wave label (e.g. 'wave-1'); NULL = unassigned.
-    wave TEXT
+    wave TEXT,
+    -- 3d6bd938: separate human-readable sprint name from the structural version
+    -- identifier (mirrors SQLite). Nullable — legacy rows are NULL.
+    sprint_name TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
