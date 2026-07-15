@@ -18,6 +18,8 @@ import sys
 import tempfile
 from typing import Any
 
+import pytest
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
@@ -280,6 +282,43 @@ def test_claim_blocks_unprospected_item():
         await db.close()
 
     _run(run())
+
+
+@pytest.mark.asyncio
+async def test_claim_allows_item_with_real_durable_pointer(anydb):
+    """Cross-backend regression: a resource-declaring item WITH a real
+    add_sprint_item_pointer() row must be claimable on BOTH SQLite and
+    Postgres.
+
+    Original bug: the claim-time evidence check ran
+    ``SELECT COUNT(*) FROM sprint_item_pointers ...`` with no column alias,
+    then read the dict-mode result via ``row.get("COUNT(*)")``. Postgres's
+    dict_row cursor names an unaliased COUNT(*) column ``count`` (lowercase,
+    no parens) -- never the literal string "COUNT(*)" -- so that lookup
+    always returned None -> 0 on Postgres, permanently blocking claim on
+    every resource-declaring item regardless of real pointer evidence. Only
+    caught live against the hosted Postgres backend; SQLite's tuple-mode
+    fetch never exercised the dict-key branch at all. Fixed by aliasing the
+    column (``AS cnt``) and reading that alias in both branches.
+    """
+    p = await db_module.create_project(anydb, "pointer-claim-regression")
+    pid = p["id"]
+    item = await db_module.add_sprint_item(
+        anydb, pid, "v1", "Has a real pointer",
+        touches_resources=["file:meridian/outputs_indexer.py:annotate_outputs"],
+    )
+    iid = item["id"]
+    await db_module.add_sprint_item_pointer(
+        anydb, pid, iid, "code",
+        [{
+            "uri": "file:meridian/outputs_indexer.py",
+            "selector": {"type": "symbol", "qualified_name": "meridian.outputs_indexer.annotate_outputs"},
+        }],
+    )
+    result = await db_module.claim_sprint_item(anydb, pid, iid)
+    assert isinstance(result, dict)
+    assert not result.get("blocked"), f"expected claim to succeed, got: {result}"
+    assert result.get("status") == "in_progress"
 
 
 def test_claim_allows_item_without_declared_resources():
