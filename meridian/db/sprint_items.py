@@ -1419,12 +1419,12 @@ async def claim_sprint_item(
     if _has_declared_resources and not bool(item.get("prospect_bypass")):
         try:
             async with db.execute(
-                "SELECT COUNT(*) FROM sprint_item_pointers WHERE sprint_item_id = ?",
+                "SELECT COUNT(*) AS cnt FROM sprint_item_pointers WHERE sprint_item_id = ?",
                 (item_id,),
             ) as _ptr_cur:
                 _ptr_row = await _ptr_cur.fetchone()
             _ptr_count = (
-                (_ptr_row[0] if not isinstance(_ptr_row, dict) else _ptr_row.get("COUNT(*)"))
+                (_ptr_row[0] if not isinstance(_ptr_row, dict) else _ptr_row.get("cnt"))
                 if _ptr_row else 0
             ) or 0
             if not _ptr_count:
