@@ -17383,6 +17383,92 @@ def test_self_host_defaults_env_over_toml_over_default(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 64b9907a — get_default_project_id: env > [project] toml > None
+# ---------------------------------------------------------------------------
+
+
+def test_get_default_project_id_env_wins(monkeypatch):
+    """MERIDIAN_PROJECT_ID env var returns the project id."""
+    import meridian.toml_config as tc
+    monkeypatch.setenv("MERIDIAN_PROJECT_ID", "env-pid-1234")
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+    assert tc.get_default_project_id() == "env-pid-1234"
+
+
+def test_get_default_project_id_toml_fallback(monkeypatch, tmp_path):
+    """[project] toml table is used when no env var is set."""
+    monkeypatch.delenv("MERIDIAN_PROJECT_ID", raising=False)
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[project]\n"
+        'project_id = "toml-pid-5678"\n',
+    )
+    assert tc.get_default_project_id() == "toml-pid-5678"
+
+
+def test_get_default_project_id_env_over_toml(monkeypatch, tmp_path):
+    """Env var wins over the [project] toml table."""
+    tc = _point_toml_at(
+        monkeypatch, tmp_path,
+        "[project]\n"
+        'project_id = "toml-pid-5678"\n',
+    )
+    monkeypatch.setenv("MERIDIAN_PROJECT_ID", "env-pid-wins")
+    assert tc.get_default_project_id() == "env-pid-wins"
+
+
+def test_get_default_project_id_none_when_unconfigured(monkeypatch):
+    """Returns None when neither env var nor toml section is configured."""
+    import meridian.toml_config as tc
+    monkeypatch.delenv("MERIDIAN_PROJECT_ID", raising=False)
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+    assert tc.get_default_project_id() is None
+
+
+@pytest.mark.asyncio
+async def test_start_session_uses_default_project_id(db, monkeypatch):
+    """start_session falls back to MERIDIAN_PROJECT_ID when no project_id given."""
+    import meridian.toml_config as tc
+    from meridian.mcp.handlers.project_tools import handle_start_session
+
+    p = await db_module.create_project(db, "default-project-test")
+    monkeypatch.setenv("MERIDIAN_PROJECT_ID", p["id"])
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+
+    result = await handle_start_session(
+        {"session_name": "test-default-scope"},
+        db=db,
+        data_dir="/tmp",
+        tenant=None,
+        _mcp_tenant_id=None,
+        executor_sessions=set(),
+    )
+    assert "error" not in result
+    assert result.get("session_id") or result.get("session", {}).get("id")
+
+
+@pytest.mark.asyncio
+async def test_start_session_no_project_id_returns_error(db, monkeypatch):
+    """start_session returns error when no project_id, project_name, or default configured."""
+    import meridian.toml_config as tc
+    from meridian.mcp.handlers.project_tools import handle_start_session
+
+    monkeypatch.delenv("MERIDIAN_PROJECT_ID", raising=False)
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+
+    result = await handle_start_session(
+        {"session_name": "no-project"},
+        db=db,
+        data_dir="/tmp",
+        tenant=None,
+        _mcp_tenant_id=None,
+        executor_sessions=set(),
+    )
+    assert "error" in result
+    assert "project_id" in result["error"].lower() or "project" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
 # 9dad83fd — recovery for answered blocking HITLs whose session died
 # ---------------------------------------------------------------------------
 

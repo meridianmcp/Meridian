@@ -158,11 +158,30 @@ async def handle_start_session(
 
     ``executor_sessions`` is the handler-level in-memory set (bf51b12e) passed
     in by the caller so this module stays import-acyclic w.r.t. handler.py.
+
+    64b9907a — when neither project_id nor project_name is supplied, fall back
+    to the workspace-default project_id from the environment or meridian.toml
+    ``[project]`` section (via toml_config.get_default_project_id()).  This
+    lets a repo that always works on one project call
+    ``start_session(session_name="...")`` without repeating the project_id.
+    The toml snippet is::
+
+        [project]
+        project_id = "5787cc92-ba7d-4788-b17c-28ab7938b839"
+
+    or, equivalently, set ``MERIDIAN_PROJECT_ID`` in the environment / MCP
+    server env block.  When no default is configured and neither field is
+    supplied, the existing "project_id (or project_name) is required" error
+    is returned unchanged.
     """
     _pid = (args.get("project_id") or "").strip()
     if not _pid and args.get("project_name"):
         _p = await db_module.get_project_by_name(db, str(args["project_name"]))
         _pid = (_p or {}).get("id", "") if _p else ""
+    if not _pid:
+        # 64b9907a — last-resort: workspace-scoped default project_id.
+        from meridian import toml_config as _tc  # noqa: PLC0415
+        _pid = _tc.get_default_project_id() or ""
     if not _pid:
         return {"error": "project_id (or project_name) is required"}
     _sname = (args.get("session_name") or "").strip()
