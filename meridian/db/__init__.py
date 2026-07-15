@@ -3378,9 +3378,18 @@ async def search_tasks(
         # 82e0b887 — additively widen the candidate set with tsvector full-text
         # match so stemmed / morphological queries ("authenticating users" vs a
         # task "authentication for the user") also match. websearch_to_tsquery
-        # tolerates arbitrary user input without raising. similarity() still
-        # drives ordering (trigram score); ts_rank is a secondary tiebreak so
-        # rows matched purely by FTS (similarity 0) still order sensibly.
+        # tolerates arbitrary user input without raising. similarity() drives
+        # ordering (trigram score); ts_rank is a secondary tiebreak so rows
+        # matched purely by FTS still order sensibly.
+        #
+        # NOTE: similarity() is intentionally NOT used in the WHERE predicate.
+        # A low threshold (e.g. 0.05) caused false-positive matches for queries
+        # whose terms partially overlap the description — e.g. "authentication
+        # payments" matched "Fix the authentication bug in the login flow"
+        # because "authentication" contributes enough shared trigrams to exceed
+        # 0.05 even though "payments" is absent. The tsvector (AND) and ILIKE
+        # (per-term AND) predicates correctly enforce that the query terms must
+        # actually appear in the description; similarity is a ranking signal only.
         sql = (
             "SELECT t.id, t.description, t.status, t.created_at, "
             "s.name AS session_name, "
@@ -3388,8 +3397,7 @@ async def search_tasks(
             "FROM task_log t "
             "LEFT JOIN sessions s ON s.id = t.session_id "
             "WHERE t.project_id = ? "
-            "AND (similarity(t.description, ?) > 0.05 "
-            "OR to_tsvector('english', coalesce(t.description,'')) "
+            "AND (to_tsvector('english', coalesce(t.description,'')) "
             "@@ websearch_to_tsquery('english', ?) "
             f"OR {match_sql}) "
             "ORDER BY similarity DESC, "
@@ -3398,7 +3406,7 @@ async def search_tasks(
             "t.created_at DESC LIMIT ?"
         )
         params: tuple = (
-            query, project_id, query, query, *match_params, query, limit)
+            query, project_id, query, *match_params, query, limit)
     else:
         match_sql, match_params = _multiword_match_clause(["t.description"], query)
         sql = (
