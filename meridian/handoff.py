@@ -2802,6 +2802,7 @@ async def generate_handoff(
     graph_searcher: Callable[[str], Any] | None = None,
     extra_narrative: str | None = None,
     identity: str | None = None,
+    force_include_ids: list[str] | None = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -2813,6 +2814,14 @@ async def generate_handoff(
     Set ``skip_ai_summary=True`` for hot-path / test code that shouldn't
     burn a Haiku call. Pass ``summarizer`` to inject a stub for either
     the session-summary fan-out or the new ai_summary blurb.
+
+    ``force_include_ids`` (45f519a0 Part 2) — an optional list of sprint-item ids
+    to force-include in the pending list even when their ``deferred_until`` is in
+    the future. This is a VISIBILITY override for one handoff call only: the items
+    are appended after the deferred-exclusion filter runs, and their ``deferred_until``
+    is NOT cleared, so ``claim_sprint_item``'s own deferral gate is unaffected.
+    Use when a human genuinely wants a backburnered item back in scope for one
+    planning run without permanently re-enabling claiming.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -2872,7 +2881,11 @@ async def generate_handoff(
     # v3.1 — workspace decisions + notes apply across all projects.
     workspace_decisions = await db_module.get_workspace_decisions(db)
     workspace_notes = await db_module.get_workspace_notes(db)
-    sprint_items_all = await db_module.get_sprint_items(db, project_id, include_human=False)
+    # 45f519a0 — include_deferred=False so a deferred item is genuinely invisible
+    # to executors in the handoff pending-items list, not just gated at claim time.
+    sprint_items_all = await db_module.get_sprint_items(
+        db, project_id, include_human=False, include_deferred=False
+    )
     # Separate genuinely pending from actively-claimed in_progress items so:
     # (1) quick_start_goal only names items that haven't been claimed yet, and
     # (2) the delta output surfaces "Currently running:" at the top.
@@ -2885,6 +2898,22 @@ async def generate_handoff(
         it for it in sprint_items_all
         if it.get("status") in ("todo", "pending")
     ]
+    # 45f519a0 Part 2 — force_include_ids override: re-add specifically requested
+    # deferred items into the pending list for this handoff call only. deferred_until
+    # on the item is NOT touched, so claim_sprint_item's own gate stays intact.
+    if force_include_ids:
+        _pending_id_set = {it["id"] for it in pending_sprint_items}
+        for _fid in force_include_ids:
+            if _fid in _pending_id_set:
+                continue  # already in list (not deferred or already visible)
+            _forced = await db_module.get_sprint_item(db, _fid)
+            if (
+                _forced is not None
+                and _forced.get("project_id") == project_id
+                and _forced.get("status") in ("todo", "pending")
+            ):
+                pending_sprint_items.append(_forced)
+                _pending_id_set.add(_fid)
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
     # Flag items that may already be done based on recent task descriptions or commits
     pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks, commit_messages)

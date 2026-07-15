@@ -2062,6 +2062,12 @@ async def _handle_task_tools(
         except Exception:  # noqa: BLE001
             _graph_searcher = None
         _handoff_amended = False
+        # 45f519a0 — pass force_include_ids through so the caller can re-include
+        # specific deferred items in this handoff's pending list for one run.
+        _force_include_ids: list[str] | None = None
+        _raw_fii = args.get("force_include_ids")
+        if isinstance(_raw_fii, list):
+            _force_include_ids = [str(x) for x in _raw_fii if x]
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -2073,6 +2079,7 @@ async def _handle_task_tools(
                     commit_messages=[c["message"] for c in _gh_commits],
                     graph_searcher=_graph_searcher,
                     identity=_resolve_caller_identity(tenant),
+                    force_include_ids=_force_include_ids,
                 ),
                 timeout=90.0,
             )

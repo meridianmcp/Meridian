@@ -1105,6 +1105,28 @@ def _parse_deferral_ts(value: Any) -> "datetime | None":  # noqa: F821
     return dt
 
 
+def _is_deferred(item: dict[str, Any]) -> bool:
+    """45f519a0 — return True when a sprint item's ``deferred_until`` is in the future.
+
+    Uses the same ``_parse_deferral_ts`` parser that ``claim_sprint_item``
+    uses, so the semantics are identical: fail-open on garbage (unparseable
+    values are treated as not deferred), and timezone-aware values are
+    normalised to naive UTC before comparison.
+
+    Callers that want to exclude backburnered items from a list should filter
+    with ``[it for it in items if not _is_deferred(it)]``.
+    """
+    from datetime import datetime as _dt_cls
+
+    raw = item.get("deferred_until")
+    if not raw:
+        return False
+    dt = _parse_deferral_ts(raw)
+    if dt is None:
+        return False
+    return dt > _dt_cls.utcnow()
+
+
 async def claim_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1870,6 +1892,7 @@ async def get_sprint_items(
     include_human: bool = True,
     version: str | None = None,
     include_manual_blocker: bool | None = None,
+    include_deferred: bool = True,
 ) -> list[dict[str, Any]]:
     """List sprint items for a project, highest-priority first then oldest.
 
@@ -1895,6 +1918,13 @@ async def get_sprint_items(
     ``version`` (a76cb7c0) filters to a single sprint-version bucket. ``None``
     returns every version. Used by version-scoped sessions so an executor sees
     only the items in its bucket.
+
+    ``include_deferred`` (45f519a0) controls whether items with a future
+    ``deferred_until`` timestamp are returned. Default ``True`` keeps the
+    existing behaviour (dashboard full-board view always shows all items).
+    Pass ``False`` for executor-scoped calls (generate_handoff pending-items
+    list, claim-time checks) so a deferred item is genuinely invisible to an
+    executor rather than merely gated at claim time.
 
     Ordering (e08fee30): items are returned highest-priority first
     (urgent > high > normal > low), then oldest-first within a priority, so an
@@ -1929,6 +1959,12 @@ async def get_sprint_items(
     async with db.execute(query, params) as cur:
         rows = await cur.fetchall()
     items = [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+    # 45f519a0 — apply post-query deferred filter. deferred_until is not a SQL
+    # expression (it compares a stored timestamp against "now") so we filter in
+    # Python, the same as claim_sprint_item's existing deferral gate. Fail-open:
+    # unparseable values pass through (treated as not deferred).
+    if not include_deferred:
+        items = [it for it in items if not _is_deferred(it)]
     if show_blocked:
         return items
     # Build status lookup for dependency filtering

@@ -17878,3 +17878,147 @@ async def test_get_connection_log_ring_buffer(db):
         assert len(rows) == 5
     finally:
         _db_mod._CONNECTION_EVENTS_RING_SIZE = original
+
+
+# ---------------------------------------------------------------------------
+# 45f519a0 — deferred-item backburner tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_include_deferred_true_returns_deferred(db):
+    """include_deferred=True (default) returns items with a future deferred_until."""
+    p = await db_module.create_project(db, "deferred-test-1")
+    future = "2099-01-01T00:00:00"
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Future work", deferred_until=future
+    )
+    items = await db_module.get_sprint_items(db, p["id"], include_deferred=True)
+    ids = [it["id"] for it in items]
+    assert item["id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_include_deferred_false_hides_deferred(db):
+    """include_deferred=False excludes items with a future deferred_until."""
+    p = await db_module.create_project(db, "deferred-test-2")
+    future = "2099-01-01T00:00:00"
+    visible = await db_module.add_sprint_item(db, p["id"], "v1", "Visible work")
+    deferred = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Backburner work", deferred_until=future
+    )
+    items = await db_module.get_sprint_items(db, p["id"], include_deferred=False)
+    ids = [it["id"] for it in items]
+    assert visible["id"] in ids
+    assert deferred["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_past_deferred_not_hidden(db):
+    """An item with a PAST deferred_until is NOT hidden by include_deferred=False."""
+    p = await db_module.create_project(db, "deferred-test-3")
+    past = "2000-01-01T00:00:00"
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Past deferred", deferred_until=past
+    )
+    items = await db_module.get_sprint_items(db, p["id"], include_deferred=False)
+    ids = [it["id"] for it in items]
+    assert item["id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_garbage_deferred_passes_through(db):
+    """A garbage deferred_until is treated as not deferred (fail-open)."""
+    p = await db_module.create_project(db, "deferred-test-4")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Garbage deferred", deferred_until="not-a-date"
+    )
+    items = await db_module.get_sprint_items(db, p["id"], include_deferred=False)
+    ids = [it["id"] for it in items]
+    assert item["id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_handoff_excludes_deferred_from_pending_list(db, tmp_path):
+    """generate_handoff pending list excludes items with future deferred_until."""
+    p = await db_module.create_project(db, "deferred-handoff-1")
+    await db_module.set_goal(db, p["id"], "ship things")
+    future = "2099-01-01T00:00:00"
+    visible = await db_module.add_sprint_item(db, p["id"], "v1", "Visible task")
+    deferred = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Backburner task", deferred_until=future
+    )
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "Visible task" in content
+    assert "Backburner task" not in content
+    # deferred item id must not appear in the /goal sprint items list
+    assert deferred["id"] not in content
+
+
+@pytest.mark.asyncio
+async def test_handoff_force_include_ids_re_adds_deferred(db, tmp_path):
+    """force_include_ids re-adds a deferred item into the handoff for one call."""
+    p = await db_module.create_project(db, "deferred-handoff-2")
+    await db_module.set_goal(db, p["id"], "ship things")
+    future = "2099-01-01T00:00:00"
+    deferred = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Backburner task", deferred_until=future
+    )
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        force_include_ids=[deferred["id"]],
+    )
+    assert "Backburner task" in content
+    # deferred_until is NOT cleared — the item is still deferred in the DB
+    refetched = await db_module.get_sprint_item(db, deferred["id"])
+    assert refetched["deferred_until"] == future
+
+
+@pytest.mark.asyncio
+async def test_handoff_force_include_ids_does_not_affect_claim_gate(db, tmp_path):
+    """force_include_ids visibility override does not bypass claim_sprint_item deferral gate."""
+    from meridian.db.sprint_items import claim_sprint_item
+    p = await db_module.create_project(db, "deferred-handoff-3")
+    await db_module.set_goal(db, p["id"], "gate test")
+    future = "2099-01-01T00:00:00"
+    deferred = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Deferred task", deferred_until=future
+    )
+    # Generate handoff with force_include_ids — item appears in handoff
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        force_include_ids=[deferred["id"]],
+    )
+    assert "Deferred task" in content
+    # But claiming the item is still blocked
+    result = await claim_sprint_item(db, p["id"], deferred["id"])
+    assert isinstance(result, dict)
+    assert result.get("blocked") is True
+    assert result.get("error") == "DEFERRED"
+
+
+def test_is_deferred_helper():
+    """_is_deferred() returns True for future timestamps and False for past/missing."""
+    from meridian.db.sprint_items import _is_deferred
+
+    assert _is_deferred({"deferred_until": "2099-01-01T00:00:00"}) is True
+    assert _is_deferred({"deferred_until": "2000-01-01T00:00:00"}) is False
+    assert _is_deferred({"deferred_until": None}) is False
+    assert _is_deferred({"deferred_until": ""}) is False
+    assert _is_deferred({"deferred_until": "garbage"}) is False
+    assert _is_deferred({}) is False
+
+
+@pytest.mark.asyncio
+async def test_handoff_force_include_ids_unknown_item_is_ignored(db, tmp_path):
+    """force_include_ids silently ignores unknown or non-pending item ids."""
+    p = await db_module.create_project(db, "deferred-handoff-4")
+    await db_module.set_goal(db, p["id"], "ignore unknowns")
+    visible = await db_module.add_sprint_item(db, p["id"], "v1", "Real task")
+    # Include a made-up id — should not raise, just ignore
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        force_include_ids=["nonexistent-id-00000000"],
+    )
+    assert "Real task" in content
