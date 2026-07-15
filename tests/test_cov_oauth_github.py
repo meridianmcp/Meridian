@@ -202,6 +202,17 @@ async def test_consume_refresh_token_expired_returns_none(db):
 
 @pytest.mark.asyncio
 async def test_consume_refresh_token_bad_expiry_returns_none(db):
+    # On Postgres, oauth_refresh_tokens.expires_at is a TIMESTAMPTZ column, so
+    # inserting a malformed value like "not-a-date" is rejected at the DB level
+    # BEFORE _consume_refresh_token even runs.  The app-level defensive try/except
+    # in _consume_refresh_token guards against corrupted SQLite TEXT rows — an
+    # invariant that Postgres's schema-level type checking already prevents.
+    # Skip this test when the db fixture is backed by Postgres.
+    if hasattr(db, "_pool"):
+        pytest.skip(
+            "Postgres TIMESTAMPTZ column rejects malformed expires_at at INSERT time; "
+            "the bad-expiry code path is unreachable on Postgres by design."
+        )
     rt_hash = oa_mod._oauth_token_hash("rt_meridian_bad")
     await db.execute(
         "INSERT INTO oauth_refresh_tokens (token_hash, tenant_id, client_id, expires_at)"
