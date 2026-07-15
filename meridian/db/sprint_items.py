@@ -824,11 +824,21 @@ async def fan_out_sprint_items(
         except ValueError:
             resources_json = None  # best-effort in bulk insert — skip bad values
         iid = _new_id()
+        # ae87699d — generate slug + nickname on every creation path, not just
+        # add_sprint_item. fan_out_sprint_items was leaving both null.
+        _item_slug = await _unique_sprint_slug(
+            db, project_id, _sprint_item_slug_base(title)
+        )
+        _item_nickname = await _unique_sprint_nickname(
+            db, project_id, _sprint_item_nickname_base(title, iid)
+        )
         await db.execute(
             "INSERT INTO sprint_items "
-            "(id, project_id, version, title, item_group, notes, touches_resources) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (iid, project_id, version, title, group, description, resources_json),
+            "(id, project_id, version, title, item_group, notes, touches_resources, "
+            "slug, nickname) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (iid, project_id, version, title, group, description, resources_json,
+             _item_slug, _item_nickname),
         )
         ids.append(iid)
     if ids:
@@ -1801,12 +1811,21 @@ async def split_sprint_item(
     new_items = []
     for t in titles:
         nid = _new_id()
+        # ae87699d — generate slug + nickname on every creation path, not just
+        # add_sprint_item. split_sprint_item was leaving both null.
+        _item_slug = await _unique_sprint_slug(
+            db, project_id, _sprint_item_slug_base(t)
+        )
+        _item_nickname = await _unique_sprint_nickname(
+            db, project_id, _sprint_item_nickname_base(t, nid)
+        )
         await db.execute(
             "INSERT INTO sprint_items "
-            "(id, project_id, version, title, parent_id, split_from, milestone_type) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'task')",
+            "(id, project_id, version, title, parent_id, split_from, milestone_type, "
+            "slug, nickname) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'task', ?, ?)",
             (nid, project_id, original.get("version", ""), t,
-             original.get("parent_id"), item_id),
+             original.get("parent_id"), item_id, _item_slug, _item_nickname),
         )
         await db.commit()
         new_item = await get_sprint_item(db, nid)
@@ -1844,11 +1863,20 @@ async def merge_sprint_items(
     survivor_id = _new_id()
     version = sources[0].get("version", "")
     merged_from_json = json.dumps(item_ids)
+    # ae87699d — generate slug + nickname on every creation path, not just
+    # add_sprint_item. merge_sprint_items was leaving both null on the survivor.
+    _survivor_slug = await _unique_sprint_slug(
+        db, project_id, _sprint_item_slug_base(new_title)
+    )
+    _survivor_nickname = await _unique_sprint_nickname(
+        db, project_id, _sprint_item_nickname_base(new_title, survivor_id)
+    )
     await db.execute(
         "INSERT INTO sprint_items "
-        "(id, project_id, version, title, merged_from, milestone_type) "
-        "VALUES (?, ?, ?, ?, ?, 'task')",
-        (survivor_id, project_id, version, new_title, merged_from_json),
+        "(id, project_id, version, title, merged_from, milestone_type, slug, nickname) "
+        "VALUES (?, ?, ?, ?, ?, 'task', ?, ?)",
+        (survivor_id, project_id, version, new_title, merged_from_json,
+         _survivor_slug, _survivor_nickname),
     )
     # Close all sources. fa3e3331 — atomic from-state guard: the pre-check
     # loop above is a read-then-write race like every other transition. A

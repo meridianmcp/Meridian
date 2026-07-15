@@ -14806,6 +14806,72 @@ async def test_sprint_item_slug_autopopulated(db):
     assert c["slug"] == "custom-slug"
 
 
+@pytest.mark.asyncio
+async def test_split_sprint_item_generates_slug_and_nickname(db):
+    """ae87699d — split_sprint_item must populate slug+nickname on every new child,
+    not leave them null. Also verifies uniqueness when two children share a title."""
+    p = await db_module.create_project(db, "slug-split")
+    pid = p["id"]
+    orig = await db_module.add_sprint_item(db, pid, "v1", "Original task to split")
+    children = await db_module.split_sprint_item(db, pid, orig["id"], [
+        "Child One Part",
+        "Child Two Part",
+        "Child One Part",  # collision: same slug base, must get -2/-3 suffix
+    ])
+    assert len(children) == 3
+    for child in children:
+        assert child.get("slug"), f"slug missing on split child: {child['id']}"
+        assert child.get("nickname"), f"nickname missing on split child: {child['id']}"
+    slugs = [c["slug"] for c in children]
+    assert len(set(slugs)) == len(slugs), f"slug collision among split children: {slugs}"
+    nicknames = [c["nickname"] for c in children]
+    assert len(set(nicknames)) == len(nicknames), (
+        f"nickname collision among split children: {nicknames}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_sprint_items_generates_slug_and_nickname(db):
+    """ae87699d — merge_sprint_items must populate slug+nickname on the survivor."""
+    p = await db_module.create_project(db, "slug-merge")
+    pid = p["id"]
+    a = await db_module.add_sprint_item(db, pid, "v1", "Alpha work")
+    b = await db_module.add_sprint_item(db, pid, "v1", "Beta work", force=True)
+    survivor = await db_module.merge_sprint_items(db, pid, [a["id"], b["id"]], "Unified work item")
+    assert survivor.get("slug"), "slug missing on merge survivor"
+    assert survivor.get("nickname"), "nickname missing on merge survivor"
+    # slug derives from new_title
+    assert survivor["slug"].startswith("unified"), (
+        f"unexpected slug: {survivor['slug']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_generates_slug_and_nickname(db):
+    """ae87699d — fan_out_sprint_items must populate slug+nickname on every item,
+    not leave them null. Slugs+nicknames must be unique within the batch."""
+    p = await db_module.create_project(db, "slug-fanout")
+    pid = p["id"]
+    specs = [
+        {"title": "Fan Out Task Alpha"},
+        {"title": "Fan Out Task Beta"},
+        {"title": "Fan Out Task Alpha"},  # collision: same title, must get -2 slug suffix
+    ]
+    ids = await db_module.fan_out_sprint_items(db, pid, specs)
+    assert len(ids) == 3
+    items = [await db_module.get_sprint_item(db, iid) for iid in ids]
+    for item in items:
+        assert item is not None
+        assert item.get("slug"), f"slug missing on fan-out item: {item['id']}"
+        assert item.get("nickname"), f"nickname missing on fan-out item: {item['id']}"
+    slugs = [it["slug"] for it in items]
+    assert len(set(slugs)) == len(slugs), f"slug collision among fan-out items: {slugs}"
+    nicknames = [it["nickname"] for it in items]
+    assert len(set(nicknames)) == len(nicknames), (
+        f"nickname collision among fan-out items: {nicknames}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2b93cb59 — live-queue hardening: provisional_complete, 10s cache, tier limits
 # ---------------------------------------------------------------------------
