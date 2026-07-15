@@ -3829,6 +3829,80 @@ async def _handle_tunnel_tools(
     return _MISS
 
 
+async def _tunnel_proxy_outputs_tool(
+    tenant_id: str,
+    bare_name: str,
+    arguments: dict[str, Any],
+) -> Any:
+    """1365e01a — attempt to proxy an outputs tool call through an active tunnel.
+
+    search_outputs and annotate_outputs need a LOCAL filesystem (os.walk + DuckDB).
+    In hosted mode the server can't reach the caller's machine directly, but if the
+    caller is also running ``meridian --tunnel`` with the meridian-outputs-mcp package
+    exposed through any connected slot (e.g. configured as the fs slot's command, or
+    as a custom plugin slot), the tunnel routing cache will contain a prefixed tool
+    entry for it (e.g. ``filesystem__search_outputs``).
+
+    This function scans the live routing cache for any tunnel-registered tool whose
+    bare name (after stripping the ``__`` slot prefix) matches ``bare_name``, then
+    proxies through ``call_tunnel_tool`` using the prefixed name. Returns the plain
+    Python result dict extracted from the MCP content envelope, or ``None`` when no
+    tunnel tool matches (so the caller can fall through to the honest hosted-mode
+    error, preserving the 0dedff91 guard).
+
+    The routing cache is keyed by PREFIXED name (e.g. ``filesystem__search_outputs``);
+    ``call_tunnel_tool`` handles the prefix-strip-and-forward internally. This scan is
+    intentionally slot-agnostic — the user may wire meridian-outputs-mcp to any slot,
+    not just ``fs``. The first matching entry in the cache wins.
+    """
+    from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+
+    if not _tunnel_mod.has_active_tunnel(tenant_id):
+        return None
+
+    # Scan the routing cache for a prefixed tool entry matching __<bare_name>.
+    # The cache is built lazily by list_tunnel_tools; trigger discovery if cold.
+    routes = _tunnel_mod._tunnel_tool_routes.get(tenant_id)  # type: ignore[attr-defined]
+    if not routes:
+        await _tunnel_mod.list_tunnel_tools(tenant_id)
+        routes = _tunnel_mod._tunnel_tool_routes.get(tenant_id)
+    if not routes:
+        return None
+
+    # Find the first prefixed name whose bare part matches the requested tool.
+    suffix = f"__{bare_name}"
+    prefixed = next(
+        (pn for pn in routes if pn == bare_name or pn.endswith(suffix)), None
+    )
+    if prefixed is None:
+        return None
+
+    try:
+        tunnel_result = await _tunnel_mod.call_tunnel_tool(
+            tenant_id, prefixed, arguments,
+        )
+    except Exception:  # noqa: BLE001 — tunnel errors fall through to honest error
+        return None
+
+    if tunnel_result is None:
+        return None
+
+    # call_tunnel_tool returns the MCP ``result`` object: {content: [{type, text}]}.
+    # Extract the first text block and JSON-decode it so callers get a plain dict —
+    # the same shape _handle_outputs_tools returns on the self-hosted path.
+    content = tunnel_result.get("content") if isinstance(tunnel_result, dict) else None
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text") or ""
+                try:
+                    return json.loads(text)
+                except Exception:  # noqa: BLE001 — non-JSON from tunnel returned raw
+                    return {"_tunnel_text": text}
+    # Fallback: return the raw result if the content structure is unexpected.
+    return tunnel_result
+
+
 async def _handle_outputs_tools(
     name: str,
     args: dict[str, Any],
@@ -3837,7 +3911,20 @@ async def _handle_outputs_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: search_outputs + annotate_outputs (9e02e448 / a0e9133e)."""
+    """Dispatch group: search_outputs + annotate_outputs (9e02e448 / a0e9133e).
+
+    1365e01a — tunnel routing: when running in hosted mode (the server cannot reach
+    the caller's local filesystem), these tools first attempt to proxy through an
+    active tunnel. If the caller is running ``meridian --tunnel`` with
+    meridian-outputs-mcp exposed on any connected slot, the tunnel routing cache will
+    contain a prefixed entry for ``search_outputs`` / ``annotate_outputs`` and the
+    call is relayed to the locally-running package. When no tunnel is active or the
+    tunnel doesn't expose these tools, the original honest hosted-mode error is
+    returned unchanged (no regression of the 0dedff91 guard).
+
+    Self-hosted mode (not hosted Meridian): the call runs locally as before, never
+    touching the tunnel layer.
+    """
     if name == "annotate_outputs":
         from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
         outputs_dir = str(args.get("outputs_dir") or "").strip()
@@ -3850,16 +3937,27 @@ async def _handle_outputs_tools(
             raise ValueError("path is required")
         if not note:
             raise ValueError("note is required")
-        # 9e02e448 — local-only annotation, same guard as search_outputs:
-        # hosted Meridian can't reach the caller's machine.
+        # 9e02e448 / 1365e01a — local-only annotation: hosted Meridian can't reach
+        # the caller's machine. BUT if the caller has an active tunnel with
+        # meridian-outputs-mcp connected, proxy through it instead of just erroring.
         if _hosted_mode():
+            tenant_id = (tenant or {}).get("id", "")
+            if tenant_id:
+                _proxied = await _tunnel_proxy_outputs_tool(
+                    tenant_id, "annotate_outputs", dict(args),
+                )
+                if _proxied is not None:
+                    return _proxied
             return {
                 "error": (
                     "annotate_outputs stores annotations in a local DuckDB index "
                     "on YOUR filesystem and cannot run on hosted Meridian. "
-                    "Run Meridian self-hosted."
+                    "Start `meridian --tunnel` with the meridian-outputs package "
+                    "to enable tunnel-routed local outputs indexing, or run "
+                    "Meridian self-hosted."
                 ),
                 "hosted": True,
+                "tunnel_tried": bool(tenant_id),
             }
         return _outputs_indexer.annotate_outputs(
             outputs_dir, path, note, run_params=run_params,
@@ -3873,14 +3971,20 @@ async def _handle_outputs_tools(
             raise ValueError("outputs_dir is required")
         if not query:
             raise ValueError("query is required")
-        # Workspace decision 0dedff91 — outputs_indexer.search_outputs walks
-        # `outputs_dir` off THIS process's own filesystem (os.walk + hash +
-        # DuckDB FTS). On hosted Meridian that's the server, which can never
-        # reach a caller's own machine, so os.walk finds nothing (or silently
-        # mis-resolves a Windows path against the server cwd). Fail honestly
-        # instead — same guard as ingest_document / get_document_structure /
-        # search_code_semantic.
+        # 0dedff91 / 1365e01a — outputs_indexer.search_outputs walks `outputs_dir`
+        # off THIS process's own filesystem (os.walk + hash + DuckDB FTS). On hosted
+        # Meridian that's the server, which can never reach a caller's own machine.
+        # Before returning the honest error, attempt tunnel-routing: if the caller has
+        # an active tunnel with meridian-outputs-mcp exposed on any connected slot,
+        # proxy the call to the locally-running package — same class as d659200c.
         if _hosted_mode():
+            tenant_id = (tenant or {}).get("id", "")
+            if tenant_id:
+                _proxied = await _tunnel_proxy_outputs_tool(
+                    tenant_id, "search_outputs", dict(args),
+                )
+                if _proxied is not None:
+                    return _proxied
             return {
                 "outputs_dir": outputs_dir,
                 "query": query,
@@ -3889,11 +3993,12 @@ async def _handle_outputs_tools(
                 "error": (
                     "search_outputs walks a directory on YOUR local filesystem "
                     "and cannot run on hosted Meridian -- the server has no "
-                    "access to your machine. Run Meridian self-hosted, or use "
-                    "the tunnel-routed local file/search tools, which proxy to "
-                    "your machine."
+                    "access to your machine. Start `meridian --tunnel` with the "
+                    "meridian-outputs package to enable tunnel-routed local "
+                    "outputs indexing, or run Meridian self-hosted."
                 ),
                 "hosted": True,
+                "tunnel_tried": bool(tenant_id),
             }
         limit = args.get("limit", 10)
         try:
