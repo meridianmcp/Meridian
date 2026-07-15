@@ -390,6 +390,32 @@ def event_loop_policy():
     return asyncio.DefaultEventLoopPolicy()
 
 
+@pytest.fixture(autouse=True)
+def _reset_graph_searcher_resolver():
+    """94c26322 fallout — ``handoff._GRAPH_SEARCHER_RESOLVER`` is process-global
+    mutable state, registered by the FastAPI lifespan (via the ``client``
+    fixture) bound to THAT test's own db/tmp_path. With nothing to reset it,
+    it leaks to every subsequent test in the same xdist worker — including
+    plain ``db``-only tests that never touch ``client`` — regardless of test
+    file. A later test's ``generate_handoff`` call then invokes the stale
+    resolver against a closed db / unrelated project_id, raising, which
+    ``_annotate_code_pointers`` catches as ``prospect_status="error"``.
+
+    That used to be harmless (prospect_status was purely informational). Since
+    94c26322 wired prospect_status into a real content-filtering gate in
+    ``_build_quick_start_goal``, the stale-resolver leak now actively removes
+    expected content from generate_handoff output — order-dependent under
+    ``--dist=worksteal``, which is why this reproduced in CI but not always
+    locally. Reset to the documented default (None = no-op enrichment) before
+    AND after every test so no test can leak a resolver into another.
+    """
+    from meridian import handoff as _handoff_mod
+
+    _handoff_mod.set_graph_searcher_resolver(None)
+    yield
+    _handoff_mod.set_graph_searcher_resolver(None)
+
+
 @pytest_asyncio.fixture
 async def db():
     """Meridian's schema on the active backend, isolated per test.
