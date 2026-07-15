@@ -58,7 +58,11 @@ def _make_item(
 
 
 def _run(coro: Any) -> Any:
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run() (not get_event_loop().run_until_complete()) — the latter can
+    # return a stale/closed loop when this file shares an xdist worker process
+    # with other pytest-asyncio-managed test files, leaving dangling
+    # "coroutine was never awaited" warnings to surface in unrelated tests.
+    return asyncio.run(coro)
 
 
 async def _make_db() -> Any:
