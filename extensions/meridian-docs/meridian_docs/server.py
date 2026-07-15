@@ -152,19 +152,23 @@ def ingest_local_document_structure(
     title: str | None = None,
     source: str | None = None,
     index_db_path: str | None = None,
+    force_hosted: bool = False,
 ) -> dict[str, Any]:
-    """db42acce/c39ae092 — parse a local .docx's structural content and persist it.
+    """db42acce/c39ae092/f8c7ffdc — parse a local .docx's structural content and persist it.
 
-    TWO PATHS:
+    TWO PATHS — hosted routing is OPT-IN (f8c7ffdc):
 
-    1. LOCAL SIDECAR (c39ae092, preferred) — supply ``index_db_path`` to store
+    1. LOCAL SIDECAR (DEFAULT, no network) — supply ``index_db_path`` to store
        headings/figures/tables into a local SQLite sidecar (same DB used by
        ``index_document`` / ``search_paragraphs``).  NO network call — immune to
-       Cloudflare 403 blocks that affect the hosted POST path.
+       Cloudflare 403 blocks and the 100 KB hosted body cap.
 
-    2. HOSTED POST (db42acce, legacy fallback) — when ``index_db_path`` is
-       omitted, blocks are forwarded to the hosted ``ingest_document_structure``
-       MCP tool.  Subject to Cloudflare 403 on blocked IPs.
+    2. HOSTED POST (explicit opt-in only) — when ``index_db_path`` is omitted
+       AND ``force_hosted=True`` is set, blocks are forwarded to the hosted
+       ``ingest_document_structure`` MCP tool.  Subject to Cloudflare 403 on
+       blocked IPs and a 100 KB body cap.  If ``index_db_path`` is None and
+       ``force_hosted`` is False (the default), an error is raised — the hosted
+       path is NEVER the silent default.
 
     The structural complement to ``ingest_local_document``.  Where that tool can
     only forward plain text (populating the flat note store), this tool parses
@@ -181,8 +185,11 @@ def ingest_local_document_structure(
       project_id:     Meridian project UUID (used only on hosted path).
       title:          Document title (optional).
       source:         Source key (defaults to ``path``).
-      index_db_path:  Path to the local sidecar SQLite index (enables local
-                      storage path — no network call).
+      index_db_path:  Path to the local sidecar SQLite index (recommended —
+                      enables local storage path, no network call).
+      force_hosted:   Set True to explicitly use the hosted POST path when
+                      index_db_path is None.  Default False — hosted routing is
+                      never the silent default.
 
     Returns (local path):  ``{index_db, source, heading_count, figure_count,
                               table_count, local_path}``.
@@ -195,6 +202,7 @@ def ingest_local_document_structure(
         title=title,
         source=source,
         index_db_path=index_db_path,
+        force_hosted=force_hosted,
     )
 
 
