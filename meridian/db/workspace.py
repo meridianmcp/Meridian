@@ -733,7 +733,8 @@ async def get_workspace_settings(
         "log_task_sprint_nudge_threshold, handoff_template, "
         "execution_mode_default, code_intel_enabled_default, "
         "loop_enabled_default, auto_refresh_enabled, refresh_interval_turns, "
-        "refresh_triggers, handoff_inline_pointers, updated_at "
+        "refresh_triggers, handoff_inline_pointers, "
+        "active_session_warning_minutes, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -772,6 +773,10 @@ async def get_workspace_settings(
     # 36fea6ca — inline-resolved-pointers toggle. Missing column/row ⇒ True
     # (default on); a stored 0 keeps pointers DB-only in the handoff.
     _inline_ptrs = data.get("handoff_inline_pointers")
+    # 6e0e5cea — configurable active-session warning window. NULL/missing ⇒
+    # 10 minutes (matches the previous hardcoded constant). Minimum 1 minute.
+    _asw_mins_raw = data.get("active_session_warning_minutes")
+    _active_session_warning_minutes = max(1, int(_asw_mins_raw)) if _asw_mins_raw is not None else 10
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -787,6 +792,7 @@ async def get_workspace_settings(
         "refresh_interval_turns": (int(_interval) if _interval is not None else 10) or 10,
         "refresh_triggers": _refresh_triggers,
         "handoff_inline_pointers": (True if _inline_ptrs is None else bool(_inline_ptrs)),
+        "active_session_warning_minutes": _active_session_warning_minutes,
         "updated_at": data.get("updated_at"),
     }
 
@@ -806,6 +812,7 @@ async def update_workspace_settings(
     refresh_interval_turns: int | None = None,
     refresh_triggers: "list[str] | str | None" = None,
     handoff_inline_pointers: "bool | int | str | None" = None,
+    active_session_warning_minutes: int | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -881,6 +888,11 @@ async def update_workspace_settings(
         params.append(
             1 if handoff_inline_pointers and handoff_inline_pointers not in ("0", "false", "False") else 0
         )
+    if active_session_warning_minutes is not None:
+        # 6e0e5cea — configurable active-session warning window (minutes).
+        # Minimum 1 minute; 0 or negative values are clamped to 1.
+        updates.append("active_session_warning_minutes = ?")
+        params.append(max(1, int(active_session_warning_minutes)))
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

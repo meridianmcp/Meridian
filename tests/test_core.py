@@ -5023,6 +5023,74 @@ async def test_workspace_settings_refresh_config_roundtrip(db):
 
 
 # ---------------------------------------------------------------------------
+# 6e0e5cea — configurable active_session_warning_minutes workspace setting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_active_session_warning_minutes_default(db):
+    """active_session_warning_minutes defaults to 10 (matching the old constant)."""
+    ws = await db_module.get_workspace_settings(db)
+    assert ws["active_session_warning_minutes"] == 10
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_active_session_warning_minutes_roundtrip(db):
+    """active_session_warning_minutes can be set and re-read."""
+    ws = await db_module.update_workspace_settings(db, active_session_warning_minutes=30)
+    assert ws["active_session_warning_minutes"] == 30
+    ws2 = await db_module.get_workspace_settings(db)
+    assert ws2["active_session_warning_minutes"] == 30
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_active_session_warning_minutes_clamped(db):
+    """Values <= 0 are clamped to 1 minute minimum."""
+    ws = await db_module.update_workspace_settings(db, active_session_warning_minutes=0)
+    assert ws["active_session_warning_minutes"] == 1
+    ws2 = await db_module.update_workspace_settings(db, active_session_warning_minutes=-5)
+    assert ws2["active_session_warning_minutes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_active_executor_session_warnings_respects_configured_threshold(db):
+    """_active_executor_session_warnings uses workspace active_session_warning_minutes.
+
+    When the threshold is reduced to 1 minute, a session that was last seen
+    ~2 minutes ago should NOT trigger a warning (it falls outside the window).
+    When the threshold is 10 minutes (default), the same session IS in-window.
+    """
+    from datetime import datetime, timezone, timedelta
+    from meridian.mcp.handler import _active_executor_session_warnings
+
+    p = await db_module.create_project(db, "asw-threshold-test")
+    pid = p["id"]
+    # Register a session then backdate its last_seen to 90 seconds ago.
+    sess = await db_module.register_session(db, pid, "backdate-executor")
+    past = (datetime.now(timezone.utc) - timedelta(seconds=90)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    await db.execute(
+        "UPDATE sessions SET last_seen = ? WHERE id = ?", (past, sess["id"])
+    )
+    await db.commit()
+
+    # With default threshold (10 min = 600 s), 90 s ago is within window.
+    warns_default = await _active_executor_session_warnings(db, pid)
+    assert warns_default, "Expected warning at default 10-minute threshold"
+
+    # Set threshold to 1 minute (60 s); 90 s is now outside the window.
+    await db_module.update_workspace_settings(db, active_session_warning_minutes=1)
+    warns_narrow = await _active_executor_session_warnings(db, pid)
+    assert not warns_narrow, "Expected no warning with 1-minute threshold (session 90 s old)"
+
+    # Widen to 5 minutes (300 s); 90 s is back inside.
+    await db_module.update_workspace_settings(db, active_session_warning_minutes=5)
+    warns_wide = await _active_executor_session_warnings(db, pid)
+    assert warns_wide, "Expected warning restored at 5-minute threshold"
+
+
+# ---------------------------------------------------------------------------
 # 637dd900 — workspace layer tenant isolation
 # ---------------------------------------------------------------------------
 
@@ -7380,10 +7448,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_file_docx_region_claims",
         "_migrate_pg_connection_events",
         "_migrate_pg_sprint_version_descriptions",
+        "_migrate_pg_workspace_settings_active_session_threshold",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 103
+    assert len(allnames) == len(set(allnames)) == 104
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

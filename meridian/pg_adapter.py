@@ -2529,6 +2529,23 @@ async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> N
     )
 
 
+async def _migrate_pg_workspace_settings_active_session_threshold(
+    conn: PostgresConnection,
+) -> None:
+    """6e0e5cea — configurable active-executor-session warning threshold.
+
+    Adds ``active_session_warning_minutes`` to workspace_settings on existing
+    Postgres DBs. Default 10 matches the previously hardcoded 600-second constant
+    used by _active_executor_session_warnings in handler.py.
+
+    Mirrors db.migrations._migrate_workspace_settings_active_session_threshold.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "active_session_warning_minutes INTEGER NOT NULL DEFAULT 10"
+    )
+
+
 # ── Migration registry ──────────────────────────────────────────────────────
 # Ordered tuples consumed by _run_pg_migrations (see init_pg_db). Order is
 # load-bearing and matches the historical call sequence exactly. Defined at
@@ -3069,4 +3086,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_file_docx_region_claims,
     _migrate_pg_connection_events,
     _migrate_pg_sprint_version_descriptions,
+    _migrate_pg_workspace_settings_active_session_threshold,
 )

@@ -1054,6 +1054,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_connection_events(db)
     await _migrate_redis_overage_fields(db)
     await _migrate_sprint_version_descriptions(db)
+    await _migrate_workspace_settings_active_session_threshold(db)
     return db
 
 

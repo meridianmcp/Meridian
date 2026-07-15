@@ -1621,17 +1621,35 @@ async def _persist_prospected_pointer(
         return None
 
 
-async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
-    """fd86aacc — names of executor sessions seen active in the last 10 minutes.
+async def _active_executor_session_warnings(
+    db: Any,
+    project_id: str,
+    threshold_minutes: int | None = None,
+) -> list[str]:
+    """fd86aacc — names of executor sessions seen active within the threshold.
 
     Used to warn when sprint items are added/fanned-out while executors are
     mid-run, so a board change isn't silently injected behind their back.
     Best-effort: any error yields an empty list. (586eeda9 — shared by
     add_sprint_item + fan_out_sprint_items.)
+
+    6e0e5cea — ``threshold_minutes`` is configurable via workspace settings
+    (``active_session_warning_minutes``); when not supplied it is read from
+    the workspace settings row (default 10, matching the old hardcoded 600 s).
     """
     warnings: list[str] = []
     try:
         from datetime import datetime, timezone as _tz
+        # 6e0e5cea — resolve threshold: explicit arg wins; otherwise read from
+        # workspace settings so the user-configurable value is always honoured.
+        _thresh_mins = threshold_minutes
+        if _thresh_mins is None:
+            try:
+                _ws = await db_module.get_workspace_settings(db)
+                _thresh_mins = _ws.get("active_session_warning_minutes", 10) or 10
+            except Exception:  # noqa: BLE001 — best-effort; fall back to default
+                _thresh_mins = 10
+        _threshold_seconds = max(60, int(_thresh_mins) * 60)
         _now = datetime.now(_tz.utc)
         for _sess in await db_module.get_sessions(db, project_id):
             _ls = _sess.get("last_seen")
@@ -1641,7 +1659,7 @@ async def _active_executor_session_warnings(db: Any, project_id: str) -> list[st
                 _dt = datetime.fromisoformat(str(_ls).replace("Z", "+00:00"))
                 if _dt.tzinfo is None:
                     _dt = _dt.replace(tzinfo=_tz.utc)
-                if (_now - _dt).total_seconds() < 600:
+                if (_now - _dt).total_seconds() < _threshold_seconds:
                     warnings.append(
                         f"session '{_sess.get('name', _sess.get('id', '?'))}' is active"
                     )
