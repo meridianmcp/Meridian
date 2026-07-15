@@ -45,6 +45,11 @@ import pytest
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MERIDIAN = os.path.join(_REPO_ROOT, "meridian")
 _HANDLER = os.path.join(_MERIDIAN, "mcp", "handler.py")
+# Dispatch-table extractions (81abd31f/ba4f879b/ac4df52f) moved some tools'
+# ``if name == "tool":`` branches out of handler.py into standalone
+# ``handle_<tool>`` functions here, looked up via a dict instead of an
+# if/elif chain. The scan below must cover both shapes.
+_HANDLERS_DIR = os.path.join(_MERIDIAN, "mcp", "handlers")
 
 # Local-filesystem "sink" operations. A dispatch branch (or a delegate it calls)
 # that invokes ANY of these on a value derived from the caller's ``args`` is
@@ -136,6 +141,28 @@ def _iter_dispatch_branches(tree: ast.AST):
                 yield tool, node
 
 
+def _iter_extracted_handler_functions():
+    """Yield (tool_name, function_node) for every top-level ``handle_<tool>``
+    function in the extracted meridian/mcp/handlers/*.py modules.
+
+    These are the dict-dispatch replacement for the old ``if name == "tool":``
+    branches (a purely mechanical extraction -- same tool names, per the
+    extraction docstrings in handler.py), so a ``handle_<tool>`` function IS
+    that tool's dispatch branch now; it gets the same sink/guard scan.
+    """
+    if not os.path.isdir(_HANDLERS_DIR):
+        return
+    for fname in sorted(os.listdir(_HANDLERS_DIR)):
+        if not fname.endswith(".py") or fname == "__init__.py":
+            continue
+        tree = ast.parse(_read(os.path.join(_HANDLERS_DIR, fname)))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
+                "handle_"
+            ):
+                yield node.name[len("handle_"):], node
+
+
 def _delegate_targets(branch: ast.If) -> set[str]:
     """Names of module.function delegates called in the branch, e.g.
     ``_code_index.search_code_semantic`` handed a caller path off to a module
@@ -171,24 +198,23 @@ def _delegate_function_guarded(delegate: str) -> bool | None:
 
 def _collect_violations() -> list[str]:
     """Return a list of human-readable violation strings (empty == compliant)."""
-    src = _read(_HANDLER)
-    tree = ast.parse(src)
     violations: list[str] = []
     # Some tool names recur across dispatch groups (nested github block reuses
-    # the `if name == "..."` form). Dedupe by (tool, lineno) — each physical
-    # branch is checked once.
-    seen: set[tuple[str, int]] = set()
-    for tool, branch in _iter_dispatch_branches(tree):
-        key = (tool, branch.lineno)
+    # the `if name == "..."` form). Dedupe by (tool, where) — each physical
+    # branch/function is checked once.
+    seen: set[tuple[str, str]] = set()
+
+    def _check(tool: str, branch: ast.AST, where: str) -> None:
+        key = (tool, where)
         if key in seen:
-            continue
+            return
         seen.add(key)
 
         # Only branches that actually reference the caller's args are candidates
         # (every real dispatch branch does; this just skips structural noise).
         branch_src = ast.dump(branch)
         if "args" not in branch_src:
-            continue
+            return
 
         branch_has_sink = _has_fs_sink(branch)
 
@@ -207,14 +233,13 @@ def _collect_violations() -> list[str]:
         if not branch_has_sink and not delegate_sink:
             # This tool never touches the local filesystem (e.g. read_file /
             # patch_file go through the GitHub API). Nothing to enforce.
-            continue
+            return
 
         # A local-FS tool. It is compliant iff a guard is reachable either in its
         # own dispatch branch or inside the delegate that owns the sink.
         if _has_guard(branch) or delegate_guarded:
-            continue
+            return
 
-        where = f"handler.py:{branch.lineno}"
         detail = "inline sink" if branch_has_sink else "delegate sink"
         violations.append(
             f"MCP tool {tool!r} ({where}, {detail}) reaches a caller's local "
@@ -224,6 +249,14 @@ def _collect_violations() -> list[str]:
             f"hosted Meridian instead of mis-resolving the path against the "
             f"server's own filesystem."
         )
+
+    tree = ast.parse(_read(_HANDLER))
+    for tool, branch in _iter_dispatch_branches(tree):
+        _check(tool, branch, f"handler.py:{branch.lineno}")
+
+    for tool, func_node in _iter_extracted_handler_functions():
+        _check(tool, func_node, f"handlers/{tool}:{func_node.lineno}")
+
     return violations
 
 
@@ -318,7 +351,11 @@ def test_known_local_fs_tools_are_recognized_and_guarded(tool):
     src = _read(_HANDLER)
     tree = ast.parse(src)
     branches = {t: b for t, b in _iter_dispatch_branches(tree)}
-    assert tool in branches, f"dispatch branch for {tool!r} not found in handler.py"
+    branches.update({t: n for t, n in _iter_extracted_handler_functions()})
+    assert tool in branches, (
+        f"dispatch branch for {tool!r} not found in handler.py or "
+        f"meridian/mcp/handlers/*.py"
+    )
     branch = branches[tool]
 
     delegate_guarded = False

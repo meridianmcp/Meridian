@@ -27,7 +27,21 @@ from typing import Any
 
 import meridian.server as _server
 from meridian import db as db_module
-from meridian._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
+from meridian._deps import validate_input_size, _MANUAL_NOTE_LINT
+
+
+def _hosted_mode() -> bool:
+    """Deferred proxy to meridian.mcp.handler._hosted_mode.
+
+    Tests monkeypatch ``meridian.mcp.handler._hosted_mode`` (that was the
+    binding these tools used before the ac4df52f extraction). A direct
+    ``from meridian._deps import _hosted_mode`` here would bind a separate,
+    un-patchable reference, silently breaking hosted-mode guards that tests
+    rely on. Importing the handler module lazily at call time (not at
+    module load) keeps this correct without introducing a circular import.
+    """
+    from meridian.mcp import handler as _handler_mod  # noqa: PLC0415
+    return _handler_mod._hosted_mode()
 
 
 # ---------------------------------------------------------------------------
