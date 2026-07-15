@@ -2590,46 +2590,195 @@ async def get_parallelizable_groups(
     }
 
 
+def _topo_depth_map(items: list[dict[str, Any]]) -> dict[str, int]:
+    """Compute topological depth for each item in ``items`` by dependency.
+
+    Returns a ``{item_id: depth}`` mapping where depth 0 means "no in-set
+    dependency" and depth N means "depends on something at depth N-1". Mirrors
+    the logic in ``meridian.handoff._partition_into_waves`` but returns a plain
+    dict rather than a grouped list so callers can layer additional coloring on
+    top. Cycles are broken by treating the back-edge target as depth 0.
+
+    NOTE: This helper is intentionally self-contained in sprint_items.py because
+    meridian.handoff imports meridian.db, making a reverse import a circular
+    dependency. Keep in sync with handoff._partition_into_waves (3726cf70).
+    """
+    by_id = {it["id"]: it for it in items if it.get("id")}
+    wave_of: dict[str, int] = {}
+
+    def _depth(iid: str, seen: set[str]) -> int:
+        if iid in wave_of:
+            return wave_of[iid]
+        if iid in seen:  # dependency cycle — treat as a root
+            return 0
+        seen.add(iid)
+        it = by_id.get(iid)
+        dep = it.get("depends_on") if it else None
+        depth = (_depth(dep, seen) + 1) if (dep and dep in by_id) else 0
+        wave_of[iid] = depth
+        return depth
+
+    for iid in by_id:
+        _depth(iid, set())
+    return wave_of
+
+
 async def assign_sprint_waves(
     db: aiosqlite.Connection,
     project_id: str,
     version: str | None = None,
 ) -> dict[str, Any]:
-    """58a45b92 — persist the parallelizable grouping as a STORED, editable wave label.
+    """58a45b92 / 90955d26 — persist a full topological + conflict-free wave plan.
 
-    :func:`get_parallelizable_groups` recomputes conflict-free batches on every
-    call; this writes that plan onto each eligible item's ``wave`` column (group i →
-    ``'wave-{i+1}'``) so parallelism is deterministic and inspectable (get_sprint_items
-    surfaces ``wave``) instead of recomputed each time. An operator can then override
-    any item by hand via ``update_sprint_item(wave=...)``.
+    Previous behaviour (:func:`get_parallelizable_groups`) did a single flat pass:
+    only dependency-satisfied items were labelled; ``depends_on``-blocked items
+    were dropped into ``blocked`` and left with ``wave=NULL``.  This meant a
+    planner could never see the projected execution order for items that sit behind
+    an unfinished parent — they simply had no wave.
 
-    Only currently-ELIGIBLE items (pending/todo, dependency-satisfied, unclaimed,
-    non-manual-blocker) are labelled — the same set get_parallelizable_groups fans
-    out. Blocked / in-flight / done items are left untouched (re-run once they clear).
-    Idempotent: re-running recomputes from the live board and rewrites the labels.
+    New behaviour: project ALL pending/todo non-manual items forward through the
+    dependency graph using a two-pass algorithm:
+
+    Pass 1 — topological depth (``_topo_depth_map``):
+        Items are grouped into layers 0, 1, 2, … by how many hops separate them
+        from a root (no in-set dependency).  Layer 0 runs first; layer 1 can start
+        only after layer 0 completes; and so on.  This is the same algorithm used
+        by ``_partition_into_waves`` in ``handoff.py`` for /goal rendering.
+
+    Pass 2 — resource-conflict coloring within each layer:
+        Within a topological layer, items that share a ``touches_resources`` value
+        cannot co-schedule.  Greedy first-fit coloring (the same algorithm as
+        ``get_parallelizable_groups``) splits each layer into one or more sub-waves.
+
+    The two passes are combined: all sub-waves from layer 0 are numbered first
+    (wave-1, wave-2, …), then layer 1's sub-waves continue the numbering, and so
+    on.  The result is a monotonically numbered, globally consistent wave plan
+    where an item's wave label unambiguously encodes both its dependency position
+    AND its resource-conflict position.
+
+    Blocked (dependency-pending) items now receive a future-wave label rather than
+    ``NULL``, so ``get_sprint_items`` can surface the full execution plan even
+    before the earlier layers have completed.
+
+    Only pending/todo, non-manual-blocker items are labelled — done/failed/skipped/
+    in_progress items are left untouched.  Idempotent: re-running recomputes from
+    the live board and rewrites the labels.
 
     Returns ``{version, wave_count, assigned, waves: {'wave-1': [ids...], ...},
-    blocked_count, undeclared_count}``.
+    blocked_count, undeclared_count}``.  ``blocked_count`` now counts items whose
+    dependency is not yet DONE (they are still projected into a future wave, not
+    truly dropped).
     """
-    plan = await get_parallelizable_groups(db, project_id, version=version)
+    # ── Collect all eligible pending/todo non-manual items ─────────────────────
+    items = await get_sprint_items(db, project_id, include_manual_blocker=False)
+    items = [it for it in items if not _is_manual_sprint_item(it)]
+    if version is not None:
+        items = [it for it in items if it.get("version") == version]
+    claimable_statuses = {"pending", "todo"}
+    # Only label pending/todo items that are not already in-flight or done.
+    # In-progress items are mid-execution and must not be relabelled mid-run.
+    candidates = [
+        it for it in items
+        if (it.get("status") or "pending") in claimable_statuses
+    ]
+
+    # ── Pass 1: topological depth ───────────────────────────────────────────────
+    depth_map = _topo_depth_map(candidates)
+    if not depth_map:
+        return {
+            "version": version,
+            "wave_count": 0,
+            "assigned": 0,
+            "waves": {},
+            "blocked_count": 0,
+            "undeclared_count": 0,
+        }
+
+    max_topo = max(depth_map.values())
+    # Group candidates by their topological depth preserving input order (which
+    # inherits the DB insertion order — stable for idempotency).
+    topo_layers: list[list[dict[str, Any]]] = [[] for _ in range(max_topo + 1)]
+    for it in candidates:
+        iid = it.get("id")
+        if iid in depth_map:
+            topo_layers[depth_map[iid]].append(it)
+
+    # ── Pass 2: resource-conflict coloring within each topological layer ─────────
+    # Sort each layer highest-priority-first (e08fee30), then insertion order.
+    def _priority_key(it: dict[str, Any]) -> tuple[int, str, str]:
+        return (
+            _SPRINT_PRIORITY_RANK.get(
+                it.get("priority") or "normal", _SPRINT_PRIORITY_DEFAULT_RANK
+            ),
+            str(it.get("added_at") or ""),
+            it.get("id") or "",
+        )
+
+    wave_counter = 0
     waves: dict[str, list[str]] = {}
     assigned = 0
-    for gi, group in enumerate(plan.get("groups") or []):
-        label = f"wave-{gi + 1}"
-        ids: list[str] = []
-        for item in group:
-            await patch_sprint_item(db, project_id, item["id"], wave=label)
-            ids.append(item["id"])
-            assigned += 1
-        if ids:
-            waves[label] = ids
+    undeclared_count = 0
+
+    for layer in topo_layers:
+        if not layer:
+            continue
+        layer.sort(key=_priority_key)
+        # Attach parsed resources for conflict detection.
+        enriched = [
+            {**it, "resources": parse_touches_resources(it.get("touches_resources"))}
+            for it in layer
+        ]
+        declared = [it for it in enriched if it["resources"]]
+        undeclared_items = [it for it in enriched if not it["resources"]]
+        undeclared_count += len(undeclared_items)
+
+        # Greedy first-fit coloring on declared items (same as get_parallelizable_groups).
+        sub_groups: list[list[dict[str, Any]]] = []
+        sub_resource_sets: list[set[str]] = []
+        for it in declared:
+            res = set(it["resources"])
+            placed = False
+            for gi, used in enumerate(sub_resource_sets):
+                if not _resource_sets_conflict(res, used):
+                    sub_groups[gi].append(it)
+                    used.update(res)
+                    placed = True
+                    break
+            if not placed:
+                sub_groups.append([it])
+                sub_resource_sets.append(set(res))
+        # Each undeclared item is its own sequential sub-wave (never co-scheduled).
+        for it in undeclared_items:
+            sub_groups.append([it])
+
+        # Assign wave labels continuing from the previous topological layer's count.
+        for sub_group in sub_groups:
+            wave_counter += 1
+            label = f"wave-{wave_counter}"
+            ids: list[str] = []
+            for it in sub_group:
+                await patch_sprint_item(db, project_id, it["id"], wave=label)
+                ids.append(it["id"])
+                assigned += 1
+            if ids:
+                waves[label] = ids
+
+    # Count items whose depends_on is not yet satisfied (informational only — they
+    # now receive a projected future-wave label rather than being dropped).
+    by_id_status = {it["id"]: it.get("status") for it in items}
+    blocked_count = 0
+    for it in candidates:
+        dep = it.get("depends_on")
+        if dep and by_id_status.get(dep) not in (None, "done"):
+            blocked_count += 1
+
     return {
         "version": version,
         "wave_count": len(waves),
         "assigned": assigned,
         "waves": waves,
-        "blocked_count": len(plan.get("blocked") or []),
-        "undeclared_count": plan.get("undeclared_count", 0),
+        "blocked_count": blocked_count,
+        "undeclared_count": undeclared_count,
     }
 
 
