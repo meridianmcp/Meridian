@@ -343,10 +343,17 @@ def test_build_graph_searcher_none_without_tunnel():
 
 def test_build_graph_searcher_queries_code_intel_slot(monkeypatch):
     """4cfaecc2 — with a tunnel, the searcher issues search_graph over the tunnel
-    and unwraps the MCP text envelope into the raw match payload."""
+    and unwraps the MCP text envelope into the raw match payload.
+
+    51bdacc0 — the routes cache is keyed by the PREFIXED tool name
+    (codebase__search_graph) as list_tunnel_tools populates it; build_graph_searcher
+    must pass the prefixed name or call_tunnel_tool returns None and the graph rung
+    never runs.
+    """
     tn._tunnel_sockets["t1"] = object()
     tn._tunnel_code_sockets["t1"] = object()
-    tn._tunnel_tool_routes["t1"] = {"search_graph": "code"}
+    # Use the prefixed name — this is what list_tunnel_tools actually stores.
+    tn._tunnel_tool_routes["t1"] = {"codebase__search_graph": "code"}
     seen = {}
 
     def responder(label, method, params):
@@ -358,6 +365,7 @@ def test_build_graph_searcher_queries_code_intel_slot(monkeypatch):
     searcher = tn.build_graph_searcher("t1")
     assert searcher is not None
     matches = asyncio.run(searcher("some query"))
+    # call_tunnel_tool strips the prefix before forwarding, so the bare name is sent
     assert seen["params"]["name"] == "search_graph"
     assert matches["results"][0]["file"] == "x.py"
 
@@ -373,6 +381,38 @@ def test_build_graph_searcher_swallows_tunnel_errors(monkeypatch):
     searcher = tn.build_graph_searcher("t1")
     assert searcher is not None
     assert asyncio.run(searcher("q")) is None
+
+
+def test_build_graph_searcher_uses_prefixed_name(monkeypatch):
+    """51bdacc0 — build_graph_searcher must pass the PREFIXED tool name
+    (codebase__search_graph) to call_tunnel_tool so the routes cache lookup
+    succeeds.  list_tunnel_tools stores prefixed names; passing the bare
+    'search_graph' always returns None (cold-cache discover also finds only the
+    prefixed name) and the graph rung of prospect_symbol never fires."""
+    tn._tunnel_sockets["t1-prefix"] = object()
+    tn._tunnel_code_sockets["t1-prefix"] = object()
+    # Simulate the routes cache as list_tunnel_tools would populate it.
+    tn._tunnel_tool_routes["t1-prefix"] = {"codebase__search_graph": "code"}
+    seen_name: list[str] = []
+
+    async def fake_call_tunnel(tid, name, args, **kw):
+        seen_name.append(name)
+        payload = {"results": [{"file": "y.py", "name": "bar"}]}
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+
+    monkeypatch.setattr(tn, "call_tunnel_tool", fake_call_tunnel)
+    searcher = tn.build_graph_searcher("t1-prefix")
+    assert searcher is not None
+    result = asyncio.run(searcher("bar_func"))
+    # The prefixed name must be passed so the routes cache resolves it.
+    assert seen_name == ["codebase__search_graph"], (
+        f"build_graph_searcher passed {seen_name!r} instead of ['codebase__search_graph']; "
+        "bare 'search_graph' is never in the routes cache and causes silent None return"
+    )
+    assert result is not None
+    tn._tunnel_sockets.pop("t1-prefix", None)
+    tn._tunnel_code_sockets.pop("t1-prefix", None)
+    tn._tunnel_tool_routes.pop("t1-prefix", None)
 
 
 def test_call_tunnel_tool_strips_prefix_before_forward(monkeypatch):
