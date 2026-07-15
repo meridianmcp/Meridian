@@ -500,6 +500,10 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
             pass
 
     _tunnel_code_sockets[tenant_id] = ws
+    # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
+    # instance that misses can Fly-replay to us (no-op off Fly). af5b5739 wired
+    # this only for the FS slot (tunnel_ws); this is the equivalent for code.
+    owner_instance = record_tenant_owner_instance(tenant_id)
     _log.info("tunnel-code: tenant %s connected", tenant_id[:8])
 
     try:
@@ -537,6 +541,8 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
     finally:
         _tunnel_code_sockets.pop(tenant_id, None)
         _clear_slot_health(tenant_id, "code")
+        # af5b5739 / 5f02a21c — release ownership only if still ours.
+        clear_tenant_owner_instance(tenant_id, owner_instance)
         for fut in list(_pending_code_reqs.values()):
             if not fut.done():
                 fut.cancel()
@@ -581,6 +587,10 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
             pass
 
     _tunnel_extract_sockets[tenant_id] = ws
+    # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
+    # instance that misses an extract request can Fly-replay to us (no-op off
+    # Fly). af5b5739 wired this only for the FS slot; this is the extract fix.
+    owner_instance = record_tenant_owner_instance(tenant_id)
     _log.info("tunnel-extract: tenant %s connected", tenant_id[:8])
 
     try:
@@ -618,6 +628,8 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
     finally:
         _tunnel_extract_sockets.pop(tenant_id, None)
         _clear_slot_health(tenant_id, "extract")
+        # af5b5739 / 5f02a21c — release ownership only if still ours.
+        clear_tenant_owner_instance(tenant_id, owner_instance)
         for fut in list(_pending_extract_reqs.values()):
             if not fut.done():
                 fut.cancel()
@@ -674,6 +686,11 @@ async def _serve_tunnel_ws(
     # 4331f9cd — a (re)connect may change the slot's tool set; drop the cached
     # routes so the next tools/list rebuilds them for this tenant.
     _tunnel_tool_routes.pop(tenant_id, None)
+    # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
+    # instance that gets a request for this slot can Fly-replay to us. af5b5739
+    # only wired this for the FS slot (tunnel_ws); _serve_tunnel_ws covers ppt,
+    # word, dc, docs, zotero, and custom slots (p0-p3).
+    owner_instance = record_tenant_owner_instance(tenant_id)
     _log.info("tunnel-%s: tenant %s connected", label, tenant_id[:8])
 
     try:
@@ -718,6 +735,8 @@ async def _serve_tunnel_ws(
         # next tools/list rebuilds cleanly.
         if not has_active_tunnel(tenant_id):
             _tunnel_tool_routes.pop(tenant_id, None)
+        # af5b5739 / 5f02a21c — release ownership only if still ours.
+        clear_tenant_owner_instance(tenant_id, owner_instance)
         for fut in list(pending.values()):
             if not fut.done():
                 fut.cancel()
