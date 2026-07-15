@@ -43,6 +43,7 @@ async def test_claim_sprint_item_surfaces_code_notes_for_file_resources(db):
     item = await db_module.add_sprint_item(
         db, pid, "v1", "Fix schema migration",
         touches_resources=json.dumps([f"file:{fpath}"]),
+        prospect_bypass=True,
     )
     iid = item["id"]
 
@@ -80,6 +81,7 @@ async def test_claim_sprint_item_no_code_notes_means_field_absent(db):
     item = await db_module.add_sprint_item(
         db, pid, "v1", "Edit a file with no notes",
         touches_resources=json.dumps(["file:meridian/static/dashboard.css"]),
+        prospect_bypass=True,
     )
     iid = item["id"]
 
@@ -141,6 +143,7 @@ async def test_claim_sprint_item_symbol_resource_extracts_file_for_notes(db):
     item = await db_module.add_sprint_item(
         db, pid, "v1", "Refactor dispatch",
         touches_resources=json.dumps([f"symbol:{fpath}::_dispatch_mcp_tool"]),
+        prospect_bypass=True,
     )
     iid = item["id"]
 
@@ -184,6 +187,7 @@ async def test_claim_sprint_item_multiple_files_only_those_with_notes(db):
             f"file:{file_with_note}",
             f"file:{file_without_note}",
         ]),
+        prospect_bypass=True,
     )
     iid = item["id"]
 

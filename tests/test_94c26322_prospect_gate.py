@@ -247,14 +247,24 @@ def test_goal_gate_skipped_manual_not_excluded():
 # ---------------------------------------------------------------------------
 
 def test_claim_blocks_unprospected_item():
-    """claim_sprint_item returns a blocked dict for an unprospected item."""
+    """claim_sprint_item returns a blocked dict for an item that DECLARED
+    real code-touching resources but has no durable pointer evidence.
+
+    An item with NO declared touches_resources was never a prospecting
+    candidate in the first place (nothing for add_sprint_item's inline
+    prospecting to attempt) and is intentionally NOT gated — see
+    test_claim_allows_item_without_declared_resources below.
+    """
     async def run():
         db = await _make_db()
         proj = await db_module.create_project(db, "Test Project")
         pid = proj["id"]
-        item = await db_module.add_sprint_item(db, pid, "v1", "Unprospected task")
+        item = await db_module.add_sprint_item(
+            db, pid, "v1", "Unprospected task",
+            touches_resources=["file:meridian/nonexistent_module_xyz.py:no_such_symbol"],
+        )
         iid = item["id"]
-        # Item has no code_pointers / pointers / prospect_status -> unprospected
+        # Item declared a resource but has no code_pointers / pointers -> unprospected
         result = await db_module.claim_sprint_item(db, pid, iid)
         assert isinstance(result, dict)
         assert result.get("blocked") is True
@@ -263,6 +273,29 @@ def test_claim_blocks_unprospected_item():
         # Item must still be pending (not claimed)
         refetched = await db_module.get_sprint_item(db, iid)
         assert refetched["status"] == "pending"
+        await db.close()
+
+    _run(run())
+
+
+def test_claim_allows_item_without_declared_resources():
+    """claim_sprint_item does NOT gate an item that declared no touches_resources.
+
+    Such an item was never a prospecting candidate in the first place (manual
+    tasks, proposals, docs-only work, or anything filed without explicit
+    file/route/tool targets) -- gating it would block the overwhelming
+    majority of ordinary items, not just genuinely-risky unprospected ones.
+    """
+    async def run():
+        db = await _make_db()
+        proj = await db_module.create_project(db, "Test Project")
+        pid = proj["id"]
+        item = await db_module.add_sprint_item(db, pid, "v1", "No resources declared")
+        iid = item["id"]
+        result = await db_module.claim_sprint_item(db, pid, iid)
+        assert isinstance(result, dict)
+        assert not result.get("blocked")
+        assert result.get("status") == "in_progress"
         await db.close()
 
     _run(run())

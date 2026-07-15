@@ -2098,6 +2098,12 @@ def test_claim_sprint_item_race_returns_already_claimed():
             {"project_id": pid, "version": "v1", "title": "b", "touches_resources": ["file:b.py"]},
             db, "/tmp",
         ))
+        # 94c26322 — this test is about claim-race semantics, not prospecting;
+        # bypass is set via the legitimate human/planning-session path
+        # (update_sprint_item after creation), never at add-time.
+        import meridian.db as _db_mod  # noqa: PLC0415
+        _run(_db_mod.patch_sprint_item(db, pid, a["id"], prospect_bypass=True))
+        _run(_db_mod.patch_sprint_item(db, pid, b["id"], prospect_bypass=True))
         # First claim succeeds.
         first = _run(mh._dispatch_mcp_tool(
             "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
@@ -2125,6 +2131,8 @@ def test_claim_sprint_item_race_no_next_item():
             {"project_id": pid, "version": "v1", "title": "only", "touches_resources": ["file:a.py"]},
             db, "/tmp",
         ))
+        import meridian.db as _db_mod  # noqa: PLC0415
+        _run(_db_mod.patch_sprint_item(db, pid, a["id"], prospect_bypass=True))
         _run(mh._dispatch_mcp_tool(
             "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
         ))
@@ -2228,6 +2236,8 @@ def test_update_sprint_item_blocks_in_progress():
             "add_sprint_item", {"project_id": pid, "version": "v1", "title": "a",
                                 "touches_resources": ["file:a.py"]}, db, "/tmp",
         ))
+        import meridian.db as _db_mod  # noqa: PLC0415
+        _run(_db_mod.patch_sprint_item(db, pid, item["id"], prospect_bypass=True))
         _run(mh._dispatch_mcp_tool(
             "claim_sprint_item", {"project_id": pid, "item_id": item["id"]}, db, "/tmp",
         ))

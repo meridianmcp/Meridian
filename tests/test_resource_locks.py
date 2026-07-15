@@ -425,7 +425,9 @@ async def test_parallelizable_groups_mcp_handler_warns_on_undeclared(db):
 async def test_parallelizable_groups_running_field(db):
     """df573218 — in-flight (claimed) items surface under 'running'."""
     p = await db_module.create_project(db, "running1")
-    a = await db_module.add_sprint_item(db, p["id"], "v1", "a", touches_resources=["file:a.py"])
+    a = await db_module.add_sprint_item(
+        db, p["id"], "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True
+    )
     await db_module.add_sprint_item(db, p["id"], "v1", "b", touches_resources=["file:b.py"])
     await db_module.claim_sprint_item(db, p["id"], a["id"])
     res = await db_module.get_parallelizable_groups(db, p["id"], version="v1")

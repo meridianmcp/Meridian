@@ -1358,13 +1358,19 @@ async def claim_sprint_item(
     intent into a real, structural guard nothing can bypass by simply claiming
     the item anyway.
 
-    94c26322 — PROSPECTING GATE: if the item has no durable evidence
-    (``sprint_item_pointers`` is empty) AND no human-set ``prospect_bypass``,
-    the claim is REFUSED with a structured blocked dict
+    94c26322 — PROSPECTING GATE: if the item DECLARES real code-touching
+    resources (``touches_resources`` is non-empty) but has no durable
+    evidence (``sprint_item_pointers`` is empty) AND no human-set
+    ``prospect_bypass``, the claim is REFUSED with a structured blocked dict
     (``{"blocked": True, "error": "UNPROSPECTED", ...}``). This mirrors the
-    goal-generation gate so an executor cannot silently work around the /goal
-    exclusion by claiming the item directly. The ONLY bypass is a human
-    explicitly setting ``prospect_bypass=True`` via update_sprint_item.
+    goal-generation gate's "only block confirmed enrichment failures, not
+    never-attempted items" semantics: an item with NO declared
+    touches_resources was never a prospecting candidate in the first place
+    (nothing for add_sprint_item's inline prospecting to attempt), so it is
+    NOT gated here — mirroring items without a claimable-batch concern at all
+    (manual tasks, proposals, docs-only work). The ONLY bypass for a
+    resource-declaring item is a human explicitly setting
+    ``prospect_bypass=True`` via update_sprint_item.
     Fail-open: any DB error lets the claim proceed so a structural defect
     never permanently wedges the board.
     """
@@ -1401,7 +1407,16 @@ async def claim_sprint_item(
     # Mirrors the goal-generation gate so claim cannot silently circumvent /goal
     # exclusions. Fail-open: any DB error lets the claim proceed so a structural
     # defect never permanently wedges the board.
-    if not bool(item.get("prospect_bypass")):
+    #
+    # SCOPE GUARD: only applies when the item actually declared touches_resources
+    # (i.e. was a real prospecting candidate at add-time). An item with no
+    # declared resources was never attempted — nothing for _persist_prospected_pointer
+    # to prospect — and gating it here would block the overwhelming majority of
+    # ordinary items (manual tasks, proposals, anything filed without explicit
+    # file/route/tool targets), not just genuinely-risky unprospected ones.
+    _touches_raw = item.get("touches_resources")
+    _has_declared_resources = bool(_touches_raw) and _touches_raw not in ("[]", "null")
+    if _has_declared_resources and not bool(item.get("prospect_bypass")):
         try:
             async with db.execute(
                 "SELECT COUNT(*) FROM sprint_item_pointers WHERE sprint_item_id = ?",
