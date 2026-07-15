@@ -2909,6 +2909,7 @@ async def _handle_file_claims(
             db, args["project_id"], args["to_session_id"], args.get("payload", ""),
             from_session_id=args.get("from_session_id") or args.get("session_id"),
             kind=args.get("kind"),
+            tenant_id=_mcp_tenant_id,  # 342dd15f — Redis cost-guard
         )
     if name == "receive_messages":
         return await db_module.receive_messages(

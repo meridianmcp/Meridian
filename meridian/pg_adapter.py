@@ -2434,6 +2434,30 @@ async def _migrate_pg_registered_hostnames(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_redis_overage_fields(conn: PostgresConnection) -> None:
+    """342dd15f — per-tenant Redis command budget for the send_message
+    push-augmentation path.
+
+    Mirrors db.migrations._migrate_redis_overage_fields for Postgres. Two new
+    tenants columns:
+      - redis_commands_used   NUMERIC(14,0)  current-month Upstash PUBLISH
+                                             counter; reset monthly alongside
+                                             compute_cu_hours_used.
+      - redis_overage_cap_usd NUMERIC(8,2)   optional operator override; NULL
+                                             means code-defined defaults apply
+                                             ($1 warn / $2 disable / $4 alert).
+
+    ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
+    Hosted-only (main auth DB, tenants table).
+    """
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+        "redis_commands_used NUMERIC(14,0) DEFAULT 0;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+        "redis_overage_cap_usd NUMERIC(8,2)"
+    )
+
+
 async def _migrate_pg_file_docx_region_claims(conn: PostgresConnection) -> None:
     """Create file_docx_region_claims table on existing Postgres DBs. Was
     missing from the PG schema entirely, so claim_docx_region/get_docx_region_
@@ -2501,6 +2525,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_tunnel_plugins_by_host,
     _migrate_pg_feedback,
     _migrate_pg_registered_hostnames,
+    _migrate_pg_redis_overage_fields,
 )
 
 async def _migrate_pg_decision_code_anchor(conn: PostgresConnection) -> None:

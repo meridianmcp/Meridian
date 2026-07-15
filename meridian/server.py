@@ -580,6 +580,13 @@ async def lifespan(app: FastAPI):
                             await run_dunning_cleanup(db)
                         except Exception:  # noqa: BLE001
                             pass
+                        # 342dd15f — hourly Redis command budget check:
+                        # warning + hard-limit emails, monthly counter reset.
+                        try:
+                            from .hosted import run_redis_overage_check
+                            await run_redis_overage_check(db)
+                        except Exception:  # noqa: BLE001
+                            pass
                         # Daily at 3am: compute + storage overage check
                         import time as _time2
                         _local_hour = _time2.localtime().tm_hour

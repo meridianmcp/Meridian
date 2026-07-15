@@ -1052,6 +1052,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_resources_amended(db)
     await _migrate_session_activity(db)
     await _migrate_connection_events(db)
+    await _migrate_redis_overage_fields(db)
     return db
 
 
@@ -5194,6 +5195,7 @@ async def update_tenant(
         "overage_reset_at", "compute_throttled_at",
         "trial_started_at", "inactivity_expires_at",
         "github_pat", "tunnel_active", "tunnel_plugins", "tunnel_plugins_by_host",
+        "redis_commands_used", "redis_overage_cap_usd",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -6116,6 +6118,7 @@ async def send_message(
     *,
     from_session_id: str | None = None,
     kind: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """d3a3a01d — enqueue an actor-model message to another session.
 
@@ -6124,6 +6127,11 @@ async def send_message(
     subscriber gets pushed instead of having to poll receive_messages. Purely
     additive: publish failures / no Redis configured never affect this
     function's return value or the persisted message.
+
+    342dd15f — optional ``tenant_id`` is forwarded to
+    ``publish_session_message`` to enable per-tenant Upstash cost-guard
+    enforcement. When absent (self-hosted / unauthenticated), the budget check
+    is skipped entirely.
     """
     mid = _new_id()
     await db.execute(
@@ -6141,7 +6149,9 @@ async def send_message(
         from .. import redis_bridge as _redis_bridge  # noqa: PLC0415 — lazy, optional dep
 
         try:
-            await _redis_bridge.publish_session_message(to_session_id, row)
+            await _redis_bridge.publish_session_message(
+                to_session_id, row, tenant_id=tenant_id, db=db
+            )
         except Exception:  # noqa: BLE001
             pass  # never let a push-augmentation failure affect the DB write above
     return row
