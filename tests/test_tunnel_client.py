@@ -1140,6 +1140,123 @@ def test_install_mcp_json_updates_existing_cursor_config(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# bf31787c — meridian server entry injection
+# ---------------------------------------------------------------------------
+
+def test_meridian_server_url():
+    # The main Meridian server URL is just {base_url}/mcp (tenant-agnostic).
+    assert tc._meridian_server_url("https://usemeridian.us") == "https://usemeridian.us/mcp"
+    assert tc._meridian_server_url("https://usemeridian.us/") == "https://usemeridian.us/mcp"
+
+
+def test_tunnel_mcp_entries_includes_meridian_when_token_provided():
+    # bf31787c — when a token is supplied, the 'meridian' server entry is
+    # injected as the first entry with the correct URL and Authorization header.
+    base, tid = "https://usemeridian.us", "tid-123"
+    tok = "sk_meridian_test"
+    entries = tc._tunnel_mcp_entries(base, tid, token=tok)
+    assert "meridian" in entries
+    assert entries["meridian"]["type"] == "http"
+    assert entries["meridian"]["url"] == "https://usemeridian.us/mcp"
+    assert entries["meridian"]["headers"] == {"Authorization": f"Bearer {tok}"}
+    # Slot connectors still present.
+    assert "filesystem" in entries
+    assert "codebase-memory" in entries
+    assert "serena" in entries
+
+
+def test_tunnel_mcp_entries_omits_meridian_without_token():
+    # bf31787c — without a token (or empty token) no 'meridian' entry is injected,
+    # preserving backward-compat for callers that don't have the token handy.
+    base, tid = "https://usemeridian.us", "tid-123"
+    assert "meridian" not in tc._tunnel_mcp_entries(base, tid)
+    assert "meridian" not in tc._tunnel_mcp_entries(base, tid, token=None)
+    assert "meridian" not in tc._tunnel_mcp_entries(base, tid, token="")
+
+
+def test_install_mcp_json_injects_meridian_server_entry(tmp_path):
+    # bf31787c — with a token, _install_mcp_json writes the 'meridian' entry.
+    base, tid, tok = "https://usemeridian.us", "tid-x", "sk_meridian_tok"
+    tc._install_mcp_json(tmp_path, base, tid, token=tok)
+    servers = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    assert "meridian" in servers
+    assert servers["meridian"]["url"] == f"{base}/mcp"
+    assert servers["meridian"]["headers"]["Authorization"] == f"Bearer {tok}"
+    # Slot connectors still present.
+    assert "filesystem" in servers
+    assert "codebase-memory" in servers
+    assert "serena" in servers
+
+
+def test_install_mcp_json_without_token_omits_meridian_entry(tmp_path):
+    # bf31787c — without a token the 'meridian' entry is absent (not a regression
+    # for callers that omit the token parameter).
+    tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid-x")
+    servers = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    assert "meridian" not in servers
+    assert set(servers) == {"filesystem", "codebase-memory", "serena"}
+
+
+def test_is_our_mcp_entry_recognises_meridian_server_url():
+    # bf31787c — an entry whose url is {base_url}/mcp is recognised as ours
+    # so restore and re-inject don't accumulate stale entries.
+    base, tid = "https://usemeridian.us", "tid-123"
+    entry = {"type": "http", "url": f"{base}/mcp", "headers": {"Authorization": "Bearer tok"}}
+    assert tc._is_our_mcp_entry("meridian", entry, base, tid)
+    # A user's own server called 'meridian' pointing elsewhere must NOT be flagged.
+    other = {"type": "http", "url": "https://example.com/mcp"}
+    assert not tc._is_our_mcp_entry("meridian", other, base, tid)
+
+
+def test_inject_mcp_entries_meridian_reinject_is_idempotent(tmp_path):
+    # bf31787c — a second tunnel run should overwrite (not duplicate) the meridian
+    # entry, and should NOT create 'meridian-meridian' due to collision handling.
+    base, tid, tok = "https://usemeridian.us", "tid-y", "sk_meridian_tok"
+    entries = tc._tunnel_mcp_entries(base, tid, token=tok)
+    first = tc._inject_mcp_entries(None, entries, base, tid)
+    second = tc._inject_mcp_entries(first, entries, base, tid)
+    servers = json.loads(second)["mcpServers"]
+    # Exactly one 'meridian' key, no 'meridian-meridian'.
+    assert "meridian" in servers
+    assert "meridian-meridian" not in servers
+    assert servers["meridian"]["url"] == f"{base}/mcp"
+
+
+def test_restore_mcp_json_removes_meridian_server_entry(tmp_path):
+    # bf31787c — restore must strip the injected 'meridian' server entry so it
+    # doesn't linger after the tunnel stops.
+    base, tid, tok = "https://usemeridian.us", "tid-z", "sk_meridian_tok"
+    mcp = tmp_path / ".mcp.json"
+    snaps = tc._install_mcp_json(tmp_path, base, tid, token=tok)
+    assert "meridian" in json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+
+    tc._restore_mcp_json(snaps, base, tid)
+    # File was created (original=None) so it is deleted on restore.
+    assert not mcp.exists()
+
+
+def test_restore_mcp_json_strips_meridian_entry_from_existing_file(tmp_path):
+    # bf31787c — if the file already existed and we merged in the meridian entry,
+    # restore must strip it and leave any user-owned entries intact.
+    base, tid, tok = "https://usemeridian.us", "tid-w", "sk_meridian_tok"
+    mcp = tmp_path / ".mcp.json"
+    original_data = {"mcpServers": {"my-server": {"command": "node"}}}
+    mcp.write_text(json.dumps(original_data), encoding="utf-8")
+
+    snaps = tc._install_mcp_json(tmp_path, base, tid, token=tok)
+    # During the session both 'meridian' and 'my-server' are present.
+    live = json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+    assert "meridian" in live
+    assert "my-server" in live
+
+    tc._restore_mcp_json(snaps, base, tid)
+    restored = json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+    assert "meridian" not in restored
+    assert "filesystem" not in restored
+    assert restored == {"my-server": {"command": "node"}}
+
+
+# ---------------------------------------------------------------------------
 # _force_utf8_io — Windows cp1252 crash guard
 # ---------------------------------------------------------------------------
 

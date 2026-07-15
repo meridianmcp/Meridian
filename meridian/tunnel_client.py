@@ -1750,6 +1750,22 @@ def _permanent_extract_url(base_url: str, tenant_id: str) -> str:
     return f"{base_url.rstrip('/')}/extract/mcp/{tenant_id}/mcp"
 
 
+def _meridian_server_url(base_url: str) -> str:
+    """The Streamable HTTP URL for the hosted Meridian MCP server (tools: start_session, etc.).
+
+    This is the main Meridian connector — distinct from the three tunnel-slot
+    connectors (filesystem / codebase-memory / serena) that relay local proxies.
+    It provides all Meridian tools (start_session, get_sprint_items,
+    generate_handoff, …) and requires a bearer token for auth.
+
+    bf31787c — previously this entry was NEVER injected by the tunnel auto-update,
+    which meant a user running ``meridian --tunnel`` got the three tool-slot
+    connectors but no Meridian server itself. ``start_session`` and friends were
+    then non-existent in Claude Code, causing sessions to stall.
+    """
+    return f"{base_url.rstrip('/')}/mcp"
+
+
 def _ws_office_url(base_url: str, tenant_id: str, token: str, slot: str) -> str:
     """Build the WebSocket URL for an Office tunnel slot (ppt/word)."""
     base = base_url.rstrip("/")
@@ -2940,6 +2956,10 @@ def _is_our_mcp_entry(key: str, value: object, base_url: str, tenant_id: str) ->
     new-name key like ``filesystem`` or a collision-suffixed key). A key that is
     merely NAMED like one of our new built-ins but whose URL is NOT ours is the
     USER's own server and must never be clobbered.
+
+    bf31787c — also recognises the main Meridian server entry by its ``url``
+    (``{base_url}/mcp``) so a prior tunnel run's ``meridian`` entry is cleaned up
+    or replaced rather than accumulated.
     """
     if key in _OWN_TUNNEL_MCP_KEYS_BY_NAME or key.startswith("meridian-custom-"):
         return True
@@ -2950,12 +2970,16 @@ def _is_our_mcp_entry(key: str, value: object, base_url: str, tenant_id: str) ->
         _permanent_url(base_url, tenant_id),
         _permanent_code_url(base_url, tenant_id),
         _permanent_extract_url(base_url, tenant_id),
+        # bf31787c — main Meridian server; tenant-agnostic (shared /mcp endpoint).
+        _meridian_server_url(base_url),
     }
     return url in ours
 
 
 def _tunnel_mcp_entries(
-    base_url: str, tenant_id: str, custom: "list[dict] | None" = None,
+    base_url: str, tenant_id: str,
+    custom: "list[dict] | None" = None,
+    token: "str | None" = None,
 ) -> dict[str, dict]:
     """The HTTP MCP connector entries pointing at this tenant's tunnel.
 
@@ -2968,15 +2992,31 @@ def _tunnel_mcp_entries(
     LOCAL-ONLY and have no server route, so a co-located client reaches them
     directly, not via the relay.
 
+    bf31787c — when *token* is provided the main ``meridian`` server entry is
+    also injected, pointing at ``{base_url}/mcp`` with an ``Authorization``
+    header. Without this entry Claude Code has no Meridian tools at all
+    (start_session, get_sprint_items, generate_handoff, …) even though the three
+    tool-slot connectors are present.
+
     Collision handling and legacy-key migration happen in
     :func:`_inject_mcp_entries`, which sees the existing config; this function is
     a pure name→url map and stays trivially unit-testable.
     """
-    entries = {
+    entries: dict[str, dict] = {}
+    # bf31787c — the main Meridian server entry MUST come first so it is the
+    # first thing an agent sees in the merged mcpServers dict. The three slot
+    # connectors follow.
+    if token:
+        entries["meridian"] = {
+            "type": "http",
+            "url": _meridian_server_url(base_url),
+            "headers": {"Authorization": f"Bearer {token}"},
+        }
+    entries.update({
         _TUNNEL_MCP_SLOT_NAMES["fs"]: {"type": "http", "url": _permanent_url(base_url, tenant_id)},
         _TUNNEL_MCP_SLOT_NAMES["code"]: {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
         _TUNNEL_MCP_SLOT_NAMES["extract"]: {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
-    }
+    })
     for cp in custom or []:
         name = cp.get("name")
         port = cp.get("port")
@@ -3079,6 +3119,7 @@ def _inject_mcp_entries(
 def _install_mcp_json(
     cwd: "str | Path", base_url: str, tenant_id: str,
     custom: "list[dict] | None" = None,
+    token: "str | None" = None,
 ) -> list[tuple["Path", "str | None"]]:
     """Inject tunnel connector entries into local MCP config files.
 
@@ -3086,11 +3127,15 @@ def _install_mcp_json(
     each gets a LOCAL ``http://127.0.0.1:<port>/mcp`` connector entry alongside the
     built-in relay entries (see :func:`_tunnel_mcp_entries`).
 
+    bf31787c — *token* is the tenant's bearer token.  When provided the main
+    ``meridian`` server entry is also injected so Claude Code has access to all
+    Meridian tools (start_session, get_sprint_items, generate_handoff, …).
+
     Returns a list of ``(path, original_text_or_None)`` snapshots for restore.
     ``original_text_or_None`` is ``None`` when we created the file. Failures on
     any single file are reported and skipped — never fatal to the tunnel.
     """
-    entries = _tunnel_mcp_entries(base_url, tenant_id, custom)
+    entries = _tunnel_mcp_entries(base_url, tenant_id, custom, token=token)
     snapshots: list[tuple[Path, str | None]] = []
     for path in _mcp_json_paths(cwd):
         existed = path.exists()
@@ -3635,9 +3680,13 @@ async def run_tunnel(
     print("", flush=True)
 
     # 5b. Auto-update local MCP client config.
+    # bf31787c — pass the bearer token so _install_mcp_json can inject the main
+    # 'meridian' server entry (start_session / generate_handoff / …) alongside
+    # the three tunnel-slot connectors. Without the token the entry was silently
+    # omitted and Claude Code had no Meridian tools at all.
     mcp_snapshots: list[tuple[Path, str | None]] = []
     try:
-        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id, running_custom)
+        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id, running_custom, token=token)
     except Exception as exc:  # noqa: BLE001
         print(f"  warning: could not update local MCP config: {exc}", file=sys.stderr, flush=True)
     if mcp_snapshots:
@@ -3648,7 +3697,10 @@ async def run_tunnel(
         )
         # ef162c28 — connectors are now named by the plugin behind each slot
         # (filesystem / codebase-memory / serena) rather than by transport slot.
-        _builtin_conns = ", ".join(TUNNEL_MCP_KEYS)
+        # bf31787c — the main 'meridian' server entry (start_session / …) is
+        # always injected first when a token is available.
+        _meridian_prefix = "meridian, " if token else ""
+        _builtin_conns = _meridian_prefix + ", ".join(TUNNEL_MCP_KEYS)
         print(
             f"    added connectors: {_builtin_conns}"
             f"{_custom_conns} (removed on Ctrl+C)",
