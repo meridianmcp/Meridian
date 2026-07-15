@@ -673,6 +673,7 @@ async def add_sprint_item(
     priority: str | None = None,
     blocker_kind: str | None = None,
     wave: str | None = None,
+    sprint_name: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -694,6 +695,9 @@ async def add_sprint_item(
     ``blocker_kind`` (2282a636) is None (ordinary) or 'manual' (blocked on a
     real-world action outside Meridian) — a manual-blocker is surfaced distinctly
     and excluded from executor scoping, like milestone_type='human'.
+    ``sprint_name`` (3d6bd938) is a nullable human-readable label for the sprint
+    bucket (e.g. 'docs-cloudflare'), kept separate from ``version`` which should
+    stay a structural/semver-like identifier. NULL means no separate name.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
     is compared (word-set overlap, see ``_title_word_overlap``) against every
@@ -767,12 +771,12 @@ async def add_sprint_item(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
-        "deferred_until, track, priority, blocker_kind, wave) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "deferred_until, track, priority, blocker_kind, wave, sprint_name) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
-         priority, blocker_kind or None, wave or None),
+         priority, blocker_kind or None, wave or None, sprint_name or None),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -1473,12 +1477,13 @@ async def patch_sprint_item(
     priority: str | None = None,
     blocker_kind: Any = _UNSET,
     wave: Any = _UNSET,
+    sprint_name: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
     item_group, touches_resources, required_notes, deferred_until, track,
-    priority, blocker_kind. Only
+    priority, blocker_kind, sprint_name. Only
     fields passed as non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
@@ -1493,6 +1498,9 @@ async def patch_sprint_item(
     milestone_type). ``blocker_kind`` (2282a636) uses the ``_UNSET`` sentinel:
     omit to leave unchanged, pass an empty string / ``None`` to CLEAR it (ordinary
     item), or 'manual' to mark it blocked on a real-world action outside Meridian.
+    ``sprint_name`` (3d6bd938) uses the ``_UNSET`` sentinel: omit to leave
+    unchanged, pass an empty string / ``None`` to CLEAR it, or a non-empty
+    string to set a human-readable label (distinct from the structural ``version``).
     """
     # 6a17e735 / ARCH 1B — separate the status change (routed through
     # _transition_status for guaranteed cache bust + live event) from the
@@ -1588,6 +1596,11 @@ async def patch_sprint_item(
         # 'wave-1'), auto-filled by assign_sprint_waves or hand-set here.
         ns_fields.append("wave = ?")
         ns_values.append(wave or None)
+    if sprint_name is not _UNSET:
+        # 3d6bd938 — empty string / None CLEARS the sprint name; any other value
+        # sets a human-readable label for the bucket (distinct from version).
+        ns_fields.append("sprint_name = ?")
+        ns_values.append(sprint_name or None)
 
     if not ns_fields and status_value is None:
         return await get_sprint_item(db, item_id)

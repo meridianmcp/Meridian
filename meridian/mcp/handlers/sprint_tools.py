@@ -140,6 +140,7 @@ async def handle_add_sprint_item(
             priority=args.get("priority"),
             blocker_kind=args.get("blocker_kind"),
             wave=args.get("wave"),
+            sprint_name=args.get("sprint_name"),
         )
     except ValueError as exc:
         # 501ec93f — malformed touches_resources identifier; also e08fee30 /
@@ -337,6 +338,11 @@ async def handle_update_sprint_item(
     # untouched; pass "" / null to clear (unassigned).
     if "wave" in args:
         _patch_kwargs["wave"] = args.get("wave")
+    # 3d6bd938 — set/clear sprint_name. Only forward when the caller supplied the
+    # key (_UNSET sentinel), so omitting it leaves the stored value untouched;
+    # pass "" / null to clear (no name), or a non-empty string to set.
+    if "sprint_name" in args:
+        _patch_kwargs["sprint_name"] = args.get("sprint_name")
     try:
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"], **_patch_kwargs

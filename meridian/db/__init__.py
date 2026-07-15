@@ -305,7 +305,12 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- assign_sprint_waves auto-fills it from get_parallelizable_groups, and
     -- update_sprint_item(wave=...) edits it by hand. NULL = unassigned. Nullable
     -- plain column — no inline index (guarded-migration rule).
-    wave TEXT
+    wave TEXT,
+    -- 3d6bd938: separate human-readable sprint name from the structural version
+    -- identifier. version stays a semver-like slug (e.g. 'v0.2.x'); sprint_name
+    -- is a nullable free-text label for the bucket (e.g. 'docs-cloudflare').
+    -- No inline index (guarded-migration rule). Nullable — legacy rows are NULL.
+    sprint_name TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -1055,6 +1060,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_redis_overage_fields(db)
     await _migrate_sprint_version_descriptions(db)
     await _migrate_workspace_settings_active_session_threshold(db)
+    await _migrate_sprint_item_sprint_name(db)
     return db
 
 

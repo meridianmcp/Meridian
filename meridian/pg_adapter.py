@@ -3017,6 +3017,19 @@ async def _migrate_pg_connection_events(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_sprint_name(conn: PostgresConnection) -> None:
+    """3d6bd938 — separate human-readable sprint name from the structural version field.
+
+    version stays a semver-like structural identifier (e.g. 'v0.2.x');
+    sprint_name is a nullable free-text label for the bucket (e.g.
+    'docs-cloudflare'). ADD COLUMN IF NOT EXISTS -> idempotent.
+    Mirrors db._migrate_sprint_item_sprint_name.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS sprint_name TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3087,4 +3100,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_connection_events,
     _migrate_pg_sprint_version_descriptions,
     _migrate_pg_workspace_settings_active_session_threshold,
+    _migrate_pg_sprint_item_sprint_name,
 )

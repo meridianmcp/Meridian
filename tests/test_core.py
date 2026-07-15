@@ -7449,10 +7449,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_connection_events",
         "_migrate_pg_sprint_version_descriptions",
         "_migrate_pg_workspace_settings_active_session_threshold",
+        "_migrate_pg_sprint_item_sprint_name",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 104
+    assert len(allnames) == len(set(allnames)) == 105
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -13325,6 +13326,57 @@ async def test_patch_sprint_item_edits_notes_human_group(db):
     assert cleared["human_id"] is None
     assert cleared["item_group"] is None
     assert cleared["notes"] == "some context"
+
+
+@pytest.mark.asyncio
+async def test_sprint_item_sprint_name(db):
+    """3d6bd938 — sprint_name is stored separately from version in sprint_items.
+
+    add_sprint_item accepts sprint_name and stores it independently of version.
+    patch_sprint_item can set, update, and clear sprint_name via the _UNSET sentinel.
+    """
+    p = await db_module.create_project(db, "sprint-name-test")
+
+    # Add item with both version and sprint_name.
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v0.2.x", "Wire docs pipeline",
+        sprint_name="docs-cloudflare",
+    )
+    assert item["version"] == "v0.2.x"
+    assert item["sprint_name"] == "docs-cloudflare"
+
+    # Add item with version only — sprint_name should be None.
+    item_no_name = await db_module.add_sprint_item(
+        db, p["id"], "v0.2.x", "Unrelated task", force=True,
+    )
+    assert item_no_name["version"] == "v0.2.x"
+    assert item_no_name.get("sprint_name") is None
+
+    # patch_sprint_item can update sprint_name.
+    patched = await db_module.patch_sprint_item(
+        db, p["id"], item["id"], sprint_name="docs-cloudflare-renamed",
+    )
+    assert patched["sprint_name"] == "docs-cloudflare-renamed"
+    # version must remain unchanged.
+    assert patched["version"] == "v0.2.x"
+
+    # patch_sprint_item can clear sprint_name with empty string or None.
+    cleared = await db_module.patch_sprint_item(
+        db, p["id"], item["id"], sprint_name="",
+    )
+    assert cleared["sprint_name"] is None
+
+    # Omitting sprint_name leaves the stored value untouched (UNSET sentinel).
+    restored = await db_module.patch_sprint_item(
+        db, p["id"], item_no_name["id"], sprint_name="wave-1-items",
+    )
+    assert restored["sprint_name"] == "wave-1-items"
+
+    # get_sprint_items returns sprint_name on each item (SELECT *).
+    items = await db_module.get_sprint_items(db, p["id"])
+    by_id = {it["id"]: it for it in items}
+    assert by_id[item["id"]]["sprint_name"] is None  # was cleared
+    assert by_id[item_no_name["id"]]["sprint_name"] == "wave-1-items"
 
 
 @pytest.mark.asyncio
