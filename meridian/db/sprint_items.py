@@ -674,6 +674,7 @@ async def add_sprint_item(
     blocker_kind: str | None = None,
     wave: str | None = None,
     sprint_name: str | None = None,
+    prospect_bypass: bool = False,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -771,12 +772,14 @@ async def add_sprint_item(
         "INSERT INTO sprint_items "
         "(id, project_id, version, title, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
-        "deferred_until, track, priority, blocker_kind, wave, sprint_name) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "deferred_until, track, priority, blocker_kind, wave, sprint_name, "
+        "prospect_bypass) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
-         priority, blocker_kind or None, wave or None, sprint_name or None),
+         priority, blocker_kind or None, wave or None, sprint_name or None,
+         1 if prospect_bypass else 0),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -1354,6 +1357,16 @@ async def claim_sprint_item(
     flipping the item to in_progress. This turns a "we decided to defer this"
     intent into a real, structural guard nothing can bypass by simply claiming
     the item anyway.
+
+    94c26322 — PROSPECTING GATE: if the item has no durable evidence
+    (``sprint_item_pointers`` is empty) AND no human-set ``prospect_bypass``,
+    the claim is REFUSED with a structured blocked dict
+    (``{"blocked": True, "error": "UNPROSPECTED", ...}``). This mirrors the
+    goal-generation gate so an executor cannot silently work around the /goal
+    exclusion by claiming the item directly. The ONLY bypass is a human
+    explicitly setting ``prospect_bypass=True`` via update_sprint_item.
+    Fail-open: any DB error lets the claim proceed so a structural defect
+    never permanently wedges the board.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
@@ -1380,6 +1393,42 @@ async def claim_sprint_item(
                 "track": item.get("track"),
                 "item_id": item_id,
             }
+    # 94c26322 — refuse an unprospected item at claim time unless a human
+    # explicitly set prospect_bypass. At claim time, enrichment-time fields
+    # (code_pointers / prospect_status) are NOT on the DB row, so we check the
+    # durable sprint_item_pointers table instead (persistently pinned pointers).
+    # An item is considered evidenced if it has >= 1 row in sprint_item_pointers.
+    # Mirrors the goal-generation gate so claim cannot silently circumvent /goal
+    # exclusions. Fail-open: any DB error lets the claim proceed so a structural
+    # defect never permanently wedges the board.
+    if not bool(item.get("prospect_bypass")):
+        try:
+            async with db.execute(
+                "SELECT COUNT(*) FROM sprint_item_pointers WHERE sprint_item_id = ?",
+                (item_id,),
+            ) as _ptr_cur:
+                _ptr_row = await _ptr_cur.fetchone()
+            _ptr_count = (
+                (_ptr_row[0] if not isinstance(_ptr_row, dict) else _ptr_row.get("COUNT(*)"))
+                if _ptr_row else 0
+            ) or 0
+            if not _ptr_count:
+                return {
+                    "blocked": True,
+                    "error": "UNPROSPECTED",
+                    "reason": (
+                        "Sprint item has no durable pointers (sprint_item_pointers is "
+                        "empty). It cannot be claimed without explicit human approval. "
+                        "A human/planning session must either add a pointer via "
+                        "add_sprint_item_pointer() or call "
+                        "update_sprint_item(item_id=..., prospect_bypass=true) to "
+                        "explicitly allow this item. Executors must NOT set "
+                        "prospect_bypass themselves."
+                    ),
+                    "item_id": item_id,
+                }
+        except Exception:  # noqa: BLE001 — gate must never wedge the board
+            pass
     blocked = {"in_progress", "done", "failed", "skipped"}
     if (item.get("status") or "pending") in blocked:
         raise ValueError(
@@ -1478,12 +1527,13 @@ async def patch_sprint_item(
     blocker_kind: Any = _UNSET,
     wave: Any = _UNSET,
     sprint_name: Any = _UNSET,
+    prospect_bypass: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
     item_group, touches_resources, required_notes, deferred_until, track,
-    priority, blocker_kind, sprint_name. Only
+    priority, blocker_kind, sprint_name, prospect_bypass. Only
     fields passed as non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
@@ -1501,6 +1551,11 @@ async def patch_sprint_item(
     ``sprint_name`` (3d6bd938) uses the ``_UNSET`` sentinel: omit to leave
     unchanged, pass an empty string / ``None`` to CLEAR it, or a non-empty
     string to set a human-readable label (distinct from the structural ``version``).
+    ``prospect_bypass`` (94c26322) uses the ``_UNSET`` sentinel: omit to leave
+    unchanged, pass ``True`` / ``1`` to SET the bypass (allowing an unprospected
+    item through the goal-generation and claim gates), or ``False`` / ``0`` to
+    CLEAR it (re-enabling the structural gate). Settable by planning/human sessions
+    only — executor sessions should not set this field.
     """
     # 6a17e735 / ARCH 1B — separate the status change (routed through
     # _transition_status for guaranteed cache bust + live event) from the
@@ -1601,6 +1656,12 @@ async def patch_sprint_item(
         # sets a human-readable label for the bucket (distinct from version).
         ns_fields.append("sprint_name = ?")
         ns_values.append(sprint_name or None)
+    if prospect_bypass is not _UNSET:
+        # 94c26322 — True/1 SETS the bypass (human override: allow unprospected
+        # item through the goal-generation and claim gates); False/0/None CLEARS
+        # it (re-enable the structural gate). Stored as INTEGER 0/1.
+        ns_fields.append("prospect_bypass = ?")
+        ns_values.append(1 if prospect_bypass else 0)
 
     if not ns_fields and status_value is None:
         return await get_sprint_item(db, item_id)
@@ -1644,6 +1705,7 @@ async def add_subtask(
     parent_id: str,
     title: str,
     owner: str | None = None,
+    prospect_bypass: bool = False,
 ) -> dict[str, Any]:
     """Create a child sprint item under parent_id.
 
@@ -1701,9 +1763,11 @@ async def add_subtask(
     iid = _new_id()
     await db.execute(
         "INSERT INTO sprint_items "
-        "(id, project_id, version, title, parent_id, milestone_type, owner, depends_on) "
-        "VALUES (?, ?, ?, ?, ?, 'task', ?, ?)",
-        (iid, project_id, parent.get("version", ""), title, parent_id, owner, depends_on),
+        "(id, project_id, version, title, parent_id, milestone_type, owner, depends_on, "
+        "prospect_bypass) "
+        "VALUES (?, ?, ?, ?, ?, 'task', ?, ?, ?)",
+        (iid, project_id, parent.get("version", ""), title, parent_id, owner, depends_on,
+         1 if prospect_bypass else 0),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -2231,7 +2295,7 @@ async def get_sprint_items(
     return result
 
 
-def _item_is_unprospected(it: dict[str, Any]) -> bool:
+def _item_is_unprospected(it: dict[str, Any], *, enrichment_failure_only: bool = False) -> bool:
     """fba94f1a — return True when a sprint item has no prospecting evidence.
 
     An item is considered prospected when ANY of the following hold:
@@ -2246,21 +2310,36 @@ def _item_is_unprospected(it: dict[str, Any]) -> bool:
     Items that were intentionally skipped (``skipped_manual`` — human/MANUAL
     items, ``skipped_cap`` — beyond the enrichment cap, ``no_backend`` — no
     searcher wired for this source type) are NOT flagged unprospected: the
-    skip was deliberate and the flag would be misleading. Items with no
-    ``prospect_status`` at all (plain DB rows, never run through enrichment)
-    ARE flagged — that is the primary gap this function surfaces.
+    skip was deliberate and the flag would be misleading.
+
+    By default (``enrichment_failure_only=False``), items with NO
+    ``prospect_status`` at all (plain DB rows, never run through enrichment) ARE
+    flagged — this is the informational mode used by ``build_sprint_items_xml``
+    to surface items that lack any code grounding.
+
+    94c26322 — When ``enrichment_failure_only=True``, only items that went
+    through enrichment and received an explicit FAILURE status (``no_match``,
+    ``error``, ``no_query``) AND have no pointer evidence are flagged. This
+    is the mode used by the /goal generation safety gate: items that simply
+    haven't been enriched yet are NOT flagged (they are in a "not yet tried"
+    state rather than a confirmed-failure state). This prevents the gate from
+    blocking plain test items or items added before enrichment runs.
     """
     ps = it.get("prospect_status") or ""
-    # Intentional skips are not flagged.
+    # Intentional skips are not flagged (either mode).
     if ps in ("skipped_manual", "skipped_cap", "no_backend"):
         return False
-    # Confirmed prospected or reused cached pointer.
+    # Confirmed prospected or reused cached pointer (either mode).
     if ps in ("prospected", "cached"):
         return False
-    # Non-empty code or generic pointer means real evidence exists.
+    # Non-empty code or generic pointer means real evidence exists (either mode).
     if it.get("code_pointers") or it.get("pointers"):
         return False
-    # Everything else: no evidence, flag it.
+    # In enrichment_failure_only mode: never-enriched items (no status) are NOT flagged.
+    if enrichment_failure_only and not ps:
+        return False
+    # Default (broad) mode: everything with no evidence is flagged.
+    # enrichment_failure_only mode: ps is a failure status (no_match, error, no_query).
     return True
 
 

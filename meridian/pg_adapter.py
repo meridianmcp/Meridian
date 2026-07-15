@@ -641,7 +641,12 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     wave TEXT,
     -- 3d6bd938: separate human-readable sprint name from the structural version
     -- identifier (mirrors SQLite). Nullable — legacy rows are NULL.
-    sprint_name TEXT
+    sprint_name TEXT,
+    -- 94c26322: human-set bypass flag for the prospecting safety gate. 0/default
+    -- means the structural gate applies (unprospected items excluded from auto-run).
+    -- 1 means an explicit human override allows the item through anyway.
+    -- Settable ONLY by planning/human sessions. Plain column — no inline index.
+    prospect_bypass INTEGER NOT NULL DEFAULT 0
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -3074,6 +3079,25 @@ async def _migrate_pg_note_nickname(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> None:
+    """94c26322 — human-set bypass flag for the prospecting safety gate.
+
+    prospect_bypass (INTEGER 0/1, NOT NULL DEFAULT 0) is the ONLY structural way
+    to include an unprospected sprint item in a /goal's auto-run claimable batch.
+    Without real prospecting evidence AND without this flag set, the item is
+    excluded from goal generation and claim_sprint_item warns hard.
+
+    Settable ONLY by human/planning sessions via update_sprint_item.
+
+    ADD COLUMN IF NOT EXISTS is idempotent; existing rows default to 0.
+    Mirrors db._migrate_sprint_item_prospect_bypass.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS "
+        "prospect_bypass INTEGER NOT NULL DEFAULT 0"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3148,4 +3172,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_slug_nickname,
     _migrate_pg_decision_slug_nickname,
     _migrate_pg_note_nickname,
+    _migrate_pg_sprint_item_prospect_bypass,
 )

@@ -310,7 +310,13 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     -- identifier. version stays a semver-like slug (e.g. 'v0.2.x'); sprint_name
     -- is a nullable free-text label for the bucket (e.g. 'docs-cloudflare').
     -- No inline index (guarded-migration rule). Nullable — legacy rows are NULL.
-    sprint_name TEXT
+    sprint_name TEXT,
+    -- 94c26322: human-set bypass flag for the prospecting safety gate. When 1,
+    -- an unprospected item may still be included in /goal auto-run batches and
+    -- claimed without a hard warning. 0/NULL = no bypass (default). Settable
+    -- ONLY by planning/human sessions via update_sprint_item; executor claim
+    -- paths cannot set this. Plain INTEGER column — no inline index.
+    prospect_bypass INTEGER NOT NULL DEFAULT 0
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -1064,6 +1070,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_proposal_slug_nickname(db)
     await _migrate_decision_slug_nickname(db)
     await _migrate_note_nickname(db)
+    await _migrate_sprint_item_prospect_bypass(db)
     return db
 
 

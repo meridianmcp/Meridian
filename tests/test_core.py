@@ -7453,10 +7453,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_proposal_slug_nickname",
         "_migrate_pg_decision_slug_nickname",
         "_migrate_pg_note_nickname",
+        "_migrate_pg_sprint_item_prospect_bypass",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 108
+    assert len(allnames) == len(set(allnames)) == 109
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -14320,7 +14321,10 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
         "repo_path": "/home/user/myrepo",
         "isolation": "worktree",
     })
-    item = await db_module.add_sprint_item(db, p["id"], "v1", "Feature work")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Feature work", prospect_bypass=True
+    )
 
     result = await srv._dispatch_mcp_tool(
         "claim_sprint_item",
@@ -14345,7 +14349,10 @@ async def test_claim_returns_code_context_from_touches_resources(db):
     import meridian.server as srv
 
     p = await db_module.create_project(db, "prospect-tr")
-    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the registry proxy")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the registry proxy", prospect_bypass=True
+    )
     await db.execute(
         "UPDATE sprint_items SET touches_resources = ? WHERE id = ?",
         (_json.dumps(["file:meridian/routes/tunnel.py", "symbol:get_mcp_registry"]), item["id"]),
@@ -14373,7 +14380,10 @@ async def test_claim_code_context_falls_back_to_title_inference(db):
     import meridian.server as srv
 
     p = await db_module.create_project(db, "prospect-title")
-    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix dashboard button styling")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix dashboard button styling", prospect_bypass=True
+    )
 
     result = await srv._dispatch_mcp_tool(
         "claim_sprint_item",
@@ -14394,7 +14404,10 @@ async def test_claim_sprint_item_worktree_isolation_bypasses_file_conflict(db):
 
     p = await db_module.create_project(db, "wt-bypass-conflict")
     await db_module.set_executor_config(db, p["id"], {"isolation": "worktree"})
-    item = await db_module.add_sprint_item(db, p["id"], "v1", "Edit server")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Edit server", prospect_bypass=True
+    )
     await db.execute(
         "UPDATE sprint_items SET touches_files = ? WHERE id = ?",
         (_json.dumps(["meridian/server.py"]), item["id"]),
@@ -14701,7 +14714,8 @@ async def test_set_sprint_no_guard_when_all_started(db):
     p = await db_module.create_project(db, "sprint-guard-claimed")
     pid = p["id"]
     await db_module.set_goal(db, pid, "initial goal")
-    item = await db_module.add_sprint_item(db, pid, "v1", "in progress")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    item = await db_module.add_sprint_item(db, pid, "v1", "in progress", prospect_bypass=True)
     await db_module.claim_sprint_item(db, pid, item["id"])
 
     res = await srv._dispatch_mcp_tool(
@@ -14774,7 +14788,10 @@ async def test_add_sprint_item_blocks_duplicate_of_in_progress(db):
     """A near-duplicate of an IN_PROGRESS item is blocked too."""
     p = await db_module.create_project(db, "dup-in-progress")
     pid = p["id"]
-    existing = await db_module.add_sprint_item(db, pid, "v1", "Rewrite the installer script")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    existing = await db_module.add_sprint_item(
+        db, pid, "v1", "Rewrite the installer script", prospect_bypass=True
+    )
     await db_module.claim_sprint_item(db, pid, existing["id"])  # -> in_progress
     claimed = await db_module.get_sprint_item(db, existing["id"])
     assert claimed["status"] == "in_progress"
@@ -15345,7 +15362,10 @@ async def test_claim_sprint_item_soft_file_overlap_warning(db):
 
     p = await db_module.create_project(db, "lq-overlap")
     # auto_worktrees is on by default → hard CONFLICT is skipped, soft warning kept.
-    item = await db_module.add_sprint_item(db, p["id"], "v1", "edit server")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "edit server", prospect_bypass=True
+    )
     await db.execute(
         "UPDATE sprint_items SET touches_files = ? WHERE id = ?",
         (json.dumps(["meridian/server.py"]), item["id"]),
@@ -15440,7 +15460,10 @@ async def test_checkpoint_sweeps_in_progress_items(db, tmp_path):
 
     p = await db_module.create_project(db, "drift-ckpt")
     s = await db_module.register_session(db, p["id"], "exec")
-    item = await db_module.add_sprint_item(db, p["id"], "v1", "half-done item")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "half-done item", prospect_bypass=True
+    )
     await db_module.claim_sprint_item(db, p["id"], item["id"])  # -> in_progress
 
     res = await srv._dispatch_mcp_tool(
@@ -15455,7 +15478,10 @@ async def test_start_session_in_progress_reminder(db, tmp_path):
     import meridian.server as srv
 
     p = await db_module.create_project(db, "drift-start")
-    item = await db_module.add_sprint_item(db, p["id"], "v1", "left in progress")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "left in progress", prospect_bypass=True
+    )
     await db_module.claim_sprint_item(db, p["id"], item["id"])  # -> in_progress
 
     payload = await srv._start_session_composite(
@@ -16885,9 +16911,16 @@ async def test_chain_human_complete_does_not_file_hitl_for_ai(db):
     """When a human subtask completes and the next link is AI-owned, no HITL is
     filed — the AI subtask simply un-blocks (depends_on satisfied)."""
     p = await db_module.create_project(db, "chain-human-to-ai")
-    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Create then configure")
-    human = await db_module.add_subtask(db, p["id"], parent["id"], "Human creates", owner="human")
-    ai = await db_module.add_subtask(db, p["id"], parent["id"], "AI configures", owner="ai")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    parent = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Create then configure", prospect_bypass=True
+    )
+    human = await db_module.add_subtask(
+        db, p["id"], parent["id"], "Human creates", owner="human", prospect_bypass=True
+    )
+    ai = await db_module.add_subtask(
+        db, p["id"], parent["id"], "AI configures", owner="ai", prospect_bypass=True
+    )
 
     await db_module.complete_sprint_item(db, p["id"], human["id"])
     hitls = await db_module.list_hitl_requests(db, p["id"])
@@ -16901,10 +16934,17 @@ async def test_chain_human_complete_does_not_file_hitl_for_ai(db):
 async def test_chain_parent_stays_in_progress_until_all_done(db):
     """Parent rolls up to done only after every subtask is terminal."""
     p = await db_module.create_project(db, "chain-rollup")
-    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Full chain")
+    # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
+    parent = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Full chain", prospect_bypass=True
+    )
     await db_module.claim_sprint_item(db, p["id"], parent["id"])  # parent in_progress
-    a = await db_module.add_subtask(db, p["id"], parent["id"], "step A", owner="human")
-    b = await db_module.add_subtask(db, p["id"], parent["id"], "step B", owner="ai")
+    a = await db_module.add_subtask(
+        db, p["id"], parent["id"], "step A", owner="human", prospect_bypass=True
+    )
+    b = await db_module.add_subtask(
+        db, p["id"], parent["id"], "step B", owner="ai", prospect_bypass=True
+    )
 
     await db_module.complete_sprint_item(db, p["id"], a["id"])
     mid = await db_module.get_sprint_item(db, parent["id"])
