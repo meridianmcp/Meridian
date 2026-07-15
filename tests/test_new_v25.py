@@ -1671,15 +1671,15 @@ async def test_delete_tenant_records_removes_rows():
 
     async with db.execute("SELECT COUNT(*) FROM tenants WHERE id = ?", (tid,)) as cur:
         row = await cur.fetchone()
-    assert row[0] == 0
+    assert (row["count"] if isinstance(row, dict) else row[0]) == 0
 
     async with db.execute("SELECT COUNT(*) FROM user_sessions WHERE tenant_id = ?", (tid,)) as cur:
         row = await cur.fetchone()
-    assert row[0] == 0
+    assert (row["count"] if isinstance(row, dict) else row[0]) == 0
 
     async with db.execute("SELECT COUNT(*) FROM api_tokens WHERE tenant_id = ?", (tid,)) as cur:
         row = await cur.fetchone()
-    assert row[0] == 0
+    assert (row["count"] if isinstance(row, dict) else row[0]) == 0
 
 
 def test_dashboard_js_has_export_button():
