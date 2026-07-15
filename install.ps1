@@ -109,6 +109,12 @@ Write-Host ""
 New-Item -Force -ItemType Directory $meridianDir | Out-Null
 
 # ---- RFC 8628 device flow (reused from hooks_install.ps1, item e9f18530) -----
+# NOTE: Get-MeridianDeviceToken and Get-MeridianCachedToken are both defined here,
+# at TOP-LEVEL scope, before any -Component branching. This is required so that
+# both functions are available regardless of which component(s) are being installed.
+# Previously Get-MeridianCachedToken was defined inside the 'if ($installBinary)'
+# block, which meant -Component hooks would fail with "term not recognized" when
+# it tried to call the function. (cee295bd / bug fix)
 function Get-MeridianDeviceToken {
     <#
     .SYNOPSIS
@@ -212,6 +218,34 @@ function Get-MeridianDeviceToken {
     return $null
 }
 
+# ---- cee295bd: reuse an existing valid local token before ANY auth flow ------
+function Get-MeridianCachedToken {
+    <#
+      .SYNOPSIS
+      Return a still-valid sk_meridian_ token already cached on this machine for
+      $MeridianUrl, or $null. Mirrors the client's own ~/.meridian/config.json
+      cache (_read_cached_token in tunnel_client.py): base_url must match and the
+      30-day expiry must not have passed. This lets the installer SKIP the browser
+      device flow when the machine is already authorized, instead of forcing a
+      fresh auth round-trip on every run.
+    #>
+    param([Parameter(Mandatory)][string]$MeridianUrl)
+    $cfg = Join-Path (Join-Path $HOME '.meridian') 'config.json'
+    if (-not (Test-Path -LiteralPath $cfg)) { return $null }
+    try {
+        $data = Get-Content -Raw -LiteralPath $cfg -ErrorAction Stop | ConvertFrom-Json
+    } catch { return $null }
+    $entry = $data.tunnel_token
+    if (-not $entry) { return $null }
+    if ("$($entry.base_url)" -ne "$MeridianUrl") { return $null }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    try { $exp = [int64]$entry.expires_at } catch { return $null }
+    if ($exp -le $now) { return $null }
+    $tok = "$($entry.token)"
+    if ($tok -notmatch '^sk_meridian_') { return $null }
+    return $tok
+}
+
 # =============================================================================
 # COMPONENT: binary -- download + run the meridian-connect tunnel binary.
 # Skipped entirely for -Component hooks (5fb084fe).
@@ -275,34 +309,6 @@ if ($null -eq $userPath) { $userPath = "" }
 if ($userPath -notlike "*$meridianDir*") {
     [Environment]::SetEnvironmentVariable("Path", "$userPath;$meridianDir", "User")
     Write-Host "Added $meridianDir to user PATH (restart terminal to take effect)"
-}
-
-# ---- cee295bd: reuse an existing valid local token before ANY auth flow ------
-function Get-MeridianCachedToken {
-    <#
-      .SYNOPSIS
-      Return a still-valid sk_meridian_ token already cached on this machine for
-      $MeridianUrl, or $null. Mirrors the client's own ~/.meridian/config.json
-      cache (_read_cached_token in tunnel_client.py): base_url must match and the
-      30-day expiry must not have passed. This lets the installer SKIP the browser
-      device flow when the machine is already authorized, instead of forcing a
-      fresh auth round-trip on every run.
-    #>
-    param([Parameter(Mandatory)][string]$MeridianUrl)
-    $cfg = Join-Path (Join-Path $HOME '.meridian') 'config.json'
-    if (-not (Test-Path -LiteralPath $cfg)) { return $null }
-    try {
-        $data = Get-Content -Raw -LiteralPath $cfg -ErrorAction Stop | ConvertFrom-Json
-    } catch { return $null }
-    $entry = $data.tunnel_token
-    if (-not $entry) { return $null }
-    if ("$($entry.base_url)" -ne "$MeridianUrl") { return $null }
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    try { $exp = [int64]$entry.expires_at } catch { return $null }
-    if ($exp -le $now) { return $null }
-    $tok = "$($entry.token)"
-    if ($tok -notmatch '^sk_meridian_') { return $null }
-    return $tok
 }
 
 # ---- Keyless auth: acquire a token via the device flow (73b65117) ------------
