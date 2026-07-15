@@ -960,10 +960,19 @@ class OutputsFtsIndex:
     def search(
         self, query: str, *, limit: int = 10, include_archival: bool = True,
     ) -> list[dict[str, Any]]:
-        """BM25 search over the FTS index.  Best-effort: errors yield []."""
+        """BM25 search over the FTS index.  Best-effort: errors yield [].
+
+        Filtering (``bm25 IS NOT NULL``), ordering (``ORDER BY bm25 DESC``), and
+        row-count limiting (``LIMIT``) are all pushed into the SQL query so that
+        only the top-N matching rows are transferred from DuckDB to Python.  A
+        Python sort is still applied afterwards to honour the archival score
+        penalty (archival rows get bm25 * 0.5) without adding complexity to the
+        SQL.
+        """
         q = (query or "").strip()
         if not q:
             return []
+        safe_limit = max(1, int(limit))
         with self._read_lock:
             try:
                 con = self._connect()
@@ -974,9 +983,12 @@ class OutputsFtsIndex:
                     "SELECT path, content, mtime, sha256, size, generating_script, "
                     "kind, is_archival, canonical_path, csv_columns, json_keys, "
                     "fts_main_outputs_index.match_bm25(path, ?) AS bm25 "
-                    "FROM outputs_index"
+                    "FROM outputs_index "
+                    "WHERE fts_main_outputs_index.match_bm25(path, ?) IS NOT NULL "
+                    "ORDER BY bm25 DESC "
+                    "LIMIT ?"
                 )
-                relation = con.execute(sql, [q])
+                relation = con.execute(sql, [q, q, safe_limit])
                 columns = [c[0] for c in relation.description]
                 fetched = relation.fetchall()
             except Exception:  # noqa: BLE001
@@ -1010,48 +1022,69 @@ class OutputsFtsIndex:
                 "mtime": rec.get("mtime"),
             })
         hits.sort(key=lambda h: h["score"], reverse=True)
-        return hits[: max(1, int(limit))]
+        return hits
 
     def resolve_output(self, file_path: str) -> dict[str, Any] | None:
-        """Exact-match lookup of an output row by file path."""
+        """Exact-match lookup of an output row by file path.
+
+        The WHERE clause is pushed into SQL to avoid a full-table scan.
+        ``_normalize_output_path`` lowercases and forward-slash-normalizes on
+        Windows (``os.path.normcase`` + backslash replacement), so on Windows we
+        apply the same transformation in SQL:
+        ``lower(replace(path, '\\', '/')) = ?`` with the already-normalised
+        target.  On POSIX the stored paths already use forward slashes and are
+        case-sensitive, so a plain equality check suffices.
+        """
         target = _normalize_output_path(file_path)
         if not target:
             return None
+        import sys as _sys
         with self._read_lock:
             try:
                 con = self._connect()
                 self._ensure_schema(con)
-                relation = con.execute(
-                    "SELECT path, content, mtime, sha256, size, generating_script, "
-                    "kind, is_archival, canonical_path, csv_columns, json_keys "
-                    "FROM outputs_index"
-                )
+                if _sys.platform == "win32":
+                    # stored paths have backslashes + mixed case; target is
+                    # already forward-slash + lowercase from normcase.
+                    sql = (
+                        "SELECT path, content, mtime, sha256, size, generating_script, "
+                        "kind, is_archival, canonical_path, csv_columns, json_keys "
+                        "FROM outputs_index "
+                        "WHERE lower(replace(path, '\\', '/')) = ?"
+                    )
+                else:
+                    sql = (
+                        "SELECT path, content, mtime, sha256, size, generating_script, "
+                        "kind, is_archival, canonical_path, csv_columns, json_keys "
+                        "FROM outputs_index "
+                        "WHERE path = ?"
+                    )
+                relation = con.execute(sql, [target])
                 columns = [c[0] for c in relation.description]
-                fetched = relation.fetchall()
+                row = relation.fetchone()
             except Exception:  # noqa: BLE001
                 _log.debug("OutputsFtsIndex.resolve_output failed",
                             exc_info=True)
                 return None
-        for row in fetched:
-            rec = dict(zip(columns, row))
-            if _normalize_output_path(rec.get("path")) == target:
-                return {
-                    "path": rec["path"],
-                    "generating_script": rec.get("generating_script"),
-                    "is_archival": bool(rec.get("is_archival")),
-                    "canonical_path": rec.get("canonical_path"),
-                    "sha256": rec.get("sha256"),
-                    "kind": rec.get("kind"),
-                    "size": rec.get("size"),
-                    "mtime": rec.get("mtime"),
-                    "csv_columns": (
-                        json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
-                    ),
-                    "json_keys": (
-                        json.loads(rec["json_keys"]) if rec.get("json_keys") else None
-                    ),
-                }
-        return None
+        if row is None:
+            return None
+        rec = dict(zip(columns, row))
+        return {
+            "path": rec["path"],
+            "generating_script": rec.get("generating_script"),
+            "is_archival": bool(rec.get("is_archival")),
+            "canonical_path": rec.get("canonical_path"),
+            "sha256": rec.get("sha256"),
+            "kind": rec.get("kind"),
+            "size": rec.get("size"),
+            "mtime": rec.get("mtime"),
+            "csv_columns": (
+                json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+            ),
+            "json_keys": (
+                json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+            ),
+        }
 
     def close(self) -> None:
         with self._write_lock:

@@ -699,3 +699,121 @@ class TestDeterminism:
         # Output order should match sorted path order regardless of input order.
         assert [c["path"] for c in r1["classifications"]] == \
                [c["path"] for c in r2["classifications"]]
+
+
+# ---------------------------------------------------------------------------
+# SQL push-down optimizations: search() and resolve_output()
+# ---------------------------------------------------------------------------
+
+class TestSearchSqlPushdown:
+    """Verify search() and resolve_output() push filtering/sorting/limit into SQL."""
+
+    @duckdb_required
+    def test_search_limit_respected(self, tmp_path: Path) -> None:
+        """search() LIMIT pushed into SQL: only up to `limit` rows returned."""
+        for i in range(8):
+            (tmp_path / f"metric_{i}.csv").write_text(
+                f"metric,value\n{i},{i * 0.1}", encoding="utf-8"
+            )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        idx.rebuild()
+        hits = idx.search("metric", limit=3)
+        assert len(hits) <= 3
+        idx.close()
+
+    @duckdb_required
+    def test_search_returns_only_matches(self, tmp_path: Path) -> None:
+        """search() WHERE bm25 IS NOT NULL: non-matching rows excluded entirely."""
+        (tmp_path / "loss.csv").write_text("epoch,loss\n1,0.5", encoding="utf-8")
+        (tmp_path / "accuracy.csv").write_text("epoch,acc\n1,0.9", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        idx.rebuild()
+        hits = idx.search("loss")
+        # All returned hits must contain 'loss' -- accuracy.csv should not appear.
+        for hit in hits:
+            assert "loss" in hit["path"].lower() or hit["bm25"] > 0
+        # Specifically: accuracy.csv must not appear in the result.
+        paths = [hit["path"] for hit in hits]
+        assert not any("accuracy" in p for p in paths)
+        idx.close()
+
+    @duckdb_required
+    def test_search_no_null_bm25_in_results(self, tmp_path: Path) -> None:
+        """search() must never return hits with bm25=None (SQL filter ensures this)."""
+        for i in range(5):
+            (tmp_path / f"data_{i}.csv").write_text(
+                f"alpha,beta\n{i},x", encoding="utf-8"
+            )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        idx.rebuild()
+        hits = idx.search("alpha", limit=10)
+        for hit in hits:
+            assert hit["bm25"] is not None
+            assert hit["score"] is not None
+        idx.close()
+
+    @duckdb_required
+    def test_search_ordered_by_score_descending(self, tmp_path: Path) -> None:
+        """search() results are sorted by score descending (best match first)."""
+        # File whose name is exactly the query term should score higher than one
+        # where the term only appears in content.
+        (tmp_path / "accuracy.csv").write_text(
+            "accuracy,value\n0.9,0.95", encoding="utf-8"
+        )
+        (tmp_path / "unrelated.csv").write_text(
+            "col_a,col_b\n1,2", encoding="utf-8"
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        idx.rebuild()
+        hits = idx.search("accuracy", limit=10)
+        scores = [h["score"] for h in hits]
+        assert scores == sorted(scores, reverse=True), (
+            f"Results not sorted descending: {scores}"
+        )
+        idx.close()
+
+    @duckdb_required
+    def test_resolve_output_exact_match(self, tmp_path: Path) -> None:
+        """resolve_output() WHERE path = ?: finds indexed file without full scan."""
+        f = tmp_path / "weights.npy"
+        f.write_bytes(b"\x93NUMPY\x01\x00fake_header_data_here")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        idx.rebuild()
+        result = idx.resolve_output(str(f))
+        assert result is not None
+        assert result["kind"] == "metadata_only"
+        idx.close()
+
+    @duckdb_required
+    def test_resolve_output_missing_returns_none(self, tmp_path: Path) -> None:
+        """resolve_output() returns None for a path not in the index."""
+        (tmp_path / "real.csv").write_text("x\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        idx.rebuild()
+        result = idx.resolve_output(str(tmp_path / "nonexistent.csv"))
+        assert result is None
+        idx.close()
+
+    @duckdb_required
+    def test_resolve_output_returns_correct_fields(self, tmp_path: Path) -> None:
+        """resolve_output() returns all expected fields for an indexed CSV."""
+        f = tmp_path / "metrics.csv"
+        f.write_text('epoch,loss\n1,0.5\n2,0.3', encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        idx.rebuild()
+        result = idx.resolve_output(str(f))
+        assert result is not None
+        assert result["kind"] == "text_content"
+        assert result["csv_columns"] == ["epoch", "loss"]
+        assert result["size"] is not None
+        assert result["mtime"] is not None
+        idx.close()
+
+    @duckdb_required
+    def test_resolve_output_empty_index(self, tmp_path: Path) -> None:
+        """resolve_output() on an empty index (no files) returns None gracefully."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        idx.rebuild()
+        result = idx.resolve_output(str(tmp_path / "anything.csv"))
+        assert result is None
+        idx.close()
