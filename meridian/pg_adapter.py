@@ -2479,6 +2479,28 @@ async def _migrate_pg_file_docx_region_claims(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> None:
+    """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
+
+    Creates the sprint_version_descriptions table on existing Postgres DBs.
+    Each (project_id, version) pair carries an auto-generated concise description
+    summarising what that sprint bucket is about. Seeded and refreshed by
+    add_sprint_item in sprint_items.py. CREATE TABLE / CREATE UNIQUE INDEX IF NOT
+    EXISTS → idempotent. Mirrors db.migrations._migrate_sprint_version_descriptions.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sprint_version_descriptions ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    version TEXT NOT NULL,"
+        "    description TEXT NOT NULL,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sprint_version_desc_pv "
+        "ON sprint_version_descriptions(project_id, version)"
+    )
+
+
 # ── Migration registry ──────────────────────────────────────────────────────
 # Ordered tuples consumed by _run_pg_migrations (see init_pg_db). Order is
 # load-bearing and matches the historical call sequence exactly. Defined at
@@ -3018,4 +3040,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_session_activity,
     _migrate_pg_file_docx_region_claims,
     _migrate_pg_connection_events,
+    _migrate_pg_sprint_version_descriptions,
 )

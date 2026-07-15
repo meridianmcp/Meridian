@@ -473,6 +473,188 @@ async def _unique_sprint_nickname(
         nickname = f"{base}-{n}"
 
 
+# ---------------------------------------------------------------------------
+# f9188526 — Sprint version bucket descriptions.
+#
+# Each (project_id, version) pair carries a concise auto-generated summary of
+# what that sprint bucket is about as a whole.  The description is seeded on
+# the first add_sprint_item call for a version and refreshed on every
+# subsequent add so it reflects the full item set, not just the first one.
+# A human can overwrite the description; the next add_sprint_item will
+# regenerate it unless the item set is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _auto_generate_version_description(version: str, titles: list[str]) -> str:
+    """f9188526 — synthesise a concise bucket description from item titles.
+
+    Produces a one-or-two-sentence plain-English summary of what a sprint
+    version bucket is about, derived purely from the item titles already in
+    that bucket.  Intentionally lightweight (no LLM call): the description is
+    generated synchronously at DB write time with a simple keyword-frequency
+    heuristic so it is always available and never blocks.
+
+    Strategy:
+    1. Strip boilerplate prefix words (FEAT/FIX/BUG/CHORE/…) from each title.
+    2. Build a word-frequency map over the cleaned titles, weighting longer
+       words higher (shorter words tend to be connectives / noise).
+    3. Pick the top-3 theme words and form a sentence such as:
+       "v1.2 focuses on <word1>, <word2>, and <word3>."
+    4. Append a count sentence: "Contains N item(s) covering …".
+
+    When the bucket has zero or one title, falls back to a simpler template
+    that avoids repeating the single title verbatim.
+    """
+    # Boilerplate prefixes that appear in item titles but do not describe
+    # the bucket's theme: strip them (case-insensitively) from the front.
+    _STRIP_PREFIXES = (
+        "feat", "fix", "bug", "chore", "refactor", "test", "docs", "style",
+        "perf", "security", "harden", "revert", "wip",
+    )
+    _STOP_WORDS = frozenset({
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "by", "from", "up", "as", "is", "it", "its", "this",
+        "that", "into", "via", "not", "no", "all", "any", "be", "was", "are",
+        "has", "have", "had", "do", "did", "will", "would", "could", "should",
+        "add", "adds", "added", "new", "when", "if", "so", "then", "else",
+        "use", "uses", "used", "using", "make", "makes", "made", "set", "get",
+        "let", "now", "also", "more", "each", "every", "both", "can", "may",
+        "must", "very", "just", "only", "even", "well", "back", "out", "over",
+        "after", "before", "between", "through", "across", "during", "about",
+    })
+
+    n = len(titles)
+    if n == 0:
+        label = version or "this sprint"
+        return f"Sprint bucket '{label}' has no items yet."
+
+    # Clean titles: strip leading prefix tokens.
+    cleaned: list[str] = []
+    for t in titles:
+        words = re.split(r"[\s:_\-]+", t.strip())
+        # Drop leading prefix words (case-insensitive match).
+        while words and words[0].lower().rstrip("!?.,") in _STRIP_PREFIXES:
+            words = words[1:]
+        cleaned.append(" ".join(words))
+
+    if n == 1:
+        label = version or "this sprint"
+        return (
+            f"Sprint bucket '{label}' contains 1 item: {cleaned[0][:120]}."
+        )
+
+    # Word frequency over all cleaned titles, skipping stop words and very
+    # short tokens.  Weight each occurrence by sqrt(word_length) so domain
+    # terms ("authentication", "migration") outrank short connectives.
+    import math as _math  # noqa: PLC0415 — light stdlib, lazy to keep top-level clean
+    freq: dict[str, float] = {}
+    for t in cleaned:
+        words = re.findall(r"[a-zA-Z][a-z]{2,}", t)  # 3+ char, starts uppercase/lower
+        seen_in_title: set[str] = set()
+        for w in words:
+            lw = w.lower()
+            if lw in _STOP_WORDS:
+                continue
+            # De-duplicate within one title so a title that repeats a word
+            # doesn't inflate the global count unfairly.
+            if lw in seen_in_title:
+                continue
+            seen_in_title.add(lw)
+            freq[lw] = freq.get(lw, 0.0) + _math.sqrt(max(len(lw), 1))
+
+    # Pick up to 3 top-frequency words to form the theme description.
+    top = sorted(freq, key=lambda w: (-freq[w], w))[:3]
+
+    label = version or "this sprint"
+    if not top:
+        # Fallback: no meaningful words found (all stop-words / very short).
+        return (
+            f"Sprint bucket '{label}' contains {n} item(s)."
+        )
+
+    if len(top) == 1:
+        theme = top[0]
+    elif len(top) == 2:
+        theme = f"{top[0]} and {top[1]}"
+    else:
+        theme = f"{top[0]}, {top[1]}, and {top[2]}"
+
+    return (
+        f"Sprint bucket '{label}' focuses on {theme}. "
+        f"Contains {n} item(s)."
+    )
+
+
+async def get_sprint_version_description(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str,
+) -> str | None:
+    """f9188526 — fetch the stored description for a sprint version bucket.
+
+    Returns ``None`` when no description has been stored yet.
+    """
+    async with db.execute(
+        "SELECT description FROM sprint_version_descriptions "
+        "WHERE project_id = ? AND version = ?",
+        (project_id, version),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return (row["description"] if isinstance(row, dict) else row[0]) or None
+
+
+async def upsert_sprint_version_description(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str,
+    description: str,
+) -> None:
+    """f9188526 — create or replace the description for a sprint version bucket.
+
+    Uses INSERT OR REPLACE (SQLite) so the call is always idempotent.
+    ``updated_at`` is refreshed on every upsert.
+    """
+    iid = _new_id()
+    await db.execute(
+        "INSERT INTO sprint_version_descriptions "
+        "(id, project_id, version, description, updated_at) "
+        "VALUES (?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(project_id, version) DO UPDATE SET "
+        "description = excluded.description, updated_at = datetime('now')",
+        (iid, project_id, version, description),
+    )
+    await db.commit()
+
+
+async def get_all_sprint_version_descriptions(
+    db: aiosqlite.Connection,
+    project_id: str,
+) -> dict[str, str]:
+    """f9188526 — fetch all stored version descriptions for a project.
+
+    Returns a ``{version: description}`` mapping (empty dict when none exist).
+    Used by get_sprint_progress to include version context in the progress
+    response without a per-version round-trip.
+    """
+    async with db.execute(
+        "SELECT version, description FROM sprint_version_descriptions "
+        "WHERE project_id = ?",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    result: dict[str, str] = {}
+    for row in rows:
+        if isinstance(row, dict):
+            v, d = row.get("version"), row.get("description")
+        else:
+            v, d = row[0], row[1]
+        if v and d:
+            result[str(v)] = str(d)
+    return result
+
+
 async def add_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -598,6 +780,19 @@ async def add_sprint_item(
     _invalidate_sprint_items_cache(project_id)
     # ITEM 6 — live push so dashboards refresh the sprint board without polling.
     _publish_project_event(project_id, "sprint_item_added", {"item_id": iid})
+    # f9188526 — auto-generate (or refresh) the version bucket description.
+    # Runs after the item is committed so the full new item set is visible.
+    # Guarded: a description failure NEVER blocks or changes the returned item.
+    if version:
+        try:
+            _all_for_version = await get_sprint_items(db, project_id, version=version)
+            _ver_titles = [
+                it.get("title", "") for it in _all_for_version if it.get("title")
+            ]
+            _new_desc = _auto_generate_version_description(version, _ver_titles)
+            await upsert_sprint_version_description(db, project_id, version, _new_desc)
+        except Exception:  # noqa: BLE001 — description generation must never block
+            pass
     return item
 
 

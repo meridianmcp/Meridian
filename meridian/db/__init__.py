@@ -1053,6 +1053,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_session_activity(db)
     await _migrate_connection_events(db)
     await _migrate_redis_overage_fields(db)
+    await _migrate_sprint_version_descriptions(db)
     return db
 
 
@@ -9740,6 +9741,9 @@ from .sprint_items import (  # noqa: F401
     get_sprint_items_cached,
     get_sprint_items_for_resource,
     get_sprint_items_page,
+    get_sprint_version_description,
+    get_all_sprint_version_descriptions,
+    upsert_sprint_version_description,
     handle_session_stall,
     infer_active_sprint_version,
     merge_sprint_items,
@@ -9784,6 +9788,7 @@ from .sprint_items import (  # noqa: F401
     _sprint_priority_order_sql,
     _stalled_item_ids_for_session,
     _text_calls_for_test_coverage,
+    _auto_generate_version_description,
     _title_word_overlap,
     _title_word_set,
     _unique_sprint_nickname,

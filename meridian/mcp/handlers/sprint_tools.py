@@ -444,6 +444,17 @@ async def handle_get_sprint_progress(
     _bc = await _board_change_for_session(db, args["project_id"], args.get("session_id"))
     if _bc:
         _resp_progress["board_change"] = _bc
+    # f9188526 — include version bucket descriptions so a caller sees the
+    # concise summary for each version without a separate request.
+    # Guarded: a DB failure here must never break the progress poll.
+    try:
+        _ver_descs = await db_module.get_all_sprint_version_descriptions(
+            db, args["project_id"]
+        )
+        if _ver_descs:
+            _resp_progress["version_descriptions"] = _ver_descs
+    except Exception:  # noqa: BLE001 — descriptions are informational only
+        pass
     # 5abf3e12 — when scoped to a session, report that session's live goal
     # compliance (N items it took on via actor= vs M complete_sprint_item()'d)
     # so an executor can see mid-run whether it's on track to fully complete
