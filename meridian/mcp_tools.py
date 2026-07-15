@@ -203,7 +203,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."},
-         "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming."}},
+         "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming."},
+         "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."}},
          "required": []}},
     {"name": "load_handoff", "description":
         "Read-only: Return the latest stored handoff for a project as an MCP tool "

@@ -2859,14 +2859,20 @@ async def generate_handoff(
     # handoff can reference fresh session_summary values. 4c7cd788 — the delta
     # render never reads session_summary, so skip this network fan-out for delta
     # (a slow summarizer here was one of the mode='delta' hang seams).
-    if mode != "delta":
-        for s in sessions:
+    # 65c8b426 — Part 3: parallelize the fan-out with asyncio.gather instead of
+    # serial await-in-a-loop. With N active sessions this was N×Haiku-latency
+    # serial wall time (5 sessions × ~10s each = ~50s just in summaries before
+    # any other Haiku call). gather() runs all N concurrently; total wall time
+    # drops to ~1 Haiku call latency regardless of session count. Each coro is
+    # individually guarded so a single summarizer failure never kills the rest.
+    # Also skip summarization when _ai_disabled (skip_ai_summary=True or delta).
+    if not _ai_disabled:
+        async def _safe_summarize(sid: str) -> None:
             try:
-                await db_module.summarize_session(
-                    db, s["id"], summarizer=summarizer
-                )
+                await db_module.summarize_session(db, sid, summarizer=summarizer)
             except Exception:  # noqa: BLE001 — never break handoff on summary fail
-                continue
+                pass
+        await asyncio.gather(*(_safe_summarize(s["id"]) for s in sessions))
     tasks = await db_module.get_tasks(db, project_id, limit=50)
 
     session_names = {s["id"]: s["name"] for s in sessions}

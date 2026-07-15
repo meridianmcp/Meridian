@@ -2079,6 +2079,15 @@ async def _handle_task_tools(
             )
         except Exception:  # noqa: BLE001
             _graph_searcher = None
+        # 65c8b426 — Part 2: default skip_ai_summary=True for the MCP tool path
+        # so the 3 serial Haiku calls (summarize_session fan-out, ai_summary blurb,
+        # sprint retrospective) are skipped unless the caller explicitly opts in.
+        # They are narrative sugar; the executor-critical content (goal, pending
+        # items, tasks, decisions) has no AI dependency. Callers can pass
+        # skip_ai_summary=false to get the rich version when they have budget.
+        _skip_ai = args.get("skip_ai_summary", True)
+        if isinstance(_skip_ai, str):
+            _skip_ai = _skip_ai.lower() not in ("false", "0", "no")
         _handoff_amended = False
         # 45f519a0 — pass force_include_ids through so the caller can re-include
         # specific deferred items in this handoff's pending list for one run.
@@ -2086,6 +2095,7 @@ async def _handle_task_tools(
         _raw_fii = args.get("force_include_ids")
         if isinstance(_raw_fii, list):
             _force_include_ids = [str(x) for x in _raw_fii if x]
+        _handoff_degraded = False
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -2098,14 +2108,24 @@ async def _handle_task_tools(
                     graph_searcher=_graph_searcher,
                     identity=_resolve_caller_identity(tenant),
                     force_include_ids=_force_include_ids,
+                    skip_ai_summary=_skip_ai,
                 ),
-                timeout=90.0,
+                # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
+                # margin. The real fix (skip_ai_summary=True default) eliminates the
+                # Haiku calls that caused the live timeout; the higher ceiling is a
+                # backstop for DB-heavy projects.
+                timeout=180.0,
             )
         except asyncio.TimeoutError:
             path, content = await handoff_module_local._generate_handoff_l0(
                 db, args["project_id"], data_dir
             )
-            mode = "full"
+            # 65c8b426 — Part 1: honest fallback — report the real mode so callers
+            # can detect they got the emergency 4-field version, not a full handoff.
+            # Previously "full" was hardcoded here, making a degraded handoff
+            # indistinguishable from a successful one (confirmed live 2x tonight).
+            mode = "l0_fallback"
+            _handoff_degraded = True
         # 99e50a1d — surface a machine-readable staleness flag so the dashboard /
         # caller can offer a one-click sync when the project's stored executor
         # rules predate the current standard.
@@ -2165,6 +2185,10 @@ async def _handle_task_tools(
             "file_path": path,
             "content": _plain_content,
             "mode": mode,
+            # 65c8b426 — Part 1: degraded=True when the full handoff timed out and
+            # the emergency L0 fallback was used instead. Callers should surface
+            # this visibly rather than treating it as a normal full handoff.
+            "degraded": _handoff_degraded,
             "amended": _handoff_amended,
             "template_stale": _tpl_stale,
             "insight_hints": _insight_hints[:5],
