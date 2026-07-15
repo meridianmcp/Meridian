@@ -31,6 +31,10 @@ from meridian.db import (  # noqa: PLC0415
     get_project,
     add_project_note,
     serialize_touches_resources,
+    _unique_proposal_slug,
+    _unique_proposal_nickname,
+    _sprint_item_slug_base,
+    _sprint_item_nickname_base,
 )
 
 
@@ -341,12 +345,24 @@ async def add_workspace_proposal(
     """Insert a workspace_proposals row with status='raw'.
 
     Workspace-scoped by ``tenant_id`` (like ``add_workspace_note``). These are
-    human-authored flashes of insight — NOT auto-claimable by executors."""
+    human-authored flashes of insight — NOT auto-claimable by executors.
+
+    6fb48898 — a kebab-cased ``slug`` and a short memorable ``nickname`` are
+    auto-generated from the title, unique per tenant scope, mirroring the
+    sprint_items slug/nickname pattern (ae87699d).
+    """
     pid = _new_id()
+    # 6fb48898 — derive human-readable secondary keys from the title.
+    _slug = await _unique_proposal_slug(
+        db, tenant_id, _sprint_item_slug_base(title)
+    )
+    _nickname = await _unique_proposal_nickname(
+        db, tenant_id, _sprint_item_nickname_base(title, pid)
+    )
     await db.execute(
-        "INSERT INTO workspace_proposals (id, title, body, tags, tenant_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (pid, title, body, tags, tenant_id),
+        "INSERT INTO workspace_proposals (id, title, body, tags, tenant_id, slug, nickname) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (pid, title, body, tags, tenant_id, _slug, _nickname),
     )
     await db.commit()
     async with db.execute(

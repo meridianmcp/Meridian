@@ -1061,6 +1061,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_version_descriptions(db)
     await _migrate_workspace_settings_active_session_threshold(db)
     await _migrate_sprint_item_sprint_name(db)
+    await _migrate_proposal_slug_nickname(db)
+    await _migrate_decision_slug_nickname(db)
+    await _migrate_note_nickname(db)
     return db
 
 
@@ -6614,17 +6617,29 @@ async def pin_decision(
     priority (366317e9) is one of urgent | normal | low (default normal);
     invalid values normalize to 'normal'. It weights dashboard ordering and the
     decisions injected into start_session / generate_handoff context.
+
+    6fb48898 — a kebab-cased ``slug`` and a short memorable ``nickname`` are
+    auto-generated from the title, unique per project, mirroring sprint_items.
     """
     did = _new_id()
     priority = _normalize_decision_priority(priority)
     # 2b39549d — an assumption starts life 'unvalidated'; no assumption → NULL.
     _assump = (assumption or "").strip() or None
     _assump_status = "unvalidated" if _assump else None
+    # 6fb48898 — derive human-readable secondary keys from the title.
+    _slug = await _unique_decision_slug(
+        db, project_id, _sprint_item_slug_base(title)
+    )
+    _nickname = await _unique_decision_nickname(
+        db, project_id, _sprint_item_nickname_base(title, did)
+    )
     await db.execute(
         "INSERT INTO decisions_pinned "
-        "(id, project_id, title, body, category, priority, assumption, assumption_status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (did, project_id, title, body, category, priority, _assump, _assump_status),
+        "(id, project_id, title, body, category, priority, assumption, assumption_status, "
+        "slug, nickname) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (did, project_id, title, body, category, priority, _assump, _assump_status,
+         _slug, _nickname),
     )
     await db.commit()
     # ITEM 6 — live push so the constitution view refreshes without polling.
@@ -7738,6 +7753,141 @@ async def _unique_note_slug(
         slug = f"{base}-{n}"
 
 
+async def _unique_note_nickname(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the nickname is taken
+    in this project. Mirrors _unique_sprint_nickname for project_notes.
+    """
+    nickname = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM project_notes WHERE project_id = ? AND nickname = ?",
+            (project_id, nickname),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return nickname
+        n += 1
+        nickname = f"{base}-{n}"
+
+
+async def _unique_decision_slug(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the slug is taken in
+    this project's decisions_pinned table. Unique per project.
+    """
+    slug = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM decisions_pinned WHERE project_id = ? AND slug = ?",
+            (project_id, slug),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
+async def _unique_decision_nickname(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the nickname is taken
+    in this project's decisions_pinned table. Unique per project.
+    """
+    nickname = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM decisions_pinned WHERE project_id = ? AND nickname = ?",
+            (project_id, nickname),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return nickname
+        n += 1
+        nickname = f"{base}-{n}"
+
+
+async def _unique_proposal_slug(
+    db: aiosqlite.Connection,
+    tenant_id: str | None,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the slug is taken in
+    this tenant's workspace_proposals table. Unique per tenant (NULL tenant
+    treated as its own scope to match the workspace_proposals tenancy model).
+    """
+    slug = base
+    n = 1
+    while True:
+        if tenant_id is not None:
+            async with db.execute(
+                "SELECT id FROM workspace_proposals WHERE tenant_id = ? AND slug = ?",
+                (tenant_id, slug),
+            ) as cur:
+                row = await cur.fetchone()
+        else:
+            async with db.execute(
+                "SELECT id FROM workspace_proposals WHERE tenant_id IS NULL AND slug = ?",
+                (slug,),
+            ) as cur:
+                row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
+async def _unique_proposal_nickname(
+    db: aiosqlite.Connection,
+    tenant_id: str | None,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """6fb48898 — return ``base``, or base-2/base-3/… if the nickname is taken
+    in this tenant's workspace_proposals table. Mirrors _unique_proposal_slug.
+    """
+    nickname = base
+    n = 1
+    while True:
+        if tenant_id is not None:
+            async with db.execute(
+                "SELECT id FROM workspace_proposals WHERE tenant_id = ? AND nickname = ?",
+                (tenant_id, nickname),
+            ) as cur:
+                row = await cur.fetchone()
+        else:
+            async with db.execute(
+                "SELECT id FROM workspace_proposals WHERE tenant_id IS NULL AND nickname = ?",
+                (nickname,),
+            ) as cur:
+                row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return nickname
+        n += 1
+        nickname = f"{base}-{n}"
+
+
 async def add_project_note(
     db: aiosqlite.Connection,
     project_id: str,
@@ -7772,6 +7922,9 @@ async def add_project_note(
     5a5bba43 — a kebab-cased ``slug`` is generated from the title and stored,
     unique per project (collisions get a ``-2``/``-3``/… suffix). The slug is the
     handle ``read_note(slug)`` and the dashboard's ``mem:name`` links resolve.
+
+    6fb48898 — a short memorable ``nickname`` (1-2 words) is also generated and
+    stored, unique per project, using the same algorithm as sprint_items.nickname.
     """
     if kind not in ("wiki", "insight", "reference", "code", "document"):
         kind = None
@@ -7791,12 +7944,16 @@ async def add_project_note(
         stored_symbol = None  # a symbol is meaningless without a file anchor
     nid = _new_id()
     slug = await _unique_note_slug(db, project_id, _slugify_note(title))
+    # 6fb48898 — auto-generate a short memorable nickname alongside the slug.
+    nickname = await _unique_note_nickname(
+        db, project_id, _sprint_item_nickname_base(title, nid)
+    )
     await db.execute(
         "INSERT INTO project_notes "
-        "(id, project_id, title, body, tags, note_kind, priority, slug, "
+        "(id, project_id, title, body, tags, note_kind, priority, slug, nickname, "
         "file_path, symbol, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (nid, project_id, title, body, tags, kind, priority, slug,
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (nid, project_id, title, body, tags, kind, priority, slug, nickname,
          stored_path, stored_symbol, stored_source),
     )
     await db.commit()

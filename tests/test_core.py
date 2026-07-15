@@ -7450,10 +7450,13 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_version_descriptions",
         "_migrate_pg_workspace_settings_active_session_threshold",
         "_migrate_pg_sprint_item_sprint_name",
+        "_migrate_pg_proposal_slug_nickname",
+        "_migrate_pg_decision_slug_nickname",
+        "_migrate_pg_note_nickname",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 105
+    assert len(allnames) == len(set(allnames)) == 108
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -18210,3 +18213,133 @@ async def test_handoff_force_include_ids_unknown_item_is_ignored(db, tmp_path):
         force_include_ids=["nonexistent-id-00000000"],
     )
     assert "Real task" in content
+
+
+# ---------------------------------------------------------------------------
+# 6fb48898 — slug/nickname generation extended to decisions, notes, proposals
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pin_decision_generates_slug_and_nickname(db):
+    """pin_decision auto-populates slug and nickname from the title."""
+    p = await db_module.create_project(db, "dec-slug-test")
+    d = await db_module.pin_decision(
+        db, p["id"], "Use psycopg3 over asyncpg", "psycopg3 avoids DLL issues"
+    )
+    assert d.get("slug"), "slug should be set"
+    assert d.get("nickname"), "nickname should be set"
+    assert "psycopg3" in d["slug"]
+    # slug should be kebab-cased, nickname should be short (1-2 words)
+    assert d["slug"] == d["slug"].lower()
+    assert d["nickname"].count("-") <= 1
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_slug_unique_per_project(db):
+    """Duplicate title slugs in the same project get a numeric suffix."""
+    p = await db_module.create_project(db, "dec-slug-dedup")
+    d1 = await db_module.pin_decision(
+        db, p["id"], "psycopg3 choice", "reason a"
+    )
+    d2 = await db_module.pin_decision(
+        db, p["id"], "psycopg3 choice", "reason b"
+    )
+    assert d1["slug"] != d2["slug"]
+    assert d2["slug"].startswith(d1["slug"])  # collision → numeric suffix
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_nickname_unique_per_project(db):
+    """Duplicate nicknames in the same project get a numeric suffix."""
+    p = await db_module.create_project(db, "dec-nick-dedup")
+    d1 = await db_module.pin_decision(
+        db, p["id"], "psycopg3 choice", "body"
+    )
+    d2 = await db_module.pin_decision(
+        db, p["id"], "psycopg3 choice identical", "body"
+    )
+    # Both should have nicknames, and they should differ
+    assert d1["nickname"] and d2["nickname"]
+    assert d1["nickname"] != d2["nickname"]
+
+
+@pytest.mark.asyncio
+async def test_add_project_note_generates_nickname(db):
+    """add_project_note auto-populates both slug and nickname from the title."""
+    p = await db_module.create_project(db, "note-nick-test")
+    n = await db_module.add_project_note(
+        db, p["id"], "Redis connection pooling gotcha", "body"
+    )
+    assert n.get("slug"), "slug should be set"
+    assert n.get("nickname"), "nickname should be set"
+    # nickname should be short (1-2 words)
+    assert n["nickname"].count("-") <= 1
+    assert "redis" in n["slug"] or "connection" in n["slug"]
+
+
+@pytest.mark.asyncio
+async def test_add_project_note_nickname_unique_per_project(db):
+    """Duplicate nicknames in the same project get a numeric suffix."""
+    p = await db_module.create_project(db, "note-nick-dedup")
+    n1 = await db_module.add_project_note(
+        db, p["id"], "redis pooling gotcha", "body"
+    )
+    n2 = await db_module.add_project_note(
+        db, p["id"], "redis pooling gotcha identical words", "body"
+    )
+    assert n1["nickname"] and n2["nickname"]
+    assert n1["nickname"] != n2["nickname"]
+
+
+@pytest.mark.asyncio
+async def test_add_workspace_proposal_generates_slug_and_nickname(db):
+    """add_workspace_proposal auto-populates slug and nickname from the title."""
+    prop = await db_module.add_workspace_proposal(
+        db, "Add multi-tenant billing dashboard", "detailed body", tenant_id="t1"
+    )
+    assert prop.get("slug"), "slug should be set"
+    assert prop.get("nickname"), "nickname should be set"
+    assert "multi" in prop["slug"] or "billing" in prop["slug"]
+    assert prop["slug"] == prop["slug"].lower()
+    assert prop["nickname"].count("-") <= 1
+
+
+@pytest.mark.asyncio
+async def test_add_workspace_proposal_slug_unique_per_tenant(db):
+    """Duplicate title slugs for the same tenant get a numeric suffix."""
+    p1 = await db_module.add_workspace_proposal(
+        db, "batch export feature", "body", tenant_id="t2"
+    )
+    p2 = await db_module.add_workspace_proposal(
+        db, "batch export feature", "body", tenant_id="t2"
+    )
+    assert p1["slug"] != p2["slug"]
+    assert p2["slug"].startswith(p1["slug"])
+
+
+@pytest.mark.asyncio
+async def test_add_workspace_proposal_slug_isolated_across_tenants(db):
+    """The same slug can exist for different tenants without collision."""
+    p_a = await db_module.add_workspace_proposal(
+        db, "batch export feature", "body", tenant_id="ta"
+    )
+    p_b = await db_module.add_workspace_proposal(
+        db, "batch export feature", "body", tenant_id="tb"
+    )
+    # Different tenants → same base slug is fine
+    assert p_a["slug"] == p_b["slug"]
+
+
+@pytest.mark.asyncio
+async def test_supersede_pinned_decision_inherits_slug_generation(db):
+    """supersede_pinned_decision creates a new decision via pin_decision which
+    must also get a slug and nickname."""
+    p = await db_module.create_project(db, "dec-supersede-slug")
+    old = await db_module.pin_decision(
+        db, p["id"], "Use asyncpg", "reason a"
+    )
+    new = await db_module.supersede_pinned_decision(
+        db, old["id"], "Use psycopg3 instead", "asyncpg had DLL issues"
+    )
+    assert new.get("slug"), "superseding decision should have slug"
+    assert new.get("nickname"), "superseding decision should have nickname"

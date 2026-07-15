@@ -3030,6 +3030,47 @@ async def _migrate_pg_sprint_item_sprint_name(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_proposal_slug_nickname(conn: PostgresConnection) -> None:
+    """6fb48898 — workspace_proposals.slug + .nickname: human-referenceable
+    secondary keys derived from the proposal title at creation time.
+
+    Mirrors db._migrate_proposal_slug_nickname. ADD COLUMN IF NOT EXISTS is
+    idempotent; both columns are nullable so existing rows are unaffected.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS slug TEXT;"
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS nickname TEXT"
+    )
+
+
+async def _migrate_pg_decision_slug_nickname(conn: PostgresConnection) -> None:
+    """6fb48898 — decisions_pinned.slug + .nickname: human-referenceable
+    secondary keys derived from the decision title at creation time.
+
+    Mirrors db._migrate_decision_slug_nickname. ADD COLUMN IF NOT EXISTS is
+    idempotent; both columns are nullable so existing rows are unaffected.
+    """
+    await conn.executescript(
+        "ALTER TABLE decisions_pinned ADD COLUMN IF NOT EXISTS slug TEXT;"
+        "ALTER TABLE decisions_pinned ADD COLUMN IF NOT EXISTS nickname TEXT"
+    )
+
+
+async def _migrate_pg_note_nickname(conn: PostgresConnection) -> None:
+    """6fb48898 — project_notes.nickname: short memorable secondary key to
+    complement the existing slug column.
+
+    project_notes already has slug (added by _migrate_pg_note_slug). This adds
+    the companion nickname column matching the sprint_items pattern.
+
+    Mirrors db._migrate_note_nickname. ADD COLUMN IF NOT EXISTS is idempotent;
+    nullable so existing rows are unaffected.
+    """
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS nickname TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3101,4 +3142,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_version_descriptions,
     _migrate_pg_workspace_settings_active_session_threshold,
     _migrate_pg_sprint_item_sprint_name,
+    _migrate_pg_proposal_slug_nickname,
+    _migrate_pg_decision_slug_nickname,
+    _migrate_pg_note_nickname,
 )
