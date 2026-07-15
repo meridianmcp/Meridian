@@ -192,6 +192,7 @@ def test_failover_status_default_false(client, monkeypatch):
     assert r.json() == {"is_failover": False}
 
 
+@pytest.mark.sqlite_only  # checks db=="memory"; on PG run MERIDIAN_DB_URL is set so db=="postgres"
 def test_config_self_hosted_memory_db(client):
     r = client.get("/config")
     assert r.status_code == 200
