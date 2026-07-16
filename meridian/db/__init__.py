@@ -1768,13 +1768,58 @@ async def set_project_notify_email(
     await db.commit()
 
 
+def _is_no_such_table(exc: Exception) -> bool:
+    """Return True when ``exc`` indicates the target table does not exist.
+
+    Used by :func:`delete_project` to silently skip tables that were added in a
+    later schema version so the delete remains forward/backward-compatible across
+    SQLite and Postgres.  Any OTHER exception (FK violation, syntax error, …) is
+    NOT swallowed — it propagates so the caller sees a real failure.
+
+    SQLite raises ``sqlite3.OperationalError`` (exposed as
+    ``aiosqlite.OperationalError``) with the text "no such table: <name>".
+    Postgres raises ``psycopg.errors.UndefinedTable`` (a subclass of
+    ``psycopg.ProgrammingError``).  We check Postgres via a lazy import so this
+    module stays importable in SQLite-only environments without psycopg installed.
+    """
+    if isinstance(exc, aiosqlite.OperationalError) and "no such table" in str(exc).lower():
+        return True
+    try:
+        import psycopg.errors as _pe  # type: ignore[import]
+        if isinstance(exc, _pe.UndefinedTable):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
 async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
     """Delete a project and all associated data.
 
     Raises ``ValueError`` if any tasks are currently ``in_progress`` so
     callers can surface a warning before proceeding.  The delete is
-    unconditional for all other data (goal_states, sessions, task_log,
-    sprint_items).
+    unconditional for all other data.
+
+    Deletion order follows FK dependencies (child-before-parent).
+
+    Session-scoped children first (must precede ``sessions`` deletion):
+      file_read_claims, session_findings, session_messages,
+      session_graph_snapshots, session_notes, executor_runs,
+      file_locks, resource_locks, file_symbol_claims,
+      file_docx_region_claims, file_patch_counters, session_activity,
+      active_worktrees, hitl_requests, task_log.
+
+    Then sessions, then remaining project-scoped children
+      (goal_states, sprint_item_pointers, sprint_items,
+       decisions_pinned, insights, project_notes, handoffs,
+       codebase_graph_entities, sprint_version_descriptions),
+    and finally the project row itself.
+
+    Each DELETE is wrapped in a narrow exception guard that silently skips
+    only a "table does not exist" error (tables added in later schema versions
+    may not be present on older installs).  Any OTHER exception — FK violation,
+    constraint error, connection failure — is re-raised so the caller sees a
+    real failure rather than a silent false-success.
     """
     async with db.execute(
         "SELECT COUNT(*) as cnt FROM task_log "
@@ -1786,23 +1831,82 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
     if count:
         raise ValueError(f"{count} task(s) in_progress — complete or cancel first")
 
-    # Cascade delete child rows first, then the project itself.
-    # Order matters: hitl_requests FK -> sessions, so hitl first.
-    for stmt, params in [
+    # Ordered child-before-parent.  Tables with session_id FK must come before
+    # ``sessions``; tables with sprint_item_id references before ``sprint_items``;
+    # all project children before ``projects``.
+    #
+    # Tables without an explicit FK (session_findings, session_messages,
+    # file_read_claims, session_graph_snapshots, handoffs,
+    # codebase_graph_entities, sprint_item_pointers) are included here because
+    # they carry project_id / session_id data that would otherwise become orphaned
+    # ghost rows invisible to the rest of the system.
+    #
+    # ``sessions_archived`` is intentionally NOT present — it was never a real
+    # table; the archived status lives in the ``sessions`` table itself.
+    stmts = [
+        # --- session-scoped children (delete before sessions) ---
+        # file_read_claims has no explicit FK but is session-scoped (parallel primitives).
+        ("DELETE FROM file_read_claims WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        # session_findings / session_messages are project-scoped but also session-linked.
+        ("DELETE FROM session_findings WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM session_messages WHERE project_id = ?", (project_id,)),
+        # session_graph_snapshots: project_id + session_id columns, no explicit FK.
+        ("DELETE FROM session_graph_snapshots WHERE project_id = ?", (project_id,)),
+        # ON DELETE CASCADE session children — explicit for clarity and cross-backend safety.
+        ("DELETE FROM session_notes WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM executor_runs WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM file_locks WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM resource_locks WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM file_symbol_claims WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM file_docx_region_claims WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM file_patch_counters WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM session_activity WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        # active_worktrees: FK → sessions(id) + projects(id).
+        ("DELETE FROM active_worktrees WHERE project_id = ?", (project_id,)),
+        # hitl_requests: FK → projects(id) ON DELETE CASCADE + sessions(id).
         ("DELETE FROM hitl_requests WHERE project_id = ?", (project_id,)),
-        ("DELETE FROM sprint_items WHERE project_id = ?", (project_id,)),
+        # task_log: FK → sessions(id) + projects(id).
         ("DELETE FROM task_log WHERE project_id = ?", (project_id,)),
+        # --- sessions ---
         ("DELETE FROM sessions WHERE project_id = ?", (project_id,)),
-        ("DELETE FROM sessions_archived WHERE project_id = ?", (project_id,)),
+        # --- remaining project-scoped children ---
         ("DELETE FROM goal_states WHERE project_id = ?", (project_id,)),
+        # sprint_item_pointers references sprint_item_id — delete before sprint_items.
+        ("DELETE FROM sprint_item_pointers WHERE project_id = ?", (project_id,)),
+        # sprint_items has a self-referential parent_id FK; deleting all rows for one
+        # project at once resolves the cycle without ordering between rows.
+        ("DELETE FROM sprint_items WHERE project_id = ?", (project_id,)),
         ("DELETE FROM decisions_pinned WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM insights WHERE project_id = ?", (project_id,)),
         ("DELETE FROM project_notes WHERE project_id = ?", (project_id,)),
+        # handoffs: project_id TEXT (no explicit FK), plain delete.
+        ("DELETE FROM handoffs WHERE project_id = ?", (project_id,)),
+        # codebase_graph_entities: project_id TEXT (no explicit FK).
+        ("DELETE FROM codebase_graph_entities WHERE project_id = ?", (project_id,)),
+        # sprint_version_descriptions: FK → projects(id) ON DELETE CASCADE.
+        ("DELETE FROM sprint_version_descriptions WHERE project_id = ?", (project_id,)),
+        # --- project row itself ---
         ("DELETE FROM projects WHERE id = ?", (project_id,)),
-    ]:
+    ]
+
+    for stmt, params in stmts:
         try:
             await db.execute(stmt, params)
-        except Exception:  # noqa: BLE001 — table may not exist in older schemas
-            pass
+        except Exception as exc:  # noqa: BLE001
+            if _is_no_such_table(exc):
+                # Table added in a later schema version — safe to skip on older installs.
+                _log.debug("delete_project: skipping missing table in: %s", stmt)
+            else:
+                # Real error (FK violation, connection failure, …) — propagate.
+                raise
     await db.commit()
 
 
