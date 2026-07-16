@@ -33,10 +33,20 @@ _MERIDIAN_DOCS_LOCAL_PATH: str = str(
     Path(__file__).parent.parent / "extensions" / "meridian-docs"
 )
 
+# 469d89b4 — meridian-outputs lives in the local extensions/ directory; it is NOT
+# published to PyPI, so `uvx meridian-outputs` (bare package name) fails to install.
+# Use `uvx --from <local-path> meridian-outputs-mcp` to run from the checked-out source.
+# The entry-point is "meridian-outputs-mcp" (NOT "meridian-outputs") for the same
+# uvx name-collision reason documented in 58a044c7 above — see extensions/meridian-
+# outputs/pyproject.toml [project.scripts] for the full rationale.
+_MERIDIAN_OUTPUTS_LOCAL_PATH: str = str(
+    Path(__file__).parent.parent / "extensions" / "meridian-outputs"
+)
+
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
 # another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero")
+SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
@@ -56,8 +66,13 @@ DEFAULT_DOCS_PORT = 8818
 # 39c117b1 — zotero-mcp slot: citation/reference-manager resolution against the
 # user's LOCAL Zotero API (`uvx zotero-mcp`, env ZOTERO_LOCAL=true), bridged the
 # same automatic way as docx-mcp/meridian-docs. Port 8819 sits between docs
-# (8818) and the custom auto-assign start (8820).
+# (8818) and the outputs slot (8820).
 DEFAULT_ZOTERO_PORT = 8819
+# 469d89b4 — meridian-outputs slot: local BM25 outputs index (CSV/JSON/NPY) via
+# `uvx --from <local-path> meridian-outputs-mcp`. Port 8820 sits just after
+# zotero (8819) and was previously the custom auto-assign start; _CUSTOM_PORT_START
+# is bumped to 8821 below so auto-assigned custom ports never collide with this slot.
+DEFAULT_OUTPUTS_PORT = 8820
 
 # 8fb69d54 — 4 pre-allocated custom slots (p0-p3) on ports 8814-8817 so a custom
 # plugin bound to a slot gets a real server route (/tunnel-p0 … /tunnel-p3) and
@@ -269,6 +284,34 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "description": "Citation / reference-manager resolution against the local Zotero API (zotero-mcp)",
         "description_overrides": {},
     },
+    {
+        # 469d89b4 — meridian-outputs: local BM25 outputs index (CSV/JSON/NPY),
+        # launched via `uvx --from <local-path> meridian-outputs-mcp`. Provides
+        # search_outputs, annotate_outputs, classify_outputs, resolve_figure_output,
+        # npy_metadata, and file_fingerprint — all purely local, no hosted call.
+        # 469d89b4 — NOT published to PyPI; spawn from the local extensions/
+        # meridian-outputs directory via `uvx --from` so this works out-of-the-box
+        # without a separate PyPI publish step.
+        # The entry-point is "meridian-outputs-mcp" (NOT "meridian-outputs") for the
+        # same uvx name-collision reason documented in 58a044c7: when command name ==
+        # package name, uvx attempts a PyPI lookup after --from install and fails.
+        "name": "meridian-outputs",
+        "slot": "outputs",
+        "port": DEFAULT_OUTPUTS_PORT,
+        "url_prefix": "/outputs",
+        "enabled": False,
+        "builtin": True,
+        "core": False,
+        "command": ["uvx", "--from", _MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp"],
+        "env": {},
+        # meridian-outputs exposes bare tool names (search_outputs, annotate_outputs,
+        # …) — no self-prefix, so the server bridge namespaces them via
+        # SLOT_DISPLAY_NAMES ("outputs" → "meridian-outputs__search_outputs").
+        "prefix": None,
+        "session_mode": "stateless",
+        "description": "Local outputs index — BM25 search over CSV/JSON/NPY files (meridian-outputs)",
+        "description_overrides": {},
+    },
 ]
 
 # Editable per-slot fields that a tenant override may set.
@@ -402,6 +445,23 @@ KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
         "owner_item": None,
         "description": (
             "Citation / reference-manager resolution against the local Zotero API."
+        ),
+    },
+    {
+        "name": "meridian-outputs",
+        "package": "meridian-outputs",
+        "runtime": "uvx",
+        # 469d89b4 SHIPPED this as a first-class built-in on its own `outputs` slot
+        # (server route + WS relay in routes/tunnel.py). Local BM25 outputs index
+        # (CSV/JSON/NPY); launched from the local extensions/meridian-outputs source
+        # via `uvx --from <local-path> meridian-outputs-mcp`. NOT on PyPI.
+        "slot": "outputs",
+        "bundled": True,
+        "owner_item": None,
+        "description": (
+            "Local BM25 outputs index (CSV/JSON/NPY) — search_outputs, "
+            "annotate_outputs, classify_outputs, resolve_figure_output, "
+            "npy_metadata, file_fingerprint. All purely local, no hosted call."
         ),
     },
     {
@@ -666,14 +726,16 @@ def slot_pool_config(plugin: Any) -> "dict":
 _BUILTIN_DEFAULT_PORTS = frozenset({
     DEFAULT_FS_PORT, DEFAULT_CODE_PORT, DEFAULT_EXTRACT_PORT,
     DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT, DEFAULT_DOCS_PORT,
-    DEFAULT_ZOTERO_PORT,
+    DEFAULT_ZOTERO_PORT, DEFAULT_OUTPUTS_PORT,
 })
 
 # 9811d04c — first port a freshly-added custom plugin (from the browse "Add"
 # button) is auto-assigned when the caller supplies no port. Starts just above
-# the built-in default range (8808–8817, incl. the 4 pre-allocated custom
-# slots), so an auto-assigned port never collides with a built-in slot.
-_CUSTOM_PORT_START = 8820
+# the built-in default range (8808–8820, incl. the 4 pre-allocated custom
+# slots and the outputs built-in at 8820), so an auto-assigned port never
+# collides with a built-in slot.
+# 469d89b4 — bumped from 8820 to 8821 to make room for DEFAULT_OUTPUTS_PORT.
+_CUSTOM_PORT_START = 8821
 
 # 9811d04c — the built-in *slot* names (fs/code/extract/ppt/word/dc). A custom
 # plugin's name must not collide with a built-in slot name (task rule) nor with a
