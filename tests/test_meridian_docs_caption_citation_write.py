@@ -166,9 +166,11 @@ class TestInsertFigureCaption:
         # File must have changed.
         assert open(docx, "rb").read() != original
 
-    def test_insert_figure_caption_before(self, tmp_path):
+    def test_insert_figure_caption_before_rejected(self, tmp_path):
+        """position='before' is invalid for Figure captions and must return an error."""
         docx = str(tmp_path / "doc.docx")
         _write_docx(docx)
+        original = open(docx, "rb").read()
 
         res = docs_intel.insert_caption(
             docx_path=docx,
@@ -178,10 +180,11 @@ class TestInsertFigureCaption:
             position="before",
         )
 
-        assert "error" not in res
-        xml = _read_doc_xml(docx)
-        assert 'w:val="Caption"' in xml
-        assert "SEQ Figure" in xml
+        # Must return an error, not succeed.
+        assert "error" in res, f"expected error for Figure+before, got: {res}"
+        assert "figure" in res["error"].lower() or "before" in res["error"].lower()
+        # File must be byte-for-byte unchanged on failure.
+        assert open(docx, "rb").read() == original, "file was mutated despite error"
 
     def test_insert_figure_caption_seq_number_prefix(self, tmp_path):
         docx = str(tmp_path / "doc.docx")
@@ -252,6 +255,26 @@ class TestInsertTableCaption:
         assert 'w:val="Caption"' in xml
         assert "SEQ Table" in xml
         assert "Summary statistics" in xml
+
+    def test_insert_table_caption_before_is_valid(self, tmp_path):
+        """Regression: Table captions must still support position='before' (unaffected by Figure fix)."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        res = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            kind="Table",
+            label_text="My table above",
+            position="before",
+        )
+
+        assert "error" not in res, f"unexpected error for Table+before: {res.get('error')}"
+        assert res["status"] == "inserted"
+        assert res["kind"] == "Table"
+        xml = _read_doc_xml(docx)
+        assert "SEQ Table" in xml
+        assert "My table above" in xml
 
     def test_table_and_figure_counters_are_independent(self, tmp_path):
         """Inserting a Table caption does not affect Figure counter and v.v."""
@@ -1017,3 +1040,270 @@ class TestRoundTrip:
         assert "[Content_Types].xml" in names
         assert "word/styles.xml" in names
         assert "word/document.xml" in names
+
+
+# ---------------------------------------------------------------------------
+# Synthetic .docx fixtures for image-paragraph detection tests
+# ---------------------------------------------------------------------------
+
+# A document with two image paragraphs: one DrawingML (<w:drawing>) and one
+# legacy VML (<w:pict>).  Two plain text paragraphs surround them.
+_DOC_XML_WITH_IMAGES = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+    xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+  <w:body>
+    <w:p w14:paraId="IMG00001">
+      <w:r><w:t>Introduction paragraph.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="IMG00002">
+      <w:r>
+        <w:drawing>
+          <wp:inline><wp:extent cx="1000000" cy="500000"/></wp:inline>
+        </w:drawing>
+      </w:r>
+    </w:p>
+    <w:p w14:paraId="IMG00003">
+      <w:r><w:t>A text paragraph between images.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="IMG00004">
+      <w:r>
+        <w:pict>
+          <v:shape xmlns:v="urn:schemas-microsoft-com:vml" id="pic1" type="#_x0000_t75"/>
+        </w:pict>
+      </w:r>
+    </w:p>
+    <w:p w14:paraId="IMG00005">
+      <w:r><w:t>Conclusion paragraph.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+# A document with no images at all (for the empty-result case).
+_DOC_XML_NO_IMAGES = _DOC_XML  # reuse the basic 3-paragraph fixture
+
+
+def _write_docx_images(path: str) -> None:
+    """Write the image-containing synthetic .docx to disk."""
+    with open(path, "wb") as fh:
+        fh.write(_zip_docx(_DOC_XML_WITH_IMAGES))
+
+
+# ---------------------------------------------------------------------------
+# find_image_paragraph tests
+# ---------------------------------------------------------------------------
+
+class TestFindImageParagraph:
+    """Tests for docs_intel.find_image_paragraph."""
+
+    def test_finds_drawing_paragraph(self, tmp_path):
+        """DrawingML <w:drawing> paragraph is detected and its para_id returned."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx_images(docx)
+
+        res = docs_intel.find_image_paragraph(docx)
+
+        assert "error" not in res, f"unexpected error: {res.get('error')}"
+        assert res["count"] == 2, f"expected 2 image paragraphs, got {res['count']}"
+        paras = res["image_paragraphs"]
+        assert len(paras) == 2
+        # First image is the DrawingML one.
+        assert paras[0]["para_id"] == "IMG00002"
+
+    def test_finds_pict_paragraph(self, tmp_path):
+        """Legacy VML <w:pict> paragraph is also detected."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx_images(docx)
+
+        res = docs_intel.find_image_paragraph(docx)
+
+        assert "error" not in res
+        paras = res["image_paragraphs"]
+        # Second image is the VML pict one.
+        assert paras[1]["para_id"] == "IMG00004"
+
+    def test_no_images_returns_empty_list(self, tmp_path):
+        """Document with no images returns count=0 and empty list."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_NO_IMAGES)
+
+        res = docs_intel.find_image_paragraph(docx)
+
+        assert "error" not in res
+        assert res["count"] == 0
+        assert res["image_paragraphs"] == []
+
+    def test_figure_index_returns_single_entry(self, tmp_path):
+        """figure_index=1 returns the first image paragraph's para_id directly."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx_images(docx)
+
+        res = docs_intel.find_image_paragraph(docx, figure_index=1)
+
+        assert "error" not in res, f"unexpected error: {res.get('error')}"
+        assert res["para_id"] == "IMG00002"
+        assert res["figure_index"] == 1
+
+    def test_figure_index_selects_second(self, tmp_path):
+        """figure_index=2 returns the second image paragraph."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx_images(docx)
+
+        res = docs_intel.find_image_paragraph(docx, figure_index=2)
+
+        assert "error" not in res
+        assert res["para_id"] == "IMG00004"
+        assert res["figure_index"] == 2
+
+    def test_figure_index_out_of_range(self, tmp_path):
+        """figure_index beyond the number of images returns an error."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx_images(docx)
+
+        res = docs_intel.find_image_paragraph(docx, figure_index=99)
+
+        assert "error" in res
+        assert "out of range" in res["error"]
+
+    def test_figure_index_zero_is_invalid(self, tmp_path):
+        """figure_index=0 is out-of-range (1-based indexing)."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx_images(docx)
+
+        res = docs_intel.find_image_paragraph(docx, figure_index=0)
+
+        assert "error" in res
+
+    def test_missing_file_returns_error(self, tmp_path):
+        """Nonexistent file returns {"error": ...}."""
+        res = docs_intel.find_image_paragraph(str(tmp_path / "nonexistent.docx"))
+
+        assert "error" in res
+
+    def test_image_para_id_is_usable_as_anchor(self, tmp_path):
+        """The returned para_id can be passed directly to insert_caption (anchor after image)."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx_images(docx)
+
+        # Find the first image paragraph.
+        find_res = docs_intel.find_image_paragraph(docx, figure_index=1)
+        assert "error" not in find_res
+        anchor_id = find_res["para_id"]
+
+        # Insert a Figure caption using the image's own para_id as anchor.
+        cap_res = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id=anchor_id,
+            kind="Figure",
+            label_text="My detected figure",
+        )
+        assert "error" not in cap_res, f"insert_caption failed: {cap_res.get('error')}"
+        assert cap_res["status"] == "inserted"
+
+        # Verify the caption paragraph follows the image paragraph in document order.
+        paras = docs_intel.parse_docx(docx)
+        img_idx = next(
+            (i for i, p in enumerate(paras) if p["para_id"] == anchor_id), None
+        )
+        cap_idx = next(
+            (i for i, p in enumerate(paras) if p.get("style") == "Caption"), None
+        )
+        assert img_idx is not None, "image paragraph not found after insert"
+        assert cap_idx is not None, "Caption paragraph not found after insert"
+        assert cap_idx == img_idx + 1, (
+            f"Caption (index {cap_idx}) is not immediately after image (index {img_idx})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Figure-before rejection: API surface guard
+# ---------------------------------------------------------------------------
+
+class TestFigureCaptionBeforeRejection:
+    """Dedicated tests for the Figure+before=error behavior."""
+
+    def test_figure_before_is_rejected(self, tmp_path):
+        """position='before' for kind='Figure' must return {error: ...}."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0001",
+            kind="Figure",
+            label_text="Should never land above image",
+            position="before",
+        )
+
+        assert "error" in res
+        # The error message should mention the constraint clearly.
+        assert "before" in res["error"].lower() or "figure" in res["error"].lower()
+        # File must be unchanged — no partial write on error.
+        assert open(docx, "rb").read() == original
+
+    def test_figure_after_is_still_accepted(self, tmp_path):
+        """position='after' (default) for kind='Figure' must still work."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        res = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            kind="Figure",
+            label_text="Normal figure caption",
+            position="after",
+        )
+
+        assert "error" not in res
+        assert res["status"] == "inserted"
+
+    def test_figure_default_position_is_after(self, tmp_path):
+        """Omitting position for kind='Figure' defaults to 'after' (still valid)."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        res = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            kind="Figure",
+            label_text="Default position figure",
+        )
+
+        assert "error" not in res
+        assert res["status"] == "inserted"
+
+    def test_table_before_is_accepted(self, tmp_path):
+        """Regression: Table captions are not affected — position='before' must still work."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        res = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            kind="Table",
+            label_text="Table before anchor",
+            position="before",
+        )
+
+        assert "error" not in res
+        assert res["status"] == "inserted"
+        assert res["kind"] == "Table"
+
+    def test_table_after_is_accepted(self, tmp_path):
+        """Regression: Table captions with position='after' must still work."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        res = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            kind="Table",
+            label_text="Table after anchor",
+            position="after",
+        )
+
+        assert "error" not in res
+        assert res["status"] == "inserted"

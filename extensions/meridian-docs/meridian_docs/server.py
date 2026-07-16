@@ -207,6 +207,38 @@ def ingest_local_document_structure(
 
 
 @mcp.tool()
+def find_image_paragraph(
+    docx_path: str,
+    figure_index: int | None = None,
+) -> dict[str, Any]:
+    """Scan a .docx for paragraphs that contain an embedded image.
+
+    Detects both DrawingML (<w:drawing>) and legacy VML (<w:pict>) image
+    paragraphs.  Use this to find the correct anchor_para_id before calling
+    insert_caption with kind="Figure" — passing the image paragraph's own
+    para_id (not the preceding paragraph) ensures the caption lands BELOW
+    the image, not above it.
+
+    Args:
+      docx_path:    Absolute path to the .docx file.
+      figure_index: 1-based index selecting which image to return when the
+                    document has multiple images.  None (default) returns ALL
+                    image paragraphs as a list.
+
+    Returns (figure_index=None):
+      {image_paragraphs: [{para_id, index, text}], count: int}
+    Returns (figure_index given):
+      {para_id, index, text, figure_index: int}
+    Returns on error:
+      {error: <message>}
+    """
+    return docs_intel.find_image_paragraph(
+        docx_path=docx_path,
+        figure_index=figure_index,
+    )
+
+
+@mcp.tool()
 def insert_caption(
     docx_path: str,
     anchor_para_id: str,

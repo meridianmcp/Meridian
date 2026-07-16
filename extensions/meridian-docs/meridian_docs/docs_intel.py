@@ -911,6 +911,117 @@ def _upsert_sidecar_caption(
 
 
 # ---------------------------------------------------------------------------
+# Image-paragraph detection helper
+# ---------------------------------------------------------------------------
+
+# DrawingML and VML namespaces for image detection.
+_WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+_V = "urn:schemas-microsoft-com:vml"
+
+
+def find_image_paragraph(
+    docx_path: str,
+    figure_index: int | None = None,
+) -> dict[str, Any]:
+    """Scan a .docx for paragraphs that contain an embedded image.
+
+    A paragraph is considered an *image paragraph* when its ``<w:r>`` runs
+    contain a ``<w:drawing>`` element (DrawingML inline/anchored images, the
+    modern path) or a ``<w:pict>`` element (legacy VML path).  Both patterns
+    are checked.
+
+    This is the recommended helper for callers that need to supply a correct
+    ``anchor_para_id`` to :func:`insert_caption` for ``kind="Figure"`` without
+    manually guessing which paragraph holds the image.
+
+    Args:
+        docx_path:     Absolute path to the .docx file.
+        figure_index:  1-based index selecting which image paragraph to return
+                       when the document contains multiple images.  ``None``
+                       (default) returns ALL image paragraphs as a list.
+
+    Returns:
+        ``{image_paragraphs: [{para_id, index, text}], count: int}``
+        when ``figure_index`` is ``None``.
+
+        ``{para_id, index, text, figure_index: int}``
+        when ``figure_index`` is given and an image is found at that position.
+
+        ``{"error": <message>}`` on any failure (file not found, not a valid
+        .docx, or ``figure_index`` out of range).
+    """
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        if figure_index is None:
+            return {"image_paragraphs": [], "count": 0}
+        return {"error": "document body is empty"}
+
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+    w_drawing = _q(_W, "drawing")
+    w_pict = _q(_W, "pict")
+
+    image_paras: list[dict[str, Any]] = []
+    global_p_idx = 0
+
+    for child in body:
+        if child.tag == w_p:
+            has_image = (
+                child.find(f".//{w_drawing}") is not None
+                or child.find(f".//{w_pict}") is not None
+            )
+            if has_image:
+                real_id = child.get(w14_para_id)
+                para_id = real_id if real_id else f"p{global_p_idx}"
+                text = "".join(t.text or "" for t in child.iter(_q(_W, "t")))
+                image_paras.append(
+                    {"para_id": para_id, "index": global_p_idx, "text": text}
+                )
+            global_p_idx += 1
+        else:
+            # Walk into tables so images in table cells are also found.
+            for p in child.iter(w_p):
+                has_image = (
+                    p.find(f".//{w_drawing}") is not None
+                    or p.find(f".//{w_pict}") is not None
+                )
+                if has_image:
+                    real_id = p.get(w14_para_id)
+                    para_id = real_id if real_id else f"p{global_p_idx}"
+                    text = "".join(t.text or "" for t in p.iter(_q(_W, "t")))
+                    image_paras.append(
+                        {"para_id": para_id, "index": global_p_idx, "text": text}
+                    )
+                global_p_idx += 1
+
+    if figure_index is None:
+        return {"image_paragraphs": image_paras, "count": len(image_paras)}
+
+    # 1-based selection.
+    if figure_index < 1 or figure_index > len(image_paras):
+        return {
+            "error": (
+                f"figure_index {figure_index} is out of range: document has "
+                f"{len(image_paras)} image paragraph(s)"
+            )
+        }
+    entry = image_paras[figure_index - 1]
+    return {
+        "para_id": entry["para_id"],
+        "index": entry["index"],
+        "text": entry["text"],
+        "figure_index": figure_index,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public caption API: insert / edit / remove
 # ---------------------------------------------------------------------------
 
@@ -940,7 +1051,11 @@ def insert_caption(
         kind:            ``"Figure"`` or ``"Table"``.
         label_text:      Caption label text (e.g. ``"Loss curve for run 42"``).
                          Rendered text will be e.g. ``"Figure 1. Loss curve..."``.
-        position:        ``"after"`` (default) or ``"before"``.
+        position:        ``"after"`` (default) or ``"before"``.  For
+                         ``kind="Figure"`` only ``"after"`` is valid: a figure
+                         caption must always follow its image, so ``"before"``
+                         is rejected with an error.  Table captions may use
+                         either ``"before"`` or ``"after"``.
         section_heading: Optional heading text for the section this caption
                          belongs to.  Stored in the sidecar ``section`` column.
         index_db_path:   If supplied, the sidecar SQLite index is invalidated
@@ -955,6 +1070,18 @@ def insert_caption(
         return {"error": f"kind must be 'Figure' or 'Table', got {kind!r}"}
     if position not in ("before", "after"):
         return {"error": f"position must be 'before' or 'after', got {position!r}"}
+    # A figure caption can NEVER precede its image — it is always placed after
+    # the image paragraph.  Rejecting position="before" for kind="Figure" removes
+    # this invalid state from the API surface entirely so callers cannot
+    # accidentally produce captions above their images.
+    if kind == "Figure" and position == "before":
+        return {
+            "error": (
+                "position='before' is not valid for kind='Figure': a figure caption "
+                "must always follow its image.  Pass the image paragraph's para_id as "
+                "anchor_para_id and omit position (defaults to 'after')."
+            )
+        }
     if not label_text or not str(label_text).strip():
         return {"error": "label_text must be a non-empty string"}
 
