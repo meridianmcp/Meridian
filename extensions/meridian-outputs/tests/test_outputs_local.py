@@ -724,6 +724,40 @@ class TestCachedIndexPersistence:
         idx2.close()
         assert row is not None
 
+    @duckdb_required
+    def test_fresh_instance_detects_existing_fts_index(self, tmp_path: Path) -> None:
+        """d9c76caa follow-up: a fresh OutputsFtsIndex pointed at a db_path
+        that already has a built FTS index (from a prior process's rebuild)
+        must detect this immediately on connect, not assume _fts_built=False
+        and pay the full-table rebuild tax again on every process restart."""
+        (tmp_path / "metric.csv").write_text("epoch,loss\n1,0.5", encoding="utf-8")
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild()
+        assert idx1._fts_built is True
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        assert idx2._fts_built is False  # not yet connected
+        idx2._connect()
+        assert idx2._fts_built is True, (
+            "fresh instance should have detected the existing on-disk FTS "
+            "schema instead of assuming none exists"
+        )
+        idx2.close()
+
+    def test_fresh_instance_on_empty_db_stays_unbuilt(self, tmp_path: Path) -> None:
+        """No prior rebuild ever ran against this db_path -- _fts_built must
+        stay False (nothing to detect) rather than erroring."""
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx._connect()
+            assert idx._fts_built is False
+        finally:
+            idx.close()
+
 
 # ---------------------------------------------------------------------------
 # Determinism: same inputs -> same results (requirement 3)

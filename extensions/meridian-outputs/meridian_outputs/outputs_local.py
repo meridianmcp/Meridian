@@ -750,6 +750,29 @@ class OutputsFtsIndex:
         if self._con is None:
             import duckdb  # noqa: PLC0415
             self._con = duckdb.connect(self._db_path)
+            # d9c76caa follow-up -- a fresh instance always assumed
+            # _fts_built started False, forcing a full (expensive, non-
+            # incremental) FTS rebuild on its very first call even when a
+            # working FTS index already exists on disk from a PRIOR
+            # process's successful rebuild (0c1a4349 made the index persist
+            # across restarts, but this in-memory flag didn't know that --
+            # every fresh MCP server spawn paid the full-table-rebuild tax
+            # again regardless). Detect an existing FTS schema so a fresh
+            # process reuses it (possibly slightly stale -- same trade-off
+            # as the deadline-based skip in rebuild()) instead of always
+            # rebuilding from scratch on process restart.
+            try:
+                existing = self._con.execute(
+                    "SELECT 1 FROM information_schema.schemata "
+                    "WHERE schema_name = 'fts_main_outputs_index'"
+                ).fetchone()
+                if existing is not None:
+                    self._fts_built = True
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._connect: FTS schema probe failed",
+                    exc_info=True,
+                )
         return self._con
 
     def _ensure_schema(self, con: Any) -> None:
