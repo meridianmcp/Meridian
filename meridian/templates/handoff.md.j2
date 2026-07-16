@@ -88,6 +88,8 @@ _⚠ {{ code_pointer_skip_reason }}._
 {% endfor -%}
 {% endfor -%}
 {% endif -%}
+{% if it.suggested_model %}   Suggested model: {{ it.suggested_model }} _(hint only)_
+{% endif -%}
 {% endfor %}
 {% endif %}
 

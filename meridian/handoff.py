@@ -493,6 +493,7 @@ def _build_quick_start_goal(
     goal_group_style: str = "flat",
     loop_enabled: bool = False,
     parallel_groups: dict[str, Any] | None = None,
+    model_tier_hints: bool = False,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -739,9 +740,41 @@ def _build_quick_start_goal(
         f"<stop_conditions>Stop after {_turns} turns "
         f"{_xml_escape(_hitl_clause)}</stop_conditions>"
         f"{_type_clause}"
-        f"{_manual_note}"
+        # 81396666 — per-item model-tier hints: a <model_hints> tag listing each
+        # item id with a suggested haiku/sonnet/opus tier. Emitted only when the
+        # project has model_tier_hints_enabled on AND at least one item carries a
+        # suggested_model annotation. Hint only — not an enforced model switch.
+        + _build_model_hints_clause(pending_sprint_items, enabled=model_tier_hints)
+        + f"{_manual_note}"
         f"{_excluded_unprospected_note}"
     )
+
+
+def _build_model_hints_clause(
+    items: list[dict[str, Any]],
+    *,
+    enabled: bool = False,
+) -> str:
+    """81396666 — build a ``<model_hints>`` XML clause for the /goal block.
+
+    Returns an empty string when ``enabled`` is False or no item carries a
+    ``suggested_model`` annotation. When present, renders each annotated item's
+    id and suggested tier as a compact line inside the tag. This is a HINT only.
+    """
+    if not enabled:
+        return ""
+    hints = [
+        f"{it['id']}: {it['suggested_model']}"
+        for it in items
+        if it.get("id") and it.get("suggested_model")
+    ]
+    if not hints:
+        return ""
+    body = (
+        "Suggested model tiers (hint only — executor/human decides): "
+        + "; ".join(hints)
+    )
+    return f"\n<model_hints>{_xml_escape(body)}</model_hints>"
 
 
 def build_item_briefing(
@@ -1275,6 +1308,71 @@ def _code_pointers_enabled(settings: dict[str, Any] | None) -> bool:
     if not isinstance(cfg, dict) or "enrich_handoffs_with_code_pointers" not in cfg:
         return _ENRICH_CODE_POINTERS_DEFAULT
     return bool(cfg.get("enrich_handoffs_with_code_pointers"))
+
+
+# 81396666 — model-tier hinting. A lightweight heuristic that suggests
+# "haiku"/"sonnet"/"opus" per sprint item based on priority + inferred sprint
+# type, surfaced in generate_handoff and /goal output. This is a hint only —
+# not an enforced model switch; the executor/human still decides which model to
+# use. Toggleable per project via executor_config.model_tier_hints_enabled.
+# Default is OFF (False) so existing projects are unaffected.
+_MODEL_TIER_HINTS_DEFAULT = False
+
+# Mapping of sprint_type → priority → suggested tier.
+# Rationale for each bucket:
+#   hotfix/high → opus: high-stakes fix, needs best reasoning to avoid regressions.
+#   hotfix/normal → sonnet: routine bug fix, moderate complexity.
+#   hotfix/low → haiku: trivial patch (typo, comment, 1-liner).
+#   research/any → opus: deep analysis, understanding, paper reading.
+#   refactor/high → sonnet: careful structural change; opus is overkill unless complex.
+#   refactor/low → haiku: trivial rename / whitespace.
+#   ops/any → sonnet: deploy/release work needs care but rarely deep reasoning.
+#   feature/high → opus: complex new feature; architectural judgment needed.
+#   feature/normal → sonnet: standard feature work.
+#   feature/low → haiku: mechanical / boilerplate feature (e.g. adding a constant).
+#   megasprint/orchestrator → sonnet: long coordination run; haiku lacks context depth.
+_MODEL_TIER_TABLE: dict[str, dict[str, str]] = {
+    "hotfix": {"high": "opus", "normal": "sonnet", "low": "haiku"},
+    "research": {"high": "opus", "normal": "opus", "low": "sonnet"},
+    "refactor": {"high": "sonnet", "normal": "sonnet", "low": "haiku"},
+    "ops": {"high": "sonnet", "normal": "sonnet", "low": "haiku"},
+    "feature": {"high": "opus", "normal": "sonnet", "low": "haiku"},
+    "megasprint": {"high": "opus", "normal": "sonnet", "low": "sonnet"},
+    "orchestrator": {"high": "sonnet", "normal": "sonnet", "low": "sonnet"},
+}
+_MODEL_TIER_FALLBACK: dict[str, str] = {"high": "opus", "normal": "sonnet", "low": "haiku"}
+
+
+def suggest_model_tier(item: dict[str, Any], sprint_type: str | None = None) -> str:
+    """81396666 — lightweight heuristic: suggest "haiku"/"sonnet"/"opus" for a
+    sprint item based on its priority and the inferred sprint type.
+
+    This is a HINT only — it does not enforce a model switch. The calling session
+    or human decides whether to follow it.
+
+    ``sprint_type`` is the value returned by :func:`_infer_sprint_type` for the
+    active board; when absent, falls back to a priority-only mapping.
+    """
+    priority = (item.get("priority") or "normal").strip().lower()
+    if priority not in ("high", "normal", "low"):
+        priority = "normal"
+    table = _MODEL_TIER_TABLE.get(sprint_type or "", _MODEL_TIER_FALLBACK)
+    return table.get(priority, _MODEL_TIER_FALLBACK.get(priority, "sonnet"))
+
+
+def _model_tier_hints_enabled(settings: dict[str, Any] | None) -> bool:
+    """81396666 — return whether per-item model-tier hints are on for this project.
+
+    The flag lives in the per-project ``executor_config`` JSON blob (no schema
+    migration needed, same pattern as ``enrich_handoffs_with_code_pointers``).
+    Absent / unset ⇒ default False (opt-in). Any explicit truthy value enables it.
+    """
+    if not settings:
+        return _MODEL_TIER_HINTS_DEFAULT
+    cfg = settings.get("executor_config") or {}
+    if not isinstance(cfg, dict) or "model_tier_hints_enabled" not in cfg:
+        return _MODEL_TIER_HINTS_DEFAULT
+    return bool(cfg.get("model_tier_hints_enabled"))
 
 
 # 4cfaecc2 — wireable resolver seam. handoff.py deliberately does NOT import the
@@ -3043,6 +3141,17 @@ async def generate_handoff(
             )
         except Exception:  # noqa: BLE001 — inline pointers are best-effort
             pass
+    # 81396666 — annotate each pending item with a suggested_model hint when the
+    # per-project model_tier_hints_enabled toggle is on. Fully guarded: failure
+    # degrades to no hint and never breaks the mandatory handoff.
+    _model_hints_on = _model_tier_hints_enabled(proj_settings)
+    if _model_hints_on:
+        try:
+            _stype_for_hints = _infer_sprint_type(pending_sprint_items)
+            for _it in pending_sprint_items:
+                _it["suggested_model"] = suggest_model_tier(_it, _stype_for_hints)
+        except Exception:  # noqa: BLE001 — hints are best-effort, never fatal
+            _model_hints_on = False
     decisions_log = (project.get("decisions") or "").strip()
     now_utc = datetime.now(timezone.utc)
     generated_at = now_utc.isoformat(timespec="seconds")
@@ -3079,6 +3188,8 @@ async def generate_handoff(
         goal_group_style=_goal_group_style_from_settings(proj_settings),
         loop_enabled=_loop_enabled_from_settings(proj_settings, _ws_settings_for_loop),
         parallel_groups=_parallel_groups,
+        # 81396666 — pass the model-tier toggle so the /goal includes per-item hints.
+        model_tier_hints=_model_hints_on,
     )
     # dd07ece0 — embed a provenance token near the top of the /goal block so a
     # receiving session can call verify_handoff_token(project_id, token) to
