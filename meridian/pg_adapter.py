@@ -3098,6 +3098,40 @@ async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> N
     )
 
 
+async def _migrate_pg_handoff_tokens(conn: PostgresConnection) -> None:
+    """cb8e7c0f — handoff_tokens: DB-backed provenance token store for cross-machine
+    verify_handoff_token.
+
+    The previous in-process _HANDOFF_TOKENS dict was process-local: on a multi-
+    machine deployment (fly.toml max_count=40) generate_handoff on machine A minted
+    a token into A's dict, but verify_handoff_token called from a new session on
+    machine B read from B's empty dict and always returned not_found — making the
+    trust boundary silently useless. Storing tokens in the shared DB fixes this.
+
+    token (TEXT PK): the opaque random hex value embedded in <goal_token>.
+    project_id (TEXT NOT NULL): the project this token was minted for.
+    expires_at (TEXT NOT NULL): ISO-8601 UTC expiry timestamp.
+    consumed (INTEGER NOT NULL DEFAULT 0): 1 once the token has been verified once.
+    created_at (TEXT NOT NULL): for audit/cleanup purposes.
+
+    Idempotent: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    Mirrors db._migrate_handoff_tokens.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS handoff_tokens ("
+        "    token TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    expires_at TEXT NOT NULL,"
+        "    consumed INTEGER NOT NULL DEFAULT 0,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_handoff_tokens_project "
+        "ON handoff_tokens(project_id);"
+        "CREATE INDEX IF NOT EXISTS idx_handoff_tokens_expires "
+        "ON handoff_tokens(expires_at);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3173,4 +3207,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_decision_slug_nickname,
     _migrate_pg_note_nickname,
     _migrate_pg_sprint_item_prospect_bypass,
+    _migrate_pg_handoff_tokens,
 )

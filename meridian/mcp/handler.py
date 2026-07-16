@@ -2227,14 +2227,14 @@ async def _handle_task_tools(
             "has_handoff": bool(_latest) or bool(_pending),
         }
     if name == "verify_handoff_token":
-        # dd07ece0 — verify a provenance token extracted from a pasted /goal block.
-        # Delegates to the in-process token store in handoff.py; no DB access needed.
+        # cb8e7c0f — verify a provenance token extracted from a pasted /goal block.
+        # Delegates to DB-backed token store in handoff.py (shared across machines).
         from .. import handoff as handoff_module_local  # noqa: PLC0415
         _token = (args.get("token") or "").strip()
         if not _token:
             return {"valid": False, "reason": "not_found"}
         _pid = args.get("project_id") or ""
-        return handoff_module_local.verify_handoff_token(_token, _pid)
+        return await handoff_module_local.verify_handoff_token(db, _token, _pid)
     return _MISS
 
 

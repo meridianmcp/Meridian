@@ -59,13 +59,23 @@ _HANDOFF_TOKENS: dict[str, dict[str, Any]] = {}
 _HANDOFF_TOKEN_TTL_SECONDS = 300  # 5 minutes
 
 
-def mint_handoff_token(project_id: str) -> str:
-    """dd07ece0 — Mint a short-lived, single-use provenance token for a handoff.
+async def mint_handoff_token(db: Any, project_id: str) -> str:
+    """cb8e7c0f — Mint a short-lived, single-use provenance token for a handoff.
 
-    The token is a URL-safe random hex string (16 bytes = 32 hex chars, trimmed
-    to 8+8 for readability). It is stored in the module-level ``_HANDOFF_TOKENS``
-    dict with the project_id and an expiry timestamp, and must be consumed within
-    ``_HANDOFF_TOKEN_TTL_SECONDS`` by a single call to ``verify_handoff_token``.
+    The token is a URL-safe random hex string (16 chars). It is persisted to the
+    ``handoff_tokens`` DB table (shared across all machines on multi-instance
+    deployments) with the project_id and an expiry timestamp, and must be consumed
+    within ``_HANDOFF_TOKEN_TTL_SECONDS`` by a single call to
+    ``verify_handoff_token``.
+
+    The DB-backed store fixes the cross-machine not_found regression (cb8e7c0f):
+    the previous in-process ``_HANDOFF_TOKENS`` dict was process-local, so
+    generate_handoff on machine A minted a token that verify_handoff_token on
+    machine B never found. Storing in the shared DB makes every machine see the
+    same token store.
+
+    Falls back to the in-process ``_HANDOFF_TOKENS`` dict on DB error so the
+    best-effort handoff never fails due to a token-store write problem.
 
     Returns the token string to embed in the /goal block.
     """
@@ -73,24 +83,41 @@ def mint_handoff_token(project_id: str) -> str:
     expires_at = datetime.now(timezone.utc) + timedelta(
         seconds=_HANDOFF_TOKEN_TTL_SECONDS
     )
-    _HANDOFF_TOKENS[token] = {
-        "project_id": project_id,
-        "expires_at": expires_at,
-        "consumed": False,
-    }
-    # Opportunistic cleanup: evict expired tokens so the dict doesn't grow
-    # unbounded in long-lived processes (sessions that call generate_handoff many
-    # times). We do this at mint time rather than a background task so there are
-    # no threading/event-loop concerns.
-    _evict_expired_tokens()
+    expires_at_str = expires_at.strftime("%Y-%m-%d %H:%M:%S.%f")
+    try:
+        await db.execute(
+            "INSERT INTO handoff_tokens (token, project_id, expires_at, consumed) "
+            "VALUES (?, ?, ?, 0)",
+            (token, project_id, expires_at_str),
+        )
+        await db.commit()
+        # Opportunistic cleanup: delete expired rows so the table doesn't grow
+        # unbounded. Best-effort — never fail the mint over a cleanup error.
+        try:
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+            await db.execute(
+                "DELETE FROM handoff_tokens WHERE expires_at < ?",
+                (now_str,),
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001 — fallback: keep in-process dict as backup
+        _HANDOFF_TOKENS[token] = {
+            "project_id": project_id,
+            "expires_at": expires_at,
+            "consumed": False,
+        }
+        _evict_expired_tokens()
     return token
 
 
-def verify_handoff_token(
+async def verify_handoff_token(
+    db: Any,
     token: str,
     project_id: str,
 ) -> dict[str, Any]:
-    """dd07ece0 — Verify and consume a handoff provenance token.
+    """cb8e7c0f — Verify and consume a handoff provenance token.
 
     A receiving session calls this to independently confirm that a /goal block's
     ``<goal_token>`` line was produced by a real generate_handoff call on the
@@ -126,19 +153,60 @@ def verify_handoff_token(
     - ``{valid: False, reason: "wrong_project"}`` — token is real but was minted
       for a different project_id.
     """
+    if not token:
+        return {"valid": False, "reason": "not_found"}
+    now = datetime.now(timezone.utc)
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S.%f")
+    # Primary path: DB-backed store (shared across all machines).
+    try:
+        async with db.execute(
+            "SELECT project_id, expires_at, consumed FROM handoff_tokens WHERE token = ?",
+            (token,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is not None:
+            row_project_id = row["project_id"] if isinstance(row, dict) else row[0]
+            row_expires_at = row["expires_at"] if isinstance(row, dict) else row[1]
+            row_consumed = row["consumed"] if isinstance(row, dict) else row[2]
+            # Parse expires_at (stored as TEXT ISO-8601 UTC).
+            try:
+                expires_dt = datetime.strptime(
+                    row_expires_at[:26], "%Y-%m-%d %H:%M:%S.%f"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                expires_dt = datetime.strptime(
+                    row_expires_at[:19], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+            if now > expires_dt:
+                await db.execute(
+                    "DELETE FROM handoff_tokens WHERE token = ?", (token,)
+                )
+                await db.commit()
+                return {"valid": False, "reason": "expired"}
+            if row_consumed:
+                return {"valid": False, "reason": "already_consumed"}
+            if row_project_id != project_id:
+                return {"valid": False, "reason": "wrong_project"}
+            # Consume: mark single-use so a second verification is rejected.
+            await db.execute(
+                "UPDATE handoff_tokens SET consumed = 1 WHERE token = ?",
+                (token,),
+            )
+            await db.commit()
+            return {"valid": True, "reason": "ok"}
+    except Exception:  # noqa: BLE001 — DB unavailable; fall through to in-process dict
+        pass
+    # Fallback: in-process dict (single-process deployments / DB-error recovery).
     entry = _HANDOFF_TOKENS.get(token)
     if entry is None:
         return {"valid": False, "reason": "not_found"}
-    now = datetime.now(timezone.utc)
     if now > entry["expires_at"]:
-        # Clean up the expired entry.
         _HANDOFF_TOKENS.pop(token, None)
         return {"valid": False, "reason": "expired"}
     if entry["consumed"]:
         return {"valid": False, "reason": "already_consumed"}
     if entry["project_id"] != project_id:
         return {"valid": False, "reason": "wrong_project"}
-    # Consume: mark so a second verification attempt is rejected.
     entry["consumed"] = True
     return {"valid": True, "reason": "ok"}
 
@@ -3199,7 +3267,7 @@ async def generate_handoff(
     # ("/goal" or "/loop /goal") so it is visible but does not displace the role
     # directive or other structured tags.
     try:
-        _provenance_token = mint_handoff_token(project_id)
+        _provenance_token = await mint_handoff_token(db, project_id)
         _goal_lines = quick_start_goal.split("\n", 1)
         quick_start_goal = (
             _goal_lines[0]

@@ -1071,6 +1071,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_decision_slug_nickname(db)
     await _migrate_note_nickname(db)
     await _migrate_sprint_item_prospect_bypass(db)
+    await _migrate_handoff_tokens(db)
     return db
 
 
