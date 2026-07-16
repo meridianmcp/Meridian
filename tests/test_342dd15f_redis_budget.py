@@ -10,7 +10,9 @@ Tests cover:
   - Tier-2 DISABLE: publish returns False without touching Redis when counter
     is at or above REDIS_BUDGET_DISABLE_COMMANDS.
   - Tier-1 counter increment on successful publish.
-  - DB migration: redis_commands_used and redis_overage_cap_usd columns land.
+  - DB migration: redis_commands_used and redis_overage_cap_usd columns land
+    with correct defaults (SQLite path; Postgres path guarded by db_pg fixture).
+  - PG migration registry wiring: _migrate_pg_redis_overage_fields in HOSTED.
   - Migration registry count bump (covered by test_pg_migration_registry).
 """
 from __future__ import annotations
@@ -331,3 +333,132 @@ def test_budget_constants_match_between_bridge_and_hosted():
     assert BRIDGE_WARN == HOSTED_WARN == 500_000
     assert BRIDGE_DISABLE == HOSTED_DISABLE == 1_000_000
     assert REDIS_BUDGET_ADMIN_ALERT_COMMANDS == 2_000_000
+
+
+# ---------------------------------------------------------------------------
+# Migration wiring guard: PG registry must include the redis overage migration
+# ---------------------------------------------------------------------------
+
+
+def test_pg_migration_hosted_registry_includes_redis_overage_fields():
+    """_migrate_pg_redis_overage_fields MUST be in _PG_MIGRATIONS_HOSTED so it
+    runs on the main auth DB on startup.
+
+    This is the wiring guard that should have caught the original prod bug:
+    the function existed in code but was never added to the HOSTED registry
+    tuple, so the columns were never created on the live tenants table and
+    the $1/$2/$4 tier cost gates silently failed-open (counter always read 0).
+    """
+    from meridian import pg_adapter as pg_module
+
+    hosted_names = [f.__name__ for f in pg_module._PG_MIGRATIONS_HOSTED]
+    assert "_migrate_pg_redis_overage_fields" in hosted_names, (
+        "_migrate_pg_redis_overage_fields is missing from _PG_MIGRATIONS_HOSTED — "
+        "the redis budget columns will never be created on the live tenants table, "
+        "making the Tier-1/2/3 cost gates permanently fail-open."
+    )
+
+
+def test_migration_redis_columns_have_sane_defaults():
+    """After init_db, a freshly inserted tenant row must carry the right default
+    values for the redis budget columns:
+      - redis_commands_used  defaults to 0  (no commands issued yet)
+      - redis_overage_cap_usd  defaults to NULL  (use code-defined tier limits)
+    """
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        try:
+            await db.execute(
+                "INSERT INTO tenants (id, email, plan, notification_prefs) "
+                "VALUES (?, ?, ?, ?)",
+                ("t-defaults", "defaults@test.com", "standard", "{}"),
+            )
+            await db.commit()
+            async with db.execute(
+                "SELECT redis_commands_used, redis_overage_cap_usd "
+                "FROM tenants WHERE id = ?",
+                ("t-defaults",),
+            ) as cur:
+                row = await cur.fetchone()
+            used = row["redis_commands_used"] if isinstance(row, dict) else row[0]
+            cap = row["redis_overage_cap_usd"] if isinstance(row, dict) else row[1]
+            assert int(used or 0) == 0, (
+                f"redis_commands_used default should be 0, got {used!r}"
+            )
+            assert cap is None, (
+                f"redis_overage_cap_usd default should be NULL, got {cap!r}"
+            )
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+def test_cost_gate_is_not_fail_open_when_columns_exist(monkeypatch):
+    """End-to-end gate: with columns present and counter AT the Tier-2 limit,
+    the gate must NOT fail-open.  Verifies the entire path from DB column
+    through _get_redis_commands_used to the publish short-circuit.
+
+    This is the regression test for the prod bug: when redis_commands_used
+    is missing, _get_redis_commands_used returns 0 (safe-open fallback), so
+    the gate never fires regardless of real spend.  With the columns present
+    and populated, Tier-2 must hard-block.
+    """
+    fake = _FakeRedisClient()
+
+    async def _fake_get_client():
+        return fake
+
+    monkeypatch.setattr(redis_bridge, "get_redis_client", _fake_get_client)
+
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        try:
+            await db.execute(
+                "INSERT INTO tenants (id, email, plan, redis_commands_used, notification_prefs) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("t-gate", "gate@test.com", "standard",
+                 REDIS_BUDGET_DISABLE_COMMANDS, "{}"),
+            )
+            await db.commit()
+
+            # With the column present and counter at Tier-2, must block.
+            result = await redis_bridge.publish_session_message(
+                "sess-gate",
+                {"id": "m-gate", "payload": "data"},
+                tenant_id="t-gate",
+                db=db,
+            )
+            assert result is False, (
+                "Tier-2 gate failed-open: publish returned True despite "
+                f"redis_commands_used={REDIS_BUDGET_DISABLE_COMMANDS}"
+            )
+            assert len(fake.published) == 0, (
+                "Redis PUBLISH was called despite Tier-2 block — gate is broken"
+            )
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.asyncio
+async def test_pg_migration_adds_redis_columns_to_tenants(db_pg):
+    """Postgres path: _migrate_pg_redis_overage_fields (in _PG_MIGRATIONS_HOSTED)
+    must add redis_commands_used and redis_overage_cap_usd to the tenants table.
+
+    Skipped unless TEST_DATABASE_URL is set. The SQLite equivalent is covered by
+    test_migration_adds_redis_columns_to_tenants.
+    """
+    async with db_pg.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'tenants'",
+    ) as cur:
+        rows = await cur.fetchall()
+    col_names = {r["column_name"] if isinstance(r, dict) else r[0] for r in rows}
+    assert "redis_commands_used" in col_names, (
+        "redis_commands_used missing from Postgres tenants after migration"
+    )
+    assert "redis_overage_cap_usd" in col_names, (
+        "redis_overage_cap_usd missing from Postgres tenants after migration"
+    )
