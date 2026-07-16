@@ -23,10 +23,29 @@
 set -uo pipefail
 PROJECT_ID="5787cc92-ba7d-4788-b17c-28ab7938b839"
 MERIDIAN_URL="${MERIDIAN_URL:-http://localhost:7878}"
+
+# 14575683 -- optional jq fast path for JSON extraction, Linux/macOS only.
+# Additive: Windows/Git-Bash keeps the regex chain below byte-for-byte
+# unchanged (uname there is never Linux/Darwin). Even on Linux/macOS, if jq
+# is absent or a jq extraction comes back empty, we fall through to the same
+# tolerant regex this hook always used -- jq is never a hard dependency.
+_jq_fastpath=0
+if command -v jq >/dev/null 2>&1; then
+    case "$(uname -s 2>/dev/null)" in
+        Linux|Darwin) _jq_fastpath=1 ;;
+    esac
+fi
+
 payload="$(cat 2>/dev/null || true)"
 [ -z "$payload" ] && exit 0
 # Extract "tool_name": "..." tolerantly; fail open if it can't be parsed.
-tool="$(printf '%s' "$payload" | grep -oE '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')"
+tool=""
+if [ "$_jq_fastpath" -eq 1 ]; then
+    tool="$(printf '%s' "$payload" | jq -r '.tool_name // empty' 2>/dev/null || true)"
+fi
+if [ -z "$tool" ]; then
+    tool="$(printf '%s' "$payload" | grep -oE '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')"
+fi
 [ -z "$tool" ] && exit 0
 # Only intercept Grep and Glob tool calls.
 case "$tool" in
@@ -48,16 +67,34 @@ if [ "$ci_val" -eq 1 ] 2>/dev/null; then
     # one retry, rather than silently passing through.
     slot_resp="$(curl -sf --max-time 6 "$MERIDIAN_URL/projects/$PROJECT_ID/slot-readiness" 2>/dev/null || true)"
     if [ -n "$slot_resp" ]; then
-        # Extract "ready": true/false tolerantly.
-        slot_ready="$(printf '%s' "$slot_resp" | grep -oE '"ready"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
-        # Extract "has_tunnel": true/false tolerantly.
-        has_tunnel="$(printf '%s' "$slot_resp" | grep -oE '"has_tunnel"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
+        # Extract "ready": true/false tolerantly (jq fast path, else regex).
+        slot_ready=""
+        has_tunnel=""
+        if [ "$_jq_fastpath" -eq 1 ]; then
+            slot_ready="$(printf '%s' "$slot_resp" | jq -r '.ready | tostring' 2>/dev/null || true)"
+            has_tunnel="$(printf '%s' "$slot_resp" | jq -r '.has_tunnel | tostring' 2>/dev/null || true)"
+            case "$slot_ready" in true|false) ;; *) slot_ready="" ;; esac
+            case "$has_tunnel" in true|false) ;; *) has_tunnel="" ;; esac
+        fi
+        if [ -z "$slot_ready" ]; then
+            slot_ready="$(printf '%s' "$slot_resp" | grep -oE '"ready"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
+        fi
+        if [ -z "$has_tunnel" ]; then
+            has_tunnel="$(printf '%s' "$slot_resp" | grep -oE '"has_tunnel"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
+        fi
         if [ "$slot_ready" = "false" ]; then
             # Slot is not ready yet -- brief retry (warmup may be in progress).
             sleep 3
             slot_resp2="$(curl -sf --max-time 6 "$MERIDIAN_URL/projects/$PROJECT_ID/slot-readiness" 2>/dev/null || true)"
             if [ -n "$slot_resp2" ]; then
-                slot_ready="$(printf '%s' "$slot_resp2" | grep -oE '"ready"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
+                slot_ready=""
+                if [ "$_jq_fastpath" -eq 1 ]; then
+                    slot_ready="$(printf '%s' "$slot_resp2" | jq -r '.ready | tostring' 2>/dev/null || true)"
+                    case "$slot_ready" in true|false) ;; *) slot_ready="" ;; esac
+                fi
+                if [ -z "$slot_ready" ]; then
+                    slot_ready="$(printf '%s' "$slot_resp2" | grep -oE '"ready"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
+                fi
             fi
             if [ "$slot_ready" != "true" ]; then
                 # Still not ready after retry -- fail open with a VISIBLE warning.
