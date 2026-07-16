@@ -424,6 +424,144 @@ def remove_citation(
     )
 
 
+@mcp.tool()
+def extract_equations(path: str) -> list[dict[str, Any]]:
+    """a80af3a0 — Parse all OMML equations out of a local .docx (stdlib only, no lxml).
+
+    Detects two patterns:
+      1. Standalone: an <m:oMath> inside a regular <w:p> body paragraph.
+      2. Table-numbered: a 2-column <w:tbl> row where the first cell contains
+         an <m:oMath> and the second cell holds a parenthesised equation number
+         like "(1)" or "(2a)".  The number is attached as the "number" field.
+
+    Each record: {ordinal, para_id, omml_raw, pattern, number, flat_text}.
+    """
+    return docs_intel.parse_docx_equations_local(path)
+
+
+@mcp.tool()
+def index_equations(path: str, index_db_path: str) -> dict[str, Any]:
+    """a80af3a0 — Parse equations from a .docx and store them in the sidecar SQLite.
+
+    Extends the sidecar DB at index_db_path with a docx_equations table.
+    Idempotent — fully replaces the table on each run.  Call after
+    index_document / index_document_structure on the same file.
+
+    Returns {index_db, equation_count}.
+    """
+    return docs_intel.index_docx_equations(path, index_db_path)
+
+
+@mcp.tool()
+def get_equations(index_db_path: str) -> list[dict[str, Any]]:
+    """a80af3a0 — Retrieve all locally-stored equations from the sidecar SQLite.
+
+    Returns a list of equation records in ordinal order from the docx_equations
+    table populated by index_equations.  Returns an empty list when no equations
+    have been indexed yet.
+    """
+    return docs_intel.get_local_equations(index_db_path)
+
+
+@mcp.tool()
+def insert_equation(
+    docx_path: str,
+    anchor_para_id: str,
+    payload: str,
+    position: str = "after",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """a80af3a0 — Insert an equation into a .docx file.
+
+    Accepts a raw OMML XML string (starting with "<") or a LaTeX expression
+    (e.g. r"\\frac{a}{b}" or "E=mc^2") which is converted to OMML locally
+    using latex2mathml (pure Python, no lxml).
+
+    Three positions:
+      "before" — new display-mode paragraph immediately before the anchor.
+      "after"  — new display-mode paragraph immediately after the anchor.
+      "append" — append the <m:oMath> inline to the anchor paragraph itself.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId or p{N}/tbl{N} to anchor the insertion.
+      payload:         Raw OMML XML or LaTeX expression.
+      position:        "before", "after" (default), or "append".
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, position, para_id, omml, docx_path}
+      or {error: <message>} on failure (file NOT mutated on error).
+    """
+    return docs_intel.insert_equation_local(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        payload=payload,
+        position=position,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def edit_equation(
+    docx_path: str,
+    equation_para_id: str,
+    new_payload: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
+
+    Locates the paragraph by equation_para_id, verifies it contains at least
+    one <m:oMath>, removes the existing equation content, and inserts the new
+    equation resolved from OMML or LaTeX.
+
+    Args:
+      docx_path:         Absolute path to the .docx file (mutated in place).
+      equation_para_id:  w14:paraId or p{N} of the equation paragraph.
+      new_payload:       Replacement OMML XML or LaTeX expression.
+      index_db_path:     If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, equation_para_id, omml, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.edit_equation_local(
+        docx_path=docx_path,
+        equation_para_id=equation_para_id,
+        new_payload=new_payload,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def remove_equation(
+    docx_path: str,
+    equation_para_id: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """a80af3a0 — Remove an equation from a .docx file.
+
+    If the paragraph contains ONLY an <m:oMath> (a display-mode equation
+    paragraph), the entire paragraph is removed.  If the paragraph also
+    contains non-equation text runs (an inline equation in a text paragraph),
+    only the <m:oMath> elements are removed, leaving the paragraph's text intact.
+
+    Args:
+      docx_path:         Absolute path to the .docx file (mutated in place).
+      equation_para_id:  w14:paraId or p{N} of the equation paragraph.
+      index_db_path:     If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, equation_para_id, removed_whole_paragraph, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.remove_equation_local(
+        docx_path=docx_path,
+        equation_para_id=equation_para_id,
+        index_db_path=index_db_path,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx meridian-docs``)."""
     mcp.run()

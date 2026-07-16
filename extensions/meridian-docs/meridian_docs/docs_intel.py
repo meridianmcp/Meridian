@@ -24,6 +24,13 @@ Adds insert/edit/remove for real Word Caption paragraphs (Caption style +
 SEQ field) and CSL_CITATION complex fields (Zotero/Mendeley format).
 Stdlib only (zipfile + xml.etree.ElementTree, no lxml).
 
+a80af3a0 — OMML/equation support (local extraction + write-back).
+Two extraction patterns: standalone paragraph (<m:oMath> alone in <w:p>)
+and table-cell-with-numbering (2-col <w:tbl> row: equation | "(1)").
+Write-back: insert_equation_local / edit_equation_local / remove_equation_local.
+LaTeX -> OMML conversion via latex2mathml + stdlib ET mapper (no lxml).
+Local sidecar persistence: index_docx_equations / get_local_equations.
+
 Pure library — every function is deterministic and unit-tested against a
 synthetic in-memory .docx (see tests/test_docs_intel.py).
 """
@@ -1609,5 +1616,751 @@ def remove_citation(
     return {
         "status": "removed",
         "anchor_para_id": anchor_para_id,
+        "docx_path": docx_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# a80af3a0 — OMML/equation support
+#
+# EXTRACTION (stdlib ET, no lxml):
+#   parse_docx_equations_local() — reads every <m:oMath> from word/document.xml
+#   via zipfile + ET.  Two patterns are detected:
+#     1. Standalone-paragraph: an oMath that lives alone in a <w:p> with no
+#        meaningful text siblings (only oMath content in that paragraph).
+#     2. Table-cell-with-numbering: a <w:tbl> row whose first cell contains an
+#        oMath and whose second cell contains a parenthesised number like "(1)".
+#        The number is extracted and associated as the equation's "number" field.
+#
+# WRITE (stdlib ET):
+#   insert_equation_local() — inserts a new standalone-paragraph equation
+#     (before / after / append-inline) into a .docx, accepting raw OMML XML
+#     or a LaTeX string (converted via latex2mathml + stdlib ET mapper below).
+#   edit_equation_local()   — replaces the <m:oMath> content in an existing
+#     equation paragraph.
+#   remove_equation_local() — removes the equation paragraph (or the inline
+#     oMath, for append-position).
+#
+# LOCAL SIDECAR:
+#   index_docx_equations() — populates a docx_equations table in the sidecar
+#     SQLite DB (same DB as docx_figures / docx_tables).
+#   get_local_equations()   — reads all locally-stored equations back out.
+#
+# DEPENDENCY DECISION (a80af3a0):
+#   latex2mathml is added as an explicit dependency in pyproject.toml.  It is
+#   pure Python with no C extension — safe for uvx isolated installs.  The
+#   MathML->OMML conversion (_stdlib_mathml_to_omml below) is a stdlib ET port
+#   of the lxml-based _mathml_to_omml in meridian/doc_store.py; it produces
+#   identical OMML output using ET.SubElement with Clark-notation tags.  The
+#   latex_to_omml_local() function degrades to None when latex2mathml is absent
+#   or the LaTeX is blank/invalid — never raises.
+#   The WRITE side therefore accepts BOTH raw OMML XML (caller-supplied, e.g.
+#   from doc_store.latex_to_omml on the core server) AND a LaTeX string
+#   converted locally.  This is the cleanest path: no lxml in the extension,
+#   full LaTeX support in the extension, same contract as the core server.
+# ---------------------------------------------------------------------------
+
+# OMML namespace (math markup language used by Word for inline equations).
+# The "m" prefix is already registered at module load time (see the ET.register_namespace
+# block near the top of this file) — no second call needed here.
+_M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+
+# MathML namespace (intermediate representation from latex2mathml).
+_MATHML_NS = "http://www.w3.org/1998/Math/MathML"
+
+# Tags that are pure sequencing in MathML — flatten into their children.
+_MATHML_ROW_TAGS = frozenset({"math", "mrow", "mstyle", "mpadded", "mphantom"})
+# Tags whose text content maps to a literal OMML run.
+_MATHML_TEXT_TAGS = frozenset({"mi", "mn", "mo", "mtext"})
+
+# Parenthesised-number pattern for detecting equation number cells.
+# Matches "(1)", "(2a)", "(A.1)", "(eq3)", etc.
+_EQ_NUMBER_RE = re.compile(r"^\s*\(\s*[\w.]+\s*\)\s*$")
+
+
+def _qm(tag: str) -> str:
+    """Clark-notation for an OMML <m:tag>."""
+    return f"{{{_M}}}{tag}"
+
+
+def _omml_flatten_text_local(omml_raw: str | None) -> str:
+    """Concatenate every <m:t> text run inside a raw OMML string (best-effort).
+
+    Stdlib ET port of doc_store._omml_flatten_text — used as the dedup key for
+    equations that only carry OMML (no LaTeX source).  Returns "" on blank /
+    malformed input, never raises.
+    """
+    if not omml_raw:
+        return ""
+    try:
+        el = ET.fromstring(omml_raw)
+    except ET.ParseError:
+        return ""
+    return "".join(t.text or "" for t in el.iter(_qm("t")))
+
+
+def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
+    """Recursively convert a MathML element subtree into OMML children.
+
+    Stdlib ET port of doc_store._append_mathml (the lxml-based version).
+    Handles the common OMML subset; unrecognized constructs (matrices, etc.)
+    degrade to a flattened literal text run.
+    """
+    # Strip the namespace prefix to get the local tag name.
+    tag_full = node.tag
+    tag = tag_full.rsplit("}", 1)[-1] if "}" in tag_full else tag_full
+
+    if tag in _MATHML_ROW_TAGS:
+        for child in node:
+            _stdlib_append_mathml(child, parent)
+        return
+
+    if tag in _MATHML_TEXT_TAGS:
+        text = node.text or ""
+        if text:
+            run = ET.SubElement(parent, _qm("r"))
+            ET.SubElement(run, _qm("t")).text = text
+        return
+
+    if tag == "msup":
+        kids = list(node)
+        base = kids[0] if kids else None
+        exp = kids[1] if len(kids) > 1 else None
+        sup = ET.SubElement(parent, _qm("sSup"))
+        e = ET.SubElement(sup, _qm("e"))
+        if base is not None:
+            _stdlib_append_mathml(base, e)
+        sup_el = ET.SubElement(sup, _qm("sup"))
+        if exp is not None:
+            _stdlib_append_mathml(exp, sup_el)
+        return
+
+    if tag == "msub":
+        kids = list(node)
+        base = kids[0] if kids else None
+        sub = kids[1] if len(kids) > 1 else None
+        s = ET.SubElement(parent, _qm("sSub"))
+        e = ET.SubElement(s, _qm("e"))
+        if base is not None:
+            _stdlib_append_mathml(base, e)
+        sub_el = ET.SubElement(s, _qm("sub"))
+        if sub is not None:
+            _stdlib_append_mathml(sub, sub_el)
+        return
+
+    if tag == "msubsup":
+        kids = list(node)
+        base = kids[0] if kids else None
+        sub = kids[1] if len(kids) > 1 else None
+        sup = kids[2] if len(kids) > 2 else None
+        ss = ET.SubElement(parent, _qm("sSubSup"))
+        e = ET.SubElement(ss, _qm("e"))
+        if base is not None:
+            _stdlib_append_mathml(base, e)
+        sub_el = ET.SubElement(ss, _qm("sub"))
+        if sub is not None:
+            _stdlib_append_mathml(sub, sub_el)
+        sup_el = ET.SubElement(ss, _qm("sup"))
+        if sup is not None:
+            _stdlib_append_mathml(sup, sup_el)
+        return
+
+    if tag == "mfrac":
+        kids = list(node)
+        num = kids[0] if kids else None
+        den = kids[1] if len(kids) > 1 else None
+        f = ET.SubElement(parent, _qm("f"))
+        n_el = ET.SubElement(f, _qm("num"))
+        if num is not None:
+            _stdlib_append_mathml(num, n_el)
+        d_el = ET.SubElement(f, _qm("den"))
+        if den is not None:
+            _stdlib_append_mathml(den, d_el)
+        return
+
+    if tag == "msqrt":
+        rad = ET.SubElement(parent, _qm("rad"))
+        rad_pr = ET.SubElement(rad, _qm("radPr"))
+        deg_hide = ET.SubElement(rad_pr, _qm("degHide"))
+        deg_hide.set(_qm("val"), "1")
+        ET.SubElement(rad, _qm("deg"))
+        e = ET.SubElement(rad, _qm("e"))
+        for child in node:
+            _stdlib_append_mathml(child, e)
+        return
+
+    if tag == "mroot":
+        kids = list(node)
+        base = kids[0] if kids else None
+        index = kids[1] if len(kids) > 1 else None
+        rad = ET.SubElement(parent, _qm("rad"))
+        deg_el = ET.SubElement(rad, _qm("deg"))
+        if index is not None:
+            _stdlib_append_mathml(index, deg_el)
+        e = ET.SubElement(rad, _qm("e"))
+        if base is not None:
+            _stdlib_append_mathml(base, e)
+        return
+
+    if tag == "mfenced":
+        d = ET.SubElement(parent, _qm("d"))
+        for child in node:
+            _stdlib_append_mathml(child, d)
+        return
+
+    # Unrecognized construct (mtable, mmultiscripts, menclose, ...) — degrade
+    # to a flattened literal text run so the rest of the expression still converts.
+    flat = "".join(node.itertext())
+    if flat:
+        run = ET.SubElement(parent, _qm("r"))
+        ET.SubElement(run, _qm("t")).text = flat
+
+
+def latex_to_omml_local(latex: str | None) -> str | None:
+    """Best-effort LaTeX -> OOXML <m:oMath> XML string, or None.
+
+    a80af3a0 — stdlib ET port of doc_store.latex_to_omml (the lxml version).
+    Pipeline: latex2mathml (pure Python) -> standard MathML string ->
+    ET.fromstring -> _stdlib_append_mathml -> ET.tostring.
+
+    Never raises: any failure (missing dependency, unparsable LaTeX, malformed
+    MathML) returns None.  latex2mathml is declared in pyproject.toml as an
+    explicit dependency; if it is absent the function degrades to None gracefully.
+    """
+    if not isinstance(latex, str) or not latex.strip():
+        return None
+    try:
+        import latex2mathml.converter as _l2m  # noqa: PLC0415 — optional dep
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        mathml_str = _l2m.convert(latex)
+        mathml_root = ET.fromstring(mathml_str)
+        # Build the <m:oMath> root element.
+        omath = ET.Element(_qm("oMath"))
+        _stdlib_append_mathml(mathml_root, omath)
+        return ET.tostring(omath, encoding="unicode")
+    except Exception:  # noqa: BLE001 — conversion is best-effort
+        return None
+
+
+def _resolve_omml(payload: str) -> str | None:
+    """Resolve ``payload`` to a raw OMML string or None.
+
+    Accepts three input forms:
+      - Raw OMML XML:  starts with "<" and parses as XML containing <m:oMath>.
+      - LaTeX string:  anything else, converted via latex_to_omml_local().
+      - Blank string:  returns None.
+
+    Returns the OMML string, or None when the payload is unresolvable.
+    Raises ValueError on malformed XML payloads (start with "<" but not valid).
+    """
+    if not payload or not payload.strip():
+        return None
+    stripped = payload.strip()
+    if stripped.startswith("<"):
+        # Validate: must be parseable XML.
+        try:
+            ET.fromstring(stripped)
+        except ET.ParseError as exc:
+            raise ValueError(f"payload starts with '<' but is not valid XML: {exc}") from exc
+        return stripped
+    return latex_to_omml_local(stripped)
+
+
+# ---------------------------------------------------------------------------
+# EXTRACTION: parse_docx_equations_local
+# ---------------------------------------------------------------------------
+
+def _cell_text(tc: ET.Element) -> str:
+    """Concatenate all <w:t> text inside a table cell element."""
+    return "".join(t.text or "" for t in tc.iter(_q(_W, "t")))
+
+
+def _cell_has_omath(tc: ET.Element) -> bool:
+    """Return True if a table cell contains at least one <m:oMath>."""
+    return tc.find(f".//{_qm('oMath')}") is not None
+
+
+def parse_docx_equations_local(
+    source: str | bytes | bytearray,
+) -> list[dict[str, Any]]:
+    """Parse every <m:oMath> in word/document.xml via stdlib ET (a80af3a0).
+
+    Reads the real OOXML tree directly out of the .docx ZIP using zipfile +
+    xml.etree.ElementTree — no lxml, no third-party deps beyond stdlib.
+
+    Returns an ordered list of records::
+
+        {
+            "ordinal":    int,          # 0-based document order
+            "para_id":    str,          # w14:paraId or synthesized "p{index}"
+            "omml_raw":   str,          # serialized <m:oMath>...</m:oMath> XML
+            "pattern":    str,          # "standalone" | "table-numbered"
+            "number":     str | None,   # equation number "(1)" for table pattern
+            "flat_text":  str,          # flattened <m:t> content (dedup key)
+        }
+
+    Two patterns are detected:
+
+    1. **standalone**: an <m:oMath> occurring inside a <w:p> in the body
+       (including inside table cells that are not numbered-equation tables).
+       ``number`` is ``None``.
+
+    2. **table-numbered**: a <w:tbl> row where the first cell contains an
+       <m:oMath> and the second cell contains a parenthesised equation number
+       (e.g. "(1)", "(2a)").  The number is extracted and associated as the
+       equation's ``number`` field.  The ``para_id`` is synthesized from the
+       table's position in the body (``tbl{body_child_index}``) unless the cell
+       paragraph has a real w14:paraId.
+
+    A document with no equations returns [].
+    """
+    if isinstance(source, (bytes, bytearray)):
+        zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
+    else:
+        zf = zipfile.ZipFile(source)
+    try:
+        with zf.open("word/document.xml") as handle:
+            xml_bytes = handle.read()
+    finally:
+        zf.close()
+
+    root = ET.fromstring(xml_bytes)
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return []
+
+    w_p = _q(_W, "p")
+    w_tbl = _q(_W, "tbl")
+    w_tr = _q(_W, "tr")
+    w_tc = _q(_W, "tc")
+    w14_para_id = _q(_W14, "paraId")
+    m_omath = _qm("oMath")
+
+    equations: list[dict[str, Any]] = []
+    ordinal = 0
+    p_global_idx = 0  # counts every <w:p> in document order for synth ids
+
+    for body_child_idx, child in enumerate(body):
+        if child.tag == w_p:
+            para_id = child.get(w14_para_id) or f"p{p_global_idx}"
+            for omath_el in child.findall(f".//{m_omath}"):
+                equations.append({
+                    "ordinal": ordinal,
+                    "para_id": para_id,
+                    "omml_raw": ET.tostring(omath_el, encoding="unicode"),
+                    "pattern": "standalone",
+                    "number": None,
+                    "flat_text": _omml_flatten_text_local(
+                        ET.tostring(omath_el, encoding="unicode")
+                    ),
+                })
+                ordinal += 1
+            p_global_idx += 1
+
+        elif child.tag == w_tbl:
+            # Check every row for the equation-with-numbering pattern:
+            # first cell has oMath, second cell has a parenthesised number.
+            for tr in child.findall(f".//{w_tr}"):
+                cells = tr.findall(w_tc)
+                if len(cells) >= 2 and _cell_has_omath(cells[0]):
+                    number_text = _cell_text(cells[1]).strip()
+                    if _EQ_NUMBER_RE.match(number_text):
+                        # Table-numbered equation.
+                        # Use the first paragraph's para_id inside the cell, or synth.
+                        cell0_para = cells[0].find(w_p)
+                        if cell0_para is not None:
+                            para_id = cell0_para.get(w14_para_id) or f"tbl{body_child_idx}"
+                        else:
+                            para_id = f"tbl{body_child_idx}"
+                        for omath_el in cells[0].iter(m_omath):
+                            equations.append({
+                                "ordinal": ordinal,
+                                "para_id": para_id,
+                                "omml_raw": ET.tostring(omath_el, encoding="unicode"),
+                                "pattern": "table-numbered",
+                                "number": number_text,
+                                "flat_text": _omml_flatten_text_local(
+                                    ET.tostring(omath_el, encoding="unicode")
+                                ),
+                            })
+                            ordinal += 1
+                        continue  # handled — don't fall through to standalone scan
+
+                # Not a numbered-equation table row — scan any oMath as standalone.
+                for omath_el in tr.iter(m_omath):
+                    # Derive para_id from containing <w:p> if possible.
+                    para_id = f"tbl{body_child_idx}"
+                    equations.append({
+                        "ordinal": ordinal,
+                        "para_id": para_id,
+                        "omml_raw": ET.tostring(omath_el, encoding="unicode"),
+                        "pattern": "standalone",
+                        "number": None,
+                        "flat_text": _omml_flatten_text_local(
+                            ET.tostring(omath_el, encoding="unicode")
+                        ),
+                    })
+                    ordinal += 1
+
+    return equations
+
+
+# ---------------------------------------------------------------------------
+# LOCAL SIDECAR: docx_equations table
+# ---------------------------------------------------------------------------
+
+def _ensure_equations_table(conn: sqlite3.Connection) -> None:
+    """Add the docx_equations table to the sidecar if not already present."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_equations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ordinal INTEGER NOT NULL,
+            para_id TEXT,
+            omml_raw TEXT NOT NULL,
+            pattern TEXT NOT NULL DEFAULT 'standalone',
+            number TEXT,
+            flat_text TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+
+
+def index_docx_equations(
+    source: str | bytes | bytearray,
+    index_db_path: str,
+) -> dict[str, Any]:
+    """a80af3a0 — parse a .docx and store its equations into the sidecar SQLite.
+
+    Extends the sidecar DB at ``index_db_path`` (created if absent) with the
+    ``docx_equations`` table.  Idempotent: the table is fully replaced on each
+    run.
+
+    Returns ``{index_db, equation_count}``.
+    """
+    equations = parse_docx_equations_local(source)
+    conn = _connect(index_db_path)
+    try:
+        _ensure_equations_table(conn)
+        conn.execute("DELETE FROM docx_equations")
+        conn.executemany(
+            "INSERT INTO docx_equations "
+            "(ordinal, para_id, omml_raw, pattern, number, flat_text) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    eq["ordinal"],
+                    eq["para_id"],
+                    eq["omml_raw"],
+                    eq["pattern"],
+                    eq["number"],
+                    eq["flat_text"],
+                )
+                for eq in equations
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"index_db": index_db_path, "equation_count": len(equations)}
+
+
+def get_local_equations(index_db_path: str) -> list[dict[str, Any]]:
+    """a80af3a0 — retrieve all locally-stored equations from the sidecar.
+
+    Returns a list of equation records in ordinal order, or an empty list
+    when the docx_equations table does not yet exist.
+    """
+    conn = _connect(index_db_path)
+    try:
+        _ensure_equations_table(conn)
+        rows = conn.execute(
+            "SELECT id, ordinal, para_id, omml_raw, pattern, number, flat_text "
+            "FROM docx_equations ORDER BY ordinal"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "id": r[0],
+            "ordinal": r[1],
+            "para_id": r[2],
+            "omml_raw": r[3],
+            "pattern": r[4],
+            "number": r[5],
+            "flat_text": r[6],
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# WRITE: insert / edit / remove equation
+# ---------------------------------------------------------------------------
+
+def _build_omath_paragraph(omml_raw: str) -> ET.Element:
+    """Wrap a raw OMML string in a new <w:p> for display-mode insertion.
+
+    Produces::
+
+        <w:p>
+          <m:oMath>...</m:oMath>
+        </w:p>
+
+    The oMath element is parsed from ``omml_raw`` and appended as a child.
+    """
+    p = ET.Element(_q(_W, "p"))
+    omath_el = ET.fromstring(omml_raw)
+    p.append(omath_el)
+    return p
+
+
+def insert_equation_local(
+    docx_path: str,
+    anchor_para_id: str,
+    payload: str,
+    position: str = "after",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """a80af3a0 — Insert an equation into a .docx file.
+
+    Accepts raw OMML XML (starts with "<") or a LaTeX string (converted to OMML
+    via latex_to_omml_local).  Three positions are supported:
+
+      ``"before"`` — new display-mode paragraph immediately before anchor.
+      ``"after"``  — new display-mode paragraph immediately after anchor.
+      ``"append"`` — append the <m:oMath> inline to the anchor paragraph.
+
+    For ``"before"`` and ``"after"``, a fresh ``<w:p>`` wrapping the
+    ``<m:oMath>`` is inserted relative to the anchor paragraph (or its
+    containing body child for table-embedded anchors).  For ``"append"``,
+    the ``<m:oMath>`` element is appended as a direct child of the anchor
+    ``<w:p>`` (inline equation style).
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        anchor_para_id:  ``w14:paraId`` or ``p{N}`` / ``tbl{N}`` of the
+                         paragraph to anchor on.
+        payload:         Raw OMML XML string (``<m:oMath>...</m:oMath>``) or a
+                         LaTeX expression (e.g. ``r"\\frac{a}{b}"``).
+        position:        ``"before"``, ``"after"``, or ``"append"`` (default
+                         ``"after"``).
+        index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+        ``{status, position, para_id, omml, docx_path}``
+        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+    """
+    if position not in ("before", "after", "append"):
+        return {"error": f"position must be 'before', 'after', or 'append', got {position!r}"}
+    if not payload or not str(payload).strip():
+        return {"error": "payload must be a non-empty string (OMML XML or LaTeX)"}
+
+    # Resolve OMML before touching the file — fail fast on bad input.
+    try:
+        omml = _resolve_omml(payload.strip())
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if omml is None:
+        return {"error": f"could not convert payload to OMML: {payload!r}"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, anchor_para_id)
+    if result is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+
+    body, anchor_elem, child_idx = result
+
+    if position == "append":
+        # Inline: append <m:oMath> directly to the anchor paragraph.
+        omath_el = ET.fromstring(omml)
+        anchor_elem.append(omath_el)
+    else:
+        # Display: insert a new <w:p> wrapping the equation.
+        new_p = _build_omath_paragraph(omml)
+        insert_at = child_idx if position == "before" else child_idx + 1
+        body.insert(insert_at, new_p)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "inserted",
+        "position": position,
+        "para_id": anchor_para_id,
+        "omml": omml,
+        "docx_path": docx_path,
+    }
+
+
+def edit_equation_local(
+    docx_path: str,
+    equation_para_id: str,
+    new_payload: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
+
+    Locates the paragraph by ``equation_para_id``, verifies it contains at
+    least one ``<m:oMath>``, removes all existing ``<m:oMath>`` children, and
+    inserts the new equation (resolved from OMML or LaTeX).
+
+    Args:
+        docx_path:         Absolute path to the .docx file (mutated in place).
+        equation_para_id:  ``w14:paraId`` or ``p{N}`` of the equation paragraph.
+        new_payload:       Raw OMML XML or LaTeX expression.
+        index_db_path:     If supplied, sidecar is invalidated after write.
+
+    Returns:
+        ``{status, equation_para_id, omml, docx_path}``
+        or ``{"error": <message>}`` on failure.
+    """
+    if not new_payload or not str(new_payload).strip():
+        return {"error": "new_payload must be a non-empty string (OMML XML or LaTeX)"}
+
+    try:
+        omml = _resolve_omml(new_payload.strip())
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if omml is None:
+        return {"error": f"could not convert new_payload to OMML: {new_payload!r}"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, equation_para_id)
+    if result is None:
+        return {"error": f"para_id {equation_para_id!r} not found in {docx_path}"}
+
+    _body, para_elem, _cidx = result
+
+    # Verify: paragraph must contain at least one oMath.
+    m_omath_tag = _qm("oMath")
+    existing = [el for el in para_elem if el.tag == m_omath_tag]
+    if not existing:
+        # Also check deeper (oMath might be wrapped in oMathPara).
+        existing = list(para_elem.iter(m_omath_tag))
+    if not existing:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} does not contain an <m:oMath> element; "
+                "use insert_equation_local to add a new equation"
+            )
+        }
+
+    # Remove all direct-child oMath elements (and oMathPara wrappers).
+    m_omath_para_tag = _qm("oMathPara")
+    for child in list(para_elem):
+        if child.tag in (m_omath_tag, m_omath_para_tag):
+            para_elem.remove(child)
+
+    # Append the new oMath.
+    omath_el = ET.fromstring(omml)
+    para_elem.append(omath_el)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "edited",
+        "equation_para_id": equation_para_id,
+        "omml": omml,
+        "docx_path": docx_path,
+    }
+
+
+def remove_equation_local(
+    docx_path: str,
+    equation_para_id: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """a80af3a0 — Remove an equation paragraph (or inline oMath) from a .docx.
+
+    If the paragraph contains ONLY an <m:oMath> (a display-mode equation
+    paragraph), the entire paragraph is removed from the body.  If the
+    paragraph also contains non-equation text runs (an inline equation appended
+    to a text paragraph), only the <m:oMath> elements are removed, leaving the
+    paragraph intact.
+
+    Args:
+        docx_path:         Absolute path to the .docx file (mutated in place).
+        equation_para_id:  ``w14:paraId`` or ``p{N}`` of the equation paragraph.
+        index_db_path:     If supplied, sidecar is invalidated after write.
+
+    Returns:
+        ``{status, equation_para_id, removed_whole_paragraph, docx_path}``
+        or ``{"error": <message>}`` on failure.
+    """
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, equation_para_id)
+    if result is None:
+        return {"error": f"para_id {equation_para_id!r} not found in {docx_path}"}
+
+    body, para_elem, _cidx = result
+
+    m_omath_tag = _qm("oMath")
+    m_omath_para_tag = _qm("oMathPara")
+
+    # Check whether the paragraph has ANY oMath.
+    all_omath = list(para_elem.iter(m_omath_tag))
+    if not all_omath:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} does not contain an <m:oMath> element"
+            )
+        }
+
+    # Determine whether this paragraph is SOLELY an equation paragraph.
+    # "Solely" = all direct children are oMath / oMathPara / pPr (style).
+    eq_tags = {m_omath_tag, m_omath_para_tag, _q(_W, "pPr")}
+    non_eq_children = [c for c in para_elem if c.tag not in eq_tags]
+    remove_whole = len(non_eq_children) == 0
+
+    if remove_whole:
+        body.remove(para_elem)
+    else:
+        # Inline: remove only the oMath elements (and oMathPara wrappers).
+        for child in list(para_elem):
+            if child.tag in (m_omath_tag, m_omath_para_tag):
+                para_elem.remove(child)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "removed",
+        "equation_para_id": equation_para_id,
+        "removed_whole_paragraph": remove_whole,
         "docx_path": docx_path,
     }
