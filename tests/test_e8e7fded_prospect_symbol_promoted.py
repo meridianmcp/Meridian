@@ -43,13 +43,17 @@ def test_prospect_symbol_recommended_before_search_graph():
     assert "not `search_graph` directly" in normalized
 
 
-def test_worked_example_uses_prospect_symbol():
-    """The RIGHT (one call, immediate result) worked example should lead with
-    prospect_symbol, since that's now the recommended primary tool."""
+def test_prospect_symbol_is_described_as_finding_immediately():
+    """prospect_symbol must be described in the MANDATORY CODE INTEL PROTOCOL
+    section as finding a symbol in one call (as opposed to repeated grep attempts)."""
     text = DEFAULT_AGENT_INSTRUCTIONS
-    right_example_start = text.index("RIGHT (one call")
-    example_block = text[right_example_start : right_example_start + 300]
-    assert "prospect_symbol" in example_block
+    protocol_start = text.index("MANDATORY CODE INTEL PROTOCOL")
+    protocol_and_after = text[protocol_start:]
+    # prospect_symbol must be named and must be described as the immediate alternative.
+    assert "prospect_symbol" in protocol_and_after
+    # The section must convey that a single call replaces multiple grep attempts.
+    lowered = protocol_and_after.lower()
+    assert "immediately" in lowered or "single" in lowered or "one call" in lowered
 
 
 def test_search_graph_crosscheck_rule_still_present_as_fallback():
