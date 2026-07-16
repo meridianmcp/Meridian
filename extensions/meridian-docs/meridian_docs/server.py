@@ -562,6 +562,189 @@ def remove_equation(
     )
 
 
+@mcp.tool()
+def scan_citation_keys(docx_path: str) -> list[str]:
+    """1258794a — Return all citation keys present in a .docx (in appearance order).
+
+    Walks every paragraph looking for CSL_CITATION complex fields (the same
+    fields written by insert_citation) and extracts the citation key from each.
+    Keys are deduplicated; first-appearance order is preserved.  Returns [] when
+    the document has no in-text citations or cannot be read.
+
+    Args:
+      docx_path: Absolute path to the .docx file.
+
+    Returns:
+      A list of citation key strings, e.g. ["smith2023", "doi:10.1/x"].
+    """
+    return docs_intel.scan_all_citation_keys(docx_path)
+
+
+@mcp.tool()
+def format_reference(csl_item: dict) -> str:
+    """1258794a — Format a CSL-JSON item as an APA 7th-edition reference string.
+
+    Formats journal articles, books, book chapters, and conference papers
+    per APA 7th edition.  Other item types produce a minimal fallback:
+    Author (Year). Title.
+
+    This is a pure formatting utility — it does not read or write any file.
+    Use it to preview or verify a reference before writing it to a document.
+
+    Args:
+      csl_item: A CSL-JSON-shaped dict with at minimum ``author``, ``title``,
+                ``type`` (or ``itemType``), and ``issued`` (or ``year``) fields.
+                As returned by Zotero's local API or zotero_client.
+
+    Returns:
+      The formatted reference string.
+    """
+    return docs_intel.format_apa_reference(csl_item)
+
+
+@mcp.tool()
+def insert_bibliography_entry(
+    docx_path: str,
+    citation_key: str,
+    csl_item: dict,
+    index_db_path: str | None = None,
+) -> dict:
+    """1258794a — Write a formatted APA bibliography entry into a .docx.
+
+    Locates (or creates) a References heading at the end of the document,
+    then appends a new entry paragraph at the end of the references block.
+    The entry is formatted from the supplied CSL-JSON item (journal article,
+    book, book chapter, or conference paper; other types use a minimal fallback).
+
+    A bookmark (bibkey_<key>) is embedded in the paragraph so that
+    update_bibliography_entry and remove_bibliography_entry can locate it.
+
+    If an entry for citation_key already exists, returns an error — use
+    update_bibliography_entry to refresh an existing entry.
+
+    The citation_key should match the key used in insert_citation for the
+    corresponding in-text marker.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (mutated in place).
+      citation_key:  Stable citation identifier (DOI, zotero:KEY, citekey, etc.).
+      csl_item:      CSL-JSON-shaped item dict (from Zotero local API /
+                     zotero_client.resolve_citation_ref + item fetch).
+      index_db_path: If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, citation_key, formatted_text, docx_path}
+      or {error: <message>} on failure (file NOT mutated on error).
+    """
+    return docs_intel.insert_bibliography_entry(
+        docx_path=docx_path,
+        citation_key=citation_key,
+        csl_item=csl_item,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def update_bibliography_entry(
+    docx_path: str,
+    citation_key: str,
+    csl_item: dict,
+    index_db_path: str | None = None,
+) -> dict:
+    """1258794a — Refresh the formatted text of an existing bibliography entry.
+
+    Locates the entry paragraph for citation_key by its embedded bookmark
+    (bibkey_<key>), re-formats the reference from the updated csl_item,
+    and replaces the text run in-place.
+
+    Use this after fetching fresh Zotero data for an already-inserted entry
+    (e.g. if the journal or author list changed).
+
+    Args:
+      docx_path:     Absolute path to the .docx file (mutated in place).
+      citation_key:  The same key used when the entry was inserted.
+      csl_item:      Updated CSL-JSON item dict.
+      index_db_path: If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, citation_key, formatted_text, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.update_bibliography_entry(
+        docx_path=docx_path,
+        citation_key=citation_key,
+        csl_item=csl_item,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def remove_bibliography_entry(
+    docx_path: str,
+    citation_key: str,
+    index_db_path: str | None = None,
+) -> dict:
+    """1258794a — Remove a bibliography entry paragraph from a .docx.
+
+    Locates the entry by the bibkey_<key> bookmark and removes the entire
+    paragraph.  Use this when a citation is deleted from the document body
+    and the corresponding reference list entry should be removed.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (mutated in place).
+      citation_key:  The citation key of the entry to remove.
+      index_db_path: If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, citation_key, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.remove_bibliography_entry(
+        docx_path=docx_path,
+        citation_key=citation_key,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def sync_bibliography(
+    docx_path: str,
+    csl_items: dict,
+    index_db_path: str | None = None,
+) -> dict:
+    """1258794a — Reconcile bibliography entries against in-document citations.
+
+    Scans the document for all in-text citation keys (inserted via
+    insert_citation) and reconciles the bibliography section:
+
+      - Keys with csl_items entries but no bibliography paragraph are inserted.
+      - Keys with both in-text citations and bibliography entries are updated
+        (in case Zotero data changed since the entry was first written).
+      - Keys cited in-text but absent from csl_items are reported as
+        missing_data (caller must fetch from Zotero and re-call).
+      - Keys with bibliography entries but no longer cited in-text are reported
+        as stale_entries (caller decides whether to call remove_bibliography_entry).
+
+    Workflow: call scan_citation_keys, then fetch CSL-JSON from Zotero for each
+    key (via zotero_client.resolve_citation_ref / the Zotero local API), then
+    pass the {key: csl_item} mapping to this tool.
+
+    Args:
+      docx_path:   Absolute path to the .docx file (mutated in place).
+      csl_items:   Dict mapping citation_key -> CSL-JSON item dict.
+      index_db_path: If supplied, sidecar is invalidated after each write.
+
+    Returns:
+      {status, inserted, updated, missing_data, stale_entries, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.sync_bibliography(
+        docx_path=docx_path,
+        csl_items=csl_items,
+        index_db_path=index_db_path,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx meridian-docs``)."""
     mcp.run()

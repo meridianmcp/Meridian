@@ -2364,3 +2364,816 @@ def remove_equation_local(
         "removed_whole_paragraph": remove_whole,
         "docx_path": docx_path,
     }
+
+
+# ---------------------------------------------------------------------------
+# 1258794a — Bibliography write-back: insert / update / remove / sync
+#
+# Design decisions:
+#   - Zotero is the sole citation backend (no Mendeley / EndNote / RefWorks
+#     manual entry). Item data is fetched from the local Zotero API via
+#     meridian.zotero_client (same client used by the cross-document resolver),
+#     called through a small synchronous shim so we stay stdlib-only inside
+#     this extension process.
+#   - APA 7 formatting is supported for four item types (journal article, book,
+#     book chapter, conference paper / proceedings). A full citeproc-js-equivalent
+#     CSL style engine is explicitly out of scope — the formatter is a solid,
+#     tested APA formatter for the most common academic item types. Other types
+#     degrade gracefully to a minimal "Author (Year). Title." form.
+#   - Bibliography entries are written as plain <w:p> paragraphs with a
+#     "Bibliography" style when available (Word's built-in hanging-indent style),
+#     located after a "References" or "Bibliography" heading. If no such heading
+#     exists one is created at the end of the document body.
+#   - Each entry paragraph carries a bookmark pair (w:bookmarkStart /
+#     w:bookmarkEnd) with name "bibkey_<safe_key>" so update / remove can locate
+#     the correct paragraph reliably without re-parsing the formatted text string.
+#     This is the standard OOXML mechanism that Word preserves across re-saves.
+#   - Re-using _load_docx_xml_stdlib / _save_docx_xml_stdlib / _find_para_by_id
+#     / _extract_keys_from_instruction / _scan_citation_field — no new I/O or
+#     OOXML primitives needed beyond what captions + citations already supply.
+# ---------------------------------------------------------------------------
+
+_REFS_HEADING_TEXTS = frozenset({"references", "bibliography", "works cited", "literature cited"})
+_BIBKEY_BOOKMARK_PREFIX = "bibkey_"
+_BIBLIOGRAPHY_STYLE = "Bibliography"
+
+
+# ---------------------------------------------------------------------------
+# APA 7 formatter — CSL-JSON item → formatted reference-list string
+#
+# Scope: journal article, book, book chapter, conference paper.
+# Out of scope: full CSL style-engine generality (citeproc-js equivalent),
+# report / thesis / dataset / webpage / patent types — these degrade to a
+# minimal "Author (Year). Title." form. Documented in the commit message.
+# ---------------------------------------------------------------------------
+
+def _apa_authors(authors: list[dict[str, Any]]) -> str:
+    """Format a CSL-JSON author array into an APA author string.
+
+    CSL-JSON author: {"family": "Smith", "given": "John A."} or
+    {"literal": "World Health Organization"} for corporate authors.
+
+    APA format:
+      1 author:  Smith, J. A.
+      2 authors: Smith, J. A., & Jones, B.
+      3-19:      Smith, J. A., Jones, B., ... & Last, C.
+      20+:       first 19 then "... & Last, C."
+    """
+    if not authors:
+        return "Unknown Author"
+
+    def _fmt_one(a: dict[str, Any]) -> str:
+        lit = a.get("literal")
+        if lit:
+            return str(lit).strip()
+        family = str(a.get("family") or "").strip()
+        given = str(a.get("given") or "").strip()
+        if not family:
+            return given or "Unknown"
+        if not given:
+            return family
+        # Abbreviate given name(s): "John A." -> "J. A.", "J." -> "J."
+        initials = " ".join(
+            p[0].upper() + "." if not p.endswith(".") else p.upper()
+            for p in given.replace("-", " ").split()
+        )
+        return f"{family}, {initials}"
+
+    if len(authors) == 1:
+        return _fmt_one(authors[0])
+    if len(authors) == 2:
+        return f"{_fmt_one(authors[0])}, & {_fmt_one(authors[1])}"
+    if len(authors) <= 19:
+        parts = [_fmt_one(a) for a in authors[:-1]]
+        return ", ".join(parts) + f", & {_fmt_one(authors[-1])}"
+    # 20+ authors: first 19, ellipsis, last.
+    parts19 = [_fmt_one(a) for a in authors[:19]]
+    return ", ".join(parts19) + f", ... {_fmt_one(authors[-1])}"
+
+
+def _apa_year(item: dict[str, Any]) -> str:
+    """Extract the publication year from a CSL-JSON item.
+
+    CSL-JSON ``issued`` field: {"date-parts": [[2023]]} or [[2023, 5, 12]].
+    Falls back to ``year`` (some Zotero exports use this), then to "n.d.".
+    """
+    issued = item.get("issued")
+    if isinstance(issued, dict):
+        parts = issued.get("date-parts")
+        if isinstance(parts, list) and parts and isinstance(parts[0], list) and parts[0]:
+            year = parts[0][0]
+            if year:
+                return str(year)
+    # Fallback: top-level year (non-standard but used by some Zotero exports).
+    year_raw = item.get("year")
+    if year_raw:
+        return str(year_raw).strip()
+    return "n.d."
+
+
+def _apa_doi_or_url(item: dict[str, Any]) -> str:
+    """Return 'https://doi.org/<doi>' if DOI present, else URL, else ''."""
+    doi = item.get("DOI") or item.get("doi")
+    if doi and str(doi).strip():
+        d = str(doi).strip()
+        if not d.startswith("http"):
+            d = "https://doi.org/" + d
+        return d
+    url = item.get("URL") or item.get("url")
+    if url and str(url).strip():
+        return str(url).strip()
+    return ""
+
+
+def format_apa_reference(item: dict[str, Any]) -> str:
+    """Format a CSL-JSON item as an APA 7th-edition reference-list entry.
+
+    Supported item types (``type`` / ``itemType`` field):
+      - ``article-journal`` / ``journalArticle`` -> journal article format
+      - ``book``                                  -> book format
+      - ``chapter`` / ``bookSection``             -> book chapter format
+      - ``paper-conference`` / ``conferencePaper`` -> conference paper format
+      - anything else                             -> minimal fallback
+
+    The ``item`` dict is CSL-JSON-shaped (as returned by Zotero's local API).
+    Pure / deterministic and never raises (returns a best-effort string on
+    any missing / malformed data).
+
+    OUT OF SCOPE: reports, theses, datasets, webpages, patents, and any type
+    not listed above — they get the minimal fallback: Author (Year). Title.
+    Full CSL style-engine support (citeproc-js equivalent) is a declared
+    non-goal for this item (1258794a).
+    """
+    if not isinstance(item, dict):
+        return ""
+
+    authors = item.get("author") or []
+    if not isinstance(authors, list):
+        authors = []
+
+    item_type = str(item.get("type") or item.get("itemType") or "").strip()
+
+    author_str = _apa_authors(authors)
+    year = _apa_year(item)
+    title = str(item.get("title") or "Untitled").strip()
+    doi_url = _apa_doi_or_url(item)
+
+    # --- Journal article ---
+    if item_type in ("article-journal", "journalArticle", "article"):
+        journal = str(
+            item.get("container-title") or item.get("journalAbbreviation") or ""
+        ).strip()
+        volume = str(item.get("volume") or "").strip()
+        issue = str(item.get("issue") or "").strip()
+        page = str(item.get("page") or "").strip()
+        parts = [f"{author_str} ({year}). {title}."]
+        source_parts: list[str] = []
+        if journal:
+            if volume and issue:
+                source_parts.append(f"{journal}, {volume}({issue})")
+            elif volume:
+                source_parts.append(f"{journal}, {volume}")
+            else:
+                source_parts.append(journal)
+        if page:
+            if source_parts:
+                source_parts[-1] += f", {page}"
+            else:
+                source_parts.append(page)
+        if source_parts:
+            parts.append(" ".join(source_parts) + ".")
+        if doi_url:
+            parts.append(doi_url)
+        return " ".join(parts)
+
+    # --- Book ---
+    if item_type in ("book",):
+        publisher = str(item.get("publisher") or "").strip()
+        place = str(
+            item.get("publisher-place") or item.get("place") or ""
+        ).strip()
+        edition = str(item.get("edition") or "").strip()
+        ed_str = f" ({edition} ed.)" if edition else ""
+        parts = [f"{author_str} ({year}). {title}{ed_str}."]
+        pub_parts: list[str] = []
+        if place:
+            pub_parts.append(place)
+        if publisher:
+            pub_parts.append(publisher)
+        if pub_parts:
+            parts.append(": ".join(pub_parts) + ".")
+        if doi_url:
+            parts.append(doi_url)
+        return " ".join(parts)
+
+    # --- Book chapter ---
+    if item_type in ("chapter", "bookSection"):
+        editor_list = item.get("editor") or []
+        if not isinstance(editor_list, list):
+            editor_list = []
+        container = str(item.get("container-title") or "").strip()
+        publisher = str(item.get("publisher") or "").strip()
+        page = str(item.get("page") or "").strip()
+        ed_names = _apa_authors(editor_list) if editor_list else ""
+        ed_role = " (Ed.)," if len(editor_list) == 1 else " (Eds.),"
+        parts = [f"{author_str} ({year}). {title}."]
+        in_parts: list[str] = []
+        if ed_names:
+            in_parts.append(f"In {ed_names}{ed_role}")
+        if container:
+            in_parts.append(container)
+        if page:
+            in_parts.append(f"(pp. {page})")
+        if in_parts:
+            parts.append(" ".join(in_parts) + ".")
+        if publisher:
+            parts.append(publisher + ".")
+        if doi_url:
+            parts.append(doi_url)
+        return " ".join(parts)
+
+    # --- Conference paper ---
+    if item_type in ("paper-conference", "conferencePaper"):
+        conference = str(
+            item.get("container-title")
+            or item.get("event-title")
+            or item.get("event")
+            or ""
+        ).strip()
+        publisher = str(item.get("publisher") or "").strip()
+        page = str(item.get("page") or "").strip()
+        parts = [f"{author_str} ({year}). {title}."]
+        if conference:
+            conf_str = conference
+            if page:
+                conf_str += f", {page}"
+            parts.append(conf_str + ".")
+        if publisher:
+            parts.append(publisher + ".")
+        if doi_url:
+            parts.append(doi_url)
+        return " ".join(parts)
+
+    # --- Fallback for unrecognised types ---
+    parts = [f"{author_str} ({year}). {title}."]
+    if doi_url:
+        parts.append(doi_url)
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Document scan: discover all citation keys present in the document
+# ---------------------------------------------------------------------------
+
+def scan_all_citation_keys(docx_path: str) -> list[str]:
+    """Return a deduplicated list of all citation keys present in a .docx.
+
+    Walks every paragraph in ``word/document.xml`` looking for CSL_CITATION
+    complex fields (same ``_scan_citation_field`` used by ``remove_citation``).
+    Returns keys in first-appearance order.  Returns [] on any error.
+    """
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError):
+        return []
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return []
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    for para in body.iter(_q(_W, "p")):
+        scan = _scan_citation_field(para)
+        if scan is None:
+            continue
+        _bi, _ei, instr, _disp = scan
+        for key in _extract_keys_from_instruction(instr):
+            if key not in seen:
+                seen.add(key)
+                ordered.append(key)
+
+    return ordered
+
+
+# ---------------------------------------------------------------------------
+# Bibliography section locator / creator
+# ---------------------------------------------------------------------------
+
+def _find_references_heading(
+    body: ET.Element,
+) -> tuple[int, ET.Element] | None:
+    """Find a References / Bibliography heading paragraph in the body.
+
+    Returns ``(body_child_index, heading_element)`` for the FIRST body-level
+    paragraph whose style is a heading style AND whose text normalises to one
+    of the recognised heading texts (``references``, ``bibliography``, etc.).
+
+    Returns ``None`` when no such heading is found.
+    """
+    w_p = _q(_W, "p")
+    w_pStyle = _q(_W, "pStyle")
+    w_pPr = _q(_W, "pPr")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+
+    for idx, child in enumerate(body):
+        if child.tag != w_p:
+            continue
+        ppr = child.find(w_pPr)
+        if ppr is None:
+            continue
+        pstyle = ppr.find(w_pStyle)
+        if pstyle is None:
+            continue
+        style_val = pstyle.get(w_val) or ""
+        if not _is_heading(style_val):
+            continue
+        text = "".join(t.text or "" for t in child.iter(w_t)).strip().lower()
+        if text in _REFS_HEADING_TEXTS:
+            return (idx, child)
+
+    return None
+
+
+def _build_references_heading() -> ET.Element:
+    """Build a ``<w:p>`` element for a 'References' heading (Heading1 style)."""
+    p = ET.Element(_q(_W, "p"))
+    pPr = ET.SubElement(p, _q(_W, "pPr"))
+    pStyle = ET.SubElement(pPr, _q(_W, "pStyle"))
+    pStyle.set(_q(_W, "val"), "Heading1")
+    r = ET.SubElement(p, _q(_W, "r"))
+    t = ET.SubElement(r, _q(_W, "t"))
+    t.text = "References"
+    return p
+
+
+def _build_bibliography_paragraph(
+    citation_key: str,
+    formatted_text: str,
+) -> ET.Element:
+    """Build a ``<w:p>`` for a bibliography entry.
+
+    Uses the ``Bibliography`` style (Word's built-in hanging-indent style).
+    Embeds a ``w:bookmarkStart`` / ``w:bookmarkEnd`` pair with name
+    ``bibkey_<safe_key>`` so update / remove operations can locate this
+    paragraph reliably.
+    """
+    # Sanitise the citation key for use as a bookmark name.
+    # Word bookmark names: alphanumeric + underscore, max 40 chars, starts with letter.
+    safe_key = re.sub(r"[^A-Za-z0-9_]", "_", citation_key)
+    if safe_key and safe_key[0].isdigit():
+        safe_key = "k_" + safe_key
+    safe_key = safe_key[:40]
+    bookmark_name = f"{_BIBKEY_BOOKMARK_PREFIX}{safe_key}"
+
+    p = ET.Element(_q(_W, "p"))
+
+    # Paragraph properties: Bibliography style.
+    pPr = ET.SubElement(p, _q(_W, "pPr"))
+    pStyle = ET.SubElement(pPr, _q(_W, "pStyle"))
+    pStyle.set(_q(_W, "val"), _BIBLIOGRAPHY_STYLE)
+
+    # Bookmark start (id=0; Word renumbers on next open — that's fine).
+    bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
+    bm_start.set(_q(_W, "id"), "0")
+    bm_start.set(_q(_W, "name"), bookmark_name)
+
+    # Text run with the formatted reference.
+    r = ET.SubElement(p, _q(_W, "r"))
+    t = ET.SubElement(r, _q(_W, "t"))
+    t.set(_q(_XML_NS, "space"), "preserve")
+    t.text = formatted_text
+
+    # Bookmark end.
+    bm_end = ET.SubElement(p, _q(_W, "bookmarkEnd"))
+    bm_end.set(_q(_W, "id"), "0")
+
+    return p
+
+
+def _find_bibliography_entry(
+    body: ET.Element,
+    citation_key: str,
+) -> tuple[int, ET.Element] | None:
+    """Find an existing bibliography entry paragraph for ``citation_key``.
+
+    Searches for a ``<w:bookmarkStart>`` whose ``w:name`` is
+    ``bibkey_<safe_key>`` and returns ``(body_child_index, paragraph_element)``
+    for the body-level ``<w:p>`` that contains it.
+
+    Returns ``None`` when not found.
+    """
+    safe_key = re.sub(r"[^A-Za-z0-9_]", "_", citation_key)
+    if safe_key and safe_key[0].isdigit():
+        safe_key = "k_" + safe_key
+    safe_key = safe_key[:40]
+    bookmark_name = f"{_BIBKEY_BOOKMARK_PREFIX}{safe_key}"
+
+    w_p = _q(_W, "p")
+    w_bookmarkStart = _q(_W, "bookmarkStart")
+    w_name = _q(_W, "name")
+
+    for idx, child in enumerate(body):
+        if child.tag != w_p:
+            continue
+        for bm in child.iter(w_bookmarkStart):
+            if bm.get(w_name) == bookmark_name:
+                return (idx, child)
+
+    return None
+
+
+def _bibliography_entries_range(
+    body: ET.Element,
+    heading_idx: int,
+) -> tuple[int, int]:
+    """Return ``(start_idx, end_idx)`` for the bibliography block after the heading.
+
+    ``start_idx`` is heading_idx + 1.
+    ``end_idx`` is the index of the first body child AFTER the bibliography
+    block (i.e., the next heading or the body's end).  A new entry should be
+    inserted at ``end_idx``.
+    """
+    start = heading_idx + 1
+    body_list = list(body)
+    n = len(body_list)
+    end = start
+
+    for i in range(start, n):
+        child = body_list[i]
+        if child.tag != _q(_W, "p"):
+            end = i
+            break
+        ppr = child.find(_q(_W, "pPr"))
+        style_val = ""
+        if ppr is not None:
+            ps = ppr.find(_q(_W, "pStyle"))
+            if ps is not None:
+                style_val = ps.get(_q(_W, "val")) or ""
+        # Stop at the next heading.
+        if _is_heading(style_val):
+            end = i
+            break
+        end = i + 1
+    else:
+        end = n
+
+    return (start, end)
+
+
+# ---------------------------------------------------------------------------
+# Public bibliography API: insert / update / remove / sync
+# ---------------------------------------------------------------------------
+
+def insert_bibliography_entry(
+    docx_path: str,
+    citation_key: str,
+    csl_item: dict[str, Any],
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """1258794a — Write a formatted APA bibliography entry into a .docx.
+
+    Locates (or creates) a ``References`` heading at the end of the document,
+    then inserts a new entry paragraph at the end of the references block.
+    The entry is formatted as an APA 7th-edition reference from the supplied
+    CSL-JSON ``csl_item`` dict (as returned by Zotero's local API or by
+    ``zotero_client.resolve_citation_ref`` + ``fetch_zotero_csl_item``).
+
+    If an entry for ``citation_key`` already exists (detected by bookmark name)
+    this function returns an error — use ``update_bibliography_entry`` instead.
+
+    Args:
+        docx_path:     Absolute path to the .docx file (mutated in place).
+        citation_key:  Stable citation identifier (DOI, Zotero key, citekey —
+                       used as the bookmark name so update/remove can find it).
+        csl_item:      CSL-JSON-shaped item dict with at minimum ``author``,
+                       ``title``, ``type``/``itemType``, and ``issued`` fields.
+        index_db_path: If supplied, sidecar is invalidated after the write.
+
+    Returns:
+        ``{status, citation_key, formatted_text, docx_path}``
+        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+    """
+    if not citation_key or not str(citation_key).strip():
+        return {"error": "citation_key must be a non-empty string"}
+    if not isinstance(csl_item, dict):
+        return {"error": "csl_item must be a CSL-JSON dict"}
+
+    clean_key = str(citation_key).strip()
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    # Check for duplicate.
+    if _find_bibliography_entry(body, clean_key) is not None:
+        return {
+            "error": (
+                f"bibliography entry for {clean_key!r} already exists; "
+                "use update_bibliography_entry to refresh it"
+            )
+        }
+
+    # Format the reference text.
+    try:
+        formatted_text = format_apa_reference(csl_item)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not format CSL-JSON item: {exc}"}
+
+    if not formatted_text.strip():
+        return {"error": "formatted reference text is empty — malformed CSL-JSON item?"}
+
+    # Locate or create the References heading.
+    heading_result = _find_references_heading(body)
+    if heading_result is None:
+        # Create heading at end of body (before sectPr if present).
+        body_list = list(body)
+        insert_pos = len(body_list)
+        # sectPr is usually the last element; don't insert after it.
+        if body_list and body_list[-1].tag == _q(_W, "sectPr"):
+            insert_pos = len(body_list) - 1
+        heading_p = _build_references_heading()
+        body.insert(insert_pos, heading_p)
+        heading_idx = insert_pos
+        entry_insert_pos = heading_idx + 1
+    else:
+        heading_idx, _heading_elem = heading_result
+        _start, end = _bibliography_entries_range(body, heading_idx)
+        entry_insert_pos = end
+
+    entry_p = _build_bibliography_paragraph(clean_key, formatted_text)
+    body.insert(entry_insert_pos, entry_p)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "inserted",
+        "citation_key": clean_key,
+        "formatted_text": formatted_text,
+        "docx_path": docx_path,
+    }
+
+
+def update_bibliography_entry(
+    docx_path: str,
+    citation_key: str,
+    csl_item: dict[str, Any],
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """1258794a — Refresh the formatted text of an existing bibliography entry.
+
+    Locates the entry paragraph for ``citation_key`` by its embedded bookmark
+    name, re-formats the reference from the (possibly updated) ``csl_item``,
+    and replaces the text run in-place.
+
+    Args:
+        docx_path:     Absolute path to the .docx file (mutated in place).
+        citation_key:  The same key used when the entry was inserted.
+        csl_item:      Updated CSL-JSON item dict.
+        index_db_path: If supplied, sidecar is invalidated after the write.
+
+    Returns:
+        ``{status, citation_key, formatted_text, docx_path}``
+        or ``{"error": <message>}`` on failure.
+    """
+    if not citation_key or not str(citation_key).strip():
+        return {"error": "citation_key must be a non-empty string"}
+    if not isinstance(csl_item, dict):
+        return {"error": "csl_item must be a CSL-JSON dict"}
+
+    clean_key = str(citation_key).strip()
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    entry_result = _find_bibliography_entry(body, clean_key)
+    if entry_result is None:
+        return {
+            "error": (
+                f"no bibliography entry found for {clean_key!r}; "
+                "use insert_bibliography_entry to add it first"
+            )
+        }
+
+    _entry_idx, entry_elem = entry_result
+
+    try:
+        formatted_text = format_apa_reference(csl_item)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not format CSL-JSON item: {exc}"}
+
+    if not formatted_text.strip():
+        return {"error": "formatted reference text is empty — malformed CSL-JSON item?"}
+
+    # Replace the first <w:t> text run in the paragraph.
+    for t_el in entry_elem.iter(_q(_W, "t")):
+        t_el.text = formatted_text
+        t_el.set(_q(_XML_NS, "space"), "preserve")
+        break
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "updated",
+        "citation_key": clean_key,
+        "formatted_text": formatted_text,
+        "docx_path": docx_path,
+    }
+
+
+def remove_bibliography_entry(
+    docx_path: str,
+    citation_key: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """1258794a — Remove a bibliography entry paragraph from a .docx.
+
+    Locates the entry by the ``bibkey_<key>`` bookmark and removes the entire
+    paragraph.
+
+    Args:
+        docx_path:     Absolute path to the .docx file (mutated in place).
+        citation_key:  The citation key of the entry to remove.
+        index_db_path: If supplied, sidecar is invalidated after the write.
+
+    Returns:
+        ``{status, citation_key, docx_path}``
+        or ``{"error": <message>}`` on failure.
+    """
+    if not citation_key or not str(citation_key).strip():
+        return {"error": "citation_key must be a non-empty string"}
+
+    clean_key = str(citation_key).strip()
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    entry_result = _find_bibliography_entry(body, clean_key)
+    if entry_result is None:
+        return {"error": f"no bibliography entry found for {clean_key!r}"}
+
+    _entry_idx, entry_elem = entry_result
+    body.remove(entry_elem)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "removed",
+        "citation_key": clean_key,
+        "docx_path": docx_path,
+    }
+
+
+def sync_bibliography(
+    docx_path: str,
+    csl_items: dict[str, dict[str, Any]],
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """1258794a — Reconcile bibliography entries against in-document citations.
+
+    Given a ``csl_items`` mapping from citation key -> CSL-JSON item dict:
+
+      1. Scans the document for all in-text citation keys.
+      2. For each in-text key that has a ``csl_items`` entry:
+         - Inserts it if no bibliography entry yet exists.
+         - Updates it if an entry already exists (refresh in case Zotero
+           data changed).
+      3. Reports keys cited in-text but absent from ``csl_items`` as
+         ``missing_data`` (caller must fetch from Zotero and re-call).
+      4. Reports ``stale_entries``: keys with bibliography entries no longer
+         cited in-text (informational; caller decides whether to remove them).
+
+    This function does NOT alphabetize existing entries in-place — that
+    would require removing and re-inserting all entries, which is risky.
+    New entries are inserted at the end of the references block in citation-
+    appearance order.
+
+    Args:
+        docx_path:     Absolute path to the .docx file (mutated in place).
+        csl_items:     Mapping from citation key -> CSL-JSON item dict.
+        index_db_path: If supplied, sidecar is invalidated after each write.
+
+    Returns:
+        ``{status, inserted, updated, missing_data, stale_entries, docx_path}``
+        or ``{"error": <message>}`` on failure.
+
+        ``missing_data``: list of keys cited in-text but absent from csl_items.
+        ``stale_entries``: list of bookmark-key suffixes with entries no longer
+                           cited in-text.
+    """
+    if not isinstance(csl_items, dict):
+        return {"error": "csl_items must be a dict mapping citation_key -> CSL-JSON item"}
+
+    if not os.path.exists(docx_path):
+        return {"error": f"no such file: {docx_path}"}
+
+    # Step 1: discover in-text keys.
+    in_text_keys = scan_all_citation_keys(docx_path)
+
+    # Step 2: discover existing bibliography entry keys (by bookmark names).
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    existing_bm_keys: set[str] = set()
+    if body is not None:
+        w_bookmarkStart = _q(_W, "bookmarkStart")
+        w_name = _q(_W, "name")
+        for p in body.iter(_q(_W, "p")):
+            for bm in p.iter(w_bookmarkStart):
+                name = bm.get(w_name) or ""
+                if name.startswith(_BIBKEY_BOOKMARK_PREFIX):
+                    bm_suffix = name[len(_BIBKEY_BOOKMARK_PREFIX):]
+                    existing_bm_keys.add(bm_suffix)
+
+    in_text_set = set(in_text_keys)
+
+    # Build the set of bookmark-key suffixes for in-text keys.
+    def _safe_bm_key(k: str) -> str:
+        s = re.sub(r"[^A-Za-z0-9_]", "_", k)
+        if s and s[0].isdigit():
+            s = "k_" + s
+        return s[:40]
+
+    in_text_bm_keys = {_safe_bm_key(k) for k in in_text_keys}
+    stale_entries: list[str] = list(existing_bm_keys - in_text_bm_keys)
+
+    missing_data: list[str] = []
+    inserted: list[str] = []
+    updated: list[str] = []
+    errors: list[str] = []
+
+    for key in in_text_keys:
+        if key not in csl_items:
+            missing_data.append(key)
+            continue
+        item = csl_items[key]
+        bm_key = _safe_bm_key(key)
+
+        if bm_key in existing_bm_keys:
+            res = update_bibliography_entry(docx_path, key, item, index_db_path)
+            if "error" in res:
+                errors.append(f"{key}: {res['error']}")
+            else:
+                updated.append(key)
+        else:
+            res = insert_bibliography_entry(docx_path, key, item, index_db_path)
+            if "error" in res:
+                errors.append(f"{key}: {res['error']}")
+            else:
+                inserted.append(key)
+                existing_bm_keys.add(bm_key)
+
+    result: dict[str, Any] = {
+        "status": "ok" if not errors else "partial",
+        "inserted": inserted,
+        "updated": updated,
+        "missing_data": missing_data,
+        "stale_entries": stale_entries,
+        "docx_path": docx_path,
+    }
+    if errors:
+        result["errors"] = errors
+    return result
