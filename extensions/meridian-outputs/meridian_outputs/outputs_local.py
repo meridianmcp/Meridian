@@ -1287,13 +1287,37 @@ def _cache_key(outputs_dir: str) -> str:
     return _normalize_output_path(outputs_dir) or os.path.abspath(str(outputs_dir))
 
 
+def _resolve_index_db_path(outputs_dir: str) -> str:
+    """Return the on-disk DuckDB path for ``outputs_dir``'s index cache.
+
+    The cache lives at ``<outputs_dir>/.meridian-outputs-cache/index.duckdb``
+    so it travels with the data it indexes and stays out of unrelated
+    directories.  :func:`ensure_gitignored` is called on the cache directory
+    so it never gets committed.  On any failure to create the directory
+    (permissions, read-only tree, etc.) this falls back to ``:memory:`` so a
+    single bad outputs_dir degrades to the old (non-persistent) behaviour
+    instead of raising.
+    """
+    cache_dir = os.path.join(outputs_dir, ".meridian-outputs-cache")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        ensure_gitignored(cache_dir)
+    except OSError:
+        _log.debug(
+            "_resolve_index_db_path: could not create cache dir %r, "
+            "falling back to :memory:", cache_dir, exc_info=True,
+        )
+        return ":memory:"
+    return os.path.join(cache_dir, "index.duckdb")
+
+
 def _get_cached_index(outputs_dir: str) -> OutputsFtsIndex:
     """Look up (or create) the cached OutputsFtsIndex for a directory."""
     key = _cache_key(outputs_dir)
     with _index_cache_lock:
         idx = _index_cache.pop(key, None)
         if idx is None:
-            idx = OutputsFtsIndex(outputs_dir)
+            idx = OutputsFtsIndex(outputs_dir, db_path=_resolve_index_db_path(outputs_dir))
         _index_cache[key] = idx
         while len(_index_cache) > _MAX_CACHED_INDEXES:
             _, evicted = _index_cache.popitem(last=False)

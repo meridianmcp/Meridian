@@ -673,6 +673,59 @@ class TestSearchOutputsAPI:
 
 
 # ---------------------------------------------------------------------------
+# On-disk index persistence + auto-gitignore (sprint item 0c1a4349)
+# ---------------------------------------------------------------------------
+
+class TestCachedIndexPersistence:
+    """_get_cached_index must persist to a real on-disk DuckDB file, not
+    :memory:, and must activate ensure_gitignored on the cache directory."""
+
+    def test_resolve_index_db_path_not_memory(self, tmp_path: Path) -> None:
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        assert db_path != ":memory:"
+        assert db_path.endswith("index.duckdb")
+        assert os.path.isdir(tmp_path / ".meridian-outputs-cache")
+
+    def test_resolve_index_db_path_writes_gitignore(self, tmp_path: Path) -> None:
+        OL._resolve_index_db_path(str(tmp_path))
+        gi_path = tmp_path / ".gitignore"
+        assert gi_path.is_file()
+        assert ".meridian-outputs-cache/" in gi_path.read_text(encoding="utf-8")
+
+    def test_resolve_index_db_path_falls_back_on_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def _boom(path: str, exist_ok: bool = False) -> None:
+            raise OSError("simulated permission failure")
+
+        monkeypatch.setattr(OL.os, "makedirs", _boom)
+        assert OL._resolve_index_db_path(str(tmp_path)) == ":memory:"
+
+    @duckdb_required
+    def test_get_cached_index_uses_real_db_path(self, tmp_path: Path) -> None:
+        idx = OL._get_cached_index(str(tmp_path))
+        assert idx._db_path != ":memory:"
+        assert os.path.isfile(idx._db_path) or os.path.isdir(os.path.dirname(idx._db_path))
+
+    @duckdb_required
+    def test_index_survives_cache_eviction(self, tmp_path: Path) -> None:
+        """Rebuilding via a fresh OutputsFtsIndex pointed at the same on-disk
+        db_path (simulating cache eviction / process restart) must see rows
+        indexed by a prior instance -- the whole point of persisting."""
+        (tmp_path / "metric.csv").write_text("epoch,loss\n1,0.5", encoding="utf-8")
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild()
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        row = idx2.resolve_output(str(tmp_path / "metric.csv"))
+        idx2.close()
+        assert row is not None
+
+
+# ---------------------------------------------------------------------------
 # Determinism: same inputs -> same results (requirement 3)
 # ---------------------------------------------------------------------------
 
