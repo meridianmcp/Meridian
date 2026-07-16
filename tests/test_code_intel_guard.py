@@ -18,10 +18,16 @@ grep exclusively instead of code-intel tools. This tests the ACTUAL hook BEHAVIO
 from __future__ import annotations
 
 import asyncio
+import functools
 import http.server
 import json
+import os
+import re
 import shutil
+import socket
 import subprocess
+import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -52,43 +58,226 @@ _WIN_CRASH_CODES = frozenset(
 
 
 # ---------------------------------------------------------------------------
-# Minimal HTTP stub for the /projects/{id}/settings endpoint
+# Network topology detection
 # ---------------------------------------------------------------------------
 
-class _StubHandler(http.server.BaseHTTPRequestHandler):
-    """Serves a single canned JSON response for any GET /projects/*/settings."""
+@functools.lru_cache(maxsize=1)
+def _bash_is_wsl2() -> bool:
+    """Return True if the 'bash' on PATH is WSL2 bash (Linux kernel in Hyper-V).
 
-    code_intel_enabled: int = 1  # class-level, set per test via the fixture
+    WSL2 bash runs in a separate network namespace from Windows.  The Windows
+    Hyper-V firewall blocks inbound connections from WSL2 to Windows on
+    ephemeral ports, so a stub server bound to 127.0.0.1 or 0.0.0.0 on Windows
+    is unreachable from WSL2 bash.  On Git Bash / native Linux CI there is no
+    such boundary.
+    """
+    try:
+        r = subprocess.run(
+            ["bash", "-c",
+             "grep -qi 'microsoft.*wsl2\\|wsl2.*microsoft' /proc/version 2>/dev/null"
+             " && echo yes || echo no"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return r.stdout.strip() == "yes"
+    except Exception:
+        return False
 
-    def do_GET(self):  # noqa: N802
-        body = json.dumps({"code_intel_enabled": self.__class__.code_intel_enabled}).encode()
+
+def _windows_path_to_wsl(path: str) -> str:
+    """Convert a Windows path (C:\\...) to a WSL2-accessible /mnt/c/... path."""
+    path = path.replace("\\", "/")
+    path = re.sub(r"^([A-Za-z]):/", lambda m: f"/mnt/{m.group(1).lower()}/", path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Stub server inline script (used by both native and WSL2 modes)
+# ---------------------------------------------------------------------------
+
+def _stub_script(code_intel_enabled: int) -> str:
+    """Return a self-contained Python script that starts an HTTP stub server.
+
+    The script writes its bound port number to stdout before entering
+    serve_forever(), allowing the parent process to read it back.
+
+    For /slot-readiness requests the stub returns ready=true + has_tunnel=true
+    so the guard sees a ready slot and proceeds to block (exit 2) when
+    code_intel_enabled=1, rather than failing open due to "no tunnel".
+    """
+    return f"""\
+import http.server, json, sys
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if 'slot-readiness' in self.path:
+            body = json.dumps({{"ready": True, "has_tunnel": True}}).encode()
+        else:
+            body = json.dumps({{"code_intel_enabled": {code_intel_enabled}}}).encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+    def log_message(self, *a, **k): pass
 
-    def log_message(self, *args, **kwargs):
-        pass  # silence access log
-
-
-def _start_stub_server(code_intel_enabled: int) -> tuple[int, threading.Thread]:
-    """Start a stub HTTP server; return (port, thread)."""
-    _StubHandler.code_intel_enabled = code_intel_enabled
-    server = http.server.HTTPServer(("127.0.0.1", 0), _StubHandler)
-    port = server.server_address[1]
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    return port, t
+s = http.server.HTTPServer(('127.0.0.1', 0), H)
+sys.stdout.write(str(s.server_address[1]) + '\\n')
+sys.stdout.flush()
+s.serve_forever()
+"""
 
 
-def _free_port() -> int:
-    """Return a port number that is currently not bound (best-effort)."""
-    import socket
+# ---------------------------------------------------------------------------
+# Stub server helpers
+# ---------------------------------------------------------------------------
+
+class _StubServer:
+    """Minimal HTTP stub that lives in the same network namespace as bash.
+
+    Root cause: on Windows, 'bash' resolves to WSL2 (C:\\Windows\\System32\\
+    bash.exe).  WSL2 runs a full Linux kernel under Hyper-V with its own
+    network namespace.  A Python HTTP server started on the Windows side (even
+    bound to 0.0.0.0) is blocked by the Windows Hyper-V firewall and is NOT
+    reachable from inside WSL2 on ephemeral ports.
+
+    Fix: when WSL2 bash is detected, start the stub server as a python3
+    subprocess INSIDE WSL2, by writing the server script to a Windows temp file
+    (accessible from WSL2 via /mnt/c/...) and running it via bash.  Both the
+    stub server and the hook then run in WSL2's network namespace and reach each
+    other on 127.0.0.1.
+
+    On Git Bash / Linux CI (no WSL2 boundary) the classic Python-side server
+    bound to 127.0.0.1 works as before.
+    """
+
+    def __init__(self, code_intel_enabled: int) -> None:
+        self.code_intel_enabled = code_intel_enabled
+        self._thread: threading.Thread | None = None
+        self._wsl_proc: "subprocess.Popen[bytes] | None" = None
+        self._tmpfile: str | None = None
+        self.url: str = ""
+
+    def start(self) -> None:
+        if _bash_is_wsl2():
+            self._start_in_wsl2()
+        else:
+            self._start_native()
+
+    def _start_native(self) -> None:
+        """Start the stub on the Windows / Linux CI side."""
+        script = _stub_script(self.code_intel_enabled)
+        # We can't use the script helper directly in threading, so start a
+        # plain HTTPServer the old way.
+        class _H(http.server.BaseHTTPRequestHandler):
+            ci_val = self.code_intel_enabled
+
+            def do_GET(self):  # noqa: N802
+                if "slot-readiness" in self.path:
+                    body = json.dumps({"ready": True, "has_tunnel": True}).encode()
+                else:
+                    body = json.dumps({"code_intel_enabled": self.__class__.ci_val}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a, **kw): pass  # silence
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+        port = srv.server_address[1]
+        self._thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        self._thread.start()
+        self.url = f"http://127.0.0.1:{port}"
+
+    def _start_in_wsl2(self) -> None:
+        """Start the stub as a python3 process inside WSL2.
+
+        Writes the server script to a Windows temp file, converts the path to
+        WSL2's /mnt/c/... form, and runs it via 'bash -c python3 <path>'.
+        The server immediately prints its bound port to stdout so we know when
+        it's ready.
+        """
+        script = _stub_script(self.code_intel_enabled)
+        # Write to Windows temp; WSL2 can read it via /mnt/<drive>/...
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".py", mode="w", delete=False, encoding="utf-8"
+        )
+        tmp.write(script)
+        tmp.close()
+        self._tmpfile = tmp.name
+        wsl_path = _windows_path_to_wsl(tmp.name)
+
+        proc = subprocess.Popen(
+            ["bash", "-c", f"python3 '{wsl_path}'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        # Server writes port then blocks in serve_forever.
+        port_line = proc.stdout.readline().decode("utf-8", "replace").strip()
+        if not port_line.isdigit():
+            proc.kill()
+            stderr = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", "replace")
+            raise RuntimeError(
+                f"WSL2 stub server failed to start (got port={port_line!r}, "
+                f"stderr={stderr!r})"
+            )
+        self._wsl_proc = proc
+        self.url = f"http://127.0.0.1:{port_line}"
+
+    def stop(self) -> None:
+        if self._wsl_proc is not None:
+            self._wsl_proc.kill()
+            self._wsl_proc = None
+        if self._tmpfile is not None:
+            try:
+                os.unlink(self._tmpfile)
+            except OSError:
+                pass
+            self._tmpfile = None
+
+
+def _start_stub_server(code_intel_enabled: int) -> tuple[str, _StubServer]:
+    """Start a stub HTTP server in the correct network namespace for bash.
+
+    Returns (url, stub).  Pass *url* directly as MERIDIAN_URL to the hook --
+    it is already set to a 127.0.0.1 address reachable by the bash process
+    that will run the hook (WSL2 or native).
+    """
+    stub = _StubServer(code_intel_enabled)
+    stub.start()
+    return stub.url, stub
+
+
+def _free_url() -> str:
+    """Return a URL on an unbound port in the same namespace as bash.
+
+    Used by the 'server unreachable' tests: the port must be free (no listener)
+    *in the namespace where curl runs*, so WSL2 gets a free WSL2 port.
+    """
+    if _bash_is_wsl2():
+        r = subprocess.run(
+            ["bash", "-c",
+             "python3 -c \""
+             "import socket; s=socket.socket(); s.bind(('127.0.0.1',0));"
+             " p=s.getsockname()[1]; s.close(); print(p)"
+             "\""],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        port = r.stdout.strip()
+        if port.isdigit():
+            return f"http://127.0.0.1:{port}"
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        return f"http://127.0.0.1:{s.getsockname()[1]}"
 
+
+# ---------------------------------------------------------------------------
+# Hook runner
+# ---------------------------------------------------------------------------
 
 def _run_hook_once(
     payload: str, *, meridian_url: str | None = None
@@ -99,8 +288,7 @@ def _run_hook_once(
     # that is not bound so curl hits "connection refused" quickly (not a timeout
     # hang as port 9 can cause on Windows).
     if meridian_url is None:
-        port = _free_port()
-        meridian_url = f"http://127.0.0.1:{port}"
+        meridian_url = _free_url()
     setup = f'export MERIDIAN_URL="{meridian_url}"; '
     cmd = setup + "exec bash .claude/hooks/code_intel_guard.sh"
     r = subprocess.run(
@@ -143,9 +331,8 @@ def _run_hook(
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_fails_open_when_server_unreachable(tool):
     """MERIDIAN_URL on an unbound port -- connection refused, hook exits 0."""
-    port = _free_port()
     payload = json.dumps({"tool_name": tool, "tool_input": {}})
-    r = _run_hook(payload, meridian_url=f"http://127.0.0.1:{port}")
+    r = _run_hook(payload, meridian_url=_free_url())
     assert r.returncode == 0, f"{tool}: must fail open when server is unreachable"
 
 
@@ -157,10 +344,13 @@ def test_hook_fails_open_when_server_unreachable(tool):
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_fails_open_when_code_intel_disabled(tool):
     """code_intel_enabled=0 -- no index, hook exits 0 (nothing to redirect to)."""
-    port, _ = _start_stub_server(code_intel_enabled=0)
-    payload = json.dumps({"tool_name": tool, "tool_input": {}})
-    r = _run_hook(payload, meridian_url=f"http://127.0.0.1:{port}")
-    assert r.returncode == 0, f"{tool}: must fail open when code_intel_enabled=0"
+    url, stub = _start_stub_server(code_intel_enabled=0)
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_hook(payload, meridian_url=url)
+        assert r.returncode == 0, f"{tool}: must fail open when code_intel_enabled=0"
+    finally:
+        stub.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -171,24 +361,30 @@ def test_hook_fails_open_when_code_intel_disabled(tool):
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_blocks_grep_glob_when_code_intel_enabled(tool):
     """code_intel_enabled=1 -- hook exits 2 and stderr names code-intel tools."""
-    port, _ = _start_stub_server(code_intel_enabled=1)
-    payload = json.dumps({"tool_name": tool, "tool_input": {}})
-    r = _run_hook(payload, meridian_url=f"http://127.0.0.1:{port}")
-    assert r.returncode == 2, f"{tool}: must exit 2 when code-intel index exists"
-    assert "find_symbol" in r.stderr, "must mention find_symbol as the alternative"
-    assert "search_graph" in r.stderr, "must mention search_graph as the alternative"
-    assert "aeba8a80" in r.stderr, "must cite the item id"
+    url, stub = _start_stub_server(code_intel_enabled=1)
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_hook(payload, meridian_url=url)
+        assert r.returncode == 2, f"{tool}: must exit 2 when code-intel index exists"
+        assert "find_symbol" in r.stderr, "must mention find_symbol as the alternative"
+        assert "search_graph" in r.stderr, "must mention search_graph as the alternative"
+        assert "aeba8a80" in r.stderr, "must cite the item id"
+    finally:
+        stub.stop()
 
 
 @_needs_bash
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_stderr_names_the_tool_that_was_blocked(tool):
     """The error message names the specific blocked tool (Grep or Glob)."""
-    port, _ = _start_stub_server(code_intel_enabled=1)
-    payload = json.dumps({"tool_name": tool, "tool_input": {}})
-    r = _run_hook(payload, meridian_url=f"http://127.0.0.1:{port}")
-    assert r.returncode == 2
-    assert tool in r.stderr, f"stderr must name the blocked tool ({tool})"
+    url, stub = _start_stub_server(code_intel_enabled=1)
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_hook(payload, meridian_url=url)
+        assert r.returncode == 2
+        assert tool in r.stderr, f"stderr must name the blocked tool ({tool})"
+    finally:
+        stub.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -203,10 +399,13 @@ def test_hook_stderr_names_the_tool_that_was_blocked(tool):
 )
 def test_hook_allows_all_other_tools(tool):
     """Tools other than Grep/Glob must never be blocked, even with index enabled."""
-    port, _ = _start_stub_server(code_intel_enabled=1)
-    payload = json.dumps({"tool_name": tool, "tool_input": {}})
-    r = _run_hook(payload, meridian_url=f"http://127.0.0.1:{port}")
-    assert r.returncode == 0, f"{tool} must not be blocked by the code-intel guard"
+    url, stub = _start_stub_server(code_intel_enabled=1)
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_hook(payload, meridian_url=url)
+        assert r.returncode == 0, f"{tool} must not be blocked by the code-intel guard"
+    finally:
+        stub.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +416,12 @@ def test_hook_allows_all_other_tools(tool):
 @pytest.mark.parametrize("payload", ["", "not json at all", "{}", '{"foo":"bar"}'])
 def test_hook_fails_open_on_unparseable(payload):
     """Malformed or missing stdin: hook must never trap the executor."""
-    port, _ = _start_stub_server(code_intel_enabled=1)
-    r = _run_hook(payload, meridian_url=f"http://127.0.0.1:{port}")
-    assert r.returncode == 0, "must fail open on unparseable payload"
+    url, stub = _start_stub_server(code_intel_enabled=1)
+    try:
+        r = _run_hook(payload, meridian_url=url)
+        assert r.returncode == 0, "must fail open on unparseable payload"
+    finally:
+        stub.stop()
 
 
 # ---------------------------------------------------------------------------
