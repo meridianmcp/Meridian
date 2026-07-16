@@ -994,9 +994,18 @@ class OutputsFtsIndex:
                 p: a.sha256 for p, a in precomputed.items()
             }
 
+            stale_set = set(stale)
+
             def _cached_hasher(path: str) -> str | None:
                 if path in _precomp_hashes:
                     return _precomp_hashes[path]
+                # Non-stale (mtime/size unchanged) archival candidates already
+                # have a known-good hash from a prior rebuild -- reuse it
+                # instead of re-hashing the file from disk again this run.
+                if path not in stale_set:
+                    cached_row = self._row_cache.get(path)
+                    if cached_row is not None:
+                        return cached_row.sha256
                 return self._hasher(path)
 
             classifications = classify_canonical_archival(

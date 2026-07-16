@@ -1134,6 +1134,86 @@ class TestRebuildPhase1Deadline:
 
 
 # ---------------------------------------------------------------------------
+# Archival-classification hash persistence (sprint item 7a6a278f)
+# ---------------------------------------------------------------------------
+
+class TestArchivalHashPersistence:
+    """classify_canonical_archival must not re-hash unchanged archival
+    candidates on every rebuild() -- only newly-stale files get re-hashed."""
+
+    def test_unchanged_archival_candidate_not_rehashed(self, tmp_path: Path) -> None:
+        """classify_canonical_archival only runs when something is stale or
+        removed, so the test needs an unrelated file to change between
+        rebuilds -- that keeps classify_canonical_archival on the call path
+        while the archival pair itself stays untouched."""
+        content = b"a,b\n1,2\n"
+        canonical = tmp_path / "run.csv"
+        archival = tmp_path / "run_old.csv"
+        unrelated = tmp_path / "unrelated.csv"
+        canonical.write_bytes(content)
+        archival.write_bytes(content)
+        unrelated.write_bytes(b"x\n1")
+
+        call_log: list[str] = []
+        real_hasher = OL._sha256_file
+
+        def counting_hasher(path: str) -> str | None:
+            call_log.append(path)
+            return real_hasher(path)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), hasher=counting_hasher)
+        try:
+            idx.rebuild()
+            assert str(canonical) in call_log  # both files new -- must be hashed once
+            assert str(archival) in call_log
+
+            # Change only the unrelated file so `stale` is non-empty on the
+            # second rebuild (keeping classify_canonical_archival on the call
+            # path) while the archival pair itself is untouched.
+            unrelated.write_bytes(b"x\n2")
+            os.utime(str(unrelated), None)
+            call_log.clear()
+            idx.rebuild()
+            assert str(canonical) not in call_log, (
+                "unchanged canonical file was re-hashed by classify_canonical_archival"
+            )
+            assert str(archival) not in call_log, (
+                "unchanged archival candidate was re-hashed by classify_canonical_archival"
+            )
+        finally:
+            idx.close()
+
+    def test_changed_file_still_rehashed(self, tmp_path: Path) -> None:
+        """A genuinely modified archival candidate must still be re-hashed --
+        persistence must not mask real content changes."""
+        canonical = tmp_path / "run.csv"
+        archival = tmp_path / "run_old.csv"
+        canonical.write_bytes(b"a,b\n1,2\n")
+        archival.write_bytes(b"a,b\n1,2\n")
+
+        call_log: list[str] = []
+        real_hasher = OL._sha256_file
+
+        def counting_hasher(path: str) -> str | None:
+            call_log.append(path)
+            return real_hasher(path)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), hasher=counting_hasher)
+        try:
+            idx.rebuild()
+            call_log.clear()
+
+            archival.write_bytes(b"a,b\n9,9\n")
+            os.utime(str(archival), None)
+            idx.rebuild()
+            assert str(archival) in call_log, (
+                "a genuinely modified archival candidate must be re-hashed"
+            )
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
 # DuckDB FTS capability probe (sprint item b8314850)
 #
 # Sprint item b8314850 asked us to switch _rebuild_fts() from overwrite=1 to
