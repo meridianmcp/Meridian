@@ -1086,8 +1086,13 @@ class TestRebuildPhase1Deadline:
     of always running every worker to completion before Phase 2 even starts."""
 
     def test_default_budget_raised_from_5s(self) -> None:
-        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS >= 150.0
-        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS <= 180.0
+        # 5845cc6d: lowered from the original 170.0 fix to 130.0 to leave more
+        # headroom under the ~4min external MCP client timeout once real
+        # uvx-cold-start + protocol overhead is added on top of the internal
+        # rebuild() budget -- real-world validation showed 170.0 cut it too
+        # close. Still far above the original unreachable 5.0s default.
+        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS >= 100.0
+        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS <= 150.0
 
     def test_phase1_deadline_bounds_wall_clock(self, tmp_path: Path) -> None:
         """A tight deadline must make rebuild() return well before every
@@ -1129,6 +1134,44 @@ class TestRebuildPhase1Deadline:
             count = idx.rebuild(max_seconds=None)
             assert count == 5
             assert idx.last_rebuild_partial is False
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_phase1_subdeadline_leaves_phase2_time_to_persist(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression test for 5845cc6d: on a tree too large to fully analyse
+        within the budget, Phase 1 must still leave Phase 2 real time to
+        persist whatever it DID manage to compute. Before the fix, Phase 1
+        used the FULL deadline and could consume all of it, leaving Phase 2
+        zero iterations -- total_indexed stuck at 0 forever regardless of how
+        many files were actually hashed."""
+        n_files = 40
+        for i in range(n_files):
+            (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+
+        def slow_hasher(path: str) -> str | None:
+            time.sleep(0.3)
+            return OL._sha256_file(path)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), hasher=slow_hasher)
+        try:
+            # 8 workers, 0.3s/file -> ~5 waves of 8 to finish everything
+            # (~1.5s total). phase1_deadline is 0.5 * max_seconds; with
+            # max_seconds=1.0 that's 0.5s -- enough for exactly one wave (8
+            # files) to complete before Phase 1 cuts itself off, leaving
+            # ~0.5s for Phase 2 (cheap: no hashing, just cache + DB writes).
+            count = idx.rebuild(max_seconds=1.0)
+            assert count > 0, (
+                "rebuild() made zero forward progress -- Phase 1's own "
+                "sub-deadline isn't leaving Phase 2 any time to persist"
+            )
+            assert count < n_files, (
+                "test setup didn't actually exercise a deadline cutoff -- "
+                "all files were indexed, so this isn't testing partial progress"
+            )
+            assert idx.last_rebuild_partial is True
         finally:
             idx.close()
 
