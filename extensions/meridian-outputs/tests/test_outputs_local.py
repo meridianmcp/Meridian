@@ -1175,6 +1175,56 @@ class TestRebuildPhase1Deadline:
         finally:
             idx.close()
 
+    @duckdb_required
+    def test_skips_fts_rebuild_when_deadline_passed_and_index_exists(
+        self, tmp_path: Path,
+    ) -> None:
+        """d9c76caa follow-up: once an FTS index exists, a rebuild() whose
+        deadline has already passed by the time the write phase reaches
+        _rebuild_fts() must skip that (expensive, full-table, non-
+        incremental) step rather than paying its cost unconditionally --
+        search() still returns results off the existing (now slightly
+        stale) index instead of the call blowing its budget regardless of
+        how well Phase 1/Phase 2 behaved."""
+        a = tmp_path / "a.csv"
+        b = tmp_path / "b.csv"
+        a.write_text("col\n1", encoding="utf-8")
+        b.write_text("col\n2", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()  # generous default budget -> FTS actually gets built
+            assert idx._fts_built is True
+
+            call_count = [0]
+            real_rebuild_fts = idx._rebuild_fts
+
+            def counting_rebuild_fts(con: Any) -> None:
+                call_count[0] += 1
+                real_rebuild_fts(con)
+
+            idx._rebuild_fts = counting_rebuild_fts
+
+            # Removing a file forces removed_paths to be non-empty, which
+            # makes changed=True UNCONDITIONALLY (that loop has no deadline
+            # check) -- this reaches the `if changed:` block (and therefore
+            # the new skip-fts decision) even with an already-expired
+            # deadline, where a stale-only rebuild would otherwise never
+            # get there at all.
+            b.unlink()
+            idx.rebuild(max_seconds=-100.0)  # deadline already in the past
+            assert call_count[0] == 0, (
+                "FTS rebuild should have been skipped once the deadline had "
+                "already passed, not paid unconditionally"
+            )
+            assert idx.last_rebuild_partial is True
+
+            # search() must still work off the existing index, not nothing.
+            hits = idx.search("col")
+            assert isinstance(hits, list)
+        finally:
+            idx.close()
+
 
 # ---------------------------------------------------------------------------
 # Archival-classification hash persistence (sprint item 7a6a278f)

@@ -1082,7 +1082,33 @@ class OutputsFtsIndex:
                                 for r in new_rows
                             ],
                         )
-                    self._rebuild_fts(con)
+                    # d9c76caa follow-up -- _rebuild_fts() is a FULL,
+                    # non-incremental rebuild (DuckDB has no incremental FTS
+                    # support in the installed version, per b8314850) whose
+                    # cost grows with the TOTAL row count and has no deadline
+                    # check of its own. On a huge cold tree this alone can
+                    # push the overall rebuild() call well past its budget
+                    # even after Phase 1/Phase 2 correctly stop on time (the
+                    # real-MCP-path validation for this item showed exactly
+                    # that: search_outputs still exceeded the ~4min external
+                    # ceiling with Phase 1/2 fixed). Skip the rebuild when the
+                    # deadline has already passed AND a usable FTS index
+                    # already exists from a prior successful rebuild --
+                    # search() only rebuilds FTS itself when none exists yet
+                    # (_fts_built is False), so skipping here never leaves
+                    # search() with nothing to query, only slightly-stale
+                    # results (missing this round's newest rows) until a
+                    # future call with enough remaining budget completes a
+                    # fresh one.
+                    skip_fts = (
+                        self._fts_built
+                        and deadline is not None
+                        and time.monotonic() > deadline
+                    )
+                    if skip_fts:
+                        self.last_rebuild_partial = True
+                    else:
+                        self._rebuild_fts(con)
                 except Exception:  # noqa: BLE001
                     _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
             return len(rows)
