@@ -1078,6 +1078,62 @@ class TestParallelRebuildCorrectness:
 
 
 # ---------------------------------------------------------------------------
+# rebuild() Phase 1 deadline enforcement (sprint item d9c76caa)
+# ---------------------------------------------------------------------------
+
+class TestRebuildPhase1Deadline:
+    """Phase 1's ThreadPoolExecutor must actually respect max_seconds instead
+    of always running every worker to completion before Phase 2 even starts."""
+
+    def test_default_budget_raised_from_5s(self) -> None:
+        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS >= 150.0
+        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS <= 180.0
+
+    def test_phase1_deadline_bounds_wall_clock(self, tmp_path: Path) -> None:
+        """A tight deadline must make rebuild() return well before every
+        worker would finish -- proof Phase 1 no longer blocks on
+        as_completed() until all futures are done."""
+        n_files = 16
+        for i in range(n_files):
+            (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+
+        def slow_hasher(path: str) -> str | None:
+            time.sleep(1.0)
+            return OL._sha256_file(path)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), hasher=slow_hasher)
+        try:
+            start = time.monotonic()
+            idx.rebuild(max_seconds=0.2)
+            elapsed = time.monotonic() - start
+            # With 8 workers and 16 files at 1s/hasher call, running Phase 1 to
+            # completion would take ~2s. A working deadline check should return
+            # once the first batch of workers reports back (~1s), well short
+            # of that -- proving Phase 1 didn't wait for every future.
+            assert elapsed < 1.8, (
+                f"rebuild() took {elapsed:.2f}s with a 0.2s budget -- Phase 1 "
+                "appears to have blocked until all workers finished"
+            )
+            assert idx.last_rebuild_partial is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_unlimited_budget_processes_everything(self, tmp_path: Path) -> None:
+        """max_seconds=None must still index every file (no regression to the
+        deadline-enforcement change for the common/default case)."""
+        for i in range(5):
+            (tmp_path / f"g{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            count = idx.rebuild(max_seconds=None)
+            assert count == 5
+            assert idx.last_rebuild_partial is False
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
 # DuckDB FTS capability probe (sprint item b8314850)
 #
 # Sprint item b8314850 asked us to switch _rebuild_fts() from overwrite=1 to

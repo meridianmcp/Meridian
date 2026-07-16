@@ -342,7 +342,7 @@ _SCRIPT_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-DEFAULT_REBUILD_BUDGET_SECONDS = 5.0
+DEFAULT_REBUILD_BUDGET_SECONDS = 170.0
 MERIDIAN_NOTES_FILENAME = "MERIDIAN_NOTES.md"
 
 
@@ -944,21 +944,43 @@ class OutputsFtsIndex:
             # Cap workers at 8 to avoid spawning hundreds of threads for a huge
             # outputs tree; I/O is the bottleneck, not CPU count.
             max_workers = min(8, len(stale))
-            with concurrent.futures.ThreadPoolExecutor(
+            # Not a `with` block: on a deadline breach we need
+            # shutdown(wait=False, cancel_futures=True) so still-queued work is
+            # dropped immediately. A `with` block's default __exit__ calls
+            # shutdown(wait=True), which would block until every submitted
+            # future finishes -- silently defeating the deadline check below on
+            # a large/cold tree (this was the actual bug: Phase 1 had no
+            # deadline check at all and always ran to completion).
+            pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_workers,
                 thread_name_prefix="meridian_outputs_analyse",
-            ) as pool:
+            )
+            phase1_deadline_hit = False
+            try:
                 futures = {
                     pool.submit(_analyse_file, p, self._hasher): p
                     for p in stale
                 }
                 for fut in concurrent.futures.as_completed(futures):
+                    if deadline is not None and time.monotonic() > deadline:
+                        phase1_deadline_hit = True
+                        break
                     try:
                         analysis = fut.result()
                         precomputed[analysis.path] = analysis
                     except Exception:  # noqa: BLE001
                         p = futures[fut]
                         _log.debug("_analyse_file failed for %r", p, exc_info=True)
+            finally:
+                if phase1_deadline_hit:
+                    _log.debug(
+                        "rebuild: Phase 1 budget exceeded with %d/%d files "
+                        "analysed; cancelling remaining work",
+                        len(precomputed), len(stale),
+                    )
+                    pool.shutdown(wait=False, cancel_futures=True)
+                else:
+                    pool.shutdown(wait=True)
 
         # classify_canonical_archival needs all paths (not just stale ones) to
         # detect archival twins correctly.  It is read-only, so it runs here
