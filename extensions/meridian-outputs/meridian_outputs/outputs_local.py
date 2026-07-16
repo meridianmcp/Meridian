@@ -342,7 +342,7 @@ _SCRIPT_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-DEFAULT_REBUILD_BUDGET_SECONDS = 5.0
+DEFAULT_REBUILD_BUDGET_SECONDS = 170.0
 MERIDIAN_NOTES_FILENAME = "MERIDIAN_NOTES.md"
 
 
@@ -944,21 +944,43 @@ class OutputsFtsIndex:
             # Cap workers at 8 to avoid spawning hundreds of threads for a huge
             # outputs tree; I/O is the bottleneck, not CPU count.
             max_workers = min(8, len(stale))
-            with concurrent.futures.ThreadPoolExecutor(
+            # Not a `with` block: on a deadline breach we need
+            # shutdown(wait=False, cancel_futures=True) so still-queued work is
+            # dropped immediately. A `with` block's default __exit__ calls
+            # shutdown(wait=True), which would block until every submitted
+            # future finishes -- silently defeating the deadline check below on
+            # a large/cold tree (this was the actual bug: Phase 1 had no
+            # deadline check at all and always ran to completion).
+            pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_workers,
                 thread_name_prefix="meridian_outputs_analyse",
-            ) as pool:
+            )
+            phase1_deadline_hit = False
+            try:
                 futures = {
                     pool.submit(_analyse_file, p, self._hasher): p
                     for p in stale
                 }
                 for fut in concurrent.futures.as_completed(futures):
+                    if deadline is not None and time.monotonic() > deadline:
+                        phase1_deadline_hit = True
+                        break
                     try:
                         analysis = fut.result()
                         precomputed[analysis.path] = analysis
                     except Exception:  # noqa: BLE001
                         p = futures[fut]
                         _log.debug("_analyse_file failed for %r", p, exc_info=True)
+            finally:
+                if phase1_deadline_hit:
+                    _log.debug(
+                        "rebuild: Phase 1 budget exceeded with %d/%d files "
+                        "analysed; cancelling remaining work",
+                        len(precomputed), len(stale),
+                    )
+                    pool.shutdown(wait=False, cancel_futures=True)
+                else:
+                    pool.shutdown(wait=True)
 
         # classify_canonical_archival needs all paths (not just stale ones) to
         # detect archival twins correctly.  It is read-only, so it runs here
@@ -972,9 +994,18 @@ class OutputsFtsIndex:
                 p: a.sha256 for p, a in precomputed.items()
             }
 
+            stale_set = set(stale)
+
             def _cached_hasher(path: str) -> str | None:
                 if path in _precomp_hashes:
                     return _precomp_hashes[path]
+                # Non-stale (mtime/size unchanged) archival candidates already
+                # have a known-good hash from a prior rebuild -- reuse it
+                # instead of re-hashing the file from disk again this run.
+                if path not in stale_set:
+                    cached_row = self._row_cache.get(path)
+                    if cached_row is not None:
+                        return cached_row.sha256
                 return self._hasher(path)
 
             classifications = classify_canonical_archival(
@@ -1287,13 +1318,37 @@ def _cache_key(outputs_dir: str) -> str:
     return _normalize_output_path(outputs_dir) or os.path.abspath(str(outputs_dir))
 
 
+def _resolve_index_db_path(outputs_dir: str) -> str:
+    """Return the on-disk DuckDB path for ``outputs_dir``'s index cache.
+
+    The cache lives at ``<outputs_dir>/.meridian-outputs-cache/index.duckdb``
+    so it travels with the data it indexes and stays out of unrelated
+    directories.  :func:`ensure_gitignored` is called on the cache directory
+    so it never gets committed.  On any failure to create the directory
+    (permissions, read-only tree, etc.) this falls back to ``:memory:`` so a
+    single bad outputs_dir degrades to the old (non-persistent) behaviour
+    instead of raising.
+    """
+    cache_dir = os.path.join(outputs_dir, ".meridian-outputs-cache")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        ensure_gitignored(cache_dir)
+    except OSError:
+        _log.debug(
+            "_resolve_index_db_path: could not create cache dir %r, "
+            "falling back to :memory:", cache_dir, exc_info=True,
+        )
+        return ":memory:"
+    return os.path.join(cache_dir, "index.duckdb")
+
+
 def _get_cached_index(outputs_dir: str) -> OutputsFtsIndex:
     """Look up (or create) the cached OutputsFtsIndex for a directory."""
     key = _cache_key(outputs_dir)
     with _index_cache_lock:
         idx = _index_cache.pop(key, None)
         if idx is None:
-            idx = OutputsFtsIndex(outputs_dir)
+            idx = OutputsFtsIndex(outputs_dir, db_path=_resolve_index_db_path(outputs_dir))
         _index_cache[key] = idx
         while len(_index_cache) > _MAX_CACHED_INDEXES:
             _, evicted = _index_cache.popitem(last=False)

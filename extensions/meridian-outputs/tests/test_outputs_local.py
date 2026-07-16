@@ -673,6 +673,59 @@ class TestSearchOutputsAPI:
 
 
 # ---------------------------------------------------------------------------
+# On-disk index persistence + auto-gitignore (sprint item 0c1a4349)
+# ---------------------------------------------------------------------------
+
+class TestCachedIndexPersistence:
+    """_get_cached_index must persist to a real on-disk DuckDB file, not
+    :memory:, and must activate ensure_gitignored on the cache directory."""
+
+    def test_resolve_index_db_path_not_memory(self, tmp_path: Path) -> None:
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        assert db_path != ":memory:"
+        assert db_path.endswith("index.duckdb")
+        assert os.path.isdir(tmp_path / ".meridian-outputs-cache")
+
+    def test_resolve_index_db_path_writes_gitignore(self, tmp_path: Path) -> None:
+        OL._resolve_index_db_path(str(tmp_path))
+        gi_path = tmp_path / ".gitignore"
+        assert gi_path.is_file()
+        assert ".meridian-outputs-cache/" in gi_path.read_text(encoding="utf-8")
+
+    def test_resolve_index_db_path_falls_back_on_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def _boom(path: str, exist_ok: bool = False) -> None:
+            raise OSError("simulated permission failure")
+
+        monkeypatch.setattr(OL.os, "makedirs", _boom)
+        assert OL._resolve_index_db_path(str(tmp_path)) == ":memory:"
+
+    @duckdb_required
+    def test_get_cached_index_uses_real_db_path(self, tmp_path: Path) -> None:
+        idx = OL._get_cached_index(str(tmp_path))
+        assert idx._db_path != ":memory:"
+        assert os.path.isfile(idx._db_path) or os.path.isdir(os.path.dirname(idx._db_path))
+
+    @duckdb_required
+    def test_index_survives_cache_eviction(self, tmp_path: Path) -> None:
+        """Rebuilding via a fresh OutputsFtsIndex pointed at the same on-disk
+        db_path (simulating cache eviction / process restart) must see rows
+        indexed by a prior instance -- the whole point of persisting."""
+        (tmp_path / "metric.csv").write_text("epoch,loss\n1,0.5", encoding="utf-8")
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild()
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        row = idx2.resolve_output(str(tmp_path / "metric.csv"))
+        idx2.close()
+        assert row is not None
+
+
+# ---------------------------------------------------------------------------
 # Determinism: same inputs -> same results (requirement 3)
 # ---------------------------------------------------------------------------
 
@@ -1022,6 +1075,142 @@ class TestParallelRebuildCorrectness:
         # The file should still get indexed via the fallback path.
         assert count >= 0  # may be 0 if fallback also failed; main check is no raise
         idx.close()
+
+
+# ---------------------------------------------------------------------------
+# rebuild() Phase 1 deadline enforcement (sprint item d9c76caa)
+# ---------------------------------------------------------------------------
+
+class TestRebuildPhase1Deadline:
+    """Phase 1's ThreadPoolExecutor must actually respect max_seconds instead
+    of always running every worker to completion before Phase 2 even starts."""
+
+    def test_default_budget_raised_from_5s(self) -> None:
+        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS >= 150.0
+        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS <= 180.0
+
+    def test_phase1_deadline_bounds_wall_clock(self, tmp_path: Path) -> None:
+        """A tight deadline must make rebuild() return well before every
+        worker would finish -- proof Phase 1 no longer blocks on
+        as_completed() until all futures are done."""
+        n_files = 16
+        for i in range(n_files):
+            (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+
+        def slow_hasher(path: str) -> str | None:
+            time.sleep(1.0)
+            return OL._sha256_file(path)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), hasher=slow_hasher)
+        try:
+            start = time.monotonic()
+            idx.rebuild(max_seconds=0.2)
+            elapsed = time.monotonic() - start
+            # With 8 workers and 16 files at 1s/hasher call, running Phase 1 to
+            # completion would take ~2s. A working deadline check should return
+            # once the first batch of workers reports back (~1s), well short
+            # of that -- proving Phase 1 didn't wait for every future.
+            assert elapsed < 1.8, (
+                f"rebuild() took {elapsed:.2f}s with a 0.2s budget -- Phase 1 "
+                "appears to have blocked until all workers finished"
+            )
+            assert idx.last_rebuild_partial is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_unlimited_budget_processes_everything(self, tmp_path: Path) -> None:
+        """max_seconds=None must still index every file (no regression to the
+        deadline-enforcement change for the common/default case)."""
+        for i in range(5):
+            (tmp_path / f"g{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            count = idx.rebuild(max_seconds=None)
+            assert count == 5
+            assert idx.last_rebuild_partial is False
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Archival-classification hash persistence (sprint item 7a6a278f)
+# ---------------------------------------------------------------------------
+
+class TestArchivalHashPersistence:
+    """classify_canonical_archival must not re-hash unchanged archival
+    candidates on every rebuild() -- only newly-stale files get re-hashed."""
+
+    def test_unchanged_archival_candidate_not_rehashed(self, tmp_path: Path) -> None:
+        """classify_canonical_archival only runs when something is stale or
+        removed, so the test needs an unrelated file to change between
+        rebuilds -- that keeps classify_canonical_archival on the call path
+        while the archival pair itself stays untouched."""
+        content = b"a,b\n1,2\n"
+        canonical = tmp_path / "run.csv"
+        archival = tmp_path / "run_old.csv"
+        unrelated = tmp_path / "unrelated.csv"
+        canonical.write_bytes(content)
+        archival.write_bytes(content)
+        unrelated.write_bytes(b"x\n1")
+
+        call_log: list[str] = []
+        real_hasher = OL._sha256_file
+
+        def counting_hasher(path: str) -> str | None:
+            call_log.append(path)
+            return real_hasher(path)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), hasher=counting_hasher)
+        try:
+            idx.rebuild()
+            assert str(canonical) in call_log  # both files new -- must be hashed once
+            assert str(archival) in call_log
+
+            # Change only the unrelated file so `stale` is non-empty on the
+            # second rebuild (keeping classify_canonical_archival on the call
+            # path) while the archival pair itself is untouched.
+            unrelated.write_bytes(b"x\n2")
+            os.utime(str(unrelated), None)
+            call_log.clear()
+            idx.rebuild()
+            assert str(canonical) not in call_log, (
+                "unchanged canonical file was re-hashed by classify_canonical_archival"
+            )
+            assert str(archival) not in call_log, (
+                "unchanged archival candidate was re-hashed by classify_canonical_archival"
+            )
+        finally:
+            idx.close()
+
+    def test_changed_file_still_rehashed(self, tmp_path: Path) -> None:
+        """A genuinely modified archival candidate must still be re-hashed --
+        persistence must not mask real content changes."""
+        canonical = tmp_path / "run.csv"
+        archival = tmp_path / "run_old.csv"
+        canonical.write_bytes(b"a,b\n1,2\n")
+        archival.write_bytes(b"a,b\n1,2\n")
+
+        call_log: list[str] = []
+        real_hasher = OL._sha256_file
+
+        def counting_hasher(path: str) -> str | None:
+            call_log.append(path)
+            return real_hasher(path)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), hasher=counting_hasher)
+        try:
+            idx.rebuild()
+            call_log.clear()
+
+            archival.write_bytes(b"a,b\n9,9\n")
+            os.utime(str(archival), None)
+            idx.rebuild()
+            assert str(archival) in call_log, (
+                "a genuinely modified archival candidate must be re-hashed"
+            )
+        finally:
+            idx.close()
 
 
 # ---------------------------------------------------------------------------
