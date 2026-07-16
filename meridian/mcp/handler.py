@@ -3562,7 +3562,42 @@ async def _handle_plugin_tools(
         slot_tool_counts: dict[str, int] = {}
         slot_tool_names: dict[str, list[str]] = {}
         tenant_id = tenant.get("id") if tenant else None
-        if tenant_id and _tunnel_mod.has_active_tunnel(tenant_id):
+        # Cross-instance-aware tunnel reachability check (ea2c7aed).
+        #
+        # has_active_tunnel() is a per-process in-memory check — on a Fly.io
+        # multi-instance deployment the request can land on an instance that does
+        # NOT hold the tenant's WebSocket, causing has_active_tunnel() to return
+        # False even though the tunnel is genuinely connected on a sibling machine.
+        #
+        # We replicate the same cross-instance-aware pattern that the HTTP proxy path
+        # (_do_proxy / fly_replay_target) already uses:
+        #   1. LOCAL check — this instance holds at least one tunnel socket.
+        #   2. SIBLING check — _tenant_owner_instance records the owning Fly machine
+        #      id on WS connect; if it's set and differs from self, a sibling owns it.
+        #   3. DB FLAG fallback — tenant.tunnel_active is set on connect / cleared on
+        #      disconnect; used when _tenant_owner_instance isn't populated (e.g. the
+        #      owning instance restarted and wiped its in-memory map, or the flag
+        #      survived a brief restart with no reconnect yet).
+        #
+        # This is a REPORTING fix: status (tunnel_active) reflects the real
+        # cross-fleet state.  _fetch_slot_tools won't return live tools on a non-owning
+        # instance (the slot socket isn't here), so slot counts stay 0 for cross-
+        # instance misses — the per-slot active/invocable flags remain accurate
+        # (they're based on whether tools were actually fetched).  Fixing the actual
+        # tool-fetch path for cross-instance cases is a separate routing concern (the
+        # existing fly_replay mechanism already handles it for HTTP proxy calls).
+        _local_active = bool(tenant_id and _tunnel_mod.has_active_tunnel(tenant_id))
+        _cross_instance_active = bool(
+            tenant_id and (
+                _tunnel_mod.tenant_owner_instance(tenant_id)  # type: ignore[attr-defined]
+                or (tenant and tenant.get("tunnel_active"))
+            )
+        )
+        _tunnel_reachable = _local_active or _cross_instance_active
+        if tenant_id and _tunnel_reachable and _local_active:
+            # Only attempt live slot-tool fetches when THIS instance holds the
+            # socket — _fetch_slot_tools returns [] immediately when the socket
+            # isn't local, so there is no point calling it on a cross-instance miss.
             try:
                 slot_results = await asyncio.gather(
                     *[
@@ -3644,7 +3679,9 @@ async def _handle_plugin_tools(
 
         return {
             "plugins": result_plugins,
-            "tunnel_active": bool(tenant_id and _tunnel_mod.has_active_tunnel(tenant_id)),
+            # ea2c7aed — use the cross-instance-aware flag so status reflects the
+            # whole Fly deployment, not just this instance's in-memory socket map.
+            "tunnel_active": _tunnel_reachable,
             "hint": "Call get_plugin_details(name=<plugin_name>) for full tool schema.",
             # 8f66d85e — clarify HOW plugin tools are called so agents stop trying
             # to invoke them as native Meridian tools.
@@ -3676,9 +3713,22 @@ async def _handle_plugin_tools(
         slot = target["slot"]
         tenant_id = tenant.get("id") if tenant else None
 
+        # Cross-instance-aware gate (ea2c7aed) — mirrors the fix in list_plugins.
+        # See the detailed comment there for the full rationale.  _fetch_slot_tools
+        # only makes sense when THIS instance holds the socket, so we only attempt
+        # the live fetch on a local hit; the cross-instance flag influences only the
+        # caller-visible status/active reporting (via the returned tool_count).
+        _local_active_gpd = bool(tenant_id and _tunnel_mod.has_active_tunnel(tenant_id))
+        _cross_instance_active_gpd = bool(
+            tenant_id and (
+                _tunnel_mod.tenant_owner_instance(tenant_id)  # type: ignore[attr-defined]
+                or (tenant and tenant.get("tunnel_active"))
+            )
+        )
+
         # Fetch full tools list for this slot
         tools: list[dict] = []
-        if tenant_id and _tunnel_mod.has_active_tunnel(tenant_id):
+        if tenant_id and _local_active_gpd:
             try:
                 _, tools = await _tunnel_mod._fetch_slot_tools(tenant_id, slot)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
@@ -3712,6 +3762,8 @@ async def _handle_plugin_tools(
             "description": target.get("description", ""),
             "tools": tools,
             "tool_count": len(tools),
+            # ea2c7aed — cross-instance-aware tunnel status; mirrors list_plugins fix.
+            "tunnel_active": _local_active_gpd or _cross_instance_active_gpd,
         }
         if skill_note:
             result["skill_guide"] = {
