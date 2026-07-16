@@ -724,6 +724,40 @@ class TestCachedIndexPersistence:
         idx2.close()
         assert row is not None
 
+    @duckdb_required
+    def test_fresh_instance_detects_existing_fts_index(self, tmp_path: Path) -> None:
+        """d9c76caa follow-up: a fresh OutputsFtsIndex pointed at a db_path
+        that already has a built FTS index (from a prior process's rebuild)
+        must detect this immediately on connect, not assume _fts_built=False
+        and pay the full-table rebuild tax again on every process restart."""
+        (tmp_path / "metric.csv").write_text("epoch,loss\n1,0.5", encoding="utf-8")
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild()
+        assert idx1._fts_built is True
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        assert idx2._fts_built is False  # not yet connected
+        idx2._connect()
+        assert idx2._fts_built is True, (
+            "fresh instance should have detected the existing on-disk FTS "
+            "schema instead of assuming none exists"
+        )
+        idx2.close()
+
+    def test_fresh_instance_on_empty_db_stays_unbuilt(self, tmp_path: Path) -> None:
+        """No prior rebuild ever ran against this db_path -- _fts_built must
+        stay False (nothing to detect) rather than erroring."""
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx._connect()
+            assert idx._fts_built is False
+        finally:
+            idx.close()
+
 
 # ---------------------------------------------------------------------------
 # Determinism: same inputs -> same results (requirement 3)
@@ -1086,8 +1120,13 @@ class TestRebuildPhase1Deadline:
     of always running every worker to completion before Phase 2 even starts."""
 
     def test_default_budget_raised_from_5s(self) -> None:
-        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS >= 150.0
-        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS <= 180.0
+        # 5845cc6d: lowered from the original 170.0 fix to 130.0 to leave more
+        # headroom under the ~4min external MCP client timeout once real
+        # uvx-cold-start + protocol overhead is added on top of the internal
+        # rebuild() budget -- real-world validation showed 170.0 cut it too
+        # close. Still far above the original unreachable 5.0s default.
+        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS >= 100.0
+        assert OL.DEFAULT_REBUILD_BUDGET_SECONDS <= 150.0
 
     def test_phase1_deadline_bounds_wall_clock(self, tmp_path: Path) -> None:
         """A tight deadline must make rebuild() return well before every
@@ -1129,6 +1168,94 @@ class TestRebuildPhase1Deadline:
             count = idx.rebuild(max_seconds=None)
             assert count == 5
             assert idx.last_rebuild_partial is False
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_phase1_subdeadline_leaves_phase2_time_to_persist(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression test for 5845cc6d: on a tree too large to fully analyse
+        within the budget, Phase 1 must still leave Phase 2 real time to
+        persist whatever it DID manage to compute. Before the fix, Phase 1
+        used the FULL deadline and could consume all of it, leaving Phase 2
+        zero iterations -- total_indexed stuck at 0 forever regardless of how
+        many files were actually hashed."""
+        n_files = 40
+        for i in range(n_files):
+            (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+
+        def slow_hasher(path: str) -> str | None:
+            time.sleep(0.3)
+            return OL._sha256_file(path)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), hasher=slow_hasher)
+        try:
+            # 8 workers, 0.3s/file -> ~5 waves of 8 to finish everything
+            # (~1.5s total). phase1_deadline is 0.5 * max_seconds; with
+            # max_seconds=1.0 that's 0.5s -- enough for exactly one wave (8
+            # files) to complete before Phase 1 cuts itself off, leaving
+            # ~0.5s for Phase 2 (cheap: no hashing, just cache + DB writes).
+            count = idx.rebuild(max_seconds=1.0)
+            assert count > 0, (
+                "rebuild() made zero forward progress -- Phase 1's own "
+                "sub-deadline isn't leaving Phase 2 any time to persist"
+            )
+            assert count < n_files, (
+                "test setup didn't actually exercise a deadline cutoff -- "
+                "all files were indexed, so this isn't testing partial progress"
+            )
+            assert idx.last_rebuild_partial is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_skips_fts_rebuild_when_deadline_passed_and_index_exists(
+        self, tmp_path: Path,
+    ) -> None:
+        """d9c76caa follow-up: once an FTS index exists, a rebuild() whose
+        deadline has already passed by the time the write phase reaches
+        _rebuild_fts() must skip that (expensive, full-table, non-
+        incremental) step rather than paying its cost unconditionally --
+        search() still returns results off the existing (now slightly
+        stale) index instead of the call blowing its budget regardless of
+        how well Phase 1/Phase 2 behaved."""
+        a = tmp_path / "a.csv"
+        b = tmp_path / "b.csv"
+        a.write_text("col\n1", encoding="utf-8")
+        b.write_text("col\n2", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()  # generous default budget -> FTS actually gets built
+            assert idx._fts_built is True
+
+            call_count = [0]
+            real_rebuild_fts = idx._rebuild_fts
+
+            def counting_rebuild_fts(con: Any) -> None:
+                call_count[0] += 1
+                real_rebuild_fts(con)
+
+            idx._rebuild_fts = counting_rebuild_fts
+
+            # Removing a file forces removed_paths to be non-empty, which
+            # makes changed=True UNCONDITIONALLY (that loop has no deadline
+            # check) -- this reaches the `if changed:` block (and therefore
+            # the new skip-fts decision) even with an already-expired
+            # deadline, where a stale-only rebuild would otherwise never
+            # get there at all.
+            b.unlink()
+            idx.rebuild(max_seconds=-100.0)  # deadline already in the past
+            assert call_count[0] == 0, (
+                "FTS rebuild should have been skipped once the deadline had "
+                "already passed, not paid unconditionally"
+            )
+            assert idx.last_rebuild_partial is True
+
+            # search() must still work off the existing index, not nothing.
+            hits = idx.search("col")
+            assert isinstance(hits, list)
         finally:
             idx.close()
 

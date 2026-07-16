@@ -342,7 +342,18 @@ _SCRIPT_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-DEFAULT_REBUILD_BUDGET_SECONDS = 170.0
+DEFAULT_REBUILD_BUDGET_SECONDS = 130.0
+# 5845cc6d — Phase 1 (parallel hashing) gets at most this fraction of the
+# overall budget, measured from rebuild()'s own start (not from when Phase 1
+# begins). On a cold multi-hundred-thousand-file tree the walk + staleness
+# stat loop alone can consume a large chunk of the budget before Phase 1 even
+# starts; without its own sub-deadline, Phase 1 would then consume ALL of
+# whatever remained, leaving Phase 2 zero time to persist anything it
+# computed -- every call would make zero forward progress, forever. Splitting
+# the budget guarantees Phase 2 always gets a real (roughly equal) share to
+# write whatever Phase 1 managed to finish, so every rebuild() call commits
+# some real progress instead of only the last one (if it ever arrives).
+_PHASE1_BUDGET_FRACTION = 0.5
 MERIDIAN_NOTES_FILENAME = "MERIDIAN_NOTES.md"
 
 
@@ -739,6 +750,29 @@ class OutputsFtsIndex:
         if self._con is None:
             import duckdb  # noqa: PLC0415
             self._con = duckdb.connect(self._db_path)
+            # d9c76caa follow-up -- a fresh instance always assumed
+            # _fts_built started False, forcing a full (expensive, non-
+            # incremental) FTS rebuild on its very first call even when a
+            # working FTS index already exists on disk from a PRIOR
+            # process's successful rebuild (0c1a4349 made the index persist
+            # across restarts, but this in-memory flag didn't know that --
+            # every fresh MCP server spawn paid the full-table-rebuild tax
+            # again regardless). Detect an existing FTS schema so a fresh
+            # process reuses it (possibly slightly stale -- same trade-off
+            # as the deadline-based skip in rebuild()) instead of always
+            # rebuilding from scratch on process restart.
+            try:
+                existing = self._con.execute(
+                    "SELECT 1 FROM information_schema.schemata "
+                    "WHERE schema_name = 'fts_main_outputs_index'"
+                ).fetchone()
+                if existing is not None:
+                    self._fts_built = True
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._connect: FTS schema probe failed",
+                    exc_info=True,
+                )
         return self._con
 
     def _ensure_schema(self, con: Any) -> None:
@@ -889,7 +923,12 @@ class OutputsFtsIndex:
             :class:`~concurrent.futures.ThreadPoolExecutor`.  Each worker does
             only read-only I/O (stat + read + hash) -- no DB access, no shared
             mutable state.  Results are collected and sorted by path for
-            deterministic ordering.
+            deterministic ordering.  Bounded by its own sub-deadline
+            (``_PHASE1_BUDGET_FRACTION`` of ``max_seconds``, 5845cc6d) so it
+            can never consume the whole budget and leave Phase 2 nothing to
+            persist -- every call is guaranteed a real chance to commit
+            whatever Phase 1 managed to finish, not just the first call that
+            happens to complete before the deadline.
           * Run :func:`classify_canonical_archival` on all paths (also
             read-only) once the worker results are in.
 
@@ -907,6 +946,13 @@ class OutputsFtsIndex:
         """
         deadline = (None if max_seconds is None
                     else time.monotonic() + max_seconds)
+        # 5845cc6d — Phase 1 gets its own, earlier sub-deadline so it can never
+        # consume the entire budget and starve Phase 2 of time to persist
+        # anything. Computed from the same start point as `deadline` (not from
+        # when Phase 1 begins) so it also implicitly accounts for time already
+        # spent on the walk + staleness-stat pass below.
+        phase1_deadline = (None if max_seconds is None
+                            else time.monotonic() + max_seconds * _PHASE1_BUDGET_FRACTION)
 
         # ------------------------------------------------------------------
         # Phase 1: read-only pre-analysis (no lock, may run in parallel)
@@ -962,7 +1008,7 @@ class OutputsFtsIndex:
                     for p in stale
                 }
                 for fut in concurrent.futures.as_completed(futures):
-                    if deadline is not None and time.monotonic() > deadline:
+                    if phase1_deadline is not None and time.monotonic() > phase1_deadline:
                         phase1_deadline_hit = True
                         break
                     try:
@@ -1002,11 +1048,21 @@ class OutputsFtsIndex:
                 # Non-stale (mtime/size unchanged) archival candidates already
                 # have a known-good hash from a prior rebuild -- reuse it
                 # instead of re-hashing the file from disk again this run.
+                # (`path not in stale_set` structurally guarantees a row_cache
+                # hit here: staleness is defined as "manifest mismatch OR no
+                # row_cache entry", so a non-stale path always has one.)
                 if path not in stale_set:
-                    cached_row = self._row_cache.get(path)
-                    if cached_row is not None:
-                        return cached_row.sha256
-                return self._hasher(path)
+                    return self._row_cache[path].sha256
+                # 5845cc6d — genuinely stale but Phase 1 didn't get to it
+                # before its own sub-deadline. Do NOT fall back to a fresh
+                # synchronous self._hasher(path) call here: classify_canonical
+                # _archival has no deadline check of its own, so looping
+                # through potentially thousands of un-analysed stale files
+                # would blow the overall budget just as badly as the original
+                # Phase-1-blocks-forever bug this fix targets. None is a safe
+                # default ("not confirmed archival this round") -- the file
+                # gets a proper hash once its turn in a future Phase 1 comes up.
+                return None
 
             classifications = classify_canonical_archival(
                 all_paths, hasher=_cached_hasher,
@@ -1049,7 +1105,33 @@ class OutputsFtsIndex:
                                 for r in new_rows
                             ],
                         )
-                    self._rebuild_fts(con)
+                    # d9c76caa follow-up -- _rebuild_fts() is a FULL,
+                    # non-incremental rebuild (DuckDB has no incremental FTS
+                    # support in the installed version, per b8314850) whose
+                    # cost grows with the TOTAL row count and has no deadline
+                    # check of its own. On a huge cold tree this alone can
+                    # push the overall rebuild() call well past its budget
+                    # even after Phase 1/Phase 2 correctly stop on time (the
+                    # real-MCP-path validation for this item showed exactly
+                    # that: search_outputs still exceeded the ~4min external
+                    # ceiling with Phase 1/2 fixed). Skip the rebuild when the
+                    # deadline has already passed AND a usable FTS index
+                    # already exists from a prior successful rebuild --
+                    # search() only rebuilds FTS itself when none exists yet
+                    # (_fts_built is False), so skipping here never leaves
+                    # search() with nothing to query, only slightly-stale
+                    # results (missing this round's newest rows) until a
+                    # future call with enough remaining budget completes a
+                    # fresh one.
+                    skip_fts = (
+                        self._fts_built
+                        and deadline is not None
+                        and time.monotonic() > deadline
+                    )
+                    if skip_fts:
+                        self.last_rebuild_partial = True
+                    else:
+                        self._rebuild_fts(con)
                 except Exception:  # noqa: BLE001
                     _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
             return len(rows)

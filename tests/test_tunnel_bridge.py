@@ -692,6 +692,7 @@ def test_tunnel_status_reports_active_sockets():
         "dc_active": False,
         "docs_active": False,
         "zotero_active": False,
+        "outputs_active": False,
         "slot_health": {},  # d71ba2e7 — no slots reported unhealthy
         "slot_status": {},  # 9a8645c1 — no slot diagnostics
     }
