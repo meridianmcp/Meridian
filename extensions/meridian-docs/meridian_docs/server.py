@@ -206,6 +206,224 @@ def ingest_local_document_structure(
     )
 
 
+@mcp.tool()
+def insert_caption(
+    docx_path: str,
+    anchor_para_id: str,
+    kind: str,
+    label_text: str,
+    position: str = "after",
+    section_heading: str | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Insert a real Word Caption paragraph into a .docx file.
+
+    Writes a new paragraph with style Caption and a SEQ Figure / SEQ Table
+    field directly into word/document.xml, then re-packs the ZIP preserving
+    all other members.  The SEQ number is auto-incremented (count of existing
+    same-kind captions + 1).
+
+    Both Figure and Table captions use the same Word Caption-style + SEQ
+    mechanism — the ``kind`` parameter selects which counter to use.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId or p{N} of the paragraph/table to anchor on.
+      kind:            "Figure" or "Table".
+      label_text:      Caption label text (e.g. "Loss curve for run 42").
+                       Rendered text will be e.g. "Figure 1. Loss curve...".
+      position:        "after" (default) or "before".
+      section_heading: Optional section heading for organizational association.
+                       Stored in the sidecar index section column.
+      index_db_path:   If supplied, sidecar is invalidated after write so the
+                       next read auto-reindexes (keeps metadata in sync).
+
+    Returns:
+      {status, kind, seq_number, label_text, section_heading, docx_path}
+      or {error: <message>} on failure (file NOT mutated on error).
+    """
+    return docs_intel.insert_caption(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        kind=kind,
+        label_text=label_text,
+        position=position,
+        section_heading=section_heading,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def edit_caption(
+    docx_path: str,
+    caption_para_id: str,
+    new_label_text: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Edit the label text of an existing Word Caption paragraph.
+
+    Locates the paragraph by caption_para_id, verifies it is a Caption
+    paragraph (Caption style or SEQ field present), replaces the label text
+    run while preserving the SEQ field and style.  The SEQ number is NOT
+    changed so Word's field-refresh cycle continues to work correctly.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      caption_para_id: w14:paraId or p{N} of the Caption paragraph.
+      new_label_text:  Replacement label text.
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, caption_para_id, new_label_text, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.edit_caption(
+        docx_path=docx_path,
+        caption_para_id=caption_para_id,
+        new_label_text=new_label_text,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def remove_caption(
+    docx_path: str,
+    caption_para_id: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Remove a Caption paragraph from a .docx file.
+
+    Locates the paragraph by caption_para_id, verifies it is a Caption
+    paragraph (Caption style or SEQ field present), removes it from the body,
+    and re-packs the ZIP.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      caption_para_id: w14:paraId or p{N} of the Caption paragraph.
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, caption_para_id, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.remove_caption(
+        docx_path=docx_path,
+        caption_para_id=caption_para_id,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def insert_citation(
+    docx_path: str,
+    anchor_para_id: str,
+    citation_keys: list[str],
+    formatted_text: str,
+    source: str = "zotero",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Insert a real CSL_CITATION complex field into a .docx paragraph.
+
+    Appends the citation complex field (begin / instrText / separate / cached /
+    end) to the end of the target paragraph.  The field instruction is
+    "ADDIN ZOTERO_ITEM CSL_CITATION {...}" (Zotero) or "ADDIN CSL_CITATION {...}"
+    (generic CSL), making it recognisable by Zotero/Mendeley on document open and
+    by the extraction side (CSL_CITATION token in docparse.docs_intel).
+
+    This is the write counterpart of the read-side citation extraction already
+    present in packages/docparse.  The bibliography write path (1258794a) depends
+    on this producing recognisable citation fields.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId or p{N} of the paragraph to cite in.
+      citation_keys:   One or more stable citation identifiers (DOI, URI, etc.).
+      formatted_text:  Rendered in-text marker (e.g. "(Smith et al., 2023)").
+      source:          "zotero" (default) or "csl".
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, anchor_para_id, citation_keys, formatted_text, source, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.insert_citation(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        citation_keys=citation_keys,
+        formatted_text=formatted_text,
+        source=source,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def edit_citation(
+    docx_path: str,
+    anchor_para_id: str,
+    new_citation_keys: list[str] | None = None,
+    new_formatted_text: str | None = None,
+    source: str = "zotero",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Replace an existing CSL_CITATION field with updated keys/text.
+
+    Locates the first complex field in the paragraph whose instrText contains
+    CSL_CITATION, removes the old field runs (begin through end), and inserts a
+    new complex field with the updated keys / formatted text in their place.
+
+    At least one of new_citation_keys or new_formatted_text must be supplied.
+    When only one is given the other is inferred from the existing field.
+
+    Args:
+      docx_path:          Absolute path to the .docx file (mutated in place).
+      anchor_para_id:     w14:paraId or p{N} of the paragraph to edit.
+      new_citation_keys:  Replacement citation keys (None = keep existing).
+      new_formatted_text: Replacement display text (None = keep existing).
+      source:             "zotero" or "csl".
+      index_db_path:      If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, anchor_para_id, citation_keys, formatted_text, source, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.edit_citation(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        new_citation_keys=new_citation_keys,
+        new_formatted_text=new_formatted_text,
+        source=source,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def remove_citation(
+    docx_path: str,
+    anchor_para_id: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Remove the first CSL_CITATION complex field from a paragraph.
+
+    Locates the field by scanning for a complex field (fldChar begin...end)
+    whose instrText contains CSL_CITATION, removes all its constituent runs,
+    and re-packs the ZIP.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId or p{N} of the paragraph to edit.
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, anchor_para_id, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.remove_citation(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        index_db_path=index_db_path,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx meridian-docs``)."""
     mcp.run()
