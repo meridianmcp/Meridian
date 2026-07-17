@@ -1,4 +1,4 @@
-# AGENTS.md — Meridian executor guide
+﻿# AGENTS.md — Meridian executor guide
 
 Canonical instructions for any agent (Claude Code, Codex) working on this repo.
 `CLAUDE.md` imports this file. Keep it tight.
@@ -150,7 +150,7 @@ verify immediately on receipt.
   token from the wrong project) will fail verification.
 - **NOT PROVED:** That the surrounding body text is unmodified. The token is a standalone
   opaque value — it does not cryptographically bind to the sprint-item list, `<exclusions>`,
-  `<role>`, or any other field in the `/goal` block. An adversary who obtains a genuine
+  `<executor_directive>`, or any other field in the `/goal` block. An adversary who obtains a genuine
   token could pair it with an edited body (different sprint items, extra instructions) and
   the token would still verify as `valid=True`. **This is a known gap and is intentional:**
   full body-integrity checking would require embedding a content hash into the token and
