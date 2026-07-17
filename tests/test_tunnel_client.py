@@ -1961,12 +1961,28 @@ def test_is_slot_claimed_by_live_client_live_different_client(tmp_path, monkeypa
     """Returns True when the claim names a DIFFERENT client whose PID is still alive."""
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
     # Write a claim from a "different" client — use os.getpid() as the tunnel_pid
-    # (it is definitely alive) but a different client_id.
+    # (it is definitely alive) but a different client_id. This uses the REAL
+    # psutil (not yet patched below), so the claim carries a genuine create_time.
     tc._write_slot_claim(9002, "other-client-xyz")
+    real_create_time = json.loads(tc._slot_claim_path(9002).read_text()).get("create_time")
 
     import types
     fake_psutil = types.ModuleType("psutil")
     fake_psutil.pid_exists = lambda pid: True  # the other tunnel is still alive
+
+    class _FakeProc:
+        """PID-reuse hardening (2026-07-17) checks create_time(), not just
+        pid_exists() -- the fake psutil module must provide a Process() that
+        returns the exact create_time the claim was written with, so the
+        comparison in _is_slot_claimed_by_live_client genuinely matches."""
+
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            return real_create_time
+
+    fake_psutil.Process = _FakeProc
     monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
 
     assert tc._is_slot_claimed_by_live_client(9002, "my-client-abc") is True
@@ -2017,7 +2033,10 @@ def test_kill_stale_port_occupant_spares_live_client_process(tmp_path, monkeypat
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
 
     # Write a claim for the OTHER client (different client_id, PID still alive).
+    # Uses the REAL psutil (not yet patched below), so the claim carries a
+    # genuine create_time that the fake Process.create_time() below must match.
     tc._write_slot_claim(8809, "live-other-client")
+    real_create_time = json.loads(tc._slot_claim_path(8809).read_text()).get("create_time")
 
     import types
     fake_psutil = types.ModuleType("psutil")
@@ -2030,6 +2049,9 @@ def test_kill_stale_port_occupant_spares_live_client_process(tmp_path, monkeypat
     class _FakeProc:
         def __init__(self, pid):
             self.pid = pid
+
+        def create_time(self):
+            return real_create_time
 
         def terminate(self):
             killed.setdefault("terminate", []).append(self.pid)

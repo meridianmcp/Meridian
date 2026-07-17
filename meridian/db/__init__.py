@@ -1071,6 +1071,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_decision_slug_nickname(db)
     await _migrate_note_nickname(db)
     await _migrate_sprint_item_prospect_bypass(db)
+    await _migrate_handoff_tokens(db)
+    await _migrate_server_logs(db)
     return db
 
 
@@ -1767,13 +1769,58 @@ async def set_project_notify_email(
     await db.commit()
 
 
+def _is_no_such_table(exc: Exception) -> bool:
+    """Return True when ``exc`` indicates the target table does not exist.
+
+    Used by :func:`delete_project` to silently skip tables that were added in a
+    later schema version so the delete remains forward/backward-compatible across
+    SQLite and Postgres.  Any OTHER exception (FK violation, syntax error, …) is
+    NOT swallowed — it propagates so the caller sees a real failure.
+
+    SQLite raises ``sqlite3.OperationalError`` (exposed as
+    ``aiosqlite.OperationalError``) with the text "no such table: <name>".
+    Postgres raises ``psycopg.errors.UndefinedTable`` (a subclass of
+    ``psycopg.ProgrammingError``).  We check Postgres via a lazy import so this
+    module stays importable in SQLite-only environments without psycopg installed.
+    """
+    if isinstance(exc, aiosqlite.OperationalError) and "no such table" in str(exc).lower():
+        return True
+    try:
+        import psycopg.errors as _pe  # type: ignore[import]
+        if isinstance(exc, _pe.UndefinedTable):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
 async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
     """Delete a project and all associated data.
 
     Raises ``ValueError`` if any tasks are currently ``in_progress`` so
     callers can surface a warning before proceeding.  The delete is
-    unconditional for all other data (goal_states, sessions, task_log,
-    sprint_items).
+    unconditional for all other data.
+
+    Deletion order follows FK dependencies (child-before-parent).
+
+    Session-scoped children first (must precede ``sessions`` deletion):
+      file_read_claims, session_findings, session_messages,
+      session_graph_snapshots, session_notes, executor_runs,
+      file_locks, resource_locks, file_symbol_claims,
+      file_docx_region_claims, file_patch_counters, session_activity,
+      active_worktrees, hitl_requests, task_log.
+
+    Then sessions, then remaining project-scoped children
+      (goal_states, sprint_item_pointers, sprint_items,
+       decisions_pinned, insights, project_notes, handoffs,
+       codebase_graph_entities, sprint_version_descriptions),
+    and finally the project row itself.
+
+    Each DELETE is wrapped in a narrow exception guard that silently skips
+    only a "table does not exist" error (tables added in later schema versions
+    may not be present on older installs).  Any OTHER exception — FK violation,
+    constraint error, connection failure — is re-raised so the caller sees a
+    real failure rather than a silent false-success.
     """
     async with db.execute(
         "SELECT COUNT(*) as cnt FROM task_log "
@@ -1785,23 +1832,82 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
     if count:
         raise ValueError(f"{count} task(s) in_progress — complete or cancel first")
 
-    # Cascade delete child rows first, then the project itself.
-    # Order matters: hitl_requests FK -> sessions, so hitl first.
-    for stmt, params in [
+    # Ordered child-before-parent.  Tables with session_id FK must come before
+    # ``sessions``; tables with sprint_item_id references before ``sprint_items``;
+    # all project children before ``projects``.
+    #
+    # Tables without an explicit FK (session_findings, session_messages,
+    # file_read_claims, session_graph_snapshots, handoffs,
+    # codebase_graph_entities, sprint_item_pointers) are included here because
+    # they carry project_id / session_id data that would otherwise become orphaned
+    # ghost rows invisible to the rest of the system.
+    #
+    # ``sessions_archived`` is intentionally NOT present — it was never a real
+    # table; the archived status lives in the ``sessions`` table itself.
+    stmts = [
+        # --- session-scoped children (delete before sessions) ---
+        # file_read_claims has no explicit FK but is session-scoped (parallel primitives).
+        ("DELETE FROM file_read_claims WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        # session_findings / session_messages are project-scoped but also session-linked.
+        ("DELETE FROM session_findings WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM session_messages WHERE project_id = ?", (project_id,)),
+        # session_graph_snapshots: project_id + session_id columns, no explicit FK.
+        ("DELETE FROM session_graph_snapshots WHERE project_id = ?", (project_id,)),
+        # ON DELETE CASCADE session children — explicit for clarity and cross-backend safety.
+        ("DELETE FROM session_notes WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM executor_runs WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM file_locks WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM resource_locks WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM file_symbol_claims WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM file_docx_region_claims WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM file_patch_counters WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        ("DELETE FROM session_activity WHERE session_id IN "
+         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+        # active_worktrees: FK → sessions(id) + projects(id).
+        ("DELETE FROM active_worktrees WHERE project_id = ?", (project_id,)),
+        # hitl_requests: FK → projects(id) ON DELETE CASCADE + sessions(id).
         ("DELETE FROM hitl_requests WHERE project_id = ?", (project_id,)),
-        ("DELETE FROM sprint_items WHERE project_id = ?", (project_id,)),
+        # task_log: FK → sessions(id) + projects(id).
         ("DELETE FROM task_log WHERE project_id = ?", (project_id,)),
+        # --- sessions ---
         ("DELETE FROM sessions WHERE project_id = ?", (project_id,)),
-        ("DELETE FROM sessions_archived WHERE project_id = ?", (project_id,)),
+        # --- remaining project-scoped children ---
         ("DELETE FROM goal_states WHERE project_id = ?", (project_id,)),
+        # sprint_item_pointers references sprint_item_id — delete before sprint_items.
+        ("DELETE FROM sprint_item_pointers WHERE project_id = ?", (project_id,)),
+        # sprint_items has a self-referential parent_id FK; deleting all rows for one
+        # project at once resolves the cycle without ordering between rows.
+        ("DELETE FROM sprint_items WHERE project_id = ?", (project_id,)),
         ("DELETE FROM decisions_pinned WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM insights WHERE project_id = ?", (project_id,)),
         ("DELETE FROM project_notes WHERE project_id = ?", (project_id,)),
+        # handoffs: project_id TEXT (no explicit FK), plain delete.
+        ("DELETE FROM handoffs WHERE project_id = ?", (project_id,)),
+        # codebase_graph_entities: project_id TEXT (no explicit FK).
+        ("DELETE FROM codebase_graph_entities WHERE project_id = ?", (project_id,)),
+        # sprint_version_descriptions: FK → projects(id) ON DELETE CASCADE.
+        ("DELETE FROM sprint_version_descriptions WHERE project_id = ?", (project_id,)),
+        # --- project row itself ---
         ("DELETE FROM projects WHERE id = ?", (project_id,)),
-    ]:
+    ]
+
+    for stmt, params in stmts:
         try:
             await db.execute(stmt, params)
-        except Exception:  # noqa: BLE001 — table may not exist in older schemas
-            pass
+        except Exception as exc:  # noqa: BLE001
+            if _is_no_such_table(exc):
+                # Table added in a later schema version — safe to skip on older installs.
+                _log.debug("delete_project: skipping missing table in: %s", stmt)
+            else:
+                # Real error (FK violation, connection failure, …) — propagate.
+                raise
     await db.commit()
 
 
@@ -3107,6 +3213,8 @@ async def log_task(
         raise ValueError(f"invalid task status: {status}")
     if kind not in ("shipped", "found", "decided", "blocked"):
         kind = None
+    from meridian.secret_redaction import check_for_secrets
+    check_for_secrets(description, context="task description")
     tid = _new_id()
     await db.execute(
         "INSERT INTO task_log "
@@ -3177,6 +3285,8 @@ async def update_task(
         fields.append("status = ?")
         values.append(status)
     if description is not None:
+        from meridian.secret_redaction import check_for_secrets
+        check_for_secrets(description, context="task description")
         fields.append("description = ?")
         values.append(description)
     if not fields:
@@ -6628,6 +6738,8 @@ async def pin_decision(
     6fb48898 — a kebab-cased ``slug`` and a short memorable ``nickname`` are
     auto-generated from the title, unique per project, mirroring sprint_items.
     """
+    from meridian.secret_redaction import check_for_secrets
+    check_for_secrets(body, context="decision body")
     did = _new_id()
     priority = _normalize_decision_priority(priority)
     # 2b39549d — an assumption starts life 'unvalidated'; no assumption → NULL.
@@ -6831,6 +6943,8 @@ async def update_pinned_decision(
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     fields: dict[str, Any] = {}
     if body is not None:
+        from meridian.secret_redaction import check_for_secrets
+        check_for_secrets(body, context="decision body")
         fields["body"] = body
         # Append-only edit history: snapshot the prior body before overwriting,
         # but only when the body actually changed (no-op edits don't pollute it).
@@ -7604,6 +7718,99 @@ async def get_connection_log(
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
+# ---------------------------------------------------------------------------
+# f0a48685 — server_logs: application-wide WARNING/ERROR/EXCEPTION log capture.
+#
+# A custom logging.Handler writes qualifying records here so any session
+# (including hosted-only claude.ai sessions without local machine access) can
+# inspect server-side errors without raw Fly.io log access.  Kept separate from
+# connection_events: connection_events is one structured row per /mcp HTTP
+# request; server_logs is one row per arbitrary application log record.
+# ---------------------------------------------------------------------------
+
+_SERVER_LOGS_RING_SIZE = 2000  # global cap — not per-tenant
+
+
+async def record_server_log(
+    db: aiosqlite.Connection,
+    *,
+    level: str,
+    logger: str,
+    message: str,
+    exc_text: str | None = None,
+) -> None:
+    """Write one server_log row and prune the oldest beyond the ring size.
+
+    Best-effort: callers must wrap in try/except so a persistence failure
+    never propagates back through the logging framework and into the original
+    call site.
+
+    level vocabulary: 'WARNING', 'ERROR', 'EXCEPTION'
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+    entry_id = _new_id()
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "INSERT INTO server_logs (id, level, logger, message, exc_text, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            entry_id,
+            level[:20],
+            logger[:200],
+            message[:2000],
+            exc_text[:4000] if exc_text else None,
+            now_ts,
+        ),
+    )
+    # Prune: keep only the most recent N rows globally.
+    tiebreak = "ctid" if hasattr(db, "_pool") else "rowid"
+    await db.execute(
+        f"DELETE FROM server_logs WHERE {tiebreak} NOT IN ("
+        f"  SELECT {tiebreak} FROM server_logs "
+        f"  ORDER BY recorded_at DESC, {tiebreak} DESC LIMIT ?"
+        f")",
+        (_SERVER_LOGS_RING_SIZE,),
+    )
+    await db.commit()
+
+
+async def get_server_logs(
+    db: aiosqlite.Connection,
+    since: str | None = None,
+    limit: int = 100,
+    level_filter: str | None = None,
+    module_filter: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return recent server log entries, newest first.
+
+    ``since`` is an ISO timestamp string — only entries at or after this time
+    are returned. ``limit`` caps the result set (max 500). ``level_filter``
+    restricts to a specific level (e.g. 'ERROR'). ``module_filter`` is a
+    substring match against the logger name.
+    """
+    limit = min(limit, 500)
+    params: list[Any] = []
+    clauses: list[str] = []
+    if since:
+        clauses.append("recorded_at >= ?")
+        params.append(since)
+    if level_filter:
+        clauses.append("level = ?")
+        params.append(level_filter.upper()[:20])
+    if module_filter:
+        clauses.append("logger LIKE ?")
+        params.append(f"%{module_filter}%")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+    async with db.execute(
+        f"SELECT * FROM server_logs {where} "
+        f"ORDER BY recorded_at DESC LIMIT ?",
+        params,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
 async def get_project_by_token(
     db: aiosqlite.Connection, token: str
 ) -> dict[str, Any] | None:
@@ -7937,6 +8144,8 @@ async def add_project_note(
         kind = None
     if priority not in ("high", "normal", "low"):
         priority = "normal"
+    from meridian.secret_redaction import check_for_secrets
+    check_for_secrets(body, context="note body")
     stored_source = (source or "").strip() or None
     # 771c00d7 — code anchor: require a real path, normalize it to match claims,
     # and keep ``symbol`` only alongside a path. Anchors are independent of kind
@@ -8344,6 +8553,8 @@ async def update_project_note(
     if title is not None:
         fields["title"] = title
     if body is not None:
+        from meridian.secret_redaction import check_for_secrets
+        check_for_secrets(body, context="note body")
         fields["body"] = body
     if tags is not None:
         fields["tags"] = tags
@@ -9542,10 +9753,19 @@ async def record_handoff(
     hid = _new_id()
     is_pg = hasattr(db, "_pool")
     if is_pg:
-        now_expr = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')"
+        # handoffs.created_at is TIMESTAMPTZ on Postgres (see
+        # _migrate_pg_handoffs_table) -- insert a native timestamptz value
+        # directly, matching amend_handoff's now() below. clock_timestamp()
+        # (not now(), which is frozen at transaction-start) preserves the
+        # monotonic-ordering guarantee this function needs. A prior version
+        # wrapped this in to_char(...) to produce a formatted TEXT string,
+        # which raised psycopg.errors.DatatypeMismatch against the real
+        # timestamptz column -- always broken, never exercised without a
+        # live Postgres in the loop.
+        now_expr = "clock_timestamp()"
         await db.execute(
             f"INSERT INTO handoffs (id, project_id, session_id, mode, body, created_at) "
-            f"VALUES (?, ?, ?, ?, ?, ({now_expr}))",
+            f"VALUES (?, ?, ?, ?, ?, {now_expr})",
             (hid, project_id, session_id, mode, body),
         )
     else:

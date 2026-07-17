@@ -206,6 +206,577 @@ def ingest_local_document_structure(
     )
 
 
+@mcp.tool()
+def find_image_paragraph(
+    docx_path: str,
+    figure_index: int | None = None,
+) -> dict[str, Any]:
+    """Scan a .docx for paragraphs that contain an embedded image.
+
+    Detects both DrawingML (<w:drawing>) and legacy VML (<w:pict>) image
+    paragraphs.  Use this to find the correct anchor_para_id before calling
+    insert_caption with kind="Figure" — passing the image paragraph's own
+    para_id (not the preceding paragraph) ensures the caption lands BELOW
+    the image, not above it.
+
+    Args:
+      docx_path:    Absolute path to the .docx file.
+      figure_index: 1-based index selecting which image to return when the
+                    document has multiple images.  None (default) returns ALL
+                    image paragraphs as a list.
+
+    Returns (figure_index=None):
+      {image_paragraphs: [{para_id, index, text}], count: int}
+    Returns (figure_index given):
+      {para_id, index, text, figure_index: int}
+    Returns on error:
+      {error: <message>}
+    """
+    return docs_intel.find_image_paragraph(
+        docx_path=docx_path,
+        figure_index=figure_index,
+    )
+
+
+@mcp.tool()
+def insert_caption(
+    docx_path: str,
+    anchor_para_id: str,
+    kind: str,
+    label_text: str,
+    position: str = "after",
+    section_heading: str | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Insert a real Word Caption paragraph into a .docx file.
+
+    Writes a new paragraph with style Caption and a SEQ Figure / SEQ Table
+    field directly into word/document.xml, then re-packs the ZIP preserving
+    all other members.  The SEQ number is auto-incremented (count of existing
+    same-kind captions + 1).
+
+    Both Figure and Table captions use the same Word Caption-style + SEQ
+    mechanism — the ``kind`` parameter selects which counter to use.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId or p{N} of the paragraph/table to anchor on.
+      kind:            "Figure" or "Table".
+      label_text:      Caption label text (e.g. "Loss curve for run 42").
+                       Rendered text will be e.g. "Figure 1. Loss curve...".
+      position:        "after" (default) or "before".
+      section_heading: Optional section heading for organizational association.
+                       Stored in the sidecar index section column.
+      index_db_path:   If supplied, sidecar is invalidated after write so the
+                       next read auto-reindexes (keeps metadata in sync).
+
+    Returns:
+      {status, kind, seq_number, label_text, section_heading, docx_path}
+      or {error: <message>} on failure (file NOT mutated on error).
+    """
+    return docs_intel.insert_caption(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        kind=kind,
+        label_text=label_text,
+        position=position,
+        section_heading=section_heading,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def edit_caption(
+    docx_path: str,
+    caption_para_id: str,
+    new_label_text: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Edit the label text of an existing Word Caption paragraph.
+
+    Locates the paragraph by caption_para_id, verifies it is a Caption
+    paragraph (Caption style or SEQ field present), replaces the label text
+    run while preserving the SEQ field and style.  The SEQ number is NOT
+    changed so Word's field-refresh cycle continues to work correctly.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      caption_para_id: w14:paraId or p{N} of the Caption paragraph.
+      new_label_text:  Replacement label text.
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, caption_para_id, new_label_text, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.edit_caption(
+        docx_path=docx_path,
+        caption_para_id=caption_para_id,
+        new_label_text=new_label_text,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def remove_caption(
+    docx_path: str,
+    caption_para_id: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Remove a Caption paragraph from a .docx file.
+
+    Locates the paragraph by caption_para_id, verifies it is a Caption
+    paragraph (Caption style or SEQ field present), removes it from the body,
+    and re-packs the ZIP.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      caption_para_id: w14:paraId or p{N} of the Caption paragraph.
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, caption_para_id, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.remove_caption(
+        docx_path=docx_path,
+        caption_para_id=caption_para_id,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def insert_citation(
+    docx_path: str,
+    anchor_para_id: str,
+    citation_keys: list[str],
+    formatted_text: str,
+    source: str = "zotero",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Insert a real CSL_CITATION complex field into a .docx paragraph.
+
+    Appends the citation complex field (begin / instrText / separate / cached /
+    end) to the end of the target paragraph.  The field instruction is
+    "ADDIN ZOTERO_ITEM CSL_CITATION {...}" (Zotero) or "ADDIN CSL_CITATION {...}"
+    (generic CSL), making it recognisable by Zotero/Mendeley on document open and
+    by the extraction side (CSL_CITATION token in docparse.docs_intel).
+
+    This is the write counterpart of the read-side citation extraction already
+    present in packages/docparse.  The bibliography write path (1258794a) depends
+    on this producing recognisable citation fields.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId or p{N} of the paragraph to cite in.
+      citation_keys:   One or more stable citation identifiers (DOI, URI, etc.).
+      formatted_text:  Rendered in-text marker (e.g. "(Smith et al., 2023)").
+      source:          "zotero" (default) or "csl".
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, anchor_para_id, citation_keys, formatted_text, source, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.insert_citation(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        citation_keys=citation_keys,
+        formatted_text=formatted_text,
+        source=source,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def edit_citation(
+    docx_path: str,
+    anchor_para_id: str,
+    new_citation_keys: list[str] | None = None,
+    new_formatted_text: str | None = None,
+    source: str = "zotero",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Replace an existing CSL_CITATION field with updated keys/text.
+
+    Locates the first complex field in the paragraph whose instrText contains
+    CSL_CITATION, removes the old field runs (begin through end), and inserts a
+    new complex field with the updated keys / formatted text in their place.
+
+    At least one of new_citation_keys or new_formatted_text must be supplied.
+    When only one is given the other is inferred from the existing field.
+
+    Args:
+      docx_path:          Absolute path to the .docx file (mutated in place).
+      anchor_para_id:     w14:paraId or p{N} of the paragraph to edit.
+      new_citation_keys:  Replacement citation keys (None = keep existing).
+      new_formatted_text: Replacement display text (None = keep existing).
+      source:             "zotero" or "csl".
+      index_db_path:      If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, anchor_para_id, citation_keys, formatted_text, source, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.edit_citation(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        new_citation_keys=new_citation_keys,
+        new_formatted_text=new_formatted_text,
+        source=source,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def remove_citation(
+    docx_path: str,
+    anchor_para_id: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """9d749639 — Remove the first CSL_CITATION complex field from a paragraph.
+
+    Locates the field by scanning for a complex field (fldChar begin...end)
+    whose instrText contains CSL_CITATION, removes all its constituent runs,
+    and re-packs the ZIP.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId or p{N} of the paragraph to edit.
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, anchor_para_id, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.remove_citation(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def extract_equations(path: str) -> list[dict[str, Any]]:
+    """a80af3a0 — Parse all OMML equations out of a local .docx (stdlib only, no lxml).
+
+    Detects two patterns:
+      1. Standalone: an <m:oMath> inside a regular <w:p> body paragraph.
+      2. Table-numbered: a 2-column <w:tbl> row where the first cell contains
+         an <m:oMath> and the second cell holds a parenthesised equation number
+         like "(1)" or "(2a)".  The number is attached as the "number" field.
+
+    Each record: {ordinal, para_id, omml_raw, pattern, number, flat_text}.
+    """
+    return docs_intel.parse_docx_equations_local(path)
+
+
+@mcp.tool()
+def index_equations(path: str, index_db_path: str) -> dict[str, Any]:
+    """a80af3a0 — Parse equations from a .docx and store them in the sidecar SQLite.
+
+    Extends the sidecar DB at index_db_path with a docx_equations table.
+    Idempotent — fully replaces the table on each run.  Call after
+    index_document / index_document_structure on the same file.
+
+    Returns {index_db, equation_count}.
+    """
+    return docs_intel.index_docx_equations(path, index_db_path)
+
+
+@mcp.tool()
+def get_equations(index_db_path: str) -> list[dict[str, Any]]:
+    """a80af3a0 — Retrieve all locally-stored equations from the sidecar SQLite.
+
+    Returns a list of equation records in ordinal order from the docx_equations
+    table populated by index_equations.  Returns an empty list when no equations
+    have been indexed yet.
+    """
+    return docs_intel.get_local_equations(index_db_path)
+
+
+@mcp.tool()
+def insert_equation(
+    docx_path: str,
+    anchor_para_id: str,
+    payload: str,
+    position: str = "after",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """a80af3a0 — Insert an equation into a .docx file.
+
+    Accepts a raw OMML XML string (starting with "<") or a LaTeX expression
+    (e.g. r"\\frac{a}{b}" or "E=mc^2") which is converted to OMML locally
+    using latex2mathml (pure Python, no lxml).
+
+    Three positions:
+      "before" — new display-mode paragraph immediately before the anchor.
+      "after"  — new display-mode paragraph immediately after the anchor.
+      "append" — append the <m:oMath> inline to the anchor paragraph itself.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId or p{N}/tbl{N} to anchor the insertion.
+      payload:         Raw OMML XML or LaTeX expression.
+      position:        "before", "after" (default), or "append".
+      index_db_path:   If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, position, para_id, omml, docx_path}
+      or {error: <message>} on failure (file NOT mutated on error).
+    """
+    return docs_intel.insert_equation_local(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        payload=payload,
+        position=position,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def edit_equation(
+    docx_path: str,
+    equation_para_id: str,
+    new_payload: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
+
+    Locates the paragraph by equation_para_id, verifies it contains at least
+    one <m:oMath>, removes the existing equation content, and inserts the new
+    equation resolved from OMML or LaTeX.
+
+    Args:
+      docx_path:         Absolute path to the .docx file (mutated in place).
+      equation_para_id:  w14:paraId or p{N} of the equation paragraph.
+      new_payload:       Replacement OMML XML or LaTeX expression.
+      index_db_path:     If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, equation_para_id, omml, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.edit_equation_local(
+        docx_path=docx_path,
+        equation_para_id=equation_para_id,
+        new_payload=new_payload,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def remove_equation(
+    docx_path: str,
+    equation_para_id: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """a80af3a0 — Remove an equation from a .docx file.
+
+    If the paragraph contains ONLY an <m:oMath> (a display-mode equation
+    paragraph), the entire paragraph is removed.  If the paragraph also
+    contains non-equation text runs (an inline equation in a text paragraph),
+    only the <m:oMath> elements are removed, leaving the paragraph's text intact.
+
+    Args:
+      docx_path:         Absolute path to the .docx file (mutated in place).
+      equation_para_id:  w14:paraId or p{N} of the equation paragraph.
+      index_db_path:     If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, equation_para_id, removed_whole_paragraph, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.remove_equation_local(
+        docx_path=docx_path,
+        equation_para_id=equation_para_id,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def scan_citation_keys(docx_path: str) -> list[str]:
+    """1258794a — Return all citation keys present in a .docx (in appearance order).
+
+    Walks every paragraph looking for CSL_CITATION complex fields (the same
+    fields written by insert_citation) and extracts the citation key from each.
+    Keys are deduplicated; first-appearance order is preserved.  Returns [] when
+    the document has no in-text citations or cannot be read.
+
+    Args:
+      docx_path: Absolute path to the .docx file.
+
+    Returns:
+      A list of citation key strings, e.g. ["smith2023", "doi:10.1/x"].
+    """
+    return docs_intel.scan_all_citation_keys(docx_path)
+
+
+@mcp.tool()
+def format_reference(csl_item: dict) -> str:
+    """1258794a — Format a CSL-JSON item as an APA 7th-edition reference string.
+
+    Formats journal articles, books, book chapters, and conference papers
+    per APA 7th edition.  Other item types produce a minimal fallback:
+    Author (Year). Title.
+
+    This is a pure formatting utility — it does not read or write any file.
+    Use it to preview or verify a reference before writing it to a document.
+
+    Args:
+      csl_item: A CSL-JSON-shaped dict with at minimum ``author``, ``title``,
+                ``type`` (or ``itemType``), and ``issued`` (or ``year``) fields.
+                As returned by Zotero's local API or zotero_client.
+
+    Returns:
+      The formatted reference string.
+    """
+    return docs_intel.format_apa_reference(csl_item)
+
+
+@mcp.tool()
+def insert_bibliography_entry(
+    docx_path: str,
+    citation_key: str,
+    csl_item: dict,
+    index_db_path: str | None = None,
+) -> dict:
+    """1258794a — Write a formatted APA bibliography entry into a .docx.
+
+    Locates (or creates) a References heading at the end of the document,
+    then appends a new entry paragraph at the end of the references block.
+    The entry is formatted from the supplied CSL-JSON item (journal article,
+    book, book chapter, or conference paper; other types use a minimal fallback).
+
+    A bookmark (bibkey_<key>) is embedded in the paragraph so that
+    update_bibliography_entry and remove_bibliography_entry can locate it.
+
+    If an entry for citation_key already exists, returns an error — use
+    update_bibliography_entry to refresh an existing entry.
+
+    The citation_key should match the key used in insert_citation for the
+    corresponding in-text marker.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (mutated in place).
+      citation_key:  Stable citation identifier (DOI, zotero:KEY, citekey, etc.).
+      csl_item:      CSL-JSON-shaped item dict (from Zotero local API /
+                     zotero_client.resolve_citation_ref + item fetch).
+      index_db_path: If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, citation_key, formatted_text, docx_path}
+      or {error: <message>} on failure (file NOT mutated on error).
+    """
+    return docs_intel.insert_bibliography_entry(
+        docx_path=docx_path,
+        citation_key=citation_key,
+        csl_item=csl_item,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def update_bibliography_entry(
+    docx_path: str,
+    citation_key: str,
+    csl_item: dict,
+    index_db_path: str | None = None,
+) -> dict:
+    """1258794a — Refresh the formatted text of an existing bibliography entry.
+
+    Locates the entry paragraph for citation_key by its embedded bookmark
+    (bibkey_<key>), re-formats the reference from the updated csl_item,
+    and replaces the text run in-place.
+
+    Use this after fetching fresh Zotero data for an already-inserted entry
+    (e.g. if the journal or author list changed).
+
+    Args:
+      docx_path:     Absolute path to the .docx file (mutated in place).
+      citation_key:  The same key used when the entry was inserted.
+      csl_item:      Updated CSL-JSON item dict.
+      index_db_path: If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, citation_key, formatted_text, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.update_bibliography_entry(
+        docx_path=docx_path,
+        citation_key=citation_key,
+        csl_item=csl_item,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def remove_bibliography_entry(
+    docx_path: str,
+    citation_key: str,
+    index_db_path: str | None = None,
+) -> dict:
+    """1258794a — Remove a bibliography entry paragraph from a .docx.
+
+    Locates the entry by the bibkey_<key> bookmark and removes the entire
+    paragraph.  Use this when a citation is deleted from the document body
+    and the corresponding reference list entry should be removed.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (mutated in place).
+      citation_key:  The citation key of the entry to remove.
+      index_db_path: If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, citation_key, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.remove_bibliography_entry(
+        docx_path=docx_path,
+        citation_key=citation_key,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def sync_bibliography(
+    docx_path: str,
+    csl_items: dict,
+    index_db_path: str | None = None,
+) -> dict:
+    """1258794a — Reconcile bibliography entries against in-document citations.
+
+    Scans the document for all in-text citation keys (inserted via
+    insert_citation) and reconciles the bibliography section:
+
+      - Keys with csl_items entries but no bibliography paragraph are inserted.
+      - Keys with both in-text citations and bibliography entries are updated
+        (in case Zotero data changed since the entry was first written).
+      - Keys cited in-text but absent from csl_items are reported as
+        missing_data (caller must fetch from Zotero and re-call).
+      - Keys with bibliography entries but no longer cited in-text are reported
+        as stale_entries (caller decides whether to call remove_bibliography_entry).
+
+    Workflow: call scan_citation_keys, then fetch CSL-JSON from Zotero for each
+    key (via zotero_client.resolve_citation_ref / the Zotero local API), then
+    pass the {key: csl_item} mapping to this tool.
+
+    Args:
+      docx_path:   Absolute path to the .docx file (mutated in place).
+      csl_items:   Dict mapping citation_key -> CSL-JSON item dict.
+      index_db_path: If supplied, sidecar is invalidated after each write.
+
+    Returns:
+      {status, inserted, updated, missing_data, stale_entries, docx_path}
+      or {error: <message>} on failure.
+    """
+    return docs_intel.sync_bibliography(
+        docx_path=docx_path,
+        csl_items=csl_items,
+        index_db_path=index_db_path,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx meridian-docs``)."""
     mcp.run()

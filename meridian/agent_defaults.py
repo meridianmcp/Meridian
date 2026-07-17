@@ -252,20 +252,8 @@ prospect_symbol wherever the full protocol would have called for it.
 
 **grep/glob NEVER as first step for code search (443aa32a):** Raw bash `grep`,
 `rg`, `find`, and glob patterns are a last resort for code search — not a default.
-A live executor session ran 4 consecutive failing grep patterns looking for a
-dispatch branch that a single `find_symbol` call would have found immediately.
-This is the anti-pattern this protocol exists to prevent.
-
-WRONG (what that session did):
-  grep -r "handle_webhook" .          # 0 results
-  grep -r "webhook_dispatch" .        # 0 results
-  grep -r "process_event" .           # 0 results
-  grep -r "dispatch" src/             # eventually found it, 4 tries later
-
-RIGHT (one call, immediate result):
-  prospect_symbol("dispatch_webhook_event")   # runs graph → Serena → semantic automatically
-  → returns exact file, line, and body in one shot, with the rung that succeeded
-
+Multiple consecutive failing grep attempts to find a symbol is the exact anti-pattern
+this protocol exists to prevent — a single `prospect_symbol` call finds it immediately.
 If you find yourself writing a grep/glob command to locate a symbol or function,
 STOP — use `prospect_symbol` (preferred), `find_symbol`, `search_graph`, or
 `search_code_semantic` instead. grep/glob may be used AFTER code-intel tools

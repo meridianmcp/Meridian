@@ -1240,6 +1240,261 @@ async def test_delete_project_removes_from_list(db):
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_delete_project_cleans_all_child_tables(db):
+    """delete_project removes rows from every child table, not just the original 8.
+
+    This test seeds rows in every table that has a project_id or session_id
+    reference (where sessions cascade from the project) and then asserts every
+    row is gone after delete_project, plus the project row itself is gone.
+    """
+    import uuid as _uuid
+
+    def _uid():
+        return str(_uuid.uuid4())
+
+    # --- Create project + session ---
+    pid = (await db_module.create_project(db, f"del-full-{_uid()[:8]}"))["id"]
+    sess = await db_module.register_session(db, pid, "del-sess")
+    sid = sess["id"]
+
+    # --- goal_states ---
+    await db_module.set_goal(db, pid, "del test goal")
+
+    # --- sessions (already created above) ---
+
+    # --- task_log ---
+    await db_module.log_task(db, sid, pid, "del task")
+
+    # --- sprint_items ---
+    item = await db_module.add_sprint_item(db, pid, "v1.0", "del item")
+    iid = item["id"]
+
+    # --- decisions_pinned ---
+    await db_module.pin_decision(db, pid, "del decision", "body", "TECHNICAL")
+
+    # --- insights ---
+    await db_module.create_insight(db, pid, "del insight", "del body")
+
+    # --- project_notes ---
+    await db_module.add_project_note(db, pid, "del note", "body")
+
+    # --- hitl_requests ---
+    await db_module.request_hitl(db, pid, "del question", session_id=sid)
+
+    # --- session_notes (session child) ---
+    await db_module.add_session_note(db, sid, "del session note", "body")
+
+    # --- executor_runs (session + project child) ---
+    await db_module.create_executor_run(db, sid, pid)
+
+    # --- active_worktrees ---
+    await db_module.register_worktree(db, sid, pid, "branch-del", "/tmp/del-wt")
+
+    # --- session_activity ---
+    await db_module.record_session_activity(db, sid, "test_tool", "del activity")
+
+    # --- session_findings ---
+    await db_module.store_finding(db, pid, "del finding", session_id=sid)
+
+    # --- session_messages ---
+    await db_module.send_message(db, pid, sid, "del message", from_session_id=sid)
+
+    # --- sprint_item_pointers ---
+    await db_module.add_sprint_item_pointer(
+        db, pid, iid, "code",
+        [{"uri": "file:///del.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+    )
+
+    # --- sprint_version_descriptions ---
+    await db_module.upsert_sprint_version_description(db, pid, "v1.0", "del desc")
+
+    # --- handoffs ---
+    await db_module.record_handoff(db, pid, "full", "del handoff body", session_id=sid)
+
+    # --- codebase_graph_entities ---
+    await db_module.upsert_graph_entities(
+        db, pid, [{"qualified_name": "del.MyClass", "file": "del.py", "kind": "class"}]
+    )
+
+    # --- file_locks (via direct execute — claim_file has TTL expiry side-effects) ---
+    expires = "2099-01-01 00:00:00"
+    await db.execute(
+        "INSERT INTO file_locks (id, file_path, session_id, expires_at) VALUES (?, ?, ?, ?)",
+        (_uid(), "/del/file.py", sid, expires),
+    )
+    await db.commit()
+
+    # --- resource_locks ---
+    await db.execute(
+        "INSERT INTO resource_locks (id, resource_id, resource_type, session_id, expires_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (_uid(), "file:/del/res.py", "file", sid, expires),
+    )
+    await db.commit()
+
+    # --- file_symbol_claims ---
+    await db.execute(
+        "INSERT INTO file_symbol_claims "
+        "(id, session_id, file_path, symbol_name, symbol_type, line_start, line_end) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (_uid(), sid, "/del/sym.py", "DelClass", "class", 1, 10),
+    )
+    await db.commit()
+
+    # --- file_docx_region_claims ---
+    await db.execute(
+        "INSERT INTO file_docx_region_claims (id, session_id, file_path, element_id) "
+        "VALUES (?, ?, ?, ?)",
+        (_uid(), sid, "/del/doc.docx", "elem-del"),
+    )
+    await db.commit()
+
+    # --- file_patch_counters ---
+    await db.execute(
+        "INSERT INTO file_patch_counters (id, session_id, file_path, patch_count) "
+        "VALUES (?, ?, ?, ?)",
+        (_uid(), sid, "/del/patched.py", 3),
+    )
+    await db.commit()
+
+    # --- file_read_claims ---
+    await db.execute(
+        "INSERT INTO file_read_claims (id, file_path, session_id, expires_at) "
+        "VALUES (?, ?, ?, ?)",
+        (_uid(), "/del/read.py", sid, expires),
+    )
+    await db.commit()
+
+    # --- session_graph_snapshots ---
+    await db.execute(
+        "INSERT INTO session_graph_snapshots "
+        "(id, session_id, project_id, node_count, edge_count, hotspot_count, file_churn) "
+        "VALUES (?, ?, ?, 1, 2, 3, 4)",
+        (_uid(), sid, pid),
+    )
+    await db.commit()
+
+    # --- NOW delete the project ---
+    await db_module.delete_project(db, pid)
+
+    # --- Assert project itself is gone ---
+    assert await db_module.get_project(db, pid) is None
+
+    # --- Assert every child table is clean ---
+    async def _count(table, col="project_id"):
+        async with db.execute(f"SELECT COUNT(*) FROM {table} WHERE {col} = ?", (pid,)) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def _count_by_session(table):
+        async with db.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE session_id = ?", (sid,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+
+    # Direct project_id columns
+    assert await _count("goal_states") == 0, "goal_states not cleaned"
+    assert await _count("task_log") == 0, "task_log not cleaned"
+    assert await _count("sprint_items") == 0, "sprint_items not cleaned"
+    assert await _count("decisions_pinned") == 0, "decisions_pinned not cleaned"
+    assert await _count("insights") == 0, "insights not cleaned"
+    assert await _count("project_notes") == 0, "project_notes not cleaned"
+    assert await _count("hitl_requests") == 0, "hitl_requests not cleaned"
+    assert await _count("sprint_item_pointers") == 0, "sprint_item_pointers not cleaned"
+    assert await _count("sprint_version_descriptions") == 0, "sprint_version_descriptions not cleaned"
+    assert await _count("session_findings") == 0, "session_findings not cleaned"
+    assert await _count("session_messages") == 0, "session_messages not cleaned"
+    assert await _count("codebase_graph_entities") == 0, "codebase_graph_entities not cleaned"
+    assert await _count("active_worktrees") == 0, "active_worktrees not cleaned"
+    assert await _count("handoffs") == 0, "handoffs not cleaned"
+    assert await _count("executor_runs") == 0, "executor_runs not cleaned"
+    # session_graph_snapshots has project_id column
+    assert await _count("session_graph_snapshots") == 0, "session_graph_snapshots not cleaned"
+    # sessions itself
+    assert await _count("sessions") == 0, "sessions not cleaned"
+
+    # Session-scoped (no project_id column; keyed by session_id)
+    assert await _count_by_session("session_notes") == 0, "session_notes not cleaned"
+    assert await _count_by_session("file_locks") == 0, "file_locks not cleaned"
+    assert await _count_by_session("resource_locks") == 0, "resource_locks not cleaned"
+    assert await _count_by_session("file_symbol_claims") == 0, "file_symbol_claims not cleaned"
+    assert await _count_by_session("file_docx_region_claims") == 0, "file_docx_region_claims not cleaned"
+    assert await _count_by_session("file_patch_counters") == 0, "file_patch_counters not cleaned"
+    assert await _count_by_session("file_read_claims") == 0, "file_read_claims not cleaned"
+    assert await _count_by_session("session_activity") == 0, "session_activity not cleaned"
+
+
+@pytest.mark.asyncio
+async def test_delete_project_in_progress_guard_raises(db):
+    """delete_project raises ValueError when in_progress tasks exist."""
+    import uuid as _uuid
+
+    pid = (await db_module.create_project(db, f"del-guard-{_uuid.uuid4().hex[:8]}"))["id"]
+    sess = await db_module.register_session(db, pid, "guard-sess")
+    sid = sess["id"]
+    task = await db_module.log_task(db, sid, pid, "running task", status="pending")
+    await db_module.claim_task(db, task["id"], sid)
+
+    with pytest.raises(ValueError, match="in_progress"):
+        await db_module.delete_project(db, pid)
+
+    # Project must still exist — the guard prevented deletion
+    assert await db_module.get_project(db, pid) is not None
+
+
+def test_is_no_such_table_only_matches_missing_table_errors():
+    """_is_no_such_table returns True only for 'no such table' errors, not others.
+
+    This verifies that the narrow exception guard in delete_project will NOT
+    swallow a genuine FK-violation or other real database error.
+    """
+    import aiosqlite
+    from meridian.db import _is_no_such_table
+
+    # Should match: SQLite "no such table" error
+    assert _is_no_such_table(aiosqlite.OperationalError("no such table: some_table"))
+    # Should match: case-insensitive variant
+    assert _is_no_such_table(aiosqlite.OperationalError("NO SUCH TABLE: x"))
+
+    # Should NOT match: other OperationalError (e.g. FK violation, locked DB)
+    assert not _is_no_such_table(aiosqlite.OperationalError("FOREIGN KEY constraint failed"))
+    assert not _is_no_such_table(aiosqlite.OperationalError("database is locked"))
+    assert not _is_no_such_table(aiosqlite.OperationalError("disk I/O error"))
+
+    # Should NOT match: arbitrary exceptions
+    assert not _is_no_such_table(RuntimeError("something went wrong"))
+    assert not _is_no_such_table(ValueError("bad value"))
+    assert not _is_no_such_table(Exception("generic error"))
+
+
+def test_delete_project_http_returns_500_on_db_error(client):
+    """DELETE /projects/{id} returns 500 (not 204) when the underlying delete raises.
+
+    Confirms that routes/projects.py does not silently succeed when delete_project
+    raises an unexpected exception.  Prior to the fix, the blanket except-pass in
+    delete_project meant a real FK violation would cause delete_project to return
+    normally (no exception) so the route always returned 204; now a real error
+    propagates and FastAPI returns 500.
+    """
+    import uuid as _uuid
+    from unittest.mock import patch, AsyncMock
+
+    p = client.post("/projects", json={"name": f"del-500-{_uuid.uuid4().hex[:6]}"}).json()
+
+    async def _raise(*_a, **_kw):
+        raise RuntimeError("forced db error")
+
+    with patch("meridian.db.delete_project", side_effect=_raise):
+        r = client.delete(f"/projects/{p['id']}")
+
+    # Must NOT be 204 (false success); should be a server-error status
+    assert r.status_code >= 500, (
+        f"Expected 5xx when delete_project raises RuntimeError, got {r.status_code}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # DB-level: get_goal
 # ---------------------------------------------------------------------------

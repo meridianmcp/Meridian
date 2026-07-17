@@ -1133,6 +1133,41 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="check_embedded_staleness",
+                description=(
+                    "432fcfcb — detect whether a figure or table EMBEDDED into "
+                    "a .docx has since drifted from its generating source (a "
+                    "plot script output, CSV, etc.). Distinct from the .docx "
+                    "mtime staleness check: this checks whether the SOURCE FILE "
+                    "that fed the embedded copy changed AFTER the copy was made. "
+                    "Covers figures (resolved via file_path + outputs_dir) and "
+                    "tables (explicit source_path) via one shared mechanism. "
+                    "Uses SHA-256 fingerprint + mtime from the outputs_index "
+                    "(same outputs_dir resolve-through as find_similar_figure). "
+                    "Returns {stale, reason, source_path, embed_sha256, "
+                    "current_sha256, embed_mtime, current_mtime}. "
+                    "stale=False: unchanged; stale=True: drifted "
+                    "(reason='content-changed'); stale=None: "
+                    "source-missing or no-source-provenance (distinct states)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "kind": {"type": "string", "enum": ["figure", "table"], "description": "Whether to check a figure or a table."},
+                        "figure_id": {"type": "string", "description": "Id of the stored doc_figures row (kind=figure). Used to auto-resolve source_path from file_path."},
+                        "table_id": {"type": "string", "description": "Id of the stored doc_tables row (kind=table). Informational; source_path must still be given explicitly for tables."},
+                        "source_path": {"type": "string", "description": "Explicit path to the generating source file on disk. For figures this is inferred from file_path+outputs_dir when absent; for tables it must be supplied."},
+                        "outputs_dir": {"type": "string", "description": "The meridian-outputs directory to resolve the figure file_path through (figures only). Triggers the same OutputsFtsIndex resolve-through used by find_similar_figure to obtain the embed-time sha256."},
+                        "embed_sha256": {"type": "string", "description": "SHA-256 recorded at embed time. When absent the tool looks it up from the outputs_index via outputs_dir."},
+                        "embed_mtime": {"type": "number", "description": "Mtime recorded at embed time (Unix float). Used as fallback when no sha256 is available."},
+                    },
+                    "required": ["doc", "kind"],
+                },
+            ),
+            Tool(
                 name="ingest_document_structure",
                 description=(
                     "db42acce — persist pre-parsed structural data "
@@ -2227,6 +2262,7 @@ def build_mcp_server():
                 "index_equation", "find_similar_equation", "insert_equation", "update_paragraph", "find_symbol_usages",
                 "index_figure", "find_similar_figure",
                 "index_table", "find_similar_table",
+                "check_embedded_staleness",
                 "search_outputs",
                 "search_code_semantic",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",

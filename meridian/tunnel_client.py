@@ -1328,6 +1328,20 @@ def _write_slot_claim(port: int, client_id: str) -> None:
         pass
 
 
+def _clear_slot_claim(port: int) -> None:
+    """Remove the slot-ownership claim for *port* (best-effort).
+
+    Called from ``SlotProxy.kill()`` when WE own the process and are tearing
+    it down.  A claim left behind by a crashed tunnel that never called kill()
+    is handled by the live-PID check in
+    :func:`_is_slot_claimed_by_live_client`.
+    """
+    try:
+        _slot_claim_path(port).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _is_slot_claimed_by_live_client(port: int, current_client_id: str) -> bool:
     """Return True iff *port* is claimed by a DIFFERENT, still-running client.
 

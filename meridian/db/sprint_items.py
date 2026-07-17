@@ -928,6 +928,8 @@ async def _transition_status(
         fields.append("task_id = ?")
         values.append(task_id)
     if notes is not None:
+        from meridian.secret_redaction import check_for_secrets
+        check_for_secrets(notes, context="sprint item notes")
         fields.append("notes = ?")
         values.append(notes)
     if pushed_to is not None:
@@ -1620,6 +1622,8 @@ async def patch_sprint_item(
         ns_fields.append("feedback_note = ?")
         ns_values.append(feedback_note)
     if notes is not None:
+        from meridian.secret_redaction import check_for_secrets
+        check_for_secrets(notes, context="sprint item notes")
         ns_fields.append("notes = ?")
         ns_values.append(notes)
     if human_id is not None:

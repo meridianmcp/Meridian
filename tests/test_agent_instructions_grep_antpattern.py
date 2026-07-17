@@ -44,16 +44,17 @@ def test_grep_antpattern_appears_inside_code_intel_protocol():
 
 
 def test_before_after_example_present():
-    """A concrete before/after (WRONG/RIGHT) example must be present."""
+    """The anti-pattern and correct alternative must both be described."""
     text = DEFAULT_AGENT_INSTRUCTIONS
-    # Both the wrong-approach label and the right-approach label must appear.
-    assert "WRONG" in text, (
-        "DEFAULT_AGENT_INSTRUCTIONS must include a WRONG example showing the "
-        "anti-pattern of consecutive failing grep attempts."
+    # The anti-pattern (consecutive failing greps) must be described.
+    assert "consecutive" in text.lower() or "anti-pattern" in text.lower(), (
+        "DEFAULT_AGENT_INSTRUCTIONS must describe the consecutive-failing-grep "
+        "anti-pattern."
     )
-    assert "RIGHT" in text, (
-        "DEFAULT_AGENT_INSTRUCTIONS must include a RIGHT example showing the "
-        "correct code-intel-first approach."
+    # The correct alternative (prospect_symbol) must be named.
+    assert "prospect_symbol" in text, (
+        "DEFAULT_AGENT_INSTRUCTIONS must name prospect_symbol as the correct "
+        "code-intel-first approach."
     )
 
 

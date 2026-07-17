@@ -10,14 +10,16 @@ requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Adam Camerer" }]
 keywords = ["mcp", "docx", "ooxml", "documents", "thesis"]
-# The DOCX parser (docs_intel) is stdlib-only; the only runtime dep is the
-# MCP SDK. document_content_tree for ingest_local_document_structure is a
-# vendored local copy (meridian_docs/_vendored_content_tree.py), not a
-# cross-package docparse dependency -- uvx's isolated --from <path>
-# environments do not reliably resolve path-based [tool.uv.sources]
-# dependencies (confirmed live, 2026-07-14).
+# The DOCX parser (docs_intel) is mostly stdlib-only; the MCP SDK is the only
+# runtime dep for the read/caption/citation tools.  a80af3a0 adds latex2mathml
+# for the equation write path (LaTeX -> MathML -> OMML): it is pure Python with
+# no C extension, safe for uvx isolated installs.  document_content_tree for
+# ingest_local_document_structure is a vendored local copy
+# (meridian_docs/_vendored_content_tree.py), not a cross-package docparse
+# dependency -- uvx's isolated --from <path> environments do not reliably
+# resolve path-based [tool.uv.sources] dependencies (confirmed live, 2026-07-14).
 version = "0.1.2"
-dependencies = ["mcp>=1.0"]
+dependencies = ["mcp>=1.0", "latex2mathml>=2.0"]
 
 [project.scripts]
 # 58a044c7 — renamed from "meridian-docs" to "meridian-docs-mcp" to avoid the

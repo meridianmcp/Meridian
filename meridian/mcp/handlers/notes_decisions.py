@@ -1281,6 +1281,171 @@ async def handle_find_similar_table(
 
 
 # ---------------------------------------------------------------------------
+# Section 9b: Embedded-copy-vs-source drift detection (432fcfcb)
+# ---------------------------------------------------------------------------
+
+async def handle_check_embedded_staleness(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: check_embedded_staleness.
+
+    432fcfcb — detect whether a figure or table that was EMBEDDED into a .docx
+    at some point in time has since drifted from its generating source (a plot
+    script output, a CSV, etc.). This is distinct from check_staleness() in
+    meridian-docs (which checks if the .docx itself changed since last indexed)
+    — this checks if the SOURCE that fed the embedded copy has changed SINCE the
+    copy was made.
+
+    The comparison uses the SHA-256 fingerprint recorded in the outputs_index
+    (via meridian-outputs / search_outputs / find_similar_figure's
+    resolve-through) at embed time vs the CURRENT sha256 of the live source
+    file on disk right now.
+
+    Covers figures (have a file_path pointing to the embedded image asset) and
+    tables (have a source_path pointing to the CSV/JSON/npy that was copied) via
+    one shared mechanism. For figures, the source_path is resolved automatically
+    from the stored figure's file_path via the outputs_dir (when given). For
+    tables, source_path must be supplied explicitly (since doc_tables stores no
+    file_path).
+
+    Three states are returned:
+      stale=False  reason="current"            — source unchanged
+      stale=True   reason="content-changed"    — sha256 differs (drifted)
+      stale=None   reason="source-missing"     — source file gone (distinct)
+      stale=None   reason="no-source-provenance" — no source info available
+
+    Args (all optional except project_id + doc + kind):
+      project_id   — required
+      doc          — the stored document's source (same as index_figure/index_table)
+      kind         — "figure" or "table" (required)
+      figure_id    — id of the stored doc_figures row (for kind=figure)
+      table_id     — id of the stored doc_tables row (for kind=table)
+      source_path  — explicit path to the generating source file on disk; for
+                     figures, inferred from file_path + outputs_dir when absent
+      outputs_dir  — the meridian-outputs directory to resolve the figure's
+                     file_path through (figures only; triggers the same
+                     OutputsFtsIndex resolve-through used by find_similar_figure)
+      embed_sha256 — the SHA-256 recorded at embed time; when absent the tool
+                     looks it up from the outputs_index row via outputs_dir
+      embed_mtime  — the mtime recorded at embed time (fallback when no sha256)
+    """
+    validate_input_size(args.get("doc"), "doc", 2_000)
+    validate_input_size(args.get("figure_id"), "figure_id", 200)
+    validate_input_size(args.get("table_id"), "table_id", 200)
+    validate_input_size(args.get("source_path"), "source_path", 4_000)
+    validate_input_size(args.get("outputs_dir"), "outputs_dir", 4_000)
+    validate_input_size(args.get("embed_sha256"), "embed_sha256", 200)
+
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    kind = (args.get("kind") or "").strip().lower()
+    if kind not in ("figure", "table"):
+        return {"error": "kind must be 'figure' or 'table'"}
+    doc_source = (args.get("doc") or "").strip()
+    if not doc_source:
+        return {"error": "doc is required"}
+
+    # Resolve the doc-structure store so we can look up the stored figure/table.
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {
+            "error": (
+                f"no stored document for doc={doc_source!r} — ingest_document "
+                "it first"
+            ),
+        }
+
+    # ---------- figure path: resolve file_path + outputs_dir resolve-through ---
+    source_path: str | None = (args.get("source_path") or "").strip() or None
+    embed_sha256: str | None = (args.get("embed_sha256") or "").strip() or None
+    embed_mtime: float | None = None
+    _em = args.get("embed_mtime")
+    if _em is not None:
+        try:
+            embed_mtime = float(_em)
+        except (TypeError, ValueError):
+            embed_mtime = None
+
+    if kind == "figure":
+        figure_id = (args.get("figure_id") or "").strip() or None
+        if figure_id:
+            try:
+                figs = await store.get_figures(doc_row["id"])
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"could not fetch figures: {exc}"}
+            fig = next((f for f in figs if str(f.get("id")) == figure_id), None)
+            if fig is None:
+                return {
+                    "error": (
+                        f"no doc_figures row for figure_id={figure_id!r} in "
+                        f"document {doc_source!r} — use find_similar_figure "
+                        "to locate the correct figure_id"
+                    ),
+                }
+            if source_path is None:
+                source_path = (fig.get("file_path") or "").strip() or None
+
+        # When outputs_dir is provided, resolve through the outputs index to get
+        # the sha256 recorded at index/embed time (same mechanism as
+        # find_similar_figure's d2a3537a cross-store resolve-through).
+        outputs_dir = str(args.get("outputs_dir") or "").strip()
+        # Hosted-mode guard (same as find_similar_figure): the outputs tree lives
+        # on the caller's machine; skip the resolve-through when hosted.
+        if _hosted_mode():
+            outputs_dir = ""
+        if outputs_dir and source_path and embed_sha256 is None:
+            if os.path.isdir(outputs_dir):
+                try:
+                    from meridian import outputs_indexer as _oi  # noqa: PLC0415
+                    _index = _oi.OutputsFtsIndex(outputs_dir)
+                    try:
+                        await asyncio.to_thread(_index.rebuild)
+                        linked = _index.resolve_output(source_path)
+                        if linked is not None:
+                            embed_sha256 = linked.get("sha256") or None
+                            if embed_mtime is None:
+                                _lm = linked.get("mtime")
+                                if _lm is not None:
+                                    try:
+                                        embed_mtime = float(_lm)
+                                    except (TypeError, ValueError):
+                                        pass
+                    finally:
+                        _index.close()
+                except Exception:  # noqa: BLE001 — resolve-through is advisory
+                    pass
+
+    # ---------- table path: source_path must be given explicitly ---------------
+    # (doc_tables stores no file_path — the caller knows the source CSV/file)
+
+    # ---------- run the staleness check ----------------------------------------
+    from meridian.embedded_staleness import check_embedded_staleness  # noqa: PLC0415
+    result = check_embedded_staleness(
+        kind,
+        source_path=source_path,
+        embed_sha256=embed_sha256,
+        embed_mtime=embed_mtime,
+    )
+    return {
+        "project_id": args["project_id"],
+        "doc": doc_source,
+        "document_id": doc_row["id"],
+        **result,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Section 10: Insights and findings
 # ---------------------------------------------------------------------------
 

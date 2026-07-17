@@ -504,6 +504,223 @@ async def test_get_plugin_details_known_plugin_no_tunnel(db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ea2c7aed — cross-instance-aware tunnel reachability in list_plugins /
+# get_plugin_details.
+#
+# On Fly.io multi-instance, a request can land on an instance that doesn't
+# hold the tenant's tunnel WebSocket.  has_active_tunnel() is per-process
+# in-memory — it returns False on a non-owning instance — but the owning
+# instance's id is recorded in _tenant_owner_instance, and the DB flag
+# tenant.tunnel_active is set on connect / cleared on disconnect.  Both
+# sources constitute cross-instance evidence that the tunnel IS active.
+#
+# These tests simulate the cross-instance scenario directly (parallel to
+# test_tunnel_fly_replay.py's pattern for _do_proxy) and verify that
+# list_plugins / get_plugin_details correctly report tunnel_active=True
+# even when has_active_tunnel() says False on the current instance.
+# ---------------------------------------------------------------------------
+
+def _reset_tunnel_state(tid: str) -> None:
+    """Remove all in-memory tunnel state for `tid` (mirrors _reset() in test_tunnel_fly_replay)."""
+    from meridian.routes import tunnel as tn
+    tn._tenant_owner_instance.pop(tid, None)
+    tn._tunnel_sockets.pop(tid, None)
+    tn._tunnel_extract_sockets.pop(tid, None)
+    tn._tunnel_code_sockets.pop(tid, None)
+    tn._tunnel_ppt_sockets.pop(tid, None)
+    tn._tunnel_word_sockets.pop(tid, None)
+    tn._tunnel_dc_sockets.pop(tid, None)
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_tunnel_active_via_owner_instance(db, monkeypatch):
+    """ea2c7aed: list_plugins reports tunnel_active=True when a sibling Fly instance
+    owns the socket (_tenant_owner_instance set), even though has_active_tunnel()
+    returns False on THIS instance.
+    """
+    from meridian.routes import tunnel as tn
+
+    tid = "cross-lp-owner"
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    try:
+        # Simulate: sibling owns the socket, no local socket.
+        tn._tenant_owner_instance[tid] = "machine-sibling"
+        tenant = {"id": tid, "plan": "pro"}
+
+        out = await mh._dispatch_mcp_tool(
+            "list_plugins", {}, db, "/tmp", tenant=tenant,
+        )
+        assert out["tunnel_active"] is True, (
+            "list_plugins must report tunnel_active=True when a sibling instance "
+            "is the known owner (_tenant_owner_instance), even with no local socket"
+        )
+        assert "plugins" in out
+    finally:
+        _reset_tunnel_state(tid)
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_tunnel_active_via_db_flag(db, monkeypatch):
+    """ea2c7aed: list_plugins reports tunnel_active=True when tenant.tunnel_active
+    is set in the DB (set on WS connect, cleared on disconnect), even though
+    has_active_tunnel() returns False because there is no local socket.
+    """
+    from meridian.routes import tunnel as tn
+
+    tid = "cross-lp-dbflag"
+    try:
+        # No _tenant_owner_instance entry, no local sockets — but DB flag is set.
+        tenant = {"id": tid, "plan": "pro", "tunnel_active": 1}
+
+        out = await mh._dispatch_mcp_tool(
+            "list_plugins", {}, db, "/tmp", tenant=tenant,
+        )
+        assert out["tunnel_active"] is True, (
+            "list_plugins must report tunnel_active=True when tenant.tunnel_active "
+            "DB flag is set, even with no local socket and no owner-instance record"
+        )
+    finally:
+        _reset_tunnel_state(tid)
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_tunnel_inactive_when_no_evidence(db, monkeypatch):
+    """ea2c7aed: list_plugins correctly reports tunnel_active=False when neither
+    a local socket, a sibling-owner record, nor a DB flag is present.
+    """
+    from meridian.routes import tunnel as tn
+
+    tid = "cross-lp-inactive"
+    try:
+        # All three sources absent → tunnel genuinely not connected.
+        tenant = {"id": tid, "plan": "pro", "tunnel_active": 0}
+
+        out = await mh._dispatch_mcp_tool(
+            "list_plugins", {}, db, "/tmp", tenant=tenant,
+        )
+        assert out["tunnel_active"] is False
+    finally:
+        _reset_tunnel_state(tid)
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_slot_tools_not_fetched_on_cross_instance_miss(db, monkeypatch):
+    """ea2c7aed: on a cross-instance miss (no local socket, sibling owns it),
+    list_plugins must NOT attempt _fetch_slot_tools (which would return [] and is
+    wasteful), so all slot tool_counts remain 0 / active=False in per-plugin entries.
+    tunnel_active top-level is still True.
+    """
+    from meridian.routes import tunnel as tn
+
+    fetch_calls: list[str] = []
+
+    async def _fake_fetch(tid: str, label: str):
+        fetch_calls.append(label)
+        return label, []
+
+    monkeypatch.setattr(tn, "_fetch_slot_tools", _fake_fetch)
+
+    tid = "cross-lp-nofetch"
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    try:
+        tn._tenant_owner_instance[tid] = "machine-sibling"
+        tenant = {"id": tid, "plan": "pro"}
+
+        out = await mh._dispatch_mcp_tool(
+            "list_plugins", {}, db, "/tmp", tenant=tenant,
+        )
+        # tunnel_active must be True (cross-instance evidence).
+        assert out["tunnel_active"] is True
+        # But _fetch_slot_tools must NOT have been called (no local socket).
+        assert fetch_calls == [], (
+            "_fetch_slot_tools should not be called on a cross-instance miss; "
+            f"got calls for labels: {fetch_calls}"
+        )
+        # Per-slot entries: active=False because no live tools were fetched.
+        for entry in out["plugins"]:
+            assert entry["active"] is False
+            assert entry["invocable"] is False
+            assert entry["tools"] == []
+    finally:
+        _reset_tunnel_state(tid)
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_tunnel_active_via_owner_instance(db, monkeypatch):
+    """ea2c7aed: get_plugin_details reports tunnel_active=True when a sibling Fly
+    instance owns the socket, even though has_active_tunnel() returns False here.
+    """
+    from meridian.routes import tunnel as tn
+    from meridian.tunnel_plugins import BUILTIN_PLUGINS
+
+    tid = "cross-gpd-owner"
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    try:
+        tn._tenant_owner_instance[tid] = "machine-sibling"
+        tenant = {"id": tid, "plan": "pro"}
+
+        plugin_name = BUILTIN_PLUGINS[0]["name"]
+        out = await mh._dispatch_mcp_tool(
+            "get_plugin_details", {"name": plugin_name}, db, "/tmp", tenant=tenant,
+        )
+        assert "error" not in out
+        assert out["tunnel_active"] is True, (
+            "get_plugin_details must report tunnel_active=True when a sibling "
+            "instance is the known owner, even with no local socket"
+        )
+        # tools list is empty (can't fetch from a non-owning instance) — expected.
+        assert out["tools"] == []
+        assert out["tool_count"] == 0
+    finally:
+        _reset_tunnel_state(tid)
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_tunnel_active_via_db_flag(db, monkeypatch):
+    """ea2c7aed: get_plugin_details reports tunnel_active=True when the DB flag
+    is set, with no local socket and no owner-instance record.
+    """
+    from meridian.routes import tunnel as tn
+    from meridian.tunnel_plugins import BUILTIN_PLUGINS
+
+    tid = "cross-gpd-dbflag"
+    try:
+        tenant = {"id": tid, "plan": "pro", "tunnel_active": 1}
+
+        plugin_name = BUILTIN_PLUGINS[0]["name"]
+        out = await mh._dispatch_mcp_tool(
+            "get_plugin_details", {"name": plugin_name}, db, "/tmp", tenant=tenant,
+        )
+        assert "error" not in out
+        assert out["tunnel_active"] is True
+        assert out["tools"] == []
+    finally:
+        _reset_tunnel_state(tid)
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_tunnel_inactive_when_no_evidence(db, monkeypatch):
+    """ea2c7aed: get_plugin_details correctly reports tunnel_active=False when
+    no local socket, no owner record, and DB flag is 0.
+    """
+    from meridian.routes import tunnel as tn
+    from meridian.tunnel_plugins import BUILTIN_PLUGINS
+
+    tid = "cross-gpd-inactive"
+    try:
+        tenant = {"id": tid, "plan": "pro", "tunnel_active": 0}
+
+        plugin_name = BUILTIN_PLUGINS[0]["name"]
+        out = await mh._dispatch_mcp_tool(
+            "get_plugin_details", {"name": plugin_name}, db, "/tmp", tenant=tenant,
+        )
+        assert "error" not in out
+        assert out["tunnel_active"] is False
+    finally:
+        _reset_tunnel_state(tid)
+
+
+# ---------------------------------------------------------------------------
 # 11. search_outputs — missing arg guards + hosted-mode guard
 # ---------------------------------------------------------------------------
 

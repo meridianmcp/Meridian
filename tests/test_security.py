@@ -14,7 +14,7 @@ _SKIP_EXTENSIONS = {
     ".pdf", ".zip", ".sqlite", ".db", ".pyc",
     ".woff", ".woff2", ".ttf", ".eot", ".svg",
 }
-_SKIP_FILES = {"test_security.py", "scan_sensitive.py"}
+_SKIP_FILES = {"test_security.py", "scan_sensitive.py", "test_secret_redaction.py"}
 
 
 def _tracked_text_files():

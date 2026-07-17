@@ -1461,3 +1461,251 @@ class TestDuckDbFtsCapabilityProbe:
             assert hits, "Expected at least one BM25 hit for 'alpha' after overwrite build"
         finally:
             con.close()
+
+
+# ---------------------------------------------------------------------------
+# Cold-tree FTS deferral fix (sprint item b1789c0d)
+# ---------------------------------------------------------------------------
+
+@duckdb_required
+class TestColdTreeFtsDeferral:
+    """_rebuild_fts() must be skipped -- not run -- when the overall deadline
+    has already expired, even on a cold tree where _fts_built is still False.
+
+    Before this fix, the d9c76caa guard only fired when _fts_built was True,
+    so a cold/first-call against a large tree would still call _rebuild_fts()
+    unconditionally -- the cost of which scales with total row count and has
+    no internal deadline.  On a 66k-file tree this alone hit the ~4min
+    external MCP client timeout, returning total_indexed=0 with no error.
+
+    After the fix:
+    - If the deadline passed AND _fts_built is False: _fts_pending=True,
+      _rebuild_fts() is NOT called, last_rebuild_partial=True.
+    - The NEXT search() call (which has a fresh deadline) performs the lazy
+      FTS build so real BM25 results come back.
+    - A warm tree (both _fts_built=True and deadline passed) still uses the
+      existing index unchanged (prior d9c76caa behaviour preserved).
+    """
+
+    def test_cold_tree_deadline_skips_fts_sets_pending(
+        self, tmp_path: Path,
+    ) -> None:
+        """First rebuild() on a cold tree with an already-expired deadline must
+        write rows to the DB but skip _rebuild_fts(), leaving _fts_pending=True
+        so search() knows to build the index on the next call."""
+        for i in range(5):
+            (tmp_path / f"file_{i}.csv").write_text(
+                f"col_unique_{i}\n{i}", encoding="utf-8"
+            )
+
+        fts_call_count = [0]
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        real_rebuild_fts = idx._rebuild_fts
+
+        def counting_rebuild_fts(con: Any) -> None:
+            fts_call_count[0] += 1
+            real_rebuild_fts(con)
+
+        idx._rebuild_fts = counting_rebuild_fts
+        try:
+            # max_seconds=None means no overall deadline BUT we simulate an
+            # already-expired deadline by using a deeply-negative max_seconds.
+            count = idx.rebuild(max_seconds=-1.0)  # deadline already past
+            # The removed-paths + stale paths are non-trivial, so changed=True
+            # and we DO enter the if-changed block. With an expired deadline,
+            # _rebuild_fts() must be SKIPPED.
+            assert fts_call_count[0] == 0, (
+                "b1789c0d: _rebuild_fts() was called despite an already-expired "
+                "deadline on a cold tree (must be skipped to avoid the timeout bug)"
+            )
+            # Rows may or may not have been written (deadline may have expired
+            # before Phase 2 got any iterations), but _fts_pending must be set.
+            assert idx._fts_pending is True, (
+                "b1789c0d: _fts_pending must be True after FTS was deferred "
+                "on a cold tree with an expired deadline"
+            )
+            assert idx.last_rebuild_partial is True
+        finally:
+            idx.close()
+
+    def test_cold_tree_partial_rebuild_then_search_builds_fts(
+        self, tmp_path: Path,
+    ) -> None:
+        """Simulate the real bug scenario: rebuild() writes rows but FTS is
+        deferred because the deadline expires -- then search() triggers a lazy
+        FTS build and returns real results.
+
+        The live bug sequence:
+          call 1: Phase 1+2 write N rows, but _rebuild_fts() itself exceeds
+                  budget -> total_indexed=N, hits=[], partial=True, fts_pending=True
+          call 2: search() sees _fts_pending, calls _rebuild_fts() with a fresh
+                  deadline -> real BM25 hits come back.
+
+        We simulate this by manually driving the state: first do a real rebuild
+        (rows written), then simulate a second rebuild that sets _fts_pending by
+        expiring the deadline before _rebuild_fts can fire, then verify search()
+        lazily builds the FTS.
+        """
+        n_files = 5
+        for i in range(n_files):
+            (tmp_path / f"result_{i}.csv").write_text(
+                f"epoch,uniqueterm_{i}\n{i},{i}", encoding="utf-8"
+            )
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        call_sequence: list[str] = []
+        real_rebuild_fts = idx._rebuild_fts
+
+        def counting_rebuild_fts(con: Any) -> None:
+            call_sequence.append("fts_call")
+            real_rebuild_fts(con)
+
+        try:
+            # Step 1: write rows to the DB using the underlying helpers directly,
+            # bypassing _rebuild_fts entirely. This puts us in the state where
+            # rows exist but no FTS index was ever built -- exactly the state
+            # the real bug leaves behind when _rebuild_fts times out.
+            # We achieve this by running Phase 1 + Phase 2 of rebuild with
+            # max_seconds=None (no deadline) but with _rebuild_fts patched to
+            # raise a simulated timeout error, which is caught by the outer
+            # try/except and leaves _fts_built=False.
+            def simulated_fts_timeout(con: Any) -> None:
+                call_sequence.append("fts_timeout")
+                raise RuntimeError("simulated FTS timeout (b1789c0d test)")
+
+            idx._rebuild_fts = simulated_fts_timeout
+            # Run rebuild -- rows get written but FTS "times out"
+            idx.rebuild(max_seconds=None)
+            # Rows are in _row_cache but FTS didn't build (exception was swallowed)
+            assert len(idx._row_cache) == n_files, (
+                f"Expected {n_files} rows in cache after rebuild, got {len(idx._row_cache)}"
+            )
+            assert idx._fts_built is False
+
+            # Manually set _fts_pending to True to simulate what the fixed code
+            # would have done had it detected the expiry before calling _rebuild_fts.
+            idx._fts_pending = True
+            idx.last_rebuild_partial = True
+
+            # Step 2: search() with the real _rebuild_fts restored.
+            # It sees _fts_pending=True, calls _rebuild_fts() lazily.
+            idx._rebuild_fts = counting_rebuild_fts
+            call_sequence.clear()
+
+            hits = idx.search("uniqueterm_3")
+
+            assert "fts_call" in call_sequence, (
+                "b1789c0d: search() must trigger lazy _rebuild_fts() when _fts_pending=True"
+            )
+            assert idx._fts_pending is False, (
+                "_fts_pending must be cleared after the lazy build completes"
+            )
+            assert any("result_3" in h["path"] for h in hits), (
+                f"b1789c0d: expected BM25 hit for uniqueterm_3 after lazy FTS build, "
+                f"got: {hits}"
+            )
+        finally:
+            idx.close()
+
+    def test_warm_tree_deadline_passed_still_uses_existing_fts(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression check for d9c76caa (warm tree): an expired deadline on a
+        WARM tree (_fts_built=True) must still skip _rebuild_fts() and use the
+        existing index -- same as before the b1789c0d change."""
+        (tmp_path / "data.csv").write_text("warmterm,val\n1,2", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            # First rebuild with a generous budget -- FTS gets built.
+            idx.rebuild(max_seconds=None)
+            assert idx._fts_built is True
+
+            fts_call_count = [0]
+            real_rebuild_fts = idx._rebuild_fts
+
+            def counting_fts(con: Any) -> None:
+                fts_call_count[0] += 1
+                real_rebuild_fts(con)
+
+            idx._rebuild_fts = counting_fts
+
+            # Second rebuild with expired deadline -- must skip FTS (existing index usable).
+            (tmp_path / "data.csv").unlink()  # force changed=True
+            idx.rebuild(max_seconds=-100.0)
+
+            assert fts_call_count[0] == 0, (
+                "warm tree + expired deadline should still skip _rebuild_fts() "
+                "(regression check for d9c76caa)"
+            )
+            assert idx._fts_pending is False, (
+                "_fts_pending must stay False for a warm tree -- "
+                "the existing index is usable"
+            )
+            # search() must still return results from the existing index.
+            hits = idx.search("warmterm")
+            assert isinstance(hits, list)
+        finally:
+            idx.close()
+
+    def test_search_outputs_cold_tree_returns_partial_not_silent_empty(
+        self, tmp_path: Path,
+    ) -> None:
+        """The module-level search_outputs() must never return a bare, unexplained
+        {hits: [], total_indexed: 0} on a cold tree where indexing is in progress.
+
+        Before b1789c0d: a cold tree always returned that indistinguishable result.
+        After: first call sets partial=True (and fts_pending=True if FTS deferred).
+        A subsequent call (warm rows, fresh deadline) returns real hits.
+        """
+        n_files = 5
+        for i in range(n_files):
+            (tmp_path / f"cold_{i}.csv").write_text(
+                f"cold_unique_term_{i}\n{i}", encoding="utf-8"
+            )
+
+        # Simulate a cold tree under tight budget: Phase 1 processes files but
+        # FTS is deferred (deadline already in the past by the time Phase 2 runs).
+        # We use search_outputs directly (module-level API, as in the live bug).
+        result1 = OL.search_outputs(str(tmp_path), "cold_unique_term_2", max_seconds=-1.0)
+
+        # Must NOT be a silent empty result -- must carry partial=True signal.
+        assert result1.get("partial") is True, (
+            "b1789c0d: search_outputs() on a cold tree with expired deadline must "
+            f"return partial=True, not a silent empty result. Got: {result1}"
+        )
+        # total_in_index must reflect cumulative rows (even on partial runs)
+        # so the caller can distinguish 'cold tree, indexing in progress'
+        # from 'empty tree, nothing to find'.
+        assert "total_in_index" in result1, (
+            "b1789c0d: search_outputs() must include total_in_index for caller visibility"
+        )
+
+        # Second call: fresh budget (no artificial limit) -- should get real results.
+        result2 = OL.search_outputs(str(tmp_path), "cold_unique_term_2")
+        assert result2["total_indexed"] >= 1, (
+            "b1789c0d: second search_outputs() call must index files and return non-zero "
+            f"total_indexed. Got: {result2}"
+        )
+        # After FTS is built on the second call, hits should be available.
+        assert len(result2["hits"]) >= 1, (
+            f"b1789c0d: second call must return BM25 hits once FTS is built. Got: {result2}"
+        )
+
+    def test_search_outputs_small_warm_tree_unaffected(
+        self, tmp_path: Path,
+    ) -> None:
+        """A small tree that fits comfortably within the default budget must
+        behave exactly as before: total_indexed=N, hits=<results>, no partial flag."""
+        (tmp_path / "normal.csv").write_text(
+            "normalterm,value\n1,2", encoding="utf-8"
+        )
+        result = OL.search_outputs(str(tmp_path), "normalterm")
+        assert result["total_indexed"] >= 1
+        assert len(result["hits"]) >= 1
+        assert result.get("partial") is not True, (
+            "a small/warm tree must not set partial=True: "
+            f"got {result}"
+        )
+        assert result.get("fts_pending") is not True

@@ -742,6 +742,13 @@ class OutputsFtsIndex:
         self._con = connection
         self._owns_con = connection is None
         self._fts_built = False
+        # b1789c0d — set when _rebuild_fts() is deferred because the overall
+        # deadline expired before Phase 2 could reach it (includes the cold/
+        # first-call case where _fts_built is still False). search() uses this
+        # flag to schedule a lazy FTS build on the NEXT call once some rows are
+        # actually in the table -- so the caller gets REAL results (from a
+        # partial but non-empty index) instead of empty hits with total_indexed=0.
+        self._fts_pending = False
         self._manifest: dict[str, tuple[float | None, int | None]] = {}
         self._row_cache: dict[str, OutputRow] = {}
         self.last_rebuild_partial = False
@@ -1105,35 +1112,59 @@ class OutputsFtsIndex:
                                 for r in new_rows
                             ],
                         )
-                    # d9c76caa follow-up -- _rebuild_fts() is a FULL,
+                    # b1789c0d / d9c76caa -- _rebuild_fts() is a FULL,
                     # non-incremental rebuild (DuckDB has no incremental FTS
                     # support in the installed version, per b8314850) whose
                     # cost grows with the TOTAL row count and has no deadline
                     # check of its own. On a huge cold tree this alone can
                     # push the overall rebuild() call well past its budget
-                    # even after Phase 1/Phase 2 correctly stop on time (the
-                    # real-MCP-path validation for this item showed exactly
-                    # that: search_outputs still exceeded the ~4min external
-                    # ceiling with Phase 1/2 fixed). Skip the rebuild when the
-                    # deadline has already passed AND a usable FTS index
-                    # already exists from a prior successful rebuild --
-                    # search() only rebuilds FTS itself when none exists yet
-                    # (_fts_built is False), so skipping here never leaves
-                    # search() with nothing to query, only slightly-stale
-                    # results (missing this round's newest rows) until a
-                    # future call with enough remaining budget completes a
-                    # fresh one.
-                    skip_fts = (
-                        self._fts_built
-                        and deadline is not None
-                        and time.monotonic() > deadline
+                    # even after Phase 1/Phase 2 correctly stop on time.
+                    #
+                    # d9c76caa addressed the WARM-tree case (skip when
+                    # _fts_built AND deadline passed) but NOT the COLD-tree
+                    # case: on a first-ever call _fts_built is always False,
+                    # so the old guard never fired and _rebuild_fts() ran
+                    # unconditionally -- confirming the bug was live against a
+                    # 66k-file tree (both calls returned total_indexed=0
+                    # because _rebuild_fts() itself hit the ~4min external
+                    # client timeout, crashing the whole call).
+                    #
+                    # Fix (b1789c0d): skip _rebuild_fts() whenever the deadline
+                    # has already passed -- regardless of whether _fts_built is
+                    # True or False. On the cold case (_fts_built=False) we set
+                    # _fts_pending=True so search() knows to schedule a lazy
+                    # FTS build on the NEXT call (once rows exist in the table).
+                    # This guarantees every call makes real row-level progress
+                    # AND the second call (warm rows, pending FTS) can pay the
+                    # _rebuild_fts() cost with a fresh deadline, eventually
+                    # returning actual BM25 results instead of forever empty hits.
+                    deadline_passed = (
+                        deadline is not None and time.monotonic() > deadline
                     )
-                    if skip_fts:
+                    if deadline_passed:
                         self.last_rebuild_partial = True
+                        if not self._fts_built:
+                            # Cold-tree case: rows were written but FTS index
+                            # was never built. Flag it so search() attempts a
+                            # lazy build on its next invocation.
+                            self._fts_pending = True
+                        # (Warm-tree case: _fts_built=True -- search() already
+                        # has a working index; it will just be slightly stale
+                        # until the next call with enough remaining budget.)
                     else:
+                        self._fts_pending = False
                         self._rebuild_fts(con)
                 except Exception:  # noqa: BLE001
                     _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
+            # b1789c0d: also set _fts_pending when the deadline expired before
+            # any rows were written (changed=False because _apply_precomputed
+            # exited immediately on a deeply-negative deadline). In that case
+            # we never entered the `if changed:` block above, so the pending
+            # flag was never set -- but the FTS index is still unbuilt on a
+            # cold tree. Check last_rebuild_partial (set by _apply_precomputed)
+            # to catch this case.
+            if self.last_rebuild_partial and not self._fts_built:
+                self._fts_pending = True
             return len(rows)
 
     def _apply_precomputed(
@@ -1262,6 +1293,14 @@ class OutputsFtsIndex:
         Python sort is still applied afterwards to honour the archival score
         penalty (archival rows get bm25 * 0.5) without adding complexity to the
         SQL.
+
+        b1789c0d: when _fts_pending is True (rows exist in the table from a
+        prior partial rebuild but _rebuild_fts() was deferred because that
+        call's deadline expired first), this method attempts a lazy FTS build
+        now -- the MCP call that triggered SEARCH has a fresh budget, so paying
+        _rebuild_fts()'s per-row cost here is the right moment.  Once built,
+        _fts_pending is cleared and _fts_built is set so subsequent calls
+        skip the build entirely (warm path).
         """
         q = (query or "").strip()
         if not q:
@@ -1272,6 +1311,11 @@ class OutputsFtsIndex:
                 con = self._connect()
                 self._ensure_schema(con)
                 if not self._fts_built:
+                    # b1789c0d: _fts_pending means rows are ready in the table
+                    # but FTS was deferred from a prior rebuild(). Attempt a
+                    # lazy build now. An empty table (no rows yet) is a no-op
+                    # (DuckDB FTS over an empty table is fast and harmless).
+                    self._fts_pending = False
                     self._rebuild_fts(con)
                 sql = (
                     "SELECT path, content, mtime, sha256, size, generating_script, "
@@ -1451,6 +1495,16 @@ def search_outputs(
     Fully local -- no hosted call.  Reuses a cached incremental
     :class:`OutputsFtsIndex` per ``outputs_dir``.  Secret files are never
     indexed (filtered by :func:`is_secret_path` before any file is walked).
+
+    b1789c0d: on a cold, large tree the first call may not complete the FTS
+    rebuild within its budget.  In that case ``total_indexed`` reflects how
+    many rows were committed to the DB this call, ``total_in_index`` reflects
+    the cumulative row count across ALL prior calls (which may be larger after
+    the second call), and ``partial=True`` signals more indexing remains.
+    Callers should re-invoke search_outputs to get progressively better
+    results as the index builds across multiple calls.  An empty ``hits``
+    list with ``partial=True`` means the FTS index has not yet been built
+    (still pending) -- check ``total_in_index`` to see if rows already exist.
     """
     result: dict[str, Any] = {
         "outputs_dir": outputs_dir,
@@ -1466,11 +1520,22 @@ def search_outputs(
         return result
     index = _get_cached_index(outputs_dir)
     result["total_indexed"] = index.rebuild(max_seconds=max_seconds)
+    # b1789c0d -- expose cumulative row count from the DB (which may be
+    # larger than total_indexed on a partial rebuild that resumes prior work)
+    # so callers can distinguish "cold tree, indexing in progress" from
+    # "empty tree, nothing to find". total_in_index == len(index._row_cache)
+    # because _row_cache always mirrors what is (or will be) in the DB.
+    result["total_in_index"] = len(index._row_cache)
     hits = index.search(query, limit=limit, include_archival=include_archival)
     for hit in hits:
         hit["annotations"] = index.get_annotations_for_path(hit["path"])
     result["hits"] = hits
     if index.last_rebuild_partial:
+        result["partial"] = True
+    if index._fts_pending:
+        # Rows exist but FTS index hasn't been built yet.  Signal this so the
+        # caller knows to re-invoke (the next search() call will build FTS).
+        result["fts_pending"] = True
         result["partial"] = True
     return result
 

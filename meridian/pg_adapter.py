@@ -3079,6 +3079,36 @@ async def _migrate_pg_note_nickname(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_server_logs(conn: PostgresConnection) -> None:
+    """f0a48685 — server_logs: application-wide WARNING/ERROR/EXCEPTION log capture.
+
+    Every WARNING-or-above logging record emitted anywhere in the Meridian
+    process is persisted here via a custom logging.Handler so post-mortem
+    diagnosis of incidents is possible from a hosted-only session with no
+    local machine access.
+
+    Kept separate from connection_events: connection_events is one structured
+    row per /mcp HTTP request; server_logs is one row per arbitrary log record.
+
+    Mirrors db._migrate_server_logs. Idempotent via CREATE TABLE IF NOT EXISTS
+    + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS server_logs ("
+        "    id TEXT PRIMARY KEY,"
+        "    level TEXT NOT NULL DEFAULT 'ERROR',"
+        "    logger TEXT NOT NULL DEFAULT '',"
+        "    message TEXT NOT NULL DEFAULT '',"
+        "    exc_text TEXT,"
+        f"    recorded_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_server_logs_level_at "
+        "ON server_logs(level, recorded_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_server_logs_at "
+        "ON server_logs(recorded_at DESC)"
+    )
+
+
 async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> None:
     """94c26322 — human-set bypass flag for the prospecting safety gate.
 
@@ -3095,6 +3125,40 @@ async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> N
     await conn.executescript(
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS "
         "prospect_bypass INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_handoff_tokens(conn: PostgresConnection) -> None:
+    """cb8e7c0f — handoff_tokens: DB-backed provenance token store for cross-machine
+    verify_handoff_token.
+
+    The previous in-process _HANDOFF_TOKENS dict was process-local: on a multi-
+    machine deployment (fly.toml max_count=40) generate_handoff on machine A minted
+    a token into A's dict, but verify_handoff_token called from a new session on
+    machine B read from B's empty dict and always returned not_found — making the
+    trust boundary silently useless. Storing tokens in the shared DB fixes this.
+
+    token (TEXT PK): the opaque random hex value embedded in <goal_token>.
+    project_id (TEXT NOT NULL): the project this token was minted for.
+    expires_at (TEXT NOT NULL): ISO-8601 UTC expiry timestamp.
+    consumed (INTEGER NOT NULL DEFAULT 0): 1 once the token has been verified once.
+    created_at (TEXT NOT NULL): for audit/cleanup purposes.
+
+    Idempotent: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    Mirrors db._migrate_handoff_tokens.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS handoff_tokens ("
+        "    token TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    expires_at TEXT NOT NULL,"
+        "    consumed INTEGER NOT NULL DEFAULT 0,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_handoff_tokens_project "
+        "ON handoff_tokens(project_id);"
+        "CREATE INDEX IF NOT EXISTS idx_handoff_tokens_expires "
+        "ON handoff_tokens(expires_at);"
     )
 
 
@@ -3173,4 +3237,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_decision_slug_nickname,
     _migrate_pg_note_nickname,
     _migrate_pg_sprint_item_prospect_bypass,
+    _migrate_pg_handoff_tokens,
+    _migrate_pg_server_logs,
 )
