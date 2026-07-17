@@ -15,6 +15,12 @@ dependencies = [
     "mcp>=1.0",
     "duckdb>=0.10",
     "watchdog>=4.0",
+    # 279448b4 -- official Tantivy Python bindings (quickwit-oss/tantivy-py on
+    # GitHub) publish to PyPI under the package name "tantivy", NOT
+    # "tantivy-py" -- that latter name is a different, essentially abandoned
+    # PyPI package (3 releases, last an rc, unrelated author). Verified via
+    # PyPI JSON API + GitHub search before adding.
+    "tantivy>=0.22",
 ]
 
 [project.optional-dependencies]

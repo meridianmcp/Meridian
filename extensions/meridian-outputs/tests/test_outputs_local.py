@@ -1709,3 +1709,31 @@ class TestColdTreeFtsDeferral:
             f"got {result}"
         )
         assert result.get("fts_pending") is not True
+
+
+class TestTantivyDependency:
+    """279448b4 -- the real PyPI package is "tantivy" (quickwit-oss/tantivy-py's
+    official bindings), NOT "tantivy-py" (a different, unrelated, essentially
+    abandoned package under that literal name). This just confirms the
+    dependency actually installs and does a real write+search round trip;
+    later items (77443d83/a6056886/8163816e) wire it into OutputsFtsIndex."""
+
+    def test_tantivy_importable(self) -> None:
+        import tantivy  # noqa: PLC0415
+
+        assert tantivy is not None
+
+    def test_tantivy_write_and_search_round_trip(self) -> None:
+        import tantivy  # noqa: PLC0415
+
+        schema_builder = tantivy.SchemaBuilder()
+        schema_builder.add_text_field("body", stored=True)
+        schema = schema_builder.build()
+        index = tantivy.Index(schema)
+        writer = index.writer()
+        writer.add_document(tantivy.Document(body="hello world tantivy smoke test"))
+        writer.commit()
+        index.reload()
+        query = index.parse_query("hello", ["body"])
+        hits = index.searcher().search(query, 10).hits
+        assert len(hits) == 1
