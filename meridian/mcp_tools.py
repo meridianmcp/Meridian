@@ -2218,6 +2218,221 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "fan_out_sprint_items":      "both",  # orchestrators also use it; keep "both"
 }
 
+# ---------------------------------------------------------------------------
+# b905da5a — 3-tier MCP tool workflow classification.
+#
+# Every tool is classified into one of three tiers that reflect HOW OFTEN it
+# is realistically called in a normal single-session workflow:
+#
+#   "main-workflow"    — called in virtually every session; the essential loop.
+#   "common-support"   — called frequently but not every single call; regular
+#                        hygiene that most healthy sessions use.
+#   "maintenance-only" — genuinely occasional: orchestrator-only primitives,
+#                        periodic diagnostics, display-only persistence helpers.
+#
+# This is stamped onto every tool entry in the loop below (tool["workflow_tier"])
+# and is visible in tools/list responses so any MCP client can read it.
+# The dashboard Tools Reference view groups tools by this field.
+#
+# Classification rationale for unlisted tools (those not in Adam's explicit lists):
+#   - get_notes, read_note, add_note: common-support — routine note lookups
+#   - log_task: common-support — sessions log meaningful work often
+#   - get_tasks, search_tasks, search_all, search_synthesis: common-support — regular lookups
+#   - get_pinned_decisions, pin_decision, update_decision, archive_decision:
+#     common-support — decision lifecycle used regularly in planning sessions
+#   - get_hitl_request, list_hitl_requests, answer_hitl, dismiss_hitl: common-support
+#   - claim_file, release_file: common-support — file locking per AGENTS.md protocol
+#   - get_file_claims: Adam listed under MAINTENANCE but it's used as a file-locking
+#     hygiene step in the claim sequence; kept common-support since it's the read-
+#     check step before every claim_file call
+#   - fan_out_sprint_items, add_subtask: common-support — orchestrators call often
+#   - get_sprint_item_pointers, resolve_sprint_item_pointers: common-support
+#   - search_code_semantic, prospect_symbol, search_outputs: common-support
+#   - ingest_document, get_document_structure, get_latex_structure: common-support
+#     in document-focused sessions (occasional for code-only sessions)
+#   - paper_search, capture_research_finding, save_finding: common-support
+#   - get_workspace_proposals, advance_proposal_status: common-support — part of
+#     the add_workspace_proposal -> promote_proposal main-workflow arc
+#   - run_verification: common-support — routine test running in executor sessions
+#   - get_goal, get_sprint_progress: common-support — orientation calls
+#   - get_session_brief, get_context_block, refresh_context: common-support
+#   - add_sprint_note, get_sprint_notes: common-support — session scratchpad
+#   - annotate_outputs: common-support — used alongside search_outputs
+#   - validate_assumption: explicitly listed under COMMON SUPPORT by Adam
+#   - Everything else (docx write-back, workspace CRUD, config, admin diagnostics,
+#     parallel-coord primitives, graph metrics, plugin mgmt, session recovery):
+#     maintenance-only — specialized or orchestrator-only use
+# ---------------------------------------------------------------------------
+
+_TOOL_WORKFLOW_TIER: dict[str, str] = {
+    # ---- MAIN WORKFLOW: every session ----
+    "start_session":              "main-workflow",
+    "get_planning_brief":         "main-workflow",
+    "get_sprint_items":           "main-workflow",
+    "add_workspace_proposal":     "main-workflow",
+    "promote_proposal":           "main-workflow",
+    "add_sprint_item":            "main-workflow",
+    "claim_sprint_item":          "main-workflow",
+    "complete_sprint_item":       "main-workflow",
+    "generate_handoff":           "main-workflow",
+    "request_hitl":               "main-workflow",
+
+    # ---- COMMON SUPPORT: frequent hygiene ----
+    # explicitly listed by Adam as common-support
+    "checkpoint":                 "common-support",
+    "add_insight":                "common-support",
+    "get_insights":               "common-support",
+    "validate_assumption":        "common-support",
+    "merge_sprint_items":         "common-support",
+    "split_sprint_item":          "common-support",
+    "add_sprint_item_pointer":    "common-support",
+    "update_sprint_item":         "common-support",
+    # notes / knowledge (regular lookups)
+    "log_task":                   "common-support",
+    "get_notes":                  "common-support",
+    "read_note":                  "common-support",
+    "add_note":                   "common-support",
+    "get_tasks":                  "common-support",
+    "search_tasks":               "common-support",
+    "search_all":                 "common-support",
+    "search_synthesis":           "common-support",
+    # decisions lifecycle
+    "pin_decision":               "common-support",
+    "get_pinned_decisions":       "common-support",
+    "update_decision":            "common-support",
+    "archive_decision":           "common-support",
+    # goal / sprint read
+    "get_goal":                   "common-support",
+    "get_sprint_progress":        "common-support",
+    # session orientation
+    "get_session_brief":          "common-support",
+    "get_context_block":          "common-support",
+    "refresh_context":            "common-support",
+    "add_sprint_note":            "common-support",
+    "get_sprint_notes":           "common-support",
+    # hitl management
+    "get_hitl_request":           "common-support",
+    "list_hitl_requests":         "common-support",
+    "answer_hitl":                "common-support",
+    "dismiss_hitl":               "common-support",
+    # file-locking (claim sequence per AGENTS.md)
+    "claim_file":                 "common-support",
+    "release_file":               "common-support",
+    "get_file_claims":            "common-support",
+    # code-intel (used when searching codebase)
+    "search_code_semantic":       "common-support",
+    "prospect_symbol":            "common-support",
+    "search_outputs":             "common-support",
+    "annotate_outputs":           "common-support",
+    # sprint decomposition / pointers
+    "fan_out_sprint_items":       "common-support",
+    "add_subtask":                "common-support",
+    "get_sprint_item_pointers":   "common-support",
+    "resolve_sprint_item_pointers": "common-support",
+    # document ingestion (contextual, used in document-focused sessions)
+    "ingest_document":            "common-support",
+    "get_document_structure":     "common-support",
+    "get_latex_structure":        "common-support",
+    # research
+    "paper_search":               "common-support",
+    "capture_research_finding":   "common-support",
+    "save_finding":               "common-support",
+    # workspace proposals workflow arc
+    "get_workspace_proposals":    "common-support",
+    "advance_proposal_status":    "common-support",
+    # test running
+    "run_verification":           "common-support",
+
+    # ---- MAINTENANCE ONLY: genuinely occasional ----
+    # explicitly listed by Adam as maintenance-only
+    "analyze_sprint":             "maintenance-only",
+    "get_parallelizable_groups":  "maintenance-only",
+    "assign_sprint_waves":        "maintenance-only",
+    "reconcile_sprint_drift":     "maintenance-only",
+    "get_symbol_hotspots":        "maintenance-only",
+    "get_symbol_claims":          "maintenance-only",
+    # parallel coordination primitives (orchestrator-only)
+    "send_message":               "maintenance-only",
+    "receive_messages":           "maintenance-only",
+    "idle_until_all_done":        "maintenance-only",
+    "store_finding":              "maintenance-only",
+    # parallel coordination (single-session wait)
+    "idle_until_session_done":    "maintenance-only",
+    # session diagnostics / audit
+    "get_session_log":            "maintenance-only",
+    "get_session_activity":       "maintenance-only",
+    "get_connection_log":         "maintenance-only",
+    "get_server_logs":            "maintenance-only",
+    "search_server_logs":         "maintenance-only",
+    # config / setup (one-time or rare)
+    "set_executor_config":        "maintenance-only",
+    "set_agent_instructions":     "maintenance-only",
+    "get_agent_instructions":     "maintenance-only",
+    "set_active_repo":            "maintenance-only",
+    # goal / sprint editing (planning boundaries only)
+    "set_goal":                   "maintenance-only",
+    "set_north_star":             "maintenance-only",
+    "set_sprint":                 "maintenance-only",
+    # project CRUD
+    "create_project":             "maintenance-only",
+    "rename_project":             "maintenance-only",
+    "merge_project":              "maintenance-only",
+    "set_parent_project":         "maintenance-only",
+    "list_projects":              "maintenance-only",
+    "get_project_by_name":        "maintenance-only",
+    # low-level session management
+    "register_session":           "maintenance-only",
+    "list_sessions":              "maintenance-only",
+    "heartbeat":                  "maintenance-only",
+    "load_handoff":               "maintenance-only",
+    "verify_handoff_token":       "maintenance-only",
+    # sprint item pointer cleanup
+    "delete_sprint_item_pointer": "maintenance-only",
+    # note cleanup
+    "delete_note":                "maintenance-only",
+    # findings store (orchestrator-only parallel handoff)
+    "get_findings":               "maintenance-only",
+    # docx write-back / specialized document ops
+    "index_equation":             "maintenance-only",
+    "find_similar_equation":      "maintenance-only",
+    "insert_equation":            "maintenance-only",
+    "update_paragraph":           "maintenance-only",
+    "find_symbol_usages":         "maintenance-only",
+    "index_figure":               "maintenance-only",
+    "find_similar_figure":        "maintenance-only",
+    "link_figure_caption":        "maintenance-only",
+    "index_table":                "maintenance-only",
+    "find_similar_table":         "maintenance-only",
+    "ingest_document_structure":  "maintenance-only",
+    "claim_docx_region":          "maintenance-only",
+    "get_docx_region_claims":     "maintenance-only",
+    "release_docx_region_claims": "maintenance-only",
+    "get_citation_edges":         "maintenance-only",
+    "resolve_citations":          "maintenance-only",
+    # workspace management (cross-project admin)
+    "add_workspace_note":              "maintenance-only",
+    "get_workspace_notes":             "maintenance-only",
+    "pin_workspace_decision":          "maintenance-only",
+    "get_workspace_decisions":         "maintenance-only",
+    "get_workspace_settings":          "maintenance-only",
+    "update_workspace_settings":       "maintenance-only",
+    "add_workspace_sprint_item":       "maintenance-only",
+    "get_workspace_sprint_items":      "maintenance-only",
+    "update_workspace_sprint_item":    "maintenance-only",
+    "complete_workspace_sprint_item":  "maintenance-only",
+    "save_blog_post":                  "maintenance-only",
+    "get_blog_posts":                  "maintenance-only",
+    "update_md_section":               "maintenance-only",
+    # plugin / manifest management
+    "list_plugins":               "maintenance-only",
+    "get_plugin_details":         "maintenance-only",
+    "refresh_tool_manifest":      "maintenance-only",
+    # analysis / graph
+    "analyze_model_efficiency":   "maintenance-only",
+    "snapshot_graph_metrics":     "maintenance-only",
+    "get_graph_diff":             "maintenance-only",
+}
+
 _TITLE_OVERRIDES: dict[str, str] = {
     "request_hitl": "Request HITL",
     "get_hitl_request": "Get HITL Request",
@@ -2303,6 +2518,10 @@ for _tool in _MCP_TOOLS_LIST:
     # so callers (e.g. _select_active_tool_set) can filter without re-declaring tags.
     _tool["category"] = _TOOL_CATEGORY.get(_tool["name"], "other")
     _tool["role_relevance"] = _TOOL_ROLE_RELEVANCE.get(_tool["name"], "both")
+    # b905da5a — stamp workflow_tier: machine-readable 3-tier classification visible
+    # in tools/list responses so any MCP client can see it. Default "common-support"
+    # for any tool not explicitly mapped (safe: unknown tools are support-level).
+    _tool["workflow_tier"] = _TOOL_WORKFLOW_TIER.get(_tool["name"], "common-support")
 
 
 # ---------------------------------------------------------------------------
