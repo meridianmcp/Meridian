@@ -30,6 +30,16 @@
                         "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\worktree_guard.ps1\""
                     }
                 ]
+            },
+            {
+                "matcher": "Read|Bash|Grep|Glob",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1\""
+                    }
+                ]
             }
         ],
         "PostToolUse": [

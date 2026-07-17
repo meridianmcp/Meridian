@@ -1072,6 +1072,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_note_nickname(db)
     await _migrate_sprint_item_prospect_bypass(db)
     await _migrate_handoff_tokens(db)
+    await _migrate_server_logs(db)
     return db
 
 
@@ -3212,6 +3213,8 @@ async def log_task(
         raise ValueError(f"invalid task status: {status}")
     if kind not in ("shipped", "found", "decided", "blocked"):
         kind = None
+    from meridian.secret_redaction import check_for_secrets
+    check_for_secrets(description, context="task description")
     tid = _new_id()
     await db.execute(
         "INSERT INTO task_log "
@@ -3282,6 +3285,8 @@ async def update_task(
         fields.append("status = ?")
         values.append(status)
     if description is not None:
+        from meridian.secret_redaction import check_for_secrets
+        check_for_secrets(description, context="task description")
         fields.append("description = ?")
         values.append(description)
     if not fields:
@@ -6733,6 +6738,8 @@ async def pin_decision(
     6fb48898 — a kebab-cased ``slug`` and a short memorable ``nickname`` are
     auto-generated from the title, unique per project, mirroring sprint_items.
     """
+    from meridian.secret_redaction import check_for_secrets
+    check_for_secrets(body, context="decision body")
     did = _new_id()
     priority = _normalize_decision_priority(priority)
     # 2b39549d — an assumption starts life 'unvalidated'; no assumption → NULL.
@@ -6936,6 +6943,8 @@ async def update_pinned_decision(
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     fields: dict[str, Any] = {}
     if body is not None:
+        from meridian.secret_redaction import check_for_secrets
+        check_for_secrets(body, context="decision body")
         fields["body"] = body
         # Append-only edit history: snapshot the prior body before overwriting,
         # but only when the body actually changed (no-op edits don't pollute it).
@@ -7709,6 +7718,99 @@ async def get_connection_log(
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
+# ---------------------------------------------------------------------------
+# f0a48685 — server_logs: application-wide WARNING/ERROR/EXCEPTION log capture.
+#
+# A custom logging.Handler writes qualifying records here so any session
+# (including hosted-only claude.ai sessions without local machine access) can
+# inspect server-side errors without raw Fly.io log access.  Kept separate from
+# connection_events: connection_events is one structured row per /mcp HTTP
+# request; server_logs is one row per arbitrary application log record.
+# ---------------------------------------------------------------------------
+
+_SERVER_LOGS_RING_SIZE = 2000  # global cap — not per-tenant
+
+
+async def record_server_log(
+    db: aiosqlite.Connection,
+    *,
+    level: str,
+    logger: str,
+    message: str,
+    exc_text: str | None = None,
+) -> None:
+    """Write one server_log row and prune the oldest beyond the ring size.
+
+    Best-effort: callers must wrap in try/except so a persistence failure
+    never propagates back through the logging framework and into the original
+    call site.
+
+    level vocabulary: 'WARNING', 'ERROR', 'EXCEPTION'
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+    entry_id = _new_id()
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "INSERT INTO server_logs (id, level, logger, message, exc_text, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            entry_id,
+            level[:20],
+            logger[:200],
+            message[:2000],
+            exc_text[:4000] if exc_text else None,
+            now_ts,
+        ),
+    )
+    # Prune: keep only the most recent N rows globally.
+    tiebreak = "ctid" if hasattr(db, "_pool") else "rowid"
+    await db.execute(
+        f"DELETE FROM server_logs WHERE {tiebreak} NOT IN ("
+        f"  SELECT {tiebreak} FROM server_logs "
+        f"  ORDER BY recorded_at DESC, {tiebreak} DESC LIMIT ?"
+        f")",
+        (_SERVER_LOGS_RING_SIZE,),
+    )
+    await db.commit()
+
+
+async def get_server_logs(
+    db: aiosqlite.Connection,
+    since: str | None = None,
+    limit: int = 100,
+    level_filter: str | None = None,
+    module_filter: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return recent server log entries, newest first.
+
+    ``since`` is an ISO timestamp string — only entries at or after this time
+    are returned. ``limit`` caps the result set (max 500). ``level_filter``
+    restricts to a specific level (e.g. 'ERROR'). ``module_filter`` is a
+    substring match against the logger name.
+    """
+    limit = min(limit, 500)
+    params: list[Any] = []
+    clauses: list[str] = []
+    if since:
+        clauses.append("recorded_at >= ?")
+        params.append(since)
+    if level_filter:
+        clauses.append("level = ?")
+        params.append(level_filter.upper()[:20])
+    if module_filter:
+        clauses.append("logger LIKE ?")
+        params.append(f"%{module_filter}%")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+    async with db.execute(
+        f"SELECT * FROM server_logs {where} "
+        f"ORDER BY recorded_at DESC LIMIT ?",
+        params,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
 async def get_project_by_token(
     db: aiosqlite.Connection, token: str
 ) -> dict[str, Any] | None:
@@ -8042,6 +8144,8 @@ async def add_project_note(
         kind = None
     if priority not in ("high", "normal", "low"):
         priority = "normal"
+    from meridian.secret_redaction import check_for_secrets
+    check_for_secrets(body, context="note body")
     stored_source = (source or "").strip() or None
     # 771c00d7 — code anchor: require a real path, normalize it to match claims,
     # and keep ``symbol`` only alongside a path. Anchors are independent of kind
@@ -8449,6 +8553,8 @@ async def update_project_note(
     if title is not None:
         fields["title"] = title
     if body is not None:
+        from meridian.secret_redaction import check_for_secrets
+        check_for_secrets(body, context="note body")
         fields["body"] = body
     if tags is not None:
         fields["tags"] = tags
