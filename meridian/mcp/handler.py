@@ -861,13 +861,41 @@ async def _handle_mcp_request(
                     # dispatch when a tenant is set, so the tunnel must not advertise
                     # them here or list/call would disagree.
                     reserved = {t.get("name") for t in tools} | set(_server._GITHUB_TOOL_NAMES)
-                    tunnel_tools = await _tunnel_mod.list_tunnel_tools(
-                        tenant["id"], reserved,
-                    )
+                    # 2026-07-17 outage hotfix — list_tunnel_tools' own per-slot
+                    # retry budget (up to 4 attempts * 3s timeout each = ~13.5s
+                    # worst case for a single slot marked "healthy" but actually
+                    # unreachable) had NO outer bound here, so a single stale-healthy
+                    # slot could delay the entire tools/list response past a client's
+                    # tool-loading timeout — the native tool set (list_projects,
+                    # add_sprint_item, etc.) is tenant/tunnel-independent and must
+                    # never be held hostage by a slow/hanging tunnel fetch. Bound the
+                    # WHOLE tunnel-tools fetch to 5s regardless of slot count/health
+                    # staleness; a timeout here degrades to native-only (same signal
+                    # shape as the existing generic-exception branch below).
+                    import asyncio as _asyncio  # noqa: PLC0415
+                    try:
+                        tunnel_tools = await _asyncio.wait_for(
+                            _tunnel_mod.list_tunnel_tools(tenant["id"], reserved),
+                            timeout=5.0,
+                        )
+                    except _asyncio.TimeoutError:
+                        tunnel_tools = []
+                        tunnel_health = {
+                            "status": "degraded",
+                            "message": (
+                                "Meridian tunnel plugin-tool fetch exceeded 5s and was "
+                                "abandoned so native tools could still load on time — a "
+                                "slot's health state is likely stale (marked healthy but "
+                                "unreachable). Only native tools are listed this request; "
+                                "retry, or check the `meridian --tunnel` process."
+                            ),
+                        }
                     tools = tools + tunnel_tools
-                    if not tunnel_tools:
-                        # Tunnel is up but advertised nothing — a slot is still
-                        # starting or failed its pre-flight health check.
+                    if not tunnel_tools and tunnel_health is None:
+                        # Tunnel is up but advertised nothing (and it wasn't our new
+                        # 5s outer timeout above, which already set its own specific
+                        # message) — a slot is still starting or failed its
+                        # pre-flight health check.
                         tunnel_health = {
                             "status": "degraded",
                             "message": (
@@ -2744,6 +2772,8 @@ async def _handle_session_tools(
         handle_get_session_log,
         handle_get_session_activity,
         handle_get_connection_log,
+        handle_get_server_logs,
+        handle_search_server_logs,
         handle_get_agent_instructions,
         handle_set_agent_instructions,
         handle_set_executor_config,
@@ -2761,6 +2791,8 @@ async def _handle_session_tools(
         "get_session_log": handle_get_session_log,
         "get_session_activity": handle_get_session_activity,
         "get_connection_log": handle_get_connection_log,
+        "get_server_logs": handle_get_server_logs,
+        "search_server_logs": handle_search_server_logs,
         "get_agent_instructions": handle_get_agent_instructions,
         "set_agent_instructions": handle_set_agent_instructions,
         "set_executor_config": handle_set_executor_config,
