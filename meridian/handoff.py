@@ -47,16 +47,29 @@ _SESSION_HANDOFF_STATE: dict[str, str] = {}
 
 # dd07ece0 — provenance token store: short-lived, single-use tokens that let a
 # receiving session independently verify a /goal block came from a real
-# generate_handoff call (not injected/spoofed text shaped like one).
-# In-process dict is sufficient: tokens are consumed immediately on first
-# verification and are only valid for a handful of minutes — they don't need
-# to survive a process restart. Keyed by token → {project_id, expires_at,
-# consumed}. Prefer this over a DB table/migration for something this ephemeral.
+# generate_handoff call (not injected/spoofed text shaped like one). cb8e7c0f
+# moved the primary store to the shared `handoff_tokens` DB table (below) so
+# verification works across machines; this in-process dict now only serves as
+# the DB-unavailable fallback path in mint/verify_handoff_token.
 _HANDOFF_TOKENS: dict[str, dict[str, Any]] = {}
 
 # TTL for handoff tokens — short enough to thwart replay of recorded tokens,
 # long enough that a human paste-and-verify flow always succeeds.
 _HANDOFF_TOKEN_TTL_SECONDS = 300  # 5 minutes
+
+# a36c22ef — grace window before an expired row is physically deleted by the
+# opportunistic cleanup in mint_handoff_token. Without this, a token that
+# expires and is then swept by *any* concurrent mint call (system-wide, not
+# just this project) disappears before a slightly-late verify_handoff_token
+# call ever sees it — downgrading a truthful reason="expired" into a
+# misleading reason="not_found", which looks identical to a fabricated
+# token. verify_handoff_token's own expiry check is unaffected: it still
+# compares against the real expires_at, so rows inside the grace window are
+# still correctly reported as expired instead of merely being deleted late.
+# Only benefits tokens that are NEVER verified: a token that IS verified late
+# self-heals via verify_handoff_token's own per-token DELETE-on-expiry-detect,
+# regardless of this window.
+_HANDOFF_TOKEN_CLEANUP_GRACE_SECONDS = 3600  # 1 hour
 
 
 async def mint_handoff_token(db: Any, project_id: str) -> str:
@@ -91,13 +104,19 @@ async def mint_handoff_token(db: Any, project_id: str) -> str:
             (token, project_id, expires_at_str),
         )
         await db.commit()
-        # Opportunistic cleanup: delete expired rows so the table doesn't grow
-        # unbounded. Best-effort — never fail the mint over a cleanup error.
+        # Opportunistic cleanup: delete rows past the grace window so the table
+        # doesn't grow unbounded, without deleting recently-expired rows out
+        # from under a late-but-legitimate verify_handoff_token call (a36c22ef —
+        # see _HANDOFF_TOKEN_CLEANUP_GRACE_SECONDS). Best-effort — never fail
+        # the mint over a cleanup error.
         try:
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+            cleanup_cutoff_str = (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=_HANDOFF_TOKEN_CLEANUP_GRACE_SECONDS)
+            ).strftime("%Y-%m-%d %H:%M:%S.%f")
             await db.execute(
                 "DELETE FROM handoff_tokens WHERE expires_at < ?",
-                (now_str,),
+                (cleanup_cutoff_str,),
             )
             await db.commit()
         except Exception:  # noqa: BLE001

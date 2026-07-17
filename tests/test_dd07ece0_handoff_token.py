@@ -491,3 +491,76 @@ async def test_already_consumed_rejected_anydb(anydb):
     second = await handoff_module.verify_handoff_token(anydb, token, "pid-consumed")
     assert second["valid"] is False, f"second verify must fail: {second}"
     assert second["reason"] == "already_consumed"
+
+
+# ---------------------------------------------------------------------------
+# a36c22ef — opportunistic cleanup must not turn a truthful "expired" into a
+# misleading "not_found" for a token that only just expired.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recently_expired_token_still_reports_expired_after_concurrent_mint(anydb):
+    """a36c22ef: a token that expired moments ago must still report reason="expired",
+    even if some unrelated concurrent mint_handoff_token call has since run its
+    opportunistic cleanup. Before the grace-window fix, the cleanup's bulk DELETE
+    used ``expires_at < now``, which physically removes a just-expired row before
+    a slightly-late verify_handoff_token call ever sees it — downgrading the
+    truthful reason="expired" into an indistinguishable-from-fabricated
+    reason="not_found".
+    """
+    import secrets as _secrets
+
+    token = _secrets.token_hex(8)
+    past_str = (
+        datetime.now(timezone.utc) - timedelta(seconds=5)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    await anydb.execute(
+        "INSERT INTO handoff_tokens (token, project_id, expires_at, consumed) "
+        "VALUES (?, ?, ?, 0)",
+        (token, "pid-recently-expired", past_str),
+    )
+    await anydb.commit()
+
+    # Simulate a concurrent, unrelated mint on another project — this is the
+    # call that runs the opportunistic cleanup.
+    await handoff_module.mint_handoff_token(anydb, "pid-unrelated-concurrent-mint")
+
+    result = await handoff_module.verify_handoff_token(anydb, token, "pid-recently-expired")
+    assert result["valid"] is False
+    assert result["reason"] == "expired", (
+        f"a just-expired token must report reason='expired', not '{result['reason']}' "
+        "— the opportunistic cleanup swept it before verification"
+    )
+
+
+@pytest.mark.asyncio
+async def test_long_expired_token_eventually_cleaned_up_anydb(anydb):
+    """a36c22ef: the grace window bounds table growth — a token expired well
+    beyond _HANDOFF_TOKEN_CLEANUP_GRACE_SECONDS is still swept by the
+    opportunistic cleanup and correctly reports not_found once truly gone.
+    """
+    import secrets as _secrets
+
+    token = _secrets.token_hex(8)
+    long_past_str = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=handoff_module._HANDOFF_TOKEN_CLEANUP_GRACE_SECONDS + 60)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    await anydb.execute(
+        "INSERT INTO handoff_tokens (token, project_id, expires_at, consumed) "
+        "VALUES (?, ?, ?, 0)",
+        (token, "pid-long-expired", long_past_str),
+    )
+    await anydb.commit()
+
+    # Concurrent mint on another project runs the opportunistic cleanup, which
+    # should now sweep this long-dead row.
+    await handoff_module.mint_handoff_token(anydb, "pid-unrelated-concurrent-mint-2")
+
+    result = await handoff_module.verify_handoff_token(anydb, token, "pid-long-expired")
+    assert result["valid"] is False
+    assert result["reason"] == "not_found", (
+        f"a token expired well past the grace window should be swept and report "
+        f"not_found, got '{result['reason']}'"
+    )
