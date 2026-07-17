@@ -125,11 +125,15 @@ async def test_goal_block_contains_prominent_verification_banner(db, tmp_path):
     assert security_idx > goal_token_idx, (
         "581144fa: verification banner must appear AFTER the <goal_token> tag, not before"
     )
-    # The banner must appear before the <role> tag so it cannot be missed.
-    role_idx = content.find("<role>")
-    if role_idx != -1:  # empty-board /goal has no <role> tag, skip this check
-        assert security_idx < role_idx, (
-            "581144fa: verification banner must appear BEFORE <role> so it is seen first"
+    # The banner must appear before the executor-directive tag so it cannot be
+    # missed. 0af1d7d6 renamed <role> -> <executor_directive> (the old name
+    # structurally mimicked a prompt-injection payload); check the current
+    # name so this assertion doesn't silently no-op after that rename.
+    directive_idx = content.find("<executor_directive>")
+    if directive_idx != -1:  # empty-board /goal has no directive tag, skip this check
+        assert security_idx < directive_idx, (
+            "581144fa: verification banner must appear BEFORE <executor_directive> "
+            "so it is seen first"
         )
 
 
