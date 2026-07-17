@@ -2832,7 +2832,10 @@ async def _migrate_pg_sprint_item_priority_blocker(conn: PostgresConnection) -> 
     'normal'; higher-priority pending items are surfaced/claimed/grouped first.
     ``blocker_kind`` — nullable; NULL = ordinary, 'manual' = blocked on a
     real-world action outside Meridian (distinct from milestone_type='human', and
-    excluded from executor scoping the same way). Enums enforced at the app layer.
+    excluded from executor scoping the same way). f89d440f — 'superseded' =
+    item's premise replaced by other work; hard-blocked at claim_sprint_item
+    itself (not just a listing exclusion like 'manual'). Enums enforced at the
+    app layer (see ``_VALID_SPRINT_BLOCKER_KINDS`` in db/sprint_items.py).
     CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path.
     ADD COLUMN IF NOT EXISTS → idempotent. Mirrors
     db._migrate_sprint_item_priority_blocker.

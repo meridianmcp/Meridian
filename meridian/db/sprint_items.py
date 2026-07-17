@@ -303,7 +303,20 @@ _SPRINT_PRIORITY_DEFAULT_RANK = _SPRINT_PRIORITY_RANK["normal"]
 # real-world action OUTSIDE Meridian (publish something, obtain an API key, talk
 # to an advisor). DISTINCT from milestone_type='human' (WHO executes) — a
 # manual-blocker is excluded from executor "just claim the next pending" scoping.
-_VALID_SPRINT_BLOCKER_KINDS = ("manual",)
+# 'manual' is a SOFT gate: it only affects listing/wave-assignment surfaces
+# (get_sprint_items, dashboard wave grouping) — claim_sprint_item itself still
+# allows a direct claim by item_id, since a human may legitimately hand an
+# executor that exact id once the real-world blocker has been cleared.
+#
+# f89d440f — 'superseded' = the item's whole premise has been replaced by other
+# work (e.g. a workspace proposal) and it must NOT be re-executed even by a
+# direct claim_sprint_item(item_id=...) call. Before this, "do not claim" only
+# existed as prose in the notes field, which claim_sprint_item never reads —
+# so an item correctly declined in one session (e.g. c2021725) became claimable
+# again in the next, since nothing but human judgment stopped it. 'superseded'
+# is therefore a HARD gate, enforced inside claim_sprint_item itself (see the
+# blocked-dict check below), unlike 'manual's listing-only exclusion.
+_VALID_SPRINT_BLOCKER_KINDS = ("manual", "superseded")
 
 
 def _sprint_priority_order_sql(column: str = "priority") -> str:
@@ -752,7 +765,8 @@ async def add_sprint_item(
         raise ValueError(
             f"priority must be one of {_VALID_SPRINT_PRIORITIES}, got {priority!r}"
         )
-    # 2282a636 — validate blocker_kind. None = ordinary; only 'manual' is defined.
+    # 2282a636 — validate blocker_kind. None = ordinary; see
+    # _VALID_SPRINT_BLOCKER_KINDS for the defined values ('manual', 'superseded').
     if blocker_kind is not None and blocker_kind not in _VALID_SPRINT_BLOCKER_KINDS:
         raise ValueError(
             f"blocker_kind must be None or one of {_VALID_SPRINT_BLOCKER_KINDS}, "
@@ -1402,6 +1416,17 @@ async def claim_sprint_item(
     ``prospect_bypass=True`` via update_sprint_item.
     Fail-open: any DB error lets the claim proceed so a structural defect
     never permanently wedges the board.
+
+    f89d440f — SUPERSEDED GATE: if ``blocker_kind == 'superseded'``, the claim
+    is REFUSED with a structured blocked dict (``{"blocked": True, "error":
+    "SUPERSEDED", ...}``), same as the DEFERRED gate below. Clear
+    ``blocker_kind`` via ``update_sprint_item`` to make the item claimable
+    again once a human has resolved whatever superseded it. Unlike the
+    'manual' blocker_kind (a soft, listing-only exclusion — see
+    ``_VALID_SPRINT_BLOCKER_KINDS``), this is a hard gate on the claim itself,
+    because a superseded item's id can still reach an executor directly (a
+    stale goal block, prior session memory) even when it never appears in a
+    fresh listing.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
@@ -1428,6 +1453,25 @@ async def claim_sprint_item(
                 "track": item.get("track"),
                 "item_id": item_id,
             }
+    # f89d440f — refuse a superseded item. Hard gate (unlike 'manual', which is
+    # only a listing-level exclusion) because a stale goal block or prior
+    # session memory can hand an executor this item_id directly, bypassing any
+    # listing filter entirely — exactly the recurrence this gate closes.
+    if (item.get("blocker_kind") or "").strip() == "superseded":
+        _notes = (item.get("notes") or "").strip()
+        return {
+            "blocked": True,
+            "error": "SUPERSEDED",
+            "reason": (
+                "Sprint item is marked blocker_kind='superseded' — its premise "
+                "has been replaced by other work and it must not be executed "
+                "as-is. See the item's notes for what superseded it. A human "
+                "must clear blocker_kind via update_sprint_item to make it "
+                "claimable again."
+                + (f" Notes: {_notes}" if _notes else "")
+            ),
+            "item_id": item_id,
+        }
     # 94c26322 — refuse an unprospected item at claim time unless a human
     # explicitly set prospect_bypass. At claim time, enrichment-time fields
     # (code_pointers / prospect_status) are NOT on the DB row, so we check the
