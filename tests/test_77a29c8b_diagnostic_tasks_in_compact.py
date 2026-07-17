@@ -87,7 +87,7 @@ def test_render_delta_handoff_includes_diagnostics():
         completed_items=[],
         in_progress_items=[],
         pending_sprint_items=[],
-        quick_start_goal="/goal\n<role>executor</role>",
+        quick_start_goal="/goal\n<executor_directive>executor</executor_directive>",
         diagnostic_tasks=diag,
     )
     assert "Recent diagnostics (blocked/found):" in content
@@ -104,7 +104,7 @@ def test_render_delta_handoff_omits_diagnostic_block_when_empty():
         completed_items=[],
         in_progress_items=[],
         pending_sprint_items=[],
-        quick_start_goal="/goal\n<role>executor</role>",
+        quick_start_goal="/goal\n<executor_directive>executor</executor_directive>",
         diagnostic_tasks=[],
     )
     assert "Recent diagnostics" not in content
@@ -117,7 +117,7 @@ def test_render_delta_handoff_omits_diagnostic_block_when_none():
         completed_items=[],
         in_progress_items=[],
         pending_sprint_items=[],
-        quick_start_goal="/goal\n<role>executor</role>",
+        quick_start_goal="/goal\n<executor_directive>executor</executor_directive>",
         # diagnostic_tasks not passed (defaults to None)
     )
     assert "Recent diagnostics" not in content
@@ -135,7 +135,7 @@ def test_render_starter_handoff_includes_diagnostics():
         _FAKE_PROJECT,
         completed_items=[],
         pending_items=[],
-        quick_start_goal="/goal\n<role>executor</role>",
+        quick_start_goal="/goal\n<executor_directive>executor</executor_directive>",
         diagnostic_tasks=diag,
     )
     assert "Recent diagnostics (blocked/found):" in content
@@ -148,7 +148,7 @@ def test_render_starter_handoff_omits_diagnostic_block_when_empty():
         _FAKE_PROJECT,
         completed_items=[],
         pending_items=[],
-        quick_start_goal="/goal\n<role>executor</role>",
+        quick_start_goal="/goal\n<executor_directive>executor</executor_directive>",
         diagnostic_tasks=[],
     )
     assert "Recent diagnostics" not in content

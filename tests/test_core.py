@@ -301,8 +301,8 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     assert "did A" in content and "did B" in content
     assert "## Quick Start" in content
     # 5abf3e12 — empty-board /goal is XML-structured: the verify text is the
-    # <role> body now, not inline after "/goal ".
-    assert "<role>Verify remaining work is complete.</role>" in content
+    # <executor_directive> body now, not inline after "/goal ".
+    assert "<executor_directive>Verify remaining work is complete.</executor_directive>" in content
     assert "pixi run test passes 2150+" in content
     # 0d5453bc — empty-board goal must also state the single-run constraint.
     assert "run once at the end, not per item" in content
@@ -382,8 +382,8 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "dependency order" in content
     assert f"{first['id']}, {second['id']}." in content
     # f628b880 — the /goal leads with the non-deferential executor directive.
-    # 5abf3e12 — now inside the <role> tag of the XML-structured /goal.
-    assert "<role>You are an executor. Claim and execute" in content
+    # 5abf3e12 — now inside the <executor_directive> tag of the XML-structured /goal.
+    assert "<executor_directive>You are an executor. Claim and execute" in content
     assert "complete_sprint_item()" in content
 
 
@@ -17905,7 +17905,7 @@ def test_build_item_briefing_basic_structure():
     # Must start with /goal (same convention as _build_quick_start_goal).
     assert brief.startswith("/goal\n")
     # Required XML tags must all be present.
-    assert "<role>" in brief and "</role>" in brief
+    assert "<executor_directive>" in brief and "</executor_directive>" in brief
     assert "<first_step>" in brief and "</first_step>" in brief
     assert "<task>" in brief and "</task>" in brief
     assert "<completion_criteria>" in brief and "</completion_criteria>" in brief

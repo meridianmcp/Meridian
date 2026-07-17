@@ -86,10 +86,10 @@ def test_build_quick_start_goal_with_and_without_items():
     assert "abc123" in full and "def456" in full
     assert "complete_sprint_item()" in full
     # f628b880 — non-deferential executor directive leads the items /goal.
-    # 5abf3e12 — the /goal is now XML-structured: /goal, then a <role> tag whose
-    # body is the executor directive.
-    assert full.startswith("/goal\n<role>You are an executor. Claim and execute")
-    assert "<role>You are an executor. Claim and execute" in full
+    # 5abf3e12 — the /goal is now XML-structured: /goal, then an <executor_directive>
+    # tag whose body is the executor directive.
+    assert full.startswith("/goal\n<executor_directive>You are an executor. Claim and execute")
+    assert "<executor_directive>You are an executor. Claim and execute" in full
     # 4cfaecc2 — the items /goal instructs a live board query up front, and the
     # test floor tracks the real suite size (524 -> 2150).
     # 0d5453bc — full suite runs ONCE at the end of the megasprint, not per item.
@@ -98,6 +98,24 @@ def test_build_quick_start_goal_with_and_without_items():
     assert "ONCE at the very end of the entire" in full
     assert "not per item" in full
     assert handoff_module._DEFAULT_GOAL_TEST_FLOOR == 2150
+
+
+def test_build_quick_start_goal_uses_executor_directive_not_role():
+    """0af1d7d6 — regression guard: the /goal must use <executor_directive> (not the
+    injection-shaped <role> tag that a receiving session's prompt-injection screening
+    would rightly flag). Checks both the items path and the empty-board path."""
+    items_goal = handoff_module._build_quick_start_goal([{"id": "abc123"}])
+    empty_goal = handoff_module._build_quick_start_goal([])
+    # New tag must be present on both paths.
+    assert "<executor_directive>" in items_goal
+    assert "</executor_directive>" in items_goal
+    assert "<executor_directive>" in empty_goal
+    assert "</executor_directive>" in empty_goal
+    # Old injection-shaped tag must NOT appear anywhere in either output.
+    assert "<role>" not in items_goal, "<role> tag must not appear — use <executor_directive>"
+    assert "</role>" not in items_goal, "</role> tag must not appear — use </executor_directive>"
+    assert "<role>" not in empty_goal, "<role> tag must not appear on empty-board path"
+    assert "</role>" not in empty_goal, "</role> tag must not appear on empty-board path"
 
 
 def test_build_quick_start_goal_max_turns():
@@ -132,8 +150,8 @@ def test_build_quick_start_goal_excludes_manual_items():
 
     # The executable item leads the claim-and-execute directive.
     assert "code01" in goal
-    # 5abf3e12 — XML-structured /goal: /goal then <role>…executor directive…
-    assert goal.startswith("/goal\n<role>You are an executor. Claim and execute")
+    # 5abf3e12 — XML-structured /goal: /goal then <executor_directive>…executor directive…
+    assert goal.startswith("/goal\n<executor_directive>You are an executor. Claim and execute")
     # MANUAL ids appear ONLY in the separate <exclusions> tag, never in the
     # pressure list. (5abf3e12 — the maintainer todo is now an <exclusions> tag.)
     exec_clause, _, manual_clause = goal.partition("<exclusions>")
@@ -315,12 +333,12 @@ def test_build_quick_start_goal_xml_structure_preserves_constraints():
     tags, root = _parse_goal_xml(goal)  # asserts well-formed XML
     # Every constraint is present as a distinct XML tag.
     assert set(tags) >= {
-        "role", "first_step", "sprint_items", "completion_criteria",
+        "executor_directive", "first_step", "sprint_items", "completion_criteria",
         "not_done_until", "stop_conditions", "sprint_type", "exclusions",
     }
-    # <role> — executor, act immediately, don't ask.
-    assert "You are an executor" in tags["role"]
-    assert "without asking for direction" in tags["role"]
+    # <executor_directive> — executor, act immediately, don't ask.
+    assert "You are an executor" in tags["executor_directive"]
+    assert "without asking for direction" in tags["executor_directive"]
     # <first_step> — live board query before trusting the snapshot.
     assert 'get_sprint_items(status="pending")' in tags["first_step"]
     # <sprint_items> — the executable ids, MANUAL item excluded.
