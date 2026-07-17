@@ -2316,15 +2316,34 @@ def _render_delta_handoff(
             lines.append(f"- {item['id']} — {item['title']}")
     else:
         lines.append("- none")
+    # bc834237 — cap the pending list so a large backlog never bloats the delta
+    # payload. Delta is richer than starter (session-continuity context), so the
+    # cap is 20 items (vs starter's 3) with titles truncated to 150 chars
+    # (vs starter's 80 but consistent with the 200-char diagnostic precedent).
+    # The dependency (topological) order from _prepare_pending_sprint_items is
+    # preserved — items are NOT re-sorted here, so high-priority items surfaced
+    # first by the caller's ordering are NOT pushed behind the cutoff.
+    _DELTA_PENDING_CAP = 20
+    _DELTA_TITLE_MAX = 150
     lines += ["", "Pending:"]
     if pending_sprint_items:
-        for item in pending_sprint_items:
+        shown = pending_sprint_items[:_DELTA_PENDING_CAP]
+        hidden = pending_sprint_items[_DELTA_PENDING_CAP:]
+        for item in shown:
             suffix = ""
             if item.get("possibly_done"):
                 suffix = " ⚠ possibly done — verify before executing"
+            short_title = item["title"].strip()[:_DELTA_TITLE_MAX]
             lines.append(
-                f"- {item['id']} [{item['status']}] {item['title']}{suffix}"
+                f"- {item['id']} [{item['status']}] {short_title}{suffix}"
             )
+        if hidden:
+            high_count = sum(
+                1 for it in hidden
+                if (it.get("priority") or "normal").strip().lower() == "high"
+            )
+            high_note = f" ({high_count} high-priority)" if high_count else ""
+            lines.append(f"  +{len(hidden)} more pending{high_note}")
     else:
         lines.append("- none")
     # 77a29c8b — surface recent diagnostic entries (blocked/found) so a resumed
