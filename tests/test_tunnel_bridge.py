@@ -568,6 +568,41 @@ def test_handler_tools_list_no_health_meta_when_tunnel_healthy(monkeypatch):
     assert "meridian/tunnelHealth" not in meta
 
 
+def test_handler_tools_list_bounds_slow_tunnel_fetch_to_outer_timeout(monkeypatch):
+    """2026-07-17 outage hotfix — a tunnel slot marked 'healthy' but actually
+    unreachable used to have no OUTER bound on the tools/list response time:
+    list_tunnel_tools' own per-slot retry budget (4 attempts * 3s = ~13.5s worst
+    case) could delay the entire tools/list call past a client's tool-loading
+    timeout, making claude.ai report the connector as having zero tools even
+    though native tools are tenant/tunnel-independent. A hard 5s outer wait_for
+    now guarantees native tools are never held hostage by a slow/hanging fetch."""
+    import time as _time
+
+    tenant = {"id": "t1", "plan": "pro"}
+    monkeypatch.setattr(tn, "has_active_tunnel", lambda tid: True)
+
+    async def hangs_forever(tid, reserved):
+        await asyncio.sleep(30)
+        return [{"name": "trace_path", "description": "graph"}]
+
+    monkeypatch.setattr(tn, "list_tunnel_tools", hangs_forever)
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    start = _time.monotonic()
+    resp = asyncio.run(mh._handle_mcp_request(body, db=None, data_dir="/tmp", tenant=tenant))
+    elapsed = _time.monotonic() - start
+    # Bounded well under the 30s hang and under any plausible client timeout —
+    # proves the outer 5s wait_for fired rather than the mock completing.
+    assert elapsed < 8.0, f"tools/list took {elapsed:.1f}s — outer timeout did not bound it"
+    # Native tools still present — the hang never breaks tools/list.
+    names = {t["name"] for t in resp["result"]["tools"]}
+    assert "log_task" in names
+    assert "trace_path" not in names  # the hung fetch's result must be discarded, not awaited-through
+    # ...and the timeout is SIGNALLED with its own specific message.
+    health = resp["result"].get("_meta", {}).get("meridian/tunnelHealth")
+    assert health and health["status"] == "degraded"
+    assert "5s" in health["message"]
+
+
 def test_handler_tools_call_routes_to_tunnel(monkeypatch):
     tenant = {"id": "t1", "plan": "pro"}
     monkeypatch.setattr(tn, "has_active_tunnel", lambda tid: True)
