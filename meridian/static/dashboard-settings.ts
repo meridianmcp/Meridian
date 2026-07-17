@@ -594,6 +594,63 @@ window._settingsBrowserConnectorCardHtml = _settingsBrowserConnectorCardHtml;
 window._settingsNotificationsCardHtml = _settingsNotificationsCardHtml;
 window._settingsNotificationPrefsHtml = _settingsNotificationPrefsHtml;
 
+// b905da5a — Tools Reference renderer. Builds a grouped list of all MCP tools
+// by workflow_tier. Pure function: takes the /tools response array and returns
+// an HTML string. Exported so vitest can test it directly without a live server.
+export type ToolEntry = { name: string; title?: string; description?: string; workflow_tier?: string };
+
+export function _toolsReferenceHtml(tools: ToolEntry[]): string {
+  const TIERS: Array<[string, string, string]> = [
+    ["main-workflow",    "Main Workflow",    "Called in virtually every session — the essential executor loop."],
+    ["common-support",  "Common Support",   "Called frequently; regular hygiene most healthy sessions use."],
+    ["maintenance-only","Maintenance Only",  "Genuinely occasional: periodic diagnostics, orchestrator-only primitives, one-time configuration."],
+  ];
+  const TIER_COLORS: Record<string, string> = {
+    "main-workflow":    "var(--accent)",
+    "common-support":  "#a78bfa",
+    "maintenance-only":"var(--muted)",
+  };
+
+  const byTier: Record<string, ToolEntry[]> = {
+    "main-workflow": [],
+    "common-support": [],
+    "maintenance-only": [],
+  };
+  for (const t of tools) {
+    const tier = t.workflow_tier || "common-support";
+    if (!byTier[tier]) byTier[tier] = [];
+    byTier[tier].push(t);
+  }
+
+  let out = `<div style="font-size:10px;color:var(--muted);margin-bottom:12px">
+    ${tools.length} built-in MCP tools across 3 tiers. The <code>workflow_tier</code> field is machine-readable in every <code>tools/list</code> response.
+  </div>`;
+
+  for (const [tierKey, tierLabel, tierDesc] of TIERS) {
+    const tierTools = byTier[tierKey] || [];
+    const color = TIER_COLORS[tierKey] || "var(--muted)";
+    out += `<div style="margin-bottom:14px">
+      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;border-bottom:1px solid var(--border);padding-bottom:4px">
+        <span style="font-size:10px;font-weight:700;color:${color};text-transform:uppercase;letter-spacing:.06em">${tierLabel}</span>
+        <span style="font-size:9px;color:var(--muted)">${tierDesc}</span>
+        <span style="margin-left:auto;font-size:9px;color:var(--muted)">${tierTools.length} tools</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:4px">`;
+    for (const tool of tierTools) {
+      const displayName = tool.title || tool.name;
+      // Show first sentence of description (up to 80 chars) as tooltip
+      const desc = (tool.description || "").replace(/\s+/g, " ").slice(0, 120);
+      out += `<div style="padding:4px 6px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;display:flex;flex-direction:column;gap:2px" title="${(window as any).escapeHtml ? (window as any).escapeHtml(desc) : desc}">
+          <code style="font-size:9px;font-family:var(--font-mono);color:var(--text);word-break:break-all">${tool.name}</code>
+          <span style="font-size:9px;color:var(--muted);line-height:1.3;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${displayName}</span>
+        </div>`;
+    }
+    out += `</div></div>`;
+  }
+  return out;
+}
+window._toolsReferenceHtml = _toolsReferenceHtml;
+
 export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
   const body = document.getElementById(`settings-body-${projectId}`);
@@ -3058,6 +3115,18 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
   html += '</div></details>';  // close Project Config section
+
+  // ── b905da5a — Tools Reference ───────────────────────────────────────────
+  // Human-readable grouped list of all MCP tools by workflow tier.
+  // Loaded lazily from /tools endpoint on first expand so it never adds latency
+  // to the initial settings render.
+  html += _secHtml('tools-ref', 'MCP Tools Reference');
+  html += `<div id="tools-ref-body-${projectId}">
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">All built-in Meridian MCP tools, grouped by how often they appear in a typical session. Expand to load.</div>
+    <div id="tools-ref-content-${projectId}" style="display:none"></div>
+  </div>`;
+  html += '</div></details>';  // close Tools Reference section
+
   html += '</div></details>';  // close PROJECT SETTINGS group
 
   // ── ACCOUNT & WORKSPACE group ────────────────────────────────────────────
@@ -3815,6 +3884,40 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
   _applySettingsRoleVisibility(projectId, _guest);
 
   _collapseConnectPlatforms(projectId);
+
+  // b905da5a — Tools Reference lazy-load: fetch /tools and render when the
+  // accordion is first opened so the initial settings render stays fast.
+  {
+    const _trDetails = document.getElementById(`settings-sec-tools-ref-${projectId}`);
+    const _trContent = document.getElementById(`tools-ref-content-${projectId}`);
+    const _trBody = document.getElementById(`tools-ref-body-${projectId}`);
+    if (_trDetails && _trContent && _trBody) {
+      let _trLoaded = false;
+      const _loadToolsRef = async () => {
+        if (_trLoaded) return;
+        _trLoaded = true;
+        _trContent.style.display = '';
+        _trContent.innerHTML = '<div style="font-size:10px;color:var(--muted)">Loading…</div>';
+        try {
+          const tools = await api('/tools');
+          if (Array.isArray(tools)) {
+            _trContent.innerHTML = _toolsReferenceHtml(tools);
+          } else {
+            _trContent.innerHTML = '<div style="font-size:10px;color:var(--muted)">Could not load tool list.</div>';
+          }
+        } catch (e: any) {
+          _trContent.innerHTML = `<div style="font-size:10px;color:var(--error)">Failed: ${escapeHtml(String(e))}</div>`;
+        }
+      };
+      if ((_trDetails as HTMLDetailsElement).open) {
+        // Already expanded on render — load immediately.
+        _loadToolsRef().catch(() => {});
+      }
+      _trDetails.addEventListener('toggle', () => {
+        if ((_trDetails as HTMLDetailsElement).open) _loadToolsRef().catch(() => {});
+      });
+    }
+  }
 
   // Append the Executor Rules + Code Intelligence section (defined in dashboard.js)
   // so the full settings tab includes it. Fire-and-forget so its fetch doesn't

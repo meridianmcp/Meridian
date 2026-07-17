@@ -2783,6 +2783,53 @@
   window._settingsBrowserConnectorCardHtml = _settingsBrowserConnectorCardHtml;
   window._settingsNotificationsCardHtml = _settingsNotificationsCardHtml;
   window._settingsNotificationPrefsHtml = _settingsNotificationPrefsHtml;
+  function _toolsReferenceHtml(tools) {
+    const TIERS = [
+      ["main-workflow", "Main Workflow", "Called in virtually every session \u2014 the essential executor loop."],
+      ["common-support", "Common Support", "Called frequently; regular hygiene most healthy sessions use."],
+      ["maintenance-only", "Maintenance Only", "Genuinely occasional: periodic diagnostics, orchestrator-only primitives, one-time configuration."]
+    ];
+    const TIER_COLORS = {
+      "main-workflow": "var(--accent)",
+      "common-support": "#a78bfa",
+      "maintenance-only": "var(--muted)"
+    };
+    const byTier = {
+      "main-workflow": [],
+      "common-support": [],
+      "maintenance-only": []
+    };
+    for (const t3 of tools) {
+      const tier = t3.workflow_tier || "common-support";
+      if (!byTier[tier]) byTier[tier] = [];
+      byTier[tier].push(t3);
+    }
+    let out = `<div style="font-size:10px;color:var(--muted);margin-bottom:12px">
+    ${tools.length} built-in MCP tools across 3 tiers. The <code>workflow_tier</code> field is machine-readable in every <code>tools/list</code> response.
+  </div>`;
+    for (const [tierKey, tierLabel, tierDesc] of TIERS) {
+      const tierTools = byTier[tierKey] || [];
+      const color = TIER_COLORS[tierKey] || "var(--muted)";
+      out += `<div style="margin-bottom:14px">
+      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;border-bottom:1px solid var(--border);padding-bottom:4px">
+        <span style="font-size:10px;font-weight:700;color:${color};text-transform:uppercase;letter-spacing:.06em">${tierLabel}</span>
+        <span style="font-size:9px;color:var(--muted)">${tierDesc}</span>
+        <span style="margin-left:auto;font-size:9px;color:var(--muted)">${tierTools.length} tools</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:4px">`;
+      for (const tool of tierTools) {
+        const displayName = tool.title || tool.name;
+        const desc = (tool.description || "").replace(/\s+/g, " ").slice(0, 120);
+        out += `<div style="padding:4px 6px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;display:flex;flex-direction:column;gap:2px" title="${window.escapeHtml ? window.escapeHtml(desc) : desc}">
+          <code style="font-size:9px;font-family:var(--font-mono);color:var(--text);word-break:break-all">${tool.name}</code>
+          <span style="font-size:9px;color:var(--muted);line-height:1.3;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${displayName}</span>
+        </div>`;
+      }
+      out += `</div></div>`;
+    }
+    return out;
+  }
+  window._toolsReferenceHtml = _toolsReferenceHtml;
   async function loadSettingsTab2(projectId, { force = false } = {}) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
@@ -4618,6 +4665,12 @@ project_id = "${displayPid}"`;
         };
       }, 0);
       html += "</div></details>";
+      html += _secHtml("tools-ref", "MCP Tools Reference");
+      html += `<div id="tools-ref-body-${projectId}">
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">All built-in Meridian MCP tools, grouped by how often they appear in a typical session. Expand to load.</div>
+    <div id="tools-ref-content-${projectId}" style="display:none"></div>
+  </div>`;
+      html += "</div></details>";
       html += "</div></details>";
       {
         let _awOpen = false;
@@ -5151,6 +5204,38 @@ project_id = "${displayPid}"`;
       body.dataset.settingsTs = String(Date.now());
       _applySettingsRoleVisibility(projectId, _guest);
       _collapseConnectPlatforms(projectId);
+      {
+        const _trDetails = document.getElementById(`settings-sec-tools-ref-${projectId}`);
+        const _trContent = document.getElementById(`tools-ref-content-${projectId}`);
+        const _trBody = document.getElementById(`tools-ref-body-${projectId}`);
+        if (_trDetails && _trContent && _trBody) {
+          let _trLoaded = false;
+          const _loadToolsRef = async () => {
+            if (_trLoaded) return;
+            _trLoaded = true;
+            _trContent.style.display = "";
+            _trContent.innerHTML = '<div style="font-size:10px;color:var(--muted)">Loading\u2026</div>';
+            try {
+              const tools = await api("/tools");
+              if (Array.isArray(tools)) {
+                _trContent.innerHTML = _toolsReferenceHtml(tools);
+              } else {
+                _trContent.innerHTML = '<div style="font-size:10px;color:var(--muted)">Could not load tool list.</div>';
+              }
+            } catch (e3) {
+              _trContent.innerHTML = `<div style="font-size:10px;color:var(--error)">Failed: ${escapeHtml(String(e3))}</div>`;
+            }
+          };
+          if (_trDetails.open) {
+            _loadToolsRef().catch(() => {
+            });
+          }
+          _trDetails.addEventListener("toggle", () => {
+            if (_trDetails.open) _loadToolsRef().catch(() => {
+            });
+          });
+        }
+      }
       try {
         window.loadExecutorRulesSection?.(projectId);
       } catch (e3) {
@@ -7679,7 +7764,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // node_modules/preact/dist/preact.module.js
+  // ../../../node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -7938,7 +8023,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // node_modules/preact/hooks/dist/hooks.module.js
+  // ../../../node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8079,7 +8164,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -8932,7 +9017,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // node_modules/zustand/esm/vanilla.mjs
+  // ../../../node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();

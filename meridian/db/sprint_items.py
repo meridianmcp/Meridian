@@ -381,9 +381,29 @@ async def get_sprint_items_cached(
 
 
 def _sprint_item_slug_base(text: str) -> str:
-    """b944c905 — kebab-case a title into a short human-readable id base."""
+    """b944c905 — kebab-case a title into a short human-readable id base.
+
+    d2e4f557 — applies stopword filtering (reusing _NICKNAME_STOPWORDS) before
+    taking the word budget, so boilerplate title prefixes like "BUG (confirmed
+    live, Adam explicit):" are stripped and the slug captures actual substance.
+    Word budget is top-8 post-filter (vs. nickname's top-2) to give slugs enough
+    context to be distinguishable at a glance.
+
+    Edge-case: if the title has fewer than 3 non-stopword words after filtering,
+    falls back to the unfiltered word list so the slug is never empty or
+    degenerate (a title that is entirely boilerplate still produces something
+    identifiable, just not a great slug — the collision-suffix mechanism handles
+    the rest).
+    """
     words = re.findall(r"[a-z0-9]+", (text or "").lower())
-    return "-".join(words[:6])[:60].strip("-") or "item"
+    # Apply stopword filter + length gate (same rules as nickname, len > 2).
+    filtered = [w for w in words if w not in _NICKNAME_STOPWORDS and len(w) > 2]
+    # Use filtered words when at least one exists; fall back to raw words only
+    # when the title is entirely boilerplate/stopwords so we never produce an
+    # empty slug (a title of all stopwords still produces an identifiable slug
+    # from its raw words, and the collision-suffix mechanism handles the rest).
+    chosen = filtered if filtered else words
+    return "-".join(chosen[:8])[:60].strip("-") or "item"
 
 
 async def _unique_sprint_slug(
@@ -422,13 +442,20 @@ _NICKNAME_NOUN = (
     "quartz", "sparrow", "atlas", "cove", "beacon", "cypress", "drift", "fjord",
     "grove", "heron", "isle", "kite", "lagoon", "moss", "nimbus", "onyx",
 )
-# Title words too generic to make a distinctive nickname (mostly sprint-item
-# prefixes / connectives). Dropped before picking the 1-2 keeper words.
+# Title words too generic to make a distinctive slug or nickname (mostly
+# sprint-item prefixes, connectives, and project-convention boilerplate words).
+# Dropped before picking keeper words for both slug generation and nickname
+# generation. Extended (d2e4f557) with project-observed high-frequency
+# non-distinctive words: "adam", "explicit", "tonight", "real", "given" appear
+# in a large fraction of titles via the house convention "FEAT (Adam explicit)"
+# and add zero substance to a slug or nickname.
 _NICKNAME_STOPWORDS = frozenset({
     "feat", "bug", "fix", "rule", "the", "and", "for", "add", "adds", "added",
     "new", "serious", "confirmed", "live", "severe", "paper", "blog", "post",
     "manual", "correction", "with", "via", "not", "its", "this", "that", "into",
     "from", "onto", "task", "chore", "docs", "doc", "test", "refactor",
+    # d2e4f557 — project-convention boilerplate words (high-frequency, zero substance)
+    "adam", "explicit", "tonight", "real", "given",
 })
 
 
