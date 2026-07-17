@@ -70,6 +70,20 @@ def test_build_executor_config_block_empty_config_is_just_header_plus_creds():
     assert all(line == "# Executor Config" or line.startswith("credentials_rule:") for line in lines)
 
 
+def test_outputs_dirs_is_preserved_by_normalize():
+    # e2688fc1 — outputs_dirs must be kept so the codeintel vtab can read it.
+    out = ec.normalize_executor_config({
+        "outputs_dirs": ["/data/outputs", "/scratch/results"],
+        "branch": "dev",
+    })
+    assert out["outputs_dirs"] == ["/data/outputs", "/scratch/results"]
+    assert out["branch"] == "dev"
+    # Confirm it survives round-trip through executor_config_for_output too.
+    full = ec.executor_config_for_output({"outputs_dirs": ["/data/outputs"]})
+    assert full["outputs_dirs"] == ["/data/outputs"]
+    assert "credentials_rule" in full
+
+
 def test_merge_repo_paths_dedupes_and_normalizes():
     existing = [{"cwd": " /a ", "hostname": "h1"}, {"cwd": "/b", "hostname": ""}]
     new = [{"cwd": "/a", "hostname": "h1"}, {"cwd": "/c"}, {"no_cwd": "x"}, "bad"]
