@@ -1297,13 +1297,19 @@ def _write_slot_claim(port: int, client_id: str) -> None:
     """Write a slot-ownership claim for *port*.
 
     Records the per-run *client_id* (a UUID generated once per ``run_tunnel``
-    invocation) and this process's PID so that a subsequent tunnel startup can
-    distinguish "port held by a live tunnel whose PID is still running" from
-    "port held by an orphan whose parent exited". Best-effort — a claim write
-    failure must NEVER block or crash a spawn.
+    invocation), this process's PID, and (when psutil is available) its exact
+    ``create_time()`` so that a subsequent tunnel startup can distinguish
+    "port held by a live tunnel whose PID is still running" from "port held
+    by an orphan whose parent exited" WITHOUT being fooled by PID reuse (the
+    OS reassigning a dead process's old PID to an unrelated new process --
+    common on long-uptime machines). Best-effort — a claim write failure must
+    NEVER block or crash a spawn.
 
     aaddb273 — written by ``SlotProxy.ensure_running`` immediately after a
     successful Popen so the claim reflects the current generation.
+    PID-reuse hardening (2026-07-17) — added create_time to close a false
+    positive where a reused PID made a long-dead tunnel look "still alive",
+    permanently blocking the stale-orphan kill on every subsequent restart.
     """
     if not client_id:
         return
@@ -1311,25 +1317,14 @@ def _write_slot_claim(port: int, client_id: str) -> None:
         claim_dir = _slot_claim_dir()
         claim_dir.mkdir(parents=True, exist_ok=True)
         claim_path = _slot_claim_path(port)
-        claim_path.write_text(
-            json.dumps({"client_id": client_id, "tunnel_pid": os.getpid()}),
-            encoding="utf-8",
-        )
+        claim_data: "dict[str, object]" = {"client_id": client_id, "tunnel_pid": os.getpid()}
+        try:
+            import psutil  # type: ignore
+            claim_data["create_time"] = psutil.Process(os.getpid()).create_time()
+        except Exception:  # noqa: BLE001 — psutil unavailable; degrade to PID-only
+            pass
+        claim_path.write_text(json.dumps(claim_data), encoding="utf-8")
     except Exception:  # noqa: BLE001 — best-effort, never block spawn
-        pass
-
-
-def _clear_slot_claim(port: int) -> None:
-    """Remove the slot-ownership claim for *port* (best-effort).
-
-    Called from ``SlotProxy.kill()`` when WE own the process and are tearing
-    it down.  A claim left behind by a crashed tunnel that never called kill()
-    is handled by the live-PID check in
-    :func:`_is_slot_claimed_by_live_client`.
-    """
-    try:
-        _slot_claim_path(port).unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001
         pass
 
 
@@ -1342,13 +1337,28 @@ def _is_slot_claimed_by_live_client(port: int, current_client_id: str) -> bool:
     running, the port occupant is legitimately owned by someone else and must
     NOT be killed.
 
+    PID-reuse hardening (2026-07-17) — the original liveness check was
+    ``psutil.pid_exists(tunnel_pid)`` alone: on a long-uptime machine the OS
+    can and does reassign a dead process's old PID to a wholly unrelated
+    later process, so pid_exists() alone can report a long-dead tunnel as
+    "still alive" indefinitely — the confirmed live symptom tonight (a
+    working code-intel slot going permanently unresponsive mid-session, not
+    recoverable by a plain restart). When the claim carries a ``create_time``
+    (written by a claim-file version new enough to include it), this now also
+    verifies ``psutil.Process(tunnel_pid).create_time()`` matches — PID +
+    creation-time together are a genuinely unique process identity on any OS,
+    closing the false-positive. A claim written before this fix (no
+    create_time field) falls back to the original PID-only check so old
+    claim files degrade safely rather than erroring.
+
     Returns False (safe to kill) in all other cases:
     * No claim file — orphan from a generation that never wrote claims (or
       pre-dates this feature); kill as usual (preserves 963d0bd behaviour).
     * Same ``client_id`` — this IS our process somehow still on the port from
       a previous incomplete teardown in the same run; kill and respawn.
-    * Claim file exists but ``tunnel_pid`` is not alive — the claiming tunnel
-      crashed without calling kill(); the process on the port is an orphan.
+    * Claim file exists but ``tunnel_pid`` is not alive, or its create_time no
+      longer matches (the PID was reused) — the claiming tunnel is gone; the
+      process on the port is an orphan.
     * Any read/parse/psutil error — safe default: treat as orphan and let the
       caller decide.
 
@@ -1366,11 +1376,23 @@ def _is_slot_claimed_by_live_client(port: int, current_client_id: str) -> bool:
         if claimed_client == current_client_id:
             # Same run — OUR process somehow still holds the port; treat as orphan.
             return False
-        # Different client: check if its tunnel process is still alive.
+        # Different client: check if its tunnel process is still alive AND is
+        # genuinely the SAME process that wrote the claim (not a PID-reuse
+        # false match).
         try:
             import psutil  # type: ignore
+            proc = psutil.Process(int(tunnel_pid))
+            claimed_create_time = claim.get("create_time")
+            if claimed_create_time is not None:
+                # Small epsilon: create_time() is a float that can lose a hair
+                # of precision across a write/read round-trip on some
+                # platforms; a genuine match is within a tiny fraction of a
+                # second, a PID-reuse mismatch will not be.
+                return abs(proc.create_time() - float(claimed_create_time)) < 1.0
+            # Older claim file without create_time — fall back to PID-only
+            # (matches the pre-fix behaviour exactly for old claim files).
             return psutil.pid_exists(int(tunnel_pid))
-        except Exception:  # noqa: BLE001 — psutil unavailable or bad pid; safe default
+        except Exception:  # noqa: BLE001 — psutil unavailable, no such pid, or bad pid; safe default
             return False
     except Exception:  # noqa: BLE001 — missing file, bad JSON, etc.
         return False
