@@ -780,7 +780,87 @@ class OutputsFtsIndex:
                     "OutputsFtsIndex._connect: FTS schema probe failed",
                     exc_info=True,
                 )
+            # QUICK PATCH (2026-07-16, live diagnosis) -- 0c1a4349 made the
+            # outputs_index TABLE persist to disk, but _manifest/_row_cache
+            # (the in-memory staleness-detection state) were never rehydrated
+            # from it on a fresh process. Every process restart therefore saw
+            # an empty _row_cache, making EVERY file look stale again
+            # regardless of how much real work a prior process already
+            # persisted to disk -- confirmed live: a 205k+-file tree's cache
+            # file sat at a fixed size for hours across multiple calls,
+            # because each call re-did the same early-sorted subset of files
+            # from scratch instead of continuing past where the last one left
+            # off. Rehydrate from the existing table (if any) so restarts
+            # resume instead of restarting.
+            try:
+                self._rehydrate_cache_from_disk()
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._connect: cache rehydration failed",
+                    exc_info=True,
+                )
         return self._con
+
+    def _rehydrate_cache_from_disk(self) -> None:
+        """Populate ``_manifest``/``_row_cache`` from any pre-existing rows in
+        the on-disk ``outputs_index`` table, so a fresh process resumes prior
+        progress instead of treating every file as stale again. No-op (and
+        cheap) when the table doesn't exist yet or is empty."""
+        con = self._con
+        if con is None:
+            return
+        try:
+            exists = con.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = 'outputs_index'"
+            ).fetchone()
+        except Exception:  # noqa: BLE001
+            return
+        if exists is None:
+            return
+        try:
+            relation = con.execute(
+                "SELECT path, content, mtime, sha256, size, "
+                "generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys FROM outputs_index"
+            )
+            columns = [c[0] for c in relation.description]
+            fetched = relation.fetchall()
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "OutputsFtsIndex._rehydrate_cache_from_disk: read failed",
+                exc_info=True,
+            )
+            return
+        for raw in fetched:
+            rec = dict(zip(columns, raw))
+            path = rec.get("path")
+            if not path:
+                continue
+            row = OutputRow(
+                path=path,
+                content=rec.get("content"),
+                mtime=rec.get("mtime"),
+                sha256=rec.get("sha256"),
+                size=rec.get("size"),
+                generating_script=rec.get("generating_script"),
+                kind=rec.get("kind"),
+                is_archival=bool(rec.get("is_archival")),
+                canonical_path=rec.get("canonical_path"),
+                csv_columns=(
+                    json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+                ),
+                json_keys=(
+                    json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+                ),
+            )
+            self._row_cache[path] = row
+            self._manifest[path] = (rec.get("mtime"), rec.get("size"))
+        if fetched:
+            _log.debug(
+                "OutputsFtsIndex._rehydrate_cache_from_disk: resumed %d "
+                "cached rows from disk", len(fetched),
+            )
 
     def _ensure_schema(self, con: Any) -> None:
         con.execute(
