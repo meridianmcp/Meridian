@@ -660,6 +660,18 @@ async def test_add_subtask_handler_direct(db, project, sprint_item):
     assert "id" in result or "title" in result
 
 
+@pytest.mark.asyncio
+async def test_add_subtask_missing_project_id(db, sprint_item):
+    """94938492 — omitting project_id (and project_name) must return a clean
+    error, not a raw KeyError leaking as a JSON-RPC -32603."""
+    iid = sprint_item["id"]
+    result = await st_mod.handle_add_subtask(
+        {"parent_id": iid, "title": "Orphaned subtask"},
+        db, _DATA_DIR, None, None
+    )
+    assert "project_id is required" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # split_sprint_item
 # ---------------------------------------------------------------------------

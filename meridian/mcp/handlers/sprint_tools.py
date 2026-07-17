@@ -826,7 +826,17 @@ async def handle_add_subtask(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: add_subtask."""
+    """MCP tool: add_subtask.
+
+    94938492 — project_id is resolved from project_name by the shared
+    _dispatch_mcp_tool resolver on the HTTP path, but the stdio path has no
+    such fallback for add_subtask and neither caller can help it if BOTH are
+    omitted. Guard like handle_add_sprint_item does, instead of letting the
+    direct args["project_id"] read below raise a raw KeyError that leaks as
+    a cryptic JSON-RPC -32603.
+    """
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
     return await db_module.add_subtask(
         db, args["project_id"], args["parent_id"], args["title"],
         owner=args.get("owner"),
