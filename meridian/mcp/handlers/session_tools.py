@@ -342,6 +342,100 @@ async def handle_get_connection_log(
     }
 
 
+async def handle_get_server_logs(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_server_logs.
+
+    f0a48685 — returns recent application-level WARNING/ERROR/EXCEPTION log
+    records from the server_logs ring-buffer.  Unlike get_connection_log (which
+    is scoped per-tenant by /mcp request metadata), server_logs are process-global
+    and not scoped by tenant_id.  Any authenticated caller can read the full log
+    — this is intentional, since server errors are not tenant-private data and the
+    most common use case is incident diagnosis from a hosted-only session.
+    """
+    _since = (args.get("since") or "").strip() or None
+    _limit = min(int(args.get("limit", 100)), 500)
+    _level = (args.get("level_filter") or "").strip().upper() or None
+    _module = (args.get("module_filter") or "").strip() or None
+    try:
+        _entries = await db_module.get_server_logs(
+            db,
+            since=_since,
+            limit=_limit,
+            level_filter=_level,
+            module_filter=_module,
+        )
+    except Exception:  # noqa: BLE001 — degrade gracefully, never surface a DB error
+        _entries = []
+    return {
+        "count": len(_entries),
+        "since": _since,
+        "level_filter": _level,
+        "module_filter": _module,
+        "entries": _entries,
+    }
+
+
+async def handle_search_server_logs(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: search_server_logs.
+
+    222d54f8 — BM25 full-text search over the server_logs ring-buffer using
+    DuckDB native FTS.  Fetches the complete current snapshot of server_logs
+    from the DB (async, here), then hands off to the synchronous
+    :mod:`meridian.server_log_index` module which manages the DuckDB sidecar.
+
+    Design: the DB fetch is async (standard Meridian DB pattern); the DuckDB
+    FTS work is synchronous (DuckDB has its own thread safety model).  We avoid
+    asyncio.run_in_executor because the index is tiny (max 2000 rows) and the
+    BM25 search is sub-millisecond.
+    """
+    _query = (args.get("query") or "").strip()
+    if not _query:
+        return {"query": "", "total_in_index": 0, "count": 0, "hits": [],
+                "error": "query is required"}
+    _since = (args.get("since") or "").strip() or None
+    _level = (args.get("level") or "").strip().upper() or None
+    _limit = max(1, min(int(args.get("limit", 20)), 200))
+
+    # Fetch the complete current server_logs snapshot (no filters -- we want
+    # all rows so the FTS index is fully synced, and BM25 + post-filters handle
+    # narrowing).  The ring-buffer is at most 2000 rows so this is always cheap.
+    try:
+        _all_rows = await db_module.get_server_logs(db, limit=2000)
+    except Exception:  # noqa: BLE001
+        _all_rows = []
+
+    from meridian import server_log_index as _sli  # noqa: PLC0415
+    import os  # noqa: PLC0415
+    _db_path = ":memory:"
+    if data_dir:
+        _db_path = os.path.join(data_dir, "server_log_index.duckdb")
+
+    try:
+        _result = _sli.search_server_logs(
+            _all_rows,
+            _query,
+            limit=_limit,
+            level=_level,
+            since=_since,
+            db_path=_db_path,
+        )
+    except Exception:  # noqa: BLE001 — degrade gracefully, never surface a DB error
+        _result = {"query": _query, "total_in_index": 0, "count": 0, "hits": []}
+    return _result
+
+
 async def handle_get_agent_instructions(
     args: dict[str, Any],
     db: Any,

@@ -3079,6 +3079,36 @@ async def _migrate_pg_note_nickname(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_server_logs(conn: PostgresConnection) -> None:
+    """f0a48685 — server_logs: application-wide WARNING/ERROR/EXCEPTION log capture.
+
+    Every WARNING-or-above logging record emitted anywhere in the Meridian
+    process is persisted here via a custom logging.Handler so post-mortem
+    diagnosis of incidents is possible from a hosted-only session with no
+    local machine access.
+
+    Kept separate from connection_events: connection_events is one structured
+    row per /mcp HTTP request; server_logs is one row per arbitrary log record.
+
+    Mirrors db._migrate_server_logs. Idempotent via CREATE TABLE IF NOT EXISTS
+    + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS server_logs ("
+        "    id TEXT PRIMARY KEY,"
+        "    level TEXT NOT NULL DEFAULT 'ERROR',"
+        "    logger TEXT NOT NULL DEFAULT '',"
+        "    message TEXT NOT NULL DEFAULT '',"
+        "    exc_text TEXT,"
+        f"    recorded_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_server_logs_level_at "
+        "ON server_logs(level, recorded_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_server_logs_at "
+        "ON server_logs(recorded_at DESC)"
+    )
+
+
 async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> None:
     """94c26322 — human-set bypass flag for the prospecting safety gate.
 
@@ -3208,4 +3238,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_note_nickname,
     _migrate_pg_sprint_item_prospect_bypass,
     _migrate_pg_handoff_tokens,
+    _migrate_pg_server_logs,
 )

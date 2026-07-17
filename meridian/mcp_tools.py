@@ -1475,6 +1475,40 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "since": {"type": "string", "description": "ISO timestamp (UTC). Only return events at or after this time. Example: '2026-07-15 03:00:00'"},
          "limit": {"type": "integer", "description": "Max entries to return (default 100, max 200)."}},
          "required": []}},
+    {"name": "get_server_logs", "description":
+        "Read-only: Return recent application-level WARNING/ERROR/EXCEPTION log records "
+        "(newest first, up to 500 entries). Captures any logging.warning() / "
+        "logging.error() / unhandled-exception records emitted anywhere in the "
+        "Meridian process — not just /mcp request metadata. Use this to diagnose "
+        "server-side errors (OAuth flow failures, tools/list timeouts, deploy "
+        "health issues, DB connection errors) without needing raw Fly.io log access. "
+        "Complements get_connection_log (which covers per-request /mcp metadata only). "
+        "Returns {count, since, level_filter, module_filter, entries}.",
+     "inputSchema": {"type": "object", "properties": {
+         "since": {"type": "string", "description": "ISO timestamp (UTC). Only return entries at or after this time. Example: '2026-07-15 03:00:00'"},
+         "limit": {"type": "integer", "description": "Max entries to return (default 100, max 500)."},
+         "level_filter": {"type": "string", "enum": ["WARNING", "ERROR", "EXCEPTION"], "description": "Filter to a specific log level. Omit to return all WARNING-and-above entries."},
+         "module_filter": {"type": "string", "description": "Substring match against the logger name (e.g. 'meridian.server', 'hosted'). Omit for no filter."}},
+         "required": []}},
+    {"name": "search_server_logs", "description":
+        "222d54f8 — BM25 full-text search over the server_logs ring-buffer. "
+        "Complements get_server_logs (which filters by level/module/since) with "
+        "keyword-ranked retrieval — useful when you know WHAT went wrong but not "
+        "exactly WHEN (e.g. search 'OAuth token refresh' or 'psycopg connection pool' "
+        "across the last 2000 log records). Uses DuckDB native FTS (Okapi BM25) with "
+        "Porter stemming over a concatenated body of level + logger + message + exc_text. "
+        "Incremental: re-syncs only new/evicted rows on each call; repeat queries over "
+        "an unchanged log window are near-free. Ring-buffer eviction is handled "
+        "consistently — rows pruned from server_logs are removed from the FTS index on "
+        "the next call. Returns {query, total_in_index, count, hits:[{id, level, logger, "
+        "message, exc_text, recorded_at, score, bm25}]}. Empty/no-match query returns "
+        "{hits:[]}.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "BM25 search terms — keywords across log level, logger name, message text, and traceback (e.g. 'OAuth refresh', 'connection pool timeout', 'psycopg')."},
+         "since": {"type": "string", "description": "ISO timestamp (UTC). Only return hits at or after this time (post-BM25 filter). Example: '2026-07-15 03:00:00'"},
+         "level": {"type": "string", "enum": ["WARNING", "ERROR", "EXCEPTION"], "description": "Filter hits to a specific log level (post-BM25 filter). Omit to return all levels."},
+         "limit": {"type": "integer", "description": "Max ranked hits to return (default 20)."}},
+         "required": ["query"]}},
     {"name": "search_all", "description":
         "Read-only: Universal search across all project content: tasks, notes, pinned decisions, "
         "and sprint items. Uses LIKE matching (SQLite) or ILIKE (Postgres). "
@@ -1838,7 +1872,8 @@ _READ_ONLY_TOOLS = {
     "paper_search",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
-    "get_session_log", "get_session_activity", "get_connection_log",
+    "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
+    "search_server_logs",
     "idle_until_session_done", "generate_handoff", "load_handoff",
     "verify_handoff_token",
     "get_insights",
@@ -1908,6 +1943,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_context_block":       "session",
     "get_session_log":         "session",
     "get_connection_log":      "session",
+    "get_server_logs":         "session",
+    "search_server_logs":      "session",
     "list_sessions":           "session",
     "refresh_context":         "session",
     "heartbeat":               "session",
@@ -2122,6 +2159,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_session_brief":         "both",
     "get_session_log":           "both",
     "get_connection_log":        "both",
+    "get_server_logs":           "both",
+    "search_server_logs":        "both",
     "list_sessions":             "both",
     "idle_until_session_done":   "both",
     "get_sprint_notes":          "both",
@@ -2245,6 +2284,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "search_code_semantic": "Search Code Semantic",
     "run_verification": "Run Verification",
     "prospect_symbol": "Prospect Symbol",
+    "search_server_logs": "Search Server Logs",
 }
 
 for _tool in _MCP_TOOLS_LIST:

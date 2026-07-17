@@ -309,6 +309,92 @@ async def _keepalive_tunnel_sessions(app) -> list:
         return []
 
 
+import logging  # noqa: E402 — needed for _MeridianDBLogHandler definition
+
+
+class _MeridianDBLogHandler(logging.Handler):
+    """f0a48685 — persist WARNING/ERROR/EXCEPTION log records to server_logs.
+
+    Attached to the root logger at app startup so every qualifying record
+    from anywhere in the process is captured without the caller needing to
+    import anything.
+
+    Design constraints:
+    - logging.emit() is synchronous; we are in an async server.
+    - emit() may be called from non-event-loop threads (uvicorn worker, etc.).
+    - A failure in emit() must never propagate to the original log call site.
+      The stdlib Handler.handleError() contract guarantees this — we just need
+      to not let our _async_write coroutine throw unhandled exceptions, and we
+      must never block emit().
+
+    Strategy: schedule a fire-and-forget task on the running event loop via
+    asyncio.get_event_loop().create_task().  If no loop is running (e.g. during
+    import-time or from a non-asyncio thread), silently drop the record — we
+    accept very-early-startup records may not be persisted.
+    """
+
+    def __init__(self, db: Any) -> None:
+        super().__init__()
+        self._db = db
+        # Prevent recursive emit: if record_server_log itself logs a warning,
+        # we must not recurse.  Use a thread-local reentrancy guard.
+        import threading  # noqa: PLC0415
+        self._lock_local = threading.local()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Reentrancy guard: if we are already inside emit() for this thread,
+        # skip to avoid infinite recursion.
+        if getattr(self._lock_local, "in_emit", False):
+            return
+        self._lock_local.in_emit = True
+        try:
+            # Map levelno to our three vocabulary values.
+            if record.levelno >= logging.ERROR and record.exc_info:
+                level = "EXCEPTION"
+            elif record.levelno >= logging.ERROR:
+                level = "ERROR"
+            else:
+                level = "WARNING"
+
+            try:
+                msg = self.format(record)
+            except Exception:  # noqa: BLE001
+                msg = record.getMessage()
+
+            exc_text: str | None = None
+            if record.exc_info:
+                try:
+                    import traceback as _tb  # noqa: PLC0415
+                    exc_text = "".join(_tb.format_exception(*record.exc_info))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            db = self._db
+
+            async def _async_write() -> None:
+                try:
+                    await db_module.record_server_log(
+                        db,
+                        level=level,
+                        logger=record.name,
+                        message=msg,
+                        exc_text=exc_text,
+                    )
+                except Exception:  # noqa: BLE001 — persistence must never crash the server
+                    pass
+
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(_async_write())
+            except Exception:  # noqa: BLE001 — no loop / closed loop: silently drop
+                pass
+        except Exception:  # noqa: BLE001 — final safety net
+            self.handleError(record)
+        finally:
+            self._lock_local.in_emit = False
+
+
 async def _run_session_keepalive_loop(db, app=None) -> None:
     """Periodically refresh connected sessions. Started by both the FastAPI
     lifespan (hosted/HTTP clients) and the stdio entrypoint (local clients) so
@@ -701,10 +787,27 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — never block startup on the dispatcher
             pass
 
+    # f0a48685 — attach the application-wide WARNING/ERROR log handler so any
+    # ERROR/WARNING/EXCEPTION record emitted anywhere in the process is persisted
+    # to the server_logs table.  Must be attached AFTER the DB is open (db is
+    # available here).  Structurally fail-safe: if the handler itself raises
+    # during emit() the standard logging framework swallows it (Handler.handleError
+    # is called, which by default writes to sys.stderr but never re-raises).
+    import logging as _log_mod  # noqa: PLC0415
+    _srv_log_handler = _MeridianDBLogHandler(db)
+    _srv_log_handler.setLevel(_log_mod.WARNING)
+    _log_mod.getLogger().addHandler(_srv_log_handler)
+
     try:
         yield
 
     finally:
+        # Detach the DB log handler before closing the DB so no late log record
+        # tries to write to a closed connection.
+        try:
+            _log_mod.getLogger().removeHandler(_srv_log_handler)
+        except Exception:  # noqa: BLE001
+            pass
         summary_task.cancel()
         watch_task.cancel()
         version_task.cancel()
