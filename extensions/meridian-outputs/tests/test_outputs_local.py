@@ -1341,126 +1341,20 @@ class TestArchivalHashPersistence:
 
 
 # ---------------------------------------------------------------------------
-# DuckDB FTS capability probe (sprint item b8314850)
+# DuckDB FTS capability probe (sprint item b8314850) -- REMOVED (77443d83)
 #
-# Sprint item b8314850 asked us to switch _rebuild_fts() from overwrite=1 to
-# incremental=true.  Before implementing, we empirically verify what the
-# installed DuckDB version actually supports.
-#
-# Finding (2026-07-15): DuckDB 1.5.4 does NOT support the "incremental"
-# parameter for create_fts_index.  The valid named parameters are:
-#   ignore, lower, overwrite, stemmer, stopwords, strip_accents
-# The only FTS DDL functions available are create_fts_index and drop_fts_index.
-# There is no incremental/append/update path -- a full rebuild (overwrite=1) is
-# the only supported mechanism.  The sprint item explicitly authorises a
-# documented-blocked outcome over a forced implementation, so _rebuild_fts()
-# is left unchanged.  This test pins the empirical evidence so it will fail
-# (and prompt re-evaluation) if a future DuckDB upgrade adds incremental support.
+# This class used to empirically probe DuckDB's create_fts_index parameters
+# (documenting that DuckDB 1.5.4 has no "incremental" option, only a full
+# overwrite=1 rebuild) to justify why _rebuild_fts() used a full rebuild.
+# That whole question is now moot: 77443d83/a9b8485a replaced DuckDB's FTS
+# extension with Tantivy for the search index entirely (see
+# OutputsFtsIndex._rebuild_fts / .search). DuckDB's create_fts_index is no
+# longer called anywhere in this module, so a probe of its parameter support
+# no longer documents anything about our own behaviour -- removed rather than
+# left around to misleadingly imply we still care about it. See
+# TestTantivyMigration below for the equivalent capability coverage
+# (incremental commit + legacy-row backfill) under the new architecture.
 # ---------------------------------------------------------------------------
-
-@pytest.mark.skipif(not _DUCKDB_AVAILABLE, reason="duckdb not installed")
-class TestDuckDbFtsCapabilityProbe:
-    """Empirical probe for DuckDB FTS incremental-rebuild capability.
-
-    These tests document exactly what the installed DuckDB version exposes.
-    They are intentionally written to PASS against an older DuckDB that lacks
-    incremental support, and to FAIL (loudly) if a future version adds it --
-    at which point sprint item b8314850 should be re-opened and implemented.
-    """
-
-    def test_duckdb_version_is_recorded(self) -> None:
-        """Ensure DuckDB is importable and its version is visible in CI logs."""
-        import duckdb  # noqa: PLC0415
-        version = duckdb.__version__
-        # Log clearly so the CI artifact captures it.
-        print(f"\nInstalled DuckDB version: {version}")
-        # Basic sanity: version string is non-empty.
-        assert version and version.strip()
-
-    def test_fts_functions_available(self) -> None:
-        """The FTS extension exposes exactly create_fts_index and drop_fts_index."""
-        import duckdb  # noqa: PLC0415
-        con = duckdb.connect(":memory:")
-        try:
-            con.execute("INSTALL fts")
-            con.execute("LOAD fts")
-            rows = con.execute(
-                "SELECT function_name FROM duckdb_functions() "
-                "WHERE function_name ILIKE '%fts%' ORDER BY function_name"
-            ).fetchall()
-            names = {r[0] for r in rows}
-            assert "create_fts_index" in names
-            assert "drop_fts_index" in names
-        finally:
-            con.close()
-
-    def test_incremental_param_not_supported(self) -> None:
-        """create_fts_index does NOT accept an 'incremental' parameter.
-
-        If this test starts failing (i.e. the call STOPS raising a BinderError),
-        it means the installed DuckDB has gained incremental FTS support and
-        sprint item b8314850 should be re-evaluated and implemented.
-        """
-        import duckdb  # noqa: PLC0415
-        con = duckdb.connect(":memory:")
-        try:
-            con.execute("INSTALL fts")
-            con.execute("LOAD fts")
-            con.execute(
-                "CREATE TABLE probe_docs (path VARCHAR PRIMARY KEY, content VARCHAR)"
-            )
-            con.execute("INSERT INTO probe_docs VALUES ('a.py', 'hello world')")
-            # First do a valid full build so the index exists.
-            con.execute(
-                "PRAGMA create_fts_index('probe_docs', 'path', 'content', "
-                "stemmer = 'porter', stopwords = 'none', overwrite = 1)"
-            )
-            # Now insert a new row and attempt incremental rebuild.
-            con.execute("INSERT INTO probe_docs VALUES ('b.py', 'new document')")
-            raised = False
-            try:
-                con.execute(
-                    "PRAGMA create_fts_index('probe_docs', 'path', 'content', "
-                    "incremental = true)"
-                )
-            except Exception as exc:  # noqa: BLE001
-                raised = True
-                # Confirm it is the "invalid named parameter" error, not some other issue.
-                assert "incremental" in str(exc).lower() or "invalid" in str(exc).lower(), (
-                    f"Unexpected error (not the expected BinderError): {exc}"
-                )
-            assert raised, (
-                "create_fts_index accepted 'incremental=true' -- DuckDB now supports "
-                "incremental FTS rebuild.  Re-open sprint item b8314850 and implement "
-                "the switch from overwrite=1 to incremental=true in _rebuild_fts()."
-            )
-        finally:
-            con.close()
-
-    def test_valid_fts_params_include_overwrite(self) -> None:
-        """Verify overwrite=1 (the current implementation) still works correctly."""
-        import duckdb  # noqa: PLC0415
-        con = duckdb.connect(":memory:")
-        try:
-            con.execute("INSTALL fts")
-            con.execute("LOAD fts")
-            con.execute(
-                "CREATE TABLE overwrite_docs (path VARCHAR PRIMARY KEY, content VARCHAR)"
-            )
-            con.execute("INSERT INTO overwrite_docs VALUES ('x.py', 'alpha beta gamma')")
-            con.execute(
-                "PRAGMA create_fts_index('overwrite_docs', 'path', 'content', "
-                "stemmer = 'porter', stopwords = 'none', overwrite = 1)"
-            )
-            # Confirm search works after overwrite build.
-            rows = con.execute(
-                "SELECT fts_main_overwrite_docs.match_bm25(path, 'alpha') AS score, path "
-                "FROM overwrite_docs"
-            ).fetchall()
-            hits = [r for r in rows if r[0] is not None]
-            assert hits, "Expected at least one BM25 hit for 'alpha' after overwrite build"
-        finally:
-            con.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1709,6 +1603,123 @@ class TestColdTreeFtsDeferral:
             f"got {result}"
         )
         assert result.get("fts_pending") is not True
+
+
+class TestTantivySearchIndex:
+    """77443d83/a6056886 -- OutputsFtsIndex._rebuild_fts/.search now go
+    through Tantivy instead of DuckDB's FTS extension."""
+
+    def test_content_update_reflected_in_search(self, tmp_path: Path) -> None:
+        """A changed file's OLD content must stop matching and its NEW
+        content must start matching -- confirms _rebuild_fts's delete-then-
+        add per changed row (not a stale/duplicate Tantivy doc)."""
+        f = tmp_path / "run.csv"
+        f.write_text("originalterm,value\n1,2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert any(h["path"] == str(f) for h in idx.search("originalterm"))
+
+            f.write_text("updatedterm,value\n9,9", encoding="utf-8")
+            os.utime(str(f), None)
+            idx.rebuild()
+
+            assert any(h["path"] == str(f) for h in idx.search("updatedterm")), (
+                "updated content must be searchable after rebuild()"
+            )
+            assert not any(h["path"] == str(f) for h in idx.search("originalterm")), (
+                "stale content must NOT still match after the row was replaced "
+                "(would indicate a duplicate/leftover Tantivy doc)"
+            )
+        finally:
+            idx.close()
+
+    def test_removed_file_no_longer_matches(self, tmp_path: Path) -> None:
+        """A deleted file's Tantivy doc must be removed via delete_documents,
+        not merely orphaned in the DuckDB metadata table."""
+        f = tmp_path / "gone.csv"
+        f.write_text("vanishingterm,value\n1,2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert any(h["path"] == str(f) for h in idx.search("vanishingterm"))
+            f.unlink()
+            idx.rebuild()
+            assert not any(h["path"] == str(f) for h in idx.search("vanishingterm"))
+        finally:
+            idx.close()
+
+
+class TestTantivyMigration:
+    """8163816e -- a pre-Tantivy (pure-DuckDB-FTS) install's outputs_index
+    table can already hold rows that predate this migration. Those rows
+    aren't "stale" by filesystem mtime/size, so simulate the upgrade
+    scenario directly: insert a row into the DuckDB metadata table without
+    ever routing it through Tantivy, then confirm rebuild()/search() still
+    finds it via the one-time backfill in
+    _migrate_duckdb_rows_to_tantivy_if_needed."""
+
+    def test_legacy_duckdb_only_row_is_backfilled(self, tmp_path: Path) -> None:
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            con = idx._connect()
+            idx._ensure_schema(con)
+            # Simulate a pre-Tantivy install: a row already sitting in the
+            # DuckDB metadata table with no corresponding Tantivy document.
+            con.execute(
+                "INSERT INTO outputs_index VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    str(tmp_path / "legacy.csv"), "legacytermvalue content",
+                    time.time(), "deadbeef", 10, None, "csv", False, None,
+                    None, None,
+                ],
+            )
+            assert idx._tantivy_index is None or (
+                idx._tantivy_index.searcher().num_docs == 0
+            ), "test setup invariant: nothing committed to Tantivy yet"
+
+            hits = idx.search("legacytermvalue")
+            assert any(
+                h["path"] == str(tmp_path / "legacy.csv") for h in hits
+            ), (
+                "a pre-existing DuckDB-only row must be backfilled into "
+                "Tantivy by the migration path, not silently invisible to "
+                "search() forever after an upgrade"
+            )
+        finally:
+            idx.close()
+
+    def test_migration_is_idempotent_on_reconnect(self, tmp_path: Path) -> None:
+        """Re-running the migration check (e.g. on a fresh process reconnect)
+        must not error or duplicate documents once already backfilled."""
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            con = idx1._connect()
+            idx1._ensure_schema(con)
+            con.execute(
+                "INSERT INTO outputs_index VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    str(tmp_path / "legacy2.csv"), "onlyonceterm content",
+                    time.time(), "cafef00d", 10, None, "csv", False, None,
+                    None, None,
+                ],
+            )
+            idx1.search("onlyonceterm")  # triggers the one-time backfill
+            idx1.close()
+
+            idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+            hits = idx2.search("onlyonceterm")
+            matches = [h for h in hits if h["path"] == str(tmp_path / "legacy2.csv")]
+            assert len(matches) == 1, (
+                f"expected exactly one match after reconnect, got {len(matches)}"
+            )
+            idx2.close()
+        finally:
+            pass
 
 
 class TestTantivyDependency:
