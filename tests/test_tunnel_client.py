@@ -1964,7 +1964,7 @@ def test_is_slot_claimed_by_live_client_live_different_client(tmp_path, monkeypa
     # (it is definitely alive) but a different client_id. This uses the REAL
     # psutil (not yet patched below), so the claim carries a genuine create_time.
     tc._write_slot_claim(9002, "other-client-xyz")
-    real_create_time = json.loads(tc._slot_claim_path(9002).read_text())["create_time"]
+    real_create_time = json.loads(tc._slot_claim_path(9002).read_text()).get("create_time")
 
     import types
     fake_psutil = types.ModuleType("psutil")
@@ -2036,7 +2036,7 @@ def test_kill_stale_port_occupant_spares_live_client_process(tmp_path, monkeypat
     # Uses the REAL psutil (not yet patched below), so the claim carries a
     # genuine create_time that the fake Process.create_time() below must match.
     tc._write_slot_claim(8809, "live-other-client")
-    real_create_time = json.loads(tc._slot_claim_path(8809).read_text())["create_time"]
+    real_create_time = json.loads(tc._slot_claim_path(8809).read_text()).get("create_time")
 
     import types
     fake_psutil = types.ModuleType("psutil")

@@ -9753,10 +9753,19 @@ async def record_handoff(
     hid = _new_id()
     is_pg = hasattr(db, "_pool")
     if is_pg:
-        now_expr = "to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')"
+        # handoffs.created_at is TIMESTAMPTZ on Postgres (see
+        # _migrate_pg_handoffs_table) -- insert a native timestamptz value
+        # directly, matching amend_handoff's now() below. clock_timestamp()
+        # (not now(), which is frozen at transaction-start) preserves the
+        # monotonic-ordering guarantee this function needs. A prior version
+        # wrapped this in to_char(...) to produce a formatted TEXT string,
+        # which raised psycopg.errors.DatatypeMismatch against the real
+        # timestamptz column -- always broken, never exercised without a
+        # live Postgres in the loop.
+        now_expr = "clock_timestamp()"
         await db.execute(
             f"INSERT INTO handoffs (id, project_id, session_id, mode, body, created_at) "
-            f"VALUES (?, ?, ?, ?, ?, ({now_expr}))",
+            f"VALUES (?, ?, ?, ?, ?, {now_expr})",
             (hid, project_id, session_id, mode, body),
         )
     else:
