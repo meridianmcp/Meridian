@@ -14939,11 +14939,12 @@ async def test_sprint_item_slug_autopopulated(db):
     p = await db_module.create_project(db, "slug-proj")
     pid = p["id"]
     a = await db_module.add_sprint_item(db, pid, "v1", "Wire the OAuth Login Flow")
-    assert a["slug"] == "wire-the-oauth-login-flow"
+    # d2e4f557 — "the" is a stopword; slug is now stopword-filtered.
+    assert a["slug"] == "wire-oauth-login-flow"
     assert a.get("human_id") is None  # slug is NOT the assignee field
     # Same title (forced past the dup guard) → -2 suffix.
     b = await db_module.add_sprint_item(db, pid, "v1", "Wire the OAuth Login Flow", force=True)
-    assert b["slug"] == "wire-the-oauth-login-flow-2"
+    assert b["slug"] == "wire-oauth-login-flow-2"
     # A caller-supplied slug base is slugified too.
     c = await db_module.add_sprint_item(db, pid, "v1", "Something else", slug="Custom Slug")
     assert c["slug"] == "custom-slug"
@@ -15013,6 +15014,83 @@ async def test_fan_out_sprint_items_generates_slug_and_nickname(db):
     assert len(set(nicknames)) == len(nicknames), (
         f"nickname collision among fan-out items: {nicknames}"
     )
+
+
+# ---------------------------------------------------------------------------
+# d2e4f557 — slug stopword filtering: slug captures substance, not boilerplate
+# ---------------------------------------------------------------------------
+
+
+def test_sprint_item_slug_base_filters_stopwords():
+    """d2e4f557 — _sprint_item_slug_base applies stopword filtering so boilerplate
+    title prefixes (house convention "BUG (confirmed live, Adam explicit): ...") are
+    stripped and the slug captures actual substance rather than the boilerplate."""
+    from meridian.db.sprint_items import _sprint_item_slug_base
+
+    # Self-demonstrating case from the sprint item's own notes: a title that
+    # opens with the full boilerplate prefix. Old behavior would give
+    # "bug-confirmed-live-adam-explicit-sprint"; new behavior gives substance.
+    title = "BUG (confirmed live, Adam explicit): sprint item slug generation uses positional truncation"
+    slug = _sprint_item_slug_base(title)
+    # Must NOT start with typical boilerplate words
+    for bad in ("bug", "confirmed", "adam", "explicit"):
+        assert not slug.startswith(bad), (
+            f"slug {slug!r} still starts with boilerplate word {bad!r}"
+        )
+    # Must contain substance words from the actual title body
+    assert "sprint" in slug or "slug" in slug or "generation" in slug or "positional" in slug, (
+        f"slug {slug!r} does not contain any substance words from the title"
+    )
+    # Must be a valid kebab slug (no uppercase, no parens, reasonable length)
+    assert slug == slug.lower()
+    assert "(" not in slug and ")" not in slug
+    assert 1 <= len(slug) <= 60
+
+
+def test_sprint_item_slug_base_project_stopwords_dropped():
+    """d2e4f557 — project-convention words (adam, explicit, tonight, real, given)
+    are now stopwords and must not appear in slug output when substantive words exist."""
+    from meridian.db.sprint_items import _sprint_item_slug_base
+
+    slug = _sprint_item_slug_base("FEAT (Adam explicit, tonight): database migration fix")
+    assert "adam" not in slug
+    assert "explicit" not in slug
+    assert "tonight" not in slug
+    # Substantive words from the body should appear
+    assert "database" in slug or "migration" in slug
+
+
+def test_sprint_item_slug_base_short_or_all_boilerplate_fallback():
+    """d2e4f557 — when a title has fewer than 3 non-stopword words, the slug must
+    not crash or produce empty/degenerate output; it falls back gracefully."""
+    from meridian.db.sprint_items import _sprint_item_slug_base
+
+    # Entirely-boilerplate title: all words are stopwords or length <= 2.
+    # The fallback uses raw words so the slug is non-empty (not the "item" sentinel
+    # unless every raw word is also empty after tokenisation).
+    slug = _sprint_item_slug_base("bug fix the")
+    assert isinstance(slug, str) and len(slug) > 0
+
+    # Empty title → "item" sentinel.
+    assert _sprint_item_slug_base("") == "item"
+    assert _sprint_item_slug_base(None) == "item"  # type: ignore[arg-type]
+
+    # Very short all-stopword title still produces something non-empty.
+    result = _sprint_item_slug_base("the and for")
+    assert isinstance(result, str) and len(result) > 0
+
+
+def test_sprint_item_nickname_base_new_stopwords():
+    """d2e4f557 — 'adam', 'explicit', 'tonight', 'real', 'given' are now in
+    _NICKNAME_STOPWORDS and must not appear in nickname output when better words
+    are available."""
+    from meridian.db.sprint_items import _sprint_item_nickname_base
+
+    nick = _sprint_item_nickname_base("FEAT (Adam explicit): database migration repair", "id-x")
+    assert "adam" not in nick
+    assert "explicit" not in nick
+    # Should pick substance words
+    assert "database" in nick or "migration" in nick or "repair" in nick
 
 
 # ---------------------------------------------------------------------------
