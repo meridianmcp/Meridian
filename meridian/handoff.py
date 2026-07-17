@@ -2320,15 +2320,25 @@ def _render_delta_handoff(
     # payload. Delta is richer than starter (session-continuity context), so the
     # cap is 20 items (vs starter's 3) with titles truncated to 150 chars
     # (vs starter's 80 but consistent with the 200-char diagnostic precedent).
-    # The dependency (topological) order from _prepare_pending_sprint_items is
-    # preserved — items are NOT re-sorted here, so high-priority items surfaced
-    # first by the caller's ordering are NOT pushed behind the cutoff.
+    # Selection is priority-ranked (urgent > high > normal > low), NOT raw
+    # incoming order: _prepare_pending_sprint_items only sorts by dependency
+    # topology, which has no relationship to priority, so a genuinely urgent
+    # item could otherwise land past position 20 purely by chance and be
+    # silently hidden. A stable sort preserves the caller's relative ordering
+    # within each priority tier.
     _DELTA_PENDING_CAP = 20
     _DELTA_TITLE_MAX = 150
+    _PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
     lines += ["", "Pending:"]
     if pending_sprint_items:
-        shown = pending_sprint_items[:_DELTA_PENDING_CAP]
-        hidden = pending_sprint_items[_DELTA_PENDING_CAP:]
+        ranked = sorted(
+            pending_sprint_items,
+            key=lambda it: _PRIORITY_RANK.get(
+                (it.get("priority") or "normal").strip().lower(), 2
+            ),
+        )
+        shown = ranked[:_DELTA_PENDING_CAP]
+        hidden = ranked[_DELTA_PENDING_CAP:]
         for item in shown:
             suffix = ""
             if item.get("possibly_done"):
@@ -2338,12 +2348,21 @@ def _render_delta_handoff(
                 f"- {item['id']} [{item['status']}] {short_title}{suffix}"
             )
         if hidden:
+            urgent_count = sum(
+                1 for it in hidden
+                if (it.get("priority") or "normal").strip().lower() == "urgent"
+            )
             high_count = sum(
                 1 for it in hidden
                 if (it.get("priority") or "normal").strip().lower() == "high"
             )
-            high_note = f" ({high_count} high-priority)" if high_count else ""
-            lines.append(f"  +{len(hidden)} more pending{high_note}")
+            note_parts = []
+            if urgent_count:
+                note_parts.append(f"{urgent_count} urgent")
+            if high_count:
+                note_parts.append(f"{high_count} high-priority")
+            note = f" ({', '.join(note_parts)})" if note_parts else ""
+            lines.append(f"  +{len(hidden)} more pending{note}")
     else:
         lines.append("- none")
     # 77a29c8b — surface recent diagnostic entries (blocked/found) so a resumed

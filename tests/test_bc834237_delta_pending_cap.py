@@ -63,13 +63,37 @@ def test_delta_pending_cap_emits_plus_n_more_line():
     )
 
 
+def test_delta_pending_cap_promotes_priority_items_into_shown():
+    """A high-priority item ranked LAST in raw order must still be SHOWN.
+
+    Selection is priority-ranked (urgent > high > normal > low), not a raw
+    positional truncation — a genuinely important item must never be hidden
+    just because of where it happened to fall in dependency-topological order.
+    """
+    items = [_make_item(i) for i in range(25)]  # 25 normal items
+    items.append(_make_item(999, priority="urgent"))  # last in raw order
+    result = _render_delta_handoff(
+        {"id": "proj-1", "name": "Test Project"},
+        generated_at="2026-07-17 00:00:00",
+        completed_items=[],
+        in_progress_items=[],
+        pending_sprint_items=items,
+        quick_start_goal="/goal\nstart_session()",
+    )
+    assert "item-0999" in result, (
+        "An urgent item must be promoted into the shown list even though it "
+        "was last in raw/dependency order"
+    )
+    assert "+6 more pending" in result  # 26 total items, cap 20 -> 6 hidden
+
+
 def test_delta_pending_cap_high_priority_count_in_summary():
-    """Hidden items include 5 high-priority ones → summary names the count."""
-    # First 20 are shown (normal priority), remaining 30 are hidden.
-    # Make 5 of the hidden ones high-priority.
-    items = [_make_item(i) for i in range(20)]  # shown
-    items += [_make_item(20 + i, priority="high") for i in range(5)]  # high
-    items += [_make_item(25 + i) for i in range(25)]  # normal
+    """More high/urgent items than the cap → summary names the overflow count."""
+    # 25 urgent + 25 high: only the cap (20) is shown, all ranked ahead of
+    # priority, so the hidden tail is entirely urgent/high overflow -- 5
+    # urgent and 25 high remain hidden (20 of the 25 urgent are shown first).
+    items = [_make_item(i, priority="urgent") for i in range(25)]
+    items += [_make_item(100 + i, priority="high") for i in range(25)]
     result = _render_delta_handoff(
         {"id": "proj-1", "name": "Test Project"},
         generated_at="2026-07-17 00:00:00",
@@ -79,8 +103,8 @@ def test_delta_pending_cap_high_priority_count_in_summary():
         quick_start_goal="/goal\nstart_session()",
     )
     assert "+30 more pending" in result
-    assert "(5 high-priority)" in result, (
-        "Expected '(5 high-priority)' in the '+N more' summary line"
+    assert "(5 urgent, 25 high-priority)" in result, (
+        "Expected the hidden-tail urgent/high counts in the '+N more' summary line"
     )
 
 
