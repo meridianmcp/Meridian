@@ -2531,3 +2531,249 @@ def test_ensure_running_noop_when_already_running(monkeypatch):
 
     assert kill_calls == []
     assert spawned == []
+
+
+# ---------------------------------------------------------------------------
+# a9d1ef7f — scoped cache-clear + spawn retry on uvx/npx tool-spawn failure
+# ---------------------------------------------------------------------------
+
+
+def test_detect_spawn_tool_uvx_bare():
+    assert tc._detect_spawn_tool(["uvx", "my-package"]) == ("uvx", "my-package")
+
+
+def test_detect_spawn_tool_uvx_with_y_flag():
+    assert tc._detect_spawn_tool(["uvx", "-y", "some-pkg"]) == ("uvx", "some-pkg")
+
+
+def test_detect_spawn_tool_uvx_from_flag_skips_value():
+    # "uvx --from serena-agent serena start-mcp-server" — package is the token
+    # AFTER the --from value ("serena-agent"), which is "serena".
+    result = tc._detect_spawn_tool(
+        ["uvx", "--from", "serena-agent", "serena", "start-mcp-server"]
+    )
+    assert result == ("uvx", "serena")
+
+
+def test_detect_spawn_tool_uvx_exe_suffix():
+    assert tc._detect_spawn_tool(["uvx.exe", "mcp-server"]) == ("uvx", "mcp-server")
+
+
+def test_detect_spawn_tool_npx_bare():
+    assert tc._detect_spawn_tool(["npx", "-y", "mcp-proxy"]) == ("npx", "mcp-proxy")
+
+
+def test_detect_spawn_tool_npx_cmd_suffix():
+    result = tc._detect_spawn_tool(["C:\\npm\\npx.cmd", "-y", "mcp-proxy"])
+    assert result == ("npx", "mcp-proxy")
+
+
+def test_detect_spawn_tool_cmd_c_wrapper_unwrap():
+    # Windows "cmd /c npx -y mcp-proxy" pattern
+    result = tc._detect_spawn_tool(
+        ["cmd", "/c", "npx", "-y", "@wonderwhy-er/desktop-commander@latest"]
+    )
+    assert result == ("npx", "@wonderwhy-er/desktop-commander@latest")
+
+
+def test_detect_spawn_tool_non_package_manager_returns_none():
+    assert tc._detect_spawn_tool(["python", "-m", "code_extractor"]) is None
+
+
+def test_detect_spawn_tool_bare_binary_returns_none():
+    assert tc._detect_spawn_tool(["/usr/bin/my-mcp-server"]) is None
+
+
+def test_detect_spawn_tool_empty_cmd_returns_none():
+    assert tc._detect_spawn_tool([]) is None
+
+
+def test_detect_spawn_tool_not_a_list_returns_none():
+    assert tc._detect_spawn_tool(None) is None  # type: ignore[arg-type]
+
+
+def test_detect_spawn_tool_uvx_no_package_after_flags_returns_none():
+    # All tokens are flags / flag-values — no package name survives.
+    assert tc._detect_spawn_tool(["uvx", "--from", "pkg-src"]) is None
+
+
+def test_detect_spawn_tool_npx_flag_equals_form():
+    # --cache=/tmp/c style — the "=" form is skipped, package follows
+    result = tc._detect_spawn_tool(["npx", "--cache=/tmp/c", "mcp-proxy"])
+    assert result == ("npx", "mcp-proxy")
+
+
+# ---------------------------------------------------------------------------
+# _spawn_with_cache_retry: behaviour tests
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_with_cache_retry_succeeds_first_try(monkeypatch):
+    """Normal path: first Popen succeeds → cache-clear and retry are never called."""
+    clear_called = []
+    monkeypatch.setattr(tc, "_scoped_cache_clear", lambda cmd, label="": clear_called.append(1))
+
+    spawn_count = [0]
+    fake_proc = _FakeProc()
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        return fake_proc
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    result = tc._spawn_with_cache_retry(["uvx", "my-tool"], None, "test")
+    assert result is fake_proc
+    assert spawn_count[0] == 1
+    assert clear_called == [], "cache should NOT be cleared on a successful first spawn"
+
+
+def test_spawn_with_cache_retry_clears_cache_and_retries_on_failure(monkeypatch):
+    """Failure path: first Popen raises → scoped clear → second Popen succeeds."""
+    clear_calls = []
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear",
+        lambda cmd, label="": clear_calls.append(cmd) or True,
+    )
+
+    spawn_count = [0]
+    fake_proc = _FakeProc()
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        if spawn_count[0] == 1:
+            raise FileNotFoundError("ENOENT: uvx not found (simulated first-try failure)")
+        return fake_proc
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    result = tc._spawn_with_cache_retry(["uvx", "mcp-server-code-extractor"], None, "extract")
+    assert result is fake_proc
+    assert spawn_count[0] == 2, "should have attempted exactly 2 spawns"
+    assert len(clear_calls) == 1, "cache-clear should be called once between attempts"
+    assert clear_calls[0] == ["uvx", "mcp-server-code-extractor"]
+
+
+def test_spawn_with_cache_retry_raises_original_error_if_retry_also_fails(monkeypatch):
+    """Both Popen attempts fail → the ORIGINAL first-try exception is re-raised."""
+    monkeypatch.setattr(tc, "_scoped_cache_clear", lambda cmd, label="": True)
+
+    spawn_count = [0]
+    original_exc = OSError("spawn totally broken")
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        if spawn_count[0] == 1:
+            raise original_exc
+        raise RuntimeError("retry also failed")
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    import pytest
+    with pytest.raises(OSError, match="spawn totally broken"):
+        tc._spawn_with_cache_retry(["npx", "-y", "mcp-proxy"], None, "fs")
+    assert spawn_count[0] == 2
+
+
+def test_spawn_with_cache_retry_no_cache_clear_for_non_pm_command(monkeypatch):
+    """A bare binary command that fails: retry fires, but cache-clear returns False."""
+    clear_results = []
+
+    def _fake_clear(cmd, label=""):
+        result = tc._detect_spawn_tool(cmd) is not None  # mirrors real behaviour
+        clear_results.append(result)
+        return result
+
+    monkeypatch.setattr(tc, "_scoped_cache_clear", _fake_clear)
+
+    spawn_count = [0]
+    fake_proc = _FakeProc()
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        if spawn_count[0] == 1:
+            raise OSError("ENOENT")
+        return fake_proc
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    result = tc._spawn_with_cache_retry(["/usr/local/bin/my-server"], None, "custom:foo")
+    assert result is fake_proc
+    # clear was called but detected no package manager (returns False), retry still ran
+    assert spawn_count[0] == 2
+    assert clear_results == [False], "no package-manager detected → clear returned False"
+
+
+# ---------------------------------------------------------------------------
+# _scoped_cache_clear: per-tool-type behaviour (unit-tested with mocks)
+# ---------------------------------------------------------------------------
+
+
+def test_scoped_cache_clear_uvx_calls_uv_cache_clean(monkeypatch, tmp_path):
+    """uvx command → runs 'uv cache clean <pkg>', returns True."""
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    run_calls = []
+
+    def _fake_run(cmd, **kw):
+        run_calls.append(cmd)
+        class R:
+            returncode = 0
+            stdout = stderr = ""
+        return R()
+
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run)
+
+    result = tc._scoped_cache_clear(["uvx", "some-mcp-tool"], "test")
+    assert result is True
+    assert len(run_calls) == 1
+    assert run_calls[0] == ["/usr/bin/uv", "cache", "clean", "some-mcp-tool"]
+
+
+def test_scoped_cache_clear_npx_removes_npx_cache_dir(monkeypatch, tmp_path):
+    """npx command → removes the _npx cache dir, returns True."""
+    npx_dir = tmp_path / "_npx"
+    npx_dir.mkdir()
+    (npx_dir / "some_cache_entry").mkdir()
+
+    # Patch _package_cache_locations to return our tmp dir.
+    monkeypatch.setattr(
+        tc, "_package_cache_locations",
+        lambda: {"npx": str(npx_dir), "uvx": str(tmp_path / "uv"), "uv_tools": str(tmp_path / "tools")},
+    )
+
+    result = tc._scoped_cache_clear(["npx", "-y", "mcp-proxy"], "fs")
+    assert result is True
+    # The _npx dir should have been removed.
+    assert not npx_dir.exists()
+
+
+def test_scoped_cache_clear_returns_false_for_non_pm_command(monkeypatch):
+    """Non-uvx/npx command → returns False immediately, no subprocess call."""
+    run_calls = []
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **kw: run_calls.append(a))
+
+    result = tc._scoped_cache_clear(["python", "-m", "code_extractor"], "extract")
+    assert result is False
+    assert run_calls == []
+
+
+def test_scoped_cache_clear_npx_noop_when_cache_dir_missing(monkeypatch, tmp_path):
+    """_npx dir doesn't exist → returns True anyway (retry should still proceed)."""
+    monkeypatch.setattr(
+        tc, "_package_cache_locations",
+        lambda: {"npx": str(tmp_path / "_npx_missing"), "uvx": "", "uv_tools": ""},
+    )
+    result = tc._scoped_cache_clear(["npx", "-y", "@pkg/tool"], "slot")
+    assert result is True  # attempted (retry proceeds even when dir is absent)
+
+
+def test_scoped_cache_clear_uvx_uv_not_found_still_returns_true(monkeypatch, tmp_path):
+    """uv binary not on PATH and not in ~/.local/bin → returns True (retry proceeds)."""
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
+    # Make ~/.local/bin/uv non-existent.
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+
+    result = tc._scoped_cache_clear(["uvx", "--from", "serena-agent", "serena"], "extract")
+    assert result is True  # retry should still be attempted

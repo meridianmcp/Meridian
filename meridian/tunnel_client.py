@@ -408,9 +408,10 @@ class SlotProxy:
                 flush=True,
             )
             try:
-                self._proc = subprocess.Popen(
-                    self.cmd, env=self.env, **_spawn_kwargs()
-                )
+                # a9d1ef7f — use _spawn_with_cache_retry so a uvx/npx spawn failure
+                # triggers a scoped cache clear for JUST that tool + one retry before
+                # surfacing the error. Zero overhead on the normal (success) path.
+                self._proc = _spawn_with_cache_retry(self.cmd, self.env, self.label)
                 self.holder["proc"] = self._proc
                 # aaddb273 — record ownership so a subsequent tunnel startup can
                 # distinguish this live process from an orphan (see _write_slot_claim).
@@ -1179,6 +1180,217 @@ def _spawn_kwargs() -> dict:
         # genuine constant.
         return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)}
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Scoped cache-clear + spawn retry (a9d1ef7f)
+# ---------------------------------------------------------------------------
+
+def _detect_spawn_tool(cmd: "list[str]") -> "tuple[str, str] | None":
+    """Detect whether *cmd* is a uvx or npx tool invocation; extract the package name.
+
+    Returns ``("uvx", package_name)`` or ``("npx", package_name)`` when *cmd*
+    looks like a package-manager tool-run — i.e., the first token (ignoring a
+    Windows ``cmd /c`` wrapper) ends with ``uvx``/``uvx.exe`` or ``npx``/``npx.cmd``.
+    Returns ``None`` for any other command (bare binary, Python module, etc.)
+    so the cache-clear path is never triggered for those.
+
+    *package_name* is the first positional non-flag token after the tool binary
+    and the ``-y``/``--yes`` / ``-p``/``--from`` flags that precede it — this is
+    the package whose cache entry is corrupt and needs clearing. Pure and
+    side-effect-free. (a9d1ef7f)
+    """
+    if not cmd or not isinstance(cmd, list):
+        return None
+    tokens = list(cmd)
+    # Unwrap Windows "cmd /c <rest>" wrapper so the actual launcher is first.
+    if tokens and tokens[0].lower() in ("cmd", "cmd.exe") and len(tokens) >= 2:
+        if tokens[1].lower() in ("/c", "/k", "/s"):
+            tokens = tokens[2:]
+    if not tokens:
+        return None
+    launcher = Path(tokens[0]).name.lower()
+    # Normalise .exe suffix and .cmd shim suffix on Windows.
+    for suffix in (".exe", ".cmd"):
+        if launcher.endswith(suffix):
+            launcher = launcher[: -len(suffix)]
+            break
+
+    if launcher == "uvx":
+        tool = "uvx"
+    elif launcher == "npx":
+        tool = "npx"
+    else:
+        return None
+
+    # Scan past flags that precede the package name.
+    # For uvx: --from/--with/--python/-p can take a value; --no-project/--isolated are boolean.
+    # For npx: -y/--yes/--prefer-offline are boolean; --package/-p takes a value.
+    # We use a simple linear scan: skip known flag patterns, take the first non-flag token.
+    _uvx_value_flags = {"--from", "-p", "--python", "--with", "--directory"}
+    _npx_value_flags = {"--package", "-p"}
+    value_flags = _uvx_value_flags if tool == "uvx" else _npx_value_flags
+    pkg = ""
+    i = 1  # start after the launcher
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("--") and "=" in tok:
+            # --flag=value: skip this token, next is a new flag or the package.
+            i += 1
+            continue
+        if tok in value_flags:
+            # This flag consumes the NEXT token as its value; skip both.
+            i += 2
+            continue
+        if tok.startswith("-"):
+            # A boolean flag with no value.
+            i += 1
+            continue
+        # First non-flag token is the package name (or at least a component of it).
+        pkg = tok
+        break
+
+    if not pkg:
+        return None
+    return (tool, pkg)
+
+
+def _scoped_cache_clear(cmd: "list[str]", label: str = "?") -> bool:
+    """Attempt a scoped cache clear for the package manager tool in *cmd*.
+
+    Called only after a spawn failure, never on the normal path.  Returns True
+    when a clear was attempted (even if the subprocess itself returned non-zero
+    or raised — the intent is a best-effort wipe before the retry, not a
+    guarantee). Returns False when *cmd* is not a recognisable uvx/npx invocation
+    (so the caller knows no clear was possible and can decide whether to retry).
+
+    Scoping contract (a9d1ef7f):
+
+    * **uvx** — runs ``uv cache clean <package>`` which prunes only that package's
+      downloaded wheels/sdists from the uv cache, leaving every other package
+      untouched.  The tool venv in ``UV_TOOL_DIR`` is left alone (uvx ephemeral
+      runs do not persist a tool venv, so there is nothing to wipe there).
+
+    * **npx** — deletes only the ``_npx/`` subdirectory inside the npm cache dir
+      (default ``~/.npm/_npx``, or ``%LOCALAPPDATA%/npm-cache/_npx`` on Windows).
+      ``_npx/`` holds **only** ephemeral per-run environments created by ``npx -y``
+      and is entirely safe to remove; it is regenerated on the next run.  The main
+      npm content-addressable store is NOT touched, so other packages' registry
+      metadata stays intact.  This is more scoped than ``npm cache clean --force``
+      (which wipes the entire npm cache indiscriminately).
+
+    Never raises.  All subprocess / filesystem errors are swallowed so a bad
+    cache clear can never prevent the retry from being attempted.  (a9d1ef7f)
+    """
+    detection = _detect_spawn_tool(cmd)
+    if detection is None:
+        return False
+    tool, pkg = detection
+
+    if tool == "uvx":
+        # Locate the uv binary: prefer "uv" on PATH; fall back to ~/.local/bin/uv.
+        uv = shutil.which("uv")
+        if not uv:
+            _uv_name = "uv.exe" if sys.platform == "win32" else "uv"
+            _uv_cand = Path.home() / ".local" / "bin" / _uv_name
+            if _uv_cand.exists():
+                uv = str(_uv_cand)
+        if not uv:
+            # uv not found — skip the clear but still signal "attempted" so the
+            # retry proceeds (uvx itself implies uv is present, but if
+            # shutil.which can't see it we have nowhere useful to clear from).
+            print(
+                f"tunnel:{label}: cannot clear uvx cache for {pkg!r} — "
+                "uv binary not found on PATH; retrying anyway",
+                flush=True,
+            )
+            return True
+        try:
+            result = subprocess.run(
+                [uv, "cache", "clean", pkg],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                print(
+                    f"tunnel:{label}: cleared uvx cache for {pkg!r} (retry attempt follows)",
+                    flush=True,
+                )
+            else:
+                _err = (result.stderr or result.stdout or "").strip()[:120]
+                print(
+                    f"tunnel:{label}: uv cache clean {pkg!r} returned "
+                    f"{result.returncode} ({_err}); retrying anyway",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never block the retry
+            print(
+                f"tunnel:{label}: uv cache clean {pkg!r} raised {exc}; retrying anyway",
+                flush=True,
+            )
+        return True
+
+    # tool == "npx"
+    # Clear ONLY the _npx ephemeral-run cache directory — not the full npm cache.
+    locs = _package_cache_locations()
+    npx_cache = Path(locs["npx"])  # already points at <npm_cache>/_npx
+    if npx_cache.exists():
+        import shutil as _shutil  # noqa: PLC0415 — local import keeps module top light
+        try:
+            _shutil.rmtree(npx_cache, ignore_errors=True)
+            print(
+                f"tunnel:{label}: cleared npx ephemeral cache at {npx_cache} "
+                f"(retry attempt follows)",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            print(
+                f"tunnel:{label}: could not remove npx cache {npx_cache}: {exc}; retrying anyway",
+                flush=True,
+            )
+    else:
+        print(
+            f"tunnel:{label}: npx cache dir {npx_cache} not found — retrying without clear",
+            flush=True,
+        )
+    return True
+
+
+def _spawn_with_cache_retry(
+    cmd: "list[str]",
+    env: "dict | None",
+    label: str,
+) -> "subprocess.Popen":
+    """Spawn *cmd* via ``subprocess.Popen``; on failure, do a scoped cache clear and retry once.
+
+    On first-attempt success the scoped clear is never triggered — zero overhead
+    on the normal path.  On first-attempt failure:
+
+    1. Run ``_scoped_cache_clear`` — for uvx/npx commands this clears only that
+       tool's cache entry (never a global wipe); for non-package-manager commands
+       it is a no-op that returns False.
+    2. Retry the Popen exactly once.
+    3. If the retry also fails, re-raise the *original* first-attempt exception
+       so the error surfaces identically to how it did before this feature existed.
+
+    Uses ``_spawn_kwargs()`` internally (same as every other Popen site in this
+    file) so the Windows ``CREATE_NEW_PROCESS_GROUP`` flag is always applied.
+    (a9d1ef7f)
+    """
+    kwargs = _spawn_kwargs()
+    try:
+        return subprocess.Popen(cmd, env=env, **kwargs)
+    except Exception as first_exc:  # noqa: BLE001
+        # First spawn failed. Try a scoped cache clear (best-effort) then retry.
+        print(
+            f"tunnel:{label}: spawn failed ({first_exc}); "
+            "attempting scoped cache-clear + one retry",
+            file=sys.stderr, flush=True,
+        )
+        _scoped_cache_clear(cmd, label)
+        try:
+            return subprocess.Popen(cmd, env=env, **kwargs)
+        except Exception:  # noqa: BLE001 — retry also failed; surface the original
+            raise first_exc from None
 
 
 def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
@@ -3783,7 +3995,8 @@ async def run_tunnel(
         _kill_stale_port_occupant(cport, f"custom:{cname}", current_client_id=_client_id)
         print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
         try:
-            proc_custom = subprocess.Popen(cmd_custom, env=spawn_env, **_spawn_kwargs())
+            # a9d1ef7f — scoped cache-clear + one retry on spawn failure.
+            proc_custom = _spawn_with_cache_retry(cmd_custom, spawn_env, f"custom:{cname}")
             proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": spawn_env, "label": f"custom:{cname}"})
             running_custom.append({"name": cname, "port": cport})
         except Exception as exc:
