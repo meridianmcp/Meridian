@@ -950,3 +950,97 @@ def test_classify_heading_text_known_patterns():
     assert docs_intel._classify_heading_text("Annex B") == "appendix"
     assert docs_intel._classify_heading_text("Introduction") is None
     assert docs_intel._classify_heading_text("Methodology") is None
+
+
+# ---------------------------------------------------------------------------
+# 32d84131 — SQLite FTS5 external-content table + BM25 search
+# Decision: meridian-docs uses SQLite FTS5 (not Tantivy) for full-text
+# search over paragraph text. FTS5 is built into Python's sqlite3 module
+# with zero extra dependencies; Tantivy (used by meridian-outputs) requires
+# a compiled Rust extension unsuitable for a stdlib-only uvx extension.
+# ---------------------------------------------------------------------------
+
+
+def test_fts5_search_basic_match(tmp_path):
+    """fts5_search_paragraphs returns the correct paragraph on a keyword hit."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    hits = docs_intel.fts5_search_paragraphs(db, "sessions")
+    assert len(hits) == 1
+    assert hits[0]["para_id"] == "00000002"
+    assert "bm25_score" in hits[0]
+    # BM25 scores are negative in SQLite FTS5 (lower = more relevant).
+    assert isinstance(hits[0]["bm25_score"], float)
+
+
+def test_fts5_search_no_match_returns_empty(tmp_path):
+    """fts5_search_paragraphs returns an empty list when no paragraphs match."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    hits = docs_intel.fts5_search_paragraphs(db, "xyzzy_nonexistent_token_42")
+    assert hits == []
+
+
+def test_fts5_search_phrase_query(tmp_path):
+    """Phrase queries (quoted tokens) match only exact sequences."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # Exact phrase present in the doc.
+    hits = docs_intel.fts5_search_paragraphs(db, '"AI sessions"')
+    assert len(hits) == 1
+    assert hits[0]["para_id"] == "00000002"
+
+    # Reversed order — NOT a match for phrase search.
+    hits_rev = docs_intel.fts5_search_paragraphs(db, '"sessions AI"')
+    assert hits_rev == []
+
+
+def test_fts5_search_heading_found(tmp_path):
+    """Heading paragraphs are indexed and findable by FTS5."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    hits = docs_intel.fts5_search_paragraphs(db, "Introduction")
+    assert any(h["para_id"] == "00000001" for h in hits)
+    assert any(h["style"] is not None for h in hits)
+
+
+def test_fts5_search_limit_respected(tmp_path):
+    """limit parameter caps the number of results."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # The doc has 4 paragraphs; asking for any token that could match many rows
+    # -- use a wildcard so all text rows are candidate hits.
+    hits = docs_intel.fts5_search_paragraphs(db, "a*", limit=1)
+    assert len(hits) <= 1
+
+
+def test_fts5_index_rebuilt_on_reindex(tmp_path):
+    """After index_docx is called a second time the FTS5 index reflects the new content."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # Verify first index is searchable.
+    assert len(docs_intel.fts5_search_paragraphs(db, "sessions")) == 1
+
+    # Re-index (idempotent rebuild).
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # FTS5 still returns correct results after rebuild.
+    hits = docs_intel.fts5_search_paragraphs(db, "sessions")
+    assert len(hits) == 1
+    assert hits[0]["para_id"] == "00000002"
+
+
+def test_fts5_search_invalid_query_returns_empty_not_raises(tmp_path):
+    """Syntactically invalid FTS5 queries return empty list, not an exception."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # An unclosed quote is a syntax error in FTS5.
+    hits = docs_intel.fts5_search_paragraphs(db, '"unclosed phrase')
+    assert isinstance(hits, list)

@@ -462,6 +462,65 @@ def _connect(index_db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    # 32d84131 — SQLite FTS5 external-content table for BM25 full-text search
+    # over paragraph text. Uses external-content mode pointing at docx_paragraphs
+    # so the text is not duplicated on disk. The FTS index is rebuilt atomically
+    # by index_docx() after each paragraph table replacement; sync triggers keep
+    # it consistent for incremental writes (caption inserts, etc.).
+    #
+    # WHY FTS5 (NOT Tantivy): meridian-docs is a stdlib-only, uvx-installable
+    # extension (no compiled C extensions, no Rust binaries). SQLite FTS5 is
+    # built into Python's sqlite3 module on all platforms, requires zero extra
+    # dependencies, and provides native BM25 ranking via bm25(docx_fts).
+    # Tantivy (used by meridian-outputs for its own FTS) requires a compiled
+    # Rust extension and is a heavyweight dependency — inappropriate for a
+    # lightweight DOCX parsing extension that ships as a pure-Python package.
+    # The two subsystems are independent: meridian-outputs indexes flat output
+    # files across a directory tree (high volume, append-heavy); meridian-docs
+    # indexes paragraphs of a single DOCX in a sidecar SQLite (low volume,
+    # rebuild-on-reindex). FTS5 is the right tool here. See decision pinned
+    # under "meridian-docs uses SQLite FTS5, not Tantivy".
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS docx_fts
+        USING fts5(
+            text,
+            content='docx_paragraphs',
+            content_rowid='rowid'
+        )
+        """
+    )
+    # Sync triggers: keep docx_fts consistent when docx_paragraphs rows are
+    # inserted or deleted individually (e.g. during caption write-back).
+    # Full rebuilds via index_docx() bypass these and call
+    # INSERT INTO docx_fts(docx_fts) VALUES('rebuild') directly.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_paragraphs_ai
+        AFTER INSERT ON docx_paragraphs BEGIN
+            INSERT INTO docx_fts(rowid, text) VALUES (new.rowid, new.text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_paragraphs_ad
+        AFTER DELETE ON docx_paragraphs BEGIN
+            INSERT INTO docx_fts(docx_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_paragraphs_au
+        AFTER UPDATE ON docx_paragraphs BEGIN
+            INSERT INTO docx_fts(docx_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+            INSERT INTO docx_fts(rowid, text) VALUES (new.rowid, new.text);
+        END
+        """
+    )
     return conn
 
 
@@ -549,6 +608,12 @@ def index_docx(
                 "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
                 ("source_mtime", str(mtime) if mtime is not None else None),
             )
+        # 32d84131 — rebuild the FTS5 index from the current docx_paragraphs
+        # content. This is a full content-sync (not trigger-driven) so the index
+        # is always consistent after index_docx regardless of how the paragraph
+        # table was populated. The 'rebuild' command re-reads the content table
+        # and regenerates all FTS posting lists atomically.
+        conn.execute("INSERT INTO docx_fts(docx_fts) VALUES ('rebuild')")
         conn.commit()
     finally:
         conn.close()
@@ -623,6 +688,71 @@ def find_paragraphs(
         conn.close()
     return [
         {"para_id": r[0], "index": r[1], "style": r[2], "text": r[3]} for r in rows
+    ]
+
+
+def fts5_search_paragraphs(
+    index_db_path: str, query: str, limit: int = 20
+) -> list[dict[str, Any]]:
+    """32d84131 — BM25 full-text search over paragraph text via SQLite FTS5.
+
+    Uses the ``docx_fts`` external-content FTS5 virtual table (backed by
+    ``docx_paragraphs``) populated by :func:`index_docx`. Results are ranked
+    by BM25 relevance (most relevant first); document order is NOT preserved
+    (use :func:`find_paragraphs` for substring/order-preserving scan).
+
+    The FTS5 query syntax is a subset of SQLite FTS5 query syntax:
+    bare tokens are AND-ed by default; ``OR``, ``NOT``, and phrase queries
+    (``"two words"``) are supported. Wildcards (``term*``) are supported
+    for prefix matching.
+
+    Auto-refreshes the index if the source .docx changed since last indexed
+    (see :func:`_ensure_fresh`).
+
+    Args:
+        index_db_path:  Path to the sidecar SQLite index built by
+                        :func:`index_docx`.
+        query:          FTS5 query string (e.g. ``"meridian"`` or
+                        ``'"AI sessions"'`` for a phrase).
+        limit:          Maximum number of results to return (default 20).
+
+    Returns:
+        List of ``{para_id, index, style, text, bm25_score}`` dicts ordered
+        by relevance (best match first). Empty list when no matches or when
+        the FTS5 index has not been built yet (first call before
+        :func:`index_docx`).
+    """
+    _ensure_fresh(index_db_path)
+    conn = _connect(index_db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.para_id, p.idx, p.style, p.text,
+                   bm25(docx_fts) AS score
+            FROM docx_fts
+            JOIN docx_paragraphs p ON p.rowid = docx_fts.rowid
+            WHERE docx_fts MATCH ?
+            ORDER BY score
+            LIMIT ?
+            """,
+            (query, int(limit)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # FTS5 table may not exist in an older sidecar that pre-dates 32d84131,
+        # or the query may be syntactically invalid — degrade to empty rather
+        # than raising so callers get a consistent empty-list signal.
+        return []
+    finally:
+        conn.close()
+    return [
+        {
+            "para_id": r[0],
+            "index": r[1],
+            "style": r[2],
+            "text": r[3],
+            "bm25_score": r[4],
+        }
+        for r in rows
     ]
 
 
