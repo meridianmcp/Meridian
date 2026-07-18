@@ -1488,6 +1488,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Returns {count, since, level_filter, module_filter, entries}.",
      "inputSchema": {"type": "object", "properties": {
          "since": {"type": "string", "description": "ISO timestamp (UTC). Only return entries at or after this time. Example: '2026-07-15 03:00:00'"},
+         "seek_to": {"type": "string", "description": "b241a437: Positional seek hint. ISO timestamp (UTC) of the point you want to navigate to. When provided (and since= is absent), the checkpoint index supplies a tight since= bound so the DB scan skips rows older than the target. Use get_server_log_checkpoint first to warm the index. Falls back to a full scan when the index is empty. Example: '2026-07-17 03:00:00'"},
          "limit": {"type": "integer", "description": "Max entries to return (default 100, max 500)."},
          "level_filter": {"type": "string", "enum": ["WARNING", "ERROR", "EXCEPTION"], "description": "Filter to a specific log level. Omit to return all WARNING-and-above entries."},
          "module_filter": {"type": "string", "description": "Substring match against the logger name (e.g. 'meridian.server', 'hosted'). Omit for no filter."}},
@@ -1511,6 +1512,24 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "level": {"type": "string", "enum": ["WARNING", "ERROR", "EXCEPTION"], "description": "Filter hits to a specific log level (post-BM25 filter). Omit to return all levels."},
          "limit": {"type": "integer", "description": "Max ranked hits to return (default 20)."}},
          "required": ["query"]}},
+    {"name": "get_server_log_checkpoint", "description":
+        "b241a437 -- Read-only: Return the positional/checkpoint index for the server_logs "
+        "ring-buffer. The checkpoint is a lightweight 'table of contents' mapping "
+        "minute-level timestamp buckets to the first/last row id and row count in that "
+        "bucket. Use this for fast navigation through large log windows: find the bucket "
+        "just before your target timestamp, then use its min_recorded_at as the since= "
+        "argument to get_server_logs to skip all older rows without scanning. "
+        "Complementary to search_server_logs (BM25 text search): this is positional "
+        "navigation (WHERE in the log?) not semantic ranking (WHAT text?). "
+        "The optional seek_to= argument returns the best since= hint directly. "
+        "The index is rebuilt from the in-memory snapshot on every get_server_logs / "
+        "search_server_logs call, so it is always current. Returns {total_rows, "
+        "bucket_granularity_label, min_recorded_at, max_recorded_at, bucket_count, "
+        "buckets:[{bucket, count, min_recorded_at, max_recorded_at, first_id, last_id}], "
+        "seek_hint (when seek_to= given)}.",
+     "inputSchema": {"type": "object", "properties": {
+         "seek_to": {"type": "string", "description": "Optional ISO timestamp (UTC). When provided, returns a seek_hint field with the best since= value to pass to get_server_logs to start near this timestamp. Example: '2026-07-17 03:00:00'"}},
+         "required": []}},
     {"name": "search_all", "description":
         "Read-only: Universal search across all project content: tasks, notes, pinned decisions, "
         "and sprint items. Uses LIKE matching (SQLite) or ILIKE (Postgres). "
@@ -1875,7 +1894,7 @@ _READ_ONLY_TOOLS = {
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
-    "search_server_logs",
+    "search_server_logs", "get_server_log_checkpoint",
     "idle_until_session_done", "generate_handoff", "load_handoff",
     "verify_handoff_token",
     "get_insights",
@@ -1944,9 +1963,10 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_session_brief":       "session",
     "get_context_block":       "session",
     "get_session_log":         "session",
-    "get_connection_log":      "session",
-    "get_server_logs":         "session",
-    "search_server_logs":      "session",
+    "get_connection_log":         "session",
+    "get_server_logs":            "session",
+    "search_server_logs":         "session",
+    "get_server_log_checkpoint":  "session",
     "list_sessions":           "session",
     "refresh_context":         "session",
     "heartbeat":               "session",
@@ -2160,9 +2180,10 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_context_block":         "both",
     "get_session_brief":         "both",
     "get_session_log":           "both",
-    "get_connection_log":        "both",
-    "get_server_logs":           "both",
-    "search_server_logs":        "both",
+    "get_connection_log":           "both",
+    "get_server_logs":              "both",
+    "search_server_logs":           "both",
+    "get_server_log_checkpoint":    "both",
     "list_sessions":             "both",
     "idle_until_session_done":   "both",
     "get_sprint_notes":          "both",
@@ -2363,9 +2384,10 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # session diagnostics / audit
     "get_session_log":            "maintenance-only",
     "get_session_activity":       "maintenance-only",
-    "get_connection_log":         "maintenance-only",
-    "get_server_logs":            "maintenance-only",
-    "search_server_logs":         "maintenance-only",
+    "get_connection_log":           "maintenance-only",
+    "get_server_logs":              "maintenance-only",
+    "search_server_logs":           "maintenance-only",
+    "get_server_log_checkpoint":    "maintenance-only",
     # config / setup (one-time or rare)
     "set_executor_config":        "maintenance-only",
     "set_agent_instructions":     "maintenance-only",
@@ -2502,6 +2524,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "run_verification": "Run Verification",
     "prospect_symbol": "Prospect Symbol",
     "search_server_logs": "Search Server Logs",
+    "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }
 
 for _tool in _MCP_TOOLS_LIST:

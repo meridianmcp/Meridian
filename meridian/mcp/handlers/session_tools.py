@@ -357,11 +357,26 @@ async def handle_get_server_logs(
     and not scoped by tenant_id.  Any authenticated caller can read the full log
     — this is intentional, since server errors are not tenant-private data and the
     most common use case is incident diagnosis from a hosted-only session.
+
+    b241a437 — positional seeking: when ``seek_to`` is provided and the
+    checkpoint index is warm, we derive a tight ``since=`` hint from the index
+    and pass it to the DB query, skipping earlier rows without a full scan.
+    Falls back to a normal query when the index is empty or the hint is None.
     """
     _since = (args.get("since") or "").strip() or None
     _limit = min(int(args.get("limit", 100)), 500)
     _level = (args.get("level_filter") or "").strip().upper() or None
     _module = (args.get("module_filter") or "").strip() or None
+
+    # b241a437: positional seek — use the checkpoint index to derive a tight
+    # since= hint when the caller supplies seek_to=<timestamp>.
+    _seek_to = (args.get("seek_to") or "").strip() or None
+    if _seek_to and _since is None:
+        from meridian import server_log_checkpoint as _slc  # noqa: PLC0415
+        _hint = _slc.seek_hint_for(_seek_to)
+        if _hint:
+            _since = _hint
+
     try:
         _entries = await db_module.get_server_logs(
             db,
@@ -372,6 +387,18 @@ async def handle_get_server_logs(
         )
     except Exception:  # noqa: BLE001 — degrade gracefully, never surface a DB error
         _entries = []
+
+    # b241a437: keep the checkpoint index warm — rebuild it from a full
+    # snapshot whenever we have an unfiltered fetch (i.e. no level/module
+    # filters and limit is large) so subsequent seek_to calls are fast.
+    # We use a fire-and-forget pattern (best-effort, never blocks the response).
+    if not _level and not _module and _limit >= 500:
+        try:
+            from meridian import server_log_checkpoint as _slc2  # noqa: PLC0415
+            _slc2.build_checkpoint(_entries)
+        except Exception:  # noqa: BLE001
+            pass
+
     return {
         "count": len(_entries),
         "since": _since,
@@ -433,7 +460,92 @@ async def handle_search_server_logs(
         )
     except Exception:  # noqa: BLE001 — degrade gracefully, never surface a DB error
         _result = {"query": _query, "total_in_index": 0, "count": 0, "hits": []}
+
+    # b241a437: keep the checkpoint index warm from the full snapshot we just
+    # fetched (no extra DB round-trip needed -- we already have all rows).
+    try:
+        from meridian import server_log_checkpoint as _slc  # noqa: PLC0415
+        _slc.build_checkpoint(_all_rows)
+    except Exception:  # noqa: BLE001
+        pass
+
     return _result
+
+
+async def handle_get_server_log_checkpoint(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_server_log_checkpoint.
+
+    b241a437 -- return the current positional/checkpoint index for the
+    server_logs ring-buffer.
+
+    The checkpoint is a lightweight 'table of contents' mapping minute-level
+    timestamp buckets to the first/last row id and row count in that bucket.
+    Callers can use this to navigate large log windows efficiently:
+
+    1. Call this tool to get the bucket list.
+    2. Find the bucket at or just before the target timestamp.
+    3. Use its ``min_recorded_at`` as the ``since=`` argument to
+       ``get_server_logs`` -- the DB query will skip all older rows.
+
+    The index is rebuilt from the in-memory snapshot (at most 2000 rows) by
+    ``get_server_logs`` and ``search_server_logs`` on every call, so it is
+    always up-to-date with the current ring-buffer state.  When no log rows
+    have been fetched yet in this process (fresh start), the index is empty
+    and ``bucket_count`` will be 0 -- callers should fall back to a full
+    ``get_server_logs`` scan.
+
+    The optional ``seek_to`` argument is a convenience shortcut: when provided,
+    the tool returns the best ``since`` hint for that timestamp directly in the
+    response field ``seek_hint``, saving the caller a manual bucket scan.
+
+    Returns::
+
+        {
+            "total_rows":              int,   -- rows in the current ring-buffer snapshot
+            "bucket_granularity_label": str,  -- e.g. "minute"
+            "min_recorded_at":         str | null,
+            "max_recorded_at":         str | null,
+            "bucket_count":            int,
+            "buckets": [
+                {
+                    "bucket":           str,  -- "YYYY-MM-DD HH:MM"
+                    "count":            int,
+                    "min_recorded_at":  str,
+                    "max_recorded_at":  str,
+                    "first_id":         str,
+                    "last_id":          str,
+                },
+                ...                            -- oldest-first
+            ],
+            "seek_hint": str | null,  -- only present when seek_to= was given
+        }
+    """
+    _seek_to = (args.get("seek_to") or "").strip() or None
+
+    # If the checkpoint is empty (no rows seen yet), do a lazy full fetch to
+    # populate it so this tool is self-warming on first call.
+    from meridian import server_log_checkpoint as _slc  # noqa: PLC0415
+    _current = _slc.get_checkpoint_dict()
+    if _current.get("total_rows", 0) == 0:
+        try:
+            _all_rows = await db_module.get_server_logs(db, limit=2000)
+            _slc.build_checkpoint(_all_rows)
+            _current = _slc.get_checkpoint_dict()
+        except Exception:  # noqa: BLE001
+            pass
+
+    result: dict[str, Any] = dict(_current)
+
+    if _seek_to:
+        result["seek_hint"] = _slc.seek_hint_for(_seek_to)
+
+    return result
 
 
 async def handle_get_agent_instructions(
