@@ -366,6 +366,42 @@ def test_call_tunnel_tool_list_paths_checks_each(monkeypatch):
         ))
 
 
+def test_call_tunnel_tool_bounds_cold_cache_discovery_to_outer_timeout(monkeypatch):
+    """9ab967d6 — hardening audit companion to the 2026-07-17 tools/list outage
+    hotfix. ``call_tunnel_tool``'s cold-route-cache path awaits
+    ``list_tunnel_tools`` directly; that function's own per-slot retry budget
+    (up to ~14s worst case for a slot marked healthy but actually unreachable)
+    used to have NO outer bound here, so a single stale-healthy slot could hang
+    an actual tools/call indefinitely (worse than the tools/list case this
+    mirrors, since it fires on every cold-cache tool call, not just discovery).
+    A hard ``_TOOL_DISCOVERY_TIMEOUT`` wait_for now guarantees this returns
+    promptly (miss/None) instead of hanging on a slow/wedged fetch."""
+    import time as _time
+
+    tenant = "t-cold-cache-hang"
+    tn._tunnel_sockets[tenant] = object()
+    # No pre-seeded route — forces the cold-cache discovery branch.
+    assert tenant not in tn._tunnel_tool_routes
+
+    async def hangs_forever(tid, reserved=frozenset()):
+        await asyncio.sleep(30)
+        return [{"name": "some_tool"}]
+
+    monkeypatch.setattr(tn, "list_tunnel_tools", hangs_forever)
+
+    start = _time.monotonic()
+    result = asyncio.run(tn.call_tunnel_tool(tenant, "filesystem__read_file", {}))
+    elapsed = _time.monotonic() - start
+
+    # Bounded well under the 30s hang — proves the outer wait_for fired.
+    assert elapsed < tn._TOOL_DISCOVERY_TIMEOUT + 5.0, (
+        f"call_tunnel_tool took {elapsed:.1f}s — outer discovery timeout did not bound it"
+    )
+    # No route was discovered (the hung fetch's result is discarded, not
+    # awaited-through), so the call correctly reports "no tunnel tool found".
+    assert result is None
+
+
 # ===========================================================================
 # 8. _extract_install_command — runtime preference (uv > npm > other)
 # ===========================================================================
