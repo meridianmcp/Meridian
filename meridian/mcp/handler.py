@@ -778,7 +778,312 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
                 "comments": comments,
             }
 
+        if name == "issue_write":
+            # fdaa5b55 / 8fc92474 — comment on and/or update the state of a
+            # SINGLE issue. ``issue_number`` is a required scalar int — there
+            # is deliberately no plural/array/batch parameter anywhere on this
+            # branch, so no caller (however compromised) can make one dispatch
+            # touch more than one issue. Comment and state-change are each
+            # independent, best-effort HTTP calls so a caller can do either or
+            # both in one call.
+            raw_number = args.get("issue_number")
+            try:
+                number = int(raw_number)  # rejects lists/dicts/None outright
+            except (TypeError, ValueError):
+                return {"error": "issue_number is required and must be a single integer"}
+            comment_body = args.get("comment")
+            state = args.get("state")
+            state_reason = args.get("state_reason")
+            result: dict[str, Any] = {"number": number}
+            if isinstance(comment_body, str) and comment_body.strip():
+                cr = await http.post(
+                    f"https://api.github.com/repos/{repo}/issues/{number}/comments",
+                    headers=gh_headers,
+                    json={"body": comment_body},
+                )
+                if cr.status_code not in (200, 201):
+                    return {"error": f"Comment failed ({cr.status_code}): {cr.text[:200]}"}
+                result["comment_id"] = cr.json().get("id")
+            if state in ("open", "closed"):
+                patch_payload: dict[str, Any] = {"state": state}
+                if state == "closed" and state_reason:
+                    patch_payload["state_reason"] = state_reason
+                pr = await http.patch(
+                    f"https://api.github.com/repos/{repo}/issues/{number}",
+                    headers=gh_headers,
+                    json=patch_payload,
+                )
+                if pr.status_code not in (200, 201):
+                    return {"error": f"State update failed ({pr.status_code}): {pr.text[:200]}"}
+                i = pr.json()
+                result["state"] = i.get("state")
+                result["html_url"] = i.get("html_url")
+            return result
+
     return {"error": f"Unknown GitHub tool: {name}"}
+
+
+async def _close_or_propose_github_issue(
+    db: Any, project_id: str, item: dict[str, Any], tenant: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """fdaa5b55 — on sprint item completion, close (or propose closing) the
+    ONE GitHub issue linked to ``item``.
+
+    Called by ``meridian.mcp.handlers.sprint_tools.handle_complete_sprint_item``
+    immediately after ``db_module.complete_sprint_item`` succeeds. Returns
+    ``None`` when the item has no linked issue (the overwhelmingly common
+    case) so callers can skip attaching anything to the response.
+
+    Trust boundary (eda40627 / 8c170bcc): the ONLY signal consulted to decide
+    auto-close vs propose is ``item.get('github_issue_source')`` — a column
+    written exclusively by ``db.sprint_items.link_sprint_item_github_issue``
+    at issue-creation time. This function never calls a GitHub read endpoint
+    (no ``get_issue``, no label/custom-field lookup) as part of this decision,
+    so nothing readable/writable by a GitHub collaborator (issue body,
+    comments, labels, custom fields) can ever flip an issue from 'manual' to
+    'meridian_auto' treatment.
+
+    Blast radius (8fc92474): exactly one ``issue_number`` — read once, from
+    this item's own row — is ever passed to ``_dispatch_github_tool``. There
+    is no loop over issues, no "all open issues" query, nothing that could
+    make one completion call touch more than one issue even under a logic
+    bug or a successful injection into the notes text used for the comment
+    body (which is itself escaped — see ``build_github_completion_comment``).
+
+    Never raises: any GitHub-call failure is captured in the returned dict's
+    ``error`` key so a transient GitHub outage can never turn an already-
+    successful sprint-item completion into a caller-visible exception.
+    """
+    issue_number = item.get("github_issue_number")
+    if not issue_number:
+        return None
+    if not tenant:
+        return {"issue_number": issue_number, "action": "skipped", "reason": "no_tenant_context"}
+    # eda40627 — read ONLY the DB column; never inferred from GitHub content.
+    issue_source = item.get("github_issue_source")
+    is_meridian_auto = issue_source == "meridian_auto"
+    comment_body = db_module.build_github_completion_comment(
+        item, proposed=not is_meridian_auto,
+    )
+    try:
+        comment_result = await _dispatch_github_tool(
+            "issue_write",
+            {"project_id": project_id, "issue_number": issue_number, "comment": comment_body},
+            tenant, db,
+        )
+        if isinstance(comment_result, dict) and comment_result.get("error"):
+            return {
+                "issue_number": issue_number, "issue_source": issue_source,
+                "action": "error", "error": comment_result["error"],
+            }
+        if is_meridian_auto:
+            close_result = await _dispatch_github_tool(
+                "issue_write",
+                {
+                    "project_id": project_id, "issue_number": issue_number,
+                    "state": "closed", "state_reason": "completed",
+                },
+                tenant, db,
+            )
+            if isinstance(close_result, dict) and close_result.get("error"):
+                return {
+                    "issue_number": issue_number, "issue_source": issue_source,
+                    "action": "error", "error": close_result["error"],
+                    "comment_result": comment_result,
+                }
+            return {
+                "issue_number": issue_number, "issue_source": issue_source,
+                "action": "auto_closed",
+                "comment_result": comment_result, "close_result": close_result,
+            }
+        # manual / unset — never auto-close; comment already posted above,
+        # now file a non-blocking HITL so a human decides whether to close it.
+        hitl = await db_module.request_hitl(
+            db, project_id,
+            question=(
+                f"Sprint item completion is proposing to close GitHub issue "
+                f"#{issue_number}. It was not created by Meridian's automated "
+                f"flow (github_issue_source={issue_source!r}), so it was NOT "
+                "auto-closed — only a proposal comment was posted. Close it?"
+            ),
+            context=f"project={project_id} sprint_item={item.get('id')} issue=#{issue_number}",
+            urgency="normal",
+            kind="sprint_item_issue_closure_proposal",
+            options=["Yes — close it", "No — leave open"],
+            recommended="Yes — close it",
+            payload=json.dumps({
+                "project_id": project_id, "issue_number": issue_number,
+                "sprint_item_id": item.get("id"),
+            }),
+        )
+        return {
+            "issue_number": issue_number, "issue_source": issue_source,
+            "action": "proposed_hitl",
+            "comment_result": comment_result, "hitl_id": (hitl or {}).get("id"),
+        }
+    except Exception as exc:  # noqa: BLE001 — never let this break a completed item
+        return {
+            "issue_number": issue_number, "issue_source": issue_source,
+            "action": "error", "error": str(exc),
+        }
+
+
+async def discover_and_link_manual_issue(
+    db: Any,
+    project_id: str,
+    item_id: str,
+    issue_number: int,
+    tenant: dict[str, Any] | None,
+    *,
+    actor: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """5dfe34b2 — the discovery/linking half of the opt-in manual-issue
+    extension. This is what makes ``github_issue_source='manual'`` ever get
+    written onto a real sprint item in the first place — before this function
+    existed, ``link_sprint_item_github_issue`` had exactly one caller
+    (``_on_hitl_answered``'s ``proposal_github_issue`` branch), which only
+    ever writes ``source='meridian_auto'``. Once THIS function links an item
+    (source='manual'), fdaa5b55's existing, UNCHANGED
+    ``_close_or_propose_github_issue`` picks it up at completion time exactly
+    as already tested (comment + propose + HITL — never auto-close).
+
+    Gate order (fail closed at every step):
+      1. Toggle must be ON (workspace_settings.manual_issue_screening_enabled).
+         OFF (the default) is a clean no-op — this function does nothing a
+         disabled feature shouldn't, structurally, not just by convention.
+      2. Read the issue's raw content (title + body + comments) via the
+         GitHub API — the ONLY network read in this whole pipeline.
+      3. 2178b161 — log the RAW content (hashed, append-only) BEFORE any
+         screening or processing touches it.
+      4. d86d70a5 — run the wave-relative velocity/anomaly check. Anomalous
+         is NON-BLOCKING: it does not stop this call, it audit-logs +
+         escalates a normal-urgency HITL for human awareness (Adam explicitly
+         rejected silent auto-disable).
+      5. 18d25f05 — screen title/body/comments for hardcoded injection shapes.
+         Flagged content is NEVER linked automatically — a human-review HITL
+         is filed instead (with only a SANITIZED excerpt shown, per point 3
+         of the rendering-discipline requirement), and the function returns
+         without calling link_sprint_item_github_issue.
+      6. Only when screening passes: link the issue as source='manual' and
+         audit-log the action.
+
+    Never raises — GitHub/DB failures are captured in the returned dict's
+    ``error`` key (same never-break-the-caller discipline as
+    ``_close_or_propose_github_issue``).
+    """
+    tenant_id = tenant.get("id") if isinstance(tenant, dict) else None
+    try:
+        settings = await db_module.get_workspace_settings(db, tenant_id=tenant_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"action": "error", "error": f"failed to read workspace settings: {exc}"}
+    if not settings.get("manual_issue_screening_enabled"):
+        return {"action": "skipped", "reason": "toggle_disabled"}
+    if not tenant:
+        return {"action": "skipped", "reason": "no_tenant_context"}
+
+    # 2. Read raw issue content — the one network read in this pipeline.
+    try:
+        issue = await _dispatch_github_tool(
+            "get_issue", {"project_id": project_id, "number": issue_number}, tenant, db,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"action": "error", "error": f"failed to read issue: {exc}"}
+    if not isinstance(issue, dict) or issue.get("error"):
+        err = issue.get("error") if isinstance(issue, dict) else "unknown error"
+        return {"action": "error", "error": str(err)}
+
+    title = issue.get("title") or ""
+    body = issue.get("body") or ""
+    comments = [c.get("body") or "" for c in (issue.get("comments") or [])]
+    raw_combined = "\n\n---\n\n".join(filter(None, [title, body, *comments]))
+
+    # 3. Raw-content forensic log — BEFORE screening touches anything.
+    try:
+        await db_module.log_raw_manual_issue_content(db, project_id, issue_number, raw_combined)
+    except Exception:  # noqa: BLE001 — logging must never block the read it's logging
+        pass
+
+    # 4. Wave-relative velocity/anomaly check — non-blocking escalation only.
+    try:
+        item = await db_module.get_sprint_item(db, item_id)
+        anomaly = await db_module.check_manual_issue_action_velocity(
+            db, project_id, triggering_item=item,
+        )
+        if anomaly.get("is_anomalous"):
+            await db_module.record_action_audit_event(
+                db, "velocity_anomaly", tenant_id=tenant_id, project_id=project_id,
+                actor=actor or session_id,
+                detail=json.dumps(anomaly),
+            )
+            await db_module.request_hitl(
+                db, project_id,
+                question=(
+                    f"Manual-issue GitHub action volume looks anomalous: "
+                    f"{anomaly.get('recent_actions')} recent actions vs an expected "
+                    f"~{anomaly.get('threshold')} correlated to the current wave "
+                    f"(wave_size={anomaly.get('wave_size')}). No action is blocked — "
+                    "this is FYI for human awareness."
+                ),
+                context=f"project={project_id} issue=#{issue_number} anomaly={json.dumps(anomaly)}",
+                urgency="normal",
+                kind="manual_issue_velocity_anomaly",
+                payload=json.dumps({"project_id": project_id, "issue_number": issue_number, **anomaly}),
+            )
+    except Exception:  # noqa: BLE001 — the anomaly signal is advisory only
+        pass
+
+    # 5. Heuristic injection screening — flagged content is NEVER auto-linked.
+    screening = db_module.screen_manual_issue(title, body, comments)
+    if screening.get("flagged"):
+        try:
+            await db_module.record_action_audit_event(
+                db, "manual_issue_link_flagged", tenant_id=tenant_id, project_id=project_id,
+                actor=actor or session_id,
+                detail=json.dumps({"issue_number": issue_number, "reasons": screening["reasons"]}),
+            )
+            excerpt = db_module.sanitize_manual_issue_excerpt(f"{title}\n\n{body}")
+            await db_module.request_hitl(
+                db, project_id,
+                question=(
+                    f"GitHub issue #{issue_number} was flagged by content screening "
+                    f"({', '.join(screening['reason_labels'])}) and was NOT linked/acted "
+                    "on automatically. Review the (sanitized) excerpt below and decide "
+                    "whether to link it manually."
+                ),
+                context=f"project={project_id} issue=#{issue_number}\n\nExcerpt:\n{excerpt}",
+                urgency="normal",
+                kind="manual_issue_screening_flagged",
+                payload=json.dumps({
+                    "project_id": project_id, "issue_number": issue_number,
+                    "sprint_item_id": item_id, "reasons": screening["reasons"],
+                }),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "action": "flagged", "issue_number": issue_number,
+            "reasons": screening["reasons"],
+        }
+
+    # 6. Screening passed — link it. fdaa5b55's existing, unmodified
+    # _close_or_propose_github_issue takes over from here at completion time.
+    try:
+        issue_url = issue.get("html_url")
+        linked = await db_module.link_sprint_item_github_issue(
+            db, project_id, item_id, issue_number, issue_url, source="manual",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"action": "error", "error": f"failed to link issue: {exc}"}
+    try:
+        await db_module.record_action_audit_event(
+            db, "manual_issue_linked", tenant_id=tenant_id, project_id=project_id,
+            actor=actor or session_id,
+            detail=json.dumps({"issue_number": issue_number, "sprint_item_id": item_id}),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return {"action": "linked", "issue_number": issue_number, "item": linked}
 
 
 _MERIDIAN_TOOL_NAMES_CACHE: "frozenset[str] | None" = None
@@ -1906,7 +2211,8 @@ async def _handle_project_tools(
 ) -> Any:
     """Dispatch group: create_project, set_parent_project, rename_project,
     register_session, start_session, list_projects, get_project_by_name,
-    get_goal, set_goal, set_north_star, merge_project.
+    get_goal, set_goal, set_north_star, merge_project, add_custom_hook,
+    get_custom_hooks, delete_custom_hook.
 
     97d695c4 — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -1927,6 +2233,9 @@ async def _handle_project_tools(
         handle_set_goal,
         handle_set_north_star,
         handle_merge_project,
+        handle_add_custom_hook,
+        handle_get_custom_hooks,
+        handle_delete_custom_hook,
     )
 
     # Tools that need no extra context beyond the standard five parameters.
@@ -1941,6 +2250,9 @@ async def _handle_project_tools(
         "set_goal": handle_set_goal,
         "set_north_star": handle_set_north_star,
         "merge_project": handle_merge_project,
+        "add_custom_hook": handle_add_custom_hook,
+        "get_custom_hooks": handle_get_custom_hooks,
+        "delete_custom_hook": handle_delete_custom_hook,
     }
 
     if name in _standard_dispatch:
@@ -2604,7 +2916,9 @@ async def _handle_hitl_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: request_hitl, get_hitl_request, list_hitl_requests, answer_hitl, dismiss_hitl, update_md_section."""
+    """Dispatch group: request_hitl, get_hitl_request, list_hitl_requests, answer_hitl,
+    dismiss_hitl, update_md_section, request_manual_issue_screening_toggle,
+    link_manual_github_issue (5dfe34b2)."""
     if name == "request_hitl":
         validate_input_size(args.get("question"), "question", 10_000)
         validate_input_size(args.get("context"), "context", 50_000)
@@ -2674,6 +2988,53 @@ async def _handle_hitl_tools(
                     f"Whichever arrives first (dashboard or chat) unblocks you."
                 )
         return _dc_result
+    if name == "request_manual_issue_screening_toggle":
+        # 5dfe34b2 / cd495afa — the ONLY entry point that can ever move the
+        # manual-issue-screening toggle toward enabled. `kind` and
+        # `require_human=True` are HARDCODED here — a caller cannot override
+        # either — so even a fully compromised caller of this exact tool can
+        # only ever produce a PENDING HITL that Meridian's own auto-answer
+        # machinery is structurally forbidden from answering (require_human).
+        # Disabling (enable=False) skips the HITL — turning the riskier mode
+        # OFF is the fail-safe direction — and applies immediately.
+        _toggle_enable = bool(args.get("enable"))
+        if not _toggle_enable:
+            updated = await db_module.set_manual_issue_screening_enabled(
+                db, False, tenant_id=_mcp_tenant_id,
+                actor=args.get("session_id") or "direct_disable",
+            )
+            return {"applied": True, "manual_issue_screening_enabled": False, "settings": updated}
+        _yes_opt = "Yes — enable manual-issue screening"
+        _no_opt = "No — keep disabled"
+        _toggle_question = (
+            "Enable the opt-in manual-issue content-screening extension "
+            "(extends the automated GitHub-issue comment/propose flow — never "
+            "auto-close — to issues Meridian did not itself create, gated "
+            "behind hardcoded injection-pattern screening)? "
+            + db_module._MANUAL_ISSUE_SCREENING_RISK_WARNING  # noqa: SLF001
+        )
+        hitl = await db_module.request_hitl(
+            db, args.get("project_id") or "workspace",
+            question=_toggle_question,
+            session_id=args.get("session_id"),
+            context=args.get("context") or "Requested via request_manual_issue_screening_toggle",
+            urgency="normal",
+            kind="manual_issue_screening_toggle",
+            options=[_yes_opt, _no_opt],
+            recommended=_no_opt,
+            require_human=True,
+            payload=json.dumps({"tenant_id": _mcp_tenant_id}),
+        )
+        return hitl
+    if name == "link_manual_github_issue":
+        # 5dfe34b2 — the entry point for the discovery/screening/linking flow.
+        # No-ops cleanly (action='skipped') when the toggle is off, so calling
+        # it is always safe regardless of workspace configuration.
+        result = await discover_and_link_manual_issue(
+            db, args["project_id"], args["item_id"], int(args["issue_number"]),
+            tenant, actor=args.get("session_id"), session_id=args.get("session_id"),
+        )
+        return result
     if name == "get_hitl_request":
         result = await db_module.get_hitl_request(db, args["request_id"])
         if result is None:
@@ -2696,6 +3057,7 @@ async def _handle_hitl_tools(
         result = await _server._answer_hitl_and_apply(
             db, args["request_id"], args["answer"],
             answered_by=args.get("answered_by"), approved=True,
+            tenant=tenant,
         )
         if result is None:
             raise ValueError("hitl request not found")
@@ -2877,7 +3239,7 @@ async def _handle_sprint_tools(
     analyze_sprint, claim_sprint_item, add_subtask, split_sprint_item,
     merge_sprint_items, complete_sprint_item, add_sprint_item_pointer,
     get_sprint_item_pointers, resolve_sprint_item_pointers,
-    delete_sprint_item_pointer, complete_wave_gate.
+    delete_sprint_item_pointer, complete_wave_gate, configure_wave_gate.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -2908,6 +3270,7 @@ async def _handle_sprint_tools(
         handle_resolve_sprint_item_pointers,
         handle_delete_sprint_item_pointer,
         handle_complete_wave_gate,
+        handle_configure_wave_gate,
     )
 
     _standard_dispatch: dict[str, Any] = {
@@ -2932,6 +3295,7 @@ async def _handle_sprint_tools(
         "resolve_sprint_item_pointers": handle_resolve_sprint_item_pointers,
         "delete_sprint_item_pointer": handle_delete_sprint_item_pointer,
         "complete_wave_gate": handle_complete_wave_gate,
+        "configure_wave_gate": handle_configure_wave_gate,
     }
 
     if name in _standard_dispatch:

@@ -12,6 +12,9 @@ import json
 import re
 import time
 from typing import Any
+from xml.sax.saxutils import escape as _xml_escape  # fdaa5b55/cd038235 — same
+# escaping helper/discipline as 5abf3e12 (meridian/handoff.py's
+# _build_quick_start_goal), reused here for GitHub-bound comment bodies.
 
 import aiosqlite
 
@@ -715,6 +718,7 @@ async def add_sprint_item(
     wave: str | None = None,
     sprint_name: str | None = None,
     prospect_bypass: bool = False,
+    required_tool: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -739,6 +743,11 @@ async def add_sprint_item(
     ``sprint_name`` (3d6bd938) is a nullable human-readable label for the sprint
     bucket (e.g. 'docs-cloudflare'), kept separate from ``version`` which should
     stay a structural/semver-like identifier. NULL means no separate name.
+    ``required_tool`` (4d1fb28f) is a nullable free-form pin naming the specific
+    MCP tool/plugin the executor MUST use for this item (e.g. 'Serena:
+    replace_symbol_body'). NULL means ordinary executor discretion. When set,
+    it is rendered as a hard directive (not a hint) in the /goal block built by
+    ``handoff._build_quick_start_goal`` / ``build_item_briefing``.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
     is compared (word-set overlap, see ``_title_word_overlap``) against every
@@ -814,13 +823,13 @@ async def add_sprint_item(
         "(id, project_id, version, title, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
         "deferred_until, track, priority, blocker_kind, wave, sprint_name, "
-        "prospect_bypass) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "prospect_bypass, required_tool) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
          priority, blocker_kind or None, wave or None, sprint_name or None,
-         1 if prospect_bypass else 0),
+         1 if prospect_bypass else 0, required_tool or None),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -1068,6 +1077,181 @@ class SprintItemEvidenceRequired(ValueError):
     (5823db0b) — the item is flagged required_notes but has no evidence."""
 
 
+class SprintItemVerificationRequired(ValueError):
+    """Raised when complete_sprint_item is blocked by the require_verification
+    gate (e2e1b682) — the item needs an independent, fresh-session PASS on
+    file (filed by a session distinct from the one completing it) before the
+    completion is allowed to stick."""
+
+
+# ---------------------------------------------------------------------------
+# e2e1b682 — independent fresh-session verifier gate for sprint completion.
+#
+# Closes the "hallucinated-compliance completion" gap: without this, nothing
+# stopped the SAME session that did (or merely claims to have done) the work
+# from also being the one that reports it done — required_notes only checks
+# that *some* evidence text exists, not that anyone independent looked at it.
+#
+# sprint_items.require_verification (opt-in INTEGER 0/1, mirrors
+# prospect_bypass's structural-gate shape) marks an item as needing an
+# INDEPENDENT PASS before complete_sprint_item is allowed to stick.
+#
+# Trust boundary (same shape as verify_handoff_token, see AGENTS.md 2ee0000c):
+# this layer structurally proves WHO filed the verdict and THAT it differs
+# from the completing actor — it does NOT (and cannot, from the DB layer
+# alone) prove HOW the verdict was derived. The "fresh, no-memory subsession
+# with read-only tools" contract is a process-level convention the launcher
+# of the verifier subsession must honour; what IS enforced here, structurally:
+#   1. A PASS verdict must exist on file (sprint_item_verifications).
+#   2. Its verifier_session_id must differ from the actor completing the item
+#      (independence — the same session cannot mark its own homework).
+#   3. A FAIL verdict (or no verdict at all) refuses completion outright.
+# ---------------------------------------------------------------------------
+
+_SPRINT_ITEM_VERIFICATIONS_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS sprint_item_verifications ("
+    "    id TEXT PRIMARY KEY,"
+    "    project_id TEXT NOT NULL,"
+    "    sprint_item_id TEXT NOT NULL,"
+    "    verdict TEXT NOT NULL,"              # 'pass' | 'fail'
+    "    verifier_session_id TEXT NOT NULL,"
+    "    notes TEXT,"
+    "    seq INTEGER NOT NULL DEFAULT 0,"     # per-item insertion order (see below)
+    "    created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+    ")"
+)
+
+_VALID_VERIFICATION_VERDICTS = {"pass", "fail"}
+
+
+async def _ensure_sprint_item_verifications_table(db: aiosqlite.Connection) -> None:
+    """Idempotently create sprint_item_verifications (tolerates concurrent init;
+    mirrors _ensure_wave_gate_results_table)."""
+    await db.execute(_SPRINT_ITEM_VERIFICATIONS_TABLE_DDL)
+
+
+async def record_sprint_item_verification(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    verifier_session_id: str,
+    verdict: str,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Persist one independent fresh-session PASS/FAIL verdict for a sprint item.
+
+    ``verifier_session_id`` identifies the session that performed the
+    independent check. Whether it is genuinely a *different* session from the
+    one that implemented / is completing the item is checked at the
+    ``complete_sprint_item`` gate, not here — this function only records the
+    verdict. Returns the stored row (dict).
+
+    ``seq`` — NOT wall-clock ``created_at`` — is what determines "latest":
+    computed here as ``1 + MAX(existing seq for this item)``. Neither
+    backend's clock is trustworthy enough for strict per-item ordering — the
+    random-UUID ``id`` doesn't correlate with insertion order at all, SQLite's
+    ``datetime('now')`` is only second-granular, and even Python's own
+    ``datetime.now()`` can tie between two awaited calls on coarser system
+    timers (observed on Windows). A FAIL followed by a same-tick re-check PASS
+    (the core "fix and re-verify" workflow this table exists for) must never
+    be ambiguous, so ordering is driven by an explicit, clock-independent
+    counter instead. Not fully race-proof under truly concurrent writers on
+    the SAME item across processes (same caveat as this server's other
+    single-process-assuming counters, e.g. routes/sprint.py's stop-override
+    budget) — acceptable here since a rare mis-ordered tie only affects which
+    of two verdicts filed in the same instant is treated as "latest", never
+    data loss or a false PASS.
+    """
+    if not (verifier_session_id or "").strip():
+        raise ValueError(
+            "record_sprint_item_verification requires a non-empty verifier_session_id"
+        )
+    verdict_norm = (verdict or "").strip().lower()
+    if verdict_norm not in _VALID_VERIFICATION_VERDICTS:
+        raise ValueError(
+            f"verdict must be one of {sorted(_VALID_VERIFICATION_VERDICTS)}, got {verdict!r}"
+        )
+    await _ensure_sprint_item_verifications_table(db)
+    vid = _new_id()
+    async with db.execute(
+        "SELECT COALESCE(MAX(seq), 0) AS m FROM sprint_item_verifications "
+        "WHERE project_id = ? AND sprint_item_id = ?",
+        (project_id, item_id),
+    ) as cur:
+        _seq_row = await cur.fetchone()
+    next_seq = int((_seq_row["m"] if isinstance(_seq_row, dict) else _seq_row[0]) or 0) + 1
+    await db.execute(
+        "INSERT INTO sprint_item_verifications "
+        "(id, project_id, sprint_item_id, verdict, verifier_session_id, notes, seq) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (vid, project_id, item_id, verdict_norm, verifier_session_id, notes, next_seq),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM sprint_item_verifications WHERE id = ?", (vid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {}
+
+
+async def get_latest_sprint_item_verification(
+    db: aiosqlite.Connection, project_id: str, item_id: str
+) -> dict[str, Any] | None:
+    """Return the most recently filed verification row for a sprint item, or
+    None if it has never been independently verified.
+
+    Ordered by ``seq DESC`` (see :func:`record_sprint_item_verification` for
+    why wall-clock ``created_at`` isn't a reliable enough ordering key on its
+    own); ``created_at DESC, id DESC`` are kept only as defensive tiebreakers
+    for pre-existing rows with ``seq = 0`` (the column's default, e.g. rows
+    written before this counter existed).
+    """
+    await _ensure_sprint_item_verifications_table(db)
+    async with db.execute(
+        "SELECT * FROM sprint_item_verifications "
+        "WHERE project_id = ? AND sprint_item_id = ? "
+        "ORDER BY seq DESC, created_at DESC, id DESC LIMIT 1",
+        (project_id, item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) if row is not None else None
+
+
+async def count_sprint_items_awaiting_verification(
+    db: aiosqlite.Connection, project_id: str
+) -> int:
+    """e2e1b682 — count of in_progress, require_verification items that do NOT
+    yet have an independent on-file PASS (no verdict at all, a FAIL, or only a
+    same-session self-report). Purely informational: backs the Stop-hook
+    guard's advisory ``verification_pending_count`` (routes/sprint.py's
+    ``/sprint/pending_count`` endpoint) so a human watching the guard's output
+    sees that a fresh check is still owed even though this never blocks a
+    session from stopping (only complete_sprint_item's structural gate blocks
+    the completion itself).
+    """
+    async with db.execute(
+        "SELECT id, actor FROM sprint_items "
+        "WHERE project_id = ? AND status = 'in_progress' AND require_verification = 1",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        return 0
+    n = 0
+    for r in rows:
+        row = _row_to_dict(r) or {}
+        item_id = row.get("id")
+        actor = row.get("actor")
+        verification = await get_latest_sprint_item_verification(db, project_id, item_id)
+        if (
+            verification is None
+            or verification.get("verdict") != "pass"
+            or (actor and verification.get("verifier_session_id") == actor)
+        ):
+            n += 1
+    return n
+
+
 class SprintItemStatusRace(ValueError):
     """Raised by _update_sprint_item_status (fa3e3331) when an ``expected_statuses``
     guard rejects a transition — the item exists but is no longer in an expected
@@ -1203,6 +1387,250 @@ def _check_evidence_quality(evidence_text: str) -> str | None:
     return None
 
 
+async def _check_stored_evidence(
+    db: aiosqlite.Connection,
+    item: dict[str, Any],
+    task_id: str | None,
+    notes: str | None,
+) -> str | None:
+    """1ec33edf (refile of abb7c388 — the original shipped only on a worktree
+    branch that never merged into dev, so this was reconfirmed unfixed and
+    redone here) — mechanical check that STORED evidence actually exists at
+    completion time.
+
+    Distinct from :func:`_check_evidence_quality`, which analyses the *text
+    quality* of evidence notes for over-fit patterns without touching disk or
+    the DB. This function checks whether the physical evidence referenced by
+    the item is real and verifiable:
+
+    1. **touches_resources file/symbol entries** — when the item declares
+       ``file:`` or ``symbol:`` resources (the canonical "what I touched"
+       record), check that at least one of those files exists on the
+       filesystem. If every declared file is absent, the evidence is likely
+       fabricated, stale, or was produced in a different worktree.
+
+    2. **task_id existence** — when a ``task_id`` is linked (either as
+       argument or already stored on the item), verify the ``task_log`` row
+       actually exists in the DB. A task_id that resolves to nothing is
+       hollow evidence.
+
+    3. **File paths mentioned in notes** — when the combined notes text
+       explicitly mentions plausible ``.py`` paths, check at least one exists
+       on the filesystem. A notes field claiming "fixed auth.py" where
+       ``auth.py`` cannot be found is a thin-evidence signal. Only runs when
+       there is no touches_resources declaration, to avoid double-warning on
+       the same completion call.
+
+    Design invariants (mirrors :func:`_check_evidence_quality`):
+    - **ADVISORY ONLY** — returns a warning string but never raises; the
+      calling :func:`complete_sprint_item` surfaces it as
+      ``stored_evidence_warning`` in the returned dict without blocking the
+      completion.
+    - **FAIL-OPEN** — any filesystem or DB error is swallowed; the function
+      returns ``None`` (no warning) rather than wedging the board.
+    - **Conservative** — only warns when there is a clear, high-confidence
+      signal that claimed evidence does not exist, not merely when evidence
+      is absent (many legitimate items don't declare touches_resources).
+    - Runs for ALL completions, not only ``required_notes`` ones — a declared
+      touches_resources or linked task_id that turns out not to exist is a
+      thin-evidence signal regardless of whether the item was gated.
+    """
+    import os  # noqa: PLC0415 — lazy: only used in this function
+
+    try:
+        # ------------------------------------------------------------------
+        # Check 1: touches_resources file/symbol entries exist on disk.
+        # Only warn when the item DOES declare file/symbol resources AND
+        # none of them can be found — the absence of a declaration is fine
+        # (many items don't declare touches_resources).
+        # ------------------------------------------------------------------
+        resources_raw = item.get("touches_resources")
+        if resources_raw:
+            resources = parse_touches_resources(resources_raw)
+            # Collect file paths declared via file: or symbol: resource ids.
+            declared_paths: list[str] = []
+            for rid in resources:
+                rid_lower = rid.lower()
+                if rid_lower.startswith("inferred:"):
+                    rid = rid[len("inferred:"):]
+                if rid.startswith("file:"):
+                    path = rid[len("file:"):]
+                    declared_paths.append(path)
+                elif rid.startswith("symbol:"):
+                    # symbol:<path>::<symbol> — extract the path part.
+                    path = rid[len("symbol:"):].partition("::")[0]
+                    declared_paths.append(path)
+            if declared_paths:
+                any_exists = any(os.path.exists(p) for p in declared_paths)
+                if not any_exists:
+                    absent = declared_paths[:3]  # cap the list for readability
+                    more = f" (and {len(declared_paths) - 3} more)" if len(declared_paths) > 3 else ""
+                    return (
+                        f"Stored evidence check: {len(declared_paths)} file(s) declared in "
+                        f"touches_resources cannot be found on disk: "
+                        f"{', '.join(absent)}{more}. "
+                        "Either the files were not actually modified, the paths are wrong, "
+                        "or the work was done in a different worktree. "
+                        "Verify the correct files were changed before treating this as complete."
+                    )
+
+        # ------------------------------------------------------------------
+        # Check 2: task_id resolves to an existing task_log row.
+        # Only warn when a task_id IS provided; absence is fine.
+        # ------------------------------------------------------------------
+        effective_task_id = task_id or item.get("task_id")
+        if effective_task_id:
+            async with db.execute(
+                "SELECT id FROM task_log WHERE id = ?", (effective_task_id,)
+            ) as cur:
+                task_row = await cur.fetchone()
+            if task_row is None:
+                return (
+                    f"Stored evidence check: task_id {effective_task_id!r} is linked as "
+                    "evidence but no matching task_log row was found. "
+                    "The task may have been deleted or the id may be incorrect. "
+                    "Pass notes=... describing what shipped, or link a valid task_id."
+                )
+
+        # ------------------------------------------------------------------
+        # Check 3: file paths explicitly mentioned in notes exist on disk.
+        # Only active when there are no touches_resources declarations
+        # (Check 1 already covered the declared-path case), to avoid
+        # double-warning on the same completion call.
+        # Only warn when ALL mentioned paths are absent (fail-open: a mix of
+        # present and absent paths is not suspicious — paths change over time).
+        # ------------------------------------------------------------------
+        if not resources_raw:
+            combined_notes = " ".join(filter(None, [
+                (notes or "").strip(),
+                (item.get("notes") or "").strip(),
+            ]))
+            if combined_notes:
+                mentioned_paths = re.findall(
+                    r"[\w/\\.-]+\.py\b", combined_notes
+                )
+                # Only count paths that look structural (contain a slash, or
+                # start with a known top-level dir) — excludes bare "a.py".
+                plausible_paths = [
+                    p for p in mentioned_paths
+                    if len(p) > 5 and ("/" in p or p.startswith("tests/") or p.startswith("meridian/"))
+                ]
+                if plausible_paths:
+                    any_exists = any(os.path.exists(p) for p in plausible_paths)
+                    if not any_exists:
+                        absent = plausible_paths[:3]
+                        more = f" (and {len(plausible_paths) - 3} more)" if len(plausible_paths) > 3 else ""
+                        return (
+                            f"Stored evidence check: notes mention {len(plausible_paths)} file path(s) "
+                            f"that cannot be found on disk: {', '.join(absent)}{more}. "
+                            "If work was done in a different worktree, the paths may be valid "
+                            "there but are unverifiable here. Consider adding the commit SHA or "
+                            "test run output as evidence."
+                        )
+
+    except Exception:  # noqa: BLE001 — stored-evidence check must never block completion
+        return None
+
+    return None
+
+
+_VALID_GITHUB_ISSUE_SOURCES = {"meridian_auto", "manual"}
+
+
+async def link_sprint_item_github_issue(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    issue_number: int,
+    issue_url: str | None,
+    source: str,
+) -> dict[str, Any] | None:
+    """fdaa5b55 / eda40627 — the ONE write path for a sprint item's linked
+    GitHub issue + its trust classification.
+
+    ``source`` MUST be ``'meridian_auto'`` (Meridian itself filed the issue —
+    only ever passed by server.py's ``_on_hitl_answered`` 'proposal_github_issue'
+    branch, right after a real ``create_issue`` GitHub API call succeeds) or
+    ``'manual'`` (a human filed it, or a session linked one on the human's own
+    initiative). Any other value raises ``ValueError`` — there is deliberately
+    no way to write anything else, and NOTHING in this codebase ever derives
+    ``source`` from an issue's title/body/labels/custom fields; it is always
+    an explicit, deterministic argument from a known call site.
+
+    Returns the updated item row, or ``None`` if ``item_id`` doesn't exist
+    under ``project_id`` (mirrors the other status-transition helpers' no-op-
+    on-miss behaviour — never raises for a stale/foreign id).
+    """
+    if source not in _VALID_GITHUB_ISSUE_SOURCES:
+        raise ValueError(
+            f"github_issue_source must be one of {sorted(_VALID_GITHUB_ISSUE_SOURCES)}; got {source!r}"
+        )
+    cursor = await db.execute(
+        "UPDATE sprint_items SET github_issue_number = ?, github_issue_url = ?, "
+        "github_issue_source = ? WHERE id = ? AND project_id = ?",
+        (issue_number, issue_url, source, item_id, project_id),
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    _invalidate_sprint_items_cache(project_id)
+    return await get_sprint_item(db, item_id)
+
+
+def build_github_completion_comment(
+    item: dict[str, Any],
+    notes: str | None = None,
+    task_id: str | None = None,
+    *,
+    proposed: bool = False,
+) -> str:
+    """fdaa5b55 / cd038235 — build the GitHub issue completion comment body.
+
+    SECURITY: every fragment interpolated here comes ONLY from Meridian's own
+    DB-stored notes/evidence (the sprint item's ``title``/``notes`` fields and
+    the caller-supplied ``notes``/``task_id``) — this function never reads a
+    GitHub issue's own body or comments as input (that would let anyone with
+    issue-open access on a PUBLIC repo inject text back into the very comment
+    Meridian posts). Each fragment is still run through the SAME
+    ``xml.sax.saxutils.escape`` helper 5abf3e12 established for /goal
+    generation (meridian/handoff.py's ``_xml_escape``) before being
+    interpolated — defense in depth, in case a notes field was ever itself
+    populated from less-trusted upstream content. Escaping happens here, at
+    the point this text is emitted toward GitHub, not just at DB-write time.
+
+    ``proposed=True`` renders the "manual issue — proposing closure, needs
+    human review" framing instead of the "auto-closed" framing; the caller
+    decides which based on the item's ``github_issue_source`` DB column
+    (never anything read back from GitHub — see 8c170bcc).
+    """
+    title = _xml_escape((item.get("title") or "(untitled sprint item)").strip())
+    combined = " ".join(filter(None, [
+        (notes or "").strip(),
+        (item.get("notes") or "").strip(),
+    ])).strip()
+    evidence = _xml_escape(combined) if combined else "(no additional notes recorded)"
+    lines = [
+        f"Sprint item **{title}** was marked complete in Meridian.",
+        "",
+        "Evidence / notes:",
+        evidence,
+    ]
+    _linked_task = task_id or item.get("task_id")
+    if _linked_task:
+        lines.append("")
+        lines.append(f"Linked task: `{_xml_escape(str(_linked_task))}`")
+    lines.append("")
+    if proposed:
+        lines.append(
+            "_This issue was not created by Meridian's automated flow, so it "
+            "was **not** auto-closed. Proposing closure — please review and "
+            "close manually if this looks right._"
+        )
+    else:
+        lines.append("_Closing automatically — this issue was created by Meridian._")
+    return "\n".join(lines)
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1210,6 +1638,9 @@ async def complete_sprint_item(
     task_id: str | None = None,
     notes: str | None = None,
     actor: str | None = None,
+    verifier_session_id: str | None = None,
+    verification_verdict: str | None = None,
+    verification_notes: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
 
@@ -1230,10 +1661,90 @@ async def complete_sprint_item(
     ADVISORY ONLY — it never blocks completion and never raises. The heuristic
     is conservative (high thresholds, three simple structural rules) to avoid
     false positives on legitimate autonomous workflows.
+
+    e2e1b682 — independent fresh-session verifier gate: when the item is
+    flagged ``require_verification``, completion is refused (raises
+    :class:`SprintItemVerificationRequired`) unless an on-file
+    ``sprint_item_verifications`` row has ``verdict == "pass"`` AND its
+    ``verifier_session_id`` differs from ``actor`` (the session completing the
+    item) — a same-session self-report does not satisfy the gate. Pass
+    ``verifier_session_id`` + ``verification_verdict`` (``"pass"``/``"fail"``,
+    optionally ``verification_notes``) to file a fresh verdict and have it
+    checked in this same call; omit them to check whatever verdict is already
+    on file. This is a STRUCTURAL gate — it never silently downgrades to an
+    advisory warning the way the evidence-quality heuristic does.
+
+    1ec33edf (refile of abb7c388) — stored evidence verification: after the
+    existence + quality checks above, run :func:`_check_stored_evidence` over
+    the item's touches_resources, task_id, and notes. This is a MECHANICAL
+    check that the physical evidence declared by the item actually exists
+    (files on disk, task_log rows in DB) — a real evidence check, not just
+    the required_notes text-presence gate. Runs for every completion, not
+    only required_notes ones. If it fires, the returned item dict gains a
+    ``stored_evidence_warning`` key. Also ADVISORY ONLY — never blocks
+    completion; fail-open on any error.
+
+    fdaa5b55 — the returned row carries whatever ``github_issue_number`` /
+    ``github_issue_url`` / ``github_issue_source`` this item already had (a
+    plain ``SELECT *`` — nothing else is touched or looked up here). This
+    function does NOT itself call GitHub: closing/commenting requires a
+    tenant's GitHub PAT, which this DB-only layer never has access to. The
+    MCP handler layer (meridian/mcp/handlers/sprint_tools.py,
+    ``handle_complete_sprint_item``) reads the returned
+    ``github_issue_number``/``github_issue_source`` and — via
+    ``meridian.mcp.handler._close_or_propose_github_issue`` — either auto-
+    closes (``github_issue_source == 'meridian_auto'``) or posts a proposed-
+    closure comment + files a non-blocking HITL (anything else). That
+    downstream step only ever touches the ONE issue linked to THIS item
+    (8fc92474) and classifies purely from the DB column above, never from
+    issue title/body/labels/custom fields (eda40627/8c170bcc).
     """
     item = await get_sprint_item(db, item_id)
     _evidence_quality_warning: str | None = None
+    _stored_evidence_warning: str | None = None
     if item is not None and item.get("project_id") == project_id:
+        if item.get("require_verification"):
+            if verifier_session_id and verification_verdict:
+                await record_sprint_item_verification(
+                    db, project_id, item_id, verifier_session_id,
+                    verification_verdict, notes=verification_notes,
+                )
+            verification = await get_latest_sprint_item_verification(db, project_id, item_id)
+            _completing_actor = (actor or "").strip()
+            if verification is None:
+                raise SprintItemVerificationRequired(
+                    f"item {item_id} requires an independent fresh-session "
+                    "verification before it can be completed (require_verification "
+                    "is set) — no verification is on file yet. Spin up a fresh, "
+                    "no-memory subsession with read-only tools to independently "
+                    "inspect the change, then retry complete_sprint_item passing "
+                    "verifier_session_id=<that session's own id> and "
+                    "verification_verdict='pass' (or 'fail')."
+                )
+            if verification.get("verdict") != "pass":
+                _vnote = verification.get("notes")
+                raise SprintItemVerificationRequired(
+                    f"item {item_id}'s latest fresh verification is FAIL "
+                    f"(filed by session {verification.get('verifier_session_id')!r}"
+                    f"{': ' + _vnote if _vnote else ''}). Address the issue the "
+                    "verifier found and obtain a fresh independent PASS before "
+                    "completing."
+                )
+            if not _completing_actor:
+                raise SprintItemVerificationRequired(
+                    f"item {item_id} requires an independent fresh-session "
+                    "verification, but complete_sprint_item was not given an "
+                    "actor= identity — cannot confirm the on-file PASS was filed "
+                    "by a session other than the one completing it. Pass actor=."
+                )
+            if verification.get("verifier_session_id") == _completing_actor:
+                raise SprintItemVerificationRequired(
+                    f"item {item_id}'s only PASS verification was filed by the "
+                    f"same session ({_completing_actor!r}) that is completing it "
+                    "— that is not independent. A fresh, separate subsession "
+                    "(different session_id, no memory of the implementation) "
+                    "must file the PASS verdict."
+                )
         if item.get("required_notes"):
             has_evidence = bool(
                 (notes or "").strip()
@@ -1261,6 +1772,16 @@ async def complete_sprint_item(
                     _evidence_quality_warning = _check_evidence_quality(_combined_evidence)
                 except Exception:  # noqa: BLE001 — heuristic must never block completion
                     _evidence_quality_warning = None
+        # 1ec33edf — mechanical stored-evidence check: runs for ALL completions
+        # (not just required_notes), because a declared touches_resources or
+        # linked task_id that does not actually exist is a thin-evidence signal
+        # regardless of whether the item was gated.
+        try:
+            _stored_evidence_warning = await _check_stored_evidence(
+                db, item, task_id, notes
+            )
+        except Exception:  # noqa: BLE001 — never block completion
+            _stored_evidence_warning = None
     result = await _update_sprint_item_status(
         db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
         expected_statuses=_ACTIVE_SPRINT_STATUSES,
@@ -1268,9 +1789,12 @@ async def complete_sprint_item(
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
         await _advance_task_chain(db, project_id, item_id)
-        if _evidence_quality_warning:
+        if _evidence_quality_warning or _stored_evidence_warning:
             result = dict(result)
-            result["evidence_quality_warning"] = _evidence_quality_warning
+            if _evidence_quality_warning:
+                result["evidence_quality_warning"] = _evidence_quality_warning
+            if _stored_evidence_warning:
+                result["stored_evidence_warning"] = _stored_evidence_warning
     return result
 
 
@@ -1427,6 +1951,14 @@ async def claim_sprint_item(
     because a superseded item's id can still reach an executor directly (a
     stale goal block, prior session memory) even when it never appears in a
     fresh listing.
+
+    4d1fb28f — ``required_tool`` (when set via ``update_sprint_item`` /
+    ``add_sprint_item``) is NOT a claim-time gate — it's advisory guidance,
+    not an enforced block, because Meridian cannot verify which tool an
+    executor actually invokes. It flows through on the returned dict (this
+    function's result is a full ``get_sprint_item`` row) so a caller that
+    claims directly (bypassing /goal's rendered ``<required_tool>``
+    directive) still sees the pin and can honour it.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
@@ -1470,6 +2002,39 @@ async def claim_sprint_item(
                 "claimable again."
                 + (f" Notes: {_notes}" if _notes else "")
             ),
+            "item_id": item_id,
+        }
+    # 74a8f420 — WAVE GATE STRUCTURAL ENFORCEMENT: an item whose wave sits
+    # beyond a configured-but-not-yet-passed wave gate boundary cannot be
+    # claimed. This is what turns wave gates (deterministic action pipelines —
+    # push_dev/push_main/deploy/wait/run_verification — attached to a wave or
+    # wave-range via configure_wave_gate) from advisory /goal prose into an
+    # actual claim-time block, the same class of fix as the DEFERRED/
+    # SUPERSEDED/UNPROSPECTED gates above. Fail-open: any DB error (e.g. the
+    # wave_gate_configs table not yet migrated) lets the claim proceed so a
+    # structural defect never permanently wedges the board.
+    try:
+        _blocking_gate = await _get_blocking_wave_gate(db, project_id, item.get("wave"))
+    except Exception:  # noqa: BLE001 — gate must never wedge the board
+        _blocking_gate = None
+    if _blocking_gate is not None:
+        _gate_end = _blocking_gate.get("wave_end")
+        return {
+            "blocked": True,
+            "error": "WAVE_GATE_PENDING",
+            "reason": (
+                f"Sprint item is in wave {item.get('wave')!r}, which sits beyond "
+                f"wave {_gate_end!r}'s configured gate pipeline "
+                f"({_blocking_gate.get('actions')!r}). That gate has not completed "
+                "yet — run its action pipeline (push_dev/push_main/deploy/wait/"
+                "run_verification as configured) then call complete_wave_gate("
+                f"project_id=..., wave_label={_gate_end!r}, verification_payload="
+                "<real run_verification result>) before this item can be claimed."
+            ),
+            "wave": item.get("wave"),
+            "gate_wave_start": _blocking_gate.get("wave_start"),
+            "gate_wave_end": _gate_end,
+            "gate_actions": _blocking_gate.get("actions"),
             "item_id": item_id,
         }
     # 94c26322 — refuse an unprospected item at claim time unless a human
@@ -1616,17 +2181,28 @@ async def patch_sprint_item(
     wave: Any = _UNSET,
     sprint_name: Any = _UNSET,
     prospect_bypass: Any = _UNSET,
+    depends_on: Any = _UNSET,
+    require_verification: Any = _UNSET,
+    required_tool: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
     item_group, touches_resources, required_notes, deferred_until, track,
-    priority, blocker_kind, sprint_name, prospect_bypass. Only
-    fields passed as non-None are changed;
+    priority, blocker_kind, sprint_name, prospect_bypass, depends_on,
+    require_verification, required_tool. Only fields passed as non-None are
+    changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
     so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
     / JSON string / comma-separated string of typed ids to set it.
+    ``depends_on`` (56f607ec) uses the ``_UNSET`` sentinel: omit to leave
+    unchanged, pass an empty string / ``None`` to CLEAR it (item becomes
+    independently claimable again), or another sprint item's id to set/fix
+    dependency ordering retroactively — previously ``depends_on`` could only
+    be set at creation time via ``add_sprint_item``, with no way to fix
+    ordering on an already-filed item. Raises ``ValueError`` if the id equals
+    ``item_id`` itself (a self-dependency would deadlock the item).
     ``deferred_until`` / ``track`` (dec69708) also use the ``_UNSET`` sentinel:
     omit to leave unchanged, pass an empty string / ``None`` to CLEAR the
     deferral (making the item immediately claimable again), or an ISO timestamp
@@ -1644,6 +2220,17 @@ async def patch_sprint_item(
     item through the goal-generation and claim gates), or ``False`` / ``0`` to
     CLEAR it (re-enabling the structural gate). Settable by planning/human sessions
     only — executor sessions should not set this field.
+    ``require_verification`` (e2e1b682) uses the ``_UNSET`` sentinel: omit to
+    leave unchanged, pass ``True`` / ``1`` to SET the independent
+    fresh-session verifier gate (completion via ``complete_sprint_item``
+    then requires an on-file PASS filed by a session distinct from the one
+    completing it), or ``False`` / ``0`` to CLEAR it (ordinary completion,
+    evidence gate only).
+    ``required_tool`` (4d1fb28f) uses the ``_UNSET`` sentinel: omit to leave
+    unchanged, pass an empty string / ``None`` to CLEAR the pin (ordinary
+    executor discretion), or a free-form tool/plugin name (e.g. 'Serena:
+    replace_symbol_body') to SET it — rendered as a hard directive in the
+    /goal block, not left to executor habit.
     """
     # 6a17e735 / ARCH 1B — separate the status change (routed through
     # _transition_status for guaranteed cache bust + live event) from the
@@ -1752,6 +2339,30 @@ async def patch_sprint_item(
         # it (re-enable the structural gate). Stored as INTEGER 0/1.
         ns_fields.append("prospect_bypass = ?")
         ns_values.append(1 if prospect_bypass else 0)
+    if depends_on is not _UNSET:
+        # 56f607ec — empty string / None CLEARS the dependency (item becomes
+        # independently claimable); otherwise set it to another item's id.
+        # Previously depends_on could only be fixed at creation time — this
+        # closes the gap that forced ordering into prose notes instead.
+        _dep = depends_on or None
+        if _dep is not None and _dep == item_id:
+            raise ValueError("depends_on cannot be the item's own id (self-dependency)")
+        ns_fields.append("depends_on = ?")
+        ns_values.append(_dep)
+    if require_verification is not _UNSET:
+        # e2e1b682 — True/1 SETS the independent fresh-session verifier gate
+        # (complete_sprint_item then requires an on-file PASS filed by a
+        # session distinct from the one completing it); False/0/None CLEARS it
+        # (ordinary completion, evidence gate only). Stored as INTEGER 0/1.
+        ns_fields.append("require_verification = ?")
+        ns_values.append(1 if require_verification else 0)
+    if required_tool is not _UNSET:
+        # 4d1fb28f — empty string / None CLEARS the pin (ordinary executor
+        # discretion); any other value sets the free-form required-tool name.
+        # No enum: tool/plugin names are arbitrary strings ('Serena:
+        # replace_symbol_body', a named tunnel plugin, 'meridian__patch_file').
+        ns_fields.append("required_tool = ?")
+        ns_values.append(required_tool or None)
 
     if not ns_fields and status_value is None:
         return await get_sprint_item(db, item_id)
@@ -3287,3 +3898,247 @@ async def complete_wave_gate(
         "next_wave_item_ids": next_wave_item_ids,
         "gate_id": gate_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# 74a8f420 — configure_wave_gate: deterministic, on-the-fly-configurable
+# action pipelines attached to a wave or wave-range, ENFORCED STRUCTURALLY by
+# claim_sprint_item (see the WAVE_GATE_PENDING check below) rather than being
+# advisory /goal prose. complete_wave_gate (d2430713, above) already recorded
+# *evidence* that a gate passed; this section adds the missing piece it
+# explicitly called out: a real config table so claim_sprint_item can look up
+# "is there a configured-but-unpassed gate between me and this item's wave"
+# instead of trusting the executor to have read the /goal text.
+#
+# A gate config is keyed by its ``wave_end`` — the boundary wave after which
+# the pipeline must run. ``wave_start`` documents the (possibly multi-wave)
+# range the gate covers (e.g. wave_start='wave-1', wave_end='wave-3' — one
+# gate checkpoint after waves 1-3, not one gate per wave). Only ``wave_end``
+# is used for enforcement: any item whose numeric wave sorts strictly after
+# wave_end, on the same "prefix-N" label family (e.g. 'wave-4' vs
+# 'wave-3'), is blocked at claim time until a matching wave_gate_results row
+# exists (written by complete_wave_gate once the pipeline's real
+# run_verification evidence is supplied).
+# ---------------------------------------------------------------------------
+
+# The only action types a gate pipeline may declare. push_dev/push_main/deploy
+# are executed by the executor via the trigger_workflow MCP tool; run_verification
+# maps 1:1 onto the run_verification MCP tool (whose real output is what
+# complete_wave_gate requires as evidence); wait is a plain pause step.
+_VALID_WAVE_GATE_ACTIONS = frozenset({
+    "push_dev", "push_main", "deploy", "wait", "run_verification",
+})
+
+_WAVE_GATE_CONFIGS_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS wave_gate_configs ("
+    "    id TEXT PRIMARY KEY,"
+    "    project_id TEXT NOT NULL,"
+    "    wave_start TEXT NOT NULL,"     # first wave covered by this gate (documentation)
+    "    wave_end TEXT NOT NULL,"       # boundary wave — enforcement key
+    "    actions TEXT NOT NULL,"        # JSON array of {"type": ..., ...params}
+    "    actor TEXT,"
+    "    created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+    "    updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
+    "    UNIQUE(project_id, wave_end)"  # one pipeline per boundary wave
+    ")"
+)
+
+
+async def _ensure_wave_gate_configs_table(db: aiosqlite.Connection) -> None:
+    """Idempotently create wave_gate_configs (called inline, tolerates concurrent init)."""
+    await db.execute(_WAVE_GATE_CONFIGS_TABLE_DDL)
+
+
+def _split_wave_label(wave_label: str | None) -> tuple[str | None, int | None]:
+    """Parse a 'prefix-N' wave label (e.g. 'wave-3') into (prefix, N).
+
+    Returns (None, None) for anything that doesn't match — callers treat that
+    as "not comparable" and fail open (no gate enforcement possible without a
+    parseable ordering), mirroring complete_wave_gate's own next-wave-label
+    parsing.
+    """
+    if not wave_label:
+        return (None, None)
+    _parts = str(wave_label).rsplit("-", 1)
+    if len(_parts) == 2 and _parts[1].isdigit():
+        return (_parts[0], int(_parts[1]))
+    return (None, None)
+
+
+async def configure_wave_gate(
+    db: aiosqlite.Connection,
+    project_id: str,
+    wave_end: str,
+    actions: list[dict[str, Any]],
+    wave_start: str | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """74a8f420 — configure (or on-the-fly reconfigure) a wave gate's action pipeline.
+
+    ``wave_end`` (e.g. 'wave-3') is the boundary: claim_sprint_item structurally
+    refuses to claim any item whose wave sorts strictly after wave_end until a
+    matching ``wave_gate_results`` row exists (written by complete_wave_gate).
+    ``wave_start`` (defaults to wave_end) documents the range covered — e.g.
+    wave_start='wave-1', wave_end='wave-3' is one deploy checkpoint after three
+    waves' worth of items, not three separate gates.
+
+    ``actions`` is the deterministic pipeline: an ordered, non-empty list of
+    dicts, each with a ``type`` in push_dev | push_main | deploy | wait |
+    run_verification (extra keys — e.g. {"type": "wait", "seconds": 30} — are
+    preserved verbatim for the executor to read).
+
+    Re-configuring an already-configured (but not yet passed) ``wave_end`` is
+    an upsert — this is the "on-the-fly-configurable" half of the spec: a
+    planner can revise the pipeline for a wave boundary right up until an
+    executor actually completes it. Once wave_gate_results has a row for
+    wave_end the config is immutable (raises ValueError) — rewriting a passed
+    gate's pipeline after the fact would silently invalidate evidence that
+    claim_sprint_item already relied on to unblock items.
+    """
+    wave_end = str(wave_end or "").strip()
+    if not wave_end:
+        raise ValueError("configure_wave_gate requires a non-empty wave_end")
+    wave_start = str(wave_start).strip() if wave_start else wave_end
+    if not isinstance(actions, list) or not actions:
+        raise ValueError(
+            "configure_wave_gate requires a non-empty actions list — the "
+            "deterministic pipeline (push_dev/push_main/deploy/wait/"
+            "run_verification) that must run before the next wave unlocks."
+        )
+    _normalized: list[dict[str, Any]] = []
+    for _i, _action in enumerate(actions):
+        if not isinstance(_action, dict) or not _action.get("type"):
+            raise ValueError(
+                f"configure_wave_gate: actions[{_i}] must be a dict with a "
+                f"'type' key, got {_action!r}"
+            )
+        _atype = str(_action["type"]).strip().lower()
+        if _atype not in _VALID_WAVE_GATE_ACTIONS:
+            raise ValueError(
+                f"configure_wave_gate: actions[{_i}].type={_atype!r} is not "
+                f"one of the supported actions: {sorted(_VALID_WAVE_GATE_ACTIONS)}"
+            )
+        _normalized.append({**_action, "type": _atype})
+
+    await _ensure_wave_gate_configs_table(db)
+    await _ensure_wave_gate_results_table(db)
+
+    # A passed gate's config is immutable — see docstring.
+    async with db.execute(
+        "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
+        (project_id, wave_end),
+    ) as _res_cur:
+        _already_passed = await _res_cur.fetchone()
+    if _already_passed is not None:
+        raise ValueError(
+            f"Wave gate for {wave_end!r} on project {project_id!r} has already "
+            "completed — its pipeline is immutable. Configure a NEW wave_end "
+            "boundary instead of reconfiguring a passed gate."
+        )
+
+    _actions_json = json.dumps(_normalized)
+    async with db.execute(
+        "SELECT id FROM wave_gate_configs WHERE project_id = ? AND wave_end = ?",
+        (project_id, wave_end),
+    ) as _cfg_cur:
+        _existing = await _cfg_cur.fetchone()
+    if _existing is not None:
+        _config_id = _existing["id"] if isinstance(_existing, dict) else _existing[0]
+        await db.execute(
+            "UPDATE wave_gate_configs SET wave_start = ?, actions = ?, actor = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (wave_start, _actions_json, actor, _config_id),
+        )
+    else:
+        _config_id = _new_id()
+        await db.execute(
+            "INSERT INTO wave_gate_configs "
+            "(id, project_id, wave_start, wave_end, actions, actor) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (_config_id, project_id, wave_start, wave_end, _actions_json, actor),
+        )
+    await db.commit()
+
+    return {
+        "configured": True,
+        "gate_config_id": _config_id,
+        "project_id": project_id,
+        "wave_start": wave_start,
+        "wave_end": wave_end,
+        "actions": _normalized,
+    }
+
+
+async def get_wave_gate_configs(
+    db: aiosqlite.Connection, project_id: str,
+) -> list[dict[str, Any]]:
+    """Read-only: list every configured wave gate for a project (oldest first),
+    each annotated with ``gate_passed`` (whether wave_gate_results already has
+    a matching row) so callers don't need a second query to know what's still
+    pending."""
+    await _ensure_wave_gate_configs_table(db)
+    await _ensure_wave_gate_results_table(db)
+    async with db.execute(
+        "SELECT * FROM wave_gate_configs WHERE project_id = ? ORDER BY created_at",
+        (project_id,),
+    ) as _cur:
+        _rows = await _cur.fetchall()
+    out: list[dict[str, Any]] = []
+    for _row in _rows:
+        _cfg = _row_to_dict(_row) or {}
+        try:
+            _cfg["actions"] = json.loads(_cfg.get("actions") or "[]")
+        except (TypeError, ValueError):
+            _cfg["actions"] = []
+        async with db.execute(
+            "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
+            (project_id, _cfg.get("wave_end")),
+        ) as _res_cur:
+            _cfg["gate_passed"] = (await _res_cur.fetchone()) is not None
+        out.append(_cfg)
+    return out
+
+
+async def _get_blocking_wave_gate(
+    db: aiosqlite.Connection, project_id: str, item_wave: str | None,
+) -> dict[str, Any] | None:
+    """Return the lowest-boundary configured-but-unpassed wave gate that
+    structurally blocks claiming an item in ``item_wave``, or None if nothing
+    blocks it (no wave on the item, no configs, an unparseable wave label, or
+    every configured boundary at-or-below this wave has already passed).
+
+    This is the function claim_sprint_item calls to turn wave gates from
+    advisory /goal prose into a real, structural claim-time block.
+    """
+    _item_prefix, _item_num = _split_wave_label(item_wave)
+    if _item_num is None:
+        return None
+    await _ensure_wave_gate_configs_table(db)
+    await _ensure_wave_gate_results_table(db)
+    async with db.execute(
+        "SELECT * FROM wave_gate_configs WHERE project_id = ?",
+        (project_id,),
+    ) as _cur:
+        _configs = await _cur.fetchall()
+    _blocking: dict[str, Any] | None = None
+    _blocking_num: int | None = None
+    for _row in _configs:
+        _cfg = _row_to_dict(_row) or {}
+        _cfg_prefix, _cfg_num = _split_wave_label(_cfg.get("wave_end"))
+        if _cfg_num is None or _cfg_prefix != _item_prefix or _cfg_num >= _item_num:
+            continue  # not a boundary strictly before this item's wave
+        async with db.execute(
+            "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
+            (project_id, _cfg.get("wave_end")),
+        ) as _res_cur:
+            _passed = await _res_cur.fetchone()
+        if _passed is not None:
+            continue  # this boundary's gate already passed
+        if _blocking_num is None or _cfg_num < _blocking_num:
+            try:
+                _cfg["actions"] = json.loads(_cfg.get("actions") or "[]")
+            except (TypeError, ValueError):
+                _cfg["actions"] = []
+            _blocking = _cfg
+            _blocking_num = _cfg_num
+    return _blocking

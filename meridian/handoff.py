@@ -32,7 +32,7 @@ import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from . import db as db_module
-from .db.sprint_items import _item_is_unprospected
+from .db.sprint_items import _item_is_unprospected, _split_wave_label
 from .executor_config import build_executor_config_block, has_executor_config
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -277,6 +277,58 @@ def _format_content(content) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, indent=2)
+
+
+# 08c355c2 — staleness threshold for the legacy goal_states.sprint free-text
+# field. Once sprint-item tracking is in use, this field is never updated, so
+# months-old text silently renders at equal weight to current data. Any sprint
+# text not updated within this many days IS demoted / warned in the handoff;
+# a project with no sprint items (not yet using item tracking) is exempt since
+# the free-text field is still the only sprint signal available.
+_SPRINT_STALE_DAYS = 30
+
+
+def _sprint_stale_days(
+    goal: "dict[str, Any] | None",
+    has_sprint_items: bool,
+) -> "int | None":
+    """08c355c2 — return how many whole days the goal.sprint field has been
+    stale, or None when it is NOT considered stale.
+
+    A sprint is stale when:
+    * the project has sprint items (item-tracking is active — the free-text
+      field is therefore superseded and no longer maintained), AND
+    * the ``sprint_updated_at`` timestamp on the goal row is older than
+      ``_SPRINT_STALE_DAYS``.
+
+    Returns ``None`` when:
+    * ``has_sprint_items`` is False (item tracking not yet active; the field
+      is still the only signal and must be shown),
+    * the sprint field itself is empty/None (nothing to demote),
+    * ``sprint_updated_at`` is absent/unparseable (pre-migration rows; fail-
+      safe: don't demote on missing data),
+    * the field is within the freshness window.
+
+    This is a pure function — no I/O — so it is trivially unit-testable.
+    """
+    if not has_sprint_items:
+        return None
+    if not goal:
+        return None
+    sprint_text = (goal.get("sprint") or "").strip()
+    if not sprint_text:
+        return None
+    updated_at_raw = goal.get("sprint_updated_at") or goal.get("updated_at")
+    if not updated_at_raw:
+        return None  # no timestamp — fail-safe: don't demote
+    updated_dt = _parse_ts(updated_at_raw)
+    if updated_dt is None:
+        return None  # unparseable — fail-safe
+    now = datetime.now()  # naive, same as _parse_ts output
+    age_days = (now - updated_dt).days
+    if age_days >= _SPRINT_STALE_DAYS:
+        return age_days
+    return None
 
 
 # 2d6d8677 — cap each embedded per-item body so a handoff can't balloon past the
@@ -581,6 +633,7 @@ def _build_quick_start_goal(
     loop_enabled: bool = False,
     parallel_groups: dict[str, Any] | None = None,
     model_tier_hints: bool = False,
+    wave_gate_pending: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -603,6 +656,16 @@ def _build_quick_start_goal(
     mode 0 — "stop if HITL triggered"; mode 1/2 — "Do NOT file HITLs, skip
     blocked items and continue" (the auto-answer path never blocks the executor,
     so the old "stop if HITL triggered" clause was dead code for modes 1/2).
+
+    ``wave_gate_pending`` (74a8f420) is the caller-precomputed list of configured
+    wave gates that have NOT yet passed (each dict has at least ``wave_end`` and
+    ``actions``, as returned by ``db.get_wave_gate_configs`` filtered to
+    ``gate_passed=False``). Any pending item whose wave sorts beyond a pending
+    gate's ``wave_end`` boundary is excluded from the claimable batch with a
+    structured ``<excluded_wave_gate_pending>`` note — mirroring what
+    claim_sprint_item's own WAVE_GATE_PENDING check will refuse at claim time.
+    This is what makes wave gates ENFORCED rather than advisory /goal prose: the
+    /goal never hands out an item the executor can't actually claim.
     """
     try:
         _turns = int(max_turns)
@@ -671,6 +734,60 @@ def _build_quick_start_goal(
             "session must call update_sprint_item(item_id=..., prospect_bypass=true). "
             "Executors must NOT set prospect_bypass themselves. -->"
         )
+    # 74a8f420 — WAVE GATE STRUCTURAL ENFORCEMENT: exclude items whose wave sits
+    # beyond a configured-but-unpassed wave gate boundary from the claimable
+    # batch, mirroring the unprospected-gate exclusion above. This is what makes
+    # wave gates ENFORCED rather than advisory /goal prose: claim_sprint_item
+    # will structurally refuse (WAVE_GATE_PENDING) any of these items anyway, so
+    # the /goal never hands one out as if it were immediately claimable.
+    _excluded_wave_gated: list[dict[str, Any]] = []
+    if wave_gate_pending:
+        _pending_gates = [
+            g for g in wave_gate_pending if not g.get("gate_passed")
+        ]
+
+        def _blocking_gate_for(_wave: str | None) -> dict[str, Any] | None:
+            _prefix, _num = _split_wave_label(_wave)
+            if _num is None:
+                return None
+            _best: dict[str, Any] | None = None
+            _best_num: int | None = None
+            for _g in _pending_gates:
+                _g_prefix, _g_num = _split_wave_label(_g.get("wave_end"))
+                if _g_num is None or _g_prefix != _prefix or _g_num >= _num:
+                    continue
+                if _best_num is None or _g_num < _best_num:
+                    _best, _best_num = _g, _g_num
+            return _best
+
+        _kept: list[dict[str, Any]] = []
+        for _it in pending_sprint_items:
+            _gate = _blocking_gate_for(_it.get("wave"))
+            if _gate is not None:
+                _excluded_wave_gated.append({**_it, "_blocking_gate": _gate})
+            else:
+                _kept.append(_it)
+        pending_sprint_items = _kept
+    _excluded_wave_gate_note = ""
+    if _excluded_wave_gated:
+        _exc_ids = ", ".join(it["id"] for it in _excluded_wave_gated if it.get("id"))
+        _exc_n = len(_excluded_wave_gated)
+        _boundaries = sorted({
+            it["_blocking_gate"].get("wave_end")
+            for it in _excluded_wave_gated
+            if it.get("_blocking_gate", {}).get("wave_end")
+        })
+        _excluded_wave_gate_note = (
+            f'\n<excluded_wave_gate_pending count="{_exc_n}">'
+            f"{_xml_escape(_exc_ids)}"
+            "</excluded_wave_gate_pending>"
+            "\n<!-- These items are structurally blocked by claim_sprint_item "
+            f"until the wave gate(s) at {_xml_escape(', '.join(_boundaries))} "
+            "complete: run the configured action pipeline (push_dev/push_main/"
+            "deploy/wait/run_verification) then call complete_wave_gate with the "
+            "real run_verification result. This is enforced at claim time, not "
+            "just this prose note. -->"
+        )
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     if not item_ids:
         # 5abf3e12 — empty-board branch: same constraints as before (verify,
@@ -690,6 +807,7 @@ def _build_quick_start_goal(
             f"{_xml_escape(_hitl_clause)}</stop_conditions>"
             f"{_manual_note}"
             f"{_excluded_unprospected_note}"
+            f"{_excluded_wave_gate_note}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -832,8 +950,12 @@ def _build_quick_start_goal(
         # project has model_tier_hints_enabled on AND at least one item carries a
         # suggested_model annotation. Hint only — not an enforced model switch.
         + _build_model_hints_clause(pending_sprint_items, enabled=model_tier_hints)
+        # 4d1fb28f — item-level tool/plugin pin: hard guidance, unconditional
+        # (unlike the model-tier hint above, which is opt-in and soft).
+        + _build_required_tool_clause(pending_sprint_items)
         + f"{_manual_note}"
         f"{_excluded_unprospected_note}"
+        f"{_excluded_wave_gate_note}"
     )
 
 
@@ -862,6 +984,35 @@ def _build_model_hints_clause(
         + "; ".join(hints)
     )
     return f"\n<model_hints>{_xml_escape(body)}</model_hints>"
+
+
+def _build_required_tool_clause(items: list[dict[str, Any]]) -> str:
+    """4d1fb28f — build a ``<required_tool>`` XML clause for the /goal block.
+
+    Refiled from a stuck original attempt (3a92ad62), tied to GitHub issue
+    #8/#13: a planner can pin the specific MCP tool/plugin an item MUST use
+    (via ``update_sprint_item(required_tool=...)`` / ``add_sprint_item``)
+    instead of leaving tool choice to executor habit.
+
+    UNLIKE ``_build_model_hints_clause`` (a soft hint, gated behind an opt-in
+    ``model_tier_hints`` flag), this is rendered UNCONDITIONALLY whenever any
+    pending item carries a ``required_tool`` pin — it's hard guidance, not a
+    suggestion the executor can weigh and skip. Returns an empty string when
+    no item in the batch has a pin set, so it never adds noise to an ordinary
+    /goal.
+    """
+    pins = [
+        f"{it['id']}: {it['required_tool']}"
+        for it in items
+        if it.get("id") and it.get("required_tool")
+    ]
+    if not pins:
+        return ""
+    body = (
+        "The following sprint items MUST use the named tool/plugin — this is "
+        "a hard requirement, not a suggestion: " + "; ".join(pins)
+    )
+    return f"\n<required_tool>{_xml_escape(body)}</required_tool>"
 
 
 def build_item_briefing(
@@ -916,6 +1067,7 @@ def build_item_briefing(
     depends_on = (item.get("depends_on") or "").strip()
     blocker_kind = (item.get("blocker_kind") or "").strip()
     milestone_type = (item.get("milestone_type") or "task").strip()
+    required_tool = (item.get("required_tool") or "").strip()
 
     # Render the touches_resources field as a readable list of paths/identifiers.
     raw_resources = item.get("touches_resources")
@@ -1009,6 +1161,19 @@ def build_item_briefing(
     ]
     if resources_text:
         parts.append(f"<resources>{_xml_escape(resources_text)}</resources>")
+    # 4d1fb28f — item-level tool/plugin pin: rendered as a dedicated, hard
+    # directive tag (not folded into <task> prose) so it reaches the executor
+    # as guidance it cannot skim past, mirroring the batch /goal's
+    # <required_tool> clause (_build_required_tool_clause).
+    if required_tool:
+        parts.append(
+            "<required_tool>"
+            + _xml_escape(
+                f"This item MUST use the following tool/plugin — this is a "
+                f"hard requirement, not a suggestion: {required_tool}"
+            )
+            + "</required_tool>"
+        )
     parts += [
         f"<completion_criteria>{_xml_escape(completion_text)}</completion_criteria>",
         f"<not_done_until>{_xml_escape(not_done_text)}</not_done_until>",
@@ -2751,6 +2916,10 @@ _SPRINT_GUARD_SH = """#!/usr/bin/env bash
 # b4ce3274 — bounded retry ceiling: the server stops reporting pending>0 for a
 # session after MERIDIAN_STOP_OVERRIDE_CEILING forced continuations, so this
 # guard then lets the stop through (exit 0) instead of blocking forever.
+# e2e1b682 — verification_pending_count is ADVISORY ONLY: it surfaces items
+# flagged require_verification that are still missing an independent
+# fresh-session PASS, but never changes the exit code (only
+# complete_sprint_item's structural gate blocks the completion itself).
 set -uo pipefail
 PROJECT_ID="__PROJECT_ID__"
 MERIDIAN_URL="${MERIDIAN_URL:-__URL__}"
@@ -2776,6 +2945,10 @@ fi
 if printf '%s' "$resp" | grep -Eq '"stopped_at_ceiling"[[:space:]]*:[[:space:]]*true'; then
   echo "Meridian: stop-override ceiling reached — allowing stop despite pending items; generate a delta handoff." >&2
 fi
+verpending="$(printf '%s' "$resp" | grep -oE '"verification_pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
+if [ -n "$verpending" ] && [ "$verpending" -gt 0 ] 2>/dev/null; then
+  echo "Meridian: $verpending item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet)." >&2
+fi
 exit 0
 """
 
@@ -2785,6 +2958,10 @@ _SPRINT_GUARD_PS1 = """# c0d2356d — Claude Code Stop hook (auto-written by gen
 # b4ce3274 — bounded retry ceiling: after MERIDIAN_STOP_OVERRIDE_CEILING forced
 # continuations the server reports pending 0 + stopped_at_ceiling, so this guard
 # lets the stop through instead of blocking forever.
+# e2e1b682 — verification_pending_count is ADVISORY ONLY: it surfaces items
+# flagged require_verification that are still missing an independent
+# fresh-session PASS, but never changes the exit code (only
+# complete_sprint_item's structural gate blocks the completion itself).
 $ErrorActionPreference = 'SilentlyContinue'
 $ProjectId = '__PROJECT_ID__'
 $Url = if ($env:MERIDIAN_URL) { $env:MERIDIAN_URL } else { '__URL__' }
@@ -2809,8 +2986,110 @@ if ($pending -gt 0) {
 if ($r.stopped_at_ceiling -eq $true) {
     [Console]::Error.WriteLine("Meridian: stop-override ceiling reached - allowing stop despite pending items; generate a delta handoff.")
 }
+if ($null -ne $r.verification_pending_count -and [int]$r.verification_pending_count -gt 0) {
+    [Console]::Error.WriteLine("Meridian: $([int]$r.verification_pending_count) item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet).")
+}
 exit 0
 """
+
+
+def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
+    """273287cb — render the file(s) to write for one ``custom_hooks`` row.
+
+    Returns a ``{filename: content}`` mapping (relative to ``.claude/hooks/``).
+    One to three files depending on ``blocking`` / whether ``script_ps1`` is set:
+
+    * ``blocking=True``  — the script is written byte-for-byte (one file per
+      language provided). Its own exit code drives Claude Code's real
+      exit-code-blocking semantics (exit 2 blocks a PreToolUse call / a Stop /
+      feeds PostToolUse output back to the model) — same contract as
+      sprint_guard.{sh,ps1} today.
+    * ``blocking=False`` — "strong suggestion power" without determinism: the
+      script still runs and its stderr/stdout still surface, but an exit code
+      of 2 is downgraded to 1 so it can never hard-block.
+        - sh: wrapped in a ``( ... )`` subshell (a genuine child process, so a
+          bare ``exit N`` inside the user's script only ends the subshell —
+          the wrapper script keeps running to inspect ``$?`` and decide the
+          real exit code).
+        - ps1: PowerShell's ``exit`` statement cannot be intercepted within a
+          single process (it isn't a shadow-able function), so the user's body
+          is written to a companion ``<slug>_body.ps1`` and the wrapper
+          invokes it as a genuine child process (``& powershell -File ...``),
+          which inherits stdin/stdout/stderr and reports its exit code via
+          ``$LASTEXITCODE`` — the same isolation the sh subshell gets for free.
+    """
+    slug = hook["slug"]
+    name = hook.get("name") or slug
+    event = hook["event"]
+    matcher = hook.get("matcher") or ""
+    blocking = bool(hook.get("blocking", 1))
+    header_bits = [f"event={event}"]
+    if matcher:
+        header_bits.append(f"matcher={matcher}")
+    header_bits.append("blocking" if blocking else "advisory (non-blocking)")
+    header = (
+        f"# Meridian user-defined hook '{name}' ({', '.join(header_bits)}).\n"
+        f"# Auto-written by generate_handoff from custom_hooks (273287cb) — edit via "
+        f"the add_custom_hook/update_custom_hook MCP tools, not this file directly.\n"
+    )
+    out: dict[str, str] = {}
+
+    script_sh = (hook.get("script_sh") or "").strip("\n")
+    if script_sh:
+        if blocking:
+            out[f"{slug}.sh"] = header + script_sh + "\n"
+        else:
+            out[f"{slug}.sh"] = (
+                header
+                + "set -uo pipefail\n"
+                + "(\n"
+                + script_sh + "\n"
+                + ")\n"
+                + '_meridian_hook_rc=$?\n'
+                + 'if [ "$_meridian_hook_rc" -eq 2 ]; then\n'
+                + f'  echo "Meridian: hook \'{name}\' would have blocked '
+                  '(advisory mode -- downgraded to non-blocking)" >&2\n'
+                + "  exit 1\n"
+                + "fi\n"
+                + 'exit "$_meridian_hook_rc"\n'
+            )
+
+    script_ps1 = (hook.get("script_ps1") or "").strip("\n")
+    if script_ps1:
+        if blocking:
+            out[f"{slug}.ps1"] = header + script_ps1 + "\n"
+        else:
+            body_name = f"{slug}_body.ps1"
+            out[body_name] = header + script_ps1 + "\n"
+            out[f"{slug}.ps1"] = (
+                header
+                + "$ErrorActionPreference = 'SilentlyContinue'\n"
+                + f'& powershell -NoProfile -NonInteractive -File "$PSScriptRoot\\{body_name}"\n'
+                + "$_meridianHookRc = $LASTEXITCODE\n"
+                + "if ($_meridianHookRc -eq 2) {\n"
+                + f"    [Console]::Error.WriteLine(\"Meridian: hook '{name}' would have "
+                  "blocked (advisory mode - downgraded to non-blocking)\")\n"
+                + "    exit 1\n"
+                + "}\n"
+                + "exit $_meridianHookRc\n"
+            )
+    return out
+
+
+async def _write_custom_hooks(db: aiosqlite.Connection, project_id: str, hooks_dir: Path) -> None:
+    """273287cb — (re)write every enabled ``custom_hooks`` row for ``project_id``
+    into ``hooks_dir``. Called from ``_write_sprint_guard_hooks`` under the same
+    best-effort try/except (a failure here must never break the handoff).
+    Never touches ``sprint_guard.{sh,ps1}`` — ``add_custom_hook`` already
+    rejects the reserved ``sprint_guard`` slug, and this is a second,
+    defense-in-depth skip in case a row somehow bypassed that check.
+    """
+    hooks = await db_module.get_custom_hooks(db, project_id, enabled_only=True)
+    for hook in hooks:
+        if hook.get("slug") in db_module._RESERVED_HOOK_SLUGS:  # noqa: SLF001
+            continue
+        for filename, content in _render_custom_hook_files(hook).items():
+            (hooks_dir / filename).write_text(content, encoding="utf-8")
 
 
 async def _write_sprint_guard_hooks(
@@ -2819,8 +3098,13 @@ async def _write_sprint_guard_hooks(
     """c0d2356d — write .claude/hooks/sprint_guard.{sh,ps1} into the repo with
     ``project_id`` + MERIDIAN_URL baked in. Best-effort: a read-only /
     site-packages install (no writable .claude) must never break the mandatory
-    handoff, so all failures are swallowed. Only ever writes the sprint_guard.*
-    files — never the token-rotation hooks.* scripts.
+    handoff, so all failures are swallowed.
+
+    273287cb — generalized past sprint_guard: after writing the (always-on)
+    sprint_guard files, also (re)writes every enabled row from this project's
+    ``custom_hooks`` table (see ``_write_custom_hooks`` / ``_render_custom_hook_files``)
+    — user-creatable PreToolUse/PostToolUse/Stop hooks, injected into the repo
+    by the same mechanism as sprint_guard.
 
     Skips the repo-side write during the test suite (it would dirty the committed
     .claude/hooks); tests pass an isolated ``root`` to exercise it directly.
@@ -2856,6 +3140,7 @@ async def _write_sprint_guard_hooks(
         ps1 = _SPRINT_GUARD_PS1.replace("__PROJECT_ID__", project_id).replace("__URL__", url)
         (hooks_dir / "sprint_guard.sh").write_text(sh, encoding="utf-8")
         (hooks_dir / "sprint_guard.ps1").write_text(ps1, encoding="utf-8")
+        await _write_custom_hooks(db, project_id, hooks_dir)
     except Exception:  # noqa: BLE001 — never break handoff on a hook-write failure
         pass
 
@@ -2917,13 +3202,21 @@ async def _generate_handoff_l0(
 
 
 def _build_readiness_block(
-    sprint: str | None,
+    sprint: "str | None",
     pending_count: int,
     decisions_count: int,
+    sprint_stale_days: "int | None" = None,
 ) -> str:
     """Build the =HANDOFF READINESS= header block prepended to every handoff."""
     lines = ["=== HANDOFF READINESS ==="]
-    if sprint:
+    if sprint_stale_days is not None:
+        # 08c355c2 — sprint field is stale: demote it with an age warning so
+        # an executor reading the readiness block sees that this text is old
+        # and sprint items are the authoritative source of work.
+        lines.append(
+            f"⚠ Sprint (STALE — {sprint_stale_days}d old, superseded by sprint items): {sprint}"
+        )
+    elif sprint:
         lines.append(f"✓ Sprint: {sprint}")
     else:
         lines.append("⚠ No sprint name set")
@@ -3302,6 +3595,16 @@ async def generate_handoff(
         _parallel_groups = await db_module.get_parallelizable_groups(db, project_id)
     except Exception:  # noqa: BLE001
         _parallel_groups = None
+    # 74a8f420 — feed configured-but-unpassed wave gates into the /goal so a
+    # gated item is excluded from the claimable batch instead of being handed
+    # out only to be refused by claim_sprint_item's WAVE_GATE_PENDING check.
+    # Guarded + fail-open: any failure (e.g. pre-migration DB) degrades to no
+    # wave-gate exclusion.
+    _wave_gate_pending = None
+    try:
+        _wave_gate_pending = await db_module.get_wave_gate_configs(db, project_id)
+    except Exception:  # noqa: BLE001
+        _wave_gate_pending = None
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=db_module.normalize_execution_mode(
@@ -3315,6 +3618,7 @@ async def generate_handoff(
         parallel_groups=_parallel_groups,
         # 81396666 — pass the model-tier toggle so the /goal includes per-item hints.
         model_tier_hints=_model_hints_on,
+        wave_gate_pending=_wave_gate_pending,
     )
     # dd07ece0 — embed a provenance token near the top of the /goal block so a
     # receiving session can call verify_handoff_token(project_id, token) to
@@ -3377,6 +3681,13 @@ async def generate_handoff(
         ai_summary = await _generate_ai_summary(
             l1_tasks, goal.get("sprint"), summarizer=summarizer
         )
+
+    # 08c355c2 — compute how stale the legacy goal.sprint free-text field is.
+    # This is used in both the full Jinja2 template and the readiness block to
+    # demote/warn about months-old sprint text that hasn't been updated since
+    # sprint-item tracking took over as the authoritative source of work.
+    _has_any_sprint_items = bool(sprint_items_all)
+    _sprint_stale = _sprint_stale_days(goal, _has_any_sprint_items)
 
     if mode == "delta":
         # 00dbeed0 — since_ts MUST be durable, not the in-memory
@@ -3469,6 +3780,9 @@ async def generate_handoff(
                 decisions_log=decisions_log,
                 ai_summary=ai_summary,
                 quick_start_goal=quick_start_goal,
+                # 08c355c2 — staleness days for the legacy sprint text field;
+                # None when fresh/exempt (no items, or updated recently).
+                sprint_stale_days=_sprint_stale,
             )
 
     # 302db181 — computed session span: first + last activity, distinct calendar
@@ -3493,6 +3807,7 @@ async def generate_handoff(
         sprint=goal.get("sprint"),
         pending_count=len(pending_sprint_items),
         decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
+        sprint_stale_days=_sprint_stale,
     )
     content = f"{readiness_block}\n\n{content}"
 
@@ -3847,6 +4162,13 @@ async def _generate_starter_handoff(
         _s_parallel_groups = await db_module.get_parallelizable_groups(db, project["id"])
     except Exception:  # noqa: BLE001
         _s_parallel_groups = None
+    # 74a8f420 — see the twin comment in generate_handoff: exclude items gated
+    # behind a configured-but-unpassed wave gate boundary. Guarded, fail-open.
+    _s_wave_gate_pending = None
+    try:
+        _s_wave_gate_pending = await db_module.get_wave_gate_configs(db, project["id"])
+    except Exception:  # noqa: BLE001
+        _s_wave_gate_pending = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=db_module.normalize_execution_mode(
@@ -3858,6 +4180,7 @@ async def _generate_starter_handoff(
         goal_group_style=_goal_group_style_from_settings(settings),
         loop_enabled=_loop_enabled_from_settings(settings, _s_ws_settings),
         parallel_groups=_s_parallel_groups,
+        wave_gate_pending=_s_wave_gate_pending,
     )
     # 77a29c8b — fetch recent tasks so blocked/found diagnostic entries are
     # visible even in the minimal starter path (guarded: never break handoff).

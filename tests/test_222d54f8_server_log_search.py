@@ -461,3 +461,140 @@ async def test_handle_search_server_logs_empty_query(db, tmp_path):
     )
     assert "error" in result
     assert result["hits"] == []
+
+
+# ---------------------------------------------------------------------------
+# 36a401fa — deadline-skip / lazy-pending escape hatch for sync()'s
+# _rebuild_fts() call (verifying whether the b1789c0d cold-index failure
+# on OutputsFtsIndex was inherited here).
+#
+# Before this fix, ServerLogFtsIndex.sync() called self._rebuild_fts(con)
+# unconditionally whenever rows changed, with NO deadline check at all --
+# the same "monolithic full-rebuild, no budget" shape that caused
+# b1789c0d/de33589b once OutputsFtsIndex's data source outgrew what a
+# synchronous rebuild could do inside the external MCP client timeout.
+# server_logs is capped small today (2000-row ring buffer), so the failure
+# was not YET reachable in practice, but nothing enforced that invariant.
+# ---------------------------------------------------------------------------
+
+class TestSyncDeadlineSkip:
+    def test_sync_skips_fts_rebuild_when_deadline_already_passed(self):
+        """An already-expired max_seconds must skip _rebuild_fts() entirely,
+        writing rows but deferring the FTS build via _fts_pending."""
+        pytest.importorskip("duckdb")
+        idx = ServerLogFtsIndex(db_path=":memory:")
+        fts_call_count = [0]
+        real_rebuild_fts = idx._rebuild_fts
+
+        def counting_rebuild_fts(con: Any) -> None:
+            fts_call_count[0] += 1
+            real_rebuild_fts(con)
+
+        idx._rebuild_fts = counting_rebuild_fts
+        try:
+            rows = _make_realistic_rows()
+            # Deeply-negative budget: deadline is already in the past.
+            total = idx.sync(rows, max_seconds=-1.0)
+            assert total == len(rows)
+            assert fts_call_count[0] == 0, (
+                "36a401fa: _rebuild_fts() must be skipped when the sync() "
+                "deadline has already passed"
+            )
+            assert idx._fts_pending is True
+            assert idx.last_sync_partial is True
+            # Rows were still written even though FTS was deferred.
+            assert idx._last_sync_count == len(rows)
+        finally:
+            idx.close()
+
+    def test_search_lazily_builds_fts_after_deadline_skip(self):
+        """After a deadline-skipped sync(), the next search() call performs
+        the deferred FTS build with a fresh budget and returns real hits."""
+        pytest.importorskip("duckdb")
+        idx = ServerLogFtsIndex(db_path=":memory:")
+        try:
+            rows = _make_realistic_rows()
+            idx.sync(rows, max_seconds=-1.0)
+            assert idx._fts_built is False
+            assert idx._fts_pending is True
+
+            hits = idx.search("OAuth token refresh")
+            assert len(hits) >= 1
+            assert idx._fts_built is True
+            assert idx._fts_pending is False
+        finally:
+            idx.close()
+
+    def test_sync_default_budget_completes_normally(self):
+        """The default (generous) budget must behave exactly as before: FTS
+        builds inline within sync(), no partial/pending state left behind."""
+        pytest.importorskip("duckdb")
+        idx = ServerLogFtsIndex(db_path=":memory:")
+        try:
+            rows = _make_realistic_rows()
+            idx.sync(rows)
+            assert idx._fts_built is True
+            assert idx._fts_pending is False
+            assert idx.last_sync_partial is False
+            hits = idx.search("OAuth")
+            assert len(hits) >= 1
+        finally:
+            idx.close()
+
+    def test_module_fn_search_server_logs_surfaces_partial_on_deadline_skip(
+        self, tmp_path,
+    ):
+        """search_server_logs() must surface partial=True when the sync()
+        deadline is hit, mirroring search_outputs()'s b1789c0d contract, and
+        must NOT return a silent, unexplained empty/ambiguous result.
+
+        Uses a unique tmp_path db_path (not ":memory:") for isolation --
+        ":memory:" is a shared cache key (see _index_cache), so reusing it
+        across tests would alias onto whatever index another test already
+        built for that key.
+
+        Note: with an already-expired deadline (max_seconds=-1.0), sync()
+        defers _rebuild_fts() (verified directly against ServerLogFtsIndex in
+        test_sync_skips_fts_rebuild_when_deadline_already_passed above), but
+        the module function's own immediate follow-up call to index.search()
+        has no deadline of its own, so for a small row count it recovers
+        inline within the SAME call -- real hits ARE returned here.  The
+        durable signal a caller can rely on is `partial=True` (sourced from
+        last_sync_partial, which is not reset by search()), confirming the
+        FTS rebuild itself was deferred by sync() rather than paid for
+        unconditionally, exactly the invariant b1789c0d/de33589b required.
+        """
+        pytest.importorskip("duckdb")
+        db_path = str(tmp_path / "test_partial_signal.duckdb")
+        rows = _make_realistic_rows()
+        result = search_server_logs(
+            rows, "OAuth token refresh", db_path=db_path, max_seconds=-1.0,
+        )
+        assert result.get("partial") is True
+        assert result["total_in_index"] == len(rows)
+        # search()'s inline lazy build recovers immediately for this tiny
+        # row count, so real hits are still present (not silently dropped).
+        assert result["count"] >= 1
+        assert "OAuth" in result["hits"][0]["message"]
+
+    def test_module_fn_persistent_db_recovers_after_deadline_skip(self, tmp_path):
+        """Using a persistent db_path (so the index is reused across calls,
+        as the real MCP handler does), a deadline-skipped first call is
+        followed by a normal-budget second call that still returns real hits,
+        and the partial signal clears once a sync() completes within budget."""
+        pytest.importorskip("duckdb")
+        db_path = str(tmp_path / "test_deadline.duckdb")
+        rows = _make_realistic_rows()
+
+        result1 = search_server_logs(
+            rows, "OAuth token refresh", db_path=db_path, max_seconds=-1.0,
+        )
+        assert result1.get("partial") is True
+
+        # Second call, same persistent index, default (generous) budget --
+        # sync() completes within budget this time, so partial clears.
+        result2 = search_server_logs(rows, "OAuth token refresh", db_path=db_path)
+        assert result2["count"] >= 1
+        assert result2.get("partial") is not True
+        assert result2.get("fts_pending") is not True
+        assert "OAuth" in result2["hits"][0]["message"]

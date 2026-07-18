@@ -1073,7 +1073,17 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_prospect_bypass(db)
     await _migrate_handoff_tokens(db)
     await _migrate_wave_gate_results(db)
+    await _migrate_wave_gate_configs(db)
     await _migrate_server_logs(db)
+    await _migrate_custom_hooks(db)
+    await _migrate_sprint_item_require_verification(db)
+    await _migrate_sprint_item_verifications_table(db)
+    await _migrate_proposal_github_issue(db)
+    await _migrate_sprint_item_required_tool(db)
+    await _migrate_sprint_item_github_issue_link(db)
+    await _migrate_manual_issue_screening_toggle(db)
+    await _migrate_action_audit_log_table(db)
+    await _migrate_manual_issue_content_log_table(db)
     return db
 
 
@@ -1795,12 +1805,24 @@ def _is_no_such_table(exc: Exception) -> bool:
     return False
 
 
-async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
-    """Delete a project and all associated data.
+async def delete_project(
+    db: aiosqlite.Connection, project_id: "str | list[str]"
+) -> None:
+    """Delete one or more projects and all associated data.
 
-    Raises ``ValueError`` if any tasks are currently ``in_progress`` so
-    callers can surface a warning before proceeding.  The delete is
-    unconditional for all other data.
+    ``project_id`` accepts either a single id (``str``, the original shape —
+    all existing callers are unaffected) or a list of ids to batch-delete
+    many projects in one call (0e4980d4). Batching runs each table's DELETE
+    once with a single ``WHERE project_id IN (...)`` across every id in the
+    batch, rather than looping the whole per-table statement list once per
+    project — the same number of round trips regardless of batch size.
+
+    Raises ``ValueError`` if any tasks across the batch are currently
+    ``in_progress`` so callers can surface a warning before proceeding. The
+    check (and therefore the abort) applies to the whole batch: if any one
+    project in the batch has in-progress tasks, nothing in the batch is
+    deleted, matching the single-project all-or-nothing behavior. The
+    delete is unconditional for all other data.
 
     Deletion order follows FK dependencies (child-before-parent).
 
@@ -1815,7 +1837,7 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
       (goal_states, sprint_item_pointers, sprint_items,
        decisions_pinned, insights, project_notes, handoffs,
        codebase_graph_entities, sprint_version_descriptions),
-    and finally the project row itself.
+    and finally the project row(s) itself.
 
     Each DELETE is wrapped in a narrow exception guard that silently skips
     only a "table does not exist" error (tables added in later schema versions
@@ -1823,10 +1845,16 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
     constraint error, connection failure — is re-raised so the caller sees a
     real failure rather than a silent false-success.
     """
+    project_ids = [project_id] if isinstance(project_id, str) else list(project_id)
+    if not project_ids:
+        return
+    placeholders = ", ".join("?" for _ in project_ids)
+    ids_params = tuple(project_ids)
+
     async with db.execute(
-        "SELECT COUNT(*) as cnt FROM task_log "
-        "WHERE project_id = ? AND status = 'in_progress'",
-        (project_id,),
+        f"SELECT COUNT(*) as cnt FROM task_log "
+        f"WHERE project_id IN ({placeholders}) AND status = 'in_progress'",
+        ids_params,
     ) as cur:
         row = await cur.fetchone()
         count = int(row["cnt"] if row else 0)
@@ -1849,54 +1877,54 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
         # --- session-scoped children (delete before sessions) ---
         # file_read_claims has no explicit FK but is session-scoped (parallel primitives).
         ("DELETE FROM file_read_claims WHERE session_id IN "
-         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+         f"(SELECT id FROM sessions WHERE project_id IN ({placeholders}))", ids_params),
         # session_findings / session_messages are project-scoped but also session-linked.
-        ("DELETE FROM session_findings WHERE project_id = ?", (project_id,)),
-        ("DELETE FROM session_messages WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM session_findings WHERE project_id IN ({placeholders})", ids_params),
+        (f"DELETE FROM session_messages WHERE project_id IN ({placeholders})", ids_params),
         # session_graph_snapshots: project_id + session_id columns, no explicit FK.
-        ("DELETE FROM session_graph_snapshots WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM session_graph_snapshots WHERE project_id IN ({placeholders})", ids_params),
         # ON DELETE CASCADE session children — explicit for clarity and cross-backend safety.
         ("DELETE FROM session_notes WHERE session_id IN "
-         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
-        ("DELETE FROM executor_runs WHERE project_id = ?", (project_id,)),
+         f"(SELECT id FROM sessions WHERE project_id IN ({placeholders}))", ids_params),
+        (f"DELETE FROM executor_runs WHERE project_id IN ({placeholders})", ids_params),
         ("DELETE FROM file_locks WHERE session_id IN "
-         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+         f"(SELECT id FROM sessions WHERE project_id IN ({placeholders}))", ids_params),
         ("DELETE FROM resource_locks WHERE session_id IN "
-         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+         f"(SELECT id FROM sessions WHERE project_id IN ({placeholders}))", ids_params),
         ("DELETE FROM file_symbol_claims WHERE session_id IN "
-         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+         f"(SELECT id FROM sessions WHERE project_id IN ({placeholders}))", ids_params),
         ("DELETE FROM file_docx_region_claims WHERE session_id IN "
-         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+         f"(SELECT id FROM sessions WHERE project_id IN ({placeholders}))", ids_params),
         ("DELETE FROM file_patch_counters WHERE session_id IN "
-         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+         f"(SELECT id FROM sessions WHERE project_id IN ({placeholders}))", ids_params),
         ("DELETE FROM session_activity WHERE session_id IN "
-         "(SELECT id FROM sessions WHERE project_id = ?)", (project_id,)),
+         f"(SELECT id FROM sessions WHERE project_id IN ({placeholders}))", ids_params),
         # active_worktrees: FK → sessions(id) + projects(id).
-        ("DELETE FROM active_worktrees WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM active_worktrees WHERE project_id IN ({placeholders})", ids_params),
         # hitl_requests: FK → projects(id) ON DELETE CASCADE + sessions(id).
-        ("DELETE FROM hitl_requests WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM hitl_requests WHERE project_id IN ({placeholders})", ids_params),
         # task_log: FK → sessions(id) + projects(id).
-        ("DELETE FROM task_log WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM task_log WHERE project_id IN ({placeholders})", ids_params),
         # --- sessions ---
-        ("DELETE FROM sessions WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM sessions WHERE project_id IN ({placeholders})", ids_params),
         # --- remaining project-scoped children ---
-        ("DELETE FROM goal_states WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM goal_states WHERE project_id IN ({placeholders})", ids_params),
         # sprint_item_pointers references sprint_item_id — delete before sprint_items.
-        ("DELETE FROM sprint_item_pointers WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM sprint_item_pointers WHERE project_id IN ({placeholders})", ids_params),
         # sprint_items has a self-referential parent_id FK; deleting all rows for one
         # project at once resolves the cycle without ordering between rows.
-        ("DELETE FROM sprint_items WHERE project_id = ?", (project_id,)),
-        ("DELETE FROM decisions_pinned WHERE project_id = ?", (project_id,)),
-        ("DELETE FROM insights WHERE project_id = ?", (project_id,)),
-        ("DELETE FROM project_notes WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM sprint_items WHERE project_id IN ({placeholders})", ids_params),
+        (f"DELETE FROM decisions_pinned WHERE project_id IN ({placeholders})", ids_params),
+        (f"DELETE FROM insights WHERE project_id IN ({placeholders})", ids_params),
+        (f"DELETE FROM project_notes WHERE project_id IN ({placeholders})", ids_params),
         # handoffs: project_id TEXT (no explicit FK), plain delete.
-        ("DELETE FROM handoffs WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM handoffs WHERE project_id IN ({placeholders})", ids_params),
         # codebase_graph_entities: project_id TEXT (no explicit FK).
-        ("DELETE FROM codebase_graph_entities WHERE project_id = ?", (project_id,)),
+        (f"DELETE FROM codebase_graph_entities WHERE project_id IN ({placeholders})", ids_params),
         # sprint_version_descriptions: FK → projects(id) ON DELETE CASCADE.
-        ("DELETE FROM sprint_version_descriptions WHERE project_id = ?", (project_id,)),
-        # --- project row itself ---
-        ("DELETE FROM projects WHERE id = ?", (project_id,)),
+        (f"DELETE FROM sprint_version_descriptions WHERE project_id IN ({placeholders})", ids_params),
+        # --- project row(s) itself ---
+        (f"DELETE FROM projects WHERE id IN ({placeholders})", ids_params),
     ]
 
     for stmt, params in stmts:
@@ -1951,6 +1979,27 @@ def _stale_collapse_map(
     return out
 
 
+def _collapsed_field_summary(tag: str, meta: dict[str, Any]) -> str:
+    """Plain-text one-line stand-in for a stale goal field.
+
+    Shared by the XML collapse path (:func:`_collapsed_field_line`) and the
+    raw-dict / cache-block collapse path (14847f20) so the wording — and the
+    "pass expand_stale=true" escape hatch — stays in sync across every
+    representation of the same field.
+    """
+    date = meta.get("date")
+    age_days = meta.get("age_days")
+    if date and age_days is not None:
+        return (
+            f"[stale {tag} from {date} ({age_days}d old) — collapsed; pass "
+            "expand_stale=true or call get_session_brief for full text]"
+        )
+    return (
+        f"[stale {tag} — collapsed; pass expand_stale=true or call "
+        "get_session_brief for full text]"
+    )
+
+
 def _collapsed_field_line(
     tag: str, cache: str, meta: dict[str, Any], escape_fn: Any
 ) -> str:
@@ -1963,16 +2012,7 @@ def _collapsed_field_line(
     """
     date = meta.get("date")
     age_days = meta.get("age_days")
-    if date and age_days is not None:
-        summary = (
-            f"stale {tag} from {date} ({age_days}d old) — collapsed; pass "
-            "expand_stale=true or call get_session_brief for full text"
-        )
-    else:
-        summary = (
-            f"stale {tag} — collapsed; pass expand_stale=true or call "
-            "get_session_brief for full text"
-        )
+    summary = _collapsed_field_summary(tag, meta)
     parts = [f'  <{tag} cache="{cache}" stale="true" collapsed="true"']
     if date:
         parts.append(f' stale_since="{escape_fn(str(date))}"')
@@ -2112,10 +2152,55 @@ def build_goal_xml(
     return "\n".join(out)
 
 
+def collapse_stale_goal_fields(
+    goal: dict[str, Any] | None,
+    coherence_warning: dict[str, Any] | None,
+    expand_stale: bool = True,
+) -> dict[str, Any] | None:
+    """Trim coherence-flagged-stale text out of the raw ``goal`` dict.
+
+    2b4e69aa taught :func:`build_goal_xml` to collapse a stale north_star /
+    version_goal / sprint field to a one-line summary; the raw ``goal`` dict
+    handed back alongside ``goal_xml`` (e.g. by ``start_session``'s full
+    orientation) never got the same treatment — so a week-old field was
+    STILL dumped in full even though ``coherence_warning`` already flagged
+    it stale, and duplicated across ``goal``, ``goal["xml"]`` and
+    ``goal["cache_blocks"]``. That duplication of stale content was the
+    dominant contributor to a 269KB default ``start_session`` payload
+    (14847f20).
+
+    Mirrors ``build_goal_xml``'s default: ``expand_stale=True`` (the
+    default) returns ``goal`` unchanged so every existing caller keeps its
+    current behaviour byte-for-byte. Pass ``expand_stale=False`` to collapse.
+    Returns a shallow copy — the input dict (and anything already derived
+    from its FULL text, like ``goal["xml"]`` / ``goal["cache_blocks"]``
+    built before this runs) is never mutated.
+    """
+    if goal is None or expand_stale:
+        return goal
+    collapse = _stale_collapse_map(coherence_warning)
+    if not collapse:
+        return goal
+    trimmed = dict(goal)
+    if "north_star" in collapse and trimmed.get("north_star"):
+        trimmed["north_star"] = _collapsed_field_summary(
+            "north_star", collapse["north_star"]
+        )
+    if "version_goal" in collapse and trimmed.get("content"):
+        trimmed["content"] = _collapsed_field_summary(
+            "version_goal", collapse["version_goal"]
+        )
+    if "sprint" in collapse and trimmed.get("sprint"):
+        trimmed["sprint"] = _collapsed_field_summary("sprint", collapse["sprint"])
+    return trimmed
+
+
 def build_goal_cache_blocks(
     goal: dict[str, Any] | None,
     project_name: str,
     recent_tasks: list[dict[str, Any]] | None = None,
+    coherence_warning: dict[str, Any] | None = None,
+    expand_stale: bool = True,
 ) -> list[dict[str, Any]]:
     """Return goal text as Anthropic-API content blocks with cache hints.
 
@@ -2134,7 +2219,14 @@ def build_goal_cache_blocks(
     a prefix of the full prompt, so a hit requires the cached blocks
     to lead. Anything mutable that appears before a cached block
     invalidates the cache for every cold session.
+
+    ``expand_stale`` (14847f20, mirroring :func:`build_goal_xml`'s 2b4e69aa
+    flag): when ``False`` and ``coherence_warning`` flagged a field stale,
+    that block's body is replaced with the same one-line collapsed summary
+    used by the XML path, instead of the full text. Defaults to ``True`` so
+    every existing caller is unchanged.
     """
+    collapse = {} if expand_stale else _stale_collapse_map(coherence_warning)
     if goal is None:
         north_star = version_goal = sprint = ""
         version = 0
@@ -2149,6 +2241,15 @@ def build_goal_cache_blocks(
         else:
             version_goal = json.dumps(content, indent=2)
         sprint = goal.get("sprint") or ""
+
+    if "north_star" in collapse and north_star:
+        north_star = _collapsed_field_summary("north_star", collapse["north_star"])
+    if "version_goal" in collapse and version_goal:
+        version_goal = _collapsed_field_summary(
+            "version_goal", collapse["version_goal"]
+        )
+    if "sprint" in collapse and sprint:
+        sprint = _collapsed_field_summary("sprint", collapse["sprint"])
 
     header = (
         f"# Meridian goal — project: {project_name} (v{version})\n\n"
@@ -10143,11 +10244,14 @@ from .sprint_items import (  # noqa: F401
     add_subtask,
     analyze_sprint,
     assign_sprint_waves,
+    build_github_completion_comment,
     build_sprint_items_xml,
     claim_sprint_item,
     complete_sprint_item,
     complete_wave_gate,
+    configure_wave_gate,
     count_pending_sprint_items,
+    count_sprint_items_awaiting_verification,
     delete_sprint_item_pointer,
     fail_sprint_item,
     fan_out_sprint_items,
@@ -10160,15 +10264,19 @@ from .sprint_items import (  # noqa: F401
     get_sprint_items_cached,
     get_sprint_items_for_resource,
     get_sprint_items_page,
+    get_wave_gate_configs,
+    get_latest_sprint_item_verification,
     get_sprint_version_description,
     get_all_sprint_version_descriptions,
     upsert_sprint_version_description,
     handle_session_stall,
     infer_active_sprint_version,
+    link_sprint_item_github_issue,
     merge_sprint_items,
     patch_sprint_item,
     provisional_complete_sprint_item,
     push_sprint_item,
+    record_sprint_item_verification,
     requeue_or_fail_stalled_item,
     skip_sprint_item,
     split_sprint_item,
@@ -10177,6 +10285,7 @@ from .sprint_items import (  # noqa: F401
     # Public classes
     SprintItemEvidenceRequired,
     SprintItemStatusRace,
+    SprintItemVerificationRequired,
     # Private helpers also imported directly in tests/callers
     _ACTIVE_SPRINT_STATUSES,
     _DUP_BLOCKING_SPRINT_STATUSES,
@@ -10201,6 +10310,8 @@ from .sprint_items import (  # noqa: F401
     _is_manual_sprint_item,
     _maybe_rollup_parent,
     _parse_deferral_ts,
+    _split_wave_label,
+    _get_blocking_wave_gate,
     _session_stall_summary,
     _sprint_item_nickname_base,
     _sprint_item_slug_base,
@@ -10296,6 +10407,7 @@ from .workspace import (  # noqa: F401
     get_workspace_proposals,
     advance_workspace_proposal_status,
     promote_workspace_proposal,
+    set_proposal_github_issue,
     delete_workspace_proposal,
     # Public workspace sprint-board functions
     add_workspace_sprint_item,
@@ -10306,6 +10418,12 @@ from .workspace import (  # noqa: F401
     get_workspace_settings,
     update_workspace_settings,
     seed_workspace_settings_from_toml,
+    # 5dfe34b2 / cd495afa — manual-issue-screening toggle + audit trail
+    _MANUAL_ISSUE_SCREENING_RISK_WARNING,
+    ManualIssueScreeningToggleError,
+    set_manual_issue_screening_enabled,
+    record_action_audit_event,
+    get_action_audit_log,
     # Public workspace-member / invite functions
     create_workspace_invite,
     get_workspace_invite_by_token_hash,
@@ -10321,4 +10439,29 @@ from .workspace import (  # noqa: F401
     update_workspace_member,
     get_workspaces_for_email,
     get_scoped_project_ids_for_member,
+)
+
+# 5dfe34b2 — manual-issue content-screening extension. Imported last (after
+# workspace's set_manual_issue_screening_enabled / get_action_audit_log are
+# already bound on this module) since manual_issue_intel's velocity-anomaly
+# check lazily imports those names back from meridian.db.
+from .manual_issue_intel import (  # noqa: F401
+    screen_manual_issue_content,
+    screen_manual_issue,
+    sanitize_manual_issue_excerpt,
+    log_raw_manual_issue_content,
+    get_raw_manual_issue_content_log,
+    check_manual_issue_action_velocity,
+)
+
+
+from .hooks import (  # noqa: F401
+    VALID_HOOK_EVENTS,
+    _RESERVED_HOOK_SLUGS,
+    _sanitize_hook_slug,
+    add_custom_hook,
+    get_custom_hooks,
+    get_custom_hook,
+    update_custom_hook,
+    delete_custom_hook,
 )

@@ -112,9 +112,11 @@ async def patch_hitl_endpoint(
         # HITL actually writes its file (same single path as the MCP tool).
         from meridian.server import _answer_hitl_and_apply  # noqa: PLC0415
 
+        tenant = await _get_tenant_from_request(request)
         result = await _answer_hitl_and_apply(
             db, request_id, answer,
             answered_by=body.get("answered_by"), approved=True,
+            tenant=tenant,
         )
     elif action == "dismiss":
         result = await db_module.dismiss_hitl_request(db, request_id)

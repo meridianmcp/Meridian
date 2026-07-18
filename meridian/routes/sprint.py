@@ -136,19 +136,30 @@ async def sprint_pending_count(
     lets the stop through, and ``stopped_at_ceiling`` is set with a ``reason`` so
     a delta handoff can be generated. Below the ceiling behaviour is byte-for-byte
     unchanged. ``session_id`` scopes the counter per session (the guard passes it
-    when known); absent it, the project id keys the counter."""
+    when known); absent it, the project id keys the counter.
+
+    e2e1b682 — ``verification_pending_count`` is a purely ADVISORY field
+    (present on every response shape below, never affects the exit-code
+    decision the guard makes): the number of in_progress, require_verification
+    items with no independent on-file PASS yet. Surfaces the "hallucinated-
+    compliance completion" risk to whoever is watching the guard's stderr even
+    though such an item never itself blocks a stop (only complete_sprint_item's
+    structural gate blocks the completion)."""
     db = await _db(request)
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     n = await db_module.count_pending_sprint_items(db, project_id)
+    verification_pending = await db_module.count_sprint_items_awaiting_verification(
+        db, project_id
+    )
 
     # No pending work — nothing to block on. Reset the budget so a later run (or
     # a reused session id) starts fresh, and return today's plain shape.
     if n <= 0:
         key = (session_id or "").strip() or project_id
         _reset_stop_override(key)
-        return {"pending_count": n}
+        return {"pending_count": n, "verification_pending_count": verification_pending}
 
     # There IS pending work. Decide whether we may still force a continuation.
     ceiling = _stop_override_ceiling()
@@ -164,6 +175,7 @@ async def sprint_pending_count(
                 "stopped_at_ceiling": True,
                 "stop_override_count": used,
                 "stop_override_ceiling": ceiling,
+                "verification_pending_count": verification_pending,
                 "reason": (
                     f"stop-override ceiling ({ceiling}) reached — allowing stop "
                     "despite pending sprint items; generate a delta handoff."
@@ -176,6 +188,7 @@ async def sprint_pending_count(
         "pending_count": n,
         "stopped_at_ceiling": False,
         "stop_override_count": new_count,
+        "verification_pending_count": verification_pending,
         "stop_override_ceiling": ceiling,
     }
 

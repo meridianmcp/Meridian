@@ -16,6 +16,16 @@ Exercises:
   - Sidecar sync: insert_caption with index_db_path invalidates mtime and
     upserts into docx_figures / docx_tables.
 
+1c59cb90 — also exercises insert_cross_reference (REFILED from 7b5bfb00):
+  - insert_caption now embeds a "_Ref<digits>" bookmark around the caption's
+    "<Kind> <N>" text and returns it as ref_bookmark.
+  - insert_cross_reference builds a REF complex field targeting that bookmark,
+    resolvable via target_caption_para_id OR bookmark_name.
+  - Retrofit path: a pre-1c59cb90 caption (no bookmark) gets one created
+    on-demand the first time it's cross-referenced by para_id.
+  - Trailing-space handling, and error paths (missing bookmark/target/anchor,
+    both-or-neither identifier args, non-caption target).
+
 All tests use synthetic minimal .docx files built in-memory (no real Word
 files, no network).  Test file follows the naming convention of existing
 meridian-docs tests:
@@ -1307,3 +1317,265 @@ class TestFigureCaptionBeforeRejection:
 
         assert "error" not in res
         assert res["status"] == "inserted"
+
+
+# ---------------------------------------------------------------------------
+# Cross-reference: REF-field mechanism (1c59cb90, REFILED from 7b5bfb00)
+# ---------------------------------------------------------------------------
+
+class TestInsertCaptionRefBookmark:
+    """insert_caption now embeds a _Ref cross-reference bookmark natively."""
+
+    def test_insert_caption_returns_ref_bookmark(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        res = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            kind="Figure",
+            label_text="Loss curve",
+        )
+
+        assert "error" not in res
+        assert res["ref_bookmark"].startswith("_Ref")
+
+        xml = _read_doc_xml(docx)
+        assert f'w:name="{res["ref_bookmark"]}"' in xml
+        assert "<w:bookmarkStart" in xml
+        assert "<w:bookmarkEnd" in xml
+
+    def test_two_captions_get_distinct_bookmarks(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        res1 = docs_intel.insert_caption(
+            docx_path=docx, anchor_para_id="AABB0002", kind="Figure", label_text="One",
+        )
+        res2 = docs_intel.insert_caption(
+            docx_path=docx, anchor_para_id="AABB0003", kind="Figure", label_text="Two",
+        )
+        assert "error" not in res1 and "error" not in res2
+        assert res1["ref_bookmark"] != res2["ref_bookmark"]
+
+    def test_ref_bookmark_persisted_in_sidecar(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        db = str(tmp_path / "index.db")
+        _write_docx(docx)
+        docs_intel._connect(db).close()
+
+        res = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            kind="Figure",
+            label_text="A figure",
+            index_db_path=db,
+        )
+        assert "error" not in res
+
+        conn = sqlite3.connect(db)
+        row = conn.execute("SELECT ref_bookmark FROM docx_figures").fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == res["ref_bookmark"]
+
+
+class TestInsertCrossReference:
+    def test_insert_cross_reference_by_target_para_id(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        cap = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            kind="Figure",
+            label_text="Loss curve",
+        )
+        assert "error" not in cap
+
+        paras = docs_intel.parse_docx(docx)
+        cap_para = next(p for p in paras if p.get("style") == "Caption")
+
+        res = docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="AABB0003",
+            target_caption_para_id=cap_para["para_id"],
+        )
+
+        assert "error" not in res, f"unexpected error: {res.get('error')}"
+        assert res["status"] == "inserted"
+        assert res["kind"] == "Figure"
+        assert res["seq_number"] == "1"
+        assert res["display_text"] == "Figure 1"
+        assert res["bookmark_name"] == cap["ref_bookmark"]
+
+        xml = _read_doc_xml(docx)
+        assert f"REF {cap['ref_bookmark']} \\h" in xml
+        assert 'fldCharType="begin"' in xml
+        assert 'fldCharType="separate"' in xml
+        assert 'fldCharType="end"' in xml
+        assert "Figure 1" in xml
+
+    def test_insert_cross_reference_by_bookmark_name(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        cap = docs_intel.insert_caption(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            kind="Table",
+            label_text="Summary stats",
+        )
+        assert "error" not in cap
+
+        res = docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="AABB0003",
+            bookmark_name=cap["ref_bookmark"],
+        )
+
+        assert "error" not in res, f"unexpected error: {res.get('error')}"
+        assert res["kind"] == "Table"
+        assert res["display_text"] == "Table 1"
+        xml = _read_doc_xml(docx)
+        assert f"REF {cap['ref_bookmark']} \\h" in xml
+
+    def test_retrofits_bookmark_on_pre_existing_caption(self, tmp_path):
+        """A caption built without a ref bookmark (pre-1c59cb90 shape) gets one
+        created on demand the first time it's cross-referenced by para_id."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_CAPTION)
+        xml_before = _read_doc_xml(docx)
+        assert "bookmarkStart" not in xml_before
+
+        res = docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="CCDD0003",
+            target_caption_para_id="CCDD0002",
+        )
+
+        assert "error" not in res, f"unexpected error: {res.get('error')}"
+        assert res["bookmark_name"].startswith("_Ref")
+        assert res["kind"] == "Figure"
+        assert res["seq_number"] == "1"
+        assert res["display_text"] == "Figure 1"
+
+        xml_after = _read_doc_xml(docx)
+        assert f'w:name="{res["bookmark_name"]}"' in xml_after
+        assert f"REF {res['bookmark_name']} \\h" in xml_after
+
+    def test_inserts_separating_space_before_field(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        cap = docs_intel.insert_caption(
+            docx_path=docx, anchor_para_id="AABB0002", kind="Figure", label_text="X",
+        )
+
+        docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="AABB0003",  # "A second body paragraph." — no trailing space
+            bookmark_name=cap["ref_bookmark"],
+        )
+
+        xml = _read_doc_xml(docx)
+        assert "A second body paragraph." in xml and "Figure 1" in xml
+        # A dedicated preserved-space run must precede the field runs.
+        assert 'xml:space="preserve">' in xml
+
+    def test_requires_exactly_one_target_identifier(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+        original = open(docx, "rb").read()
+
+        res_neither = docs_intel.insert_cross_reference(
+            docx_path=docx, anchor_para_id="AABB0002",
+        )
+        assert "error" in res_neither
+
+        res_both = docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="AABB0002",
+            target_caption_para_id="AABB0003",
+            bookmark_name="_Ref100000000",
+        )
+        assert "error" in res_both
+        assert open(docx, "rb").read() == original
+
+    def test_unknown_anchor_para_id(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_CAPTION)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="BOGUS",
+            target_caption_para_id="CCDD0002",
+        )
+        assert "error" in res
+        assert open(docx, "rb").read() == original
+
+    def test_unknown_target_caption_para_id(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_CAPTION)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="CCDD0003",
+            target_caption_para_id="BOGUS",
+        )
+        assert "error" in res
+        assert open(docx, "rb").read() == original
+
+    def test_target_para_is_not_a_caption(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_CAPTION)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="CCDD0003",
+            target_caption_para_id="CCDD0001",  # plain paragraph, not a caption
+        )
+        assert "error" in res
+        assert open(docx, "rb").read() == original
+
+    def test_unknown_bookmark_name(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_CAPTION)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="CCDD0003",
+            bookmark_name="_Ref999999999",
+        )
+        assert "error" in res
+        assert open(docx, "rb").read() == original
+
+    def test_missing_file(self, tmp_path):
+        res = docs_intel.insert_cross_reference(
+            docx_path=str(tmp_path / "nonexistent.docx"),
+            anchor_para_id="AABB0002",
+            bookmark_name="_Ref100000000",
+        )
+        assert "error" in res
+
+    def test_reference_survives_after_reindex_read(self, tmp_path):
+        """Round-trip: the REF field's cached display text is parseable back out."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        cap = docs_intel.insert_caption(
+            docx_path=docx, anchor_para_id="AABB0002", kind="Figure", label_text="X",
+        )
+        docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="AABB0003",
+            bookmark_name=cap["ref_bookmark"],
+        )
+
+        paras = docs_intel.parse_docx(docx)
+        joined = " ".join(p.get("text", "") for p in paras)
+        assert "Figure 1" in joined

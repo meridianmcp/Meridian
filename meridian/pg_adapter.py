@@ -3113,6 +3113,33 @@ async def _migrate_pg_wave_gate_results(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_wave_gate_configs(conn: PostgresConnection) -> None:
+    """74a8f420 — wave_gate_configs: the on-the-fly-configurable action pipeline
+    (push_dev/push_main/deploy/wait/run_verification) attached to a wave or
+    wave-range, keyed by its boundary wave (``wave_end``). claim_sprint_item
+    reads this table (plus wave_gate_results) to structurally refuse claiming
+    any item whose wave sorts beyond a configured-but-unpassed boundary.
+
+    Mirrors db.migrations._migrate_wave_gate_configs. Idempotent via CREATE
+    TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS wave_gate_configs ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    wave_start TEXT NOT NULL,"
+        "    wave_end TEXT NOT NULL,"
+        "    actions TEXT NOT NULL,"
+        "    actor TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (now()::text),"
+        "    updated_at TEXT NOT NULL DEFAULT (now()::text),"
+        "    UNIQUE(project_id, wave_end)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_gate_configs_project "
+        "ON wave_gate_configs(project_id, wave_end)"
+    )
+
+
 async def _migrate_pg_server_logs(conn: PostgresConnection) -> None:
     """f0a48685 — server_logs: application-wide WARNING/ERROR/EXCEPTION log capture.
 
@@ -3143,6 +3170,58 @@ async def _migrate_pg_server_logs(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_custom_hooks(conn: PostgresConnection) -> None:
+    """273287cb — custom_hooks: user-creatable Claude Code hooks.
+
+    Generalizes past the single auto-written sprint_guard.sh/.ps1 pair so a
+    project can define its own arbitrary PreToolUse/PostToolUse/Stop hooks
+    that get written into .claude/hooks/ by generate_handoff.
+
+    Mirrors db._migrate_custom_hooks. Idempotent via CREATE TABLE IF NOT
+    EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS custom_hooks ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    name TEXT NOT NULL,"
+        "    slug TEXT NOT NULL,"
+        "    event TEXT NOT NULL CHECK (event IN ('PreToolUse','PostToolUse','Stop')),"
+        "    matcher TEXT,"
+        "    script_sh TEXT NOT NULL,"
+        "    script_ps1 TEXT,"
+        "    blocking INTEGER NOT NULL DEFAULT 1,"
+        "    enabled INTEGER NOT NULL DEFAULT 1,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE(project_id, slug)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_custom_hooks_project "
+        "ON custom_hooks(project_id, event)"
+    )
+
+
+async def _migrate_pg_proposal_github_issue(conn: PostgresConnection) -> None:
+    """3999d90f — workspace_proposals.github_issue_number + .github_issue_url.
+
+    Storage for the "also file a GitHub issue?" conditional HITL workflow:
+    promote_workspace_proposal fires a HITL when a code-related proposal is
+    promoted under a project with a connected GitHub repo; if answered yes,
+    the created issue's number/URL is persisted back onto the proposal here
+    via set_proposal_github_issue. Both columns nullable — most proposals
+    never go through this path.
+
+    Mirrors db._migrate_proposal_github_issue. ADD COLUMN IF NOT EXISTS is
+    idempotent.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
+        "github_issue_number INTEGER;"
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
+        "github_issue_url TEXT"
+    )
+
+
 async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> None:
     """94c26322 — human-set bypass flag for the prospecting safety gate.
 
@@ -3159,6 +3238,45 @@ async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> N
     await conn.executescript(
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS "
         "prospect_bypass INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_sprint_item_require_verification(conn: PostgresConnection) -> None:
+    """e2e1b682 — opt-in independent fresh-session verifier gate flag.
+
+    require_verification (INTEGER 0/1, NOT NULL DEFAULT 0) marks a sprint item
+    as needing an on-file, independent PASS (see sprint_item_verifications)
+    before complete_sprint_item will let the completion stick.
+
+    ADD COLUMN IF NOT EXISTS is idempotent; existing rows default to 0.
+    Mirrors db._migrate_sprint_item_require_verification.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS "
+        "require_verification INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_sprint_item_verifications_table(conn: PostgresConnection) -> None:
+    """e2e1b682 — sprint_item_verifications: durable audit trail of independent
+    fresh-session PASS/FAIL verdicts filed against a sprint item.
+
+    Mirrors db._migrate_sprint_item_verifications_table. Idempotent via CREATE
+    TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sprint_item_verifications ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    sprint_item_id TEXT NOT NULL,"
+        "    verdict TEXT NOT NULL,"
+        "    verifier_session_id TEXT NOT NULL,"
+        "    notes TEXT,"
+        "    seq INTEGER NOT NULL DEFAULT 0,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_sprint_item_verifications_item "
+        "ON sprint_item_verifications(sprint_item_id, seq DESC)"
     )
 
 
@@ -3193,6 +3311,102 @@ async def _migrate_pg_handoff_tokens(conn: PostgresConnection) -> None:
         "ON handoff_tokens(project_id);"
         "CREATE INDEX IF NOT EXISTS idx_handoff_tokens_expires "
         "ON handoff_tokens(expires_at);"
+    )
+
+
+async def _migrate_pg_sprint_item_required_tool(conn: PostgresConnection) -> None:
+    """4d1fb28f — sprint_items.required_tool: item-level MCP tool/plugin pin
+    (mirrors SQLite).
+
+    Nullable free-form TEXT; NULL = no pin, ordinary executor discretion.
+    When set, it's rendered as a hard ``<required_tool>`` directive in the
+    /goal block (handoff._build_quick_start_goal / build_item_briefing).
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db._migrate_sprint_item_required_tool.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS required_tool TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_github_issue_link(conn: PostgresConnection) -> None:
+    """fdaa5b55 — sprint_items.github_issue_number / .github_issue_url /
+    .github_issue_source (mirrors SQLite).
+
+    ``github_issue_source`` is written EXCLUSIVELY by
+    meridian.db.sprint_items.link_sprint_item_github_issue, and set to
+    ``'meridian_auto'`` only right after a real create_issue call succeeds
+    (server.py's ``_on_hitl_answered`` 'proposal_github_issue' branch) — never
+    inferred from issue title/body text. NULL/anything else is treated as
+    'manual'-equivalent by complete_sprint_item's close/propose gate.
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db._migrate_sprint_item_github_issue_link.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS github_issue_number INTEGER;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS github_issue_url TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS github_issue_source TEXT"
+    )
+
+
+async def _migrate_pg_manual_issue_screening_toggle(conn: PostgresConnection) -> None:
+    """5dfe34b2 / cd495afa — workspace_settings.manual_issue_screening_enabled
+    (mirrors SQLite). The ONE writer is
+    meridian.db.workspace.set_manual_issue_screening_enabled, which refuses to
+    enable it without an answered + approved require_human=True HITL of
+    kind='manual_issue_screening_toggle'. Disabling has no HITL gate (fail-safe
+    direction) but is still audit-logged.
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db._migrate_manual_issue_screening_toggle.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "manual_issue_screening_enabled INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_action_audit_log_table(conn: PostgresConnection) -> None:
+    """5dfe34b2 / cd495afa — action_audit_log: append-only WHAT-MERIDIAN-DID
+    record (toggle flips, velocity/anomaly escalations, manual-issue link
+    actions). Mirrors db._migrate_action_audit_log_table. Idempotent via
+    CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS action_audit_log ("
+        "    id TEXT PRIMARY KEY,"
+        "    tenant_id TEXT,"
+        "    project_id TEXT,"
+        "    event_type TEXT NOT NULL,"
+        "    actor TEXT,"
+        "    detail TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_action_audit_log_scope "
+        "ON action_audit_log(tenant_id, project_id, created_at DESC)"
+    )
+
+
+async def _migrate_pg_manual_issue_content_log_table(conn: PostgresConnection) -> None:
+    """5dfe34b2 / 2178b161 — manual_issue_content_log: append-only, hashed,
+    timestamped forensic log of RAW manual-issue content (title+body+
+    comments), written BEFORE screening. Mirrors
+    db._migrate_manual_issue_content_log_table. Idempotent via CREATE TABLE IF
+    NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS manual_issue_content_log ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    issue_number INTEGER NOT NULL,"
+        "    content_hash TEXT NOT NULL,"
+        "    raw_content TEXT NOT NULL,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_manual_issue_content_log_scope "
+        "ON manual_issue_content_log(project_id, issue_number, created_at DESC)"
     )
 
 
@@ -3273,5 +3487,15 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_prospect_bypass,
     _migrate_pg_handoff_tokens,
     _migrate_pg_wave_gate_results,
+    _migrate_pg_wave_gate_configs,
     _migrate_pg_server_logs,
+    _migrate_pg_custom_hooks,
+    _migrate_pg_sprint_item_require_verification,
+    _migrate_pg_sprint_item_verifications_table,
+    _migrate_pg_proposal_github_issue,
+    _migrate_pg_sprint_item_required_tool,
+    _migrate_pg_sprint_item_github_issue_link,
+    _migrate_pg_manual_issue_screening_toggle,
+    _migrate_pg_action_audit_log_table,
+    _migrate_pg_manual_issue_content_log_table,
 )

@@ -69,6 +69,18 @@ def _max_slot_inflight() -> int:
 # fast. Short on purpose: the point is to fail fast, not to queue.
 _SLOT_ACQUIRE_TIMEOUT = 1.0
 
+# 9ab967d6 — outer bound for a cold-cache ``list_tunnel_tools`` discovery call.
+# Mirrors the 2026-07-17 outage hotfix in mcp/handler.py's tools/list handler:
+# ``list_tunnel_tools`` fans out to ``_fetch_slot_tools`` per healthy slot, and
+# each slot has its OWN internal retry budget (4 attempts * 3s timeout each,
+# with 0.5s sleeps between — up to ~14s worst case) for a slot the DB marks
+# "healthy" but that is actually unreachable from this Fly instance. Any
+# caller that awaits ``list_tunnel_tools`` directly with no outer bound
+# inherits that same unbounded worst case. ``call_tunnel_tool``'s cold-cache
+# discovery path hits this on every ``tools/call`` request (not just
+# ``tools/list``), so it needs the identical guard.
+_TOOL_DISCOVERY_TIMEOUT = 5.0
+
 _slot_inflight: dict[str, asyncio.Semaphore] = {}
 
 
@@ -3402,7 +3414,25 @@ async def call_tunnel_tool(
     if label is None:
         # Cold cache (e.g. client skipped tools/list, or a different worker) —
         # discover once, then retry the lookup.
-        await list_tunnel_tools(tenant_id)
+        #
+        # 9ab967d6 — ``list_tunnel_tools`` has its own internal per-slot retry
+        # budget (up to ~14s worst case for a single slot marked "healthy" but
+        # actually unreachable, see ``_TOOL_DISCOVERY_TIMEOUT`` above). This is
+        # the exact same missing-outer-timeout shape as the 2026-07-17 tools/list
+        # outage, except this path fires on every ``tools/call`` with a cold
+        # route cache. Bound it so one stale-healthy slot can't hang the whole
+        # tool call; on timeout the lookup below simply stays a miss, and the
+        # caller's existing "no route found" handling (return None) applies.
+        try:
+            await asyncio.wait_for(
+                list_tunnel_tools(tenant_id), timeout=_TOOL_DISCOVERY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            _log.warning(
+                "tunnel tool discovery for tenant %s exceeded %.0fs — a slot's "
+                "health state is likely stale; treating '%s' as unroutable this call",
+                tenant_id[:8], _TOOL_DISCOVERY_TIMEOUT, name,
+            )
         label = (_tunnel_tool_routes.get(tenant_id) or {}).get(name)
     if label is None:
         return None

@@ -4747,6 +4747,74 @@ def test_build_goal_xml_no_collapse_without_stale_flag():
     assert 'collapsed="true"' in xml
 
 
+# ---------------------------------------------------------------------------
+# 14847f20 — extend the stale-collapse to the raw goal dict + cache_blocks
+# (previously only goal_xml collapsed, so start_session's default payload
+# still dumped the same stale text in full twice more)
+# ---------------------------------------------------------------------------
+
+
+def test_collapse_stale_goal_fields_trims_stale_raw_fields():
+    """collapse_stale_goal_fields mirrors build_goal_xml's collapsing but on
+    the raw dict: stale fields become a one-line summary, non-stale fields
+    (and every non-text key) are untouched, and the input is never mutated."""
+    goal = {
+        "version": 4,
+        "content": "MEGASPRINT full body — wave A/B/C detail dump",
+        "north_star": "WEEK-OLD NORTH STAR BODY that should be collapsed",
+        "sprint": "fresh sprint focus stays",
+        "ambient_tasks": [{"status": "done"}],
+    }
+    cw = _stale_coherence("north_star", "version_goal", age_days=8)
+    trimmed = db_module.collapse_stale_goal_fields(goal, cw, expand_stale=False)
+    assert trimmed is not goal  # shallow copy, original untouched
+    assert goal["north_star"] == "WEEK-OLD NORTH STAR BODY that should be collapsed"
+    assert "WEEK-OLD NORTH STAR BODY" not in trimmed["north_star"]
+    assert "expand_stale=true" in trimmed["north_star"]
+    assert "MEGASPRINT full body" not in trimmed["content"]
+    # Non-stale sprint + unrelated keys pass through unchanged.
+    assert trimmed["sprint"] == "fresh sprint focus stays"
+    assert trimmed["ambient_tasks"] == [{"status": "done"}]
+    assert trimmed["version"] == 4
+
+
+def test_collapse_stale_goal_fields_default_expand_stale_true_is_noop():
+    """expand_stale=True (the default) returns the SAME object unchanged —
+    every existing caller that doesn't pass expand_stale keeps identical
+    behavior."""
+    goal = {"north_star": "old", "content": "old-body", "sprint": "s"}
+    cw = _stale_coherence("north_star", age_days=9)
+    assert db_module.collapse_stale_goal_fields(goal, cw) is goal
+    assert db_module.collapse_stale_goal_fields(None, cw, expand_stale=False) is None
+
+
+def test_build_goal_cache_blocks_collapses_stale_field_when_not_expanded():
+    """build_goal_cache_blocks accepts the same coherence_warning/expand_stale
+    contract as build_goal_xml so the Anthropic cache-block duplicate of a
+    stale field doesn't stay full when the XML/raw dict already collapsed
+    it."""
+    goal = {
+        "version": 1,
+        "content": "MEGASPRINT full body",
+        "north_star": "WEEK-OLD NORTH STAR BODY",
+        "sprint": "fresh sprint stays",
+    }
+    cw = _stale_coherence("north_star", "version_goal", age_days=8)
+    blocks = db_module.build_goal_cache_blocks(
+        goal, "proj", [], coherence_warning=cw, expand_stale=False
+    )
+    blob = "\n".join(b["text"] for b in blocks)
+    assert "WEEK-OLD NORTH STAR BODY" not in blob
+    assert "MEGASPRINT full body" not in blob
+    assert "expand_stale=true" in blob
+    assert "fresh sprint stays" in blob
+    # Default (expand_stale=True) keeps every existing caller unchanged.
+    blocks_full = db_module.build_goal_cache_blocks(goal, "proj", [])
+    blob_full = "\n".join(b["text"] for b in blocks_full)
+    assert "WEEK-OLD NORTH STAR BODY" in blob_full
+    assert "MEGASPRINT full body" in blob_full
+
+
 @pytest.mark.asyncio
 async def test_start_session_composite_collapses_stale_goal_by_default(
     db, tmp_path
@@ -4786,8 +4854,20 @@ async def test_start_session_composite_collapses_stale_goal_by_default(
     # coherence_warning flag is still set (behavior preserved).
     assert res["goal"]["coherence_warning"]["level"] in {"warn", "critical"}
     assert "<coherence_warning" in goal_xml
+    # 14847f20 — the raw goal dict gets the SAME collapse as goal_xml, not
+    # just the XML string: before this fix the stale bodies were still
+    # dumped in full here (and a third time in goal_cache_blocks), which is
+    # what produced the oversized default start_session payload.
+    assert "OLD-NORTH-STAR-BODY" not in res["goal"]["north_star"]
+    assert "OLD-VERSION-GOAL-MEGASPRINT-BODY" not in res["goal"]["content"]
+    assert "expand_stale=true" in res["goal"]["north_star"]
+    assert res["goal"]["sprint"] == "FRESH-SPRINT-FOCUS"
+    cache_blob = "\n".join(b["text"] for b in res["goal_cache_blocks"])
+    assert "OLD-NORTH-STAR-BODY" not in cache_blob
+    assert "OLD-VERSION-GOAL-MEGASPRINT-BODY" not in cache_blob
+    assert "FRESH-SPRINT-FOCUS" in cache_blob
 
-    # Opt-in: expand_stale=True → full bodies restored.
+    # Opt-in: expand_stale=True → full bodies restored everywhere.
     res2 = await server_module._start_session_composite(
         db, p["id"], "expand-worker", str(tmp_path),
         compact=False, expand_stale=True,
@@ -4795,6 +4875,11 @@ async def test_start_session_composite_collapses_stale_goal_by_default(
     assert "OLD-NORTH-STAR-BODY" in res2["goal_xml"]
     assert "OLD-VERSION-GOAL-MEGASPRINT-BODY" in res2["goal_xml"]
     assert "collapsed=" not in res2["goal_xml"]
+    assert res2["goal"]["north_star"] == "OLD-NORTH-STAR-BODY"
+    assert res2["goal"]["content"] == "OLD-VERSION-GOAL-MEGASPRINT-BODY"
+    cache_blob2 = "\n".join(b["text"] for b in res2["goal_cache_blocks"])
+    assert "OLD-NORTH-STAR-BODY" in cache_blob2
+    assert "OLD-VERSION-GOAL-MEGASPRINT-BODY" in cache_blob2
 
 
 # ---------------------------------------------------------------------------
@@ -7472,11 +7557,21 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_prospect_bypass",
         "_migrate_pg_handoff_tokens",
         "_migrate_pg_wave_gate_results",
+        "_migrate_pg_wave_gate_configs",
         "_migrate_pg_server_logs",
+        "_migrate_pg_custom_hooks",
+        "_migrate_pg_sprint_item_require_verification",
+        "_migrate_pg_sprint_item_verifications_table",
+        "_migrate_pg_proposal_github_issue",
+        "_migrate_pg_sprint_item_required_tool",
+        "_migrate_pg_sprint_item_github_issue_link",
+        "_migrate_pg_manual_issue_screening_toggle",
+        "_migrate_pg_action_audit_log_table",
+        "_migrate_pg_manual_issue_content_log_table",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 112
+    assert len(allnames) == len(set(allnames)) == 122
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

@@ -3,7 +3,17 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "meridian-docs"
+# 6ee033c0 — the [project] name must not be the bare "meridian-docs" string:
+# `uvx --from <local-path> <entry-point>` resolves the local path's distribution
+# name and, when that resolved name matches (or is registry-lookup-ambiguous
+# with) the trailing command argument, uv can still attempt a PyPI registry
+# lookup even though 58a044c7 already renamed the console-script entry-point to
+# "meridian-docs-mcp". Renaming the distribution name itself to
+# "meridian-docs-mcp" removes the ambiguity at the source instead of relying
+# solely on the entry-point rename. (No uv flag reliably suppresses the
+# registry validation for `--from` installs across current uv versions, so the
+# name rename is the robust fix.)
+name = "meridian-docs-mcp"
 description = "Standalone, stdlib-only OOXML (DOCX) intelligence as an MCP server — the parser layer extracted from Meridian."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

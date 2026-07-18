@@ -64,7 +64,7 @@ _SLOT_REPROBE_INTERVAL = 60.0
 _PREFLIGHT_BUDGET_DEFAULT: "tuple[int, float]" = (2, 3.0)
 # 089a936a — a LARGER first-spawn budget for "cold-fetch" slots whose very first
 # spawn triggers a network cold download (e.g. Desktop Commander:
-# `npx -y @wonderwhy-er/desktop-commander@latest`, or the office slots'
+# `npx -y @wonderwhy-er/desktop-commander@<pinned>`, or the office slots'
 # `uvx docx-mcp` / `uvx powerpoint-mcp`) that can exceed the default ~23s.
 # attempts=4 × delay=5s with the 10s per-attempt timeout ≈ up to ~55s.
 # This applies ONLY to the first-spawn pre-flight, NOT the 60s background reprobe
@@ -80,6 +80,12 @@ _PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
 # path (`uvx --from <local-path> meridian-docs-mcp` / `uvx zotero-mcp`), so they need
 # the same larger budget on a cold cache to avoid a spurious preflight FAILED.
 _COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc", "ppt", "word", "docs", "zotero"})
+
+# 3db4f8d8 — pin Desktop Commander to a known-good npm version instead of
+# @latest.  @latest means every cold spawn re-resolves (slower, moving target,
+# and more likely to trigger AV/Defender write-lock interference during tar
+# extraction).  Bump this constant when upgrading Desktop Commander.
+_DC_PINNED_VERSION: str = "0.2.46"
 
 
 # ---------------------------------------------------------------------------
@@ -578,8 +584,9 @@ def _classify_serena_failure(err: object) -> "tuple[str, str] | None":
 # "proxy didn't respond" message. Keyed on the slot label used by the tunnel.
 _DC_PREFLIGHT_HINT = (
     "Desktop Commander did not respond on port {port} — if it isn't installed, "
-    "add it via the dashboard (npx -y @wonderwhy-er/desktop-commander@latest); "
-    "the first launch can take ~a minute to download."
+    "add it via the dashboard (npx -y @wonderwhy-er/desktop-commander@"
+    + _DC_PINNED_VERSION
+    + "); the first launch can take ~a minute to download."
 )
 _OFFICE_PREFLIGHT_HINTS = {
     "ppt": (
@@ -1359,6 +1366,148 @@ def _scoped_cache_clear(cmd: "list[str]", label: str = "?") -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# TAR_ENTRY_ERROR detection + thorough cache clear (3db4f8d8)
+# ---------------------------------------------------------------------------
+
+# 3db4f8d8 — strings that indicate a tar-extraction-corruption failure in
+# npx's output.  These appear when AV/Defender (or any other process) locks
+# a file mid-write during package extraction, leaving a partial/corrupted
+# cache entry that will keep failing on subsequent spawns until the entry is
+# wiped.  The list is intentionally conservative (case-insensitive substrings)
+# so it matches both the older npm/node TAR_ENTRY_ERROR format and npm v9+'s
+# "integrity check failed" wording for the same underlying error.
+_TAR_ENTRY_ERROR_SIGNATURES: "tuple[str, ...]" = (
+    "tar_entry_error",          # canonical npm tar extraction error code
+    "tar entry error",          # space-variant occasionally emitted
+    "integrity check failed",   # npm v9+ re-phrasing of a corrupted cached pkg
+    "eintegrity",               # npm hash-mismatch (partial download = same root cause)
+    "corrupted package",        # some npm versions emit this
+    "unexpected end of data",   # zlib/tar truncation mid-extract
+)
+
+
+def _is_tar_entry_error(text: str) -> bool:
+    """Return True if *text* contains any TAR extraction corruption signature.
+
+    Pure and side-effect-free — safe to call from tests.  (3db4f8d8)
+
+    The check is case-insensitive so ``TAR_ENTRY_ERROR``, ``Tar_Entry_Error``,
+    and ``tar_entry_error`` all match.  We normalise to lowercase once rather
+    than using re.IGNORECASE to avoid importing re at module top-level.
+    """
+    if not text:
+        return False
+    lower = text.lower()
+    return any(sig in lower for sig in _TAR_ENTRY_ERROR_SIGNATURES)
+
+
+def _scoped_cache_clear_thorough(cmd: "list[str]", label: str = "?") -> None:
+    """Thorough cache wipe for the TAR_ENTRY_ERROR failure class.  (3db4f8d8)
+
+    TAR_ENTRY_ERROR leaves a *partially-written* or *hash-mismatched* cache
+    entry that the normal ``_scoped_cache_clear`` (which only removes the
+    ephemeral ``_npx/`` directory) does NOT fully remove.  The corrupted entry
+    lives inside npm's content-addressable store (``~/.npm/_cacache`` or
+    ``%LOCALAPPDATA%/npm-cache/_cacache`` on Windows).
+
+    This variant runs the standard ``_scoped_cache_clear`` FIRST (removes
+    ``_npx/``) and then also runs ``npm cache clean --force`` to flush the
+    entire npm content-addressable store.  The full cache clean is more
+    aggressive than the scoped ``_npx/`` removal, but it is the correct remedy
+    for a corrupted ``_cacache`` entry — a partial entry in the CAS store will
+    keep causing TAR_ENTRY_ERROR on every future run of ``npx -y <pkg>`` until
+    it is expelled.
+
+    Never raises — all subprocess / filesystem errors are swallowed.
+    """
+    # Phase 1: the regular scoped clear (_npx/ removal + uv cache for uvx).
+    _scoped_cache_clear(cmd, label)
+
+    # Phase 2: npm full cache clean — only for npx commands.
+    detection = _detect_spawn_tool(cmd)
+    if detection is None or detection[0] != "npx":
+        return  # uvx / bare binary — the scoped clear above is sufficient
+
+    pkg = detection[1]
+    npm = shutil.which("npm")
+    if not npm:
+        print(
+            f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm not found on PATH; "
+            f"_npx/ already removed — full _cacache wipe skipped (pkg={pkg!r})",
+            flush=True,
+        )
+        return
+    try:
+        result = subprocess.run(
+            [npm, "cache", "clean", "--force"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            print(
+                f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm cache clean --force "
+                f"succeeded (pkg={pkg!r}); retry attempt follows",
+                flush=True,
+            )
+        else:
+            _err = (result.stderr or result.stdout or "").strip()[:200]
+            print(
+                f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm cache clean --force "
+                f"returned {result.returncode} ({_err!r}); retrying anyway",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort, never block the retry
+        print(
+            f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm cache clean raised "
+            f"{exc}; retrying anyway",
+            flush=True,
+        )
+
+
+def _probe_tar_entry_error(
+    cmd: "list[str]",
+    env: "dict | None",
+    label: str,
+    wait_seconds: float = 5.0,
+) -> bool:
+    """Probe whether running *cmd* triggers a TAR_ENTRY_ERROR by capturing stderr.
+
+    Spawns *cmd* with ``stderr=PIPE``, waits up to *wait_seconds* for it to exit
+    (fast-exit signals a broken extraction rather than a healthy long-running
+    server), then checks the captured output for TAR_ENTRY_ERROR signatures.
+
+    Returns ``True`` when a TAR extraction error is confirmed (caller should use
+    ``_scoped_cache_clear_thorough``), ``False`` otherwise (process is still
+    running / exited clean / error pattern not present).
+
+    Never raises — exceptions from ``Popen`` / ``communicate`` are swallowed so
+    that a failing probe can never block the normal retry path.  (3db4f8d8)
+    """
+    try:
+        # Note: we do NOT pass _spawn_kwargs() here — we are running a short
+        # diagnostic spawn (not the live server), and CREATE_NEW_PROCESS_GROUP on
+        # Windows is irrelevant for a probe we immediately wait on.
+        probe = subprocess.Popen(
+            cmd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            _, stderr_bytes = probe.communicate(timeout=wait_seconds)
+        except subprocess.TimeoutExpired:
+            # Process is still running after the probe window → it started OK.
+            # Kill the probe (we only wanted the diagnostic) and report clean.
+            try:
+                probe.kill()
+                probe.communicate()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+        return _is_tar_entry_error(stderr_text)
+    except Exception:  # noqa: BLE001 — probe failed entirely; assume not tar error
+        return False
+
+
 def _spawn_with_cache_retry(
     cmd: "list[str]",
     env: "dict | None",
@@ -1376,15 +1525,25 @@ def _spawn_with_cache_retry(
     3. If the retry also fails, re-raise the *original* first-attempt exception
        so the error surfaces identically to how it did before this feature existed.
 
+    TAR_ENTRY_ERROR path (3db4f8d8):
+    When the first spawn *succeeds* as a Popen (the process starts), but
+    ``_probe_tar_entry_error`` detects that the process immediately exits with a
+    TAR extraction corruption signature in its stderr, the retry uses
+    ``_scoped_cache_clear_thorough`` (which also flushes ``npm cache clean
+    --force``) instead of the scoped-only clear.  This is a distinct failure
+    class from the a9d1ef7f generic spawn-exception path: the process starts but
+    the cache entry it tries to unpack is corrupted, leaving a broken/incomplete
+    install.
+
     Uses ``_spawn_kwargs()`` internally (same as every other Popen site in this
     file) so the Windows ``CREATE_NEW_PROCESS_GROUP`` flag is always applied.
-    (a9d1ef7f)
+    (a9d1ef7f, 3db4f8d8)
     """
     kwargs = _spawn_kwargs()
     try:
-        return subprocess.Popen(cmd, env=env, **kwargs)
+        proc = subprocess.Popen(cmd, env=env, **kwargs)
     except Exception as first_exc:  # noqa: BLE001
-        # First spawn failed. Try a scoped cache clear (best-effort) then retry.
+        # First spawn failed (OSError / ENOENT / etc.) — a9d1ef7f generic path.
         print(
             f"tunnel:{label}: spawn failed ({first_exc}); "
             "attempting scoped cache-clear + one retry",
@@ -1395,6 +1554,37 @@ def _spawn_with_cache_retry(
             return subprocess.Popen(cmd, env=env, **kwargs)
         except Exception:  # noqa: BLE001 — retry also failed; surface the original
             raise first_exc from None
+
+    # Popen succeeded. Check whether the process immediately exits with a
+    # TAR_ENTRY_ERROR — the 3db4f8d8 distinct failure class.
+    # poll() after a tiny delay: a healthy server process won't have exited yet;
+    # a broken extraction dies within milliseconds.
+    time.sleep(0.1)
+    if proc.poll() is not None:
+        # Process already exited — check if it was a TAR extraction error.
+        # Run a diagnostic probe with stderr captured to identify the class.
+        if _probe_tar_entry_error(cmd, env, label, wait_seconds=5.0):
+            print(
+                f"tunnel:{label}: TAR_ENTRY_ERROR detected (corrupted npm extraction "
+                "cache, likely AV/Defender file-lock interference); applying thorough "
+                "cache clear + retry",
+                file=sys.stderr, flush=True,
+            )
+            _scoped_cache_clear_thorough(cmd, label)
+        else:
+            # Fast exit but no TAR signature — fall back to the generic scoped clear.
+            print(
+                f"tunnel:{label}: process exited immediately (code {proc.returncode}); "
+                "applying scoped cache-clear + one retry",
+                file=sys.stderr, flush=True,
+            )
+            _scoped_cache_clear(cmd, label)
+        try:
+            return subprocess.Popen(cmd, env=env, **kwargs)
+        except Exception as retry_exc:  # noqa: BLE001
+            raise retry_exc from None
+
+    return proc
 
 
 def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
@@ -1712,13 +1902,19 @@ def _dc_default_command() -> list[str]:
     """Default Desktop Commander launcher, shell-wrapped per OS.
 
     DC ships only as an npm package, so the launcher is
-    ``npx -y @wonderwhy-er/desktop-commander@latest``. On Windows ``npx`` is the
+    ``npx -y @wonderwhy-er/desktop-commander@<pinned>``. On Windows ``npx`` is the
     extension-less shim: spawned directly by mcp-proxy (no ``--shell``, since the
     first token isn't a ``.cmd``/``.bat`` path) it raises ``ENOENT`` and the
     watchdog spin-loops. Wrapping in ``cmd /c`` makes mcp-proxy spawn the real
     ``cmd.exe``, which resolves ``npx`` via ``PATHEXT``. POSIX needs no wrapper.
+
+    3db4f8d8 — pinned to a known-good version instead of ``@latest`` so that every
+    cold spawn resolves the same tarball.  ``@latest`` caused every cold spawn to
+    re-resolve the newest release, which (a) is a moving target, and (b) makes
+    AV/Defender-induced TAR_ENTRY_ERROR more likely because each new-version
+    extraction hits the same write-lock window.
     """
-    base = ["npx", "-y", "@wonderwhy-er/desktop-commander@latest"]
+    base = ["npx", "-y", f"@wonderwhy-er/desktop-commander@{_DC_PINNED_VERSION}"]
     if sys.platform == "win32":
         return ["cmd", "/c", *base]
     return base

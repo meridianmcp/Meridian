@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from meridian import db as db_module
 from meridian import handoff as handoff_module
 
@@ -252,3 +254,218 @@ def test_stop_override_ceiling_env_default_and_override(monkeypatch):
     assert sprint_routes._stop_override_ceiling() == 3   # non-positive → default
     monkeypatch.setenv("MERIDIAN_STOP_OVERRIDE_CEILING", "nope")
     assert sprint_routes._stop_override_ceiling() == 3   # unparseable → default
+
+
+# ---------------------------------------------------------------------------
+# 273287cb — user-creatable hooks: generalizes past sprint_guard.sh/.ps1 (the
+# only hook Meridian auto-writes) so a project can define its own arbitrary
+# PreToolUse/PostToolUse/Stop hooks, injected the same way by generate_handoff.
+# ---------------------------------------------------------------------------
+
+def test_add_custom_hook_derives_slug_and_defaults():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "hooks-crud")
+        hook = await db_module.add_custom_hook(
+            db, p["id"], "No Secrets!", "PreToolUse", "exit 0", matcher="Read|Bash",
+        )
+        return hook
+
+    hook = asyncio.run(_run())
+    assert hook["slug"] == "no_secrets"
+    assert hook["event"] == "PreToolUse"
+    assert hook["blocking"] == 1          # default: real exit-code semantics
+    assert hook["enabled"] == 1
+    assert hook["script_ps1"] is None
+
+
+def test_add_custom_hook_rejects_reserved_sprint_guard_name():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "hooks-reserved")
+        with pytest.raises(ValueError, match="reserved"):
+            await db_module.add_custom_hook(db, p["id"], "sprint_guard", "Stop", "exit 0")
+
+    asyncio.run(_run())
+
+
+def test_add_custom_hook_rejects_duplicate_slug_and_bad_event():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "hooks-dupe")
+        await db_module.add_custom_hook(db, p["id"], "My Hook", "PreToolUse", "exit 0")
+        with pytest.raises(ValueError, match="already exists"):
+            await db_module.add_custom_hook(db, p["id"], "my hook", "PostToolUse", "exit 0")
+        with pytest.raises(ValueError, match="event must be"):
+            await db_module.add_custom_hook(db, p["id"], "another", "Bogus", "exit 0")
+
+    asyncio.run(_run())
+
+
+def test_get_custom_hooks_filters_by_event_and_enabled():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "hooks-filter")
+        await db_module.add_custom_hook(db, p["id"], "one", "PreToolUse", "exit 0")
+        await db_module.add_custom_hook(db, p["id"], "two", "Stop", "exit 0", enabled=False)
+        all_hooks = await db_module.get_custom_hooks(db, p["id"])
+        pre_only = await db_module.get_custom_hooks(db, p["id"], event="PreToolUse")
+        enabled_only = await db_module.get_custom_hooks(db, p["id"], enabled_only=True)
+        return all_hooks, pre_only, enabled_only
+
+    all_hooks, pre_only, enabled_only = asyncio.run(_run())
+    assert len(all_hooks) == 2
+    assert [h["slug"] for h in pre_only] == ["one"]
+    assert [h["slug"] for h in enabled_only] == ["one"]
+
+
+def test_delete_custom_hook_idempotent():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "hooks-delete")
+        hook = await db_module.add_custom_hook(db, p["id"], "one", "Stop", "exit 0")
+        first = await db_module.delete_custom_hook(db, p["id"], hook["id"])
+        second = await db_module.delete_custom_hook(db, p["id"], hook["id"])
+        return first, second
+
+    first, second = asyncio.run(_run())
+    assert first is True
+    assert second is False
+
+
+def test_update_custom_hook_rename_re_derives_slug():
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "hooks-update")
+        hook = await db_module.add_custom_hook(db, p["id"], "one", "Stop", "exit 0")
+        updated = await db_module.update_custom_hook(
+            db, p["id"], hook["id"], name="renamed hook", blocking=False,
+        )
+        return updated
+
+    updated = asyncio.run(_run())
+    assert updated["slug"] == "renamed_hook"
+    assert updated["blocking"] == 0
+
+
+def test_write_sprint_guard_hooks_also_writes_enabled_custom_hooks(tmp_path):
+    # Blocking hooks are written byte-for-byte (both .sh and .ps1 when
+    # script_ps1 is provided); disabled hooks are skipped entirely; the
+    # sprint_guard files are still written unchanged alongside them.
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        await db_module.add_custom_hook(
+            db, "proj-hooks-1", "Hard Block", "PreToolUse", "echo blocked; exit 2",
+            script_ps1="Write-Output blocked; exit 2", matcher="Bash", blocking=True,
+        )
+        await db_module.add_custom_hook(
+            db, "proj-hooks-1", "Disabled One", "Stop", "exit 0", enabled=False,
+        )
+        await handoff_module._write_sprint_guard_hooks(db, "proj-hooks-1", root=tmp_path)
+
+    asyncio.run(_run())
+    hooks_dir = tmp_path / ".claude" / "hooks"
+    assert (hooks_dir / "sprint_guard.sh").exists()
+    assert (hooks_dir / "sprint_guard.ps1").exists()
+    sh = (hooks_dir / "hard_block.sh").read_text(encoding="utf-8")
+    ps1 = (hooks_dir / "hard_block.ps1").read_text(encoding="utf-8")
+    assert sh.strip().endswith("echo blocked; exit 2")   # written verbatim (blocking=True)
+    assert ps1.strip().endswith("exit 2")
+    assert not (hooks_dir / "disabled_one.sh").exists()  # disabled hooks are skipped
+
+
+def test_write_sprint_guard_hooks_advisory_hook_downgrades_exit_2(tmp_path):
+    # blocking=False: the .sh is wrapped in a subshell that downgrades a would-be
+    # exit 2 to exit 1 (advisory, never hard-blocks); the .ps1 gets a wrapper +
+    # a companion _body.ps1 (PowerShell's `exit` can't be intercepted in-process,
+    # so the body has to run as a genuine child process to isolate its exit code).
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        await db_module.add_custom_hook(
+            db, "proj-hooks-2", "Style Nudge", "PostToolUse", "echo nudge; exit 2",
+            script_ps1="Write-Output nudge; exit 2", matcher="Edit|Write", blocking=False,
+        )
+        await handoff_module._write_sprint_guard_hooks(db, "proj-hooks-2", root=tmp_path)
+
+    asyncio.run(_run())
+    hooks_dir = tmp_path / ".claude" / "hooks"
+    sh = (hooks_dir / "style_nudge.sh").read_text(encoding="utf-8")
+    assert "(\necho nudge; exit 2\n)" in sh
+    assert 'exit "$_meridian_hook_rc"' in sh
+    assert "exit 1" in sh                                 # the downgrade path
+
+    ps1 = (hooks_dir / "style_nudge.ps1").read_text(encoding="utf-8")
+    body = (hooks_dir / "style_nudge_body.ps1").read_text(encoding="utf-8")
+    assert "style_nudge_body.ps1" in ps1
+    assert "$LASTEXITCODE" in ps1
+    assert body.strip().endswith("exit 2")
+
+
+def test_write_sprint_guard_hooks_never_writes_reserved_slug_files(tmp_path):
+    # Defense-in-depth: even if a row somehow bypassed add_custom_hook's
+    # reserved-name check, the writer must never let a custom hook shadow the
+    # real sprint_guard files.
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "hooks-reserved-write")
+        # Insert directly to bypass the db-layer guard and prove the writer's
+        # own defense-in-depth skip. A distinctive marker in the bypass row's
+        # script makes it unmistakable if it ever leaked into sprint_guard.sh.
+        await db.execute(
+            "INSERT INTO custom_hooks (id, project_id, name, slug, event, "
+            "script_sh, blocking, enabled) VALUES (?, ?, 'x', 'sprint_guard', "
+            "'Stop', 'echo MERIDIAN_BYPASS_MARKER_9f3a', 1, 1)",
+            ("bypass-id", p["id"]),
+        )
+        await db.commit()
+        await handoff_module._write_sprint_guard_hooks(db, p["id"], root=tmp_path)
+        return p["id"]
+
+    asyncio.run(_run())
+    sh = (tmp_path / ".claude" / "hooks" / "sprint_guard.sh").read_text(encoding="utf-8")
+    assert "MERIDIAN_BYPASS_MARKER_9f3a" not in sh  # bypass row never leaked in
+    assert "pending_count" in sh                    # still the real sprint_guard body
+
+
+async def test_mcp_custom_hook_tools_add_get_delete(db):
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "hooks-mcp")
+    added = await srv._dispatch_mcp_tool(
+        "add_custom_hook",
+        {"project_id": p["id"], "name": "No Secrets", "event": "PreToolUse",
+         "script_sh": "exit 0", "matcher": "Read|Bash"},
+        db, "/tmp",
+    )
+    listed = await srv._dispatch_mcp_tool(
+        "get_custom_hooks", {"project_id": p["id"]}, db, "/tmp",
+    )
+    reserved_err = await srv._dispatch_mcp_tool(
+        "add_custom_hook",
+        {"project_id": p["id"], "name": "sprint_guard", "event": "Stop", "script_sh": "exit 0"},
+        db, "/tmp",
+    )
+    deleted = await srv._dispatch_mcp_tool(
+        "delete_custom_hook", {"project_id": p["id"], "hook_id": added["id"]}, db, "/tmp",
+    )
+    deleted_again = await srv._dispatch_mcp_tool(
+        "delete_custom_hook", {"project_id": p["id"], "hook_id": added["id"]}, db, "/tmp",
+    )
+    missing_args = await srv._dispatch_mcp_tool("add_custom_hook", {"project_id": p["id"]}, db, "/tmp")
+
+    assert added["slug"] == "no_secrets"
+    assert listed["hooks"][0]["id"] == added["id"]
+    assert "error" in reserved_err
+    assert deleted == {"hook_id": added["id"], "deleted": True}
+    assert deleted_again == {"hook_id": added["id"], "deleted": False}
+    assert "error" in missing_args
+
+
+def test_custom_hook_tools_registered():
+    from meridian.mcp_tools import _MCP_TOOLS_LIST, _READ_ONLY_TOOLS, _DESTRUCTIVE_TOOLS
+    names = {t["name"] for t in _MCP_TOOLS_LIST}
+    assert {"add_custom_hook", "get_custom_hooks", "delete_custom_hook"} <= names
+    assert "get_custom_hooks" in _READ_ONLY_TOOLS
+    assert "delete_custom_hook" in _DESTRUCTIVE_TOOLS
+    assert "add_custom_hook" not in _READ_ONLY_TOOLS
+    assert "add_custom_hook" not in _DESTRUCTIVE_TOOLS

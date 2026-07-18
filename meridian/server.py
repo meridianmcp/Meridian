@@ -2377,7 +2377,8 @@ async def _notify_project(
 
 
 async def _on_hitl_answered(
-    db: Any, request_row: dict[str, Any], *, approved: bool
+    db: Any, request_row: dict[str, Any], *, approved: bool,
+    tenant: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Side-effect for an answered/dismissed HITL request.
 
@@ -2386,8 +2387,109 @@ async def _on_hitl_answered(
     checkpoint via :func:`_finalize_session_md`). Never raises — any failure is
     returned as ``apply_error`` so the answer itself still succeeds. Legacy
     ``'question'`` requests are a no-op.
+
+    ``tenant`` (the answering caller's tenant dict, carrying ``github_pat``) is
+    optional and only consumed by ``kind='proposal_github_issue'`` — see below.
     """
     kind = (request_row or {}).get("kind")
+
+    if kind == "proposal_github_issue":
+        # 3999d90f — conditional proposal-to-GitHub-issue workflow. The HITL
+        # was filed by promote_workspace_proposal; here (on answer) is where
+        # the issue actually gets filed and written back onto the proposal,
+        # since only this layer has GitHub tool + tenant PAT access.
+        if not approved:
+            return {"applied": False, "reason": "rejected"}
+        raw = request_row.get("payload")
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            return {"applied": False, "apply_error": "payload is not valid JSON"}
+        answer = (request_row.get("answer") or "").strip().lower()
+        if not answer.startswith("yes"):
+            return {"applied": False, "reason": "declined"}
+        proposal_id = payload.get("proposal_id")
+        gh_project_id = payload.get("project_id")
+        issue_title = payload.get("issue_title")
+        issue_body = payload.get("issue_body") or ""
+        if not proposal_id or not gh_project_id or not issue_title:
+            return {"applied": False, "apply_error": "payload missing proposal_id/project_id/issue_title"}
+        if not tenant:
+            return {"applied": False, "reason": "no_tenant_context"}
+        try:
+            # Lazy import — mcp.handler imports meridian.server at module
+            # level, so importing it back at module level here would cycle.
+            from .mcp.handler import _dispatch_github_tool  # noqa: PLC0415
+
+            gh_result = await _dispatch_github_tool(
+                "create_issue",
+                {"project_id": gh_project_id, "title": issue_title, "body": issue_body},
+                tenant, db,
+            )
+        except Exception as exc:  # noqa: BLE001 — never crash the answer flow
+            return {"applied": False, "apply_error": f"github issue creation failed: {exc}"}
+        if not isinstance(gh_result, dict) or gh_result.get("error"):
+            err = gh_result.get("error") if isinstance(gh_result, dict) else "unknown error"
+            return {"applied": False, "apply_error": str(err)}
+        issue_number = gh_result.get("number")
+        issue_url = gh_result.get("html_url")
+        try:
+            await db_module.set_proposal_github_issue(
+                db, proposal_id, issue_number, issue_url,
+                tenant_id=(tenant.get("id") if isinstance(tenant, dict) else None),
+            )
+        except Exception as exc:  # noqa: BLE001 — never crash the answer flow
+            return {"applied": False, "apply_error": f"failed to persist issue on proposal: {exc}"}
+        # fdaa5b55 / eda40627 — this is the ONE place in the codebase that ever
+        # writes github_issue_source='meridian_auto': right here, right after a
+        # REAL create_issue call above returned a real issue number, for the
+        # sprint item promote_workspace_proposal created alongside this
+        # proposal (sprint_item_id was placed in the HITL payload at request
+        # time — see promote_workspace_proposal). Best-effort: a missing/stale
+        # sprint_item_id must never turn an already-successful issue creation
+        # into a caller-visible failure, so link failures are swallowed here
+        # (the issue is still correctly recorded on the proposal above).
+        sprint_item_id = payload.get("sprint_item_id")
+        if sprint_item_id and issue_number:
+            try:
+                await db_module.link_sprint_item_github_issue(
+                    db, gh_project_id, sprint_item_id, issue_number, issue_url,
+                    source="meridian_auto",
+                )
+            except Exception:  # noqa: BLE001 — never crash the answer flow
+                pass
+        return {"applied": True, "github_issue_number": issue_number, "github_issue_url": issue_url}
+
+    if kind == "manual_issue_screening_toggle":
+        # 5dfe34b2 / cd495afa — the ONLY place a completed require_human=True
+        # HITL of this kind is translated into an actual toggle flip. Even a
+        # forged/tampered request_row cannot bypass the real gate: the write
+        # path (db_module.set_manual_issue_screening_enabled) independently
+        # re-reads the HITL row from the DB by id and re-verifies kind,
+        # status, require_human, and answer itself — this branch is a
+        # convenience trigger, not the trust boundary.
+        raw = request_row.get("payload")
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            payload = {}
+        tenant_id_for_toggle = (tenant.get("id") if isinstance(tenant, dict) else None) or payload.get("tenant_id")
+        if not approved:
+            return {"applied": False, "reason": "rejected"}
+        answer = (request_row.get("answer") or "").strip().lower()
+        enable = answer.startswith("yes")
+        try:
+            updated = await db_module.set_manual_issue_screening_enabled(
+                db, enable,
+                tenant_id=tenant_id_for_toggle,
+                actor=f"hitl:{request_row.get('id')}",
+                hitl_id=request_row.get("id") if enable else None,
+            )
+        except db_module.ManualIssueScreeningToggleError as exc:
+            return {"applied": False, "apply_error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — never crash the answer flow
+            return {"applied": False, "apply_error": f"toggle update failed: {exc}"}
+        return {"applied": True, "manual_issue_screening_enabled": updated.get("manual_issue_screening_enabled")}
 
     if kind == "hook_project_select" and approved:
         # Store hostname → project mapping so future hooks auto-route
@@ -2450,19 +2552,24 @@ async def _answer_hitl_and_apply(
     *,
     answered_by: str | None = None,
     approved: bool = True,
+    tenant: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """The ONLY correct way to answer a HITL request — stores the answer then
     runs :func:`_on_hitl_answered`. Both the ``answer_hitl`` MCP tool and the
     route ``PATCH /hitl/{id}`` funnel through here so an ``md_section_update`` is
     applied exactly once. Returns the (possibly enriched) row, or ``None`` when
     the request was not found.
+
+    ``tenant`` is forwarded to :func:`_on_hitl_answered` — required for
+    ``kind='proposal_github_issue'`` to file the GitHub issue with the
+    caller's PAT; other kinds ignore it.
     """
     row = await db_module.answer_hitl_request(
         db, request_id, answer, answered_by=answered_by
     )
     if row is None:
         return None
-    extra = await _on_hitl_answered(db, row, approved=approved)
+    extra = await _on_hitl_answered(db, row, approved=approved, tenant=tenant)
     return {**row, **extra}
 
 
@@ -5231,11 +5338,14 @@ async def _start_session_composite(
     (project_id, session_name); NEVER on Mcp-Session-Id since ChatGPT
     regenerates that header per tool call.
 
-    ``expand_stale`` (2b4e69aa) only affects the full (``compact=False``)
-    payload's ``goal_xml``: it defaults to ``False`` so any goal field the
-    coherence check flagged stale (a week-old north_star / version_goal /
+    ``expand_stale`` (2b4e69aa; extended by 14847f20) only affects the full
+    (``compact=False``) payload: it defaults to ``False`` so any goal field
+    the coherence check flagged stale (a week-old north_star / version_goal /
     sprint) is collapsed to a one-line "expand for detail" summary instead of
-    dumped in full. Pass ``expand_stale=True`` to restore the full bodies; the
+    dumped in full — in ``goal_xml`` AND in the raw ``goal`` dict AND in
+    ``goal_cache_blocks``, so a stale field's dead weight isn't tripled up
+    across all three representations (the 269KB default payload). Pass
+    ``expand_stale=True`` to restore the full bodies everywhere; the
     ``coherence_warning`` flag is always preserved either way.
     """
     # c793377d — "just continue" resume. Auto-detect uses the 5-min heartbeat
@@ -5565,8 +5675,12 @@ async def _start_session_composite(
     )
     # v0.6.2 — Anthropic-API content blocks with cache_control on
     # the two static fields. Same ambient slice used by the XML.
+    # 14847f20 — same expand_stale collapsing as goal_xml above: a stale
+    # field flagged by coherence_warning shouldn't get dumped in full here
+    # either (it's a straight duplicate of the just-collapsed XML block).
     goal_cache_blocks = db_module.build_goal_cache_blocks(
-        goal, project_name, ambient_for_xml
+        goal, project_name, ambient_for_xml,
+        coherence_warning=coherence, expand_stale=expand_stale,
     )
     if goal is not None:
         goal["xml"] = goal_xml
@@ -5668,7 +5782,14 @@ async def _start_session_composite(
         "hitl_auto_answer_mode": _hitl_mode,
         "hitl_auto_answer_directive": _hitl_mode_directive(_hitl_mode),
         "sprint_version": scoped_version,  # a76cb7c0 — resolved scope (or None)
-        "goal": goal,
+        # 14847f20 — the raw goal dict gets the same stale-field collapse as
+        # goal_xml/goal_cache_blocks above; without it a week-old north_star
+        # / sprint was dumped in full here even though coherence_warning
+        # already flagged it stale, tripling up the same dead-weight text
+        # across goal/goal_xml/goal_cache_blocks (the 269KB default payload).
+        "goal": db_module.collapse_stale_goal_fields(
+            goal, coherence, expand_stale=expand_stale
+        ),
         "goal_xml": goal_xml,  # v0.6.1 — always present
         "goal_cache_blocks": goal_cache_blocks,  # v0.6.2 — ready for Anthropic
         "sprint_items": pending_items,  # v1.1 — active checklist (scoped)

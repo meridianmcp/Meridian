@@ -76,6 +76,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
     "assign_sprint_waves": 'assign_sprint_waves(project_id="abc-123")',
     "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
+    "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
@@ -92,6 +93,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "set_active_repo": 'set_active_repo(repo_path="C:\\\\Users\\\\me\\\\project")',
     "analyze_model_efficiency": 'analyze_model_efficiency(title="Refactor auth across 12 files + migration", file_count=12, touches_resources=["auth_db", "sessions_table"], size="xl")',
     "run_verification": 'run_verification(project_id="abc-123")  # runs stored test_cmd on your local machine via tunnel',
+    "add_custom_hook": 'add_custom_hook(project_id="abc-123", name="no-secrets", event="PreToolUse", matcher="Read|Bash", script_sh="grep -q SECRET_KEY <<<\\"$(cat)\\" && exit 2 || exit 0", blocking=True)',
+    "get_custom_hooks": 'get_custom_hooks(project_id="abc-123", event="PreToolUse")',
+    "delete_custom_hook": 'delete_custom_hook(project_id="abc-123", hook_id="hook-uuid")',
 }
 
 
@@ -364,6 +368,41 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "request_id": {"type": "string"}},
          "required": ["request_id"]}},
+    {"name": "request_manual_issue_screening_toggle", "description":
+        "5dfe34b2 — request enabling/disabling the OFF-by-default opt-in extension "
+        "that lets the automated GitHub-issue comment/propose flow (never auto-close) "
+        "also act on issues Meridian did not itself create, gated behind hardcoded "
+        "content screening. enable=true ALWAYS files a require_human=true HITL "
+        "(kind/require_human are hardcoded — this tool cannot be used to self-escalate; "
+        "only a genuine human answering in the dashboard/API can enable it). "
+        "enable=false disables immediately with no HITL (fail-safe direction) and is "
+        "audit-logged either way.",
+     "inputSchema": {"type": "object", "properties": {
+         "enable": {"type": "boolean", "description": "true to request enabling (files a human-only HITL); false to disable immediately."},
+         "project_id": {"type": "string", "description": "Optional — a project to file the enable-request HITL under; defaults to a workspace-level request."},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "context": {"type": "string"}},
+         "required": ["enable"]}},
+    {"name": "link_manual_github_issue", "description":
+        "5dfe34b2 — attempt to link a manually-filed GitHub issue (one Meridian did "
+        "NOT create) to a sprint item, extending fdaa5b55's automated comment/propose "
+        "flow to it. No-ops safely (action='skipped') unless "
+        "manual_issue_screening_enabled is on. When enabled: reads the issue's raw "
+        "content, logs it (hashed, append-only) before any processing, runs a "
+        "wave-relative velocity/anomaly check (non-blocking escalation only), then "
+        "screens title/body/comments for hardcoded injection shapes — flagged content "
+        "is never auto-linked (a human-review HITL is filed instead); only "
+        "screening-clean content gets linked (github_issue_source='manual'). Linking "
+        "NEVER by itself closes the issue — fdaa5b55's existing propose+HITL flow "
+        "still applies at sprint-item completion time.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "item_id": {"type": "string", "description": "The sprint item to link the issue to."},
+         "issue_number": {"type": "integer"},
+         "session_id": {"type": "string"}},
+         "required": ["item_id", "issue_number"]}},
     {"name": "add_note", "description":
         "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
         "Free-form title/body; comma-separated tags optional. Optional kind "
@@ -1288,7 +1327,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "blocker_kind": {"type": "string", "enum": ["manual", "superseded"],
                           "description": "2282a636 — omit for an ordinary item; 'manual' marks the item as blocked on a REAL-WORLD action OUTSIDE Meridian (publish something, obtain an API key, talk to an advisor). DISTINCT from milestone_type='human' (which is about WHO executes): a manual-blocker item is surfaced distinctly and is EXCLUDED from executor 'just claim the next pending' scoping, so an executor never treats it as claimable work. f89d440f — 'superseded' marks the item's premise as replaced by other work (e.g. a workspace proposal); UNLIKE 'manual' this is a HARD gate — claim_sprint_item refuses it outright even on a direct claim by item_id, not just a listing exclusion."},
          "wave": {"type": "string",
-                  "description": "58a45b92 — stored, deterministic wave/batch label (e.g. 'wave-1') for enforced wave-a/wave-b grouping. Usually auto-filled by assign_sprint_waves from the conflict-free parallel groups; set it here only to pin an item to a specific wave up front. Omit to leave unassigned."}},
+                  "description": "58a45b92 — stored, deterministic wave/batch label (e.g. 'wave-1') for enforced wave-a/wave-b grouping. Usually auto-filled by assign_sprint_waves from the conflict-free parallel groups; set it here only to pin an item to a specific wave up front. Omit to leave unassigned."},
+         "required_tool": {"type": "string",
+                  "description": "4d1fb28f — pin the specific MCP tool/plugin the executor MUST use for this item (e.g. 'Serena: replace_symbol_body', 'meridian__patch_file', a named tunnel plugin) instead of leaving tool choice to executor habit. Rendered as a hard directive in the /goal block (not a soft hint) — see build_item_briefing / the batch /goal's <required_tool> clause. Omit for ordinary executor discretion."}},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -1318,10 +1359,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["items"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "
-        "group, deferred_until (enforced deferral), or track. Only the fields you pass are "
-        "changed; omitted fields are left untouched. Pass an empty string for human_id, group, "
-        "deferred_until, or track to clear it. Returns the updated item, or an error if the id "
-        "is unknown.",
+        "group, deferred_until (enforced deferral), track, or depends_on (dependency ordering). "
+        "Only the fields you pass are changed; omitted fields are left untouched. Pass an empty "
+        "string for human_id, group, deferred_until, track, or depends_on to clear it. Returns "
+        "the updated item, or an error if the id is unknown.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -1342,21 +1383,40 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "wave": {"type": "string",
                   "description": "58a45b92 — set/clear the stored wave label (e.g. 'wave-1') for enforced parallel-batch grouping. Hand-override of what assign_sprint_waves computes. Pass an empty string to CLEAR (unassigned); omit to leave unchanged."},
          "prospect_bypass": {"type": "boolean",
-                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. Set false to re-enable the structural gate. Omit to leave unchanged. Executor sessions must NOT set this field."}},
+                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. Set false to re-enable the structural gate. Omit to leave unchanged. Executor sessions must NOT set this field."},
+         "depends_on": {"type": "string",
+                        "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."},
+         "require_verification": {"type": "boolean",
+                             "description": "e2e1b682 — set true to require an independent fresh-session PASS (see complete_sprint_item's verifier_session_id/verification_verdict) before the item can be completed. A same-session self-report does not satisfy this gate. Set false to re-enable ordinary completion (evidence gate only). Omit to leave unchanged."},
+         "required_tool": {"type": "string",
+                  "description": "4d1fb28f — pin (or re-pin) the specific MCP tool/plugin the executor MUST use for this item, rendered as a hard directive in the /goal block — not left to executor habit. Pass an empty string to CLEAR the pin (ordinary executor discretion); omit to leave unchanged."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "
         "Pass session_id to get a board_change field (items injected mid-run) and an "
         "active-worktree merge reminder in the response. If the item is flagged "
         "required_notes, you MUST pass notes= (evidence: what shipped / how verified) "
-        "or a task_id, or completion is refused (EVIDENCE_REQUIRED).",
+        "or a task_id, or completion is refused (EVIDENCE_REQUIRED). If the item is "
+        "flagged require_verification (e2e1b682), completion is refused "
+        "(VERIFICATION_REQUIRED) unless an independent PASS is on file: pass "
+        "verifier_session_id (a DIFFERENT session id from actor — a fresh, no-memory "
+        "subsession that inspected the change with read-only tools) and "
+        "verification_verdict='pass' to file and check the verdict in this same call. "
+        "fdaa5b55 — if the item has a linked GitHub issue, the response carries a "
+        "github_issue_action field: issues Meridian itself created (github_issue_source="
+        "'meridian_auto') are commented on and auto-closed; any other issue (manual/legacy) "
+        "only gets a proposed-closure comment plus a non-blocking HITL for human review — "
+        "never auto-closed.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
          "task_id": {"type": "string"},
          "notes": {"type": "string", "description": "Evidence for the completion (what shipped / how it was verified). Persisted on the item; satisfies the required_notes gate."},
          "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id)."},
-         "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."}},
+         "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."},
+         "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must differ from actor/session_id or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
+         "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
+         "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
         "Read-only: Cross-reference pending sprint items against recent git commits and "
@@ -1454,6 +1514,30 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "verification_payload": {"type": "object", "description": "The FULL dict returned by run_verification. Must have status='ok' and exit_code=0. Any other value (non-zero exit, error, not_configured, not_connected) is rejected. Do NOT fabricate or self-report — the server validates the payload."},
          "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."}},
          "required": ["wave_label", "verification_payload"]}},
+    {"name": "configure_wave_gate", "description":
+        "74a8f420 — PLANNING: configure (or on-the-fly reconfigure) a deterministic action "
+        "pipeline attached to a wave or wave-range, ENFORCED STRUCTURALLY — not just "
+        "advisory /goal prose. Once set, claim_sprint_item refuses (WAVE_GATE_PENDING) to "
+        "claim any item whose wave sorts beyond wave_end until complete_wave_gate records "
+        "real run_verification evidence for that boundary. actions is an ordered, non-empty "
+        "list of {\"type\": ...} dicts — type must be one of push_dev | push_main | deploy | "
+        "wait | run_verification (push_dev/push_main/deploy are run by the executor via "
+        "trigger_workflow; run_verification maps onto the run_verification tool whose output "
+        "complete_wave_gate requires as evidence; wait is a plain pause step; extra keys per "
+        "action, e.g. {\"type\": \"wait\", \"seconds\": 30}, are preserved verbatim). "
+        "wave_start (defaults to wave_end) documents a multi-wave range covered by one gate "
+        "checkpoint. Re-configuring an un-passed wave_end is an upsert — the pipeline can be "
+        "revised right up until an executor completes it; once passed the config is immutable "
+        "(returns {\"error\": ...}). Returns {configured, gate_config_id, project_id, "
+        "wave_start, wave_end, actions} on success.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "wave_end": {"type": "string", "description": "The boundary wave, e.g. 'wave-3'. Any item in a later wave (same 'prefix-N' family) is structurally blocked from claim_sprint_item until this gate completes."},
+         "wave_start": {"type": "string", "description": "Optional: first wave covered by this gate (documentation only, defaults to wave_end) — e.g. wave_start='wave-1' with wave_end='wave-3' covers waves 1-3 under one checkpoint."},
+         "actions": {"type": "array", "description": "Non-empty ordered list of {\"type\": push_dev|push_main|deploy|wait|run_verification, ...params} action dicts — the deterministic pipeline that must run before the next wave unlocks.", "items": {"type": "object"}},
+         "actor": {"type": "string", "description": "Optional session_id or actor name to record who configured the gate."}},
+         "required": ["wave_end", "actions"]}},
     {"name": "analyze_sprint", "description":
         "PLANNING: Read-only synthesis of the current sprint into one structured brief — "
         "parallelizability (conflict-free groups + max fan-out), dependency chains "
@@ -1909,6 +1993,54 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Resources (DB/schema/infra/services) the task touches. May also be an integer count. More/any resources -> more expensive."},
          "size": {"type": "string", "enum": ["xs", "s", "m", "l", "xl"], "description": "Optional explicit sprint-item size estimate (case-insensitive). Larger -> more expensive."}},
          "required": []}},
+    {"name": "add_custom_hook", "description":
+        "273287cb — define a user-creatable Claude Code hook (PreToolUse | PostToolUse | "
+        "Stop), generalizing past sprint_guard.sh/.ps1 (the only hook Meridian auto-writes "
+        "today). Written into the repo's .claude/hooks/<slug>.sh / .ps1 on the next "
+        "generate_handoff — the same auto-inject mechanism sprint_guard already uses. "
+        "script_sh (POSIX shell body) is required; script_ps1 (PowerShell body) is "
+        "optional — omit it to only ever write the .sh file. matcher is a Claude Code "
+        "tool-name regex (e.g. \"Edit|Write\"), ignored for Stop hooks. blocking (default "
+        "true) controls determinism vs. suggestion power: true writes the script "
+        "byte-for-byte so its own exit code drives REAL Claude Code exit-code-blocking "
+        "semantics (exit 2 blocks a PreToolUse call / a Stop / feeds PostToolUse output "
+        "back to the model); false wraps it so an exit 2 is downgraded to 1 before it's "
+        "written — the hook still runs and its output still surfaces, but it can never "
+        "hard-block ('strong suggestion power' without determinism). name must not be "
+        "'sprint_guard' (reserved for Meridian's own hook) or collide with an existing "
+        "hook's derived slug on this project — both raise a clear {error}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "name": {"type": "string", "description": "Human-readable hook name; sanitized to a filesystem-safe slug used for the written filename(s). Must not be 'sprint_guard'."},
+         "event": {"type": "string", "enum": ["PreToolUse", "PostToolUse", "Stop"], "description": "Which Claude Code hook event this fires on."},
+         "script_sh": {"type": "string", "description": "POSIX shell script body (required). Receives the same stdin JSON payload Claude Code passes to any hook."},
+         "script_ps1": {"type": "string", "description": "Optional PowerShell script body. Omit to only write the .sh file."},
+         "matcher": {"type": "string", "description": "Optional Claude Code tool-name matcher regex (e.g. \"Edit|Write\"); ignored for Stop hooks."},
+         "blocking": {"type": "boolean", "description": "Default true. true = real exit-code-blocking semantics (script written verbatim). false = advisory/non-blocking (an exit 2 is downgraded to 1 before writing)."},
+         "enabled": {"type": "boolean", "description": "Default true. Disabled hooks are skipped on the next generate_handoff write (their files aren't touched, but also aren't refreshed)."}},
+         "required": ["name", "event", "script_sh"]}},
+    {"name": "get_custom_hooks", "description":
+        "273287cb — list a project's user-defined hooks (newest first). Optional event "
+        "filter and enabled_only flag. Each entry includes the derived slug (the "
+        "filename stem used when written to .claude/hooks/) alongside the stored fields.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "event": {"type": "string", "enum": ["PreToolUse", "PostToolUse", "Stop"], "description": "Optional filter to only this event's hooks."},
+         "enabled_only": {"type": "boolean", "description": "When true, only return hooks with enabled=true."}},
+         "required": []}},
+    {"name": "delete_custom_hook", "description":
+        "273287cb — delete a user-defined hook by id (the id returned by add_custom_hook "
+        "/ get_custom_hooks). Idempotent: deleting an already-gone hook returns "
+        "{deleted:false} rather than erroring, matching delete_sprint_item_pointer's "
+        "convention. Does NOT remove any already-written .claude/hooks/<slug>.* files — "
+        "those are simply no longer refreshed on the next generate_handoff.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "hook_id": {"type": "string", "description": "The hook id to delete."}},
+         "required": ["hook_id"]}},
 ]
 
 _READ_ONLY_TOOLS = {
@@ -1937,8 +2069,9 @@ _READ_ONLY_TOOLS = {
     "prospect_symbol",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
+    "get_custom_hooks",
 }
-_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer"}
+_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook"}
 
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
@@ -2010,6 +2143,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_parallelizable_groups":     "sprint-management",
     "assign_sprint_waves":           "sprint-management",
     "complete_wave_gate":            "sprint-management",
+    "configure_wave_gate":           "sprint-management",
     "analyze_sprint":                "sprint-management",
     "split_sprint_item":             "sprint-management",
     "merge_sprint_items":            "sprint-management",
@@ -2123,6 +2257,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "set_executor_config": "config",
     "set_active_repo":     "config",
     "run_verification":    "config",
+    "add_custom_hook":     "config",
+    "get_custom_hooks":    "config",
+    "delete_custom_hook":  "config",
     # research
     "paper_search": "research",
 }
@@ -2166,6 +2303,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     # ---- planner-focused ----
     "get_planning_brief":        "planner",
     "assign_sprint_waves":       "planner",
+    "configure_wave_gate":       "planner",
     "get_parallelizable_groups": "planner",
     "analyze_sprint":            "planner",
     "reconcile_sprint_drift":    "planner",
@@ -2225,6 +2363,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_agent_instructions":    "both",
     "set_agent_instructions":    "both",
     "set_executor_config":       "both",
+    "add_custom_hook":           "both",
+    "get_custom_hooks":          "both",
+    "delete_custom_hook":        "both",
     "add_note":                  "both",
     "get_notes":                 "both",
     "read_note":                 "both",
@@ -2419,6 +2560,9 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "set_agent_instructions":     "maintenance-only",
     "get_agent_instructions":     "maintenance-only",
     "set_active_repo":            "maintenance-only",
+    "add_custom_hook":            "maintenance-only",
+    "get_custom_hooks":           "maintenance-only",
+    "delete_custom_hook":         "maintenance-only",
     # goal / sprint editing (planning boundaries only)
     "set_goal":                   "maintenance-only",
     "set_north_star":             "maintenance-only",
@@ -2529,6 +2673,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "reconcile_sprint_drift": "Reconcile Sprint Drift",
     "assign_sprint_waves": "Assign Sprint Waves",
     "complete_wave_gate": "Complete Wave Gate",
+    "configure_wave_gate": "Configure Wave Gate",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

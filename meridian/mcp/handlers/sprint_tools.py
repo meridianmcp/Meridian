@@ -141,6 +141,7 @@ async def handle_add_sprint_item(
             blocker_kind=args.get("blocker_kind"),
             wave=args.get("wave"),
             sprint_name=args.get("sprint_name"),
+            required_tool=args.get("required_tool"),
         )
     except ValueError as exc:
         # 501ec93f — malformed touches_resources identifier; also e08fee30 /
@@ -349,6 +350,26 @@ async def handle_update_sprint_item(
     # False/0/null clears it (re-enables the structural gate).
     if "prospect_bypass" in args:
         _patch_kwargs["prospect_bypass"] = args.get("prospect_bypass")
+    # 56f607ec — set/clear depends_on. Only forward when the caller supplied the
+    # key (_UNSET sentinel), so omitting it leaves the stored value untouched;
+    # pass "" / null to clear (independently claimable), or another sprint
+    # item's id to set/fix dependency ordering retroactively. Previously this
+    # was creation-time-only via add_sprint_item.
+    if "depends_on" in args:
+        _patch_kwargs["depends_on"] = args.get("depends_on")
+    # e2e1b682 — set/clear require_verification. Only forward when the caller
+    # supplied the key (_UNSET sentinel). True/1 sets the independent
+    # fresh-session verifier gate (complete_sprint_item then requires an
+    # on-file PASS filed by a session distinct from the one completing it);
+    # False/0/null clears it (ordinary completion, evidence gate only).
+    if "require_verification" in args:
+        _patch_kwargs["require_verification"] = args.get("require_verification")
+    # 4d1fb28f — set/clear the required_tool pin. Only forward when the caller
+    # supplied the key (_UNSET sentinel), so omitting it leaves the stored
+    # value untouched; pass "" / null to clear (ordinary executor discretion),
+    # or a tool/plugin name to pin it — rendered as hard /goal guidance.
+    if "required_tool" in args:
+        _patch_kwargs["required_tool"] = args.get("required_tool")
     try:
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -882,6 +903,7 @@ async def handle_complete_sprint_item(
         _fetch_recent_commits,
         _unclaimed_file_warnings,
         _board_change_for_session,
+        _close_or_propose_github_issue,
     )
     # 0716c9e0 — check active worktree before marking done.
     _complete_session_id = args.get("session_id") or ""
@@ -962,10 +984,23 @@ async def handle_complete_sprint_item(
             task_id=args.get("task_id"),
             notes=args.get("notes"),
             actor=_complete_actor,
+            # e2e1b682 — a fresh, independent verifier subsession passes its
+            # own session id + PASS/FAIL verdict so complete_sprint_item can
+            # check (and, when supplied, file) the require_verification gate
+            # in the same call. Ignored entirely for items without the gate.
+            verifier_session_id=args.get("verifier_session_id"),
+            verification_verdict=args.get("verification_verdict"),
+            verification_notes=args.get("verification_notes"),
         )
     except db_module.SprintItemEvidenceRequired as exc:
         return {
             "error": "EVIDENCE_REQUIRED",
+            "item_id": args["item_id"],
+            "message": str(exc),
+        }
+    except db_module.SprintItemVerificationRequired as exc:
+        return {
+            "error": "VERIFICATION_REQUIRED",
             "item_id": args["item_id"],
             "message": str(exc),
         }
@@ -985,6 +1020,22 @@ async def handle_complete_sprint_item(
     if _merge_warning:
         item = dict(item)
         item["merge_warning"] = _merge_warning
+    # fdaa5b55 — item has a linked GitHub issue: auto-close (meridian_auto)
+    # or post a proposed-closure comment + non-blocking HITL (manual/unset).
+    # Never lets a GitHub failure undo the completion that already succeeded
+    # above — any error is captured in github_issue_action["error"], not
+    # raised. See _close_or_propose_github_issue for the trust-boundary and
+    # single-issue-blast-radius guarantees.
+    if item.get("github_issue_number"):
+        try:
+            _gh_action = await _close_or_propose_github_issue(
+                db, args["project_id"], item, tenant,
+            )
+            if _gh_action:
+                item = dict(item)
+                item["github_issue_action"] = _gh_action
+        except Exception:  # noqa: BLE001 — advisory/side-effect only
+            pass
     # 02cd3992 — unclaimed-file warning: flag files modified without a lock.
     # Non-blocking; surfaces the open-door problem so the executor can act.
     if _complete_session_id:
@@ -1278,6 +1329,64 @@ async def handle_complete_wave_gate(
     try:
         result = await db_module.complete_wave_gate(
             db, project_id, wave_label, verification_payload, actor=actor
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    return result
+
+
+async def handle_configure_wave_gate(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: configure_wave_gate.
+
+    74a8f420 — configure (or on-the-fly reconfigure) a deterministic action
+    pipeline (push_dev/push_main/deploy/wait/run_verification) attached to a
+    wave or wave-range. Once configured, claim_sprint_item STRUCTURALLY
+    refuses to claim any item whose wave sorts beyond ``wave_end`` until a
+    matching complete_wave_gate call records real run_verification evidence —
+    this is enforced at claim time, not just described in /goal prose.
+
+    Returns {configured, gate_config_id, project_id, wave_start, wave_end,
+    actions} on success, or {"error": ...} on bad input / an already-passed
+    (immutable) boundary.
+    """
+    project_id = str(args.get("project_id") or "").strip()
+    project_name = str(args.get("project_name") or "").strip()
+    if not project_id and project_name:
+        _proj = await db_module.get_project_by_name(db, project_name)
+        if _proj:
+            project_id = _proj.get("id", "")
+    if not project_id:
+        return {"error": "project_id is required"}
+
+    wave_end = str(args.get("wave_end") or "").strip()
+    if not wave_end:
+        return {"error": "wave_end is required (e.g. 'wave-3')"}
+
+    actions = args.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return {
+            "error": "actions is required and must be a non-empty list",
+            "hint": (
+                "Each entry is a dict with a 'type' in push_dev | push_main | "
+                "deploy | wait | run_verification, e.g. "
+                "[{\"type\": \"push_dev\"}, {\"type\": \"run_verification\"}, "
+                "{\"type\": \"push_main\"}, {\"type\": \"deploy\"}]."
+            ),
+        }
+
+    wave_start = str(args.get("wave_start") or "").strip() or None
+    actor = str(args.get("actor") or "").strip() or None
+
+    try:
+        result = await db_module.configure_wave_gate(
+            db, project_id, wave_end, actions, wave_start=wave_start, actor=actor,
         )
     except ValueError as exc:
         return {"error": str(exc)}

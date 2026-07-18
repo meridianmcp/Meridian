@@ -40,6 +40,16 @@
                         "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1\""
                     }
                 ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\dependency_install_guard.ps1\""
+                    }
+                ]
             }
         ],
         "PostToolUse": [

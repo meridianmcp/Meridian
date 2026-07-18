@@ -303,6 +303,61 @@ async def handle_start_session(
             )
     except Exception:  # noqa: BLE001 — orientation must not break
         pass
+    # 74e79d15 — executor /goal skill presence check (GitHub issue #9).
+    # When role=executor and a repo_path is configured, verify that the target
+    # repo has a .claude/skills/goal/ directory (or .claude/commands/goal.md)
+    # so the /goal slash command is recognised by Claude Code.  Without this
+    # file a fresh executor session silently cannot respond to /goal blocks,
+    # blocking real work (the issue that prompted this fix).  Best-effort:
+    # never break start_session if the check or the path look-up fails.
+    try:
+        if (
+            isinstance(result, dict)
+            and "continuation" not in result
+            and args.get("role") == "executor"
+            and not _hosted_mode()
+        ):
+            # decision 0dedff91 — repo_path is the CALLER's local path; the
+            # os.path.isdir/isfile checks below can only run meaningfully
+            # against this process's own filesystem (self-hosted). On hosted
+            # Meridian there is nothing honest to check here, so skip rather
+            # than mis-resolve against the server's filesystem and emit a
+            # false setup_warning.
+            import os as _os  # noqa: PLC0415
+
+            _exec_cfg_check: dict | None = None
+            try:
+                _exec_cfg_check = await db_module.get_executor_config(db, _pid)
+            except Exception:  # noqa: BLE001
+                pass
+            _repo_path_check = (
+                (_exec_cfg_check or {}).get("repo_path") or ""
+            ).strip()
+            if _repo_path_check:
+                # Normalise: split on both "/" and "\" so Windows paths work on
+                # any platform without relying on pathlib.Path.name (which is
+                # platform-native and breaks Windows-style paths on Linux CI).
+                _rp = _repo_path_check.rstrip("/\\")
+                _skill_dir = _rp + "/.claude/skills/goal"
+                _cmd_file = _rp + "/.claude/commands/goal.md"
+                _has_skill = _os.path.isdir(_skill_dir)
+                _has_cmd = _os.path.isfile(_cmd_file)
+                if not _has_skill and not _has_cmd:
+                    result["setup_warning"] = (
+                        "The /goal slash command is not registered in this "
+                        f"repo ({_repo_path_check}). "
+                        "Claude Code will not recognise /goal blocks until "
+                        "you add a skill file. "
+                        "Run: mkdir -p .claude/skills/goal && "
+                        "curl -fsSL https://usemeridian.us/install/goal-skill.md "
+                        "-o .claude/skills/goal/SKILL.md "
+                        "(or copy the template from the AGENTS.md 'First-time "
+                        "executor install' section). "
+                        "Commit the file so all future sessions in this repo "
+                        "recognise /goal automatically."
+                    )
+    except Exception:  # noqa: BLE001 — setup_warning must never break orientation
+        pass
     return result
 
 
@@ -403,3 +458,81 @@ async def handle_merge_project(
         db, _src, _tgt,
         archive_source=bool(args.get("archive_source", True)),
     )
+
+
+async def handle_add_custom_hook(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: add_custom_hook (273287cb).
+
+    Creates a user-defined PreToolUse/PostToolUse/Stop hook for a project.
+    Written into the repo's ``.claude/hooks/`` on the next ``generate_handoff``
+    (see ``handoff._write_sprint_guard_hooks`` / ``_write_custom_hooks``), the
+    same mechanism that already auto-writes sprint_guard.{sh,ps1}. The db
+    layer raises ValueError for a bad event, empty name/script_sh, the
+    reserved 'sprint_guard' name, or a duplicate slug — surfaced as {error}.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    script_sh = args.get("script_sh")
+    if not script_sh:
+        return {"error": "script_sh is required"}
+    try:
+        return await db_module.add_custom_hook(
+            db, _pid,
+            name=args.get("name") or "",
+            event=args.get("event") or "",
+            script_sh=script_sh,
+            script_ps1=args.get("script_ps1"),
+            matcher=args.get("matcher"),
+            blocking=bool(args.get("blocking", True)),
+            enabled=bool(args.get("enabled", True)),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_custom_hooks(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_custom_hooks (273287cb). List a project's user-defined hooks."""
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    hooks = await db_module.get_custom_hooks(
+        db, _pid,
+        event=args.get("event"),
+        enabled_only=bool(args.get("enabled_only", False)),
+    )
+    return {"project_id": _pid, "hooks": hooks}
+
+
+async def handle_delete_custom_hook(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: delete_custom_hook (273287cb).
+
+    Idempotent: deleting an already-gone hook returns {"deleted": False}, not
+    an error (matches delete_sprint_item_pointer's convention). Does not
+    remove any already-written .claude/hooks/<slug>.* files — see
+    handoff._write_custom_hooks / db.delete_custom_hook docstrings.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    _hook_id = (args.get("hook_id") or "").strip()
+    if not _pid or not _hook_id:
+        return {"error": "project_id and hook_id are both required"}
+    deleted = await db_module.delete_custom_hook(db, _pid, _hook_id)
+    return {"hook_id": _hook_id, "deleted": deleted}

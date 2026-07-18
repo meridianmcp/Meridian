@@ -462,6 +462,15 @@ def _connect(index_db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    # 1c59cb90 — cross-reference bookmark column: records the "_Ref######"
+    # bookmark name wrapping each caption's "<Kind> <N>" text so a REF field
+    # elsewhere in the document can target it (see insert_cross_reference).
+    fig_cols = {row[1] for row in conn.execute("PRAGMA table_info(docx_figures)").fetchall()}
+    if "ref_bookmark" not in fig_cols:
+        conn.execute("ALTER TABLE docx_figures ADD COLUMN ref_bookmark TEXT")
+    tbl_cols = {row[1] for row in conn.execute("PRAGMA table_info(docx_tables)").fetchall()}
+    if "ref_bookmark" not in tbl_cols:
+        conn.execute("ALTER TABLE docx_tables ADD COLUMN ref_bookmark TEXT")
     # 32d84131 — SQLite FTS5 external-content table for BM25 full-text search
     # over paragraph text. Uses external-content mode pointing at docx_paragraphs
     # so the text is not duplicated on disk. The FTS index is rebuilt atomically
@@ -1069,6 +1078,14 @@ _CAPTION_STYLE = "Caption"
 _SEQ_FIGURE_INSTR = "SEQ Figure \\* ARABIC"
 _SEQ_TABLE_INSTR = "SEQ Table \\* ARABIC"
 
+# 1c59cb90 — cross-reference bookmark prefix, matching the naming convention
+# Word itself uses for caption bookmarks ("_Ref123456789"). A REF field
+# elsewhere in the document targets this bookmark's name so Word's field
+# refresh (F9) — not a fixed literal string — resolves prose like "Figure 3"
+# even after captions are reordered/renumbered.
+_REF_BOOKMARK_PREFIX = "_Ref"
+_REF_BOOKMARK_RE = re.compile(r"^_Ref(\d+)$")
+
 
 def _load_docx_xml_stdlib(path: str) -> tuple[bytes, ET.Element]:
     """Read a .docx at ``path`` and return ``(raw_bytes, document_root)``.
@@ -1224,10 +1241,29 @@ def _count_seq_captions(root: ET.Element, kind: str) -> int:
     return count
 
 
+def _next_ref_bookmark_name(root: ET.Element) -> str:
+    """Return the next unused ``_Ref<digits>`` cross-reference bookmark name.
+
+    Scans every ``<w:bookmarkStart>`` in the document for names matching
+    ``_Ref<digits>`` (Word's own caption-bookmark convention) and returns one
+    higher than the current maximum, seeded at 100000000 the way Word's own
+    9-digit random-looking bookmark ids start.  Deterministic (not random) so
+    repeated inserts against the same document are reproducible/testable.
+    """
+    max_seen = 100000000 - 1
+    for bm in root.iter(_q(_W, "bookmarkStart")):
+        name = bm.get(_q(_W, "name")) or ""
+        m = _REF_BOOKMARK_RE.match(name)
+        if m:
+            max_seen = max(max_seen, int(m.group(1)))
+    return f"{_REF_BOOKMARK_PREFIX}{max_seen + 1}"
+
+
 def _build_caption_paragraph(
     kind: str,
     label_text: str,
     seq_cached: str = "1",
+    ref_bookmark: str | None = None,
 ) -> ET.Element:
     """Build a ``<w:p>`` element for a Word caption using the Caption style.
 
@@ -1235,16 +1271,27 @@ def _build_caption_paragraph(
 
         <w:p>
           <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+          <w:bookmarkStart w:id="0" w:name="_Ref123456789"/>
           <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
           <w:fldSimple w:instr="SEQ Figure \\* ARABIC">
             <w:r><w:t>1</w:t></w:r>
           </w:fldSimple>
+          <w:bookmarkEnd w:id="0"/>
           <w:r><w:t xml:space="preserve">. label_text</w:t></w:r>
         </w:p>
 
     ``kind`` is ``"Figure"`` or ``"Table"``.  ``seq_cached`` is the cached
     rendered number (e.g. ``"1"``).  The fldSimple approach matches Word's own
     caption wizard (single instruction + cached result, no fldChar dance needed).
+
+    1c59cb90 — when ``ref_bookmark`` is given, the ``"<kind> "`` prefix run and
+    the SEQ field are wrapped in a ``w:bookmarkStart``/``w:bookmarkEnd`` pair
+    named ``ref_bookmark``.  That bookmark's rendered content is exactly the
+    "label and number" text (e.g. ``"Figure 3"``) — deliberately excluding the
+    descriptive ``". label_text"`` suffix — so a ``REF <bookmark> \\h`` field
+    inserted elsewhere (see :func:`insert_cross_reference`) resolves to just
+    ``"Figure 3"`` and stays correct across reordering/renumbering on Word's
+    next field refresh, instead of hand-typed prose text going stale.
     """
     if kind not in ("Figure", "Table"):
         raise ValueError(f"caption kind must be 'Figure' or 'Table', got {kind!r}")
@@ -1258,6 +1305,11 @@ def _build_caption_paragraph(
     pStyle = ET.SubElement(pPr, _q(_W, "pStyle"))
     pStyle.set(_q(_W, "val"), _CAPTION_STYLE)
 
+    if ref_bookmark:
+        bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
+        bm_start.set(_q(_W, "id"), "0")
+        bm_start.set(_q(_W, "name"), ref_bookmark)
+
     # Run: "<kind> " prefix.
     r_prefix = ET.SubElement(p, _q(_W, "r"))
     t_prefix = ET.SubElement(r_prefix, _q(_W, "t"))
@@ -1270,6 +1322,10 @@ def _build_caption_paragraph(
     r_fld = ET.SubElement(fld, _q(_W, "r"))
     t_fld = ET.SubElement(r_fld, _q(_W, "t"))
     t_fld.text = seq_cached
+
+    if ref_bookmark:
+        bm_end = ET.SubElement(p, _q(_W, "bookmarkEnd"))
+        bm_end.set(_q(_W, "id"), "0")
 
     # Run: ". <label_text>".
     r_label = ET.SubElement(p, _q(_W, "r"))
@@ -1298,12 +1354,18 @@ def _upsert_sidecar_caption(
     seq_number: str,
     caption_text: str,
     section_heading: str | None,
+    ref_bookmark: str | None = None,
 ) -> None:
     """Upsert a caption record into the sidecar SQLite index.
 
     For Figure captions: inserts a new row into ``docx_figures``.
     For Table captions: updates the ``caption`` column in ``docx_tables`` for
     the most-recent table row, or inserts a placeholder if none exists yet.
+
+    ``ref_bookmark`` (1c59cb90) is the ``_Ref<digits>`` cross-reference
+    bookmark name wrapping the caption's "<Kind> <N>" text, persisted so
+    :func:`insert_cross_reference` can look it up by figure/table id without
+    re-parsing the .docx XML.
 
     Non-fatal: exceptions are swallowed so the caller's main result is unaffected.
     """
@@ -1315,9 +1377,10 @@ def _upsert_sidecar_caption(
                 row = conn.execute("SELECT MAX(idx) FROM docx_figures").fetchone()
                 next_idx = (row[0] or 0) + 1
                 conn.execute(
-                    "INSERT INTO docx_figures (idx, para_id, caption, seq_number, section) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (next_idx, para_id, caption_text, seq_number, section_heading),
+                    "INSERT INTO docx_figures "
+                    "(idx, para_id, caption, seq_number, section, ref_bookmark) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (next_idx, para_id, caption_text, seq_number, section_heading, ref_bookmark),
                 )
             else:
                 # Table: update the most recent table's caption.
@@ -1326,17 +1389,17 @@ def _upsert_sidecar_caption(
                 ).fetchone()
                 if row:
                     conn.execute(
-                        "UPDATE docx_tables SET caption = ? WHERE id = ?",
-                        (caption_text, row[0]),
+                        "UPDATE docx_tables SET caption = ?, ref_bookmark = ? WHERE id = ?",
+                        (caption_text, ref_bookmark, row[0]),
                     )
                 else:
                     row2 = conn.execute("SELECT MAX(idx) FROM docx_tables").fetchone()
                     next_idx = (row2[0] or 0) + 1
                     conn.execute(
                         "INSERT INTO docx_tables "
-                        "(idx, row_count, col_count, rows_json, caption) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (next_idx, 0, 0, "[]", caption_text),
+                        "(idx, row_count, col_count, rows_json, caption, ref_bookmark) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (next_idx, 0, 0, "[]", caption_text, ref_bookmark),
                     )
             conn.commit()
         finally:
@@ -1497,8 +1560,12 @@ def insert_caption(
                          after the write so the next read auto-reindexes.
 
     Returns:
-        ``{status, kind, seq_number, label_text, section_heading, docx_path}``
-        or ``{"error": <message>}`` on failure (file is NOT mutated on error).
+        ``{status, kind, seq_number, label_text, section_heading, ref_bookmark,
+        docx_path}`` or ``{"error": <message>}`` on failure (file is NOT
+        mutated on error).  ``ref_bookmark`` (1c59cb90) is the ``_Ref<digits>``
+        bookmark name wrapping the caption's "<Kind> <N>" text — pass it as
+        ``bookmark_name`` to :func:`insert_cross_reference` to insert a live
+        "Figure N" prose reference elsewhere that survives reordering.
     """
     kind = str(kind).strip()
     if kind not in ("Figure", "Table"):
@@ -1534,11 +1601,13 @@ def insert_caption(
     body, _anchor_elem, child_idx = result
 
     seq_number = _count_seq_captions(root, kind) + 1
+    ref_bookmark = _next_ref_bookmark_name(root)
 
     caption_p = _build_caption_paragraph(
         kind=kind,
         label_text=label_text.strip(),
         seq_cached=str(seq_number),
+        ref_bookmark=ref_bookmark,
     )
 
     insert_at = child_idx if position == "before" else child_idx + 1
@@ -1559,6 +1628,7 @@ def insert_caption(
             seq_number=str(seq_number),
             caption_text=f"{kind} {seq_number}. {label_text.strip()}",
             section_heading=section_heading,
+            ref_bookmark=ref_bookmark,
         )
 
     return {
@@ -1567,6 +1637,7 @@ def insert_caption(
         "seq_number": seq_number,
         "label_text": label_text.strip(),
         "section_heading": section_heading,
+        "ref_bookmark": ref_bookmark,
         "docx_path": docx_path,
     }
 
@@ -1681,6 +1752,12 @@ def remove_caption(
     paragraph (Caption style or SEQ field present), removes it from the body,
     and re-packs the ZIP.
 
+    1c59cb90 — this also removes the caption's ``_Ref<digits>`` cross-reference
+    bookmark (it lives inside the removed paragraph).  Any ``REF`` field
+    elsewhere that pointed at it becomes a dangling reference — the same
+    behavior Word itself has when a captioned item is deleted; existing
+    cross-references must be re-pointed manually (or removed) afterward.
+
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
         caption_para_id: ``w14:paraId`` or ``p{N}`` of the Caption paragraph.
@@ -1738,6 +1815,252 @@ def remove_caption(
     return {
         "status": "removed",
         "caption_para_id": caption_para_id,
+        "docx_path": docx_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public cross-reference API: Word REF-field mechanism (1c59cb90)
+#
+# REFILED (original 7b5bfb00) — captions previously only got Word's SEQ-field
+# auto-numbering (insert_caption above). Prose that refers to a figure/table
+# by number ("as shown in Figure 3") had to be hand-typed, so it silently went
+# stale the moment captions were reordered or one was inserted/removed earlier
+# in the document. This adds the other half of Word's numbering system: a
+# REF field that targets the caption's own cross-reference bookmark, so the
+# rendered text tracks the SAME field-refresh cycle (F9) that keeps the SEQ
+# numbers themselves correct.
+# ---------------------------------------------------------------------------
+
+def _caption_kind_and_seq(caption_elem: ET.Element) -> tuple[str, str] | None:
+    """Return ``(kind, cached_seq_number)`` for a Caption paragraph, or ``None``.
+
+    ``kind`` is ``"Figure"`` or ``"Table"``, detected from the paragraph's
+    ``SEQ Figure`` / ``SEQ Table`` ``fldSimple``.  ``cached_seq_number`` is the
+    field's cached rendered text (e.g. ``"3"``).
+    """
+    for fld in caption_elem.iter(_q(_W, "fldSimple")):
+        instr = fld.get(_q(_W, "instr")) or ""
+        if _SEQ_FIGURE_RE.search(instr):
+            kind = "Figure"
+        elif _SEQ_TABLE_RE.search(instr):
+            kind = "Table"
+        else:
+            continue
+        cached = "".join(t.text or "" for t in fld.iter(_q(_W, "t")))
+        return kind, cached
+    return None
+
+
+def _find_caption_ref_bookmark(caption_elem: ET.Element) -> str | None:
+    """Return the ``_Ref<digits>`` bookmark name wrapping a caption, if any."""
+    for bm in caption_elem.iter(_q(_W, "bookmarkStart")):
+        name = bm.get(_q(_W, "name")) or ""
+        if _REF_BOOKMARK_RE.match(name):
+            return name
+    return None
+
+
+def _wrap_caption_in_ref_bookmark(caption_elem: ET.Element, ref_name: str) -> None:
+    """Retrofit a ``_Ref`` bookmark onto a caption paragraph built pre-1c59cb90.
+
+    Wraps the ``"<kind> "`` prefix run and the SEQ ``fldSimple`` element — the
+    same span :func:`_build_caption_paragraph` brackets natively when given a
+    ``ref_bookmark`` — with a fresh ``bookmarkStart``/``bookmarkEnd`` pair,
+    mutating ``caption_elem`` in place.  No-op (fails safe) if the expected
+    prefix-run/SEQ-field shape isn't found rather than risk corrupting the XML.
+    """
+    children = list(caption_elem)
+    w_r = _q(_W, "r")
+    w_fldSimple = _q(_W, "fldSimple")
+
+    prefix_idx: int | None = None
+    fld_idx: int | None = None
+    for i, child in enumerate(children):
+        if child.tag == w_r and prefix_idx is None:
+            prefix_idx = i
+        if child.tag == w_fldSimple:
+            instr = child.get(_q(_W, "instr")) or ""
+            if _SEQ_FIGURE_RE.search(instr) or _SEQ_TABLE_RE.search(instr):
+                fld_idx = i
+                break
+
+    if prefix_idx is None or fld_idx is None or fld_idx < prefix_idx:
+        return
+
+    bm_start = ET.Element(_q(_W, "bookmarkStart"))
+    bm_start.set(_q(_W, "id"), "0")
+    bm_start.set(_q(_W, "name"), ref_name)
+    caption_elem.insert(prefix_idx, bm_start)
+
+    bm_end = ET.Element(_q(_W, "bookmarkEnd"))
+    bm_end.set(_q(_W, "id"), "0")
+    # fld_idx shifts by +1 because bm_start was just inserted ahead of it;
+    # +1 more to land the close tag immediately after the fldSimple element.
+    caption_elem.insert(fld_idx + 2, bm_end)
+
+
+def _find_caption_by_ref_bookmark(
+    root: ET.Element, bookmark_name: str
+) -> tuple[ET.Element, tuple[str, str]] | None:
+    """Find the caption paragraph owning ``bookmark_name`` and its ``(kind, seq)``.
+
+    Returns ``None`` when no paragraph in the document has a
+    ``w:bookmarkStart`` with that name wrapping a recognisable SEQ field.
+    """
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return None
+    w_bookmarkStart = _q(_W, "bookmarkStart")
+    w_name = _q(_W, "name")
+    w_p = _q(_W, "p")
+    for p in body.iter(w_p):
+        for bm in p.iter(w_bookmarkStart):
+            if bm.get(w_name) == bookmark_name:
+                kind_seq = _caption_kind_and_seq(p)
+                if kind_seq is not None:
+                    return p, kind_seq
+    return None
+
+
+def insert_cross_reference(
+    docx_path: str,
+    anchor_para_id: str,
+    target_caption_para_id: str | None = None,
+    bookmark_name: str | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """1c59cb90 — Insert a live Word REF-field cross-reference into a .docx file.
+
+    Appends a REF complex field (``fldChar begin`` / ``instrText`` / ``fldChar
+    separate`` / cached display text / ``fldChar end``, the same 5-run shape
+    :func:`insert_citation` uses) to the paragraph identified by
+    ``anchor_para_id``.  The field's instruction targets the ``_Ref<digits>``
+    bookmark wrapping a figure or table caption's ``"<Kind> <N>"`` text (see
+    :func:`insert_caption` / :func:`_build_caption_paragraph`), with cached
+    display text like ``"Figure 3"``.
+
+    This is the difference between SEQ-field numbering (the caption's own
+    number, handled by :func:`insert_caption`) and REF-field cross-referencing
+    (prose *elsewhere* that quotes that number): a hand-typed "Figure 3" goes
+    stale the instant captions are reordered or one is inserted earlier in the
+    document; a REF field recomputes on Word's next field refresh (F9, or
+    automatically on print / Save As PDF) because it reads the SAME bookmarked
+    SEQ field the caption itself renders.
+
+    Callers identify the target caption EITHER way (exactly one required):
+      - ``target_caption_para_id``: the caption paragraph's ``w14:paraId`` (or
+        synthesised ``p{N}``).  If that caption doesn't yet carry a ``_Ref``
+        bookmark (it predates 1c59cb90, or was built by an older
+        ``insert_caption`` call), one is created now as part of this same
+        write (retrofit — still a single atomic re-pack of
+        ``word/document.xml``).
+      - ``bookmark_name``: an existing ``_Ref<digits>`` bookmark name, e.g.
+        the ``ref_bookmark`` field returned by a prior ``insert_caption`` call.
+
+    The field is appended at the end of the anchor paragraph's existing
+    content, with a separating space inserted first if the paragraph's
+    trailing text doesn't already end in whitespace — so it reads naturally
+    as trailing prose (e.g. ``"...as shown in Figure 3"``).
+
+    Args:
+        docx_path:              Absolute path to the .docx file (mutated in place).
+        anchor_para_id:         ``w14:paraId`` (or ``p{N}``) of the paragraph the
+                                 cross-reference field is appended into.
+        target_caption_para_id: ``w14:paraId`` (or ``p{N}``) of the Figure/Table
+                                 Caption paragraph being referenced.
+        bookmark_name:          Alternative to ``target_caption_para_id`` — an
+                                 existing ``_Ref<digits>`` bookmark name.
+        index_db_path:          If supplied, sidecar is invalidated after the write.
+
+    Returns:
+        ``{status, anchor_para_id, bookmark_name, kind, seq_number,
+        display_text, docx_path}`` or ``{"error": <message>}`` on failure
+        (file is NOT mutated on error).
+    """
+    if bool(target_caption_para_id) == bool(bookmark_name):
+        return {
+            "error": (
+                "exactly one of target_caption_para_id or bookmark_name must be given"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    anchor_result = _find_para_by_id(root, anchor_para_id)
+    if anchor_result is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    _anchor_body, anchor_elem, _anchor_idx = anchor_result
+
+    if target_caption_para_id is not None:
+        target_result = _find_para_by_id(root, target_caption_para_id)
+        if target_result is None:
+            return {
+                "error": f"para_id {target_caption_para_id!r} not found in {docx_path}"
+            }
+        _target_body, caption_elem, _target_idx = target_result
+
+        kind_seq = _caption_kind_and_seq(caption_elem)
+        if kind_seq is None:
+            return {
+                "error": (
+                    f"paragraph {target_caption_para_id!r} is not a Figure/Table "
+                    "Caption paragraph (no SEQ field found)"
+                )
+            }
+        kind, seq_cached = kind_seq
+
+        ref_name = _find_caption_ref_bookmark(caption_elem)
+        if ref_name is None:
+            ref_name = _next_ref_bookmark_name(root)
+            _wrap_caption_in_ref_bookmark(caption_elem, ref_name)
+    else:
+        found = _find_caption_by_ref_bookmark(root, bookmark_name)
+        if found is None:
+            return {
+                "error": (
+                    f"bookmark {bookmark_name!r} not found (or is not a caption "
+                    f"cross-reference bookmark) in {docx_path}"
+                )
+            }
+        _caption_elem, kind_seq = found
+        kind, seq_cached = kind_seq
+        ref_name = bookmark_name
+
+    display_text = f"{kind} {seq_cached}"
+
+    # Separating space so the field reads naturally as trailing prose (only
+    # when the paragraph already has text that doesn't end in whitespace).
+    existing_t_texts = [t.text or "" for t in anchor_elem.iter(_q(_W, "t"))]
+    trailing_text = existing_t_texts[-1] if existing_t_texts else ""
+    if trailing_text and not trailing_text[-1].isspace():
+        r_space = ET.SubElement(anchor_elem, _q(_W, "r"))
+        t_space = ET.SubElement(r_space, _q(_W, "t"))
+        t_space.set(_q(_XML_NS, "space"), "preserve")
+        t_space.text = " "
+
+    for r in _build_complex_field_runs(f"REF {ref_name} \\h", display_text):
+        anchor_elem.append(r)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "inserted",
+        "anchor_para_id": anchor_para_id,
+        "bookmark_name": ref_name,
+        "kind": kind,
+        "seq_number": seq_cached,
+        "display_text": display_text,
         "docx_path": docx_path,
     }
 
@@ -3739,3 +4062,343 @@ def sync_bibliography(
     if errors:
         result["errors"] = errors
     return result
+
+
+# ===========================================================================
+# c84ca127 -- chunk-level heading-aware BM25 indexing (parse_docx adapter)
+#
+# The canonical implementation in packages/docparse/docparse/docs_intel.py
+# walks ``document_content_tree``'s blocks (headings / paragraphs / tables in
+# true document order) to build heading-anchored chunks.  This copy does NOT
+# have ``document_content_tree`` -- it only has ``parse_docx()`` (a flat list
+# of ``{index, para_id, style, text}`` dicts) and ``document_outline()``
+# (heading outline derived from those dicts).
+#
+# Adaptation:
+#   - ``_build_chunks_from_paras()`` takes the flat ``parse_docx()`` list
+#     directly.  Heading detection reuses the identical ``_is_heading()`` /
+#     ``_heading_level()`` helpers already in this file, so the two codepaths
+#     stay consistent.
+#   - Paragraphs are paragraph-text-only: ``parse_docx()`` does not carry
+#     table content (tables are not paragraphs in OOXML -- they are <w:tbl>
+#     siblings; the flat ``body.findall("w:p")`` pass misses them entirely).
+#     This is an honest scope difference from the canonical version and is
+#     documented in the docstring.  No table content is fabricated.
+#   - Schema, trigger names, weight ratio (5:1), and return shapes are
+#     identical to the canonical version so callers of either package see a
+#     consistent API.
+# ===========================================================================
+
+# BM25 column weights: heading_text weight, body_text weight.
+# 5:1 ratio -- a term in the heading is treated as 5x more relevant than the
+# same term in body prose.  Matches the canonical packages/docparse value.
+_CHUNK_WEIGHT_HEADING: float = 5.0
+_CHUNK_WEIGHT_BODY: float = 1.0
+
+
+def _build_chunks_from_paras(
+    paras: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group a flat ``parse_docx()`` paragraph list into heading-anchored chunks.
+
+    This is the parse_docx-adapted counterpart of ``_build_chunks`` in
+    packages/docparse.  The algorithm is identical in structure but works from
+    a flat paragraph list (each ``{index, para_id, style, text}``) rather than
+    the interleaved blocks of ``document_content_tree``.
+
+    Scope note: ``parse_docx()`` in this package collects ONLY ``<w:p>``
+    paragraphs; ``<w:tbl>`` elements are structural siblings of paragraphs in
+    OOXML and are not surfaced here.  Consequently chunk ``body_text`` contains
+    only paragraph text -- table cell content is absent.  This is a transparent,
+    honest scope difference from the canonical version; no table data is
+    fabricated.
+
+    Algorithm:
+    - Walk paragraphs in document order, maintaining a ``heading_stack`` of
+      ancestor headings (each ``{level, text, para_id}``).
+    - When a heading paragraph is encountered:
+        - Pop the stack until empty or the top has strictly lower level than
+          the new heading (pop while ``top.level >= new.level``).
+        - Push the new heading.
+        - ``heading_path`` = ordered text of every stack entry, root first.
+        - Flush any accumulating chunk and start a new one.
+    - Non-heading paragraphs append their text to the current chunk.
+    - Paragraphs preceding the first heading are collected into a synthetic
+      "preamble" chunk with ``heading_text=""`` and ``heading_path=[]``.
+
+    Returns a list of chunk dicts::
+
+        {
+            "chunk_id": int,               # 0-based sequential index
+            "heading_text": str,           # own heading text ("" for preamble)
+            "heading_path": list[str],     # ancestor texts, root first
+            "heading_para_id": str | None,
+            "body_text": str,              # all body paragraphs joined
+            "start_para_id": str | None,   # para_id of heading (or first body para)
+            "end_para_id": str | None,     # para_id of last body para (or heading)
+        }
+    """
+    chunks: list[dict[str, Any]] = []
+    heading_stack: list[dict[str, Any]] = []  # {level, text, para_id}
+    current_body_parts: list[str] = []
+    current_body_para_ids: list[str | None] = []
+    current_heading_text: str = ""
+    current_heading_path: list[str] = []
+    current_heading_para_id: str | None = None
+    current_start_para_id: str | None = None
+
+    def _flush(chunk_id: int) -> dict[str, Any]:
+        body_text = " ".join(t for t in current_body_parts if t)
+        end_pid = (
+            current_body_para_ids[-1]
+            if current_body_para_ids
+            else current_heading_para_id
+        )
+        return {
+            "chunk_id": chunk_id,
+            "heading_text": current_heading_text,
+            "heading_path": list(current_heading_path),
+            "heading_para_id": current_heading_para_id,
+            "body_text": body_text,
+            "start_para_id": current_start_para_id,
+            "end_para_id": end_pid,
+        }
+
+    for para in paras:
+        style = para.get("style")
+        if _is_heading(style):
+            # Flush the chunk that was accumulating (skip empty preamble).
+            if current_heading_text or current_body_parts:
+                chunks.append(_flush(len(chunks)))
+
+            lvl = _heading_level(style)
+            # Pop stack entries of equal or deeper level (>= lvl).
+            while heading_stack and heading_stack[-1]["level"] >= lvl:
+                heading_stack.pop()
+            heading_stack.append({
+                "level": lvl,
+                "text": para.get("text", ""),
+                "para_id": para.get("para_id"),
+            })
+
+            current_heading_text = para.get("text", "")
+            current_heading_path = [h["text"] for h in heading_stack]
+            current_heading_para_id = para.get("para_id")
+            current_start_para_id = para.get("para_id")
+            current_body_parts = []
+            current_body_para_ids = []
+        else:
+            # Body paragraph: collect text.
+            text = para.get("text", "")
+            if text:
+                current_body_parts.append(text)
+            pid = para.get("para_id")
+            current_body_para_ids.append(pid)
+            if current_start_para_id is None:
+                current_start_para_id = pid
+
+    # Flush the last chunk.
+    if current_heading_text or current_body_parts:
+        chunks.append(_flush(len(chunks)))
+
+    return chunks
+
+
+def _connect_chunks(index_db_path: str) -> sqlite3.Connection:
+    """Open/create the sidecar SQLite DB with chunk tables and FTS5 virtual table.
+
+    Schema and trigger names match the canonical packages/docparse version
+    exactly so sidecars created by either package are interchangeable.
+    """
+    conn = sqlite3.connect(index_db_path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_chunks (
+            chunk_id          INTEGER PRIMARY KEY,
+            heading_path_json TEXT NOT NULL,
+            heading_text      TEXT NOT NULL,
+            body_text         TEXT NOT NULL,
+            start_para_id     TEXT,
+            end_para_id       TEXT
+        )
+        """
+    )
+    # FTS5 external-content table: two weighted columns, backed by docx_chunks.
+    # content_rowid maps to docx_chunks.chunk_id (INTEGER PRIMARY KEY = rowid).
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS docx_chunks_fts
+        USING fts5(
+            heading_text,
+            body_text,
+            content='docx_chunks',
+            content_rowid='chunk_id'
+        )
+        """
+    )
+    # Sync triggers: keep docx_chunks_fts consistent with docx_chunks rows.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_chunks_ai
+        AFTER INSERT ON docx_chunks BEGIN
+            INSERT INTO docx_chunks_fts(rowid, heading_text, body_text)
+            VALUES (new.chunk_id, new.heading_text, new.body_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_chunks_ad
+        AFTER DELETE ON docx_chunks BEGIN
+            INSERT INTO docx_chunks_fts(docx_chunks_fts, rowid, heading_text, body_text)
+            VALUES ('delete', old.chunk_id, old.heading_text, old.body_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_chunks_au
+        AFTER UPDATE ON docx_chunks BEGIN
+            INSERT INTO docx_chunks_fts(docx_chunks_fts, rowid, heading_text, body_text)
+            VALUES ('delete', old.chunk_id, old.heading_text, old.body_text);
+            INSERT INTO docx_chunks_fts(rowid, heading_text, body_text)
+            VALUES (new.chunk_id, new.heading_text, new.body_text);
+        END
+        """
+    )
+    return conn
+
+
+def index_docx_chunks(
+    source: str | bytes | bytearray, index_db_path: str
+) -> dict[str, Any]:
+    """c84ca127 -- build (or rebuild) the chunk-level heading-aware FTS5 index.
+
+    Parses the .docx via :func:`parse_docx`, groups paragraphs into
+    heading-anchored chunks via :func:`_build_chunks_from_paras`, stores them
+    in ``docx_chunks``, and rebuilds ``docx_chunks_fts`` atomically.
+
+    Scope note: chunks contain paragraph text only -- table cell content is not
+    present because ``parse_docx()`` in this package collects only ``<w:p>``
+    elements (not ``<w:tbl>`` siblings).  This is an honest scope difference
+    from the packages/docparse canonical version.
+
+    Returns ``{index_db, chunk_count}``.  Idempotent: the chunk table is fully
+    replaced each run so re-indexing an edited document stays consistent.
+
+    Args:
+        source:        Path to the .docx file, or its raw bytes.
+        index_db_path: Path to the sidecar SQLite DB (created if absent).
+
+    Returns:
+        ``{index_db: str, chunk_count: int}``
+    """
+    paras = parse_docx(source)
+    chunks = _build_chunks_from_paras(paras)
+
+    conn = _connect_chunks(index_db_path)
+    try:
+        conn.execute("DELETE FROM docx_chunks")
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO docx_chunks
+                (chunk_id, heading_path_json, heading_text, body_text,
+                 start_para_id, end_para_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    c["chunk_id"],
+                    json.dumps(c["heading_path"]),
+                    c["heading_text"],
+                    c["body_text"],
+                    c["start_para_id"],
+                    c["end_para_id"],
+                )
+                for c in chunks
+            ],
+        )
+        # Full FTS5 rebuild from the current docx_chunks content.
+        conn.execute("INSERT INTO docx_chunks_fts(docx_chunks_fts) VALUES ('rebuild')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"index_db": index_db_path, "chunk_count": len(chunks)}
+
+
+def fts5_search_chunks(
+    index_db_path: str,
+    query: str,
+    limit: int = 20,
+    weight_heading: float = _CHUNK_WEIGHT_HEADING,
+    weight_body: float = _CHUNK_WEIGHT_BODY,
+) -> list[dict[str, Any]]:
+    """c84ca127 -- BM25 search over the chunk-level heading-aware FTS5 index.
+
+    Searches ``docx_chunks_fts`` (populated by :func:`index_docx_chunks`)
+    with column weights so a term hit in a section heading outranks the same
+    term in body prose.  Results carry ``heading_path`` so every hit reports
+    which section it came from.
+
+    Default weights: heading_text=5.0, body_text=1.0 (5:1 ratio; matches the
+    canonical packages/docparse implementation).  The caller can override via
+    keyword arguments.
+
+    Args:
+        index_db_path:   Path to the sidecar SQLite index built by
+                         :func:`index_docx_chunks`.
+        query:           FTS5 query string (e.g. ``"design"`` or
+                         ``'"AI sessions"'`` for a phrase).
+        limit:           Maximum number of results (default 20).
+        weight_heading:  BM25 column weight for ``heading_text`` (default 5.0).
+        weight_body:     BM25 column weight for ``body_text`` (default 1.0).
+
+    Returns:
+        List of dicts ordered by BM25 relevance (most relevant first)::
+
+            {
+                "chunk_id": int,
+                "heading_path": list[str],   # section ancestry, root first
+                "heading_text": str,
+                "body_text": str,
+                "start_para_id": str | None,
+                "end_para_id": str | None,
+                "bm25_score": float,         # negative; lower = more relevant
+            }
+
+        Empty list when no matches or when the FTS5 table does not exist yet
+        (degrades gracefully rather than raising).
+    """
+    conn = _connect_chunks(index_db_path)
+    try:
+        sql = (
+            "SELECT c.chunk_id, c.heading_path_json, c.heading_text, "
+            "c.body_text, c.start_para_id, c.end_para_id, "
+            f"bm25(docx_chunks_fts, {weight_heading!r}, {weight_body!r}) AS score "
+            "FROM docx_chunks_fts "
+            "JOIN docx_chunks c ON c.chunk_id = docx_chunks_fts.rowid "
+            "WHERE docx_chunks_fts MATCH ? "
+            "ORDER BY score "
+            "LIMIT ?"
+        )
+        rows = conn.execute(sql, (query, int(limit))).fetchall()
+    except sqlite3.OperationalError:
+        # FTS5 table may not exist in an older sidecar or the query may be
+        # syntactically invalid -- degrade to empty rather than raising.
+        return []
+    finally:
+        conn.close()
+
+    return [
+        {
+            "chunk_id": r[0],
+            "heading_path": json.loads(r[1]) if r[1] else [],
+            "heading_text": r[2],
+            "body_text": r[3],
+            "start_para_id": r[4],
+            "end_para_id": r[5],
+            "bm25_score": r[6],
+        }
+        for r in rows
+    ]
