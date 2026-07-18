@@ -2121,16 +2121,19 @@ def test_slot_proxy_client_id_defaults_to_empty():
 
 
 def test_dc_default_command_wraps_cmd_on_windows(monkeypatch):
+    # 3db4f8d8 — pinned to _DC_PINNED_VERSION, not @latest.
     monkeypatch.setattr(tc.sys, "platform", "win32")
     assert tc._dc_default_command() == [
-        "cmd", "/c", "npx", "-y", "@wonderwhy-er/desktop-commander@latest",
+        "cmd", "/c", "npx", "-y",
+        f"@wonderwhy-er/desktop-commander@{tc._DC_PINNED_VERSION}",
     ]
 
 
 def test_dc_default_command_bare_npx_on_posix(monkeypatch):
+    # 3db4f8d8 — pinned to _DC_PINNED_VERSION, not @latest.
     monkeypatch.setattr(tc.sys, "platform", "linux")
     assert tc._dc_default_command() == [
-        "npx", "-y", "@wonderwhy-er/desktop-commander@latest",
+        "npx", "-y", f"@wonderwhy-er/desktop-commander@{tc._DC_PINNED_VERSION}",
     ]
 
 
@@ -2777,3 +2780,356 @@ def test_scoped_cache_clear_uvx_uv_not_found_still_returns_true(monkeypatch, tmp
 
     result = tc._scoped_cache_clear(["uvx", "--from", "serena-agent", "serena"], "extract")
     assert result is True  # retry should still be attempted
+
+
+# ---------------------------------------------------------------------------
+# 3db4f8d8 — TAR_ENTRY_ERROR detection + thorough cache clear + pinned version
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc2:
+    """Minimal Popen stand-in for TAR/retry tests."""
+    returncode = None
+
+    def __init__(self, exit_code=None):
+        self._exit_code = exit_code
+
+    def poll(self):
+        return self._exit_code
+
+    def kill(self): pass
+    def wait(self, timeout=None): pass
+    def terminate(self): pass
+
+
+# --- _is_tar_entry_error ---------------------------------------------------
+
+def test_is_tar_entry_error_canonical_uppercase():
+    """TAR_ENTRY_ERROR (the canonical npm error code) is detected case-insensitively."""
+    assert tc._is_tar_entry_error("npm ERR! TAR_ENTRY_ERROR ENOTSUP")
+
+
+def test_is_tar_entry_error_lowercase():
+    assert tc._is_tar_entry_error("error: tar_entry_error while extracting")
+
+
+def test_is_tar_entry_error_integrity_check_failed():
+    """npm v9+ uses 'integrity check failed' for the same class of corruption."""
+    assert tc._is_tar_entry_error("npm ERR! Integrity check failed for package.tgz")
+
+
+def test_is_tar_entry_error_eintegrity():
+    assert tc._is_tar_entry_error("npm ERR! code EINTEGRITY")
+
+
+def test_is_tar_entry_error_corrupted_package():
+    assert tc._is_tar_entry_error("error: corrupted package detected during install")
+
+
+def test_is_tar_entry_error_unexpected_end_of_data():
+    assert tc._is_tar_entry_error("Error: unexpected end of data")
+
+
+def test_is_tar_entry_error_clean_output_returns_false():
+    assert not tc._is_tar_entry_error("Server started on port 3000")
+    assert not tc._is_tar_entry_error("Desktop Commander MCP server ready")
+
+
+def test_is_tar_entry_error_empty_returns_false():
+    assert not tc._is_tar_entry_error("")
+    assert not tc._is_tar_entry_error(None)  # type: ignore[arg-type]
+
+
+# --- _dc_default_command pinned version ------------------------------------
+
+def test_dc_default_command_uses_pinned_version():
+    """_dc_default_command must NOT use @latest — it must use the pinned version."""
+    cmd = tc._dc_default_command()
+    # Unwrap the Windows cmd /c wrapper if present
+    flat = " ".join(cmd)
+    assert "@latest" not in flat, "desktop-commander must be pinned, not @latest"
+    assert tc._DC_PINNED_VERSION in flat, (
+        f"expected pinned version {tc._DC_PINNED_VERSION!r} in command {cmd!r}"
+    )
+
+
+def test_dc_default_command_windows_wrapped(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    cmd = tc._dc_default_command()
+    assert cmd[0] == "cmd"
+    assert "/c" in cmd
+    assert tc._DC_PINNED_VERSION in " ".join(cmd)
+    assert "@latest" not in " ".join(cmd)
+
+
+def test_dc_default_command_posix_not_wrapped(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    cmd = tc._dc_default_command()
+    assert cmd[0] == "npx"
+    assert tc._DC_PINNED_VERSION in " ".join(cmd)
+
+
+def test_dc_pinned_version_in_builtin_plugins():
+    """BUILTIN_PLUGINS desktop-commander entry must reference the pinned version
+    in its comment or command — the @latest string must not appear there."""
+    from meridian.tunnel_plugins import BUILTIN_PLUGINS
+    dc = next(p for p in BUILTIN_PLUGINS if p["name"] == "desktop-commander")
+    # command is None (spawned via _dc_default_command fallback) — that's fine;
+    # the resolved command must carry the pinned version, not @latest.
+    # _office_slot_command(dc_slot, dc_plugin) falls back to _dc_default_command().
+    resolved = tc._office_slot_command("dc", dc)
+    assert resolved is not None
+    flat = " ".join(resolved)
+    assert "@latest" not in flat
+    assert tc._DC_PINNED_VERSION in flat
+
+
+# --- _scoped_cache_clear_thorough ------------------------------------------
+
+def test_scoped_cache_clear_thorough_calls_npm_cache_clean(monkeypatch, tmp_path):
+    """For an npx command, thorough clear calls npm cache clean --force."""
+    npx_dir = tmp_path / "_npx"
+    npx_dir.mkdir()
+    monkeypatch.setattr(
+        tc, "_package_cache_locations",
+        lambda: {"npx": str(npx_dir), "uvx": "", "uv_tools": ""},
+    )
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+
+    npm_calls = []
+
+    def _fake_run(cmd, **kw):
+        npm_calls.append(cmd)
+        class R:
+            returncode = 0
+            stdout = stderr = ""
+        return R()
+
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run)
+
+    tc._scoped_cache_clear_thorough(
+        ["npx", "-y", "@wonderwhy-er/desktop-commander@0.2.46"], "dc"
+    )
+    # The full npm cache clean must have been attempted.
+    assert any("cache" in " ".join(c) and "clean" in " ".join(c) for c in npm_calls), (
+        f"expected npm cache clean call; got {npm_calls!r}"
+    )
+    assert any("--force" in c for c in npm_calls)
+
+
+def test_scoped_cache_clear_thorough_skips_npm_for_uvx(monkeypatch, tmp_path):
+    """For a uvx command, thorough clear only does the scoped uv clear (no npm)."""
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    run_calls = []
+
+    def _fake_run(cmd, **kw):
+        run_calls.append(cmd)
+        class R:
+            returncode = 0
+            stdout = stderr = ""
+        return R()
+
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run)
+
+    tc._scoped_cache_clear_thorough(["uvx", "my-mcp-server"], "extract")
+    # Only uv cache clean — no npm call.
+    assert all("uv" in str(c[0]) for c in run_calls), (
+        f"unexpected non-uv calls: {run_calls!r}"
+    )
+    assert not any("npm" in " ".join(c) for c in run_calls)
+
+
+def test_scoped_cache_clear_thorough_npm_not_found_doesnt_raise(monkeypatch, tmp_path):
+    """If npm is not on PATH, thorough clear logs and returns gracefully."""
+    npx_dir = tmp_path / "_npx"
+    npx_dir.mkdir()
+    monkeypatch.setattr(
+        tc, "_package_cache_locations",
+        lambda: {"npx": str(npx_dir), "uvx": "", "uv_tools": ""},
+    )
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)  # npm not found
+    # Must not raise.
+    tc._scoped_cache_clear_thorough(
+        ["npx", "-y", "@wonderwhy-er/desktop-commander@0.2.46"], "dc"
+    )
+
+
+# --- _probe_tar_entry_error ------------------------------------------------
+
+def test_probe_tar_entry_error_detects_tar_in_stderr(monkeypatch):
+    """When the probed process exits quickly with TAR_ENTRY_ERROR in stderr,
+    _probe_tar_entry_error returns True."""
+    import subprocess as _sp
+
+    class _TarProc:
+        returncode = 1
+        def communicate(self, timeout=None):
+            return b"", b"npm ERR! TAR_ENTRY_ERROR ENOTSUP"
+
+    monkeypatch.setattr(
+        tc.subprocess, "Popen",
+        lambda cmd, env=None, **kw: _TarProc(),
+    )
+    assert tc._probe_tar_entry_error(
+        ["npx", "-y", "@wonderwhy-er/desktop-commander@0.2.46"], None, "dc"
+    ) is True
+
+
+def test_probe_tar_entry_error_returns_false_for_long_running_process(monkeypatch):
+    """A process that doesn't exit within the probe window is NOT a TAR error."""
+    import subprocess as _sp
+
+    class _LongRunningProc:
+        returncode = None
+        def communicate(self, timeout=None):
+            raise _sp.TimeoutExpired(cmd=["npx"], timeout=timeout)
+        def kill(self): pass
+
+    monkeypatch.setattr(
+        tc.subprocess, "Popen",
+        lambda cmd, env=None, **kw: _LongRunningProc(),
+    )
+    assert tc._probe_tar_entry_error(
+        ["npx", "-y", "@wonderwhy-er/desktop-commander@0.2.46"], None, "dc",
+        wait_seconds=0.01,
+    ) is False
+
+
+def test_probe_tar_entry_error_returns_false_on_clean_fast_exit(monkeypatch):
+    """A process that exits cleanly (no TAR signature) returns False."""
+
+    class _CleanProc:
+        returncode = 0
+        def communicate(self, timeout=None):
+            return b"Desktop Commander ready", b""
+        def kill(self): pass
+
+    monkeypatch.setattr(
+        tc.subprocess, "Popen",
+        lambda cmd, env=None, **kw: _CleanProc(),
+    )
+    assert tc._probe_tar_entry_error(["npx", "-y", "tool"], None, "dc") is False
+
+
+def test_probe_tar_entry_error_returns_false_on_popen_exception(monkeypatch):
+    """If the diagnostic Popen itself raises, the probe returns False (never raises)."""
+    def _boom(cmd, env=None, **kw):
+        raise OSError("cannot spawn")
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _boom)
+    # Must not raise — returns False.
+    result = tc._probe_tar_entry_error(["npx", "-y", "tool"], None, "dc")
+    assert result is False
+
+
+# --- _spawn_with_cache_retry TAR_ENTRY_ERROR path --------------------------
+
+def test_spawn_with_cache_retry_tar_error_uses_thorough_clear(monkeypatch):
+    """When the first Popen succeeds but the process immediately exits with a
+    TAR_ENTRY_ERROR, the thorough clear is used (not just scoped clear) and
+    a second Popen is attempted."""
+    thorough_called = []
+    scoped_called = []
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear_thorough",
+        lambda cmd, label="": thorough_called.append(cmd),
+    )
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear",
+        lambda cmd, label="": scoped_called.append(cmd) or True,
+    )
+    monkeypatch.setattr(
+        tc, "_probe_tar_entry_error",
+        lambda cmd, env, label, wait_seconds=5.0: True,
+    )
+    # Patch time.sleep to avoid a real 100ms pause in the test.
+    monkeypatch.setattr(tc.time, "sleep", lambda n: None)
+
+    spawn_count = [0]
+    fake_proc_alive = _FakeProc2(exit_code=None)   # second spawn stays alive
+    fake_proc_dead = _FakeProc2(exit_code=1)        # first spawn exits immediately
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        if spawn_count[0] == 1:
+            return fake_proc_dead
+        return fake_proc_alive
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    result = tc._spawn_with_cache_retry(
+        ["npx", "-y", "@wonderwhy-er/desktop-commander@0.2.46"], None, "dc"
+    )
+    assert result is fake_proc_alive
+    assert spawn_count[0] == 2
+    assert len(thorough_called) == 1, "thorough clear must be called for TAR error"
+    assert len(scoped_called) == 0, "scoped-only clear must NOT be called for TAR error"
+
+
+def test_spawn_with_cache_retry_generic_fail_uses_scoped_clear(monkeypatch):
+    """The a9d1ef7f generic spawn-exception path still uses the scoped clear only."""
+    thorough_called = []
+    scoped_called = []
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear_thorough",
+        lambda cmd, label="": thorough_called.append(cmd),
+    )
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear",
+        lambda cmd, label="": scoped_called.append(cmd) or True,
+    )
+    monkeypatch.setattr(tc.time, "sleep", lambda n: None)
+
+    spawn_count = [0]
+    fake_proc = _FakeProc2(exit_code=None)
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        if spawn_count[0] == 1:
+            raise OSError("ENOENT — generic spawn failure")
+        return fake_proc
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    result = tc._spawn_with_cache_retry(["npx", "-y", "mcp-proxy"], None, "fs")
+    assert result is fake_proc
+    assert spawn_count[0] == 2
+    assert len(scoped_called) == 1, "scoped clear must be called for generic spawn failure"
+    assert len(thorough_called) == 0, "thorough clear must NOT be called for generic failure"
+
+
+def test_spawn_with_cache_retry_fast_exit_non_tar_uses_scoped_clear(monkeypatch):
+    """Process exits immediately but without TAR signature → falls back to scoped clear."""
+    thorough_called = []
+    scoped_called = []
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear_thorough",
+        lambda cmd, label="": thorough_called.append(cmd),
+    )
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear",
+        lambda cmd, label="": scoped_called.append(cmd) or True,
+    )
+    monkeypatch.setattr(
+        tc, "_probe_tar_entry_error",
+        lambda cmd, env, label, wait_seconds=5.0: False,  # not a TAR error
+    )
+    monkeypatch.setattr(tc.time, "sleep", lambda n: None)
+
+    spawn_count = [0]
+    fake_proc_dead = _FakeProc2(exit_code=1)
+    fake_proc_alive = _FakeProc2(exit_code=None)
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        if spawn_count[0] == 1:
+            return fake_proc_dead
+        return fake_proc_alive
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    result = tc._spawn_with_cache_retry(["npx", "-y", "some-tool"], None, "slot")
+    assert result is fake_proc_alive
+    assert spawn_count[0] == 2
+    assert len(scoped_called) == 1, "scoped clear used for non-TAR fast-exit"
+    assert len(thorough_called) == 0
