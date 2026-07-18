@@ -89,7 +89,7 @@ log_task(session_id="session-uuid", project_id="abc-123", description="Fixed aut
 
 
 ### `get_tasks`
-Read-only: Get recent tasks across all sessions.
+[SUPPORT] Read-only: Get recent tasks across all sessions.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -106,7 +106,7 @@ get_tasks(project_id="abc-123")
 
 
 ### `search_tasks`
-Read-only: Search tasks by keyword or natural-language query. Uses trigram similarity on Postgres, LIKE on SQLite. Returns top matches with similarity score.
+[SUPPORT] Read-only: Search tasks by keyword or natural-language query. Uses trigram similarity on Postgres, LIKE on SQLite. Returns top matches with similarity score.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -125,7 +125,7 @@ search_tasks(project_id="abc-123", query="rate limiting bug")
 ## Goal & sprint
 
 ### `get_goal`
-Read-only: Fine-grained — return just the goal fields (north_star, sprint, version_goal) in isolation. Use start_session or get_session_brief for full context including tasks and decisions. Use get_goal when you only need the raw goal fields.
+[SUPPORT] Read-only: Fine-grained — return just the goal fields (north_star, sprint, version_goal) in isolation. Use start_session or get_session_brief for full context including tasks and decisions. Use get_goal when you only need the raw goal fields.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -141,7 +141,7 @@ get_goal(project_id="abc-123")
 
 
 ### `set_goal`
-Set or update the goal state.
+[MAINTENANCE] Set or update the goal state.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -263,7 +263,7 @@ idle_until_session_done(watching_session_id="session-uuid")
 ## Parallel coordination
 
 ### `store_finding`
-PARALLEL COORDINATION (c35370cc): persist a per-task intermediate result to the session_findings table so it survives session boundaries. Parallel reader agents write findings; an orchestrator or writer agent reads them via get_findings. Unlike save_finding (which creates a research note), this is a lightweight key→content store for agent-to-agent handoff of intermediate work.
+[MAINTENANCE] PARALLEL COORDINATION (c35370cc): persist a per-task intermediate result to the session_findings table so it survives session boundaries. Parallel reader agents write findings; an orchestrator or writer agent reads them via get_findings. Unlike save_finding (which creates a research note), this is a lightweight key→content store for agent-to-agent handoff of intermediate work.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -279,7 +279,7 @@ PARALLEL COORDINATION (c35370cc): persist a per-task intermediate result to the 
 
 
 ### `get_findings`
-Read-only (c35370cc): read stored session_findings for a project (newest first), optionally scoped by key and/or session_id. The read side of store_finding.
+[MAINTENANCE] Read-only (c35370cc): read stored session_findings for a project (newest first), optionally scoped by key and/or session_id. The read side of store_finding.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -293,7 +293,7 @@ Read-only (c35370cc): read stored session_findings for a project (newest first),
 
 
 ### `send_message`
-PARALLEL COORDINATION (d3a3a01d): enqueue an actor-model message to another session (session_messages table). 'Done with X, you do Y' between parallel agents. The recipient reads with receive_messages. A2A-compatible.
+[MAINTENANCE] PARALLEL COORDINATION (d3a3a01d): enqueue an actor-model message to another session (session_messages table). 'Done with X, you do Y' between parallel agents. The recipient reads with receive_messages. A2A-compatible.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -308,7 +308,7 @@ PARALLEL COORDINATION (d3a3a01d): enqueue an actor-model message to another sess
 
 
 ### `receive_messages`
-PARALLEL COORDINATION (d3a3a01d): fetch unread messages addressed to a session (oldest first) and mark them read by default. The receive side of send_message.
+[MAINTENANCE] PARALLEL COORDINATION (d3a3a01d): fetch unread messages addressed to a session (oldest first) and mark them read by default. The receive side of send_message.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -320,7 +320,7 @@ PARALLEL COORDINATION (d3a3a01d): fetch unread messages addressed to a session (
 
 
 ### `idle_until_all_done`
-PARALLEL COORDINATION (d3a3a01d): non-blocking barrier check across sibling sessions. Returns {all_done, pending, statuses}; a session is done when closed/archived/missing. The server can't block, so poll until all_done is true — the A2A 'wait for X, Y, Z to finish' primitive.
+[MAINTENANCE] PARALLEL COORDINATION (d3a3a01d): non-blocking barrier check across sibling sessions. Returns {all_done, pending, statuses}; a session is done when closed/archived/missing. The server can't block, so poll until all_done is true — the A2A 'wait for X, Y, Z to finish' primitive.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -373,7 +373,7 @@ Patch a pinned decision. Pass `new_title` + `new_body` to atomically supersede (
 
 
 ### `get_pinned_decisions`
-Read-only: List pinned decisions, highest priority first (urgent → normal → low, then newest-first). Active only by default. Each row includes its priority and a parsed edit_log array of prior bodies ({body, ts}) recorded on every in-place body edit.
+[SUPPORT] Read-only: List pinned decisions, highest priority first (urgent → normal → low, then newest-first). Active only by default. Each row includes its priority and a parsed edit_log array of prior bodies ({body, ts}) recorded on every in-place body edit.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -526,7 +526,7 @@ get_planning_brief(project_id="abc-123")
 
 
 ### `analyze_sprint`
-PLANNING: Read-only synthesis of the current sprint into one structured brief — parallelizability (conflict-free groups + max fan-out), dependency chains (depends_on walked to the root), resource/file conflicts (items sharing touches_resources), and stalls (stall_count>0). Returns {summary, recommended_strategy, parallelism, dependency_chains, longest_chain, file_conflicts, stalls, blocked, running}. Call in planning sessions instead of stitching together get_parallelizable_groups + manual dependency/conflict analysis.
+[MAINTENANCE] PLANNING: Read-only synthesis of the current sprint into one structured brief — parallelizability (conflict-free groups + max fan-out), dependency chains (depends_on walked to the root), resource/file conflicts (items sharing touches_resources), and stalls (stall_count>0). Returns {summary, recommended_strategy, parallelism, dependency_chains, longest_chain, file_conflicts, stalls, blocked, running}. Call in planning sessions instead of stitching together get_parallelizable_groups + manual dependency/conflict analysis.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -702,7 +702,7 @@ read_note(project_id="abc-123", slug="deploy-note")
 
 
 ### `delete_note`
-Hard-delete a project note by id.
+[MAINTENANCE] Hard-delete a project note by id.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -713,7 +713,7 @@ Hard-delete a project note by id.
 ## Projects
 
 ### `create_project`
-Create a new Meridian project.
+[MAINTENANCE] Create a new Meridian project.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -730,7 +730,7 @@ create_project(name="my-app")
 
 
 ### `merge_project`
-d6bd60e0 — merge a phantom-duplicate project INTO another. Re-parents EVERY child row of the source project (sprint items, tasks, decisions, insights, notes, HITL requests, sessions, handoffs, pointers, …) to the target project via pure UPDATEs — NO row is ever deleted. By default the now-empty source project is soft-archived (status='archived', name prefixed with '[merged] '), never hard-deleted; pass archive_source=false to leave it untouched. Returns {source_project_id, target_project_id, moved: {table: count}, source_archived}. Returns {error} if source==target or either project does not exist.
+[MAINTENANCE] d6bd60e0 — merge a phantom-duplicate project INTO another. Re-parents EVERY child row of the source project (sprint items, tasks, decisions, insights, notes, HITL requests, sessions, handoffs, pointers, …) to the target project via pure UPDATEs — NO row is ever deleted. By default the now-empty source project is soft-archived (status='archived', name prefixed with '[merged] '), never hard-deleted; pass archive_source=false to leave it untouched. Returns {source_project_id, target_project_id, moved: {table: count}, source_archived}. Returns {error} if source==target or either project does not exist.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

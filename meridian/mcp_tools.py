@@ -2569,6 +2569,17 @@ for _tool in _MCP_TOOLS_LIST:
     # in tools/list responses so any MCP client can see it. Default "common-support"
     # for any tool not explicitly mapped (safe: unknown tools are support-level).
     _tool["workflow_tier"] = _TOOL_WORKFLOW_TIER.get(_tool["name"], "common-support")
+    # 37f8e868 — bake tier tag into the description string so ANY MCP client can
+    # read it without knowing Meridian's custom workflow_tier field.
+    # main-workflow tools are untagged (they ARE the main loop).
+    # common-support tools get "[SUPPORT] " prefix.
+    # maintenance-only tools get "[MAINTENANCE] " prefix.
+    _tier_prefix = {
+        "common-support":   "[SUPPORT] ",
+        "maintenance-only": "[MAINTENANCE] ",
+    }.get(_tool["workflow_tier"], "")
+    if _tier_prefix and not _tool.get("description", "").startswith(_tier_prefix):
+        _tool["description"] = _tier_prefix + _tool.get("description", "")
 
 
 # ---------------------------------------------------------------------------
