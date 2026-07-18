@@ -173,12 +173,15 @@ class TestDocumentContentTree:
         assert result["blocks"][0]["text"] == "Hello from bytes."
 
     def test_synthesized_para_id_when_absent(self) -> None:
-        """When w14:paraId is absent a synthesized p{index} id is assigned."""
+        """When w14:paraId is absent a stable structural-hash id (prefix 'sp') is
+        assigned rather than the old fragile positional p{index} fallback."""
         body = _plain_para("No paraId here.")  # no para_id kwarg
         docx = _make_docx(body)
         result = document_content_tree(docx)
         block = result["blocks"][0]
-        assert block["para_id"].startswith("p")
+        assert block["para_id"].startswith("sp"), (
+            f"expected 'sp...' stable synth id, got {block['para_id']!r}"
+        )
 
     def test_field_count(self) -> None:
         """field_count sums fields across all blocks."""

@@ -110,7 +110,11 @@ def _rich_docx() -> bytes:
 
 def test_parse_docx_extracts_paraids_styles_and_joined_text():
     paras = docs_intel.parse_docx(_synthetic_docx())
-    assert [p["para_id"] for p in paras] == ["00000001", "00000002", "00000003", "p3"]
+    # The fourth paragraph has no w14:paraId — it gets a stable structural-hash id
+    # (prefixed "sp") rather than the old fragile positional "p3".
+    para_ids = [p["para_id"] for p in paras]
+    assert para_ids[:3] == ["00000001", "00000002", "00000003"]
+    assert para_ids[3].startswith("sp"), f"expected stable synth id, got {para_ids[3]!r}"
     assert [p["style"] for p in paras] == ["Heading1", None, "Heading2", None]
     # Multiple runs in one paragraph are concatenated.
     assert paras[1]["text"] == "Meridian coordinates AI sessions."
@@ -434,9 +438,9 @@ def test_document_content_tree_keys_paragraphs_on_paraid():
     tree = docs_intel.document_content_tree(_rich_docx())
     para_ids = [b["para_id"] for b in tree["blocks"] if "para_id" in b]
     assert "10000006" in para_ids  # closing paragraph is addressable
-    # A paragraph without w14:paraId gets a synthesized p{index} fallback.
+    # A paragraph without w14:paraId gets a stable structural-hash id (prefix "sp").
     out = docs_intel.document_content_tree(_synthetic_docx())
-    assert any(b.get("para_id", "").startswith("p") for b in out["blocks"])
+    assert any(b.get("para_id", "").startswith("sp") for b in out["blocks"])
 
 
 def test_document_content_tree_empty_body():
@@ -449,6 +453,145 @@ def test_document_content_tree_empty_body():
     tree = docs_intel.document_content_tree(buf.getvalue())
     assert tree["blocks"] == [] and tree["tree"] == []
     assert tree["paragraph_count"] == 0 and tree["table_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# caf5ee34 — stable structural-hash para_id fallback
+# ---------------------------------------------------------------------------
+
+def _make_docx_from_xml(xml: str) -> bytes:
+    """Wrap raw document XML in a .docx ZIP."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    return buf.getvalue()
+
+
+def test_stable_synth_id_survives_insertion_elsewhere():
+    """caf5ee34 core: the same logical paragraph keeps its id after an unrelated
+    paragraph is inserted at a different position in the document."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    base_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter One</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>The target paragraph.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"""
+
+    # After insertion: an extra paragraph appears BEFORE the target.
+    after_insert_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter One</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>An inserted paragraph before the target.</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>The target paragraph.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"""
+
+    paras_before = docs_intel.parse_docx(_make_docx_from_xml(base_xml))
+    paras_after = docs_intel.parse_docx(_make_docx_from_xml(after_insert_xml))
+
+    target_before = next(p for p in paras_before if p["text"] == "The target paragraph.")
+    target_after = next(p for p in paras_after if p["text"] == "The target paragraph.")
+
+    assert target_before["para_id"].startswith("sp"), (
+        f"expected stable synth id before insertion, got {target_before['para_id']!r}"
+    )
+    assert target_before["para_id"] == target_after["para_id"], (
+        f"stable synth id shifted after insertion: "
+        f"{target_before['para_id']!r} -> {target_after['para_id']!r}"
+    )
+
+
+def test_different_paragraphs_get_different_synth_ids():
+    """Two paragraphs with different text under the same heading get distinct ids."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Section A</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>First unique paragraph.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Second unique paragraph.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    paras = docs_intel.parse_docx(_make_docx_from_xml(xml))
+    body_paras = [p for p in paras if p["kind"] == "paragraph"]
+    assert len(body_paras) == 2
+    assert body_paras[0]["para_id"].startswith("sp")
+    assert body_paras[1]["para_id"].startswith("sp")
+    assert body_paras[0]["para_id"] != body_paras[1]["para_id"], (
+        "two distinct paragraphs should get different synthesized ids"
+    )
+
+
+def test_duplicate_paragraphs_get_distinct_synth_ids():
+    """Two paragraphs with identical text at the same structural position
+    must not collide — they get different ids via the occurrence counter."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Section</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>Duplicate text.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Duplicate text.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    paras = docs_intel.parse_docx(_make_docx_from_xml(xml))
+    dup_ids = [p["para_id"] for p in paras if p["text"] == "Duplicate text."]
+    assert len(dup_ids) == 2
+    assert dup_ids[0] != dup_ids[1], (
+        "duplicate paragraphs at the same structural slot must get different synth ids"
+    )
+
+
+def test_native_paraid_unaffected_by_synth_logic():
+    """Paragraphs that already have w14:paraId keep their real id unchanged."""
+    paras = docs_intel.parse_docx(_synthetic_docx())
+    # Three paragraphs have real paraIds from the fixture.
+    assert paras[0]["para_id"] == "00000001"
+    assert paras[1]["para_id"] == "00000002"
+    assert paras[2]["para_id"] == "00000003"
+    # Only the fourth (no paraId) gets a synth id.
+    assert paras[3]["para_id"].startswith("sp")
+
+
+def test_synth_id_deterministic_across_calls():
+    """The same document parsed twice produces identical synthesized ids (no
+    randomness — this would silently break cross-run references)."""
+    docx = _synthetic_docx()
+    paras_a = docs_intel.parse_docx(docx)
+    paras_b = docs_intel.parse_docx(docx)
+    ids_a = [p["para_id"] for p in paras_a]
+    ids_b = [p["para_id"] for p in paras_b]
+    assert ids_a == ids_b, "synthesized ids must be deterministic across runs"
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ explains this tradeoff.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 import zipfile
@@ -148,9 +149,76 @@ def _paragraph_text(p: ET.Element) -> str:
     return "".join(t.text or "" for t in p.iter(_q(_W, "t")))
 
 
-def _paragraph_node(p: ET.Element, index: int) -> dict[str, Any]:
-    """Build the block dict for a <w:p> element."""
-    para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+def _build_synth_id_map(body: ET.Element) -> dict[int, str]:
+    """Build a stable synthesized-id map for every <w:p> child in *body* that
+    lacks a w14:paraId attribute.
+
+    The synthesized id is derived from a deterministic hash of:
+      - The structural path: the ancestor-heading trail at the point where the
+        paragraph appears (heading texts joined by " > ", or "<root>" when the
+        paragraph precedes all headings). This path is insertion-resistant
+        because it tracks which heading section the paragraph lives under, not
+        the raw document-order index. A paragraph inserted elsewhere in the
+        document does not change any heading text, so every other paragraph's
+        path stays the same.
+      - The paragraph's own normalised text (lowercased, whitespace collapsed).
+      - An occurrence counter that disambiguates duplicate paragraphs at exactly
+        the same structural path with exactly the same text (e.g. two blank
+        paragraphs under the same heading).
+
+    Returns a ``{id(element): synth_id_str}`` dict — keyed on Python object id
+    so callers can look up the precomputed id in O(1) without re-traversing the
+    body.  Only elements *without* a native paraId are included; callers should
+    still prefer the native id when present.
+
+    The prefix ``"sp"`` (Synthesized Paragraph) distinguishes these ids from
+    real w14:paraId values (which are 8-hex-digit Word-assigned ids) and from
+    the old ``p{index}`` positional fallback.
+    """
+    p_tag = _q(_W, "p")
+    w14_paraId = _q(_W14, "paraId")
+
+    # Track the current heading path as we walk body children.
+    heading_path: list[str] = []
+    # Count how many times we've seen each (path, text) pair to disambiguate.
+    seen: dict[tuple[str, str], int] = {}
+    result: dict[int, str] = {}
+
+    for child in body:
+        if child.tag != p_tag:
+            continue
+        native_id = child.get(w14_paraId)
+        style = _paragraph_style(child)
+        if _is_heading(style):
+            level = _heading_level(style)
+            text = _paragraph_text(child)
+            # Trim the path to the parent level and push this heading.
+            heading_path = heading_path[: level - 1] + [text]
+        if native_id:
+            continue  # has a real id — no synth id needed
+        path_str = " > ".join(heading_path) if heading_path else "<root>"
+        norm_text = re.sub(r"\s+", " ", _paragraph_text(child).lower()).strip()
+        slot_key = (path_str, norm_text)
+        occ = seen.get(slot_key, 0)
+        seen[slot_key] = occ + 1
+        raw = f"{path_str}\x00{norm_text}\x00{occ}"
+        digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
+        result[id(child)] = f"sp{digest}"
+
+    return result
+
+
+def _paragraph_node(p: ET.Element, index: int, synth_id: str | None = None) -> dict[str, Any]:
+    """Build the block dict for a <w:p> element.
+
+    ``synth_id`` is a pre-computed stable synthesized id (from
+    :func:`_build_synth_id_map`) to use when the element has no w14:paraId.
+    When *synth_id* is ``None`` and the element also has no native id, the old
+    ``f"p{index}"`` positional fallback is used — this only occurs for callers
+    that have not yet been updated to pass the synth map (kept for
+    backward-compatibility; all internal callers pass the map).
+    """
+    para_id = p.get(_q(_W14, "paraId")) or synth_id or f"p{index}"
     style = _paragraph_style(p)
     fields = _fields_in_paragraph(p)
     node: dict[str, Any] = {
@@ -238,10 +306,11 @@ def document_content_tree(source: str | bytes | bytearray) -> dict[str, Any]:
 
     p_tag = _q(_W, "p")
     tbl_tag = _q(_W, "tbl")
+    synth_map = _build_synth_id_map(body)
     blocks: list[dict[str, Any]] = []
     for index, child in enumerate(list(body)):
         if child.tag == p_tag:
-            blocks.append(_paragraph_node(child, index))
+            blocks.append(_paragraph_node(child, index, synth_map.get(id(child))))
         elif child.tag == tbl_tag:
             blocks.append(_table_node(child, index))
 

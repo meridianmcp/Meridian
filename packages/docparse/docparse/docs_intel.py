@@ -23,6 +23,7 @@ synthetic in-memory .docx (see tests/test_docs_intel.py).
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import re
@@ -572,13 +573,14 @@ def parse_docx_citations(source: str | bytes | bytearray) -> list[dict[str, Any]
     body = root.find(_q(_W, "body"))
     if body is None:
         return []
+    synth_map = _build_synth_id_map(body)
     citations: list[dict[str, Any]] = []
     heading_ordinal = -1  # index of the nearest preceding heading (-1 => none yet)
     for index, p in enumerate(body.findall(_q(_W, "p"))):
         style = _paragraph_style(p)
         if _is_heading(style):
             heading_ordinal += 1
-        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        para_id = p.get(_q(_W14, "paraId")) or synth_map.get(id(p)) or f"p{index}"
         section_ordinal = heading_ordinal if heading_ordinal >= 0 else None
         for marker in _citations_in_paragraph(p):
             citations.append(
@@ -694,8 +696,9 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     paragraphs: list[dict[str, Any]] = []
     if body is None:
         return paragraphs
+    synth_map = _build_synth_id_map(body)
     for index, p in enumerate(body.findall(_q(_W, "p"))):
-        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        para_id = p.get(_q(_W14, "paraId")) or synth_map.get(id(p)) or f"p{index}"
         style = _paragraph_style(p)
         text = _paragraph_text(p)
         paragraphs.append(
@@ -787,9 +790,59 @@ def _paragraph_text(p: ET.Element) -> str:
     return "".join(t.text or "" for t in p.iter(_q(_W, "t")))
 
 
-def _paragraph_node(p: ET.Element, index: int) -> dict[str, Any]:
-    """Build a content-tree node for one ``<w:p>`` (heading or body paragraph)."""
-    para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+def _build_synth_id_map(body: ET.Element) -> dict[int, str]:
+    """Build a stable synthesized-id map for <w:p> elements in *body* that lack
+    a native w14:paraId attribute.
+
+    Returns ``{id(element): synth_id_str}`` — only for elements without a real
+    paraId.  The synthesized id is a 16-hex-char SHA-1 digest (prefixed ``sp``)
+    derived from:
+
+    - The structural path: the heading-text trail leading to this paragraph
+      (insertion-resistant — inserts elsewhere don't rename existing headings).
+    - The paragraph's normalised text (lowercased, whitespace collapsed).
+    - An occurrence counter disambiguating duplicate paragraphs at the same
+      structural slot with the same text (e.g. two blank paragraphs under the
+      same heading).
+
+    Using ``hashlib.sha1`` (not Python's built-in ``hash()``) ensures
+    reproducibility across processes and Python restarts.
+    """
+    p_tag = _q(_W, "p")
+    w14_paraId = _q(_W14, "paraId")
+    heading_path: list[str] = []
+    seen: dict[tuple[str, str], int] = {}
+    result: dict[int, str] = {}
+    for child in body:
+        if child.tag != p_tag:
+            continue
+        native_id = child.get(w14_paraId)
+        style = _paragraph_style(child)
+        if _is_heading(style):
+            level = _heading_level(style)
+            text = _paragraph_text(child)
+            heading_path = heading_path[: level - 1] + [text]
+        if native_id:
+            continue
+        path_str = " > ".join(heading_path) if heading_path else "<root>"
+        norm_text = re.sub(r"\s+", " ", _paragraph_text(child).lower()).strip()
+        slot_key = (path_str, norm_text)
+        occ = seen.get(slot_key, 0)
+        seen[slot_key] = occ + 1
+        raw = f"{path_str}\x00{norm_text}\x00{occ}"
+        digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
+        result[id(child)] = f"sp{digest}"
+    return result
+
+
+def _paragraph_node(p: ET.Element, index: int, synth_id: str | None = None) -> dict[str, Any]:
+    """Build a content-tree node for one ``<w:p>`` (heading or body paragraph).
+
+    ``synth_id`` is a pre-computed stable id from :func:`_build_synth_id_map`;
+    when absent and the element has no native paraId, falls back to the legacy
+    positional ``f"p{index}"``.
+    """
+    para_id = p.get(_q(_W14, "paraId")) or synth_id or f"p{index}"
     style = _paragraph_style(p)
     fields = _fields_in_paragraph(p)
     node: dict[str, Any] = {
@@ -881,11 +934,12 @@ def document_content_tree(source: str | bytes | bytearray) -> dict[str, Any]:
 
     p_tag = _q(_W, "p")
     tbl_tag = _q(_W, "tbl")
+    synth_map = _build_synth_id_map(body)
     # Walk direct body children in stored order so paragraphs and tables keep
     # their real interleaving.
     for index, child in enumerate(list(body)):
         if child.tag == p_tag:
-            blocks.append(_paragraph_node(child, index))
+            blocks.append(_paragraph_node(child, index, synth_map.get(id(child))))
         elif child.tag == tbl_tag:
             blocks.append(_table_node(child, index))
         # Other body children (sectPr, bookmarks at body level, ...) are skipped
@@ -1923,12 +1977,13 @@ def _iter_caption_paragraphs(
     if body is None:
         return out
     p_tag = _q(_W, "p")
+    synth_map = _build_synth_id_map(body)
     # ``iter`` yields every <w:p> in document order, whether a direct body child
     # or nested inside a table cell — exactly the caption-search domain.
     for index, p in enumerate(body.iter(p_tag)):
         out.append(
             {
-                "para_id": p.get(_q(_W14, "paraId")) or f"p{index}",
+                "para_id": p.get(_q(_W14, "paraId")) or synth_map.get(id(p)) or f"p{index}",
                 "text": _paragraph_text(p),
                 "fields": _fields_in_paragraph(p),
             }
