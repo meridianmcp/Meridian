@@ -3368,6 +3368,24 @@ async def _migrate_pg_manual_issue_screening_toggle(conn: PostgresConnection) ->
     )
 
 
+async def _migrate_pg_workspace_tool_priority_map(conn: PostgresConnection) -> None:
+    """490e100d — workspace_settings.tool_priority_map (mirrors SQLite).
+
+    Nullable TEXT, JSON-encoded ``{category: tool}`` dict — the workspace-level
+    generalization of 4d1fb28f's per-item ``required_tool`` pin. When set,
+    handoff._build_quick_start_goal renders a hard, unconditional
+    ``<workspace_tool_priority>`` directive for every pending item whose
+    title/notes match a configured category and that has no item-level
+    override.
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db._migrate_workspace_tool_priority_map.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS tool_priority_map TEXT"
+    )
+
+
 async def _migrate_pg_action_audit_log_table(conn: PostgresConnection) -> None:
     """5dfe34b2 / cd495afa — action_audit_log: append-only WHAT-MERIDIAN-DID
     record (toggle flips, velocity/anomaly escalations, manual-issue link
@@ -3407,6 +3425,26 @@ async def _migrate_pg_manual_issue_content_log_table(conn: PostgresConnection) -
         ");"
         "CREATE INDEX IF NOT EXISTS idx_manual_issue_content_log_scope "
         "ON manual_issue_content_log(project_id, issue_number, created_at DESC)"
+    )
+
+
+async def _migrate_pg_sprint_item_github_channel(conn: PostgresConnection) -> None:
+    """7c82f7c8 — ``github_channel`` on sprint_items (mirrors SQLite).
+
+    Nullable TEXT: NULL = no channel classification recorded; 'nightly' /
+    'stable' track which release channel a linked, auto-filed GitHub issue
+    (fdaa5b55) was reported against — set from the issue template the
+    reporter picked (channel:nightly / channel:stable labels, see
+    .github/ISSUE_TEMPLATE/). 'graduated' is the third state: a bug that
+    started as nightly-only noise but is now confirmed reproducing on
+    stable too — needs a real fix before general release. Enum enforced at
+    the app layer (see ``_VALID_SPRINT_GITHUB_CHANNELS`` in
+    db/sprint_items.py). CREATE_TABLES_CORE covers fresh DBs; this is the
+    upgrade path. ADD COLUMN IF NOT EXISTS → idempotent. Mirrors
+    db._migrate_sprint_item_github_channel.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS github_channel TEXT"
     )
 
 
@@ -3498,4 +3536,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_manual_issue_screening_toggle,
     _migrate_pg_action_audit_log_table,
     _migrate_pg_manual_issue_content_log_table,
+    _migrate_pg_workspace_tool_priority_map,
+    _migrate_pg_sprint_item_github_channel,
 )

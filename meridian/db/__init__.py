@@ -1084,6 +1084,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_manual_issue_screening_toggle(db)
     await _migrate_action_audit_log_table(db)
     await _migrate_manual_issue_content_log_table(db)
+    await _migrate_workspace_tool_priority_map(db)
+    await _migrate_sprint_item_github_channel(db)
     return db
 
 
@@ -6711,6 +6713,18 @@ async def register_worktree(
     return _row_to_dict(row)  # type: ignore[return-value]
 
 
+async def get_worktree(
+    db: aiosqlite.Connection,
+    worktree_id: str,
+) -> dict[str, Any] | None:
+    """Return a single active_worktrees row by id, or None."""
+    async with db.execute(
+        "SELECT * FROM active_worktrees WHERE id = ?", (worktree_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) if row is not None else None
+
+
 async def remove_worktree(
     db: aiosqlite.Connection,
     worktree_id: str,
@@ -6755,6 +6769,47 @@ async def get_active_worktree_for_session(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row) if row is not None else None
+
+
+async def list_worktrees_pending_cleanup(
+    db: aiosqlite.Connection,
+    project_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """a03c0eeb — real disk-cleanup candidates: worktree rows still marked
+    active in the DB (``removed_at IS NULL``) whose owning sprint item has
+    reached a terminal status (``done``/``skipped``/``failed``/``pushed`` —
+    i.e. the item is merged/integrated or otherwise fully resolved) OR whose
+    owning session has ``closed``/``archived``.
+
+    DB bookkeeping (``remove_worktree``) never by itself guarantees the
+    worktree directory was actually removed from disk — an executor may
+    have called ``complete_sprint_item``/ended its session without ever
+    running ``git worktree remove`` (or the follow-up DELETE call). This is
+    the query the periodic sweep (``worktree_cleanup.sweep_stale_worktrees``)
+    uses to find those orphans so they can be reclaimed for real.
+
+    Pass ``project_id`` to scope to one project; omit to sweep every project
+    (used by the server-wide periodic sweep loop).
+    """
+    where = ["aw.removed_at IS NULL"]
+    params: list[Any] = []
+    if project_id is not None:
+        where.append("aw.project_id = ?")
+        params.append(project_id)
+    where.append(
+        "(si.status IN ('done', 'skipped', 'failed', 'pushed') "
+        "OR s.status IN ('closed', 'archived'))"
+    )
+    query = (
+        "SELECT aw.* FROM active_worktrees aw "
+        "LEFT JOIN sprint_items si ON si.id = aw.item_id "
+        "LEFT JOIN sessions s ON s.id = aw.session_id "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY aw.created_at ASC"
+    )
+    async with db.execute(query, params or None) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------

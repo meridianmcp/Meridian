@@ -175,6 +175,49 @@ def file_fingerprint(path: str) -> dict[str, Any]:
     return outputs_local.file_fingerprint(path).to_dict()
 
 
+@mcp.tool()
+def search_logs(
+    logs_dir: str,
+    query: str,
+    limit: int = 20,
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    """Lightweight, disposable regex search over a local log directory tree.
+
+    Unlike ``search_outputs``, this builds NO persistent index -- logs have no
+    guaranteed structure (rotated files, plain text, JSON-lines, syslog, mixed
+    formats), so every call re-scans the tree fresh instead of maintaining a
+    cache that would drift stale on the next rotation.
+
+    Tier 0 (always on): a sub-second ``rg`` (ripgrep) subprocess scan;
+    transparently falls back to an equivalent pure-Python regex scan when
+    ``rg`` isn't on PATH. Secret-named files (.env*, *.key, *secret*,
+    *credential*, etc.) are excluded, same as outputs indexing.
+
+    Tier 1 (opportunistic, layered on the same scan, not a second pass): each
+    matched line is cheaply sniffed for a timestamp and/or a JSON object.
+    Matches with a sniffed signal are ranked above plain ones (by severity,
+    then recency); anything unsniffable free-falls back to Tier 0's own scan
+    order at no extra cost.
+
+    Args:
+      logs_dir:         Absolute path to the log directory to search.
+      query:            Ripgrep-flavoured regex (case-insensitive); degrades
+                        to Python `re`, then a literal match, in the fallback
+                        path.
+      limit:            Maximum number of hits to return (default 20).
+      timeout_seconds:  Wall-clock scan budget in seconds (default 5.0).
+
+    Returns:
+      {logs_dir, query, hits, total_matched, engine} plus optional {error}.
+      Each hit has: path, line_number, line, tier, timestamp, timestamp_epoch,
+      level, json_fields.
+    """
+    return outputs_local.search_logs(
+        logs_dir, query, limit=limit, timeout_seconds=timeout_seconds,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx --from <path> meridian-outputs-mcp``)."""
     mcp.run()

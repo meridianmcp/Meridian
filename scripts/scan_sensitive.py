@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TARGETS = ["meridian", "docs", "templates", "scripts"]
+# 1662873f -- "extensions" added: standalone MCP-server packages under
+# extensions/ (e.g. meridian-outputs' local log/output search, meridian-docs)
+# ship real source that was previously invisible to this scan entirely.
+DEFAULT_TARGETS = ["meridian", "docs", "templates", "scripts", "extensions"]
 TEXT_SKIP_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip",
     ".sqlite", ".db", ".pyc", ".woff", ".woff2", ".ttf", ".eot",

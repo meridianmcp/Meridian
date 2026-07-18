@@ -1,23 +1,26 @@
 # 7c82f7c8 — channel labeling for auto-filed GitHub issues (fdaa5b55).
 #
-# This template is the STABLE-channel bug report: picking it (over
-# "Bug Report (Nightly Build)" below) is how the reporter applies the
-# channel:stable label — via which template they choose, not manual
-# tagging. See bug_report_nightly.yml for the nightly-channel twin.
-#
-# There is a third channel state, applied later (not at filing time, via
-# Meridian's patch_sprint_item github_channel field / a maintainer adding
-# the label by hand): channel:graduated — a bug that started as
-# nightly-only noise but is now CONFIRMED reproducing on stable too. That
-# is the signal it needs a real fix before general release, not just
-# expected-nightly churn.
+# This template is the NIGHTLY-channel bug report: picking it (over
+# "Bug Report (Stable)") is how the reporter applies the channel:nightly
+# label — via which template they choose, not manual tagging. See
+# bug_report.yml for the stable-channel twin.
 #
 # NOTE: the nightly deploy channel itself is not live yet (cd9c2bf7). This
-# labeling mechanism is built ahead of that so it is ready once it lands.
-name: Bug Report (Stable)
-description: Something isn't working on the stable release
-labels: ["bug", "channel:stable"]
+# template exists so the labeling mechanism is ready once it lands — until
+# then, prefer "Bug Report (Stable)" unless you are specifically running a
+# nightly/pre-release build.
+name: Bug Report (Nightly Build)
+description: Something isn't working on a nightly / pre-release build
+labels: ["bug", "channel:nightly"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Filing against a **nightly** build. If the same bug is later
+        confirmed on the stable release too, a maintainer will mark it
+        `channel:graduated` — the signal it needs a real fix before
+        general release rather than being expected nightly-only noise.
+
   - type: dropdown
     id: os
     attributes:
@@ -46,7 +49,7 @@ body:
     id: version
     attributes:
       label: Meridian Version
-      placeholder: "e.g. 1.0.0-alpha or commit hash"
+      placeholder: "e.g. 1.0.0-alpha or commit hash (nightly build tag if known)"
     validations:
       required: true
 

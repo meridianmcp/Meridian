@@ -370,6 +370,12 @@ async def handle_update_sprint_item(
     # or a tool/plugin name to pin it — rendered as hard /goal guidance.
     if "required_tool" in args:
         _patch_kwargs["required_tool"] = args.get("required_tool")
+    # 7c82f7c8 — set/clear github_channel. Only forward when the caller
+    # supplied the key (_UNSET sentinel), so omitting it leaves the stored
+    # value untouched; pass "" / null to clear, or one of
+    # {nightly, stable, graduated} to set it.
+    if "github_channel" in args:
+        _patch_kwargs["github_channel"] = args.get("github_channel")
     try:
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -477,6 +483,30 @@ async def handle_get_sprint_progress(
     _bc = await _board_change_for_session(db, args["project_id"], args.get("session_id"))
     if _bc:
         _resp_progress["board_change"] = _bc
+    # f78d7644 — surface the wave-urgent* lane (assign_sprint_waves) so a
+    # polling orchestrator sees urgent work is claimable RIGHT NOW, in
+    # parallel with whatever wave-N is currently in flight, rather than
+    # having to diff get_sprint_items for it. Guarded: never break the
+    # progress poll.
+    try:
+        _urgent_ready = [
+            it for it in _all
+            if (it.get("priority") or "normal") == "urgent"
+            and str(it.get("wave") or "").startswith("wave-urgent")
+            and (it.get("status") or "pending") in ("pending", "todo")
+        ]
+        if _urgent_ready:
+            _resp_progress["urgent_wave"] = {
+                "count": len(_urgent_ready),
+                "item_ids": [it["id"] for it in _urgent_ready],
+                "message": (
+                    f"{len(_urgent_ready)} urgent item(s) are queued in wave-urgent — "
+                    "claimable immediately, alongside any wave already in flight. "
+                    "Don't wait for the current wave to close."
+                ),
+            }
+    except Exception:  # noqa: BLE001
+        pass
     # f9188526 — include version bucket descriptions so a caller sees the
     # concise summary for each version without a separate request.
     # Guarded: a DB failure here must never break the progress poll.

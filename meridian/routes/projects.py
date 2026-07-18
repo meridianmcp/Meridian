@@ -12,6 +12,7 @@ from .._deps import (
     _db,
     _data_dir,
     _get_tenant_from_request,
+    _hosted_mode,
     _scoped_project_ids_for_request,
     validate_input_size,
 )
@@ -1138,6 +1139,34 @@ async def list_worktrees(project_id: str, request: Request) -> list[dict[str, An
         return []
 
 
+@router.get("/projects/{project_id}/worktrees/pending_cleanup")
+async def list_worktrees_pending_cleanup(project_id: str, request: Request) -> list[dict[str, Any]]:
+    """e401221d — read-only: worktree rows still marked active in the DB whose
+    owning sprint item/session has reached a terminal state (see
+    `db.list_worktrees_pending_cleanup`, a03c0eeb), i.e. "dead" worktrees.
+
+    Non-destructive — unlike `POST /worktrees/sweep` this never touches disk
+    or the DB; it just exposes the same candidate list so a CLIENT-SIDE hook
+    (the e401221d orphan-process reaper, `meridian/orphan_reaper.py`) can
+    cross-reference locally running pixi/python/node processes against these
+    paths and reap the ones rooted in a dead worktree. Exposed on both
+    self-hosted and hosted deployments (unlike the sweep endpoint) since it
+    performs no filesystem access itself — only the caller's own local hook
+    process touches the caller's machine.
+    """
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return await db_module.list_worktrees_pending_cleanup(await _db(request), project_id)
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully, same as list_worktrees above
+        import logging as _l
+        _l.getLogger("meridian.server").warning(
+            "list_worktrees_pending_cleanup failed for project %s: %s", project_id, exc
+        )
+        return []
+
+
 @router.post("/projects/{project_id}/worktrees", status_code=201)
 async def create_worktree(
     project_id: str, request: Request, body: WorktreeCreate
@@ -1156,12 +1185,69 @@ async def create_worktree(
     )
 
 
+@router.post("/projects/{project_id}/worktrees/sweep")
+async def sweep_project_worktrees(project_id: str, request: Request) -> dict[str, Any]:
+    """a03c0eeb — on-demand real disk cleanup for this project's worktrees.
+
+    Reclaims any active_worktrees row whose owning sprint item/session has
+    already reached a terminal state but whose directory was never actually
+    removed from disk (see `worktree_cleanup.sweep_stale_worktrees`). This is
+    the same pass the server runs periodically; exposed here so a
+    post-integration trigger (e.g. the Stop-hook sprint guard, once a
+    session's pending sprint items hit 0) doesn't have to wait for the next
+    periodic tick. Self-hosted only — hosted (multi-tenant) mode has no
+    filesystem access to the caller's worktrees and returns a no-op summary.
+    """
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if _hosted_mode():
+        return {"swept_count": 0, "skipped_count": 0, "hosted": True}
+    db = await _db(request)
+    from .. import worktree_cleanup  # noqa: PLC0415
+    from meridian.server import _REPO_ROOT  # noqa: PLC0415 — lazy, avoids import cycle
+    result = await worktree_cleanup.sweep_stale_worktrees(db, _REPO_ROOT, project_id)
+    result["hosted"] = False
+    return result
+
+
 @router.delete("/projects/{project_id}/worktrees/{worktree_id}", status_code=204)
 async def delete_worktree(
     project_id: str, worktree_id: str, request: Request
 ) -> None:
-    """Mark a registered worktree as removed. Call after `git worktree remove`."""
-    removed = await db_module.remove_worktree(await _db(request), worktree_id)
+    """Mark a registered worktree as removed — and, self-hosted only, actually
+    remove it from disk instead of only trusting the caller already ran
+    `git worktree remove` (a03c0eeb).
+
+    Historically this endpoint was pure DB bookkeeping: the caller was
+    expected to run `git worktree remove` itself first, then call this to
+    flip `removed_at`. Nothing ever confirmed that actually happened, so a
+    skipped/forgotten/crashed cleanup left the DB saying "removed" while the
+    directory (and its git worktree registration) stayed on disk — the exact
+    leak a busy megasprint compounds fast. Self-hosted Meridian runs from
+    inside the very repo it coordinates, so it can perform the real removal
+    itself here; hosted (multi-tenant) mode has no access to the caller's
+    filesystem and stays DB-only, per the local-fs-access architectural law
+    in `meridian/_deps.py`. Either way this remains best-effort: a failed
+    disk removal never blocks the DB update or 404s the caller — see
+    `worktree_cleanup.sweep_stale_worktrees` for the periodic catch-all pass
+    that reclaims anything left behind.
+    """
+    db = await _db(request)
+    wt = await db_module.get_worktree(db, worktree_id)
+    if wt is None or wt.get("removed_at") is not None:
+        raise HTTPException(status_code=404, detail="worktree not found or already removed")
+    if not _hosted_mode():
+        try:
+            from .. import worktree_cleanup  # noqa: PLC0415
+            from meridian.server import _REPO_ROOT  # noqa: PLC0415 — lazy, avoids import cycle
+            worktree_cleanup.remove_worktree_on_disk(_REPO_ROOT, wt["path"])
+        except Exception as exc:  # noqa: BLE001 — disk cleanup is best-effort
+            import logging as _l
+            _l.getLogger("meridian.server").warning(
+                "delete_worktree: on-disk cleanup failed for %s: %s", wt["path"], exc
+            )
+    removed = await db_module.remove_worktree(db, worktree_id)
     if not removed:
         raise HTTPException(status_code=404, detail="worktree not found or already removed")
 

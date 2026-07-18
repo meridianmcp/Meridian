@@ -1748,3 +1748,222 @@ class TestTantivyDependency:
         query = index.parse_query("hello", ["body"])
         hits = index.searcher().search(query, 10).hits
         assert len(hits) == 1
+
+
+# ---------------------------------------------------------------------------
+# 1662873f -- search_logs: Tier 0 (ripgrep / Python fallback) scan + Tier 1
+# (opportunistic JSON/timestamp sniffing) ranking. No persistent index.
+# ---------------------------------------------------------------------------
+
+_HAS_RG = OL._rg_binary() is not None
+
+
+class TestSniffHelpers:
+    def test_sniff_timestamp_iso8601(self) -> None:
+        raw, epoch = OL._sniff_timestamp('2026-07-18T16:10:32.123Z {"msg":"boot"}')
+        assert raw == "2026-07-18T16:10:32.123Z"
+        assert epoch is not None
+
+    def test_sniff_timestamp_syslog(self) -> None:
+        raw, epoch = OL._sniff_timestamp("Jul 18 16:10:32 host sshd[123]: auth failure")
+        assert raw == "Jul 18 16:10:32"
+        assert epoch is not None
+
+    def test_sniff_timestamp_none_for_plain_line(self) -> None:
+        raw, epoch = OL._sniff_timestamp("plain line with no timestamp at all")
+        assert raw is None
+        assert epoch is None
+
+    def test_sniff_json_whole_line(self) -> None:
+        obj = OL._sniff_json('{"level": "error", "msg": "boom"}')
+        assert obj == {"level": "error", "msg": "boom"}
+
+    def test_sniff_json_with_leading_prefix(self) -> None:
+        obj = OL._sniff_json('2026-07-18 16:10:32 {"level": "info", "msg": "ok"}')
+        assert obj == {"level": "info", "msg": "ok"}
+
+    def test_sniff_json_none_for_plain_text(self) -> None:
+        assert OL._sniff_json("just a plain log line, no braces") is None
+
+    def test_sniff_level_from_json_field(self) -> None:
+        assert OL._sniff_level("irrelevant text", {"level": "WARN"}) == "WARN"
+
+    def test_sniff_level_from_bare_regex(self) -> None:
+        assert OL._sniff_level("2026 ERROR something broke", None) == "ERROR"
+
+    def test_sniff_level_none_when_unrecognised(self) -> None:
+        assert OL._sniff_level("nothing recognisable here", None) is None
+
+
+class TestRankKey:
+    """Tier-1 signals rank above plain matches; a miss free-falls back to the
+    Tier-0 scan order (no extra ranking cost paid for a sniff that found
+    nothing)."""
+
+    def test_tier1_signal_outranks_plain_match(self) -> None:
+        plain = OL.LogMatch(path="a.log", line_number=1, line="x", scan_order=0)
+        timestamped = OL.LogMatch(
+            path="a.log", line_number=5, line="y", scan_order=5, timestamp_epoch=1000.0,
+        )
+        ordered = sorted([plain, timestamped], key=OL._rank_key, reverse=True)
+        assert ordered[0] is timestamped
+
+    def test_no_signal_falls_back_to_scan_order(self) -> None:
+        first = OL.LogMatch(path="a.log", line_number=1, line="x", scan_order=0)
+        second = OL.LogMatch(path="a.log", line_number=2, line="y", scan_order=1)
+        ordered = sorted([second, first], key=OL._rank_key, reverse=True)
+        assert ordered == [first, second]
+
+    def test_more_recent_timestamp_ranks_first(self) -> None:
+        older = OL.LogMatch(
+            path="a.log", line_number=1, line="x", scan_order=0, timestamp_epoch=100.0,
+        )
+        newer = OL.LogMatch(
+            path="a.log", line_number=2, line="y", scan_order=1, timestamp_epoch=200.0,
+        )
+        ordered = sorted([older, newer], key=OL._rank_key, reverse=True)
+        assert ordered == [newer, older]
+
+    def test_higher_severity_ranks_first(self) -> None:
+        info = OL.LogMatch(path="a.log", line_number=1, line="x", scan_order=0, level="INFO")
+        error = OL.LogMatch(path="a.log", line_number=2, line="y", scan_order=1, level="ERROR")
+        ordered = sorted([info, error], key=OL._rank_key, reverse=True)
+        assert ordered == [error, info]
+
+
+class TestScanLogsPython:
+    """Tier 0 fallback path (used unconditionally regardless of whether `rg`
+    happens to be installed on the machine running these tests)."""
+
+    def test_finds_matches_case_insensitive(self, tmp_path: Path) -> None:
+        logs_dir = _make_dir(tmp_path, {"app.log": "INFO boot ok\nERROR disk full\n"})
+        hits = OL._scan_logs_python(
+            logs_dir, "error", timeout_seconds=5.0,
+            max_matches_per_file=100, max_total_matches=100,
+        )
+        assert len(hits) == 1
+        path, line_no, text = hits[0]
+        assert path.endswith("app.log")
+        assert line_no == 2
+        assert "disk full" in text
+
+    def test_excludes_secret_named_files(self, tmp_path: Path) -> None:
+        logs_dir = _make_dir(tmp_path, {
+            "app.log": "token seen here\n",
+            ".env": "token seen here too\n",
+        })
+        hits = OL._scan_logs_python(
+            logs_dir, "token", timeout_seconds=5.0,
+            max_matches_per_file=100, max_total_matches=100,
+        )
+        paths = {p for p, _, _ in hits}
+        assert all(not p.endswith(".env") for p in paths)
+        assert any(p.endswith("app.log") for p in paths)
+
+    def test_invalid_regex_falls_back_to_literal(self, tmp_path: Path) -> None:
+        logs_dir = _make_dir(tmp_path, {"app.log": "weird [unterminated bracket line\n"})
+        hits = OL._scan_logs_python(
+            logs_dir, "[unterminated", timeout_seconds=5.0,
+            max_matches_per_file=100, max_total_matches=100,
+        )
+        assert len(hits) == 1
+
+    def test_respects_max_matches_per_file(self, tmp_path: Path) -> None:
+        content = "\n".join(f"ERROR line {i}" for i in range(10)) + "\n"
+        logs_dir = _make_dir(tmp_path, {"app.log": content})
+        hits = OL._scan_logs_python(
+            logs_dir, "ERROR", timeout_seconds=5.0,
+            max_matches_per_file=3, max_total_matches=100,
+        )
+        assert len(hits) == 3
+
+
+@pytest.mark.skipif(not _HAS_RG, reason="ripgrep (rg) not on PATH")
+class TestRunRipgrep:
+    def test_finds_matches(self, tmp_path: Path) -> None:
+        logs_dir = _make_dir(tmp_path, {"app.log": "INFO boot ok\nERROR disk full\n"})
+        hits = OL._run_ripgrep(logs_dir, "error", timeout_seconds=5.0, max_total_matches=100)
+        assert hits is not None
+        assert len(hits) == 1
+        path, line_no, text = hits[0]
+        assert path.endswith("app.log")
+        assert line_no == 2
+        assert "disk full" in text
+
+    def test_excludes_secret_named_files(self, tmp_path: Path) -> None:
+        logs_dir = _make_dir(tmp_path, {
+            "app.log": "token seen here\n",
+            ".env": "token seen here too\n",
+        })
+        hits = OL._run_ripgrep(logs_dir, "token", timeout_seconds=5.0, max_total_matches=100)
+        assert hits is not None
+        paths = {p for p, _, _ in hits}
+        assert all(not p.endswith(".env") for p in paths)
+
+
+def test_run_ripgrep_returns_none_when_binary_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(OL, "_rg_binary", lambda: None)
+    logs_dir = _make_dir(tmp_path, {"app.log": "ERROR boom\n"})
+    assert OL._run_ripgrep(
+        logs_dir, "error", timeout_seconds=5.0, max_total_matches=100,
+    ) is None
+
+
+class TestSearchLogs:
+    """Module-level API -- what server.py's search_logs MCP tool calls."""
+
+    def test_requires_query(self, tmp_path: Path) -> None:
+        result = OL.search_logs(str(tmp_path), "")
+        assert "error" in result
+
+    def test_requires_existing_dir(self, tmp_path: Path) -> None:
+        result = OL.search_logs(str(tmp_path / "nope"), "error")
+        assert "error" in result
+
+    def test_end_to_end_ranking_prefers_timestamped_match(self, tmp_path: Path) -> None:
+        logs_dir = _make_dir(tmp_path, {
+            "app.log": (
+                "plain ERROR line with no timestamp\n"
+                '2026-07-18T16:10:32Z {"level":"error","msg":"disk full"}\n'
+            ),
+        })
+        result = OL.search_logs(logs_dir, "error", limit=10)
+        assert "error" not in result
+        assert result["total_matched"] == 2
+        assert result["engine"] in ("ripgrep", "python-fallback")
+        top = result["hits"][0]
+        assert top["tier"] == 1
+        assert top["timestamp_epoch"] is not None
+
+    def test_forces_python_fallback_when_rg_missing(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(OL, "_rg_binary", lambda: None)
+        logs_dir = _make_dir(tmp_path, {"app.log": "INFO boot\nERROR disk full\n"})
+        result = OL.search_logs(logs_dir, "error", limit=10)
+        assert result["engine"] == "python-fallback"
+        assert result["total_matched"] == 1
+        assert result["hits"][0]["line"].endswith("disk full")
+
+    def test_secret_named_log_file_excluded(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(OL, "_rg_binary", lambda: None)
+        logs_dir = _make_dir(tmp_path, {
+            "app.log": "token appears here\n",
+            "credentials.log": "token appears here too\n",
+        })
+        result = OL.search_logs(logs_dir, "token", limit=10)
+        paths = {h["path"] for h in result["hits"]}
+        assert all("credentials" not in p for p in paths)
+
+    def test_respects_limit(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(OL, "_rg_binary", lambda: None)
+        content = "\n".join(f"ERROR line {i}" for i in range(20)) + "\n"
+        logs_dir = _make_dir(tmp_path, {"app.log": content})
+        result = OL.search_logs(logs_dir, "error", limit=5)
+        assert len(result["hits"]) == 5
+        assert result["total_matched"] == 20
+
+    def test_line_preview_truncation(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(OL, "_rg_binary", lambda: None)
+        long_line = "ERROR " + ("x" * 1000)
+        logs_dir = _make_dir(tmp_path, {"app.log": long_line + "\n"})
+        result = OL.search_logs(logs_dir, "error", limit=10, max_line_chars=50)
+        assert len(result["hits"][0]["line"]) <= 53  # 50 chars + "..."

@@ -1543,6 +1543,18 @@ async def _board_change_for_session(
     claim_sprint_item, get_sprint_progress) so a single-terminal executor sees
     items a planner injected mid-run and picks them up at the next item
     boundary — without interrupting the current task. (d01a74bf)
+
+    f78d7644 — urgent escalation: when one or more of the newly-added items are
+    ``priority='urgent'``, this is no longer a routine "pick it up after the
+    current item" notice. A single-terminal (non-parallel-fan-out) executor
+    has no separate wave-urgent lane to run alongside its current work, so the
+    only way it can honor "run this now, not queued behind normal work" is to
+    yield the item it is actively on at its *next natural checkpoint* (finish
+    the step in progress, not necessarily the whole item) and claim the urgent
+    item next, ahead of any other queued normal/low-priority work. The message
+    and an ``urgent: True`` / ``urgent_items_since_session_start`` flag make
+    that distinction explicit rather than blending urgent items into the
+    generic new-item count.
     """
     if not session_id:
         return None
@@ -1553,9 +1565,27 @@ async def _board_change_for_session(
             return None
         started = str(_curr["created_at"])
         items = await db_module.get_sprint_items(db, project_id)
-        new_count = sum(1 for it in items if (it.get("added_at") or "") > started)
+        new_items = [it for it in items if (it.get("added_at") or "") > started]
+        new_count = len(new_items)
         if new_count <= 0:
             return None
+        urgent_new = [
+            it for it in new_items if (it.get("priority") or "normal") == "urgent"
+        ]
+        urgent_count = len(urgent_new)
+        if urgent_count > 0:
+            return {
+                "new_items_since_session_start": new_count,
+                "urgent_items_since_session_start": urgent_count,
+                "urgent": True,
+                "message": (
+                    f"{urgent_count} URGENT sprint item{'s' if urgent_count != 1 else ''} "
+                    "added since this session started — yield at the next natural "
+                    "checkpoint (finish the current step, not necessarily the whole "
+                    "item) and call get_sprint_progress() to claim it now, ahead of "
+                    "normal/lower-priority queued work."
+                ),
+            }
         return {
             "new_items_since_session_start": new_count,
             "message": (

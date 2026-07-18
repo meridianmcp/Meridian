@@ -98,6 +98,23 @@ def test_no_api_key_pattern(name, pattern, description):
 
 
 # ---------------------------------------------------------------------------
+# (b2) 1662873f -- scripts/scan_sensitive.py also covers extensions/
+# ---------------------------------------------------------------------------
+
+def test_scan_sensitive_covers_extensions_dir():
+    """Standalone MCP-server packages under extensions/ (e.g. meridian-outputs'
+    local log/output search) ship real source that scan_sensitive.py's default
+    target list (meridian/docs/templates/scripts) never walked before."""
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import scan_sensitive
+
+    assert "extensions" in scan_sensitive.DEFAULT_TARGETS
+    targets = {t.name for t in scan_sensitive.existing_targets()}
+    assert "extensions" in targets
+
+
+# ---------------------------------------------------------------------------
 # (c) /health returns 200 without auth
 # ---------------------------------------------------------------------------
 

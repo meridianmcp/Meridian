@@ -321,6 +321,19 @@ _SPRINT_PRIORITY_DEFAULT_RANK = _SPRINT_PRIORITY_RANK["normal"]
 # blocked-dict check below), unlike 'manual's listing-only exclusion.
 _VALID_SPRINT_BLOCKER_KINDS = ("manual", "superseded")
 
+# 7c82f7c8 — github_channel values, mirroring the fdaa5b55 auto-filed-issue
+# labeling scheme (channel:nightly / channel:stable GitHub labels). NULL =
+# no channel classification recorded on this item. 'nightly' / 'stable' track
+# which release channel a linked, auto-filed GitHub issue was reported against
+# (set from the issue template the reporter picked — see
+# .github/ISSUE_TEMPLATE/ — at completion-time issue creation).
+# 'graduated' is the third state Adam asked for: a bug that STARTED as
+# nightly-only noise but has since been CONFIRMED reproducing on stable too —
+# the signal it needs a real fix before general release, not just
+# expected-nightly churn. The nightly deploy channel itself (cd9c2bf7) is not
+# yet live; this column is the tracking mechanism so it is ready once it is.
+_VALID_SPRINT_GITHUB_CHANNELS = ("nightly", "stable", "graduated")
+
 
 def _sprint_priority_order_sql(column: str = "priority") -> str:
     """Return a portable ``CASE`` expression ranking ``column`` urgent-first.
@@ -2184,6 +2197,7 @@ async def patch_sprint_item(
     depends_on: Any = _UNSET,
     require_verification: Any = _UNSET,
     required_tool: Any = _UNSET,
+    github_channel: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
@@ -2231,6 +2245,14 @@ async def patch_sprint_item(
     executor discretion), or a free-form tool/plugin name (e.g. 'Serena:
     replace_symbol_body') to SET it — rendered as a hard directive in the
     /goal block, not left to executor habit.
+    ``github_channel`` (7c82f7c8) uses the ``_UNSET`` sentinel: omit to leave
+    unchanged, pass an empty string / ``None`` to CLEAR it, or one of
+    {nightly, stable, graduated} to set it. Mirrors the channel:nightly /
+    channel:stable GitHub labels applied via issue-template choice
+    (.github/ISSUE_TEMPLATE/); 'graduated' marks a bug that started as
+    nightly-only noise but is now confirmed reproducing on stable — the
+    signal it needs a real fix before general release. A bad value raises
+    ValueError, like blocker_kind.
     """
     # 6a17e735 / ARCH 1B — separate the status change (routed through
     # _transition_status for guaranteed cache bust + live event) from the
@@ -2363,6 +2385,17 @@ async def patch_sprint_item(
         # replace_symbol_body', a named tunnel plugin, 'meridian__patch_file').
         ns_fields.append("required_tool = ?")
         ns_values.append(required_tool or None)
+    if github_channel is not _UNSET:
+        # 7c82f7c8 — empty string / None CLEARS it; otherwise validate the
+        # enum (nightly / stable / graduated), like blocker_kind.
+        _gc = github_channel or None
+        if _gc is not None and _gc not in _VALID_SPRINT_GITHUB_CHANNELS:
+            raise ValueError(
+                f"github_channel must be None or one of "
+                f"{_VALID_SPRINT_GITHUB_CHANNELS}, got {github_channel!r}"
+            )
+        ns_fields.append("github_channel = ?")
+        ns_values.append(_gc)
 
     if not ns_fields and status_value is None:
         return await get_sprint_item(db, item_id)
@@ -3457,10 +3490,35 @@ async def assign_sprint_waves(
     in_progress items are left untouched.  Idempotent: re-running recomputes from
     the live board and rewrites the labels.
 
+    f78d7644 — urgent carve-out: ``priority='urgent'`` items whose dependency (if
+    any) is already DONE are pulled out of the normal topological/priority
+    layering *before* pass 1 and labelled into a dedicated ``wave-urgent``
+    lane (``wave-urgent-2``, ``wave-urgent-3``, ... if urgent items themselves
+    have resource conflicts and need sub-splitting). ``wave-urgent`` is
+    orthogonal to the sequential ``wave-N`` numbering: it is meant to be read
+    by an orchestrator as "runnable immediately, in parallel with whatever
+    wave-N is already in flight" rather than "wait your turn in the queue" —
+    e.g. a live-testing break mid-megasprint that needs a fix right now, not
+    queued behind normal-priority waves. A single-executor session (no
+    parallel fan-out) instead yields its current item at the next natural
+    checkpoint and claims the wave-urgent item next — see
+    ``_board_change_for_session`` in meridian/mcp/handler.py, which flags
+    newly-added urgent items in its board-change message. Carving urgent
+    items out first also means their presence never perturbs the wave-N
+    numbering assigned to normal/lower-priority items (no shifted wave
+    counters, no urgent item silently occupying a normal-item's slot).
+    An urgent item still behind an unmet dependency does not qualify for
+    the carve-out (priority never skips real dependency order) and instead
+    flows through the normal layering below, where the existing
+    highest-priority-first sort still gives it an edge within its layer.
+
     Returns ``{version, wave_count, assigned, waves: {'wave-1': [ids...], ...},
-    blocked_count, undeclared_count}``.  ``blocked_count`` now counts items whose
-    dependency is not yet DONE (they are still projected into a future wave, not
-    truly dropped).
+    blocked_count, undeclared_count, urgent_wave_count, urgent_assigned}``.
+    ``blocked_count`` now counts items whose dependency is not yet DONE (they
+    are still projected into a future wave, not truly dropped). ``waves``
+    includes both the ``wave-N`` sequential labels and any ``wave-urgent*``
+    labels — the two families are merged in the returned mapping but remain
+    distinguishable by their key prefix.
     """
     # ── Collect all eligible pending/todo non-manual items ─────────────────────
     items = await get_sprint_items(db, project_id, include_manual_blocker=False)
@@ -3475,16 +3533,79 @@ async def assign_sprint_waves(
         if (it.get("status") or "pending") in claimable_statuses
     ]
 
-    # ── Pass 1: topological depth ───────────────────────────────────────────────
+    # ── Urgent carve-out (f78d7644) ─────────────────────────────────────────────
+    # Ready urgent items (dependency satisfied, or no dependency) never enter the
+    # normal topological layering — they get their own immediate wave-urgent* lane
+    # so they don't wait behind (or get renumbered by) normal/lower-priority waves.
+    by_id_all = {it["id"]: it for it in items}
+
+    def _dep_is_done(it: dict[str, Any]) -> bool:
+        dep = it.get("depends_on")
+        if not dep:
+            return True
+        parent = by_id_all.get(dep)
+        return bool(parent) and parent.get("status") == "done"
+
+    urgent_ready = [
+        it for it in candidates
+        if (it.get("priority") or "normal") == "urgent" and _dep_is_done(it)
+    ]
+    urgent_ready_ids = {it["id"] for it in urgent_ready}
+    candidates = [it for it in candidates if it["id"] not in urgent_ready_ids]
+
+    urgent_waves: dict[str, list[str]] = {}
+    urgent_assigned = 0
+    urgent_undeclared_count = 0
+    if urgent_ready:
+        # Oldest-first among urgent items themselves (priority is already uniform).
+        urgent_ready.sort(key=lambda it: (str(it.get("added_at") or ""), it["id"]))
+        urgent_enriched = [
+            {**it, "resources": parse_touches_resources(it.get("touches_resources"))}
+            for it in urgent_ready
+        ]
+        urgent_declared = [it for it in urgent_enriched if it["resources"]]
+        urgent_undeclared = [it for it in urgent_enriched if not it["resources"]]
+        urgent_undeclared_count = len(urgent_undeclared)
+        urgent_sub_groups: list[list[dict[str, Any]]] = []
+        urgent_sub_resource_sets: list[set[str]] = []
+        for it in urgent_declared:
+            res = set(it["resources"])
+            placed = False
+            for gi, used in enumerate(urgent_sub_resource_sets):
+                if not _resource_sets_conflict(res, used):
+                    urgent_sub_groups[gi].append(it)
+                    used.update(res)
+                    placed = True
+                    break
+            if not placed:
+                urgent_sub_groups.append([it])
+                urgent_sub_resource_sets.append(set(res))
+        # Each undeclared urgent item is its own sequential sub-wave — parallel
+        # safety can't be proven for it, same rule as the normal-lane coloring.
+        for it in urgent_undeclared:
+            urgent_sub_groups.append([it])
+        for idx, sub_group in enumerate(urgent_sub_groups):
+            label = "wave-urgent" if idx == 0 else f"wave-urgent-{idx + 1}"
+            ids: list[str] = []
+            for it in sub_group:
+                await patch_sprint_item(db, project_id, it["id"], wave=label)
+                ids.append(it["id"])
+                urgent_assigned += 1
+            if ids:
+                urgent_waves[label] = ids
+
+    # ── Pass 1: topological depth (on the remaining, non-urgent candidates) ─────
     depth_map = _topo_depth_map(candidates)
     if not depth_map:
         return {
             "version": version,
-            "wave_count": 0,
-            "assigned": 0,
-            "waves": {},
+            "wave_count": len(urgent_waves),
+            "assigned": urgent_assigned,
+            "waves": dict(urgent_waves),
             "blocked_count": 0,
-            "undeclared_count": 0,
+            "undeclared_count": urgent_undeclared_count,
+            "urgent_wave_count": len(urgent_waves),
+            "urgent_assigned": urgent_assigned,
         }
 
     max_topo = max(depth_map.values())
@@ -3565,13 +3686,18 @@ async def assign_sprint_waves(
         if dep and by_id_status.get(dep) not in (None, "done"):
             blocked_count += 1
 
+    # f78d7644 — merge the wave-urgent* lane into the returned mapping; it stays
+    # distinguishable from the wave-N sequential labels by its key prefix.
+    all_waves = {**urgent_waves, **waves}
     return {
         "version": version,
-        "wave_count": len(waves),
-        "assigned": assigned,
-        "waves": waves,
+        "wave_count": len(all_waves),
+        "assigned": assigned + urgent_assigned,
+        "waves": all_waves,
         "blocked_count": blocked_count,
-        "undeclared_count": undeclared_count,
+        "undeclared_count": undeclared_count + urgent_undeclared_count,
+        "urgent_wave_count": len(urgent_waves),
+        "urgent_assigned": urgent_assigned,
     }
 
 

@@ -33,10 +33,13 @@ import logging
 import os
 import posixpath
 import re
+import shutil
+import subprocess
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 _log = logging.getLogger(__name__)
@@ -1837,3 +1840,379 @@ def resolve_figure_output(
     index = _get_cached_index(outputs_dir)
     index.rebuild()
     return index.resolve_output(file_path)
+
+
+# ---------------------------------------------------------------------------
+# Disposable log search: Tier 0 ripgrep scan + Tier 1 opportunistic sniffing
+# ---------------------------------------------------------------------------
+#
+# Deliberately NOT built on OutputsFtsIndex.  Logs have no guaranteed
+# structure -- rotated files, plain text, JSON-lines, syslog, mixed formats
+# within the same directory -- so a persistent DuckDB/Tantivy schema would
+# drift stale the moment a file rotates or a format changes, and the
+# maintenance cost (staleness tracking, incremental rebuild, FTS commits)
+# buys nothing for a directory that's usually far smaller than a full
+# outputs/docs tree. Every call re-scans the tree fresh; there is no cache
+# to invalidate and nothing to go stale.
+#
+#   Tier 0 -- always-on. Shells out to `rg` (ripgrep) for a sub-second
+#             parallel regex scan when it's on PATH; transparently falls back
+#             to an equivalent pure-Python `re` scan (same match semantics,
+#             same secret-path exclusion, same budgets) when it isn't, so the
+#             tool always returns real results rather than an error.
+#   Tier 1 -- opportunistic, layered on the SAME scan (no second pass over
+#             the files). Each Tier-0 match line is cheaply sniffed for a
+#             timestamp and/or a JSON object. Matches with a sniffed signal
+#             rank above plain ones (by severity, then recency). A line that
+#             sniffs nothing free-falls back to Tier 0's own scan order --
+#             no extra cost is paid for the miss.
+
+_LOG_SCAN_TIMEOUT_SECONDS = 5.0
+_LOG_MAX_MATCHES_PER_FILE = 200
+_LOG_MAX_TOTAL_MATCHES = 2000
+_LOG_LINE_PREVIEW_CHARS = 500
+
+# Tier-1 timestamp sniffing: common log timestamp shapes. Order matters --
+# the first pattern that matches a line wins, so put the least ambiguous
+# shapes first.
+_LOG_TS_FORMATS: tuple[tuple["re.Pattern[str]", str], ...] = (
+    # ISO-8601 / RFC-3339: 2026-07-18T16:10:32.123Z, .../+05:30, ".../ ...".
+    (
+        re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"),
+        "iso8601",
+    ),
+    # Common (Apache/nginx) log format: 18/Jul/2026:16:10:32 +0000
+    (re.compile(r"\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2}(?:\s[+-]\d{4})?"), "clf"),
+    # syslog / journalctl short form: "Jul 18 16:10:32" -- no year in the line.
+    (re.compile(r"\b[A-Z][a-z]{2}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}\b"), "syslog"),
+)
+
+_LOG_TS_PARSE_FORMATS: dict[str, tuple[str, ...]] = {
+    "iso8601": (
+        "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+    ),
+    "clf": ("%d/%b/%Y:%H:%M:%S %z", "%d/%b/%Y:%H:%M:%S"),
+    "syslog": ("%b %d %H:%M:%S",),
+}
+
+
+def _sniff_timestamp(line: str) -> tuple[str | None, float | None]:
+    """Tier-1: best-effort timestamp extraction. Returns (raw_text, epoch).
+
+    Never raises -- an unparsable/ambiguous match just yields (None, None),
+    which is the free Tier-0 fallback signalled by :attr:`LogMatch.tier`.
+    """
+    for pattern, kind in _LOG_TS_FORMATS:
+        m = pattern.search(line)
+        if not m:
+            continue
+        raw = m.group(0)
+        # Normalize to something datetime.strptime's %z can parse: "Z" -> UTC
+        # offset, "+05:30" -> "+0530" (strptime's %z wants no colon).
+        normalized = raw.replace("Z", "+0000")
+        normalized = re.sub(r"([+-]\d{2}):(\d{2})$", r"\1\2", normalized)
+        for fmt in _LOG_TS_PARSE_FORMATS[kind]:
+            try:
+                dt = datetime.strptime(normalized, fmt)
+            except ValueError:
+                continue
+            if kind == "syslog":
+                # No year in a syslog-short timestamp -- assume "now"'s year;
+                # good enough for relative recency ranking within one scan.
+                dt = dt.replace(year=datetime.now(timezone.utc).year)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return raw, dt.timestamp()
+    return None, None
+
+
+_LOG_LEVEL_RE = re.compile(
+    r"\b(FATAL|CRITICAL|ERROR|WARN(?:ING)?|INFO|DEBUG|TRACE)\b", re.IGNORECASE
+)
+_LOG_LEVEL_RANK: dict[str, int] = {
+    "FATAL": 5, "CRITICAL": 5, "ERROR": 4, "WARN": 3, "WARNING": 3,
+    "INFO": 2, "DEBUG": 1, "TRACE": 0,
+}
+
+
+def _sniff_json(line: str) -> dict[str, Any] | None:
+    """Tier-1: best-effort JSON-object sniff for one log line.
+
+    Tries the whole (stripped) line first -- the common "one JSON object per
+    line" structured-logging convention -- then falls back to the substring
+    between the first ``{`` and last ``}`` (handles a leading timestamp/prefix
+    before the JSON payload, e.g. ``2026-07-18 16:10:32 {"level":"error"}``).
+    Returns None (free Tier-0 fallback) on anything that doesn't parse --
+    this must never cost more than a couple of cheap attempts per line.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+    candidates: list[str] = []
+    if stripped[0] == "{" and stripped[-1] == "}":
+        candidates.append(stripped)
+    else:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start != -1 and end > start:
+            candidates.append(stripped[start:end + 1])
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _sniff_level(line: str, json_fields: dict[str, Any] | None) -> str | None:
+    """Tier-1: best-effort severity-level sniff -- structured field first,
+    falling back to a bare regex scan of the raw line."""
+    if json_fields:
+        for key in ("level", "severity", "lvl", "loglevel", "log_level"):
+            val = json_fields.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip().upper()
+    m = _LOG_LEVEL_RE.search(line)
+    return m.group(1).upper() if m else None
+
+
+@dataclass
+class LogMatch:
+    """One matched log line: Tier-0 position plus opportunistic Tier-1 signals."""
+
+    path: str
+    line_number: int
+    line: str
+    scan_order: int
+    timestamp_raw: str | None = None
+    timestamp_epoch: float | None = None
+    level: str | None = None
+    json_fields: dict[str, Any] | None = None
+
+    @property
+    def tier(self) -> int:
+        """1 if any Tier-1 signal was sniffed for this line, else 0 (the
+        line free-falls back to Tier-0 scan-order ranking)."""
+        return 1 if (self.timestamp_epoch is not None or self.json_fields is not None) else 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "line_number": self.line_number,
+            "line": self.line,
+            "tier": self.tier,
+            "timestamp": self.timestamp_raw,
+            "timestamp_epoch": self.timestamp_epoch,
+            "level": self.level,
+            "json_fields": self.json_fields,
+        }
+
+
+def _rank_key(m: LogMatch) -> tuple[int, int, float, int]:
+    """Tier-1-aware ranking key, used with ``sort(key=_rank_key, reverse=True)``.
+
+    Matches carrying a Tier-1 signal (sniffed level and/or timestamp) sort
+    above plain ones, ordered by severity then recency. A match with NO
+    Tier-1 signal gets tier1_group=0 and level_rank=-1/timestamp=0.0, so
+    ties within that group fall through to ``-scan_order`` -- i.e. it keeps
+    exactly the order Tier 0's scan already produced it in. That's the "free
+    fallback to Tier 0" the sniffing never pays extra for.
+    """
+    level_rank = _LOG_LEVEL_RANK.get((m.level or "").upper(), -1)
+    has_ts = m.timestamp_epoch is not None
+    tier1_group = (1 if level_rank >= 0 else 0) + (1 if has_ts else 0)
+    return (tier1_group, level_rank, m.timestamp_epoch if has_ts else 0.0, -m.scan_order)
+
+
+def _rg_binary() -> str | None:
+    return shutil.which("rg")
+
+
+def _run_ripgrep(
+    logs_dir: str, pattern: str, *, timeout_seconds: float, max_total_matches: int,
+) -> list[tuple[str, int, str]] | None:
+    """Tier 0: shell out to ripgrep for a sub-second parallel scan.
+
+    Returns a list of ``(path, line_number, line_text)`` in ripgrep's own
+    match order, or None if ``rg`` isn't on PATH, the call errors out, or the
+    timeout is hit -- the caller then falls back to :func:`_scan_logs_python`
+    so a missing/misbehaving binary degrades gracefully instead of surfacing
+    a CLI error to the MCP caller.
+    """
+    rg_bin = _rg_binary()
+    if not rg_bin:
+        return None
+    cmd = [
+        rg_bin, "--json", "-i", "--no-heading",
+        "-m", str(_LOG_MAX_MATCHES_PER_FILE),
+        "-e", pattern, logs_dir,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _log.debug("search_logs: ripgrep invocation failed/timed out", exc_info=True)
+        return None
+    # rg exit code 0 == matches found, 1 == no matches (not a failure), 2 ==
+    # usage/regex error -- fall back to the Python scanner for the latter so
+    # a pattern ripgrep's regex engine rejects still gets a real attempt.
+    if proc.returncode not in (0, 1):
+        _log.debug(
+            "search_logs: ripgrep exited %s: %s", proc.returncode,
+            proc.stderr.decode("utf-8", "replace")[:300],
+        )
+        return None
+    out: list[tuple[str, int, str]] = []
+    for raw_line in proc.stdout.splitlines():
+        if len(out) >= max_total_matches:
+            break
+        try:
+            rec = json.loads(raw_line)
+        except (ValueError, TypeError):
+            continue
+        if rec.get("type") != "match":
+            continue
+        data = rec.get("data") or {}
+        path = (data.get("path") or {}).get("text")
+        line_number = data.get("line_number")
+        text = (data.get("lines") or {}).get("text")
+        if not path or line_number is None or text is None:
+            continue
+        if is_secret_path(path):
+            continue
+        out.append((path, int(line_number), text.rstrip("\r\n")))
+    return out
+
+
+def _scan_logs_python(
+    logs_dir: str, pattern: str, *, timeout_seconds: float,
+    max_matches_per_file: int, max_total_matches: int,
+) -> list[tuple[str, int, str]]:
+    """Tier 0 fallback when ``rg`` isn't on PATH: pure-Python line scan.
+
+    Same secret-path exclusion (:func:`_iter_safe_output_files`, shared with
+    the outputs indexer) and per-file/total match caps as the ripgrep path,
+    plus its own wall-clock deadline so a huge/cold logs tree degrades
+    (returns whatever it found so far) instead of hanging the MCP call. If
+    ``pattern`` isn't a valid Python regex, falls back further to a literal
+    (escaped) substring match rather than raising.
+    """
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        regex = re.compile(re.escape(pattern), re.IGNORECASE)
+    deadline = time.monotonic() + timeout_seconds
+    out: list[tuple[str, int, str]] = []
+    for path in _iter_safe_output_files(logs_dir):
+        if len(out) >= max_total_matches or time.monotonic() > deadline:
+            break
+        per_file = 0
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line_number, line in enumerate(fh, start=1):
+                    if per_file >= max_matches_per_file or len(out) >= max_total_matches:
+                        break
+                    if time.monotonic() > deadline:
+                        break
+                    if regex.search(line):
+                        out.append((path, line_number, line.rstrip("\r\n")))
+                        per_file += 1
+        except OSError:
+            continue
+    return out
+
+
+def search_logs(
+    logs_dir: str,
+    query: str,
+    *,
+    limit: int = 20,
+    timeout_seconds: float = _LOG_SCAN_TIMEOUT_SECONDS,
+    max_line_chars: int = _LOG_LINE_PREVIEW_CHARS,
+) -> dict[str, Any]:
+    """Disposable log search: Tier 0 ripgrep scan + Tier 1 opportunistic ranking.
+
+    Fully local, fully disposable -- unlike :class:`OutputsFtsIndex`, NO index
+    is ever written to disk. Logs have no guaranteed structure (rotated
+    files, plain text, JSON-lines, syslog, mixed formats side by side), so a
+    persistent schema would drift stale the moment a file rotates; re-scanning
+    fresh every call is the right trade-off for a tree that's usually far
+    smaller than a full outputs/docs corpus.
+
+    Tier 0 (always on): shells out to ``rg`` for a sub-second scan; falls
+    back automatically to an equivalent pure-Python regex scan when ``rg``
+    isn't installed. Secret-named files (``.env*``, ``*.key``, ``*secret*``,
+    ``*credential*``, etc.) are never scanned -- same exclusion the outputs
+    indexer uses (:func:`is_secret_path`).
+
+    Tier 1 (opportunistic, layered on the SAME scan -- no second pass): each
+    Tier-0 match line is cheaply sniffed for a timestamp and/or a JSON
+    object. Matches with a sniffed signal rank above plain ones (severity,
+    then recency). A line with no sniffable structure free-falls back to
+    Tier 0's own scan order at no extra cost.
+
+    Args:
+      logs_dir:         Absolute path to the directory tree to search.
+      query:            Search pattern. Ripgrep-flavoured regex when ``rg``
+                        is available (case-insensitive); the same pattern is
+                        applied as a Python ``re`` regex in the fallback
+                        path, degrading further to a literal (escaped) match
+                        if it isn't valid Python regex either.
+      limit:            Maximum number of hits to return (default 20).
+      timeout_seconds:  Wall-clock scan budget (default 5s) -- shared by both
+                        the ripgrep subprocess and the Python fallback.
+      max_line_chars:   Cap on returned line-text length (default 500).
+
+    Returns:
+      {logs_dir, query, hits, total_matched, engine} plus optional {error}.
+      ``engine`` is ``"ripgrep"`` or ``"python-fallback"``. Each hit is a
+      :meth:`LogMatch.to_dict` (path, line_number, line, tier, timestamp,
+      timestamp_epoch, level, json_fields).
+    """
+    result: dict[str, Any] = {
+        "logs_dir": logs_dir, "query": query, "hits": [], "total_matched": 0,
+    }
+    if not query or not str(query).strip():
+        result["error"] = "query is required"
+        return result
+    if not os.path.isdir(logs_dir):
+        result["error"] = f"logs_dir does not exist: {logs_dir}"
+        return result
+
+    raw = _run_ripgrep(
+        logs_dir, query, timeout_seconds=timeout_seconds,
+        max_total_matches=_LOG_MAX_TOTAL_MATCHES,
+    )
+    engine = "ripgrep"
+    if raw is None:
+        engine = "python-fallback"
+        raw = _scan_logs_python(
+            logs_dir, query, timeout_seconds=timeout_seconds,
+            max_matches_per_file=_LOG_MAX_MATCHES_PER_FILE,
+            max_total_matches=_LOG_MAX_TOTAL_MATCHES,
+        )
+
+    matches: list[LogMatch] = []
+    for scan_order, (path, line_number, text) in enumerate(raw):
+        json_fields = _sniff_json(text)
+        ts_raw, ts_epoch = _sniff_timestamp(text)
+        level = _sniff_level(text, json_fields)
+        preview = text if len(text) <= max_line_chars else text[:max_line_chars] + "..."
+        matches.append(LogMatch(
+            path=path, line_number=line_number, line=preview,
+            scan_order=scan_order, timestamp_raw=ts_raw, timestamp_epoch=ts_epoch,
+            level=level, json_fields=json_fields,
+        ))
+
+    matches.sort(key=_rank_key, reverse=True)
+    safe_limit = max(1, int(limit))
+    result["hits"] = [m.to_dict() for m in matches[:safe_limit]]
+    result["total_matched"] = len(matches)
+    result["engine"] = engine
+    return result
