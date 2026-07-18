@@ -957,6 +957,7 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `DELETE` | `/projects` | 0e4980d4 — batch delete: accepts multiple project ids in one call |
 | `GET` | `/projects` | List projects visible to the caller |
 | `POST` | `/projects` | Create a new project. 409 if the name is already in use |
 | `GET` | `/projects/by-name/{name}` | Look up a project by name (case-insensitive substring match) |
