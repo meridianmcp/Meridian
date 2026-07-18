@@ -315,7 +315,14 @@ async def handle_start_session(
             isinstance(result, dict)
             and "continuation" not in result
             and args.get("role") == "executor"
+            and not _hosted_mode()
         ):
+            # decision 0dedff91 — repo_path is the CALLER's local path; the
+            # os.path.isdir/isfile checks below can only run meaningfully
+            # against this process's own filesystem (self-hosted). On hosted
+            # Meridian there is nothing honest to check here, so skip rather
+            # than mis-resolve against the server's filesystem and emit a
+            # false setup_warning.
             import os as _os  # noqa: PLC0415
 
             _exec_cfg_check: dict | None = None
