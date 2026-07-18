@@ -1496,6 +1496,98 @@ def test_delete_project_http_returns_500_on_db_error(client):
 
 
 # ---------------------------------------------------------------------------
+# delete_project: batch (0e4980d4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_project_batch_deletes_multiple_ids(db):
+    """delete_project(db, [id1, id2]) deletes every project in one call."""
+    import uuid as _uuid
+
+    pid1 = (await db_module.create_project(db, f"batch-a-{_uuid.uuid4().hex[:8]}"))["id"]
+    pid2 = (await db_module.create_project(db, f"batch-b-{_uuid.uuid4().hex[:8]}"))["id"]
+    pid3 = (await db_module.create_project(db, f"batch-c-{_uuid.uuid4().hex[:8]}"))["id"]
+
+    await db_module.delete_project(db, [pid1, pid2])
+
+    assert await db_module.get_project(db, pid1) is None
+    assert await db_module.get_project(db, pid2) is None
+    # untouched sibling project survives the batch
+    assert await db_module.get_project(db, pid3) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_project_batch_in_progress_guard_blocks_whole_batch(db):
+    """One project with an in_progress task aborts the entire batch (all-or-nothing)."""
+    import uuid as _uuid
+
+    pid_clean = (await db_module.create_project(db, f"batch-clean-{_uuid.uuid4().hex[:8]}"))["id"]
+    pid_busy = (await db_module.create_project(db, f"batch-busy-{_uuid.uuid4().hex[:8]}"))["id"]
+    sess = await db_module.register_session(db, pid_busy, "batch-guard-sess")
+    task = await db_module.log_task(db, sess["id"], pid_busy, "running task", status="pending")
+    await db_module.claim_task(db, task["id"], sess["id"])
+
+    with pytest.raises(ValueError, match="in_progress"):
+        await db_module.delete_project(db, [pid_clean, pid_busy])
+
+    # Neither project was deleted — the guard runs before any DELETE statement.
+    assert await db_module.get_project(db, pid_clean) is not None
+    assert await db_module.get_project(db, pid_busy) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_project_single_str_still_works(db):
+    """Passing a bare str (the original call shape) still deletes just that project."""
+    p = await db_module.create_project(db, "batch-backcompat-proj")
+    await db_module.delete_project(db, p["id"])
+    assert await db_module.get_project(db, p["id"]) is None
+
+
+def test_delete_projects_batch_http_deletes_all(client):
+    """DELETE /projects?project_id=a&project_id=b removes both and returns a summary."""
+    import uuid as _uuid
+
+    p1 = client.post("/projects", json={"name": f"del-batch-http-a-{_uuid.uuid4().hex[:6]}"}).json()
+    p2 = client.post("/projects", json={"name": f"del-batch-http-b-{_uuid.uuid4().hex[:6]}"}).json()
+
+    r = client.delete("/projects", params={"project_id": [p1["id"], p2["id"]]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 2
+    assert set(body["deleted"]) == {p1["id"], p2["id"]}
+
+    assert client.get(f"/projects/{p1['id']}").status_code == 404
+    assert client.get(f"/projects/{p2['id']}").status_code == 404
+
+
+def test_delete_projects_batch_http_404_on_unknown_id(client):
+    """Batch delete 404s and deletes nothing when one id in the batch is bogus.
+
+    Note: the app's global 404 handler (meridian/server.py `_404_handler`)
+    renders a generic HTML error page for every ``HTTPException(404, ...)``,
+    discarding the JSON ``detail`` body — so this only asserts status code +
+    survival, matching the convention used by the app's other 404 tests.
+    """
+    import uuid as _uuid
+
+    p1 = client.post("/projects", json={"name": f"del-batch-http-c-{_uuid.uuid4().hex[:6]}"}).json()
+    bogus_id = f"does-not-exist-{_uuid.uuid4().hex[:8]}"
+
+    r = client.delete("/projects", params={"project_id": [p1["id"], bogus_id]})
+    assert r.status_code == 404
+
+    # The real project must survive — an unknown id in the batch aborts everything.
+    assert client.get(f"/projects/{p1['id']}").status_code == 200
+
+
+def test_delete_projects_batch_http_requires_project_id_param(client):
+    """DELETE /projects with no project_id query param is a 422, not a silent no-op."""
+    r = client.delete("/projects")
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # DB-level: get_goal
 # ---------------------------------------------------------------------------
 

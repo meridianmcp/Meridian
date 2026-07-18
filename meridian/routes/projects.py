@@ -5,7 +5,7 @@ import json
 import os
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
 from .._deps import (
@@ -654,6 +654,10 @@ async def delete_project(project_id: str, request: Request) -> None:
     """v1.9.x — delete a project and all data.
 
     Returns 409 if any tasks are in_progress, 404 if the project is unknown.
+
+    For deleting several projects in one call, see ``DELETE /projects``
+    (batch form, ``delete_projects_batch`` below) — this single-id endpoint
+    is unchanged and still the right choice for one project.
     """
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
@@ -662,6 +666,44 @@ async def delete_project(project_id: str, request: Request) -> None:
         await db_module.delete_project(await _db(request), project_id)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@router.delete("/projects", status_code=200)
+async def delete_projects_batch(
+    request: Request,
+    project_id: list[str] = Query(..., min_length=1),
+) -> dict[str, Any]:
+    """0e4980d4 — batch delete: accepts multiple project ids in one call.
+
+    Repeated query param: ``DELETE /projects?project_id=id1&project_id=id2``.
+    Query params (not a DELETE body) are used deliberately — ``httpx``/many
+    HTTP clients and proxies don't reliably support a request body on DELETE,
+    while repeated query params are universally supported and match FastAPI's
+    native ``list[str] = Query(...)`` binding.
+
+    Complements the single-project ``DELETE /projects/{project_id}`` above by
+    driving ``db_module.delete_project`` with a list, which runs each
+    child-table DELETE once with a single ``WHERE project_id IN (...)``
+    across the whole batch instead of looping the full per-table statement
+    set once per project (see the db function's docstring for the batching
+    rationale).
+
+    All-or-nothing like the single-project path: every id is validated to
+    exist (404, naming the unknown ids) and the in-progress-task guard is
+    checked across the whole batch (409) before anything is deleted — a
+    guard violation or an unknown id aborts the entire batch, not just the
+    offending project.
+    """
+    project_ids = list(dict.fromkeys(project_id))  # de-dupe, preserve order
+    db = await _db(request)
+    missing = [pid for pid in project_ids if await db_module.get_project(db, pid) is None]
+    if missing:
+        raise HTTPException(404, f"project(s) not found: {', '.join(missing)}")
+    try:
+        await db_module.delete_project(db, project_ids)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"deleted": project_ids, "count": len(project_ids)}
 
 
 # ---------------------------------------------------------------------------
