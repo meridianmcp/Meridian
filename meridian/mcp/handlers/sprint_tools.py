@@ -370,6 +370,12 @@ async def handle_update_sprint_item(
     # or a tool/plugin name to pin it — rendered as hard /goal guidance.
     if "required_tool" in args:
         _patch_kwargs["required_tool"] = args.get("required_tool")
+    # 7c82f7c8 — set/clear github_channel. Only forward when the caller
+    # supplied the key (_UNSET sentinel), so omitting it leaves the stored
+    # value untouched; pass "" / null to clear, or one of
+    # {nightly, stable, graduated} to set it.
+    if "github_channel" in args:
+        _patch_kwargs["github_channel"] = args.get("github_channel")
     try:
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"], **_patch_kwargs

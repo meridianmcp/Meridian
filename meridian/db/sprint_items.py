@@ -321,6 +321,19 @@ _SPRINT_PRIORITY_DEFAULT_RANK = _SPRINT_PRIORITY_RANK["normal"]
 # blocked-dict check below), unlike 'manual's listing-only exclusion.
 _VALID_SPRINT_BLOCKER_KINDS = ("manual", "superseded")
 
+# 7c82f7c8 — github_channel values, mirroring the fdaa5b55 auto-filed-issue
+# labeling scheme (channel:nightly / channel:stable GitHub labels). NULL =
+# no channel classification recorded on this item. 'nightly' / 'stable' track
+# which release channel a linked, auto-filed GitHub issue was reported against
+# (set from the issue template the reporter picked — see
+# .github/ISSUE_TEMPLATE/ — at completion-time issue creation).
+# 'graduated' is the third state Adam asked for: a bug that STARTED as
+# nightly-only noise but has since been CONFIRMED reproducing on stable too —
+# the signal it needs a real fix before general release, not just
+# expected-nightly churn. The nightly deploy channel itself (cd9c2bf7) is not
+# yet live; this column is the tracking mechanism so it is ready once it is.
+_VALID_SPRINT_GITHUB_CHANNELS = ("nightly", "stable", "graduated")
+
 
 def _sprint_priority_order_sql(column: str = "priority") -> str:
     """Return a portable ``CASE`` expression ranking ``column`` urgent-first.
@@ -2184,6 +2197,7 @@ async def patch_sprint_item(
     depends_on: Any = _UNSET,
     require_verification: Any = _UNSET,
     required_tool: Any = _UNSET,
+    github_channel: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
@@ -2231,6 +2245,14 @@ async def patch_sprint_item(
     executor discretion), or a free-form tool/plugin name (e.g. 'Serena:
     replace_symbol_body') to SET it — rendered as a hard directive in the
     /goal block, not left to executor habit.
+    ``github_channel`` (7c82f7c8) uses the ``_UNSET`` sentinel: omit to leave
+    unchanged, pass an empty string / ``None`` to CLEAR it, or one of
+    {nightly, stable, graduated} to set it. Mirrors the channel:nightly /
+    channel:stable GitHub labels applied via issue-template choice
+    (.github/ISSUE_TEMPLATE/); 'graduated' marks a bug that started as
+    nightly-only noise but is now confirmed reproducing on stable — the
+    signal it needs a real fix before general release. A bad value raises
+    ValueError, like blocker_kind.
     """
     # 6a17e735 / ARCH 1B — separate the status change (routed through
     # _transition_status for guaranteed cache bust + live event) from the
@@ -2363,6 +2385,17 @@ async def patch_sprint_item(
         # replace_symbol_body', a named tunnel plugin, 'meridian__patch_file').
         ns_fields.append("required_tool = ?")
         ns_values.append(required_tool or None)
+    if github_channel is not _UNSET:
+        # 7c82f7c8 — empty string / None CLEARS it; otherwise validate the
+        # enum (nightly / stable / graduated), like blocker_kind.
+        _gc = github_channel or None
+        if _gc is not None and _gc not in _VALID_SPRINT_GITHUB_CHANNELS:
+            raise ValueError(
+                f"github_channel must be None or one of "
+                f"{_VALID_SPRINT_GITHUB_CHANNELS}, got {github_channel!r}"
+            )
+        ns_fields.append("github_channel = ?")
+        ns_values.append(_gc)
 
     if not ns_fields and status_value is None:
         return await get_sprint_item(db, item_id)
