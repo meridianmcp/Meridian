@@ -778,7 +778,154 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
                 "comments": comments,
             }
 
+        if name == "issue_write":
+            # fdaa5b55 / 8fc92474 — comment on and/or update the state of a
+            # SINGLE issue. ``issue_number`` is a required scalar int — there
+            # is deliberately no plural/array/batch parameter anywhere on this
+            # branch, so no caller (however compromised) can make one dispatch
+            # touch more than one issue. Comment and state-change are each
+            # independent, best-effort HTTP calls so a caller can do either or
+            # both in one call.
+            raw_number = args.get("issue_number")
+            try:
+                number = int(raw_number)  # rejects lists/dicts/None outright
+            except (TypeError, ValueError):
+                return {"error": "issue_number is required and must be a single integer"}
+            comment_body = args.get("comment")
+            state = args.get("state")
+            state_reason = args.get("state_reason")
+            result: dict[str, Any] = {"number": number}
+            if isinstance(comment_body, str) and comment_body.strip():
+                cr = await http.post(
+                    f"https://api.github.com/repos/{repo}/issues/{number}/comments",
+                    headers=gh_headers,
+                    json={"body": comment_body},
+                )
+                if cr.status_code not in (200, 201):
+                    return {"error": f"Comment failed ({cr.status_code}): {cr.text[:200]}"}
+                result["comment_id"] = cr.json().get("id")
+            if state in ("open", "closed"):
+                patch_payload: dict[str, Any] = {"state": state}
+                if state == "closed" and state_reason:
+                    patch_payload["state_reason"] = state_reason
+                pr = await http.patch(
+                    f"https://api.github.com/repos/{repo}/issues/{number}",
+                    headers=gh_headers,
+                    json=patch_payload,
+                )
+                if pr.status_code not in (200, 201):
+                    return {"error": f"State update failed ({pr.status_code}): {pr.text[:200]}"}
+                i = pr.json()
+                result["state"] = i.get("state")
+                result["html_url"] = i.get("html_url")
+            return result
+
     return {"error": f"Unknown GitHub tool: {name}"}
+
+
+async def _close_or_propose_github_issue(
+    db: Any, project_id: str, item: dict[str, Any], tenant: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """fdaa5b55 — on sprint item completion, close (or propose closing) the
+    ONE GitHub issue linked to ``item``.
+
+    Called by ``meridian.mcp.handlers.sprint_tools.handle_complete_sprint_item``
+    immediately after ``db_module.complete_sprint_item`` succeeds. Returns
+    ``None`` when the item has no linked issue (the overwhelmingly common
+    case) so callers can skip attaching anything to the response.
+
+    Trust boundary (eda40627 / 8c170bcc): the ONLY signal consulted to decide
+    auto-close vs propose is ``item.get('github_issue_source')`` — a column
+    written exclusively by ``db.sprint_items.link_sprint_item_github_issue``
+    at issue-creation time. This function never calls a GitHub read endpoint
+    (no ``get_issue``, no label/custom-field lookup) as part of this decision,
+    so nothing readable/writable by a GitHub collaborator (issue body,
+    comments, labels, custom fields) can ever flip an issue from 'manual' to
+    'meridian_auto' treatment.
+
+    Blast radius (8fc92474): exactly one ``issue_number`` — read once, from
+    this item's own row — is ever passed to ``_dispatch_github_tool``. There
+    is no loop over issues, no "all open issues" query, nothing that could
+    make one completion call touch more than one issue even under a logic
+    bug or a successful injection into the notes text used for the comment
+    body (which is itself escaped — see ``build_github_completion_comment``).
+
+    Never raises: any GitHub-call failure is captured in the returned dict's
+    ``error`` key so a transient GitHub outage can never turn an already-
+    successful sprint-item completion into a caller-visible exception.
+    """
+    issue_number = item.get("github_issue_number")
+    if not issue_number:
+        return None
+    if not tenant:
+        return {"issue_number": issue_number, "action": "skipped", "reason": "no_tenant_context"}
+    # eda40627 — read ONLY the DB column; never inferred from GitHub content.
+    issue_source = item.get("github_issue_source")
+    is_meridian_auto = issue_source == "meridian_auto"
+    comment_body = db_module.build_github_completion_comment(
+        item, proposed=not is_meridian_auto,
+    )
+    try:
+        comment_result = await _dispatch_github_tool(
+            "issue_write",
+            {"project_id": project_id, "issue_number": issue_number, "comment": comment_body},
+            tenant, db,
+        )
+        if isinstance(comment_result, dict) and comment_result.get("error"):
+            return {
+                "issue_number": issue_number, "issue_source": issue_source,
+                "action": "error", "error": comment_result["error"],
+            }
+        if is_meridian_auto:
+            close_result = await _dispatch_github_tool(
+                "issue_write",
+                {
+                    "project_id": project_id, "issue_number": issue_number,
+                    "state": "closed", "state_reason": "completed",
+                },
+                tenant, db,
+            )
+            if isinstance(close_result, dict) and close_result.get("error"):
+                return {
+                    "issue_number": issue_number, "issue_source": issue_source,
+                    "action": "error", "error": close_result["error"],
+                    "comment_result": comment_result,
+                }
+            return {
+                "issue_number": issue_number, "issue_source": issue_source,
+                "action": "auto_closed",
+                "comment_result": comment_result, "close_result": close_result,
+            }
+        # manual / unset — never auto-close; comment already posted above,
+        # now file a non-blocking HITL so a human decides whether to close it.
+        hitl = await db_module.request_hitl(
+            db, project_id,
+            question=(
+                f"Sprint item completion is proposing to close GitHub issue "
+                f"#{issue_number}. It was not created by Meridian's automated "
+                f"flow (github_issue_source={issue_source!r}), so it was NOT "
+                "auto-closed — only a proposal comment was posted. Close it?"
+            ),
+            context=f"project={project_id} sprint_item={item.get('id')} issue=#{issue_number}",
+            urgency="normal",
+            kind="sprint_item_issue_closure_proposal",
+            options=["Yes — close it", "No — leave open"],
+            recommended="Yes — close it",
+            payload=json.dumps({
+                "project_id": project_id, "issue_number": issue_number,
+                "sprint_item_id": item.get("id"),
+            }),
+        )
+        return {
+            "issue_number": issue_number, "issue_source": issue_source,
+            "action": "proposed_hitl",
+            "comment_result": comment_result, "hitl_id": (hitl or {}).get("id"),
+        }
+    except Exception as exc:  # noqa: BLE001 — never let this break a completed item
+        return {
+            "issue_number": issue_number, "issue_source": issue_source,
+            "action": "error", "error": str(exc),
+        }
 
 
 _MERIDIAN_TOOL_NAMES_CACHE: "frozenset[str] | None" = None

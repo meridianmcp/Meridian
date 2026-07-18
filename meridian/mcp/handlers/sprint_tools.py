@@ -903,6 +903,7 @@ async def handle_complete_sprint_item(
         _fetch_recent_commits,
         _unclaimed_file_warnings,
         _board_change_for_session,
+        _close_or_propose_github_issue,
     )
     # 0716c9e0 — check active worktree before marking done.
     _complete_session_id = args.get("session_id") or ""
@@ -1019,6 +1020,22 @@ async def handle_complete_sprint_item(
     if _merge_warning:
         item = dict(item)
         item["merge_warning"] = _merge_warning
+    # fdaa5b55 — item has a linked GitHub issue: auto-close (meridian_auto)
+    # or post a proposed-closure comment + non-blocking HITL (manual/unset).
+    # Never lets a GitHub failure undo the completion that already succeeded
+    # above — any error is captured in github_issue_action["error"], not
+    # raised. See _close_or_propose_github_issue for the trust-boundary and
+    # single-issue-blast-radius guarantees.
+    if item.get("github_issue_number"):
+        try:
+            _gh_action = await _close_or_propose_github_issue(
+                db, args["project_id"], item, tenant,
+            )
+            if _gh_action:
+                item = dict(item)
+                item["github_issue_action"] = _gh_action
+        except Exception:  # noqa: BLE001 — advisory/side-effect only
+            pass
     # 02cd3992 — unclaimed-file warning: flag files modified without a lock.
     # Non-blocking; surfaces the open-door problem so the executor can act.
     if _complete_session_id:

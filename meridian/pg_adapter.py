@@ -3330,6 +3330,27 @@ async def _migrate_pg_sprint_item_required_tool(conn: PostgresConnection) -> Non
     )
 
 
+async def _migrate_pg_sprint_item_github_issue_link(conn: PostgresConnection) -> None:
+    """fdaa5b55 — sprint_items.github_issue_number / .github_issue_url /
+    .github_issue_source (mirrors SQLite).
+
+    ``github_issue_source`` is written EXCLUSIVELY by
+    meridian.db.sprint_items.link_sprint_item_github_issue, and set to
+    ``'meridian_auto'`` only right after a real create_issue call succeeds
+    (server.py's ``_on_hitl_answered`` 'proposal_github_issue' branch) — never
+    inferred from issue title/body text. NULL/anything else is treated as
+    'manual'-equivalent by complete_sprint_item's close/propose gate.
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db._migrate_sprint_item_github_issue_link.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS github_issue_number INTEGER;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS github_issue_url TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS github_issue_source TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3414,4 +3435,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_verifications_table,
     _migrate_pg_proposal_github_issue,
     _migrate_pg_sprint_item_required_tool,
+    _migrate_pg_sprint_item_github_issue_link,
 )

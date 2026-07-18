@@ -2440,6 +2440,24 @@ async def _on_hitl_answered(
             )
         except Exception as exc:  # noqa: BLE001 — never crash the answer flow
             return {"applied": False, "apply_error": f"failed to persist issue on proposal: {exc}"}
+        # fdaa5b55 / eda40627 — this is the ONE place in the codebase that ever
+        # writes github_issue_source='meridian_auto': right here, right after a
+        # REAL create_issue call above returned a real issue number, for the
+        # sprint item promote_workspace_proposal created alongside this
+        # proposal (sprint_item_id was placed in the HITL payload at request
+        # time — see promote_workspace_proposal). Best-effort: a missing/stale
+        # sprint_item_id must never turn an already-successful issue creation
+        # into a caller-visible failure, so link failures are swallowed here
+        # (the issue is still correctly recorded on the proposal above).
+        sprint_item_id = payload.get("sprint_item_id")
+        if sprint_item_id and issue_number:
+            try:
+                await db_module.link_sprint_item_github_issue(
+                    db, gh_project_id, sprint_item_id, issue_number, issue_url,
+                    source="meridian_auto",
+                )
+            except Exception:  # noqa: BLE001 — never crash the answer flow
+                pass
         return {"applied": True, "github_issue_number": issue_number, "github_issue_url": issue_url}
 
     if kind == "hook_project_select" and approved:

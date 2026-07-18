@@ -1366,7 +1366,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "(VERIFICATION_REQUIRED) unless an independent PASS is on file: pass "
         "verifier_session_id (a DIFFERENT session id from actor — a fresh, no-memory "
         "subsession that inspected the change with read-only tools) and "
-        "verification_verdict='pass' to file and check the verdict in this same call.",
+        "verification_verdict='pass' to file and check the verdict in this same call. "
+        "fdaa5b55 — if the item has a linked GitHub issue, the response carries a "
+        "github_issue_action field: issues Meridian itself created (github_issue_source="
+        "'meridian_auto') are commented on and auto-closed; any other issue (manual/legacy) "
+        "only gets a proposed-closure comment plus a non-blocking HITL for human review — "
+        "never auto-closed.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},

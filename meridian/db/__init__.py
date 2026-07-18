@@ -1080,6 +1080,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_verifications_table(db)
     await _migrate_proposal_github_issue(db)
     await _migrate_sprint_item_required_tool(db)
+    await _migrate_sprint_item_github_issue_link(db)
     return db
 
 
@@ -10240,6 +10241,7 @@ from .sprint_items import (  # noqa: F401
     add_subtask,
     analyze_sprint,
     assign_sprint_waves,
+    build_github_completion_comment,
     build_sprint_items_xml,
     claim_sprint_item,
     complete_sprint_item,
@@ -10266,6 +10268,7 @@ from .sprint_items import (  # noqa: F401
     upsert_sprint_version_description,
     handle_session_stall,
     infer_active_sprint_version,
+    link_sprint_item_github_issue,
     merge_sprint_items,
     patch_sprint_item,
     provisional_complete_sprint_item,

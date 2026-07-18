@@ -12,6 +12,9 @@ import json
 import re
 import time
 from typing import Any
+from xml.sax.saxutils import escape as _xml_escape  # fdaa5b55/cd038235 — same
+# escaping helper/discipline as 5abf3e12 (meridian/handoff.py's
+# _build_quick_start_goal), reused here for GitHub-bound comment bodies.
 
 import aiosqlite
 
@@ -1531,6 +1534,103 @@ async def _check_stored_evidence(
     return None
 
 
+_VALID_GITHUB_ISSUE_SOURCES = {"meridian_auto", "manual"}
+
+
+async def link_sprint_item_github_issue(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    issue_number: int,
+    issue_url: str | None,
+    source: str,
+) -> dict[str, Any] | None:
+    """fdaa5b55 / eda40627 — the ONE write path for a sprint item's linked
+    GitHub issue + its trust classification.
+
+    ``source`` MUST be ``'meridian_auto'`` (Meridian itself filed the issue —
+    only ever passed by server.py's ``_on_hitl_answered`` 'proposal_github_issue'
+    branch, right after a real ``create_issue`` GitHub API call succeeds) or
+    ``'manual'`` (a human filed it, or a session linked one on the human's own
+    initiative). Any other value raises ``ValueError`` — there is deliberately
+    no way to write anything else, and NOTHING in this codebase ever derives
+    ``source`` from an issue's title/body/labels/custom fields; it is always
+    an explicit, deterministic argument from a known call site.
+
+    Returns the updated item row, or ``None`` if ``item_id`` doesn't exist
+    under ``project_id`` (mirrors the other status-transition helpers' no-op-
+    on-miss behaviour — never raises for a stale/foreign id).
+    """
+    if source not in _VALID_GITHUB_ISSUE_SOURCES:
+        raise ValueError(
+            f"github_issue_source must be one of {sorted(_VALID_GITHUB_ISSUE_SOURCES)}; got {source!r}"
+        )
+    cursor = await db.execute(
+        "UPDATE sprint_items SET github_issue_number = ?, github_issue_url = ?, "
+        "github_issue_source = ? WHERE id = ? AND project_id = ?",
+        (issue_number, issue_url, source, item_id, project_id),
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    _invalidate_sprint_items_cache(project_id)
+    return await get_sprint_item(db, item_id)
+
+
+def build_github_completion_comment(
+    item: dict[str, Any],
+    notes: str | None = None,
+    task_id: str | None = None,
+    *,
+    proposed: bool = False,
+) -> str:
+    """fdaa5b55 / cd038235 — build the GitHub issue completion comment body.
+
+    SECURITY: every fragment interpolated here comes ONLY from Meridian's own
+    DB-stored notes/evidence (the sprint item's ``title``/``notes`` fields and
+    the caller-supplied ``notes``/``task_id``) — this function never reads a
+    GitHub issue's own body or comments as input (that would let anyone with
+    issue-open access on a PUBLIC repo inject text back into the very comment
+    Meridian posts). Each fragment is still run through the SAME
+    ``xml.sax.saxutils.escape`` helper 5abf3e12 established for /goal
+    generation (meridian/handoff.py's ``_xml_escape``) before being
+    interpolated — defense in depth, in case a notes field was ever itself
+    populated from less-trusted upstream content. Escaping happens here, at
+    the point this text is emitted toward GitHub, not just at DB-write time.
+
+    ``proposed=True`` renders the "manual issue — proposing closure, needs
+    human review" framing instead of the "auto-closed" framing; the caller
+    decides which based on the item's ``github_issue_source`` DB column
+    (never anything read back from GitHub — see 8c170bcc).
+    """
+    title = _xml_escape((item.get("title") or "(untitled sprint item)").strip())
+    combined = " ".join(filter(None, [
+        (notes or "").strip(),
+        (item.get("notes") or "").strip(),
+    ])).strip()
+    evidence = _xml_escape(combined) if combined else "(no additional notes recorded)"
+    lines = [
+        f"Sprint item **{title}** was marked complete in Meridian.",
+        "",
+        "Evidence / notes:",
+        evidence,
+    ]
+    _linked_task = task_id or item.get("task_id")
+    if _linked_task:
+        lines.append("")
+        lines.append(f"Linked task: `{_xml_escape(str(_linked_task))}`")
+    lines.append("")
+    if proposed:
+        lines.append(
+            "_This issue was not created by Meridian's automated flow, so it "
+            "was **not** auto-closed. Proposing closure — please review and "
+            "close manually if this looks right._"
+        )
+    else:
+        lines.append("_Closing automatically — this issue was created by Meridian._")
+    return "\n".join(lines)
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1583,6 +1683,21 @@ async def complete_sprint_item(
     only required_notes ones. If it fires, the returned item dict gains a
     ``stored_evidence_warning`` key. Also ADVISORY ONLY — never blocks
     completion; fail-open on any error.
+
+    fdaa5b55 — the returned row carries whatever ``github_issue_number`` /
+    ``github_issue_url`` / ``github_issue_source`` this item already had (a
+    plain ``SELECT *`` — nothing else is touched or looked up here). This
+    function does NOT itself call GitHub: closing/commenting requires a
+    tenant's GitHub PAT, which this DB-only layer never has access to. The
+    MCP handler layer (meridian/mcp/handlers/sprint_tools.py,
+    ``handle_complete_sprint_item``) reads the returned
+    ``github_issue_number``/``github_issue_source`` and — via
+    ``meridian.mcp.handler._close_or_propose_github_issue`` — either auto-
+    closes (``github_issue_source == 'meridian_auto'``) or posts a proposed-
+    closure comment + files a non-blocking HITL (anything else). That
+    downstream step only ever touches the ONE issue linked to THIS item
+    (8fc92474) and classifies purely from the DB column above, never from
+    issue title/body/labels/custom fields (eda40627/8c170bcc).
     """
     item = await get_sprint_item(db, item_id)
     _evidence_quality_warning: str | None = None
