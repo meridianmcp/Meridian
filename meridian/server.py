@@ -701,6 +701,18 @@ async def lifespan(app: FastAPI):
                         await _refresh_claude_md_current_state(db, _REPO_ROOT)
                     except Exception:  # noqa: BLE001
                         pass
+                    # a03c0eeb — periodic real disk cleanup for git worktrees
+                    # whose sprint item/session already reached a terminal
+                    # state but whose directory was never actually removed
+                    # (delete_worktree never called — dead session, crashed
+                    # executor, etc). Self-hosted only, same guard as the
+                    # CLAUDE.md refresh above: only a self-hosted server has
+                    # filesystem access to the repo it coordinates.
+                    try:
+                        from . import worktree_cleanup as _worktree_cleanup_mod
+                        await _worktree_cleanup_mod.sweep_stale_worktrees(db, _REPO_ROOT)
+                    except Exception:  # noqa: BLE001
+                        pass
             except asyncio.CancelledError:
                 break
             except Exception:  # noqa: BLE001 — never let the loop die
