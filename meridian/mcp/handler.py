@@ -2192,12 +2192,16 @@ async def _handle_task_tools(
                 )
         except Exception:  # noqa: BLE001
             _goal_warn = None
-        # 642b1818 — hotfix: return the handoff as one plain-text copyable block
-        # (strip markdown code-fence markers anywhere they appear — incl. inline in
-        # rendered note bodies — so it pastes cleanly into a fenced chat / a
-        # dashboard textarea without breaking the surrounding fence).
-        import re as _re_fence  # noqa: PLC0415
-        _plain_content = _re_fence.sub(r"```[A-Za-z0-9_+.-]*", "", content)
+        # 5234877f — wrap content in exactly ONE plain 4-backtick code fence so it
+        # renders as a single copy-pasteable block in any MCP client regardless of
+        # how the caller's markdown renderer handles surrounding context.  Four
+        # backticks (not three) avoids collision with nested ``` fences that appear
+        # inside the handoff body (e.g. the start_session code block in the Jinja2
+        # template).  This replaces the 642b1818 strip approach, which destroyed
+        # formatting and was still unreliable because callers kept adding their own
+        # blockquote/header wrappers around the plain text — the fence makes the
+        # block unambiguously self-delimiting at the wire level.
+        _plain_content = f"````\n{content}\n````"
         # 5abf3e12 — surface the stored per-session goal-compliance metric
         # (generate_handoff computed & persisted it) so the caller / dashboard
         # sees whether this session's /goal item list was fully completed.

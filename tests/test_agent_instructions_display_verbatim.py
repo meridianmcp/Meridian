@@ -1,11 +1,14 @@
-"""Regression test for f318c7e3.
+"""Regression tests for f318c7e3 and 5234877f.
 
-generate_handoff already returns paste-ready plain text in its `content` field
-(code-fence markers stripped server-side, per 642b1818) — confirmed server-side
-correct, not a bug. The gap was purely behavioral: neither the tool description
-nor agent_instructions explicitly told a calling session to DISPLAY that text —
-a session could narrate "handoff generated" without ever pasting it. This is
-instructions-only, no server logic changed.
+5234877f (latest): generate_handoff content is now delivered pre-wrapped in a
+single 4-backtick code fence so it renders as one copy-pasteable block regardless
+of how any MCP client handles surrounding markdown.  The tool description is updated
+to tell callers to output the field value verbatim — no extra headers/blockquotes.
+This replaces the 642b1818 strip-fences approach, which could not prevent callers
+from adding their own wrappers on top.
+
+f318c7e3 (prior): instructions-only fix that told a calling session to DISPLAY the
+content field verbatim.  Server logic changed further in 5234877f.
 """
 from meridian.agent_defaults import (
     DEFAULT_AGENT_INSTRUCTIONS,
@@ -38,6 +41,29 @@ def test_generate_handoff_tool_description_says_display_verbatim():
     desc = by_name["generate_handoff"]["description"]
     assert "verbatim" in desc.lower()
     assert "content" in desc.lower()
+
+
+def test_generate_handoff_tool_description_says_pre_fenced(monkeypatch):
+    """5234877f — the tool description must tell callers that content is delivered
+    pre-wrapped in a single 4-backtick fence (not stripped), so they do not add
+    extra headers/blockquotes around it."""
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    desc = by_name["generate_handoff"]["description"]
+    # Must mention the fencing approach (5234877f replaced the strip approach).
+    assert "4-backtick" in desc or "fence" in desc.lower(), (
+        "tool description must mention the pre-fenced delivery (5234877f)"
+    )
+    # Must NOT tell callers to add extra wrappers.
+    desc_lower = desc.lower()
+    # The new description says "Do NOT add extra headers, blockquotes, or fences".
+    assert "do not add" in desc_lower or "do not" in desc_lower, (
+        "tool description must tell callers not to add extra wrappers"
+    )
+    # The old 642b1818 "strips code-fence markers" claim is now outdated.
+    assert "strips code-fence markers" not in desc, (
+        "tool description must not say 'strips code-fence markers' — 5234877f "
+        "changed the approach to fence-wrapping"
+    )
 
 
 def test_standard_version_bumped_to_9():
