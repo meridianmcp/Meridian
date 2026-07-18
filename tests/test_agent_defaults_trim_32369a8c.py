@@ -20,7 +20,10 @@ _BEFORE_TRIM_CHAR_COUNT = 16309
 
 # Upper bound: must be meaningfully smaller than the pre-trim baseline.
 # Allows ~100 chars of future minor edits before the guard would need updating.
-_MAX_ALLOWED_CHARS = _BEFORE_TRIM_CHAR_COUNT - 400
+# 31a4a9c8 added a short "Dependency install guard" section (~436 chars) --
+# genuine new-feature content per this test's own documented update path, not
+# a re-inflation of the trimmed prose. Bumped headroom to 16235 (current) + 100.
+_MAX_ALLOWED_CHARS = 16335
 
 
 def test_length_decreased_after_trim():

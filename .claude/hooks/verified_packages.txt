@@ -1,0 +1,11 @@
+# 31a4a9c8 -- durable allowlist for dependency_install_guard.{sh,ps1}.
+#
+# One package name per line (comments start with #, blank lines ignored).
+# Add a name here ONLY after either:
+#   (1) verifying it on the real registry (PyPI: https://pypi.org/pypi/<name>/json,
+#       or https://www.npmjs.com/package/<name>) as the legitimate, actively
+#       maintained project -- not a typosquat -- or
+#   (2) getting explicit human confirmation via request_hitl.
+#
+# Packages already declared in pyproject.toml or package.json never need an
+# entry here -- the guard treats those as pre-approved automatically.
