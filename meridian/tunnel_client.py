@@ -1209,7 +1209,11 @@ def _detect_spawn_tool(cmd: "list[str]") -> "tuple[str, str] | None":
             tokens = tokens[2:]
     if not tokens:
         return None
-    launcher = Path(tokens[0]).name.lower()
+    # Split on both separators manually rather than pathlib.Path(...).name --
+    # Path's separator handling is platform-native (PosixPath ignores "\\"),
+    # but tool commands captured on Windows (e.g. "C:\\npm\\npx.cmd") must
+    # parse the same way when this code runs on a Linux CI/prod host.
+    launcher = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
     # Normalise .exe suffix and .cmd shim suffix on Windows.
     for suffix in (".exe", ".cmd"):
         if launcher.endswith(suffix):
