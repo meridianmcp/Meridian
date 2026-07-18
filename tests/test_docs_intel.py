@@ -1044,3 +1044,291 @@ def test_fts5_search_invalid_query_returns_empty_not_raises(tmp_path):
     # An unclosed quote is a syntax error in FTS5.
     hits = docs_intel.fts5_search_paragraphs(db, '"unclosed phrase')
     assert isinstance(hits, list)
+
+
+# ---------------------------------------------------------------------------
+# 25743ec6 — chunk-level, heading-aware, weighted BM25 indexing
+# ---------------------------------------------------------------------------
+#
+# Synthetic document used for chunk tests:
+#
+#   H1: Introduction            (00000001)
+#     body: "Meridian..."       (00000002)
+#     H2: Design                (00000003)
+#       body: "no paraId"       (p3)
+#
+# Expected chunks:
+#   chunk 0: heading="Introduction", path=["Introduction"],
+#            body="Meridian coordinates AI sessions."
+#   chunk 1: heading="Design",       path=["Introduction", "Design"],
+#            body="A paragraph with no paraId."
+# ---------------------------------------------------------------------------
+
+
+def test_build_chunks_correct_boundaries(tmp_path):
+    """_build_chunks produces one chunk per heading; body accumulates until the
+    next heading of equal or higher level."""
+    tree = docs_intel.document_content_tree(_synthetic_docx())
+    chunks = docs_intel._build_chunks(tree["blocks"])
+
+    assert len(chunks) == 2
+
+    c0 = chunks[0]
+    assert c0["chunk_id"] == 0
+    assert c0["heading_text"] == "Introduction"
+    assert c0["heading_path"] == ["Introduction"]
+    assert "Meridian" in c0["body_text"]
+    assert "AI sessions" in c0["body_text"]
+    assert c0["heading_para_id"] == "00000001"
+
+    c1 = chunks[1]
+    assert c1["chunk_id"] == 1
+    assert c1["heading_text"] == "Design"
+    # Heading path traces full ancestry: H1 then H2.
+    assert c1["heading_path"] == ["Introduction", "Design"]
+    assert "paragraph with no paraId" in c1["body_text"]
+    assert c1["heading_para_id"] == "00000003"
+
+
+def test_build_chunks_nested_headings_heading_path():
+    """Heading path correctly reflects multi-level nesting."""
+    # Build a doc: H1 "A" -> H2 "B" -> H3 "C" (level numbers 1, 2, 3)
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="A0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Alpha</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="A0000002">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Beta</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="A0000003">
+      <w:pPr><w:pStyle w:val="Heading3"/></w:pPr>
+      <w:r><w:t>Gamma</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="A0000004"><w:r><w:t>body under Gamma</w:t></w:r></w:p>
+    <w:p w14:paraId="A0000005">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Delta</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="A0000006"><w:r><w:t>body under Delta</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    docx = buf.getvalue()
+
+    tree = docs_intel.document_content_tree(docx)
+    chunks = docs_intel._build_chunks(tree["blocks"])
+
+    assert len(chunks) == 4  # Alpha, Beta, Gamma, Delta
+
+    alpha = chunks[0]
+    assert alpha["heading_text"] == "Alpha"
+    assert alpha["heading_path"] == ["Alpha"]
+    assert alpha["body_text"] == ""  # no body paragraphs under Alpha before Beta
+
+    beta = chunks[1]
+    assert beta["heading_text"] == "Beta"
+    assert beta["heading_path"] == ["Alpha", "Beta"]
+
+    gamma = chunks[2]
+    assert gamma["heading_text"] == "Gamma"
+    assert gamma["heading_path"] == ["Alpha", "Beta", "Gamma"]
+    assert "body under Gamma" in gamma["body_text"]
+
+    # Delta is H2 — resets Gamma (H3) and Beta (H2) off the stack;
+    # only Alpha (H1) remains as ancestor.
+    delta = chunks[3]
+    assert delta["heading_text"] == "Delta"
+    assert delta["heading_path"] == ["Alpha", "Delta"]
+    assert "body under Delta" in delta["body_text"]
+
+
+def test_build_chunks_equal_level_heading_resets_path():
+    """Two sibling H1 headings each produce an independent chunk; the second
+    H1 does NOT include the first H1 in its heading_path."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="B0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter One</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="B0000002"><w:r><w:t>body one</w:t></w:r></w:p>
+    <w:p w14:paraId="B0000003">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter Two</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="B0000004"><w:r><w:t>body two</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    docx = buf.getvalue()
+
+    tree = docs_intel.document_content_tree(docx)
+    chunks = docs_intel._build_chunks(tree["blocks"])
+
+    assert len(chunks) == 2
+    assert chunks[0]["heading_path"] == ["Chapter One"]
+    assert chunks[1]["heading_path"] == ["Chapter Two"]
+
+
+def test_index_docx_chunks_and_search_basic(tmp_path):
+    """index_docx_chunks populates docx_chunks; fts5_search_chunks returns hits."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    summary = docs_intel.index_docx_chunks(_synthetic_docx(), db)
+
+    assert summary["chunk_count"] == 2
+
+    # "sessions" appears in chunk 0's body (the Introduction chunk).
+    hits = docs_intel.fts5_search_chunks(db, "sessions")
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit["heading_text"] == "Introduction"
+    assert hit["heading_path"] == ["Introduction"]
+    assert "bm25_score" in hit
+    assert isinstance(hit["bm25_score"], float)
+
+
+def test_fts5_search_chunks_heading_match_outranks_body_match(tmp_path):
+    """A term that appears only in a heading ranks above the same term in body
+    text only, when the BM25 heading weight exceeds the body weight."""
+    # Doc: H1 "Design" with body "some text", H1 "Intro" with body "Design concepts"
+    # Searching "design" should rank the heading-bearing chunk higher.
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="C0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Design</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="C0000002"><w:r><w:t>some text here</w:t></w:r></w:p>
+    <w:p w14:paraId="C0000003">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="C0000004">
+      <w:r><w:t>Design concepts are explained here.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    docx = buf.getvalue()
+
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(docx, db)
+
+    hits = docs_intel.fts5_search_chunks(db, "Design")
+    assert len(hits) == 2
+    # BM25 scores are negative; lower = more relevant. The heading match should
+    # score lower (more relevant) than the body-only match.
+    heading_chunk = next(h for h in hits if h["heading_text"] == "Design")
+    body_chunk = next(h for h in hits if h["heading_text"] == "Introduction")
+    assert heading_chunk["bm25_score"] < body_chunk["bm25_score"], (
+        f"Heading chunk score {heading_chunk['bm25_score']!r} should be lower "
+        f"(more relevant) than body chunk score {body_chunk['bm25_score']!r}"
+    )
+
+
+def test_index_docx_chunks_idempotent(tmp_path):
+    """Re-indexing the same document leaves the chunk count unchanged."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    summary2 = docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    assert summary2["chunk_count"] == 2
+    hits = docs_intel.fts5_search_chunks(db, "sessions")
+    assert len(hits) == 1
+
+
+def test_fts5_search_chunks_invalid_query_returns_empty(tmp_path):
+    """Invalid FTS5 query degrades to empty list, no exception raised."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    hits = docs_intel.fts5_search_chunks(db, '"unclosed')
+    assert isinstance(hits, list)
+
+
+def test_fts5_search_chunks_no_match_returns_empty(tmp_path):
+    """Query with no matching chunks returns empty list."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    hits = docs_intel.fts5_search_chunks(db, "xyzzy_no_such_token_99")
+    assert hits == []
+
+
+def test_chunk_sync_triggers_after_manual_insert(tmp_path):
+    """Sync triggers keep docx_chunks_fts consistent after a direct row insert
+    to docx_chunks (mirrors what the AFTER INSERT trigger should handle)."""
+    import sqlite3
+
+    db = str(tmp_path / "doc.idx.sqlite")
+    # Bootstrap the schema (no chunks yet).
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+
+    conn = sqlite3.connect(db)
+    try:
+        # Manually insert a new chunk — the AFTER INSERT trigger should
+        # populate docx_chunks_fts automatically.
+        import json
+        conn.execute(
+            "INSERT INTO docx_chunks (chunk_id, heading_path_json, heading_text, "
+            "body_text, start_para_id, end_para_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (99, json.dumps(["Extra"]), "Extra", "trigger test content",
+             "E0000001", "E0000001"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The new chunk should be findable via FTS5.
+    hits = docs_intel.fts5_search_chunks(db, "trigger")
+    assert any(h["chunk_id"] == 99 for h in hits), (
+        "AFTER INSERT trigger did not sync new chunk into docx_chunks_fts"
+    )
+
+
+def test_chunk_weight_constants_documented():
+    """Module-level weight constants match expected 5:1 ratio."""
+    assert docs_intel._CHUNK_WEIGHT_HEADING == 5.0
+    assert docs_intel._CHUNK_WEIGHT_BODY == 1.0
+
+
+def test_fts5_search_chunks_result_shape(tmp_path):
+    """Every result dict carries all expected keys."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    hits = docs_intel.fts5_search_chunks(db, "Introduction")
+    assert len(hits) >= 1
+    required_keys = {
+        "chunk_id", "heading_path", "heading_text",
+        "body_text", "start_para_id", "end_para_id", "bm25_score",
+    }
+    for hit in hits:
+        assert required_keys.issubset(hit.keys()), (
+            f"Missing keys: {required_keys - hit.keys()}"
+        )
+        assert isinstance(hit["heading_path"], list)
+        assert isinstance(hit["bm25_score"], float)

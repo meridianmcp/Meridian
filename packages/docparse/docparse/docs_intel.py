@@ -2094,6 +2094,322 @@ def document_field_structures(source: str | bytes | bytearray) -> dict[str, Any]
     }
 
 
+# ===========================================================================
+# 25743ec6 — Chunk-level, heading-aware weighted BM25 indexing
+# ---------------------------------------------------------------------------
+# A "chunk" is the atomic retrieval unit: one heading plus all consecutive
+# body paragraphs that follow it until the next heading of equal or higher
+# level (or end of document). Each chunk carries a ``heading_path`` — the
+# ordered list of ancestor heading texts from document root to the chunk's
+# own heading, e.g. ["Introduction", "Background"] for a nested H2 under
+# an H1 — so a search hit can always report *which section it is in*.
+#
+# The new FTS5 virtual table ``docx_chunks_fts`` indexes two columns:
+#   heading_text  — the chunk's own heading text (weighted 5.0)
+#   body_text     — all body-paragraph text concatenated (weighted 1.0)
+#
+# Column weights rationale: a heading-text match should strongly outrank an
+# equivalent term hit in prose.  5:1 is the conventional starting point for
+# heading vs. body in BM25 multi-column schemes (mirrors Elasticsearch/Lucene
+# defaults for title-vs-body field boosts in retrieval literature).  The
+# constants are exposed at module level so tests can validate them and callers
+# can override them via the search function's keyword arguments.
+#
+# The existing paragraph-level ``fts5_search_paragraphs`` / ``docx_fts``
+# are completely untouched — this layer is purely additive.
+# ===========================================================================
+
+# BM25 column weights: heading_text weight, body_text weight.
+# 5:1 ratio — a term in the heading is treated as 5x more relevant than the
+# same term in body prose.
+_CHUNK_WEIGHT_HEADING: float = 5.0
+_CHUNK_WEIGHT_BODY: float = 1.0
+
+
+def _build_chunks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group flat ``document_content_tree`` blocks into heading-anchored chunks.
+
+    Algorithm:
+    - Walk blocks in document order, maintaining a ``heading_stack`` of the
+      ancestor headings seen so far (each entry is ``{level, text, para_id}``).
+    - When a heading block is encountered:
+        - Pop the stack until the stack is empty or the top has strictly lower
+          level than the new heading (heading levels are numeric: 1=H1, 2=H2;
+          "lower level" = "higher in the document hierarchy" = smaller integer;
+          pop until ``top.level < new.level``).
+        - Push the new heading onto the stack.
+        - The current heading_path is the ordered text of every entry in the
+          stack (root first, deepest last).
+        - Flush any accumulating chunk and start a new one for this heading.
+    - Non-heading body blocks (paragraph, table) append to the current chunk.
+    - Blocks that precede the first heading are collected into a synthetic
+      "preamble" chunk with ``heading_text=""`` and ``heading_path=[]``.
+
+    Returns a list of chunk dicts::
+
+        {
+            "chunk_id": int,               # 0-based sequential index
+            "heading_text": str,           # own heading text ("" for preamble)
+            "heading_path": list[str],     # ancestor texts, root first
+            "heading_para_id": str | None,
+            "body_text": str,              # all body blocks joined
+            "start_para_id": str | None,   # para_id of heading (or first body)
+            "end_para_id": str | None,     # para_id of last body (or heading)
+        }
+    """
+    chunks: list[dict[str, Any]] = []
+    heading_stack: list[dict[str, Any]] = []  # {level, text, para_id}
+    current_body_parts: list[str] = []
+    current_body_para_ids: list[str | None] = []
+    current_heading_text: str = ""
+    current_heading_path: list[str] = []
+    current_heading_para_id: str | None = None
+    current_start_para_id: str | None = None
+
+    def _flush(chunk_id: int) -> dict[str, Any]:
+        body_text = " ".join(t for t in current_body_parts if t)
+        end_pid = (
+            current_body_para_ids[-1]
+            if current_body_para_ids
+            else current_heading_para_id
+        )
+        return {
+            "chunk_id": chunk_id,
+            "heading_text": current_heading_text,
+            "heading_path": list(current_heading_path),
+            "heading_para_id": current_heading_para_id,
+            "body_text": body_text,
+            "start_para_id": current_start_para_id,
+            "end_para_id": end_pid,
+        }
+
+    for block in blocks:
+        kind = block.get("kind")
+        if kind == "heading":
+            # Flush the chunk that was accumulating (skip empty preamble).
+            if current_heading_text or current_body_parts:
+                chunks.append(_flush(len(chunks)))
+
+            lvl = block.get("level", 1)
+            # Pop stack entries of equal or deeper level (>= lvl).
+            while heading_stack and heading_stack[-1]["level"] >= lvl:
+                heading_stack.pop()
+            heading_stack.append({
+                "level": lvl,
+                "text": block.get("text", ""),
+                "para_id": block.get("para_id"),
+            })
+
+            current_heading_text = block.get("text", "")
+            current_heading_path = [h["text"] for h in heading_stack]
+            current_heading_para_id = block.get("para_id")
+            current_start_para_id = block.get("para_id")
+            current_body_parts = []
+            current_body_para_ids = []
+        else:
+            # Body block: collect text.
+            if kind == "table":
+                rows = block.get("rows") or []
+                text = " ".join(cell for row in rows for cell in row if cell)
+            else:
+                text = block.get("text", "")
+            if text:
+                current_body_parts.append(text)
+            pid = block.get("para_id")
+            current_body_para_ids.append(pid)
+            if current_start_para_id is None:
+                current_start_para_id = pid
+
+    # Flush the last chunk.
+    if current_heading_text or current_body_parts:
+        chunks.append(_flush(len(chunks)))
+
+    return chunks
+
+
+def _connect_chunks(index_db_path: str) -> sqlite3.Connection:
+    """Open/create the sidecar SQLite DB with chunk tables and FTS5 virtual table."""
+    conn = sqlite3.connect(index_db_path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_chunks (
+            chunk_id          INTEGER PRIMARY KEY,
+            heading_path_json TEXT NOT NULL,
+            heading_text      TEXT NOT NULL,
+            body_text         TEXT NOT NULL,
+            start_para_id     TEXT,
+            end_para_id       TEXT
+        )
+        """
+    )
+    # FTS5 external-content table: two weighted columns, backed by docx_chunks.
+    # content_rowid maps to docx_chunks.chunk_id (INTEGER PRIMARY KEY = rowid).
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS docx_chunks_fts
+        USING fts5(
+            heading_text,
+            body_text,
+            content='docx_chunks',
+            content_rowid='chunk_id'
+        )
+        """
+    )
+    # Sync triggers: keep docx_chunks_fts consistent with docx_chunks rows.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_chunks_ai
+        AFTER INSERT ON docx_chunks BEGIN
+            INSERT INTO docx_chunks_fts(rowid, heading_text, body_text)
+            VALUES (new.chunk_id, new.heading_text, new.body_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_chunks_ad
+        AFTER DELETE ON docx_chunks BEGIN
+            INSERT INTO docx_chunks_fts(docx_chunks_fts, rowid, heading_text, body_text)
+            VALUES ('delete', old.chunk_id, old.heading_text, old.body_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_chunks_au
+        AFTER UPDATE ON docx_chunks BEGIN
+            INSERT INTO docx_chunks_fts(docx_chunks_fts, rowid, heading_text, body_text)
+            VALUES ('delete', old.chunk_id, old.heading_text, old.body_text);
+            INSERT INTO docx_chunks_fts(rowid, heading_text, body_text)
+            VALUES (new.chunk_id, new.heading_text, new.body_text);
+        END
+        """
+    )
+    return conn
+
+
+def index_docx_chunks(
+    source: str | bytes | bytearray, index_db_path: str
+) -> dict[str, Any]:
+    """25743ec6 — build (or rebuild) the chunk-level heading-aware FTS5 index.
+
+    Parses the .docx via :func:`document_content_tree`, groups blocks into
+    chunks via :func:`_build_chunks`, stores them in ``docx_chunks``, and
+    rebuilds ``docx_chunks_fts`` atomically.
+
+    Returns ``{index_db, chunk_count}``. Idempotent: the chunk table is fully
+    replaced each run so re-indexing an edited document stays consistent.
+    """
+    tree = document_content_tree(source)
+    blocks = tree.get("blocks") or []
+    chunks = _build_chunks(blocks)
+
+    conn = _connect_chunks(index_db_path)
+    try:
+        conn.execute("DELETE FROM docx_chunks")
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO docx_chunks
+                (chunk_id, heading_path_json, heading_text, body_text,
+                 start_para_id, end_para_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    c["chunk_id"],
+                    json.dumps(c["heading_path"]),
+                    c["heading_text"],
+                    c["body_text"],
+                    c["start_para_id"],
+                    c["end_para_id"],
+                )
+                for c in chunks
+            ],
+        )
+        # Full FTS5 rebuild from the current docx_chunks content.
+        conn.execute("INSERT INTO docx_chunks_fts(docx_chunks_fts) VALUES ('rebuild')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"index_db": index_db_path, "chunk_count": len(chunks)}
+
+
+def fts5_search_chunks(
+    index_db_path: str,
+    query: str,
+    limit: int = 20,
+    weight_heading: float = _CHUNK_WEIGHT_HEADING,
+    weight_body: float = _CHUNK_WEIGHT_BODY,
+) -> list[dict[str, Any]]:
+    """25743ec6 — BM25 search over the chunk-level heading-aware FTS5 index.
+
+    Searches ``docx_chunks_fts`` (populated by :func:`index_docx_chunks`)
+    with column weights so a term hit in a section heading outranks the same
+    term in body prose.  Results carry ``heading_path`` so every hit reports
+    which section it came from.
+
+    Default weights: heading_text=5.0, body_text=1.0 (5:1 ratio; see the
+    25743ec6 block comment for the rationale).  The caller can override both
+    via keyword arguments.
+
+    Args:
+        index_db_path:   Path to the sidecar SQLite index built by
+                         :func:`index_docx_chunks`.
+        query:           FTS5 query string (e.g. ``"design"`` or
+                         ``'"AI sessions"'`` for a phrase).
+        limit:           Maximum number of results (default 20).
+        weight_heading:  BM25 column weight for ``heading_text`` (default 5.0).
+        weight_body:     BM25 column weight for ``body_text`` (default 1.0).
+
+    Returns:
+        List of dicts ordered by BM25 relevance (most relevant first)::
+
+            {
+                "chunk_id": int,
+                "heading_path": list[str],   # section ancestry, root first
+                "heading_text": str,
+                "body_text": str,
+                "start_para_id": str | None,
+                "end_para_id": str | None,
+                "bm25_score": float,         # negative; lower = more relevant
+            }
+
+        Empty list when no matches or when the FTS5 table does not exist yet
+        (degrades gracefully rather than raising).
+    """
+    conn = _connect_chunks(index_db_path)
+    try:
+        sql = (
+            "SELECT c.chunk_id, c.heading_path_json, c.heading_text, "
+            "c.body_text, c.start_para_id, c.end_para_id, "
+            f"bm25(docx_chunks_fts, {weight_heading!r}, {weight_body!r}) AS score "
+            "FROM docx_chunks_fts "
+            "JOIN docx_chunks c ON c.chunk_id = docx_chunks_fts.rowid "
+            "WHERE docx_chunks_fts MATCH ? "
+            "ORDER BY score "
+            "LIMIT ?"
+        )
+        rows = conn.execute(sql, (query, int(limit))).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+    return [
+        {
+            "chunk_id": r[0],
+            "heading_path": json.loads(r[1]) if r[1] else [],
+            "heading_text": r[2],
+            "body_text": r[3],
+            "start_para_id": r[4],
+            "end_para_id": r[5],
+            "bm25_score": r[6],
+        }
+        for r in rows
+    ]
+
+
 # --- Shared structural-parser conformance (67402ce7) ------------------------
 
 
