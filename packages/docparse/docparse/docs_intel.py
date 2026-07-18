@@ -52,6 +52,213 @@ def _heading_level(style: str | None) -> int:
     return int(match.group(1)) if match else 1
 
 
+# ---------------------------------------------------------------------------
+# 4a07e566 — Section-type differentiation + w:sectPr page-numbering awareness
+#
+# Section types mirror the regions a Word academic document actually uses:
+#   abstract   — "Abstract", "Summary", "Executive Summary" headings
+#   toc        — "Table of Contents", "Contents", "TOC" headings
+#   lof        — "List of Figures", "List of Tables", etc.
+#   appendix   — "Appendix"/"Annex" headings, or headings after References
+#   main       — everything else (body of the document)
+# ---------------------------------------------------------------------------
+
+_ABSTRACT_RE = re.compile(
+    r"^(abstract|summary|executive\s+summary|synopsis|preface|foreword|acknowledgements?|dedication)$",
+    re.IGNORECASE,
+)
+_TOC_RE = re.compile(
+    r"^(table\s+of\s+contents?|contents?|toc)$",
+    re.IGNORECASE,
+)
+_LOF_RE = re.compile(
+    r"^(list\s+of\s+(figures?|tables?|illustrations?|abbreviations?|symbols?|equations?|listings?)"
+    r"|figures?|tables?|illustrations?|abbreviations?|nomenclature)$",
+    re.IGNORECASE,
+)
+_APPENDIX_RE = re.compile(
+    r"^(appendix|appendices|annex|annexure|supplement)",
+    re.IGNORECASE,
+)
+_REFERENCES_RE = re.compile(
+    r"^(references?|bibliography|works?\s+cited|literature\s+cited)$",
+    re.IGNORECASE,
+)
+
+SectionType = str  # "abstract" | "toc" | "lof" | "main" | "appendix"
+
+
+def _classify_heading_text(text: str) -> SectionType | None:
+    """Return a forced section type for well-known front/back-matter headings.
+
+    Returns None for headings whose type must be inferred from position.
+    """
+    t = text.strip()
+    if _ABSTRACT_RE.match(t):
+        return "abstract"
+    if _TOC_RE.match(t):
+        return "toc"
+    if _LOF_RE.match(t):
+        return "lof"
+    if _APPENDIX_RE.match(t):
+        return "appendix"
+    return None
+
+
+def _assign_section_types(
+    headings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Annotate each heading dict with a ``section_type`` field.
+
+    Single-pass left-to-right classifier.  Rules (in priority order):
+
+    1. Text-pattern match always wins (abstract/toc/lof/appendix).
+    2. A level-1 heading matching ``_REFERENCES_RE`` moves the region to
+       "appendix" (back matter begins after references).
+    3. Headings that follow an "appendix" region-start remain "appendix".
+    4. Headings before the first non-classified level-1 default to "abstract"
+       when they don't match any explicit pattern.
+    5. Everything else is "main".
+
+    Returns a NEW list of dicts (copies) with the added ``section_type`` key.
+    """
+    in_front_matter = True
+    in_appendix = False
+    result: list[dict[str, Any]] = []
+
+    for h in headings:
+        text = h.get("text", "")
+        level = h.get("level", 1)
+        forced = _classify_heading_text(text)
+
+        if forced == "appendix":
+            in_appendix = True
+            in_front_matter = False
+            section_type: SectionType = "appendix"
+        elif in_appendix:
+            section_type = "appendix"
+        elif forced is not None:
+            section_type = forced
+        elif level == 1 and _REFERENCES_RE.match(text.strip()):
+            in_appendix = True
+            in_front_matter = False
+            section_type = "appendix"
+        elif level == 1:
+            in_front_matter = False
+            section_type = "main"
+        else:
+            section_type = "abstract" if in_front_matter else "main"
+
+        result.append({**h, "section_type": section_type})
+
+    return result
+
+
+def parse_sectpr(source: str | bytes | bytearray) -> dict[str, Any]:
+    """4a07e566 — Parse all ``<w:sectPr>`` elements in a .docx body.
+
+    A .docx uses ``<w:sectPr>`` to define section properties.  In a document
+    with front matter (roman numeral page numbers) and body (arabic numerals),
+    Word inserts a ``<w:sectPr>`` as the last child of a ``<w:pPr>`` at each
+    section boundary, plus one final ``<w:sectPr>`` as a direct child of
+    ``<w:body>`` for the last section.
+
+    Returns::
+
+        {"section_count": int, "sections": [{index, page_num_fmt,
+          page_num_start, page_num_type, is_continuous, anchor_para_id}]}
+
+    When there are no ``<w:sectPr>`` elements (a single implicit section),
+    returns ``{section_count: 0, sections: []}``.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
+    else:
+        zf = zipfile.ZipFile(source)
+    try:
+        with zf.open("word/document.xml") as handle:
+            xml = handle.read()
+    finally:
+        zf.close()
+
+    root = ET.fromstring(xml)
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"section_count": 0, "sections": []}
+
+    sections: list[dict[str, Any]] = []
+    w_sectPr = _q(_W, "sectPr")
+    w_pPr = _q(_W, "pPr")
+    w_pgNumType = _q(_W, "pgNumType")
+    w_type_el = _q(_W, "type")
+    w_fmt = _q(_W, "fmt")
+    w_start = _q(_W, "start")
+    w_val = _q(_W, "val")
+    w14_paraId = _q(_W14, "paraId")
+
+    for child in body:
+        if child.tag == _q(_W, "p"):
+            ppr = child.find(w_pPr)
+            if ppr is not None:
+                spr = ppr.find(w_sectPr)
+                if spr is not None:
+                    anchor_id = child.get(w14_paraId) or None
+                    sections.append(_parse_one_sectpr(
+                        spr, anchor_id, len(sections),
+                        w_pgNumType, w_type_el, w_fmt, w_start, w_val,
+                    ))
+        elif child.tag == w_sectPr:
+            sections.append(_parse_one_sectpr(
+                child, None, len(sections),
+                w_pgNumType, w_type_el, w_fmt, w_start, w_val,
+            ))
+
+    return {"section_count": len(sections), "sections": sections}
+
+
+def _parse_one_sectpr(
+    spr: ET.Element,
+    anchor_para_id: str | None,
+    index: int,
+    w_pgNumType: str,
+    w_type_el: str,
+    w_fmt: str,
+    w_start: str,
+    w_val: str,
+) -> dict[str, Any]:
+    """Extract page-numbering fields from a single ``<w:sectPr>`` element."""
+    pg_num = spr.find(w_pgNumType)
+    page_num_fmt: str = "decimal"
+    page_num_start: int | None = None
+    page_num_type_raw: str | None = None
+    is_continuous: bool = False
+
+    type_el = spr.find(w_type_el)
+    if type_el is not None:
+        is_continuous = type_el.get(w_val, "") == "continuous"
+
+    if pg_num is not None:
+        fmt_val = pg_num.get(w_fmt)
+        if fmt_val:
+            page_num_fmt = fmt_val
+        start_val = pg_num.get(w_start)
+        if start_val is not None:
+            try:
+                page_num_start = int(start_val)
+            except ValueError:
+                pass
+        page_num_type_raw = ET.tostring(pg_num, encoding="unicode")
+
+    return {
+        "index": index,
+        "page_num_fmt": page_num_fmt,
+        "page_num_start": page_num_start,
+        "page_num_type": page_num_type_raw,
+        "is_continuous": is_continuous,
+        "anchor_para_id": anchor_para_id,
+    }
+
+
 # Field instructions Word regenerates on refresh (F9): TOC/table-of-figures,
 # SEQ counters (LOF/LOT entry numbers), and the cross-reference family that
 # resolves to those live numbers. Anything in this set is marked
@@ -507,8 +714,9 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
 def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
     """13462df2 — stateless heading outline of a .docx (path or raw bytes). No
     sidecar index: a pure parse. Returns ``paragraph_count`` + ``heading_count``
-    + an ordered ``headings`` list (level/text/para_id) — the queryable document
-    structure docs_intel exposes without building a persistent index.
+    + an ordered ``headings`` list (level/text/para_id/section_type) — the
+    queryable document structure docs_intel exposes without building a persistent
+    index.
 
     a62e5b4f — also surfaces every Word field code (TOC / SEQ / PAGEREF ...) in
     an ordered ``fields`` list (``para_id``, ``field_type``, ``instruction``,
@@ -519,9 +727,14 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
     ``CSL_CITATION`` field codes and footnote / endnote references) in an ordered
     ``citations`` list plus a ``citation_count`` (mirroring how ``latex_intel``
     surfaces LaTeX ``\\cite`` markers). Each entry is ``{source, marker_text,
-    keys, para_id, section_ordinal}``. Still purely additive."""
+    keys, para_id, section_ordinal}``. Still purely additive.
+
+    4a07e566 — each heading now carries a ``section_type`` field
+    (abstract/toc/lof/main/appendix) classifying the document region it belongs
+    to. The ``section_regions`` key summarises the distinct regions in order.
+    """
     paras = parse_docx(source)
-    headings = [
+    raw_headings = [
         {
             "level": _heading_level(p.get("style")),
             "text": p.get("text", ""),
@@ -530,6 +743,15 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
         for p in paras
         if _is_heading(p.get("style"))
     ]
+    headings = _assign_section_types(raw_headings)
+
+    # Collect distinct regions in document order (deduplicated, first-seen).
+    seen_regions: list[str] = []
+    for h in headings:
+        r = h["section_type"]
+        if not seen_regions or seen_regions[-1] != r:
+            seen_regions.append(r)
+
     fields = [
         {
             "para_id": p.get("para_id"),
@@ -545,6 +767,7 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
         "paragraph_count": len(paras),
         "heading_count": len(headings),
         "headings": headings,
+        "section_regions": seen_regions,
         "field_count": len(fields),
         "fields": fields,
         "citation_count": len(citations),
@@ -1119,6 +1342,266 @@ def find_paragraphs(
     return [
         {"para_id": r[0], "index": r[1], "style": r[2], "text": r[3]} for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# 4a07e566 — structural element store: headings with section types + sectPr
+# ---------------------------------------------------------------------------
+
+_SEQ_FIGURE_RE = re.compile(r"\bSEQ\s+Figure\b", re.IGNORECASE)
+_SEQ_TABLE_RE = re.compile(r"\bSEQ\s+Table\b", re.IGNORECASE)
+
+
+def _is_figure_caption(block: dict[str, Any]) -> bool:
+    for fld in block.get("fields", []):
+        if fld.get("field_type") == "SEQ" and _SEQ_FIGURE_RE.search(
+            fld.get("instruction", "")
+        ):
+            return True
+    return False
+
+
+def _is_table_caption(block: dict[str, Any]) -> bool:
+    for fld in block.get("fields", []):
+        if fld.get("field_type") == "SEQ" and _SEQ_TABLE_RE.search(
+            fld.get("instruction", "")
+        ):
+            return True
+    return False
+
+
+def _seq_cached_number(block: dict[str, Any], seq_re: re.Pattern[str]) -> str | None:
+    for fld in block.get("fields", []):
+        if fld.get("field_type") == "SEQ" and seq_re.search(fld.get("instruction", "")):
+            return fld.get("cached_result") or None
+    return None
+
+
+def _connect_structural(index_db_path: str) -> sqlite3.Connection:
+    """Extend a sidecar SQLite DB with structural element tables."""
+    conn = sqlite3.connect(index_db_path)
+    # Ensure the base paragraph + meta tables exist.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_paragraphs (
+            para_id TEXT PRIMARY KEY,
+            idx INTEGER NOT NULL,
+            style TEXT,
+            text TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_headings (
+            para_id TEXT PRIMARY KEY,
+            idx INTEGER NOT NULL,
+            level INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            section_type TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_figures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idx INTEGER NOT NULL,
+            para_id TEXT,
+            caption TEXT NOT NULL,
+            seq_number TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_tables (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idx INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            col_count INTEGER NOT NULL,
+            caption TEXT,
+            rows_json TEXT NOT NULL
+        )
+        """
+    )
+    # 4a07e566 — migrate existing DBs: add section_type column if absent.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(docx_headings)").fetchall()}
+    if "section_type" not in cols:
+        conn.execute("ALTER TABLE docx_headings ADD COLUMN section_type TEXT")
+    return conn
+
+
+def index_docx_structure(
+    source: str | bytes | bytearray,
+    index_db_path: str,
+) -> dict[str, Any]:
+    """4a07e566 — parse a .docx and store its structural elements locally.
+
+    Populates ``docx_headings`` (with ``section_type``), ``docx_figures``, and
+    ``docx_tables`` in the sidecar SQLite DB at ``index_db_path`` (created if
+    absent). Uses :func:`document_content_tree` for the parse so headings and
+    tables are extracted in true document order.
+
+    Returns ``{index_db, heading_count, figure_count, table_count}``. Idempotent.
+    """
+    tree = document_content_tree(source)
+    blocks: list[dict[str, Any]] = tree.get("blocks") or []
+
+    headings_raw: list[dict[str, Any]] = []
+    figures_out: list[tuple[int, str | None, str, str | None]] = []
+    tables_out: list[tuple[int, int, int, str, str | None]] = []
+    last_table_entry_index: int | None = None
+
+    for block in blocks:
+        kind = block.get("kind")
+        idx = block.get("index", 0)
+
+        if kind == "heading":
+            headings_raw.append({
+                "para_id": block.get("para_id", f"p{idx}"),
+                "idx": idx,
+                "level": block.get("level", 1),
+                "text": block.get("text", ""),
+            })
+        elif kind == "table":
+            rows = block.get("rows") or []
+            tables_out.append((
+                idx,
+                block.get("row_count", len(rows)),
+                block.get("col_count", max((len(r) for r in rows), default=0)),
+                json.dumps(rows),
+                None,
+            ))
+            last_table_entry_index = len(tables_out) - 1
+        elif kind == "paragraph":
+            if _is_figure_caption(block):
+                seq_num = _seq_cached_number(block, _SEQ_FIGURE_RE)
+                figures_out.append((idx, block.get("para_id"), block.get("text", ""), seq_num))
+            elif _is_table_caption(block) and last_table_entry_index is not None:
+                t = tables_out[last_table_entry_index]
+                tables_out[last_table_entry_index] = (t[0], t[1], t[2], t[3], block.get("text", ""))
+
+    typed_headings = _assign_section_types([
+        {"level": h["level"], "text": h["text"], "para_id": h["para_id"]}
+        for h in headings_raw
+    ])
+    headings_out: list[tuple[str, int, int, str, str | None]] = [
+        (typed["para_id"], headings_raw[i]["idx"], typed["level"],
+         typed["text"], typed["section_type"])
+        for i, typed in enumerate(typed_headings)
+    ]
+
+    conn = _connect_structural(index_db_path)
+    try:
+        conn.execute("DELETE FROM docx_headings")
+        conn.execute("DELETE FROM docx_figures")
+        conn.execute("DELETE FROM docx_tables")
+        conn.executemany(
+            "INSERT OR REPLACE INTO docx_headings (para_id, idx, level, text, section_type) "
+            "VALUES (?, ?, ?, ?, ?)",
+            headings_out,
+        )
+        conn.executemany(
+            "INSERT INTO docx_figures (idx, para_id, caption, seq_number) "
+            "VALUES (?, ?, ?, ?)",
+            figures_out,
+        )
+        conn.executemany(
+            "INSERT INTO docx_tables (idx, row_count, col_count, rows_json, caption) "
+            "VALUES (?, ?, ?, ?, ?)",
+            tables_out,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "index_db": index_db_path,
+        "heading_count": len(headings_out),
+        "figure_count": len(figures_out),
+        "table_count": len(tables_out),
+    }
+
+
+def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
+    """4a07e566 — retrieve locally-stored structural elements from the sidecar.
+
+    Returns ``{headings, figures, tables}`` lists populated by
+    :func:`index_docx_structure`. Each heading carries a ``section_type`` field.
+    Returns empty lists for tables not yet populated.
+    """
+    conn = _connect_structural(index_db_path)
+    try:
+        heading_rows = conn.execute(
+            "SELECT para_id, idx, level, text, section_type FROM docx_headings ORDER BY idx"
+        ).fetchall()
+        figure_rows = conn.execute(
+            "SELECT id, idx, para_id, caption, seq_number FROM docx_figures ORDER BY idx"
+        ).fetchall()
+        table_rows = conn.execute(
+            "SELECT id, idx, row_count, col_count, rows_json, caption FROM docx_tables ORDER BY idx"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    headings = [
+        {"para_id": r[0], "index": r[1], "level": r[2], "text": r[3], "section_type": r[4]}
+        for r in heading_rows
+    ]
+    figures = [
+        {"id": r[0], "index": r[1], "para_id": r[2], "caption": r[3], "seq_number": r[4]}
+        for r in figure_rows
+    ]
+    tables = [
+        {
+            "id": r[0],
+            "index": r[1],
+            "row_count": r[2],
+            "col_count": r[3],
+            "rows": json.loads(r[4]) if r[4] else [],
+            "caption": r[5],
+        }
+        for r in table_rows
+    ]
+    return {
+        "headings": headings,
+        "figures": figures,
+        "tables": tables,
+        "heading_count": len(headings),
+        "figure_count": len(figures),
+        "table_count": len(tables),
+    }
+
+
+def get_document_section_map(source: str | bytes | bytearray) -> dict[str, Any]:
+    """4a07e566 — Full section-type map + sectPr page-numbering in one call.
+
+    Combines :func:`document_outline` (section-typed heading outline) with
+    :func:`parse_sectpr` (w:sectPr multi-section page-numbering).
+
+    Returns::
+
+        {paragraph_count, heading_count, headings (with section_type),
+         section_regions, sectpr: {section_count, sections}}
+    """
+    outline = document_outline(source)
+    sectpr = parse_sectpr(source)
+    return {
+        "paragraph_count": outline["paragraph_count"],
+        "heading_count": outline["heading_count"],
+        "headings": outline["headings"],
+        "section_regions": outline["section_regions"],
+        "sectpr": sectpr,
+    }
 
 
 # ===========================================================================

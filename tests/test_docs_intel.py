@@ -738,3 +738,215 @@ def test_check_document_structure_issues_appendix_letter_tag_extracted():
     assert len(order_issues) == 1
     assert order_issues[0]["tag"] == "4.2.3"
     assert order_issues[0]["previous_tag"] == "C.2.5"
+
+
+# ---------------------------------------------------------------------------
+# 4a07e566 — section-type differentiation + w:sectPr page-numbering awareness
+# ---------------------------------------------------------------------------
+
+# A synthetic document that exercises all five section types:
+#   Abstract -> TOC -> LOF -> main body -> References -> Appendix
+_SECTION_TYPED_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="60000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Abstract</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000002">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Table of Contents</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000003">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>List of Figures</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000004">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000005">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Background</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000006">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>References</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000007">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Appendix A</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000008">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Supporting Data</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
+def _section_typed_docx() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", _SECTION_TYPED_XML)
+    return buf.getvalue()
+
+
+# A synthetic document with w:sectPr elements covering:
+#   - a mid-document sectPr (roman numeral front matter, restart at 1)
+#   - the final body-level sectPr (arabic, no restart)
+_SECTPR_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="70000001">
+      <w:pPr>
+        <w:pStyle w:val="Heading1"/>
+        <w:sectPr>
+          <w:pgNumType w:fmt="lowerRoman" w:start="1"/>
+          <w:type w:val="nextPage"/>
+        </w:sectPr>
+      </w:pPr>
+      <w:r><w:t>Front Matter</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="70000002">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter 1</w:t></w:r>
+    </w:p>
+    <w:sectPr>
+      <w:pgNumType w:fmt="decimal" w:start="1"/>
+    </w:sectPr>
+  </w:body>
+</w:document>
+"""
+
+
+def _sectpr_docx() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", _SECTPR_XML)
+    return buf.getvalue()
+
+
+def test_section_type_classification_abstract_toc_lof():
+    out = docs_intel.document_outline(_section_typed_docx())
+    headings = out["headings"]
+    assert headings[0]["text"] == "Abstract"
+    assert headings[0]["section_type"] == "abstract"
+    assert headings[1]["text"] == "Table of Contents"
+    assert headings[1]["section_type"] == "toc"
+    assert headings[2]["text"] == "List of Figures"
+    assert headings[2]["section_type"] == "lof"
+
+
+def test_section_type_classification_main_body():
+    out = docs_intel.document_outline(_section_typed_docx())
+    headings = out["headings"]
+    # "Introduction" is the first unclassified level-1 heading -> main
+    intro = next(h for h in headings if h["text"] == "Introduction")
+    assert intro["section_type"] == "main"
+    # "Background" is a sub-heading under Introduction -> inherits main
+    bg = next(h for h in headings if h["text"] == "Background")
+    assert bg["section_type"] == "main"
+
+
+def test_section_type_classification_references_and_appendix():
+    out = docs_intel.document_outline(_section_typed_docx())
+    headings = out["headings"]
+    # "References" transitions to back matter -> classified as appendix
+    refs = next(h for h in headings if h["text"] == "References")
+    assert refs["section_type"] == "appendix"
+    # "Appendix A" is an explicit appendix heading
+    app = next(h for h in headings if h["text"] == "Appendix A")
+    assert app["section_type"] == "appendix"
+    # Sub-heading under Appendix A inherits appendix
+    sub = next(h for h in headings if h["text"] == "Supporting Data")
+    assert sub["section_type"] == "appendix"
+
+
+def test_section_regions_ordered_distinct():
+    out = docs_intel.document_outline(_section_typed_docx())
+    # Distinct regions in document order: abstract, toc, lof, main, appendix
+    assert out["section_regions"] == ["abstract", "toc", "lof", "main", "appendix"]
+
+
+def test_document_outline_backward_compatible_plain_doc():
+    # The original document still works — section_type is additive, not breaking.
+    out = docs_intel.document_outline(_synthetic_docx())
+    assert out["heading_count"] == 2
+    assert "section_type" in out["headings"][0]
+    assert "section_regions" in out
+    # Both headings are unclassified level-1/2 with no front-matter markers -> main
+    assert all(h["section_type"] == "main" for h in out["headings"])
+
+
+def test_parse_sectpr_detects_multi_section_page_numbering():
+    result = docs_intel.parse_sectpr(_sectpr_docx())
+    assert result["section_count"] == 2
+    sections = result["sections"]
+    # First sectPr: front matter with roman numerals, restart at 1
+    s0 = sections[0]
+    assert s0["page_num_fmt"] == "lowerRoman"
+    assert s0["page_num_start"] == 1
+    assert s0["is_continuous"] is False
+    assert s0["anchor_para_id"] == "70000001"
+    # Second sectPr: body-level, arabic decimal, restart at 1
+    s1 = sections[1]
+    assert s1["page_num_fmt"] == "decimal"
+    assert s1["page_num_start"] == 1
+    assert s1["anchor_para_id"] is None  # body-level, no anchor paragraph
+
+
+def test_parse_sectpr_no_sections_returns_empty():
+    # A simple document with no w:sectPr should return section_count=0
+    result = docs_intel.parse_sectpr(_synthetic_docx())
+    assert result["section_count"] == 0
+    assert result["sections"] == []
+
+
+def test_get_document_section_map_combines_outline_and_sectpr():
+    result = docs_intel.get_document_section_map(_sectpr_docx())
+    assert "headings" in result
+    assert "section_regions" in result
+    assert "sectpr" in result
+    assert result["sectpr"]["section_count"] == 2
+    # Both headings in _sectpr_docx are in "main" (no front-matter pattern)
+    assert all(h["section_type"] == "main" for h in result["headings"])
+
+
+def test_index_docx_structure_stores_section_type(tmp_path):
+    db = str(tmp_path / "struct.idx.sqlite")
+    # index_docx_structure goes through document_content_tree, not parse_docx,
+    # so we need a docx that the content tree can parse (same format).
+    docs_intel.index_docx_structure(_section_typed_docx(), db)
+    elements = docs_intel.get_local_structure_elements(db)
+    headings = elements["headings"]
+    assert len(headings) > 0
+    assert all("section_type" in h for h in headings)
+    abstract_headings = [h for h in headings if h["section_type"] == "abstract"]
+    main_headings = [h for h in headings if h["section_type"] == "main"]
+    assert len(abstract_headings) >= 1
+    assert len(main_headings) >= 1
+
+
+def test_assign_section_types_empty_input():
+    # Edge case: empty heading list returns empty list without crash.
+    result = docs_intel._assign_section_types([])
+    assert result == []
+
+
+def test_classify_heading_text_known_patterns():
+    assert docs_intel._classify_heading_text("Abstract") == "abstract"
+    assert docs_intel._classify_heading_text("ABSTRACT") == "abstract"
+    assert docs_intel._classify_heading_text("Table of Contents") == "toc"
+    assert docs_intel._classify_heading_text("Contents") == "toc"
+    assert docs_intel._classify_heading_text("List of Figures") == "lof"
+    assert docs_intel._classify_heading_text("List of Tables") == "lof"
+    assert docs_intel._classify_heading_text("Appendix A") == "appendix"
+    assert docs_intel._classify_heading_text("Annex B") == "appendix"
+    assert docs_intel._classify_heading_text("Introduction") is None
+    assert docs_intel._classify_heading_text("Methodology") is None
