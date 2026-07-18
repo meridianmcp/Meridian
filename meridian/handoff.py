@@ -3256,6 +3256,16 @@ async def _write_sprint_guard_hooks(
         ps1 = _SPRINT_GUARD_PS1.replace("__PROJECT_ID__", project_id).replace("__URL__", url)
         (hooks_dir / "sprint_guard.sh").write_text(sh, encoding="utf-8")
         (hooks_dir / "sprint_guard.ps1").write_text(ps1, encoding="utf-8")
+        # e401221d — ensure this project's orphan-process-reaper Stop hook
+        # exists (registered via the generic 273287cb custom_hooks pipeline,
+        # NOT hardcoded here) before rendering every enabled custom hook to
+        # disk. Idempotent; a seeding failure must not block the rest of the
+        # handoff, so it gets its own inner guard on top of the outer one.
+        try:
+            from . import orphan_reaper as _orphan_reaper  # noqa: PLC0415
+            await _orphan_reaper.seed_orphan_reaper_hook(db, project_id, url)
+        except Exception:  # noqa: BLE001 — best-effort seed, never break handoff
+            pass
         await _write_custom_hooks(db, project_id, hooks_dir)
     except Exception:  # noqa: BLE001 — never break handoff on a hook-write failure
         pass

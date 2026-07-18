@@ -1056,6 +1056,7 @@ No auth required.
 | `GET` | `/projects/{project_id}/webhook-token` | Mint-and-return the project webhook token. Shown ONCE in the UI |
 | `GET` | `/projects/{project_id}/worktrees` | List active git worktrees registered for a project |
 | `POST` | `/projects/{project_id}/worktrees` | Register a git worktree for a session. Call after `git worktree add` |
+| `GET` | `/projects/{project_id}/worktrees/pending_cleanup` | e401221d — read-only: worktree rows still marked active in the DB whose |
 | `POST` | `/projects/{project_id}/worktrees/sweep` | a03c0eeb — on-demand real disk cleanup for this project's worktrees |
 | `DELETE` | `/projects/{project_id}/worktrees/{worktree_id}` | Mark a registered worktree as removed — and, self-hosted only, actually |
 

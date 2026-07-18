@@ -1139,6 +1139,34 @@ async def list_worktrees(project_id: str, request: Request) -> list[dict[str, An
         return []
 
 
+@router.get("/projects/{project_id}/worktrees/pending_cleanup")
+async def list_worktrees_pending_cleanup(project_id: str, request: Request) -> list[dict[str, Any]]:
+    """e401221d — read-only: worktree rows still marked active in the DB whose
+    owning sprint item/session has reached a terminal state (see
+    `db.list_worktrees_pending_cleanup`, a03c0eeb), i.e. "dead" worktrees.
+
+    Non-destructive — unlike `POST /worktrees/sweep` this never touches disk
+    or the DB; it just exposes the same candidate list so a CLIENT-SIDE hook
+    (the e401221d orphan-process reaper, `meridian/orphan_reaper.py`) can
+    cross-reference locally running pixi/python/node processes against these
+    paths and reap the ones rooted in a dead worktree. Exposed on both
+    self-hosted and hosted deployments (unlike the sweep endpoint) since it
+    performs no filesystem access itself — only the caller's own local hook
+    process touches the caller's machine.
+    """
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return await db_module.list_worktrees_pending_cleanup(await _db(request), project_id)
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully, same as list_worktrees above
+        import logging as _l
+        _l.getLogger("meridian.server").warning(
+            "list_worktrees_pending_cleanup failed for project %s: %s", project_id, exc
+        )
+        return []
+
+
 @router.post("/projects/{project_id}/worktrees", status_code=201)
 async def create_worktree(
     project_id: str, request: Request, body: WorktreeCreate
