@@ -1378,6 +1378,153 @@ def _check_evidence_quality(evidence_text: str) -> str | None:
     return None
 
 
+async def _check_stored_evidence(
+    db: aiosqlite.Connection,
+    item: dict[str, Any],
+    task_id: str | None,
+    notes: str | None,
+) -> str | None:
+    """1ec33edf (refile of abb7c388 — the original shipped only on a worktree
+    branch that never merged into dev, so this was reconfirmed unfixed and
+    redone here) — mechanical check that STORED evidence actually exists at
+    completion time.
+
+    Distinct from :func:`_check_evidence_quality`, which analyses the *text
+    quality* of evidence notes for over-fit patterns without touching disk or
+    the DB. This function checks whether the physical evidence referenced by
+    the item is real and verifiable:
+
+    1. **touches_resources file/symbol entries** — when the item declares
+       ``file:`` or ``symbol:`` resources (the canonical "what I touched"
+       record), check that at least one of those files exists on the
+       filesystem. If every declared file is absent, the evidence is likely
+       fabricated, stale, or was produced in a different worktree.
+
+    2. **task_id existence** — when a ``task_id`` is linked (either as
+       argument or already stored on the item), verify the ``task_log`` row
+       actually exists in the DB. A task_id that resolves to nothing is
+       hollow evidence.
+
+    3. **File paths mentioned in notes** — when the combined notes text
+       explicitly mentions plausible ``.py`` paths, check at least one exists
+       on the filesystem. A notes field claiming "fixed auth.py" where
+       ``auth.py`` cannot be found is a thin-evidence signal. Only runs when
+       there is no touches_resources declaration, to avoid double-warning on
+       the same completion call.
+
+    Design invariants (mirrors :func:`_check_evidence_quality`):
+    - **ADVISORY ONLY** — returns a warning string but never raises; the
+      calling :func:`complete_sprint_item` surfaces it as
+      ``stored_evidence_warning`` in the returned dict without blocking the
+      completion.
+    - **FAIL-OPEN** — any filesystem or DB error is swallowed; the function
+      returns ``None`` (no warning) rather than wedging the board.
+    - **Conservative** — only warns when there is a clear, high-confidence
+      signal that claimed evidence does not exist, not merely when evidence
+      is absent (many legitimate items don't declare touches_resources).
+    - Runs for ALL completions, not only ``required_notes`` ones — a declared
+      touches_resources or linked task_id that turns out not to exist is a
+      thin-evidence signal regardless of whether the item was gated.
+    """
+    import os  # noqa: PLC0415 — lazy: only used in this function
+
+    try:
+        # ------------------------------------------------------------------
+        # Check 1: touches_resources file/symbol entries exist on disk.
+        # Only warn when the item DOES declare file/symbol resources AND
+        # none of them can be found — the absence of a declaration is fine
+        # (many items don't declare touches_resources).
+        # ------------------------------------------------------------------
+        resources_raw = item.get("touches_resources")
+        if resources_raw:
+            resources = parse_touches_resources(resources_raw)
+            # Collect file paths declared via file: or symbol: resource ids.
+            declared_paths: list[str] = []
+            for rid in resources:
+                rid_lower = rid.lower()
+                if rid_lower.startswith("inferred:"):
+                    rid = rid[len("inferred:"):]
+                if rid.startswith("file:"):
+                    path = rid[len("file:"):]
+                    declared_paths.append(path)
+                elif rid.startswith("symbol:"):
+                    # symbol:<path>::<symbol> — extract the path part.
+                    path = rid[len("symbol:"):].partition("::")[0]
+                    declared_paths.append(path)
+            if declared_paths:
+                any_exists = any(os.path.exists(p) for p in declared_paths)
+                if not any_exists:
+                    absent = declared_paths[:3]  # cap the list for readability
+                    more = f" (and {len(declared_paths) - 3} more)" if len(declared_paths) > 3 else ""
+                    return (
+                        f"Stored evidence check: {len(declared_paths)} file(s) declared in "
+                        f"touches_resources cannot be found on disk: "
+                        f"{', '.join(absent)}{more}. "
+                        "Either the files were not actually modified, the paths are wrong, "
+                        "or the work was done in a different worktree. "
+                        "Verify the correct files were changed before treating this as complete."
+                    )
+
+        # ------------------------------------------------------------------
+        # Check 2: task_id resolves to an existing task_log row.
+        # Only warn when a task_id IS provided; absence is fine.
+        # ------------------------------------------------------------------
+        effective_task_id = task_id or item.get("task_id")
+        if effective_task_id:
+            async with db.execute(
+                "SELECT id FROM task_log WHERE id = ?", (effective_task_id,)
+            ) as cur:
+                task_row = await cur.fetchone()
+            if task_row is None:
+                return (
+                    f"Stored evidence check: task_id {effective_task_id!r} is linked as "
+                    "evidence but no matching task_log row was found. "
+                    "The task may have been deleted or the id may be incorrect. "
+                    "Pass notes=... describing what shipped, or link a valid task_id."
+                )
+
+        # ------------------------------------------------------------------
+        # Check 3: file paths explicitly mentioned in notes exist on disk.
+        # Only active when there are no touches_resources declarations
+        # (Check 1 already covered the declared-path case), to avoid
+        # double-warning on the same completion call.
+        # Only warn when ALL mentioned paths are absent (fail-open: a mix of
+        # present and absent paths is not suspicious — paths change over time).
+        # ------------------------------------------------------------------
+        if not resources_raw:
+            combined_notes = " ".join(filter(None, [
+                (notes or "").strip(),
+                (item.get("notes") or "").strip(),
+            ]))
+            if combined_notes:
+                mentioned_paths = re.findall(
+                    r"[\w/\\.-]+\.py\b", combined_notes
+                )
+                # Only count paths that look structural (contain a slash, or
+                # start with a known top-level dir) — excludes bare "a.py".
+                plausible_paths = [
+                    p for p in mentioned_paths
+                    if len(p) > 5 and ("/" in p or p.startswith("tests/") or p.startswith("meridian/"))
+                ]
+                if plausible_paths:
+                    any_exists = any(os.path.exists(p) for p in plausible_paths)
+                    if not any_exists:
+                        absent = plausible_paths[:3]
+                        more = f" (and {len(plausible_paths) - 3} more)" if len(plausible_paths) > 3 else ""
+                        return (
+                            f"Stored evidence check: notes mention {len(plausible_paths)} file path(s) "
+                            f"that cannot be found on disk: {', '.join(absent)}{more}. "
+                            "If work was done in a different worktree, the paths may be valid "
+                            "there but are unverifiable here. Consider adding the commit SHA or "
+                            "test run output as evidence."
+                        )
+
+    except Exception:  # noqa: BLE001 — stored-evidence check must never block completion
+        return None
+
+    return None
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1420,9 +1567,20 @@ async def complete_sprint_item(
     checked in this same call; omit them to check whatever verdict is already
     on file. This is a STRUCTURAL gate — it never silently downgrades to an
     advisory warning the way the evidence-quality heuristic does.
+
+    1ec33edf (refile of abb7c388) — stored evidence verification: after the
+    existence + quality checks above, run :func:`_check_stored_evidence` over
+    the item's touches_resources, task_id, and notes. This is a MECHANICAL
+    check that the physical evidence declared by the item actually exists
+    (files on disk, task_log rows in DB) — a real evidence check, not just
+    the required_notes text-presence gate. Runs for every completion, not
+    only required_notes ones. If it fires, the returned item dict gains a
+    ``stored_evidence_warning`` key. Also ADVISORY ONLY — never blocks
+    completion; fail-open on any error.
     """
     item = await get_sprint_item(db, item_id)
     _evidence_quality_warning: str | None = None
+    _stored_evidence_warning: str | None = None
     if item is not None and item.get("project_id") == project_id:
         if item.get("require_verification"):
             if verifier_session_id and verification_verdict:
@@ -1493,6 +1651,16 @@ async def complete_sprint_item(
                     _evidence_quality_warning = _check_evidence_quality(_combined_evidence)
                 except Exception:  # noqa: BLE001 — heuristic must never block completion
                     _evidence_quality_warning = None
+        # 1ec33edf — mechanical stored-evidence check: runs for ALL completions
+        # (not just required_notes), because a declared touches_resources or
+        # linked task_id that does not actually exist is a thin-evidence signal
+        # regardless of whether the item was gated.
+        try:
+            _stored_evidence_warning = await _check_stored_evidence(
+                db, item, task_id, notes
+            )
+        except Exception:  # noqa: BLE001 — never block completion
+            _stored_evidence_warning = None
     result = await _update_sprint_item_status(
         db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
         expected_statuses=_ACTIVE_SPRINT_STATUSES,
@@ -1500,9 +1668,12 @@ async def complete_sprint_item(
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
         await _advance_task_chain(db, project_id, item_id)
-        if _evidence_quality_warning:
+        if _evidence_quality_warning or _stored_evidence_warning:
             result = dict(result)
-            result["evidence_quality_warning"] = _evidence_quality_warning
+            if _evidence_quality_warning:
+                result["evidence_quality_warning"] = _evidence_quality_warning
+            if _stored_evidence_warning:
+                result["stored_evidence_warning"] = _stored_evidence_warning
     return result
 
 
