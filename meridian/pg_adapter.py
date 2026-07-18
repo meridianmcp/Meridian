@@ -3314,6 +3314,22 @@ async def _migrate_pg_handoff_tokens(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_required_tool(conn: PostgresConnection) -> None:
+    """4d1fb28f — sprint_items.required_tool: item-level MCP tool/plugin pin
+    (mirrors SQLite).
+
+    Nullable free-form TEXT; NULL = no pin, ordinary executor discretion.
+    When set, it's rendered as a hard ``<required_tool>`` directive in the
+    /goal block (handoff._build_quick_start_goal / build_item_briefing).
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db._migrate_sprint_item_required_tool.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS required_tool TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3397,4 +3413,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_require_verification,
     _migrate_pg_sprint_item_verifications_table,
     _migrate_pg_proposal_github_issue,
+    _migrate_pg_sprint_item_required_tool,
 )

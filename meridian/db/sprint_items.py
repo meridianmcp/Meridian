@@ -715,6 +715,7 @@ async def add_sprint_item(
     wave: str | None = None,
     sprint_name: str | None = None,
     prospect_bypass: bool = False,
+    required_tool: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -739,6 +740,11 @@ async def add_sprint_item(
     ``sprint_name`` (3d6bd938) is a nullable human-readable label for the sprint
     bucket (e.g. 'docs-cloudflare'), kept separate from ``version`` which should
     stay a structural/semver-like identifier. NULL means no separate name.
+    ``required_tool`` (4d1fb28f) is a nullable free-form pin naming the specific
+    MCP tool/plugin the executor MUST use for this item (e.g. 'Serena:
+    replace_symbol_body'). NULL means ordinary executor discretion. When set,
+    it is rendered as a hard directive (not a hint) in the /goal block built by
+    ``handoff._build_quick_start_goal`` / ``build_item_briefing``.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
     is compared (word-set overlap, see ``_title_word_overlap``) against every
@@ -814,13 +820,13 @@ async def add_sprint_item(
         "(id, project_id, version, title, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
         "deferred_until, track, priority, blocker_kind, wave, sprint_name, "
-        "prospect_bypass) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "prospect_bypass, required_tool) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
          priority, blocker_kind or None, wave or None, sprint_name or None,
-         1 if prospect_bypass else 0),
+         1 if prospect_bypass else 0, required_tool or None),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -1830,6 +1836,14 @@ async def claim_sprint_item(
     because a superseded item's id can still reach an executor directly (a
     stale goal block, prior session memory) even when it never appears in a
     fresh listing.
+
+    4d1fb28f — ``required_tool`` (when set via ``update_sprint_item`` /
+    ``add_sprint_item``) is NOT a claim-time gate — it's advisory guidance,
+    not an enforced block, because Meridian cannot verify which tool an
+    executor actually invokes. It flows through on the returned dict (this
+    function's result is a full ``get_sprint_item`` row) so a caller that
+    claims directly (bypassing /goal's rendered ``<required_tool>``
+    directive) still sees the pin and can honour it.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
@@ -2054,13 +2068,15 @@ async def patch_sprint_item(
     prospect_bypass: Any = _UNSET,
     depends_on: Any = _UNSET,
     require_verification: Any = _UNSET,
+    required_tool: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
     item_group, touches_resources, required_notes, deferred_until, track,
     priority, blocker_kind, sprint_name, prospect_bypass, depends_on,
-    require_verification. Only fields passed as non-None are changed;
+    require_verification, required_tool. Only fields passed as non-None are
+    changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
     so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
@@ -2095,6 +2111,11 @@ async def patch_sprint_item(
     then requires an on-file PASS filed by a session distinct from the one
     completing it), or ``False`` / ``0`` to CLEAR it (ordinary completion,
     evidence gate only).
+    ``required_tool`` (4d1fb28f) uses the ``_UNSET`` sentinel: omit to leave
+    unchanged, pass an empty string / ``None`` to CLEAR the pin (ordinary
+    executor discretion), or a free-form tool/plugin name (e.g. 'Serena:
+    replace_symbol_body') to SET it — rendered as a hard directive in the
+    /goal block, not left to executor habit.
     """
     # 6a17e735 / ARCH 1B — separate the status change (routed through
     # _transition_status for guaranteed cache bust + live event) from the
@@ -2220,6 +2241,13 @@ async def patch_sprint_item(
         # (ordinary completion, evidence gate only). Stored as INTEGER 0/1.
         ns_fields.append("require_verification = ?")
         ns_values.append(1 if require_verification else 0)
+    if required_tool is not _UNSET:
+        # 4d1fb28f — empty string / None CLEARS the pin (ordinary executor
+        # discretion); any other value sets the free-form required-tool name.
+        # No enum: tool/plugin names are arbitrary strings ('Serena:
+        # replace_symbol_body', a named tunnel plugin, 'meridian__patch_file').
+        ns_fields.append("required_tool = ?")
+        ns_values.append(required_tool or None)
 
     if not ns_fields and status_value is None:
         return await get_sprint_item(db, item_id)

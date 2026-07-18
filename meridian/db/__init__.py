@@ -1079,6 +1079,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_require_verification(db)
     await _migrate_sprint_item_verifications_table(db)
     await _migrate_proposal_github_issue(db)
+    await _migrate_sprint_item_required_tool(db)
     return db
 
 

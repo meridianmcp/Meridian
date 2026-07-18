@@ -950,6 +950,9 @@ def _build_quick_start_goal(
         # project has model_tier_hints_enabled on AND at least one item carries a
         # suggested_model annotation. Hint only — not an enforced model switch.
         + _build_model_hints_clause(pending_sprint_items, enabled=model_tier_hints)
+        # 4d1fb28f — item-level tool/plugin pin: hard guidance, unconditional
+        # (unlike the model-tier hint above, which is opt-in and soft).
+        + _build_required_tool_clause(pending_sprint_items)
         + f"{_manual_note}"
         f"{_excluded_unprospected_note}"
         f"{_excluded_wave_gate_note}"
@@ -981,6 +984,35 @@ def _build_model_hints_clause(
         + "; ".join(hints)
     )
     return f"\n<model_hints>{_xml_escape(body)}</model_hints>"
+
+
+def _build_required_tool_clause(items: list[dict[str, Any]]) -> str:
+    """4d1fb28f — build a ``<required_tool>`` XML clause for the /goal block.
+
+    Refiled from a stuck original attempt (3a92ad62), tied to GitHub issue
+    #8/#13: a planner can pin the specific MCP tool/plugin an item MUST use
+    (via ``update_sprint_item(required_tool=...)`` / ``add_sprint_item``)
+    instead of leaving tool choice to executor habit.
+
+    UNLIKE ``_build_model_hints_clause`` (a soft hint, gated behind an opt-in
+    ``model_tier_hints`` flag), this is rendered UNCONDITIONALLY whenever any
+    pending item carries a ``required_tool`` pin — it's hard guidance, not a
+    suggestion the executor can weigh and skip. Returns an empty string when
+    no item in the batch has a pin set, so it never adds noise to an ordinary
+    /goal.
+    """
+    pins = [
+        f"{it['id']}: {it['required_tool']}"
+        for it in items
+        if it.get("id") and it.get("required_tool")
+    ]
+    if not pins:
+        return ""
+    body = (
+        "The following sprint items MUST use the named tool/plugin — this is "
+        "a hard requirement, not a suggestion: " + "; ".join(pins)
+    )
+    return f"\n<required_tool>{_xml_escape(body)}</required_tool>"
 
 
 def build_item_briefing(
@@ -1035,6 +1067,7 @@ def build_item_briefing(
     depends_on = (item.get("depends_on") or "").strip()
     blocker_kind = (item.get("blocker_kind") or "").strip()
     milestone_type = (item.get("milestone_type") or "task").strip()
+    required_tool = (item.get("required_tool") or "").strip()
 
     # Render the touches_resources field as a readable list of paths/identifiers.
     raw_resources = item.get("touches_resources")
@@ -1128,6 +1161,19 @@ def build_item_briefing(
     ]
     if resources_text:
         parts.append(f"<resources>{_xml_escape(resources_text)}</resources>")
+    # 4d1fb28f — item-level tool/plugin pin: rendered as a dedicated, hard
+    # directive tag (not folded into <task> prose) so it reaches the executor
+    # as guidance it cannot skim past, mirroring the batch /goal's
+    # <required_tool> clause (_build_required_tool_clause).
+    if required_tool:
+        parts.append(
+            "<required_tool>"
+            + _xml_escape(
+                f"This item MUST use the following tool/plugin — this is a "
+                f"hard requirement, not a suggestion: {required_tool}"
+            )
+            + "</required_tool>"
+        )
     parts += [
         f"<completion_criteria>{_xml_escape(completion_text)}</completion_criteria>",
         f"<not_done_until>{_xml_escape(not_done_text)}</not_done_until>",

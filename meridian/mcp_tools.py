@@ -1292,7 +1292,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "blocker_kind": {"type": "string", "enum": ["manual", "superseded"],
                           "description": "2282a636 — omit for an ordinary item; 'manual' marks the item as blocked on a REAL-WORLD action OUTSIDE Meridian (publish something, obtain an API key, talk to an advisor). DISTINCT from milestone_type='human' (which is about WHO executes): a manual-blocker item is surfaced distinctly and is EXCLUDED from executor 'just claim the next pending' scoping, so an executor never treats it as claimable work. f89d440f — 'superseded' marks the item's premise as replaced by other work (e.g. a workspace proposal); UNLIKE 'manual' this is a HARD gate — claim_sprint_item refuses it outright even on a direct claim by item_id, not just a listing exclusion."},
          "wave": {"type": "string",
-                  "description": "58a45b92 — stored, deterministic wave/batch label (e.g. 'wave-1') for enforced wave-a/wave-b grouping. Usually auto-filled by assign_sprint_waves from the conflict-free parallel groups; set it here only to pin an item to a specific wave up front. Omit to leave unassigned."}},
+                  "description": "58a45b92 — stored, deterministic wave/batch label (e.g. 'wave-1') for enforced wave-a/wave-b grouping. Usually auto-filled by assign_sprint_waves from the conflict-free parallel groups; set it here only to pin an item to a specific wave up front. Omit to leave unassigned."},
+         "required_tool": {"type": "string",
+                  "description": "4d1fb28f — pin the specific MCP tool/plugin the executor MUST use for this item (e.g. 'Serena: replace_symbol_body', 'meridian__patch_file', a named tunnel plugin) instead of leaving tool choice to executor habit. Rendered as a hard directive in the /goal block (not a soft hint) — see build_item_briefing / the batch /goal's <required_tool> clause. Omit for ordinary executor discretion."}},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -1350,7 +1352,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "depends_on": {"type": "string",
                         "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."},
          "require_verification": {"type": "boolean",
-                             "description": "e2e1b682 — set true to require an independent fresh-session PASS (see complete_sprint_item's verifier_session_id/verification_verdict) before the item can be completed. A same-session self-report does not satisfy this gate. Set false to re-enable ordinary completion (evidence gate only). Omit to leave unchanged."}},
+                             "description": "e2e1b682 — set true to require an independent fresh-session PASS (see complete_sprint_item's verifier_session_id/verification_verdict) before the item can be completed. A same-session self-report does not satisfy this gate. Set false to re-enable ordinary completion (evidence gate only). Omit to leave unchanged."},
+         "required_tool": {"type": "string",
+                  "description": "4d1fb28f — pin (or re-pin) the specific MCP tool/plugin the executor MUST use for this item, rendered as a hard directive in the /goal block — not left to executor habit. Pass an empty string to CLEAR the pin (ordinary executor discretion); omit to leave unchanged."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "

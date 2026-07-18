@@ -141,6 +141,7 @@ async def handle_add_sprint_item(
             blocker_kind=args.get("blocker_kind"),
             wave=args.get("wave"),
             sprint_name=args.get("sprint_name"),
+            required_tool=args.get("required_tool"),
         )
     except ValueError as exc:
         # 501ec93f — malformed touches_resources identifier; also e08fee30 /
@@ -363,6 +364,12 @@ async def handle_update_sprint_item(
     # False/0/null clears it (ordinary completion, evidence gate only).
     if "require_verification" in args:
         _patch_kwargs["require_verification"] = args.get("require_verification")
+    # 4d1fb28f — set/clear the required_tool pin. Only forward when the caller
+    # supplied the key (_UNSET sentinel), so omitting it leaves the stored
+    # value untouched; pass "" / null to clear (ordinary executor discretion),
+    # or a tool/plugin name to pin it — rendered as hard /goal guidance.
+    if "required_tool" in args:
+        _patch_kwargs["required_tool"] = args.get("required_tool")
     try:
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"], **_patch_kwargs
