@@ -900,6 +900,22 @@ async def test_docs_mcp_tools_matches_live_tool_doc():
     assert actual.rstrip() == expected.rstrip()
 
 
+@pytest.mark.asyncio
+async def test_docs_api_reference_matches_live_doc():
+    """docs/api-reference.md must match api_reference_doc() output.
+
+    The Route Inventory section is derived from the live FastAPI route table.
+    This test mirrors test_docs_mcp_tools_matches_live_tool_doc: if routes are
+    added/removed without regenerating the doc, CI fails via this test AND via
+    the docs-check job in test.yml.
+    """
+    expected = await server_module.api_reference_doc()
+    actual = (
+        Path(__file__).resolve().parents[1] / "docs" / "api-reference.md"
+    ).read_text(encoding="utf-8")
+    assert actual.rstrip() == expected.rstrip()
+
+
 # ---------------------------------------------------------------------------
 # v0.2.0: pending-hitl, dashboard, chat, WebSocket
 # ---------------------------------------------------------------------------
