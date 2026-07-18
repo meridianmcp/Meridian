@@ -1078,6 +1078,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_custom_hooks(db)
     await _migrate_sprint_item_require_verification(db)
     await _migrate_sprint_item_verifications_table(db)
+    await _migrate_proposal_github_issue(db)
     return db
 
 
@@ -10326,6 +10327,7 @@ from .workspace import (  # noqa: F401
     get_workspace_proposals,
     advance_workspace_proposal_status,
     promote_workspace_proposal,
+    set_proposal_github_issue,
     delete_workspace_proposal,
     # Public workspace sprint-board functions
     add_workspace_sprint_item,

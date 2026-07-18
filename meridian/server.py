@@ -2377,7 +2377,8 @@ async def _notify_project(
 
 
 async def _on_hitl_answered(
-    db: Any, request_row: dict[str, Any], *, approved: bool
+    db: Any, request_row: dict[str, Any], *, approved: bool,
+    tenant: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Side-effect for an answered/dismissed HITL request.
 
@@ -2386,8 +2387,60 @@ async def _on_hitl_answered(
     checkpoint via :func:`_finalize_session_md`). Never raises — any failure is
     returned as ``apply_error`` so the answer itself still succeeds. Legacy
     ``'question'`` requests are a no-op.
+
+    ``tenant`` (the answering caller's tenant dict, carrying ``github_pat``) is
+    optional and only consumed by ``kind='proposal_github_issue'`` — see below.
     """
     kind = (request_row or {}).get("kind")
+
+    if kind == "proposal_github_issue":
+        # 3999d90f — conditional proposal-to-GitHub-issue workflow. The HITL
+        # was filed by promote_workspace_proposal; here (on answer) is where
+        # the issue actually gets filed and written back onto the proposal,
+        # since only this layer has GitHub tool + tenant PAT access.
+        if not approved:
+            return {"applied": False, "reason": "rejected"}
+        raw = request_row.get("payload")
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            return {"applied": False, "apply_error": "payload is not valid JSON"}
+        answer = (request_row.get("answer") or "").strip().lower()
+        if not answer.startswith("yes"):
+            return {"applied": False, "reason": "declined"}
+        proposal_id = payload.get("proposal_id")
+        gh_project_id = payload.get("project_id")
+        issue_title = payload.get("issue_title")
+        issue_body = payload.get("issue_body") or ""
+        if not proposal_id or not gh_project_id or not issue_title:
+            return {"applied": False, "apply_error": "payload missing proposal_id/project_id/issue_title"}
+        if not tenant:
+            return {"applied": False, "reason": "no_tenant_context"}
+        try:
+            # Lazy import — mcp.handler imports meridian.server at module
+            # level, so importing it back at module level here would cycle.
+            from .mcp.handler import _dispatch_github_tool  # noqa: PLC0415
+
+            gh_result = await _dispatch_github_tool(
+                "create_issue",
+                {"project_id": gh_project_id, "title": issue_title, "body": issue_body},
+                tenant, db,
+            )
+        except Exception as exc:  # noqa: BLE001 — never crash the answer flow
+            return {"applied": False, "apply_error": f"github issue creation failed: {exc}"}
+        if not isinstance(gh_result, dict) or gh_result.get("error"):
+            err = gh_result.get("error") if isinstance(gh_result, dict) else "unknown error"
+            return {"applied": False, "apply_error": str(err)}
+        issue_number = gh_result.get("number")
+        issue_url = gh_result.get("html_url")
+        try:
+            await db_module.set_proposal_github_issue(
+                db, proposal_id, issue_number, issue_url,
+                tenant_id=(tenant.get("id") if isinstance(tenant, dict) else None),
+            )
+        except Exception as exc:  # noqa: BLE001 — never crash the answer flow
+            return {"applied": False, "apply_error": f"failed to persist issue on proposal: {exc}"}
+        return {"applied": True, "github_issue_number": issue_number, "github_issue_url": issue_url}
 
     if kind == "hook_project_select" and approved:
         # Store hostname → project mapping so future hooks auto-route
@@ -2450,19 +2503,24 @@ async def _answer_hitl_and_apply(
     *,
     answered_by: str | None = None,
     approved: bool = True,
+    tenant: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """The ONLY correct way to answer a HITL request — stores the answer then
     runs :func:`_on_hitl_answered`. Both the ``answer_hitl`` MCP tool and the
     route ``PATCH /hitl/{id}`` funnel through here so an ``md_section_update`` is
     applied exactly once. Returns the (possibly enriched) row, or ``None`` when
     the request was not found.
+
+    ``tenant`` is forwarded to :func:`_on_hitl_answered` — required for
+    ``kind='proposal_github_issue'`` to file the GitHub issue with the
+    caller's PAT; other kinds ignore it.
     """
     row = await db_module.answer_hitl_request(
         db, request_id, answer, answered_by=answered_by
     )
     if row is None:
         return None
-    extra = await _on_hitl_answered(db, row, approved=approved)
+    extra = await _on_hitl_answered(db, row, approved=approved, tenant=tenant)
     return {**row, **extra}
 
 

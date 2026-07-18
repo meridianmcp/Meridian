@@ -2703,6 +2703,7 @@ async def _handle_hitl_tools(
         result = await _server._answer_hitl_and_apply(
             db, args["request_id"], args["answer"],
             answered_by=args.get("answered_by"), approved=True,
+            tenant=tenant,
         )
         if result is None:
             raise ValueError("hitl request not found")

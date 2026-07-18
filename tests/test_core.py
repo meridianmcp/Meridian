@@ -7477,10 +7477,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_custom_hooks",
         "_migrate_pg_sprint_item_require_verification",
         "_migrate_pg_sprint_item_verifications_table",
+        "_migrate_pg_proposal_github_issue",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 116
+    assert len(allnames) == len(set(allnames)) == 117
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

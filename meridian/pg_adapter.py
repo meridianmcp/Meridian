@@ -3201,6 +3201,27 @@ async def _migrate_pg_custom_hooks(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_proposal_github_issue(conn: PostgresConnection) -> None:
+    """3999d90f — workspace_proposals.github_issue_number + .github_issue_url.
+
+    Storage for the "also file a GitHub issue?" conditional HITL workflow:
+    promote_workspace_proposal fires a HITL when a code-related proposal is
+    promoted under a project with a connected GitHub repo; if answered yes,
+    the created issue's number/URL is persisted back onto the proposal here
+    via set_proposal_github_issue. Both columns nullable — most proposals
+    never go through this path.
+
+    Mirrors db._migrate_proposal_github_issue. ADD COLUMN IF NOT EXISTS is
+    idempotent.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
+        "github_issue_number INTEGER;"
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
+        "github_issue_url TEXT"
+    )
+
+
 async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> None:
     """94c26322 — human-set bypass flag for the prospecting safety gate.
 
@@ -3375,4 +3396,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_custom_hooks,
     _migrate_pg_sprint_item_require_verification,
     _migrate_pg_sprint_item_verifications_table,
+    _migrate_pg_proposal_github_issue,
 )

@@ -488,7 +488,8 @@ async def promote_workspace_proposal(
             "Only 'raw' or 'investigating' proposals can be promoted."
         )
     # Verify the target project exists.
-    if await get_project(db, project_id) is None:
+    project = await get_project(db, project_id)
+    if project is None:
         raise ValueError(f"Project '{project_id}' not found")
     title = sprint_item_title or proposal["title"]
     version = sprint_item_version or "current"
@@ -533,14 +534,97 @@ async def promote_workspace_proposal(
         [proposal_id, *scope_params],
     ) as cur:
         row = await cur.fetchone()
+    promoted_proposal = _row_to_dict(row)
+
+    # 3999d90f — conditional proposal-to-GitHub-issue workflow via HITL. When
+    # the promoted proposal is code-related (the same inferred-resources
+    # signal used for touches_resources above) AND the target project has a
+    # GitHub repo connected, ask a human whether to also file a GitHub issue
+    # for it. Fire-and-forget: request_hitl either auto-answers (safe/normal
+    # mode) or sits pending for a human. Either way the answer is consumed by
+    # _on_hitl_answered's 'proposal_github_issue' handler, which files the
+    # issue via the GitHub tool and calls set_proposal_github_issue to store
+    # the number/URL back on this proposal — never done inline here, since
+    # this module has no GitHub API / tenant-PAT access.
+    github_issue_hitl: dict[str, Any] | None = None
+    is_code_related = bool(inferred)
+    github_repo = (project.get("github_repo") or "").strip()
+    if is_code_related and github_repo:
+        # Lazy import: request_hitl lives in meridian.db (defined after this
+        # module is imported by it) — see the identical pattern in
+        # sprint_items.py's _maybe_file_chain_handoff.
+        from meridian.db import request_hitl  # noqa: PLC0415
+
+        yes_option = "Yes — file a GitHub issue"
+        no_option = "No — skip"
+        github_issue_hitl = await request_hitl(
+            db, project_id,
+            question=(
+                f"Proposal '{title}' was promoted to sprint item {si_id} and looks "
+                f"code-related (matched files in {github_repo}). Also file a GitHub issue for it?"
+            ),
+            context=(
+                f"Proposal {proposal_id} -> sprint item {si_id}. "
+                f"Repo: {github_repo}. If yes, an issue titled {title!r} is filed "
+                f"and its number/URL are stored back on the proposal."
+            ),
+            urgency="normal",
+            kind="proposal_github_issue",
+            options=[yes_option, no_option],
+            recommended=yes_option,
+            payload=json.dumps({
+                "proposal_id": proposal_id,
+                "sprint_item_id": si_id,
+                "project_id": project_id,
+                "github_repo": github_repo,
+                "issue_title": title,
+                "issue_body": (
+                    f"{proposal_body}\n\n---\nFiled from Meridian proposal "
+                    f"{proposal_id} / sprint item {si_id}."
+                ),
+            }),
+        )
+
     return {
-        "proposal": _row_to_dict(row),
+        "proposal": promoted_proposal,
         "sprint_item_id": si_id,
         "sprint_item_title": title,
         "project_id": project_id,
         "sprint_item_touches_resources": resources_json,
         "sprint_item_notes": item_notes,
+        "github_issue_hitl": github_issue_hitl,
     }
+
+
+async def set_proposal_github_issue(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    issue_number: int | None,
+    issue_url: str | None,
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """3999d90f — persist a filed GitHub issue's number/URL back onto a proposal.
+
+    The write side of the conditional proposal-to-GitHub-issue HITL workflow:
+    called by _on_hitl_answered (meridian/server.py) once a
+    ``kind='proposal_github_issue'`` HITL is answered affirmatively and the
+    issue has been created via the GitHub tool. Returns the updated proposal,
+    or None if not found / wrong tenant scope."""
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    scope_sql = f" AND {scope}" if scope else ""
+    await db.execute(
+        f"UPDATE workspace_proposals SET github_issue_number = ?, "
+        f"github_issue_url = ?, updated_at = datetime('now') "
+        f"WHERE id = ?{scope_sql}",
+        [issue_number, issue_url, proposal_id, *scope_params],
+    )
+    await db.commit()
+    async with db.execute(
+        f"SELECT * FROM workspace_proposals WHERE id = ?{scope_sql}",
+        [proposal_id, *scope_params],
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
 
 
 async def delete_workspace_proposal(
