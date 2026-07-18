@@ -197,11 +197,17 @@ jobs:
           pixi-version: latest
           cache: false
       - run: pixi install
-      - name: Regenerate MCP tool docs
+      - name: Regenerate MCP tool docs and API reference
         run: pixi run python scripts/gen_docs.py
       - name: Fail if docs/mcp-tools.md is stale
         run: |
           if ! git diff --exit-code docs/mcp-tools.md; then
             echo "ERROR: docs/mcp-tools.md is out of date. Run 'pixi run python scripts/gen_docs.py' and commit the result."
+            exit 1
+          fi
+      - name: Fail if docs/api-reference.md is stale
+        run: |
+          if ! git diff --exit-code docs/api-reference.md; then
+            echo "ERROR: docs/api-reference.md is out of date. Run 'pixi run python scripts/gen_docs.py' and commit the result."
             exit 1
           fi

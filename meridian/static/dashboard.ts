@@ -7291,7 +7291,8 @@ async function loadDocsTab(projectId: any) {
 
 
 
-// Code Intel tab — show only when tunnel:code socket is live.
+// Code Intel tab — show when tunnel:code OR tunnel:outputs socket is live.
+// e2688fc1 — extended to also surface the meridian-outputs indexing state.
 // Called once per project panel after vtab strip is wired.
 async function _initCodeIntelTabVisibility(projectId: any) {
   if (!window.MERIDIAN_HOSTED) return;
@@ -7299,7 +7300,7 @@ async function _initCodeIntelTabVisibility(projectId: any) {
     const data = await api('/tunnel/plugins');
     const btn = document.getElementById(`vtab-codeintel-${projectId}`);
     if (!btn) return;
-    const isActive = !!(data && data.active && data.active.code);
+    const isActive = !!(data && data.active && (data.active.code || data.active.outputs));
     btn.style.display = isActive ? '' : 'none';
   } catch (_) {}
 }
@@ -8026,8 +8027,12 @@ async function loadCodeIntelTab(projectId: any) {
       loadProjectSettings(projectId),
     ]);
 
-    if (!pluginsData?.active?.code) {
-      body.innerHTML = '<div class="empty" style="color:var(--muted)">Code intel tunnel is not active. Run <code>meridian --tunnel</code> to connect it.</div>';
+    // e2688fc1 — gate on EITHER code OR outputs being active; each section
+    // degrades independently if its own slot is not connected.
+    const _codeActive = !!(pluginsData?.active?.code);
+    const _outputsActive = !!(pluginsData?.active?.outputs);
+    if (!_codeActive && !_outputsActive) {
+      body.innerHTML = '<div class="empty" style="color:var(--muted)">No tunnel slots are active. Run <code>meridian --tunnel</code> to connect code-intel and/or outputs indexing.</div>';
       return;
     }
 
@@ -8038,6 +8043,7 @@ async function loadCodeIntelTab(projectId: any) {
     }
 
     const codeBase = `/code/mcp/${tenantId}/mcp`;
+    const _outputsBase = `/outputs/mcp/${tenantId}/mcp`;
 
     async function _codeMcpCall(method: any, params: any) {
       const r = await fetch(codeBase, {
@@ -8062,12 +8068,38 @@ async function loadCodeIntelTab(projectId: any) {
       return parsed.result;
     }
 
-    // Verify live + count available tools
+    // e2688fc1 — identical JSON-RPC helper for the meridian-outputs tunnel proxy.
+    async function _outputsMcpCall(method: any, params: any) {
+      const r = await fetch(_outputsBase, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'},
+        body: JSON.stringify({jsonrpc: '2.0', id: 1, method, params: params || {}}),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const text = await r.text();
+      let parsed = null;
+      if (text.trim().startsWith('{')) {
+        parsed = JSON.parse(text);
+      } else {
+        for (const line of text.split('\n')) {
+          if (line.startsWith('data:')) {
+            try { parsed = JSON.parse(line.slice(5).trim()); } catch (_) {}
+          }
+        }
+      }
+      if (!parsed) throw new Error('empty response from outputs MCP');
+      if (parsed.error) throw new Error(parsed.error.message || String(parsed.error));
+      return parsed.result;
+    }
+
+    // Verify live + count available tools (only when code slot is active).
     let toolCount = 0;
-    try {
-      const tlResult = await _codeMcpCall('tools/list', {});
-      toolCount = (tlResult?.tools || []).length;
-    } catch (_) {}
+    if (_codeActive) {
+      try {
+        const tlResult = await _codeMcpCall('tools/list', {});
+        toolCount = (tlResult?.tools || []).length;
+      } catch (_) {}
+    }
 
     const execCfg = settingsData?.executor_config || {};
     const repoPaths = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
@@ -8082,12 +8114,22 @@ async function loadCodeIntelTab(projectId: any) {
     let _archError = '';     // ff8ff615 — arch fetch error → panel error state
     const _cgId = `ci-forcegraph-${projectId}`;
 
-    // Live indicator
-    html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
-      <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
-      <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
-      ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? 's' : ''}</span>` : ''}
-    </div>`;
+    // Live indicator — show separate dots for each active slot.
+    html += `<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">`;
+    if (_codeActive) {
+      html += `<span style="display:inline-flex;align-items:center;gap:6px">
+        <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
+        <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
+        ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? 's' : ''}</span>` : ''}
+      </span>`;
+    }
+    if (_outputsActive) {
+      html += `<span style="display:inline-flex;align-items:center;gap:6px">
+        <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
+        <span style="font-size:11px;color:var(--text);font-weight:600">Outputs Live</span>
+      </span>`;
+    }
+    html += `</div>`;
 
     // 3e28f593 — Resources: unified codebase + documents summary so the scattered
     // repo-path / document fields have one coherent view (which repo(s) this
@@ -8107,84 +8149,146 @@ async function loadCodeIntelTab(projectId: any) {
       </div>
     </div>`;
 
-    // fa9c9abd — the new hierarchical drill-down (ed5512b6) LEADS: injected first so
-    // it renders above the older flat layered panel. A live screenshot suggested the
-    // new codegraph was "unreachable"; it was actually wired and rendering, just below
-    // the old panel. Both mounts below resolve their container by id, so DOM order is
-    // set purely by this html-build order — reordering here is safe.
-    // ed5512b6 — the standalone codegraph visualizer (folder->file->function
-    // drill-down, color by role, static metadata on click). Mounted after
-    // body.innerHTML via the thin adapter below; the module never reaches back
-    // into the dashboard — data flows in only.
-    html += `<div style="margin-bottom:16px">
-      <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Code Tree</div>
-      <div id="${_cgId}-codegraph"></div>
-    </div>`;
+    // e2688fc1 — code-intel sections are gated on _codeActive; degraded gracefully when
+    // only the outputs slot is live (tunnel:code not connected).
+    if (_codeActive) {
+      // fa9c9abd — the new hierarchical drill-down (ed5512b6) LEADS: injected first so
+      // it renders above the older flat layered panel. A live screenshot suggested the
+      // new codegraph was "unreachable"; it was actually wired and rendering, just below
+      // the old panel. Both mounts below resolve their container by id, so DOM order is
+      // set purely by this html-build order — reordering here is safe.
+      // ed5512b6 — the standalone codegraph visualizer (folder->file->function
+      // drill-down, color by role, static metadata on click). Mounted after
+      // body.innerHTML via the thin adapter below; the module never reaches back
+      // into the dashboard — data flows in only.
+      html += `<div style="margin-bottom:16px">
+        <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Code Tree</div>
+        <div id="${_cgId}-codegraph"></div>
+      </div>`;
 
-    // ff8ff615 — the Preact CodeIntelPanel renders the layered package DAG +
-    // zoom + Generate Map into this mount point (mounted after body.innerHTML).
-    html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
+      // ff8ff615 — the Preact CodeIntelPanel renders the layered package DAG +
+      // zoom + Generate Map into this mount point (mounted after body.innerHTML).
+      html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
 
-    // Index status per repo path
-    html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
-    if (repoPaths.length) {
-      for (const rp of repoPaths) {
-        const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
-        const hostname = typeof rp === 'object' ? (rp.hostname || '') : '';
-        if (!cwd) continue;
-        try {
-          const result = await _codeMcpCall('tools/call', {name: 'index_status', arguments: {project: _repoPathToProject(cwd)}});
-          const text = (result?.content || []).map((c: any) => c.text || '').join('').trim();
-          html += `<div style="margin-bottom:10px">
-            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> · ${escapeHtml(hostname)}</span>` : ''}</div>
-            <pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(text || '(no status returned)')}</pre>
-          </div>`;
-        } catch (e: any) {
-          html += `<div style="margin-bottom:10px">
-            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}</div>
-            <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e))}</div>
-          </div>`;
+      // Index status per repo path
+      html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
+      if (repoPaths.length) {
+        for (const rp of repoPaths) {
+          const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
+          const hostname = typeof rp === 'object' ? (rp.hostname || '') : '';
+          if (!cwd) continue;
+          try {
+            const result = await _codeMcpCall('tools/call', {name: 'index_status', arguments: {project: _repoPathToProject(cwd)}});
+            const text = (result?.content || []).map((c: any) => c.text || '').join('').trim();
+            html += `<div style="margin-bottom:10px">
+              <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> · ${escapeHtml(hostname)}</span>` : ''}</div>
+              <pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(text || '(no status returned)')}</pre>
+            </div>`;
+          } catch (e: any) {
+            html += `<div style="margin-bottom:10px">
+              <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}</div>
+              <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e))}</div>
+            </div>`;
+          }
         }
+      } else {
+        html += `<div style="font-size:10px;color:var(--muted)">No repo paths configured. Add them in Settings → Executor Config to see index status.</div>`;
+      }
+      html += '</div>';
+
+      // Architecture summary
+      html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Architecture Summary</div>`;
+      try {
+        const archPath = repoPaths.length ? (typeof repoPaths[0] === 'string' ? repoPaths[0] : (repoPaths[0].cwd || '')) : '';
+        const archArgs = archPath ? {project: _repoPathToProject(archPath)} : {};
+        const archResult = await _codeMcpCall('tools/call', {name: 'get_architecture', arguments: archArgs});
+        const archText = (archResult?.content || []).map((c: any) => c.text || '').join('').trim();
+        const archSection = _codeArchSection(archText);
+        html += archSection.html;
+        archCharts = archSection.charts;
+        // 65742e42 — capture packages + fetch cross-package edges for the force-graph.
+        try {
+          const _arch = JSON.parse(archText);
+          _graphArch = _arch;
+          // 20d17e08 — join the separate layers list onto packages so the force-graph
+          // colours by layer instead of one "other" bucket (no-op if no join exists).
+          _graphPackages = _resolvePackageLayers(_arch?.packages, _arch?.layers);
+        } catch (_) { _graphPackages = []; }
+        if (_graphPackages.length) {
+          try {
+            const _edgeRes = await _codeMcpCall('tools/call', {name: 'query_graph', arguments: {
+              ...archArgs,
+              cypher: 'MATCH (a)-[r]->(b) WHERE a.package <> b.package RETURN a.package, b.package, count(r)',
+            }});
+            _graphEdges = _normalizeGraphEdges(_edgeRes);
+          } catch (_) { _graphEdges = []; }  // nodes-only graph still renders
+        }
+      } catch (e: any) {
+        _archError = String(e);
+        html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
+      }
+      html += `</div>`;
+    } else {
+      // Only outputs is active — show a friendly note that code-intel is disconnected.
+      html += `<div style="margin-bottom:16px;padding:10px 12px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;font-size:11px;color:var(--muted)">
+        Code-intel tunnel not connected. Run <code>meridian --tunnel</code> with the code slot enabled to see architecture visualization and index status.
+      </div>`;
+    }
+
+    // e2688fc1 — Outputs Index section: fetches indexing state from the meridian-outputs
+    // tunnel proxy. Always rendered; degrades gracefully when the outputs slot is
+    // not active. Reads outputs_dirs from executor_config (set via set_executor_config).
+    html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Outputs Index</div>`;
+    if (_outputsActive) {
+      // Probe the outputs tunnel: list tools to confirm live.
+      let _outputsToolCount = 0;
+      try {
+        const _otl = await _outputsMcpCall('tools/list', {});
+        _outputsToolCount = (_otl?.tools || []).length;
+      } catch (_) {}
+      html += `<div style="margin-bottom:8px;font-size:10px;color:var(--muted)">${_outputsToolCount} tool${_outputsToolCount !== 1 ? 's' : ''} available via meridian-outputs</div>`;
+
+      const _outputsDirs: string[] = Array.isArray(execCfg.outputs_dirs)
+        ? (execCfg.outputs_dirs as any[]).map(d => String(d || '').trim()).filter(Boolean)
+        : [];
+
+      if (_outputsDirs.length) {
+        for (const odir of _outputsDirs) {
+          html += `<div style="margin-bottom:12px">
+            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(odir)}</div>`;
+          try {
+            // search_outputs with an empty query returns total_indexed without scanning content.
+            const _osResult = await _outputsMcpCall('tools/call', {
+              name: 'search_outputs',
+              arguments: {outputs_dir: odir, query: '', limit: 0},
+            });
+            const _osText = (_osResult?.content || []).map((c: any) => c.text || '').join('').trim();
+            let _totalIndexed: number | null = null;
+            try {
+              const _osParsed = JSON.parse(_osText);
+              if (typeof _osParsed.total_indexed === 'number') _totalIndexed = _osParsed.total_indexed;
+            } catch (_) {}
+            if (_totalIndexed !== null) {
+              html += `<div style="font-size:11px;color:var(--text)"><b>${_totalIndexed}</b> file${_totalIndexed !== 1 ? 's' : ''} indexed</div>`;
+            } else {
+              html += `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(_osText || '(no status returned)')}</pre>`;
+            }
+          } catch (e: any) {
+            html += `<div style="font-size:10px;color:var(--error)">search_outputs failed: ${escapeHtml(String(e))}</div>`;
+          }
+          html += `</div>`;
+        }
+      } else {
+        html += `<div style="font-size:10px;color:var(--muted)">No outputs directories configured. Set <code>outputs_dirs</code> in your executor config (<code>set_executor_config</code>) to see indexing state.</div>`;
       }
     } else {
-      html += `<div style="font-size:10px;color:var(--muted)">No repo paths configured. Add them in Settings → Executor Config to see index status.</div>`;
+      html += `<div style="font-size:10px;color:var(--muted)">Outputs tunnel not connected. Run <code>meridian --tunnel</code> with the outputs slot enabled (meridian-outputs-mcp) to see indexing state.</div>`;
     }
-    html += '</div>';
+    html += `</div>`;
 
-    // Architecture summary
-    html += `<div><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Architecture Summary</div>`;
-    try {
-      const archPath = repoPaths.length ? (typeof repoPaths[0] === 'string' ? repoPaths[0] : (repoPaths[0].cwd || '')) : '';
-      const archArgs = archPath ? {project: _repoPathToProject(archPath)} : {};
-      const archResult = await _codeMcpCall('tools/call', {name: 'get_architecture', arguments: archArgs});
-      const archText = (archResult?.content || []).map((c: any) => c.text || '').join('').trim();
-      const archSection = _codeArchSection(archText);
-      html += archSection.html;
-      archCharts = archSection.charts;
-      // 65742e42 — capture packages + fetch cross-package edges for the force-graph.
-      try {
-        const _arch = JSON.parse(archText);
-        _graphArch = _arch;
-        // 20d17e08 — join the separate layers list onto packages so the force-graph
-        // colours by layer instead of one "other" bucket (no-op if no join exists).
-        _graphPackages = _resolvePackageLayers(_arch?.packages, _arch?.layers);
-      } catch (_) { _graphPackages = []; }
-      if (_graphPackages.length) {
-        try {
-          const _edgeRes = await _codeMcpCall('tools/call', {name: 'query_graph', arguments: {
-            ...archArgs,
-            cypher: 'MATCH (a)-[r]->(b) WHERE a.package <> b.package RETURN a.package, b.package, count(r)',
-          }});
-          _graphEdges = _normalizeGraphEdges(_edgeRes);
-        } catch (_) { _graphEdges = []; }  // nodes-only graph still renders
-      }
-    } catch (e: any) {
-      _archError = String(e);
-      html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
-    }
     html += `<div style="margin-top:8px;display:flex;gap:6px">
       <button class="secondary" style="font-size:10px;padding:3px 10px" onclick="loadCodeIntelTab(${JSON.stringify(projectId)})">↺ Refresh</button>
-    </div></div>`;
+    </div>`;
 
     body.innerHTML = html;
 

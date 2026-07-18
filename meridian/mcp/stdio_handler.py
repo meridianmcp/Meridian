@@ -454,10 +454,15 @@ def build_mcp_server():
                     "writes the complete L0/L1/L2 handoff. mode='delta' "
                     "returns a compact session update with completed items, "
                     "remaining pending items, and the next /goal string. "
-                    "mode='starter' returns a ≤20-line paste-after-/compact "
+                    "mode='starter' returns a <=20-line paste-after-/compact "
                     "block: project_id, start_session command, last 5 done, "
                     "top 3 pending IDs, and a /goal string. "
-                    "mode='planner' gives strategic context for claude.ai."
+                    "mode='planner' gives strategic context for claude.ai. "
+                    "DISPLAY THE RETURNED content FIELD VERBATIM to the user "
+                    "(5234877f) - the server delivers content pre-wrapped in a "
+                    "single 4-backtick code fence so it renders as one "
+                    "copy-pasteable block. Do NOT add extra headers, blockquotes, "
+                    "or fences around it - just output the field value as-is."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2244,7 +2249,10 @@ def build_mcp_server():
                         db, arguments["project_id"], state["data_dir"]
                     )
                     mode = "full"
-                result = {"path": path, "content": content, "mode": mode}
+                # 5234877f — wrap content in one 4-backtick fence (same as the
+                # HTTP/handler.py path) so the field is paste-ready as a single
+                # copy-pasteable block regardless of how the caller renders it.
+                result = {"path": path, "content": f"````\n{content}\n````", "mode": mode}
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.
                 result = await _dispatch_mcp_tool(

@@ -949,10 +949,13 @@ def test_generate_handoff_warns_on_long_goal(tmp_path):
         _run(db.close())
 
 
-def test_generate_handoff_content_is_fence_free(tmp_path):
-    """642b1818 — generate_handoff returns a single plain-text copyable block:
-    markdown code-fence lines are stripped so it pastes cleanly into a fenced
-    chat / dashboard textarea."""
+def test_generate_handoff_content_is_single_fenced_block(tmp_path):
+    """5234877f — generate_handoff content is delivered pre-wrapped in exactly one
+    4-backtick code fence (replacing the 642b1818 strip approach).  The outer fence
+    uses 4 backticks so any nested ``` fences inside the handoff body (e.g. the
+    start_session code block in the Jinja2 template) are rendered as content, not
+    as fence terminators.  Callers must output the field verbatim — no extra headers
+    or blockquotes."""
     import meridian.db as db_module
     db = _make_db()
     try:
@@ -964,7 +967,42 @@ def test_generate_handoff_content_is_fence_free(tmp_path):
             priority="high"))
         out = _run(mh._dispatch_mcp_tool(
             "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
-        assert "```" not in out["content"]
+        content = out["content"]
+        # Must start and end with a 4-backtick fence (exactly one outer wrapper).
+        assert content.startswith("````\n"), (
+            f"content must start with 4-backtick fence, got: {content[:30]!r}")
+        assert content.endswith("\n````"), (
+            f"content must end with 4-backtick fence, got: {content[-30:]!r}")
+        # The inner body (everything between the outer fences) must not start with ````
+        inner = content[5:-5]  # strip leading "````\n" (5 chars) and trailing "\n````" (5 chars)
+        assert not inner.startswith("````"), "no nested 4-backtick fences in the body"
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_content_fence_preserves_inner_triple_backticks(tmp_path):
+    """5234877f — inner ``` fences from the handoff body (e.g. the start_session
+    code block rendered by the Jinja2 template) are preserved verbatim inside the
+    outer 4-backtick fence — they are NOT stripped."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "inner-fence-proj"))
+        _run(db_module.set_goal(db, proj["id"], "", sprint="ship it"))
+        out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
+        content = out["content"]
+        # The outer 4-backtick wrapper is present.
+        assert content.startswith("````\n")
+        assert content.endswith("\n````")
+        # The inner body contains the template's ``` start_session code block.
+        inner = content[5:-5]
+        # The Jinja2 handoff template renders a ```\nstart_session(...)\n``` block
+        # under "## Start a New Session". That inner fence must survive intact.
+        assert "```" in inner, (
+            "inner handoff body must contain the start_session ``` code block; "
+            "if the template changed, update this test accordingly"
+        )
     finally:
         _run(db.close())
 

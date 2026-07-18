@@ -900,6 +900,22 @@ async def test_docs_mcp_tools_matches_live_tool_doc():
     assert actual.rstrip() == expected.rstrip()
 
 
+@pytest.mark.asyncio
+async def test_docs_api_reference_matches_live_doc():
+    """docs/api-reference.md must match api_reference_doc() output.
+
+    The Route Inventory section is derived from the live FastAPI route table.
+    This test mirrors test_docs_mcp_tools_matches_live_tool_doc: if routes are
+    added/removed without regenerating the doc, CI fails via this test AND via
+    the docs-check job in test.yml.
+    """
+    expected = await server_module.api_reference_doc()
+    actual = (
+        Path(__file__).resolve().parents[1] / "docs" / "api-reference.md"
+    ).read_text(encoding="utf-8")
+    assert actual.rstrip() == expected.rstrip()
+
+
 # ---------------------------------------------------------------------------
 # v0.2.0: pending-hitl, dashboard, chat, WebSocket
 # ---------------------------------------------------------------------------
@@ -7455,11 +7471,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_note_nickname",
         "_migrate_pg_sprint_item_prospect_bypass",
         "_migrate_pg_handoff_tokens",
+        "_migrate_pg_wave_gate_results",
         "_migrate_pg_server_logs",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 111
+    assert len(allnames) == len(set(allnames)) == 112
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -16925,6 +16942,91 @@ async def test_get_plugin_details_surfaces_skill_guide(db, tmp_path):
     )
     assert "skill_guide" in result, "skill_guide missing from get_plugin_details"
     assert "Code Intel Guide" in result["skill_guide"]["body"]
+
+
+# ---------------------------------------------------------------------------
+# 3751af82 — list_plugins enabled flag reflects per-tenant config
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_enabled_reflects_tenant_config(db, tmp_path):
+    """3751af82 — list_plugins.enabled must match the tenant's resolved plugin
+    config, not the static BUILTIN_PLUGINS default.
+
+    Opt-in slots (word, powerpoint) have enabled=False in the static defaults.
+    A tenant who has enabled them in tunnel_plugins should see enabled=True —
+    consistent with active/invocable which are derived from live WebSocket state.
+    This test uses no tunnel (so active/invocable stay False), but verifies that
+    enabled reflects the tenant's override rather than the static default.
+    """
+    import json
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    # Tenant with word slot explicitly enabled in their tunnel_plugins config
+    tenant_with_word_enabled = {
+        "id": "test-tenant-3751af82",
+        "tunnel_plugins": json.dumps({"word": {"enabled": True}}),
+        "tunnel_active": 0,
+    }
+
+    result = await _dispatch_mcp_tool(
+        "list_plugins", {}, db, str(tmp_path), tenant=tenant_with_word_enabled
+    )
+    plugins = result["plugins"]
+    word_entry = next((p for p in plugins if p["name"] == "word"), None)
+    assert word_entry is not None, "word plugin entry missing from list_plugins"
+
+    # enabled must reflect the tenant's override (True), not the static default (False)
+    assert word_entry["enabled"] is True, (
+        "word plugin enabled should be True (tenant override) but got "
+        f"{word_entry['enabled']!r} — static BUILTIN_PLUGINS default was used instead"
+    )
+    # active/invocable stay False since no tunnel is connected in this test
+    assert word_entry["active"] is False
+    assert word_entry["invocable"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_enabled_consistent_with_active_invocable(db, tmp_path):
+    """3751af82 — when a plugin slot is enabled=True by tenant config and running
+    (active=True/invocable=True), enabled must not be False from static defaults.
+
+    This test uses no live tunnel, so active/invocable are False. It checks that
+    the enabled flag is consistent with (not contradicting) the tenant's config:
+    a tenant who opted in gets enabled=True regardless of the static default.
+    A tenant without an override gets the resolved default (True for core plugins,
+    False for opt-in ones) — this also verifies no regression on the core slots.
+    """
+    import json
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    # Tenant who enabled powerpoint
+    tenant_ppt = {
+        "id": "test-tenant-ppt-3751af82",
+        "tunnel_plugins": json.dumps({"powerpoint": {"enabled": True}}),
+        "tunnel_active": 0,
+    }
+    result = await _dispatch_mcp_tool(
+        "list_plugins", {}, db, str(tmp_path), tenant=tenant_ppt
+    )
+    ppt = next((p for p in result["plugins"] if p["name"] == "powerpoint"), None)
+    assert ppt is not None
+    assert ppt["enabled"] is True, "powerpoint enabled should reflect tenant override"
+
+    # Tenant with no config — core slots remain enabled=True, opt-in remain False
+    tenant_no_config = {"id": "test-tenant-none-3751af82", "tunnel_active": 0}
+    result2 = await _dispatch_mcp_tool(
+        "list_plugins", {}, db, str(tmp_path), tenant=tenant_no_config
+    )
+    plugins2 = {p["name"]: p for p in result2["plugins"]}
+    # Core slots default to enabled=True
+    assert plugins2["filesystem"]["enabled"] is True
+    assert plugins2["code-intel"]["enabled"] is True
+    assert plugins2["code-extractor"]["enabled"] is True
+    # Opt-in slots default to enabled=False when tenant has no override
+    assert plugins2["word"]["enabled"] is False
+    assert plugins2["powerpoint"]["enabled"] is False
 
 
 # ---------------------------------------------------------------------------

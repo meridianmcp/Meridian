@@ -177,6 +177,52 @@ async def test_get_context_block_not_found(db):
         )
 
 
+@pytest.mark.asyncio
+async def test_get_context_block_xml_envelope_structure(db, project):
+    """4c9f501a — MCP tool surface wraps content in <meridian_context> XML
+    envelope (v2.5+). The 'text' field must open and close with the correct
+    tags so AI clients can parse it structurally. This test pins the actual
+    behavior so the docstring can never silently drift back to claiming plain-text."""
+    result = await st_mod.handle_get_context_block(
+        {"project_id": project["id"], "mode": "full"}, db, _DATA_DIR, None, None
+    )
+    text = result["text"]
+    # Must open with the XML envelope tag (with project_id and mode attrs).
+    assert text.startswith("<meridian_context "), (
+        "MCP get_context_block text must begin with <meridian_context ...>"
+    )
+    assert 'project_id="' in text
+    assert 'mode="full"' in text
+    # Must close with matching closing tag.
+    assert text.rstrip().endswith("</meridian_context>"), (
+        "MCP get_context_block text must end with </meridian_context>"
+    )
+    # The inner content must still contain the expected plain-text fields.
+    assert "PROJECT:" in text
+    assert "start_session" in text
+
+
+@pytest.mark.asyncio
+async def test_get_context_block_mcp_description_mentions_xml(db, project):
+    """4c9f501a — The MCP tool description must accurately describe the XML-wrapped
+    output rather than calling it 'plain-text'. Guards against future docstring
+    regressions that would again contradict the actual behavior."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+    tool = next((t for t in _MCP_TOOLS_LIST if t["name"] == "get_context_block"), None)
+    assert tool is not None, "get_context_block must be in _MCP_TOOLS_LIST"
+    desc = tool["description"]
+    # Description must mention the XML envelope, not falsely promise bare plain text.
+    assert "meridian_context" in desc or "XML" in desc, (
+        "get_context_block description must mention XML wrapping (<meridian_context>) "
+        f"instead of falsely promising plain-text output. Got: {desc!r}"
+    )
+    # Must NOT claim 'plain-text' without qualification (the historical bug).
+    assert "plain-text project context block" not in desc, (
+        "get_context_block description must not claim to return a 'plain-text project "
+        "context block' — the MCP surface wraps it in XML. Got: {desc!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # get_agent_instructions / set_agent_instructions
 # ---------------------------------------------------------------------------
@@ -665,3 +711,168 @@ def test_dispatch_table_covers_all_tools():
     ))
     _run(db.close())
     assert result is not mh._MISS, "list_sessions returned _MISS — not in dispatch table"
+
+
+# ---------------------------------------------------------------------------
+# 3fc6ff11 — get_context_block per-item pointer annotations
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_context_block_no_pointers_no_crash(db, project):
+    """3fc6ff11 — items without pointers render title-only; no crash, no empty broken section."""
+    pid = project["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "Plain item no pointers")
+    result = await st_mod.handle_get_context_block(
+        {"project_id": pid}, db, _DATA_DIR, None, None
+    )
+    text = result["text"]
+    assert "Plain item no pointers" in text
+    # No "Resolved pointers:" section should appear when there are none.
+    assert "Resolved pointers:" not in text
+
+
+@pytest.mark.asyncio
+async def test_get_context_block_with_pointer_shows_annotation(db, project):
+    """3fc6ff11 — pending item with a range pointer gets a 'Resolved pointers:' section
+    inlined below its title in get_context_block output.
+    """
+    pid = project["id"]
+    item = await db_module.add_sprint_item(db, pid, "v1", "Item with pointer")
+    # Attach a range pointer (no symbol resolution needed for range type).
+    await db_module.add_sprint_item_pointer(
+        db,
+        pid,
+        item["id"],
+        source_type="code",
+        targets=[{
+            "uri": "meridian/_deps.py",
+            "selector": {"type": "range", "start_line": 694, "end_line": 697},
+        }],
+        label="pending-items rendering loop",
+    )
+    result = await st_mod.handle_get_context_block(
+        {"project_id": pid}, db, _DATA_DIR, None, None
+    )
+    text = result["text"]
+    assert "Item with pointer" in text
+    assert "Resolved pointers:" in text
+    # The range target should render as "file:start-end".
+    assert "meridian/_deps.py" in text
+    assert "694" in text
+    # The label should appear.
+    assert "pending-items rendering loop" in text
+    # Source type bracketed.
+    assert "[code]" in text
+
+
+@pytest.mark.asyncio
+async def test_get_context_block_pointer_annotation_below_title(db, project):
+    """3fc6ff11 — pointer annotation must appear AFTER the item title line, not before it."""
+    pid = project["id"]
+    item = await db_module.add_sprint_item(db, pid, "v1", "Annotation position check")
+    await db_module.add_sprint_item_pointer(
+        db,
+        pid,
+        item["id"],
+        source_type="code",
+        targets=[{
+            "uri": "some/file.py",
+            "selector": {"type": "range", "start_line": 10, "end_line": 20},
+        }],
+    )
+    result = await st_mod.handle_get_context_block(
+        {"project_id": pid}, db, _DATA_DIR, None, None
+    )
+    text = result["text"]
+    title_pos = text.find("Annotation position check")
+    pointer_pos = text.find("Resolved pointers:")
+    assert title_pos != -1
+    assert pointer_pos != -1
+    assert title_pos < pointer_pos, (
+        "Pointer annotation section must appear after the item title line"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_context_block_multiple_items_mixed_pointers(db, project):
+    """3fc6ff11 — items with pointers get annotations; items without don't; both coexist."""
+    pid = project["id"]
+    item_with = await db_module.add_sprint_item(db, pid, "v1", "Has pointer")
+    await db_module.add_sprint_item(db, pid, "v1", "No pointer")
+    await db_module.add_sprint_item_pointer(
+        db,
+        pid,
+        item_with["id"],
+        source_type="code",
+        targets=[{
+            "uri": "meridian/server.py",
+            "selector": {"type": "range", "start_line": 1, "end_line": 5},
+        }],
+        label="top of server",
+    )
+    result = await st_mod.handle_get_context_block(
+        {"project_id": pid}, db, _DATA_DIR, None, None
+    )
+    text = result["text"]
+    assert "Has pointer" in text
+    assert "No pointer" in text
+    assert "Resolved pointers:" in text
+    assert "meridian/server.py" in text
+    assert "top of server" in text
+
+
+@pytest.mark.asyncio
+async def test_render_context_block_resolved_pointers_direct(db, project):
+    """3fc6ff11 — _render_context_block renders 'resolved_pointers' when pre-annotated items
+    are passed in (the sync renderer reads the key off each item dict directly)."""
+    from meridian._deps import _render_context_block
+    goal = None
+    # Build an item dict with pre-annotated resolved_pointers (as _annotate_resolved_pointers
+    # would produce).
+    sprint_items = [
+        {
+            "id": "fake-id-1",
+            "status": "pending",
+            "title": "Direct render item",
+            "resolved_pointers": [
+                {
+                    "source_type": "code",
+                    "label": "the renderer",
+                    "targets": ["meridian/_deps.py:694-697"],
+                }
+            ],
+        }
+    ]
+    text = _render_context_block(
+        {"id": project["id"], "name": "test-proj", "decisions": ""},
+        goal,
+        sprint_items,
+        [],
+        [],
+        [],
+    )
+    assert "Direct render item" in text
+    assert "Resolved pointers:" in text
+    assert "the renderer" in text
+    assert "meridian/_deps.py:694-697" in text
+    assert "[code]" in text
+
+
+@pytest.mark.asyncio
+async def test_render_context_block_no_pointers_key_absent(db, project):
+    """3fc6ff11 — _render_context_block handles items where 'resolved_pointers' key is missing
+    entirely (not just an empty list) — no crash, no empty section."""
+    from meridian._deps import _render_context_block
+    sprint_items = [
+        {"id": "fake-id-2", "status": "pending", "title": "No key item"},
+    ]
+    text = _render_context_block(
+        {"id": project["id"], "name": "test-proj", "decisions": ""},
+        None,
+        sprint_items,
+        [],
+        [],
+        [],
+    )
+    assert "No key item" in text
+    assert "Resolved pointers:" not in text

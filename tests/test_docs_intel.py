@@ -110,7 +110,11 @@ def _rich_docx() -> bytes:
 
 def test_parse_docx_extracts_paraids_styles_and_joined_text():
     paras = docs_intel.parse_docx(_synthetic_docx())
-    assert [p["para_id"] for p in paras] == ["00000001", "00000002", "00000003", "p3"]
+    # The fourth paragraph has no w14:paraId — it gets a stable structural-hash id
+    # (prefixed "sp") rather than the old fragile positional "p3".
+    para_ids = [p["para_id"] for p in paras]
+    assert para_ids[:3] == ["00000001", "00000002", "00000003"]
+    assert para_ids[3].startswith("sp"), f"expected stable synth id, got {para_ids[3]!r}"
     assert [p["style"] for p in paras] == ["Heading1", None, "Heading2", None]
     # Multiple runs in one paragraph are concatenated.
     assert paras[1]["text"] == "Meridian coordinates AI sessions."
@@ -434,9 +438,9 @@ def test_document_content_tree_keys_paragraphs_on_paraid():
     tree = docs_intel.document_content_tree(_rich_docx())
     para_ids = [b["para_id"] for b in tree["blocks"] if "para_id" in b]
     assert "10000006" in para_ids  # closing paragraph is addressable
-    # A paragraph without w14:paraId gets a synthesized p{index} fallback.
+    # A paragraph without w14:paraId gets a stable structural-hash id (prefix "sp").
     out = docs_intel.document_content_tree(_synthetic_docx())
-    assert any(b.get("para_id", "").startswith("p") for b in out["blocks"])
+    assert any(b.get("para_id", "").startswith("sp") for b in out["blocks"])
 
 
 def test_document_content_tree_empty_body():
@@ -449,6 +453,145 @@ def test_document_content_tree_empty_body():
     tree = docs_intel.document_content_tree(buf.getvalue())
     assert tree["blocks"] == [] and tree["tree"] == []
     assert tree["paragraph_count"] == 0 and tree["table_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# caf5ee34 — stable structural-hash para_id fallback
+# ---------------------------------------------------------------------------
+
+def _make_docx_from_xml(xml: str) -> bytes:
+    """Wrap raw document XML in a .docx ZIP."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    return buf.getvalue()
+
+
+def test_stable_synth_id_survives_insertion_elsewhere():
+    """caf5ee34 core: the same logical paragraph keeps its id after an unrelated
+    paragraph is inserted at a different position in the document."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    base_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter One</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>The target paragraph.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"""
+
+    # After insertion: an extra paragraph appears BEFORE the target.
+    after_insert_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter One</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>An inserted paragraph before the target.</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>The target paragraph.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"""
+
+    paras_before = docs_intel.parse_docx(_make_docx_from_xml(base_xml))
+    paras_after = docs_intel.parse_docx(_make_docx_from_xml(after_insert_xml))
+
+    target_before = next(p for p in paras_before if p["text"] == "The target paragraph.")
+    target_after = next(p for p in paras_after if p["text"] == "The target paragraph.")
+
+    assert target_before["para_id"].startswith("sp"), (
+        f"expected stable synth id before insertion, got {target_before['para_id']!r}"
+    )
+    assert target_before["para_id"] == target_after["para_id"], (
+        f"stable synth id shifted after insertion: "
+        f"{target_before['para_id']!r} -> {target_after['para_id']!r}"
+    )
+
+
+def test_different_paragraphs_get_different_synth_ids():
+    """Two paragraphs with different text under the same heading get distinct ids."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Section A</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>First unique paragraph.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Second unique paragraph.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    paras = docs_intel.parse_docx(_make_docx_from_xml(xml))
+    body_paras = [p for p in paras if p["kind"] == "paragraph"]
+    assert len(body_paras) == 2
+    assert body_paras[0]["para_id"].startswith("sp")
+    assert body_paras[1]["para_id"].startswith("sp")
+    assert body_paras[0]["para_id"] != body_paras[1]["para_id"], (
+        "two distinct paragraphs should get different synthesized ids"
+    )
+
+
+def test_duplicate_paragraphs_get_distinct_synth_ids():
+    """Two paragraphs with identical text at the same structural position
+    must not collide — they get different ids via the occurrence counter."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Section</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>Duplicate text.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Duplicate text.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    paras = docs_intel.parse_docx(_make_docx_from_xml(xml))
+    dup_ids = [p["para_id"] for p in paras if p["text"] == "Duplicate text."]
+    assert len(dup_ids) == 2
+    assert dup_ids[0] != dup_ids[1], (
+        "duplicate paragraphs at the same structural slot must get different synth ids"
+    )
+
+
+def test_native_paraid_unaffected_by_synth_logic():
+    """Paragraphs that already have w14:paraId keep their real id unchanged."""
+    paras = docs_intel.parse_docx(_synthetic_docx())
+    # Three paragraphs have real paraIds from the fixture.
+    assert paras[0]["para_id"] == "00000001"
+    assert paras[1]["para_id"] == "00000002"
+    assert paras[2]["para_id"] == "00000003"
+    # Only the fourth (no paraId) gets a synth id.
+    assert paras[3]["para_id"].startswith("sp")
+
+
+def test_synth_id_deterministic_across_calls():
+    """The same document parsed twice produces identical synthesized ids (no
+    randomness — this would silently break cross-run references)."""
+    docx = _synthetic_docx()
+    paras_a = docs_intel.parse_docx(docx)
+    paras_b = docs_intel.parse_docx(docx)
+    ids_a = [p["para_id"] for p in paras_a]
+    ids_b = [p["para_id"] for p in paras_b]
+    assert ids_a == ids_b, "synthesized ids must be deterministic across runs"
 
 
 # ---------------------------------------------------------------------------
@@ -738,3 +881,597 @@ def test_check_document_structure_issues_appendix_letter_tag_extracted():
     assert len(order_issues) == 1
     assert order_issues[0]["tag"] == "4.2.3"
     assert order_issues[0]["previous_tag"] == "C.2.5"
+
+
+# ---------------------------------------------------------------------------
+# 4a07e566 — section-type differentiation + w:sectPr page-numbering awareness
+# ---------------------------------------------------------------------------
+
+# A synthetic document that exercises all five section types:
+#   Abstract -> TOC -> LOF -> main body -> References -> Appendix
+_SECTION_TYPED_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="60000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Abstract</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000002">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Table of Contents</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000003">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>List of Figures</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000004">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000005">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Background</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000006">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>References</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000007">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Appendix A</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="60000008">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Supporting Data</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
+def _section_typed_docx() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", _SECTION_TYPED_XML)
+    return buf.getvalue()
+
+
+# A synthetic document with w:sectPr elements covering:
+#   - a mid-document sectPr (roman numeral front matter, restart at 1)
+#   - the final body-level sectPr (arabic, no restart)
+_SECTPR_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="70000001">
+      <w:pPr>
+        <w:pStyle w:val="Heading1"/>
+        <w:sectPr>
+          <w:pgNumType w:fmt="lowerRoman" w:start="1"/>
+          <w:type w:val="nextPage"/>
+        </w:sectPr>
+      </w:pPr>
+      <w:r><w:t>Front Matter</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="70000002">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter 1</w:t></w:r>
+    </w:p>
+    <w:sectPr>
+      <w:pgNumType w:fmt="decimal" w:start="1"/>
+    </w:sectPr>
+  </w:body>
+</w:document>
+"""
+
+
+def _sectpr_docx() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", _SECTPR_XML)
+    return buf.getvalue()
+
+
+def test_section_type_classification_abstract_toc_lof():
+    out = docs_intel.document_outline(_section_typed_docx())
+    headings = out["headings"]
+    assert headings[0]["text"] == "Abstract"
+    assert headings[0]["section_type"] == "abstract"
+    assert headings[1]["text"] == "Table of Contents"
+    assert headings[1]["section_type"] == "toc"
+    assert headings[2]["text"] == "List of Figures"
+    assert headings[2]["section_type"] == "lof"
+
+
+def test_section_type_classification_main_body():
+    out = docs_intel.document_outline(_section_typed_docx())
+    headings = out["headings"]
+    # "Introduction" is the first unclassified level-1 heading -> main
+    intro = next(h for h in headings if h["text"] == "Introduction")
+    assert intro["section_type"] == "main"
+    # "Background" is a sub-heading under Introduction -> inherits main
+    bg = next(h for h in headings if h["text"] == "Background")
+    assert bg["section_type"] == "main"
+
+
+def test_section_type_classification_references_and_appendix():
+    out = docs_intel.document_outline(_section_typed_docx())
+    headings = out["headings"]
+    # "References" transitions to back matter -> classified as appendix
+    refs = next(h for h in headings if h["text"] == "References")
+    assert refs["section_type"] == "appendix"
+    # "Appendix A" is an explicit appendix heading
+    app = next(h for h in headings if h["text"] == "Appendix A")
+    assert app["section_type"] == "appendix"
+    # Sub-heading under Appendix A inherits appendix
+    sub = next(h for h in headings if h["text"] == "Supporting Data")
+    assert sub["section_type"] == "appendix"
+
+
+def test_section_regions_ordered_distinct():
+    out = docs_intel.document_outline(_section_typed_docx())
+    # Distinct regions in document order: abstract, toc, lof, main, appendix
+    assert out["section_regions"] == ["abstract", "toc", "lof", "main", "appendix"]
+
+
+def test_document_outline_backward_compatible_plain_doc():
+    # The original document still works — section_type is additive, not breaking.
+    out = docs_intel.document_outline(_synthetic_docx())
+    assert out["heading_count"] == 2
+    assert "section_type" in out["headings"][0]
+    assert "section_regions" in out
+    # Both headings are unclassified level-1/2 with no front-matter markers -> main
+    assert all(h["section_type"] == "main" for h in out["headings"])
+
+
+def test_parse_sectpr_detects_multi_section_page_numbering():
+    result = docs_intel.parse_sectpr(_sectpr_docx())
+    assert result["section_count"] == 2
+    sections = result["sections"]
+    # First sectPr: front matter with roman numerals, restart at 1
+    s0 = sections[0]
+    assert s0["page_num_fmt"] == "lowerRoman"
+    assert s0["page_num_start"] == 1
+    assert s0["is_continuous"] is False
+    assert s0["anchor_para_id"] == "70000001"
+    # Second sectPr: body-level, arabic decimal, restart at 1
+    s1 = sections[1]
+    assert s1["page_num_fmt"] == "decimal"
+    assert s1["page_num_start"] == 1
+    assert s1["anchor_para_id"] is None  # body-level, no anchor paragraph
+
+
+def test_parse_sectpr_no_sections_returns_empty():
+    # A simple document with no w:sectPr should return section_count=0
+    result = docs_intel.parse_sectpr(_synthetic_docx())
+    assert result["section_count"] == 0
+    assert result["sections"] == []
+
+
+def test_get_document_section_map_combines_outline_and_sectpr():
+    result = docs_intel.get_document_section_map(_sectpr_docx())
+    assert "headings" in result
+    assert "section_regions" in result
+    assert "sectpr" in result
+    assert result["sectpr"]["section_count"] == 2
+    # Both headings in _sectpr_docx are in "main" (no front-matter pattern)
+    assert all(h["section_type"] == "main" for h in result["headings"])
+
+
+def test_index_docx_structure_stores_section_type(tmp_path):
+    db = str(tmp_path / "struct.idx.sqlite")
+    # index_docx_structure goes through document_content_tree, not parse_docx,
+    # so we need a docx that the content tree can parse (same format).
+    docs_intel.index_docx_structure(_section_typed_docx(), db)
+    elements = docs_intel.get_local_structure_elements(db)
+    headings = elements["headings"]
+    assert len(headings) > 0
+    assert all("section_type" in h for h in headings)
+    abstract_headings = [h for h in headings if h["section_type"] == "abstract"]
+    main_headings = [h for h in headings if h["section_type"] == "main"]
+    assert len(abstract_headings) >= 1
+    assert len(main_headings) >= 1
+
+
+def test_assign_section_types_empty_input():
+    # Edge case: empty heading list returns empty list without crash.
+    result = docs_intel._assign_section_types([])
+    assert result == []
+
+
+def test_classify_heading_text_known_patterns():
+    assert docs_intel._classify_heading_text("Abstract") == "abstract"
+    assert docs_intel._classify_heading_text("ABSTRACT") == "abstract"
+    assert docs_intel._classify_heading_text("Table of Contents") == "toc"
+    assert docs_intel._classify_heading_text("Contents") == "toc"
+    assert docs_intel._classify_heading_text("List of Figures") == "lof"
+    assert docs_intel._classify_heading_text("List of Tables") == "lof"
+    assert docs_intel._classify_heading_text("Appendix A") == "appendix"
+    assert docs_intel._classify_heading_text("Annex B") == "appendix"
+    assert docs_intel._classify_heading_text("Introduction") is None
+    assert docs_intel._classify_heading_text("Methodology") is None
+
+
+# ---------------------------------------------------------------------------
+# 32d84131 — SQLite FTS5 external-content table + BM25 search
+# Decision: meridian-docs uses SQLite FTS5 (not Tantivy) for full-text
+# search over paragraph text. FTS5 is built into Python's sqlite3 module
+# with zero extra dependencies; Tantivy (used by meridian-outputs) requires
+# a compiled Rust extension unsuitable for a stdlib-only uvx extension.
+# ---------------------------------------------------------------------------
+
+
+def test_fts5_search_basic_match(tmp_path):
+    """fts5_search_paragraphs returns the correct paragraph on a keyword hit."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    hits = docs_intel.fts5_search_paragraphs(db, "sessions")
+    assert len(hits) == 1
+    assert hits[0]["para_id"] == "00000002"
+    assert "bm25_score" in hits[0]
+    # BM25 scores are negative in SQLite FTS5 (lower = more relevant).
+    assert isinstance(hits[0]["bm25_score"], float)
+
+
+def test_fts5_search_no_match_returns_empty(tmp_path):
+    """fts5_search_paragraphs returns an empty list when no paragraphs match."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    hits = docs_intel.fts5_search_paragraphs(db, "xyzzy_nonexistent_token_42")
+    assert hits == []
+
+
+def test_fts5_search_phrase_query(tmp_path):
+    """Phrase queries (quoted tokens) match only exact sequences."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # Exact phrase present in the doc.
+    hits = docs_intel.fts5_search_paragraphs(db, '"AI sessions"')
+    assert len(hits) == 1
+    assert hits[0]["para_id"] == "00000002"
+
+    # Reversed order — NOT a match for phrase search.
+    hits_rev = docs_intel.fts5_search_paragraphs(db, '"sessions AI"')
+    assert hits_rev == []
+
+
+def test_fts5_search_heading_found(tmp_path):
+    """Heading paragraphs are indexed and findable by FTS5."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    hits = docs_intel.fts5_search_paragraphs(db, "Introduction")
+    assert any(h["para_id"] == "00000001" for h in hits)
+    assert any(h["style"] is not None for h in hits)
+
+
+def test_fts5_search_limit_respected(tmp_path):
+    """limit parameter caps the number of results."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # The doc has 4 paragraphs; asking for any token that could match many rows
+    # -- use a wildcard so all text rows are candidate hits.
+    hits = docs_intel.fts5_search_paragraphs(db, "a*", limit=1)
+    assert len(hits) <= 1
+
+
+def test_fts5_index_rebuilt_on_reindex(tmp_path):
+    """After index_docx is called a second time the FTS5 index reflects the new content."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # Verify first index is searchable.
+    assert len(docs_intel.fts5_search_paragraphs(db, "sessions")) == 1
+
+    # Re-index (idempotent rebuild).
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # FTS5 still returns correct results after rebuild.
+    hits = docs_intel.fts5_search_paragraphs(db, "sessions")
+    assert len(hits) == 1
+    assert hits[0]["para_id"] == "00000002"
+
+
+def test_fts5_search_invalid_query_returns_empty_not_raises(tmp_path):
+    """Syntactically invalid FTS5 queries return empty list, not an exception."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx(_synthetic_docx(), db)
+
+    # An unclosed quote is a syntax error in FTS5.
+    hits = docs_intel.fts5_search_paragraphs(db, '"unclosed phrase')
+    assert isinstance(hits, list)
+
+
+# ---------------------------------------------------------------------------
+# 25743ec6 — chunk-level, heading-aware, weighted BM25 indexing
+# ---------------------------------------------------------------------------
+#
+# Synthetic document used for chunk tests:
+#
+#   H1: Introduction            (00000001)
+#     body: "Meridian..."       (00000002)
+#     H2: Design                (00000003)
+#       body: "no paraId"       (p3)
+#
+# Expected chunks:
+#   chunk 0: heading="Introduction", path=["Introduction"],
+#            body="Meridian coordinates AI sessions."
+#   chunk 1: heading="Design",       path=["Introduction", "Design"],
+#            body="A paragraph with no paraId."
+# ---------------------------------------------------------------------------
+
+
+def test_build_chunks_correct_boundaries(tmp_path):
+    """_build_chunks produces one chunk per heading; body accumulates until the
+    next heading of equal or higher level."""
+    tree = docs_intel.document_content_tree(_synthetic_docx())
+    chunks = docs_intel._build_chunks(tree["blocks"])
+
+    assert len(chunks) == 2
+
+    c0 = chunks[0]
+    assert c0["chunk_id"] == 0
+    assert c0["heading_text"] == "Introduction"
+    assert c0["heading_path"] == ["Introduction"]
+    assert "Meridian" in c0["body_text"]
+    assert "AI sessions" in c0["body_text"]
+    assert c0["heading_para_id"] == "00000001"
+
+    c1 = chunks[1]
+    assert c1["chunk_id"] == 1
+    assert c1["heading_text"] == "Design"
+    # Heading path traces full ancestry: H1 then H2.
+    assert c1["heading_path"] == ["Introduction", "Design"]
+    assert "paragraph with no paraId" in c1["body_text"]
+    assert c1["heading_para_id"] == "00000003"
+
+
+def test_build_chunks_nested_headings_heading_path():
+    """Heading path correctly reflects multi-level nesting."""
+    # Build a doc: H1 "A" -> H2 "B" -> H3 "C" (level numbers 1, 2, 3)
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="A0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Alpha</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="A0000002">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Beta</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="A0000003">
+      <w:pPr><w:pStyle w:val="Heading3"/></w:pPr>
+      <w:r><w:t>Gamma</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="A0000004"><w:r><w:t>body under Gamma</w:t></w:r></w:p>
+    <w:p w14:paraId="A0000005">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Delta</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="A0000006"><w:r><w:t>body under Delta</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    docx = buf.getvalue()
+
+    tree = docs_intel.document_content_tree(docx)
+    chunks = docs_intel._build_chunks(tree["blocks"])
+
+    assert len(chunks) == 4  # Alpha, Beta, Gamma, Delta
+
+    alpha = chunks[0]
+    assert alpha["heading_text"] == "Alpha"
+    assert alpha["heading_path"] == ["Alpha"]
+    assert alpha["body_text"] == ""  # no body paragraphs under Alpha before Beta
+
+    beta = chunks[1]
+    assert beta["heading_text"] == "Beta"
+    assert beta["heading_path"] == ["Alpha", "Beta"]
+
+    gamma = chunks[2]
+    assert gamma["heading_text"] == "Gamma"
+    assert gamma["heading_path"] == ["Alpha", "Beta", "Gamma"]
+    assert "body under Gamma" in gamma["body_text"]
+
+    # Delta is H2 — resets Gamma (H3) and Beta (H2) off the stack;
+    # only Alpha (H1) remains as ancestor.
+    delta = chunks[3]
+    assert delta["heading_text"] == "Delta"
+    assert delta["heading_path"] == ["Alpha", "Delta"]
+    assert "body under Delta" in delta["body_text"]
+
+
+def test_build_chunks_equal_level_heading_resets_path():
+    """Two sibling H1 headings each produce an independent chunk; the second
+    H1 does NOT include the first H1 in its heading_path."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="B0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter One</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="B0000002"><w:r><w:t>body one</w:t></w:r></w:p>
+    <w:p w14:paraId="B0000003">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter Two</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="B0000004"><w:r><w:t>body two</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    docx = buf.getvalue()
+
+    tree = docs_intel.document_content_tree(docx)
+    chunks = docs_intel._build_chunks(tree["blocks"])
+
+    assert len(chunks) == 2
+    assert chunks[0]["heading_path"] == ["Chapter One"]
+    assert chunks[1]["heading_path"] == ["Chapter Two"]
+
+
+def test_index_docx_chunks_and_search_basic(tmp_path):
+    """index_docx_chunks populates docx_chunks; fts5_search_chunks returns hits."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    summary = docs_intel.index_docx_chunks(_synthetic_docx(), db)
+
+    assert summary["chunk_count"] == 2
+
+    # "sessions" appears in chunk 0's body (the Introduction chunk).
+    hits = docs_intel.fts5_search_chunks(db, "sessions")
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit["heading_text"] == "Introduction"
+    assert hit["heading_path"] == ["Introduction"]
+    assert "bm25_score" in hit
+    assert isinstance(hit["bm25_score"], float)
+
+
+def test_fts5_search_chunks_heading_match_outranks_body_match(tmp_path):
+    """A term that appears only in a heading ranks above the same term in body
+    text only, when the BM25 heading weight exceeds the body weight."""
+    # Doc: H1 "Design" with body "some text", H1 "Intro" with body "Design concepts"
+    # Searching "design" should rank the heading-bearing chunk higher.
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="C0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Design</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="C0000002"><w:r><w:t>some text here</w:t></w:r></w:p>
+    <w:p w14:paraId="C0000003">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="C0000004">
+      <w:r><w:t>Design concepts are explained here.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    docx = buf.getvalue()
+
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(docx, db)
+
+    hits = docs_intel.fts5_search_chunks(db, "Design")
+    assert len(hits) == 2
+    # BM25 scores are negative; lower = more relevant. The heading match should
+    # score lower (more relevant) than the body-only match.
+    heading_chunk = next(h for h in hits if h["heading_text"] == "Design")
+    body_chunk = next(h for h in hits if h["heading_text"] == "Introduction")
+    assert heading_chunk["bm25_score"] < body_chunk["bm25_score"], (
+        f"Heading chunk score {heading_chunk['bm25_score']!r} should be lower "
+        f"(more relevant) than body chunk score {body_chunk['bm25_score']!r}"
+    )
+
+
+def test_index_docx_chunks_idempotent(tmp_path):
+    """Re-indexing the same document leaves the chunk count unchanged."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    summary2 = docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    assert summary2["chunk_count"] == 2
+    hits = docs_intel.fts5_search_chunks(db, "sessions")
+    assert len(hits) == 1
+
+
+def test_fts5_search_chunks_invalid_query_returns_empty(tmp_path):
+    """Invalid FTS5 query degrades to empty list, no exception raised."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    hits = docs_intel.fts5_search_chunks(db, '"unclosed')
+    assert isinstance(hits, list)
+
+
+def test_fts5_search_chunks_no_match_returns_empty(tmp_path):
+    """Query with no matching chunks returns empty list."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    hits = docs_intel.fts5_search_chunks(db, "xyzzy_no_such_token_99")
+    assert hits == []
+
+
+def test_chunk_sync_triggers_after_manual_insert(tmp_path):
+    """Sync triggers keep docx_chunks_fts consistent after a direct row insert
+    to docx_chunks (mirrors what the AFTER INSERT trigger should handle)."""
+    import sqlite3
+
+    db = str(tmp_path / "doc.idx.sqlite")
+    # Bootstrap the schema (no chunks yet).
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+
+    conn = sqlite3.connect(db)
+    try:
+        # Manually insert a new chunk — the AFTER INSERT trigger should
+        # populate docx_chunks_fts automatically.
+        import json
+        conn.execute(
+            "INSERT INTO docx_chunks (chunk_id, heading_path_json, heading_text, "
+            "body_text, start_para_id, end_para_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (99, json.dumps(["Extra"]), "Extra", "trigger test content",
+             "E0000001", "E0000001"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The new chunk should be findable via FTS5.
+    hits = docs_intel.fts5_search_chunks(db, "trigger")
+    assert any(h["chunk_id"] == 99 for h in hits), (
+        "AFTER INSERT trigger did not sync new chunk into docx_chunks_fts"
+    )
+
+
+def test_chunk_weight_constants_documented():
+    """Module-level weight constants match expected 5:1 ratio."""
+    assert docs_intel._CHUNK_WEIGHT_HEADING == 5.0
+    assert docs_intel._CHUNK_WEIGHT_BODY == 1.0
+
+
+def test_fts5_search_chunks_result_shape(tmp_path):
+    """Every result dict carries all expected keys."""
+    db = str(tmp_path / "doc.idx.sqlite")
+    docs_intel.index_docx_chunks(_synthetic_docx(), db)
+    hits = docs_intel.fts5_search_chunks(db, "Introduction")
+    assert len(hits) >= 1
+    required_keys = {
+        "chunk_id", "heading_path", "heading_text",
+        "body_text", "start_para_id", "end_para_id", "bm25_score",
+    }
+    for hit in hits:
+        assert required_keys.issubset(hit.keys()), (
+            f"Missing keys: {required_keys - hit.keys()}"
+        )
+        assert isinstance(hit["heading_path"], list)
+        assert isinstance(hit["bm25_score"], float)

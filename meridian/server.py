@@ -3781,9 +3781,11 @@ async def mcp_tools_doc() -> str:
         "Read-only: Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` "
         "returns a compact session summary with completed items, pending items, and the next `/goal` string.")
     lines += _render_tool("get_context_block",
-        "Read-only: Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent "
-        "decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` "
-        "for a shorter paste into claude.ai.")
+        "Read-only: Return a compact project context block (north star, sprint, pending sprint items, recent tasks, recent "
+        "decisions, active sessions) wrapped in a <meridian_context> XML envelope for structured parsing by AI clients (v2.5+). "
+        "Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` "
+        "for a shorter paste into claude.ai. "
+        "The HTTP route `/projects/{id}/context-block` returns the same content as unwrapped plain text.")
     lines += ["## Planning tools\n"]
     lines += _render_tool("fan_out_sprint_items",
         "Bulk-insert sprint items in one call — lets an orchestrator LLM decompose a goal "
@@ -3859,6 +3861,700 @@ async def mcp_tools_doc() -> str:
     while lines and lines[-1].strip() in ("---", ""):
         lines.pop()
     return "\n".join(part.rstrip("\n") for part in lines).rstrip() + "\n"
+
+
+@app.get("/api-reference-doc", response_class=PlainTextResponse)
+async def api_reference_doc() -> str:
+    """Generate docs/api-reference.md from the live FastAPI route table.
+
+    The output is the full docs/api-reference.md content: hand-authored narrative
+    sections (static) followed by an auto-generated Route Inventory table derived
+    from app.routes.  The route inventory is the drift-checkable surface -- any
+    route added or removed will change the generator's output and fail CI.
+
+    Mirrors the mcp_tools_doc() live-reflection approach: the generator owns the
+    canonical file, CI diffs committed vs generated, and drift fails the build.
+    """
+    from fastapi.routing import APIRoute  # noqa: PLC0415
+
+    # --- collect and sort all public APIRoutes ---
+    # Exclude static-asset / install-script paths that are not developer-facing API.
+    _SKIP_PREFIXES = (
+        "/hooks.ps1",
+        "/hooks.sh",
+        "/hooks_install.ps1",
+        "/install",
+        "/sw.js",
+        "/manifest.webmanifest",
+        "/sitemap.xml",
+        "/robots.txt",
+        "/favicon.ico",
+    )
+    route_rows: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        path: str = route.path
+        if any(path.startswith(pfx) for pfx in _SKIP_PREFIXES):
+            continue
+        doc_str: str = (getattr(route.endpoint, "__doc__", "") or "").strip()
+        first_line = doc_str.split("\n")[0].rstrip(".") if doc_str else ""
+        for method in sorted(route.methods or []):
+            key = (method, path)
+            if key in seen:
+                continue
+            seen.add(key)
+            route_rows.append((path, method, first_line))
+
+    route_rows.sort(key=lambda r: (r[0], r[1]))
+
+    # --- group by top-level prefix ---
+    def _prefix(path: str) -> str:
+        parts = [p for p in path.split("/") if p and not p.startswith("{")]
+        return f"/{parts[0]}" if parts else "/"
+
+    groups: dict[str, list[tuple[str, str, str]]] = {}
+    for row in route_rows:
+        pfx = _prefix(row[0])
+        groups.setdefault(pfx, []).append(row)
+
+    inventory_lines: list[str] = [
+        "\n## Route Inventory\n",
+        "\n",
+        "> **Auto-generated** from the live FastAPI route table by `scripts/gen_docs.py`.",
+        " Edit `meridian/server.py` (not this file) to add or remove routes.",
+        " CI fails when committed docs drift from generator output.\n",
+        "\n",
+    ]
+    for pfx in sorted(groups):
+        inventory_lines.append(f"\n### `{pfx}`\n\n")
+        inventory_lines.append("| Method | Path | Description |\n")
+        inventory_lines.append("|--------|------|-------------|\n")
+        for path, method, desc in groups[pfx]:
+            desc_col = desc.replace("|", "\\|") if desc else ""
+            inventory_lines.append(f"| `{method}` | `{path}` | {desc_col} |\n")
+        inventory_lines.append("\n")
+
+    # --- static hand-authored narrative (embedded so the generator owns the file) ---
+    _STATIC = (
+        "# HTTP API Reference\n"
+        "\n"
+        "Meridian exposes a REST API at `http://localhost:7878` (local) or"
+        " `https://usemeridian.us` (hosted).\n"
+        "\n"
+        "Most endpoints are for internal use by the dashboard and MCP layer."
+        " The MCP tools are the recommended interface for AI sessions."
+        " This reference is for developers building integrations.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Health\n"
+        "\n"
+        "### `GET /health`\n"
+        "\n"
+        "Check server health.\n"
+        "\n"
+        "**Auth:** None required\n"
+        "\n"
+        "**Response:**\n"
+        "```json\n"
+        "{\n"
+        '  "status": "ok",\n'
+        '  "service": "meridian",\n'
+        '  "version": "0.1.9",\n'
+        '  "git_sha": "a555660ef312"\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "> `version` is read from `pyproject.toml` at startup (or the `MERIDIAN_VERSION`"
+        " env var). `git_sha` is the 12-char HEAD SHA of the running build --"
+        " useful for deploy-drift checks.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Projects\n"
+        "\n"
+        "### `GET /projects`\n"
+        "\n"
+        "List all projects.\n"
+        "\n"
+        "**Auth:** None (local) / Session cookie or Bearer token (hosted)\n"
+        "\n"
+        "**Response:** `[{id, name, created_at, ...}]`\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /projects`\n"
+        "\n"
+        "Create a project.\n"
+        "\n"
+        "**Body:**\n"
+        "```json\n"
+        '{"name": "backend-api"}\n'
+        "```\n"
+        "\n"
+        "**Response (201):**\n"
+        "```json\n"
+        '{"id": "uuid", "name": "backend-api", "created_at": "2026-05-23T00:00:00Z"}\n'
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `GET /projects/{project_id}`\n"
+        "\n"
+        "Get a single project.\n"
+        "\n"
+        '**Response (404):** `{"detail": "Project not found"}`\n'
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /projects/{project_id}/rename`\n"
+        "\n"
+        "Rename a project.\n"
+        "\n"
+        '**Body:** `{"name": "new-name"}`\n'
+        "\n"
+        "---\n"
+        "\n"
+        "### `DELETE /projects/{project_id}`\n"
+        "\n"
+        "Delete a project and all its data.\n"
+        "\n"
+        "**Response:** 204 No Content\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Goals\n"
+        "\n"
+        "### `GET /projects/{project_id}/goal`\n"
+        "\n"
+        "Get the current goal state.\n"
+        "\n"
+        "**Response:**\n"
+        "```json\n"
+        "{\n"
+        '  "id": "uuid",\n'
+        '  "project_id": "uuid",\n'
+        '  "content": "SHIPPED:\\n...",\n'
+        '  "north_star": "Long-term vision...",\n'
+        '  "sprint": "v2.3 — this week",\n'
+        '  "version": 42,\n'
+        '  "created_at": "...",\n'
+        '  "updated_at": "..."\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /projects/{project_id}/goal`\n"
+        "\n"
+        "Set the goal content.\n"
+        "\n"
+        "**Body:**\n"
+        "```json\n"
+        "{\n"
+        '  "content": "SHIPPED:\\n...\\nCURRENT FOCUS:\\n...",\n'
+        '  "north_star": "optional — update north star",\n'
+        '  "sprint": "optional — update sprint",\n'
+        '  "minor": false\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "`minor: true` updates in place without bumping the version number"
+        " (used for AUTO BLOCKS).\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /projects/{project_id}/goal/north-star`\n"
+        "\n"
+        "Update only the north star.\n"
+        "\n"
+        '**Body:** `{"north_star": "...", "human_id": "alice"}`\n'
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /projects/{project_id}/goal/sprint`\n"
+        "\n"
+        "Update only the sprint.\n"
+        "\n"
+        '**Body:** `{"sprint": "v2.3 — rate limiting + tests"}`\n'
+        "\n"
+        "---\n"
+        "\n"
+        "### `GET /projects/{project_id}/goal-history`\n"
+        "\n"
+        "Get all goal versions for a project. Newest first."
+        " Strips AUTO BLOCKS for clean diffs.\n"
+        "\n"
+        "**Response:** `[{version, content, north_star, sprint, created_at}]`\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Sessions\n"
+        "\n"
+        "### `GET /projects/{project_id}/sessions`\n"
+        "\n"
+        "List active sessions for a project.\n"
+        "\n"
+        "**Response:**\n"
+        "```json\n"
+        "[{\n"
+        '  "id": "uuid",\n'
+        '  "project_id": "uuid",\n'
+        '  "name": "feature-auth-fix",\n'
+        '  "status": "active",\n'
+        '  "human_id": "alice",\n'
+        '  "last_seen": "2026-05-23T10:00:00Z",\n'
+        '  "created_at": "..."\n'
+        "}]\n"
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /sessions/register`\n"
+        "\n"
+        "Register a new session.\n"
+        "\n"
+        "**Body:**\n"
+        "```json\n"
+        "{\n"
+        '  "project_id": "uuid",\n'
+        '  "name": "my-session",\n'
+        '  "human_id": "alice"\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /sessions/{session_id}/heartbeat`\n"
+        "\n"
+        "Update a session's `last_seen` timestamp.\n"
+        "\n"
+        '**Response:** `{"ok": true}`\n'
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /sessions/{session_id}/close`\n"
+        "\n"
+        "Close a session.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Tasks\n"
+        "\n"
+        "### `GET /projects/{project_id}/tasks`\n"
+        "\n"
+        "Get recent tasks. Newest first.\n"
+        "\n"
+        "**Query params:** `limit` (default: 50)\n"
+        "\n"
+        "**Response:**\n"
+        "```json\n"
+        "[{\n"
+        '  "id": "uuid",\n'
+        '  "session_id": "uuid",\n'
+        '  "project_id": "uuid",\n'
+        '  "description": "Fixed auth bug",\n'
+        '  "status": "done",\n'
+        '  "created_at": "..."\n'
+        "}]\n"
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /tasks`\n"
+        "\n"
+        "Log a task.\n"
+        "\n"
+        "**Body:**\n"
+        "```json\n"
+        "{\n"
+        '  "session_id": "uuid",\n'
+        '  "project_id": "uuid",\n'
+        '  "description": "Implemented rate limiting",\n'
+        '  "status": "done"\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `PATCH /tasks/{task_id}`\n"
+        "\n"
+        "Update a task (status, description).\n"
+        "\n"
+        '**Body:** `{"status": "done", "description": "updated description"}`\n'
+        "\n"
+        "---\n"
+        "\n"
+        "### `GET /projects/{project_id}/tasks/claimable`\n"
+        "\n"
+        "List unclaimed pending tasks.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /projects/{project_id}/tasks/release`\n"
+        "\n"
+        "Release a claimed task.\n"
+        "\n"
+        '**Body:** `{"task_id": "uuid", "session_id": "uuid"}`\n'
+        "\n"
+        "---\n"
+        "\n"
+        "## Sprint Items\n"
+        "\n"
+        "Sprint items are the machine-trackable checklist alongside the free-text sprint"
+        " field. Each item has a lifecycle: `todo` → `in_progress` → `done`"
+        " (or `failed` / `skipped` / `pushed`).\n"
+        "\n"
+        "### Sprint item fields\n"
+        "\n"
+        "| Field | Type | Description |\n"
+        "|-------|------|-------------|\n"
+        "| `id` | UUID | Primary key |\n"
+        "| `project_id` | UUID | Parent project |\n"
+        "| `version` | TEXT | Sprint bucket identifier (e.g. `\"v2.3\"`) |\n"
+        "| `title` | TEXT | Item description |\n"
+        "| `status` | TEXT | `todo`, `pending`, `in_progress`, `done`, `failed`,"
+        " `skipped`, `pushed`, `indeterminate`, `provisional_complete` |\n"
+        "| `item_group` | TEXT | Optional named group / swimlane for dashboard rendering |\n"
+        "| `human_id` | TEXT | Person who added the item |\n"
+        "| `notes` | TEXT | Free-text notes; updated via PATCH or on completion |\n"
+        "| `depends_on` | UUID | ID of a parent sprint item that must be `done`"
+        " before this item is claimable |\n"
+        "| `failure_mode` | TEXT | What to do when the `depends_on` parent fails:"
+        " `\"continue\"` (default) or `\"stop\"` |\n"
+        "| `milestone_type` | TEXT | `\"task\"` (default), `\"milestone\"` (timeline"
+        " marker), or `\"human\"` (human-executed) |\n"
+        "| `track` | TEXT | Named lane (e.g. `\"paper\"`) — a whole track can be"
+        " deferred or skipped by executors |\n"
+        "| `wave` | TEXT | Stored parallel-execution wave label (e.g. `\"wave-1\"`)"
+        ", auto-filled by `assign_sprint_waves` |\n"
+        "| `priority` | TEXT | `urgent`, `high`, `normal` (default), or `low`"
+        " — higher-priority pending items are surfaced first |\n"
+        "| `blocker_kind` | TEXT | `null` (ordinary), `\"manual\"` (blocked on a"
+        " real-world action outside Meridian), or `\"superseded\"` (hard-blocked,"
+        " not re-claimable) |\n"
+        "| `deferred_until` | TEXT (ISO timestamp) | Enforced deferral —"
+        " `claim_sprint_item` refuses the item while this is in the future |\n"
+        "| `touches_resources` | JSON TEXT | Typed resource identifiers for conflict"
+        " detection (e.g. `[\"file:meridian/server.py\", \"db:migrations\"]`) |\n"
+        "| `parent_id` | UUID | ID of the parent sprint item when this item is a"
+        " subtask (created via `add_subtask`) |\n"
+        "| `owner` | TEXT | `\"human\"` or `\"ai\"` — for mixed-ownership task"
+        " chains (set by `add_subtask`) |\n"
+        "| `required_notes` | INTEGER (0/1) | When 1, `complete_sprint_item` refuses"
+        " without evidence in `notes` or a linked `task_id` |\n"
+        "| `slug` | TEXT | Human-readable per-project identifier derived from the title |\n"
+        "| `nickname` | TEXT | Short (1-2 word) memorable per-project handle |\n"
+        "| `sprint_name` | TEXT | Human-readable sprint bucket label (e.g."
+        " `\"docs-cloudflare\"`), separate from `version` |\n"
+        "| `prospect_bypass` | INTEGER (0/1) | When 1, `claim_sprint_item` skips the"
+        " prospect gate |\n"
+        "| `stall_count` | INTEGER | Times this item was re-queued after a worker closed"
+        " without completing it |\n"
+        "| `pushed_to` | TEXT | Target version when status is `\"pushed\"` |\n"
+        "| `task_id` | UUID | Linked task log entry |\n"
+        "| `claimed_at` | TEXT | When the item entered `in_progress` |\n"
+        "| `completed_at` | TEXT | When the item reached a terminal status |\n"
+        "| `added_at` | TEXT | Creation timestamp |\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `GET /projects/{project_id}/sprint-items`\n"
+        "\n"
+        "List sprint items.\n"
+        "\n"
+        "**Query params:** `status` (optional filter)\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /projects/{project_id}/sprint-items`\n"
+        "\n"
+        "Add a sprint item. The REST endpoint accepts a subset of fields; use the MCP"
+        " `add_sprint_item` tool for the full parameter set (track, wave, priority,"
+        " blocker_kind, deferred_until, etc.).\n"
+        "\n"
+        "**Body:**\n"
+        "```json\n"
+        "{\n"
+        '  "title": "Add rate limiting",\n'
+        '  "version": "v2.3",\n'
+        '  "group": "Performance",\n'
+        '  "human_id": "alice",\n'
+        '  "depends_on": "uuid-of-parent-item",\n'
+        '  "failure_mode": "continue",\n'
+        '  "touches_resources": ["file:meridian/server.py"],\n'
+        '  "force": false\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "**Response (409 Conflict):** returned when a near-duplicate title already exists"
+        " as a pending/in-progress item. Pass `\"force\": true` to override.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `PATCH /projects/{project_id}/sprint-items/{item_id}`\n"
+        "\n"
+        "Update editable fields of a sprint item.\n"
+        "\n"
+        '**Body:** `{"title": "...", "notes": "...", "group": "...", "human_id": "...", '
+        '"touches_resources": [...], "status": "pending"}` (all optional)\n'
+        "\n"
+        "> `status` via PATCH is restricted to non-terminal resets: `pending`, `todo`,"
+        " `indeterminate`. Use the dedicated transition endpoints (complete / fail / skip"
+        " / push) for terminal statuses.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /projects/{project_id}/sprint-items/{item_id}/complete`\n"
+        "\n"
+        "Mark a sprint item done.\n"
+        "\n"
+        '**Body:** `{"task_id": "uuid", "notes": "evidence of completion"}`'
+        " (both optional; `notes` is required when the item has `required_notes=1`)\n"
+        "\n"
+        "### `POST /projects/{project_id}/sprint-items/{item_id}/fail`\n"
+        "\n"
+        'Mark failed. Body: `{"reason": "..."}` (optional)\n'
+        "\n"
+        "### `POST /projects/{project_id}/sprint-items/{item_id}/skip`\n"
+        "\n"
+        'Mark skipped. Body: `{"reason": "..."}` (optional)\n'
+        "\n"
+        "### `POST /projects/{project_id}/sprint-items/{item_id}/push`\n"
+        "\n"
+        'Push to future version. Body: `{"to_version": "v2.4"}`\n'
+        "\n"
+        "### `DELETE /projects/{project_id}/sprint-items/{item_id}`\n"
+        "\n"
+        "Delete a sprint item.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Human-in-the-Loop (HITL)\n"
+        "\n"
+        "HITL requests let an AI session pause and ask a human a question."
+        " The session POSTs a request, then polls `GET /hitl/{id}` until"
+        " `status` becomes `\"answered\"`.\n"
+        "\n"
+        "### `GET /hitl`\n"
+        "\n"
+        "List all pending HITL requests across all projects.\n"
+        "\n"
+        "**Query params:** `status` (`pending` | `answered` | `dismissed` | `all`,"
+        " default `pending`), `limit` (default 50)\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `GET /projects/{project_id}/hitl`\n"
+        "\n"
+        "List HITL requests scoped to a single project.\n"
+        "\n"
+        "**Query params:** `status`, `limit` (same as above)\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `POST /projects/{project_id}/hitl`\n"
+        "\n"
+        "Create a HITL request.\n"
+        "\n"
+        "**Auth:** None (local) / Session cookie or Bearer token (hosted)\n"
+        "\n"
+        "**Body:**\n"
+        "```json\n"
+        "{\n"
+        '  "question": "Should I merge the auth branch now or wait for the review?",\n'
+        '  "context": "Optional background context for the human",\n'
+        '  "urgency": "normal",\n'
+        '  "session_id": "uuid",\n'
+        '  "assigned_to": "alice"\n'
+        "}\n"
+        "```\n"
+        "\n"
+        '`urgency` values: `"normal"` (default), `"high"`, `"blocking"`\n'
+        "\n"
+        "**Response (201):**\n"
+        "```json\n"
+        "{\n"
+        '  "id": "uuid",\n'
+        '  "project_id": "uuid",\n'
+        '  "session_id": "uuid",\n'
+        '  "question": "Should I merge the auth branch now or wait for the review?",\n'
+        '  "context": null,\n'
+        '  "urgency": "normal",\n'
+        '  "status": "pending",\n'
+        '  "answer": null,\n'
+        '  "answered_by": null,\n'
+        '  "assigned_to": "alice",\n'
+        '  "created_at": "...",\n'
+        '  "answered_at": null\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "> When the project has `hitl_auto_answer` enabled, the response comes back"
+        " immediately with `answered_by: \"auto\"` and no notification is sent.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "### `GET /hitl/{request_id}`\n"
+        "\n"
+        "Get a single HITL request. Sessions poll this endpoint to read the human's answer.\n"
+        "\n"
+        '**Response (404):** `{"detail": "hitl request not found"}`\n'
+        "\n"
+        "---\n"
+        "\n"
+        "### `PATCH /hitl/{request_id}`\n"
+        "\n"
+        "Answer or dismiss a HITL request.\n"
+        "\n"
+        "**Body (answer):**\n"
+        "```json\n"
+        '{"action": "answer", "answer": "Wait for the review.", "answered_by": "alice"}\n'
+        "```\n"
+        "\n"
+        "**Body (dismiss):**\n"
+        "```json\n"
+        '{"action": "dismiss"}\n'
+        "```\n"
+        "\n"
+        '`action` defaults to `"answer"` when omitted.\n'
+        "\n"
+        "---\n"
+        "\n"
+        "## Workspace Proposals\n"
+        "\n"
+        "Workspace proposals are a human-only \"drawer of inspiration\" for cross-project"
+        " ideas. They are **not** executor-claimable — a human must review and"
+        " promote them.\n"
+        "\n"
+        "> Proposals are managed via MCP tools only (`add_workspace_proposal`,"
+        " `get_workspace_proposals`, `advance_proposal_status`, `promote_proposal`)."
+        " There is no REST endpoint for proposals.\n"
+        "\n"
+        "**Status lifecycle:** `raw` → `investigating` → `promoted` | `rejected`\n"
+        "\n"
+        "- Use `advance_proposal_status` to move through `raw → investigating"
+        " → rejected` (or back).\n"
+        "- Use `promote_proposal` to convert a proposal into a real sprint item (sets"
+        " status to `\"promoted\"` and creates a linked sprint item).\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Handoff\n"
+        "\n"
+        "### `POST /projects/{project_id}/handoff`\n"
+        "\n"
+        "Generate a context handoff file.\n"
+        "\n"
+        "**Response:**\n"
+        "```json\n"
+        "{\n"
+        '  "file_path": "data/my-project_handoff.md",\n'
+        '  "content": "---\\nMERIDIAN_CONTEXT\\n..."\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Auth (Hosted Tier)\n"
+        "\n"
+        "### `GET /auth/login`\n"
+        "\n"
+        "Serves the sign-in page with Google and GitHub OAuth buttons.\n"
+        "\n"
+        "### `GET /auth/google/login`\n"
+        "\n"
+        "Redirect to Google OAuth consent page.\n"
+        "\n"
+        "### `GET /auth/callback`\n"
+        "\n"
+        "Google OAuth callback — creates/updates tenant, sets session cookie.\n"
+        "\n"
+        "**Query params:** `code` (from Google)\n"
+        "\n"
+        "### `GET /auth/github/login`\n"
+        "\n"
+        "Redirect to GitHub OAuth consent page.\n"
+        "\n"
+        "### `GET /auth/github/callback`\n"
+        "\n"
+        "GitHub OAuth callback — creates/updates tenant, sets session cookie.\n"
+        "\n"
+        "**Query params:** `code` (from GitHub)\n"
+        "\n"
+        "### `GET /auth/logout`\n"
+        "\n"
+        "Clear session cookie, redirect to `/`.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Remote MCP (Hosted Tier)\n"
+        "\n"
+        "### `POST /mcp`\n"
+        "\n"
+        "Remote MCP endpoint — HTTP transport.\n"
+        "\n"
+        "**Auth:** `Authorization: Bearer sk_meridian_...`\n"
+        "\n"
+        "**Rate limit:** 100 requests/minute per token\n"
+        "\n"
+        "**Body:** Standard MCP JSON-RPC request\n"
+        "\n"
+        "**Response:** Standard MCP JSON-RPC response\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Admin\n"
+        "\n"
+        "### `GET /admin`\n"
+        "\n"
+        "Admin dashboard. Shows active customers, churned, signups/day, Neon project"
+        " count, recent signups, payment failures.\n"
+        "\n"
+        "**Auth:** ADMIN_EMAIL Google OAuth only\n"
+        "\n"
+        "### `GET /admin/git-status`\n"
+        "\n"
+        "Check if the local repo is behind the remote.\n"
+        "\n"
+        "**Response:**\n"
+        "```json\n"
+        "{\n"
+        '  "behind": 0,\n'
+        '  "ahead": 0,\n'
+        '  "branch": "main",\n'
+        '  "error": null\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Demo\n"
+        "\n"
+        "### `GET /demo`\n"
+        "\n"
+        "Public read-only demo dashboard. Sets a demo context cookie."
+        " Exempt from SITE_PASSWORD gate.\n"
+        "\n"
+        "No auth required.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Static Pages\n"
+        "\n"
+        "| Route | Description |\n"
+        "|-------|-------------|\n"
+        "| `GET /` | Landing page with pricing |\n"
+        "| `GET /terms` | Terms of Service |\n"
+        "| `GET /privacy` | Privacy Policy |\n"
+        "| `GET /health` | Health check |\n"
+        "| `GET /dashboard` | Dashboard (auth required on hosted) |\n"
+        "| `GET /config` | Server config (version, db type, etc.) |\n"
+    )
+
+    return _STATIC + "".join(inventory_lines)
 # /admin/health, /admin/git-status → meridian/routes/admin.py
 
 

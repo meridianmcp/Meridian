@@ -826,7 +826,17 @@ async def handle_add_subtask(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: add_subtask."""
+    """MCP tool: add_subtask.
+
+    94938492 — project_id is resolved from project_name by the shared
+    _dispatch_mcp_tool resolver on the HTTP path, but the stdio path has no
+    such fallback for add_subtask and neither caller can help it if BOTH are
+    omitted. Guard like handle_add_sprint_item does, instead of letting the
+    direct args["project_id"] read below raise a raw KeyError that leaks as
+    a cryptic JSON-RPC -32603.
+    """
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
     return await db_module.add_subtask(
         db, args["project_id"], args["parent_id"], args["title"],
         owner=args.get("owner"),
@@ -1217,3 +1227,59 @@ async def handle_delete_sprint_item_pointer(
         return {"error": "pointer_id is required"}
     removed = await db_module.delete_sprint_item_pointer(db, args["pointer_id"])
     return {"pointer_id": args["pointer_id"], "deleted": removed}
+
+
+async def handle_complete_wave_gate(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: complete_wave_gate.
+
+    d2430713 — executor calls this AFTER actually running the wave's gate action
+    list (e.g. push, deploy, wait, run_verification) to signal that the gate has
+    passed and the next wave's items may now be claimed.
+
+    The REAL structured result from run_verification MUST be passed as
+    verification_payload.  The server validates it server-side (status=='ok',
+    exit_code==0).  A plain self-report or a fabricated payload is rejected.
+
+    Returns {gate_completed, wave_label, next_wave_label, next_wave_item_count,
+    next_wave_item_ids, gate_id} on success, or raises ValueError on bad evidence.
+    """
+    project_id = str(args.get("project_id") or "").strip()
+    project_name = str(args.get("project_name") or "").strip()
+    if not project_id and project_name:
+        _proj = await db_module.get_project_by_name(db, project_name)
+        if _proj:
+            project_id = _proj.get("id", "")
+    if not project_id:
+        return {"error": "project_id is required"}
+
+    wave_label = str(args.get("wave_label") or "").strip()
+    if not wave_label:
+        return {"error": "wave_label is required (e.g. 'wave-1')"}
+
+    verification_payload = args.get("verification_payload")
+    if verification_payload is None:
+        return {
+            "error": "verification_payload is required",
+            "hint": (
+                "Pass the full dict returned by run_verification. "
+                "Only a genuine run_verification result with status='ok' and "
+                "exit_code=0 satisfies the gate — a self-report is rejected."
+            ),
+        }
+
+    actor = str(args.get("actor") or "").strip() or None
+
+    try:
+        result = await db_module.complete_wave_gate(
+            db, project_id, wave_label, verification_payload, actor=actor
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    return result

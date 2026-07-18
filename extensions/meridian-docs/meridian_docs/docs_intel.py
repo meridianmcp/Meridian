@@ -85,6 +85,242 @@ def _heading_level(style: str | None) -> int:
     return int(match.group(1)) if match else 1
 
 
+# ---------------------------------------------------------------------------
+# 4a07e566 — Section-type differentiation + w:sectPr page-numbering awareness
+#
+# Section types mirror the regions a Word academic document actually uses:
+#   abstract   — "Abstract", "Summary", "Executive Summary" headings
+#   toc        — "Table of Contents", "Contents", "TOC" headings (or TOC fields)
+#   lof        — "List of Figures", "List of Tables", "Figures", "Tables"
+#   appendix   — "Appendix" / "Annex" headings, or headings that follow the last
+#                level-1 "References"/"Bibliography" heading
+#   main       — everything else (the body of the document)
+#
+# The classifier is positional: it makes a single left-to-right pass over all
+# headings, maintaining a running region state.  Ambiguous headings at lower
+# levels inherit the region of the nearest preceding level-1 heading.
+# ---------------------------------------------------------------------------
+
+# Text patterns for known front-matter section types (case-insensitive).
+_ABSTRACT_RE = re.compile(
+    r"^(abstract|summary|executive\s+summary|synopsis|preface|foreword|acknowledgements?|dedication)$",
+    re.IGNORECASE,
+)
+_TOC_RE = re.compile(
+    r"^(table\s+of\s+contents?|contents?|toc)$",
+    re.IGNORECASE,
+)
+_LOF_RE = re.compile(
+    r"^(list\s+of\s+(figures?|tables?|illustrations?|abbreviations?|symbols?|equations?|listings?)"
+    r"|figures?|tables?|illustrations?|abbreviations?|nomenclature)$",
+    re.IGNORECASE,
+)
+_APPENDIX_RE = re.compile(
+    r"^(appendix|appendices|annex|annexure|supplement)",
+    re.IGNORECASE,
+)
+_REFERENCES_RE = re.compile(
+    r"^(references?|bibliography|works?\s+cited|literature\s+cited)$",
+    re.IGNORECASE,
+)
+
+SectionType = str  # "abstract" | "toc" | "lof" | "main" | "appendix"
+
+
+def _classify_heading_text(text: str) -> SectionType | None:
+    """Return a forced section type for well-known front/back-matter headings.
+
+    Returns None for headings whose type must be inferred from position (main
+    body content, or lower-level headings that inherit their parent's region).
+    """
+    t = text.strip()
+    if _ABSTRACT_RE.match(t):
+        return "abstract"
+    if _TOC_RE.match(t):
+        return "toc"
+    if _LOF_RE.match(t):
+        return "lof"
+    if _APPENDIX_RE.match(t):
+        return "appendix"
+    return None
+
+
+def _assign_section_types(
+    headings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Annotate each heading dict with a ``section_type`` field.
+
+    Single-pass left-to-right classifier.  Rules (in priority order):
+
+    1. Text-pattern match always wins (abstract/toc/lof/appendix).
+    2. A level-1 heading that matches the ``_REFERENCES_RE`` pattern moves the
+       region to "appendix" (back matter begins after references).
+    3. Headings that follow an "appendix" region-start remain "appendix".
+    4. Headings in the front matter (before the first non-front-matter level-1)
+       default to "abstract" when they don't match any explicit pattern.
+    5. Everything else is "main".
+
+    Returns a NEW list of dicts (copies) with the added ``section_type`` key.
+    """
+    in_front_matter = True  # before the first non-classified level-1 heading
+    in_appendix = False
+    result: list[dict[str, Any]] = []
+
+    for h in headings:
+        text = h.get("text", "")
+        level = h.get("level", 1)
+
+        forced = _classify_heading_text(text)
+
+        if forced == "appendix":
+            in_appendix = True
+            in_front_matter = False
+            section_type: SectionType = "appendix"
+        elif in_appendix:
+            section_type = "appendix"
+        elif forced is not None:
+            # abstract / toc / lof — these keep us in front matter
+            section_type = forced
+        elif level == 1 and _REFERENCES_RE.match(text.strip()):
+            # References/bibliography marks the transition to back matter
+            in_appendix = True
+            in_front_matter = False
+            section_type = "appendix"
+        elif level == 1:
+            # First unclassified level-1 heading ends front matter
+            in_front_matter = False
+            section_type = "main"
+        else:
+            # Sub-headings inherit the current region
+            section_type = "abstract" if in_front_matter else "main"
+
+        result.append({**h, "section_type": section_type})
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# w:sectPr parsing — page-number format and restart between sections
+# ---------------------------------------------------------------------------
+
+def parse_sectpr(source: str | bytes | bytearray) -> dict[str, Any]:
+    """4a07e566 — Parse all ``<w:sectPr>`` elements in a .docx body.
+
+    A .docx uses ``<w:sectPr>`` to define section properties.  In a document
+    with front matter (roman numeral page numbers) and body (arabic numerals),
+    Word inserts a ``<w:sectPr>`` as the last child of a ``<w:pPr>`` at each
+    section boundary, plus one final ``<w:sectPr>`` as a direct child of
+    ``<w:body>`` for the last section.
+
+    This function returns:
+
+    ``{section_count, sections}``
+
+    Each entry in ``sections`` is::
+
+        {
+          "index": int,              # 0-based order of sectPr in the body
+          "page_num_fmt": str,       # "decimal" | "upperRoman" | "lowerRoman" |
+                                     # "upperLetter" | "lowerLetter" | "none" | ...
+          "page_num_start": int | None,  # w:start val (restart value), or None
+          "page_num_type": str | None,   # raw w:pgNumType element summary
+          "is_continuous": bool,     # True when w:type val="continuous"
+          "anchor_para_id": str | None,  # paraId of the paragraph whose pPr
+                                         # contains this sectPr (None for the
+                                         # body-level final section)
+        }
+
+    When there are no ``<w:sectPr>`` elements (a document with a single
+    implicit section), returns ``{section_count: 0, sections: []}``.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
+    else:
+        zf = zipfile.ZipFile(source)
+    try:
+        with zf.open("word/document.xml") as handle:
+            xml = handle.read()
+    finally:
+        zf.close()
+
+    root = ET.fromstring(xml)
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"section_count": 0, "sections": []}
+
+    sections: list[dict[str, Any]] = []
+    w_sectPr = _q(_W, "sectPr")
+    w_pPr = _q(_W, "pPr")
+    w_pgNumType = _q(_W, "pgNumType")
+    w_type = _q(_W, "type")
+    w_fmt = _q(_W, "fmt")
+    w_start = _q(_W, "start")
+    w_val = _q(_W, "val")
+    w14_paraId = _q(_W14, "paraId")
+
+    for child in body:
+        # sectPr can appear as a direct child of body (final section)
+        # OR inside a paragraph's pPr (section boundary mid-document).
+        if child.tag == _q(_W, "p"):
+            ppr = child.find(w_pPr)
+            if ppr is not None:
+                spr = ppr.find(w_sectPr)
+                if spr is not None:
+                    anchor_id = child.get(w14_paraId) or None
+                    sections.append(_parse_one_sectpr(spr, anchor_id, len(sections),
+                                                      w_pgNumType, w_type, w_fmt, w_start, w_val))
+        elif child.tag == w_sectPr:
+            # Body-level final sectPr — no anchor paragraph
+            sections.append(_parse_one_sectpr(child, None, len(sections),
+                                              w_pgNumType, w_type, w_fmt, w_start, w_val))
+
+    return {"section_count": len(sections), "sections": sections}
+
+
+def _parse_one_sectpr(
+    spr: ET.Element,
+    anchor_para_id: str | None,
+    index: int,
+    w_pgNumType: str,
+    w_type: str,
+    w_fmt: str,
+    w_start: str,
+    w_val: str,
+) -> dict[str, Any]:
+    """Extract page-numbering fields from a single ``<w:sectPr>`` element."""
+    pg_num = spr.find(w_pgNumType)
+    page_num_fmt: str = "decimal"
+    page_num_start: int | None = None
+    page_num_type_raw: str | None = None
+    is_continuous: bool = False
+
+    # w:type val="continuous" means no page break at this section boundary.
+    type_el = spr.find(w_type)
+    if type_el is not None:
+        is_continuous = type_el.get(w_val, "") == "continuous"
+
+    if pg_num is not None:
+        fmt_val = pg_num.get(w_fmt)
+        if fmt_val:
+            page_num_fmt = fmt_val
+        start_val = pg_num.get(w_start)
+        if start_val is not None:
+            try:
+                page_num_start = int(start_val)
+            except ValueError:
+                pass
+        page_num_type_raw = ET.tostring(pg_num, encoding="unicode")
+
+    return {
+        "index": index,
+        "page_num_fmt": page_num_fmt,
+        "page_num_start": page_num_start,
+        "page_num_type": page_num_type_raw,
+        "is_continuous": is_continuous,
+        "anchor_para_id": anchor_para_id,
+    }
+
+
 def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     """Parse a .docx (path or raw bytes) into ordered paragraph records.
 
@@ -125,10 +361,16 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
 def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
     """13462df2 — stateless heading outline of a .docx (path or raw bytes). No
     sidecar index: a pure parse. Returns ``paragraph_count`` + ``heading_count``
-    + an ordered ``headings`` list (level/text/para_id) — the queryable document
-    structure docs_intel exposes without building a persistent index."""
+    + an ordered ``headings`` list (level/text/para_id/section_type) — the
+    queryable document structure docs_intel exposes without building a persistent
+    index.
+
+    4a07e566 — each heading now carries a ``section_type`` field
+    (abstract/toc/lof/main/appendix) classifying the document region it belongs
+    to. The ``section_regions`` key summarises the distinct regions in order.
+    """
     paras = parse_docx(source)
-    headings = [
+    raw_headings = [
         {
             "level": _heading_level(p.get("style")),
             "text": p.get("text", ""),
@@ -137,10 +379,20 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
         for p in paras
         if _is_heading(p.get("style"))
     ]
+    headings = _assign_section_types(raw_headings)
+
+    # Collect the ordered distinct regions (deduped, preserving first-seen order).
+    seen_regions: list[str] = []
+    for h in headings:
+        r = h["section_type"]
+        if not seen_regions or seen_regions[-1] != r:
+            seen_regions.append(r)
+
     return {
         "paragraph_count": len(paras),
         "heading_count": len(headings),
         "headings": headings,
+        "section_regions": seen_regions,
     }
 
 
@@ -178,10 +430,15 @@ def _connect(index_db_path: str) -> sqlite3.Connection:
             para_id TEXT PRIMARY KEY,
             idx INTEGER NOT NULL,
             level INTEGER NOT NULL,
-            text TEXT NOT NULL
+            text TEXT NOT NULL,
+            section_type TEXT
         )
         """
     )
+    # 4a07e566 — migrate existing DBs: add section_type column if absent.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(docx_headings)").fetchall()}
+    if "section_type" not in cols:
+        conn.execute("ALTER TABLE docx_headings ADD COLUMN section_type TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS docx_figures (
@@ -203,6 +460,65 @@ def _connect(index_db_path: str) -> sqlite3.Connection:
             caption TEXT,
             rows_json TEXT NOT NULL
         )
+        """
+    )
+    # 32d84131 — SQLite FTS5 external-content table for BM25 full-text search
+    # over paragraph text. Uses external-content mode pointing at docx_paragraphs
+    # so the text is not duplicated on disk. The FTS index is rebuilt atomically
+    # by index_docx() after each paragraph table replacement; sync triggers keep
+    # it consistent for incremental writes (caption inserts, etc.).
+    #
+    # WHY FTS5 (NOT Tantivy): meridian-docs is a stdlib-only, uvx-installable
+    # extension (no compiled C extensions, no Rust binaries). SQLite FTS5 is
+    # built into Python's sqlite3 module on all platforms, requires zero extra
+    # dependencies, and provides native BM25 ranking via bm25(docx_fts).
+    # Tantivy (used by meridian-outputs for its own FTS) requires a compiled
+    # Rust extension and is a heavyweight dependency — inappropriate for a
+    # lightweight DOCX parsing extension that ships as a pure-Python package.
+    # The two subsystems are independent: meridian-outputs indexes flat output
+    # files across a directory tree (high volume, append-heavy); meridian-docs
+    # indexes paragraphs of a single DOCX in a sidecar SQLite (low volume,
+    # rebuild-on-reindex). FTS5 is the right tool here. See decision pinned
+    # under "meridian-docs uses SQLite FTS5, not Tantivy".
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS docx_fts
+        USING fts5(
+            text,
+            content='docx_paragraphs',
+            content_rowid='rowid'
+        )
+        """
+    )
+    # Sync triggers: keep docx_fts consistent when docx_paragraphs rows are
+    # inserted or deleted individually (e.g. during caption write-back).
+    # Full rebuilds via index_docx() bypass these and call
+    # INSERT INTO docx_fts(docx_fts) VALUES('rebuild') directly.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_paragraphs_ai
+        AFTER INSERT ON docx_paragraphs BEGIN
+            INSERT INTO docx_fts(rowid, text) VALUES (new.rowid, new.text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_paragraphs_ad
+        AFTER DELETE ON docx_paragraphs BEGIN
+            INSERT INTO docx_fts(docx_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS docx_paragraphs_au
+        AFTER UPDATE ON docx_paragraphs BEGIN
+            INSERT INTO docx_fts(docx_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+            INSERT INTO docx_fts(rowid, text) VALUES (new.rowid, new.text);
+        END
         """
     )
     return conn
@@ -292,6 +608,12 @@ def index_docx(
                 "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
                 ("source_mtime", str(mtime) if mtime is not None else None),
             )
+        # 32d84131 — rebuild the FTS5 index from the current docx_paragraphs
+        # content. This is a full content-sync (not trigger-driven) so the index
+        # is always consistent after index_docx regardless of how the paragraph
+        # table was populated. The 'rebuild' command re-reads the content table
+        # and regenerates all FTS posting lists atomically.
+        conn.execute("INSERT INTO docx_fts(docx_fts) VALUES ('rebuild')")
         conn.commit()
     finally:
         conn.close()
@@ -366,6 +688,71 @@ def find_paragraphs(
         conn.close()
     return [
         {"para_id": r[0], "index": r[1], "style": r[2], "text": r[3]} for r in rows
+    ]
+
+
+def fts5_search_paragraphs(
+    index_db_path: str, query: str, limit: int = 20
+) -> list[dict[str, Any]]:
+    """32d84131 — BM25 full-text search over paragraph text via SQLite FTS5.
+
+    Uses the ``docx_fts`` external-content FTS5 virtual table (backed by
+    ``docx_paragraphs``) populated by :func:`index_docx`. Results are ranked
+    by BM25 relevance (most relevant first); document order is NOT preserved
+    (use :func:`find_paragraphs` for substring/order-preserving scan).
+
+    The FTS5 query syntax is a subset of SQLite FTS5 query syntax:
+    bare tokens are AND-ed by default; ``OR``, ``NOT``, and phrase queries
+    (``"two words"``) are supported. Wildcards (``term*``) are supported
+    for prefix matching.
+
+    Auto-refreshes the index if the source .docx changed since last indexed
+    (see :func:`_ensure_fresh`).
+
+    Args:
+        index_db_path:  Path to the sidecar SQLite index built by
+                        :func:`index_docx`.
+        query:          FTS5 query string (e.g. ``"meridian"`` or
+                        ``'"AI sessions"'`` for a phrase).
+        limit:          Maximum number of results to return (default 20).
+
+    Returns:
+        List of ``{para_id, index, style, text, bm25_score}`` dicts ordered
+        by relevance (best match first). Empty list when no matches or when
+        the FTS5 index has not been built yet (first call before
+        :func:`index_docx`).
+    """
+    _ensure_fresh(index_db_path)
+    conn = _connect(index_db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.para_id, p.idx, p.style, p.text,
+                   bm25(docx_fts) AS score
+            FROM docx_fts
+            JOIN docx_paragraphs p ON p.rowid = docx_fts.rowid
+            WHERE docx_fts MATCH ?
+            ORDER BY score
+            LIMIT ?
+            """,
+            (query, int(limit)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # FTS5 table may not exist in an older sidecar that pre-dates 32d84131,
+        # or the query may be syntactically invalid — degrade to empty rather
+        # than raising so callers get a consistent empty-list signal.
+        return []
+    finally:
+        conn.close()
+    return [
+        {
+            "para_id": r[0],
+            "index": r[1],
+            "style": r[2],
+            "text": r[3],
+            "bm25_score": r[4],
+        }
+        for r in rows
     ]
 
 
@@ -487,7 +874,8 @@ def index_docx_structure(
 
     # Rebuild tables with caption support (5-tuple: idx, row_count, col_count, rows_json, caption).
     # Re-parse to attach captions properly.
-    headings_out: list[tuple[str, int, int, str]] = []
+    # 4a07e566 — headings are collected as dicts so section_type can be assigned.
+    headings_raw: list[dict[str, Any]] = []
     figures_out: list[tuple[int, str | None, str, str | None]] = []
     tables_out: list[tuple[int, int, int, str, str | None]] = []  # (..., caption)
 
@@ -498,12 +886,12 @@ def index_docx_structure(
         idx = block.get("index", 0)
 
         if kind == "heading":
-            headings_out.append((
-                block.get("para_id", f"p{idx}"),
-                idx,
-                block.get("level", 1),
-                block.get("text", ""),
-            ))
+            headings_raw.append({
+                "para_id": block.get("para_id", f"p{idx}"),
+                "idx": idx,
+                "level": block.get("level", 1),
+                "text": block.get("text", ""),
+            })
         elif kind == "table":
             rows = block.get("rows") or []
             tables_out.append((
@@ -523,6 +911,17 @@ def index_docx_structure(
                 t = tables_out[last_table_entry_index]
                 tables_out[last_table_entry_index] = (t[0], t[1], t[2], t[3], block.get("text", ""))
 
+    # 4a07e566 — classify section types for all headings in one pass.
+    typed_headings = _assign_section_types([
+        {"level": h["level"], "text": h["text"], "para_id": h["para_id"]}
+        for h in headings_raw
+    ])
+    headings_out: list[tuple[str, int, int, str, str | None]] = [
+        (typed["para_id"], headings_raw[i]["idx"], typed["level"],
+         typed["text"], typed["section_type"])
+        for i, typed in enumerate(typed_headings)
+    ]
+
     conn = _connect(index_db_path)
     try:
         conn.execute("DELETE FROM docx_headings")
@@ -530,8 +929,8 @@ def index_docx_structure(
         conn.execute("DELETE FROM docx_tables")
 
         conn.executemany(
-            "INSERT OR REPLACE INTO docx_headings (para_id, idx, level, text) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO docx_headings (para_id, idx, level, text, section_type) "
+            "VALUES (?, ?, ?, ?, ?)",
             headings_out,
         )
         conn.executemany(
@@ -568,7 +967,7 @@ def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
     conn = _connect(index_db_path)
     try:
         heading_rows = conn.execute(
-            "SELECT para_id, idx, level, text FROM docx_headings ORDER BY idx"
+            "SELECT para_id, idx, level, text, section_type FROM docx_headings ORDER BY idx"
         ).fetchall()
         figure_rows = conn.execute(
             "SELECT id, idx, para_id, caption, seq_number FROM docx_figures ORDER BY idx"
@@ -580,7 +979,7 @@ def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
         conn.close()
 
     headings = [
-        {"para_id": r[0], "index": r[1], "level": r[2], "text": r[3]}
+        {"para_id": r[0], "index": r[1], "level": r[2], "text": r[3], "section_type": r[4]}
         for r in heading_rows
     ]
     figures = [
@@ -611,6 +1010,42 @@ def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
         "heading_count": len(headings),
         "figure_count": len(figures),
         "table_count": len(tables),
+    }
+
+
+def get_document_section_map(source: str | bytes | bytearray) -> dict[str, Any]:
+    """4a07e566 — Return a full section-type map + sectPr page-numbering summary.
+
+    Combines :func:`document_outline` (section-typed heading outline) with
+    :func:`parse_sectpr` (w:sectPr multi-section page-numbering) into a single
+    document intelligence view.
+
+    Returns::
+
+        {
+          "paragraph_count": int,
+          "heading_count": int,
+          "headings": [{level, text, para_id, section_type}, ...],
+          "section_regions": [str, ...],   # distinct ordered regions
+          "sectpr": {
+            "section_count": int,
+            "sections": [{index, page_num_fmt, page_num_start,
+                          page_num_type, is_continuous, anchor_para_id}, ...]
+          }
+        }
+
+    When there are no ``<w:sectPr>`` elements the ``sectpr.sections`` list is
+    empty, indicating a single implicit section with no explicit page-number
+    restart.
+    """
+    outline = document_outline(source)
+    sectpr = parse_sectpr(source)
+    return {
+        "paragraph_count": outline["paragraph_count"],
+        "heading_count": outline["heading_count"],
+        "headings": outline["headings"],
+        "section_regions": outline["section_regions"],
+        "sectpr": sectpr,
     }
 
 

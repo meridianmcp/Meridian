@@ -752,35 +752,213 @@ class OutputsFtsIndex:
         self._manifest: dict[str, tuple[float | None, int | None]] = {}
         self._row_cache: dict[str, OutputRow] = {}
         self.last_rebuild_partial = False
+        # 77443d83 -- Tantivy replaces DuckDB's own FTS extension for the
+        # search index; DuckDB (self._con) remains the metadata store (path,
+        # content, mtime, sha256, ... -- see _COLUMNS) that resolve_output and
+        # add_annotation still query directly.
+        self._tantivy_index: Any = None
+        self._tantivy_writer: Any = None
+        # Rows staged for the next Tantivy commit. Populated from THIS call's
+        # own paths_to_delete/new_rows in rebuild() whenever the FTS build is
+        # deferred past a deadline, so search()'s lazy catch-up (or the next
+        # rebuild()) commits exactly the outstanding delta -- never a full
+        # re-index -- no matter how many deferrals accumulate first.
+        self._pending_tantivy_deletes: set[str] = set()
+        self._pending_tantivy_upserts: dict[str, OutputRow] = {}
+        # 8163816e -- gates the one-time-per-process migration check that
+        # backfills Tantivy from any pre-existing DuckDB rows (upgrade path).
+        self._tantivy_migration_checked = False
 
     def _connect(self) -> Any:
         if self._con is None:
             import duckdb  # noqa: PLC0415
             self._con = duckdb.connect(self._db_path)
-            # d9c76caa follow-up -- a fresh instance always assumed
-            # _fts_built started False, forcing a full (expensive, non-
-            # incremental) FTS rebuild on its very first call even when a
-            # working FTS index already exists on disk from a PRIOR
-            # process's successful rebuild (0c1a4349 made the index persist
-            # across restarts, but this in-memory flag didn't know that --
-            # every fresh MCP server spawn paid the full-table-rebuild tax
-            # again regardless). Detect an existing FTS schema so a fresh
-            # process reuses it (possibly slightly stale -- same trade-off
-            # as the deadline-based skip in rebuild()) instead of always
-            # rebuilding from scratch on process restart.
+            # 77443d83 -- a fresh instance always assumed _fts_built started
+            # False. With Tantivy this is now cheap either way (_rebuild_fts
+            # only ever commits its pending delta, never a full re-index), but
+            # detecting an existing on-disk Tantivy index still lets a fresh
+            # process recognise a prior process's committed work immediately
+            # rather than reporting _fts_built=False until the next write.
+            tdir = self._tantivy_dir()
+            if tdir is not None:
+                try:
+                    import tantivy  # noqa: PLC0415
+                    if tantivy.Index.exists(tdir):
+                        self._fts_built = True
+                except Exception:  # noqa: BLE001
+                    _log.debug(
+                        "OutputsFtsIndex._connect: tantivy index probe failed",
+                        exc_info=True,
+                    )
+            # QUICK PATCH (2026-07-16, live diagnosis) -- 0c1a4349 made the
+            # outputs_index TABLE persist to disk, but _manifest/_row_cache
+            # (the in-memory staleness-detection state) were never rehydrated
+            # from it on a fresh process. Every process restart therefore saw
+            # an empty _row_cache, making EVERY file look stale again
+            # regardless of how much real work a prior process already
+            # persisted to disk -- confirmed live: a 205k+-file tree's cache
+            # file sat at a fixed size for hours across multiple calls,
+            # because each call re-did the same early-sorted subset of files
+            # from scratch instead of continuing past where the last one left
+            # off. Rehydrate from the existing table (if any) so restarts
+            # resume instead of restarting.
             try:
-                existing = self._con.execute(
-                    "SELECT 1 FROM information_schema.schemata "
-                    "WHERE schema_name = 'fts_main_outputs_index'"
-                ).fetchone()
-                if existing is not None:
-                    self._fts_built = True
+                self._rehydrate_cache_from_disk()
             except Exception:  # noqa: BLE001
                 _log.debug(
-                    "OutputsFtsIndex._connect: FTS schema probe failed",
+                    "OutputsFtsIndex._connect: cache rehydration failed",
                     exc_info=True,
                 )
         return self._con
+
+    def _rehydrate_cache_from_disk(self) -> None:
+        """Populate ``_manifest``/``_row_cache`` from any pre-existing rows in
+        the on-disk ``outputs_index`` table, so a fresh process resumes prior
+        progress instead of treating every file as stale again. No-op (and
+        cheap) when the table doesn't exist yet or is empty."""
+        con = self._con
+        if con is None:
+            return
+        try:
+            exists = con.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = 'outputs_index'"
+            ).fetchone()
+        except Exception:  # noqa: BLE001
+            return
+        if exists is None:
+            return
+        try:
+            relation = con.execute(
+                "SELECT path, content, mtime, sha256, size, "
+                "generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys FROM outputs_index"
+            )
+            columns = [c[0] for c in relation.description]
+            fetched = relation.fetchall()
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "OutputsFtsIndex._rehydrate_cache_from_disk: read failed",
+                exc_info=True,
+            )
+            return
+        for raw in fetched:
+            rec = dict(zip(columns, raw))
+            path = rec.get("path")
+            if not path:
+                continue
+            row = OutputRow(
+                path=path,
+                content=rec.get("content"),
+                mtime=rec.get("mtime"),
+                sha256=rec.get("sha256"),
+                size=rec.get("size"),
+                generating_script=rec.get("generating_script"),
+                kind=rec.get("kind"),
+                is_archival=bool(rec.get("is_archival")),
+                canonical_path=rec.get("canonical_path"),
+                csv_columns=(
+                    json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+                ),
+                json_keys=(
+                    json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+                ),
+            )
+            self._row_cache[path] = row
+            self._manifest[path] = (rec.get("mtime"), rec.get("size"))
+        if fetched:
+            _log.debug(
+                "OutputsFtsIndex._rehydrate_cache_from_disk: resumed %d "
+                "cached rows from disk", len(fetched),
+            )
+
+    @staticmethod
+    def _tantivy_schema() -> Any:
+        import tantivy  # noqa: PLC0415
+        schema_builder = tantivy.SchemaBuilder()
+        # 'raw' (untokenized) so delete_documents/exact-match lookups by full
+        # path work reliably -- mirrors the DuckDB table's path PRIMARY KEY.
+        schema_builder.add_text_field("path", stored=True, tokenizer_name="raw")
+        schema_builder.add_text_field("content", stored=False)
+        return schema_builder.build()
+
+    def _tantivy_dir(self) -> str | None:
+        """Directory Tantivy persists its index segments to, a sibling of the
+        DuckDB cache file. None (RAM index, no persistence) when db_path is
+        ':memory:' -- mirrors _resolve_index_db_path's own degrade-gracefully
+        behaviour for a directory that can't be created."""
+        if self._db_path == ":memory:":
+            return None
+        base = os.path.dirname(self._db_path)
+        if not base:
+            return None
+        tdir = os.path.join(base, "tantivy_index")
+        try:
+            os.makedirs(tdir, exist_ok=True)
+        except OSError:
+            return None
+        return tdir
+
+    def _connect_tantivy(self) -> tuple[Any, Any]:
+        """Lazily open (or reuse) the Tantivy index + a long-lived writer --
+        same lifecycle pattern as :meth:`_connect` for the DuckDB connection.
+        Tantivy allows only one live writer per index, so this instance keeps
+        a single writer alive across calls rather than opening/closing one
+        per commit."""
+        if self._tantivy_index is None:
+            import tantivy  # noqa: PLC0415
+            schema = self._tantivy_schema()
+            tdir = self._tantivy_dir()
+            self._tantivy_index = (
+                tantivy.Index(schema, path=tdir) if tdir is not None
+                else tantivy.Index(schema)
+            )
+            self._tantivy_writer = self._tantivy_index.writer()
+        return self._tantivy_index, self._tantivy_writer
+
+    def _migrate_duckdb_rows_to_tantivy_if_needed(
+        self, con: Any, index: Any, writer: Any,
+    ) -> None:
+        """8163816e -- migration path for pre-Tantivy (pure-DuckDB-FTS)
+        installs: their outputs_index table can already hold rows that
+        predate this migration. Those rows aren't "stale" by filesystem
+        mtime/size, so the ordinary incremental path in rebuild() never
+        revisits them -- without this, they'd simply be invisible to
+        search() forever after an upgrade.
+
+        Converter approach (cheaper than delete-and-rebuild-clean): bulk-copy
+        existing DuckDB rows straight into Tantivy once. Content is already
+        sitting in the metadata table, so no filesystem re-walk/re-hash/
+        re-classify is needed. delete_documents before each add makes this
+        naturally idempotent -- safe to re-run after a partial/crashed
+        attempt, since it's gated on Tantivy's doc count still being short of
+        DuckDB's row count rather than a one-shot flag.
+        """
+        try:
+            tantivy_count = index.searcher().num_docs
+            duckdb_count = con.execute(
+                "SELECT COUNT(*) FROM outputs_index"
+            ).fetchone()[0]
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "OutputsFtsIndex: tantivy migration count probe failed",
+                exc_info=True,
+            )
+            return
+        if duckdb_count == 0 or tantivy_count >= duckdb_count:
+            return
+        _log.info(
+            "OutputsFtsIndex: migrating pre-existing DuckDB rows into "
+            "Tantivy (%d row(s) in DuckDB, %d already in Tantivy)",
+            duckdb_count, tantivy_count,
+        )
+        import tantivy  # noqa: PLC0415
+        relation = con.execute("SELECT path, content FROM outputs_index")
+        for path, content in relation.fetchall():
+            writer.delete_documents("path", path)
+            writer.add_document(tantivy.Document(path=path, content=content or ""))
+        writer.commit()
+        index.reload()
 
     def _ensure_schema(self, con: Any) -> None:
         con.execute(
@@ -1112,22 +1290,33 @@ class OutputsFtsIndex:
                                 for r in new_rows
                             ],
                         )
-                    # b1789c0d / d9c76caa -- _rebuild_fts() is a FULL,
-                    # non-incremental rebuild (DuckDB has no incremental FTS
-                    # support in the installed version, per b8314850) whose
-                    # cost grows with the TOTAL row count and has no deadline
-                    # check of its own. On a huge cold tree this alone can
-                    # push the overall rebuild() call well past its budget
-                    # even after Phase 1/Phase 2 correctly stop on time.
+                    # 77443d83 -- stage this call's own delta for the next
+                    # Tantivy commit. Accumulates (rather than overwrites)
+                    # across deferred calls, so whenever _rebuild_fts() next
+                    # actually runs -- here or lazily from search() -- it
+                    # commits the full outstanding delta as one small Tantivy
+                    # transaction, never a full re-index.
+                    self._pending_tantivy_deletes.update(paths_to_delete)
+                    for r in new_rows:
+                        self._pending_tantivy_upserts[r.path] = r
+                    # b1789c0d / d9c76caa -- _rebuild_fts() has no deadline
+                    # check of its own. On a huge cold tree, calling it
+                    # unconditionally could push the overall rebuild() call
+                    # well past its budget even after Phase 1/Phase 2 stopped
+                    # on time (confirmed live against a 66k-file tree, back
+                    # when _rebuild_fts() was DuckDB's full non-incremental
+                    # PRAGMA create_fts_index -- both calls returned
+                    # total_indexed=0 because that alone hit the ~4min
+                    # external client timeout). Tantivy's delta-only commit
+                    # (77443d83) makes this cost proportional to what changed
+                    # rather than total row count, but the deadline gate below
+                    # is kept regardless -- a large deferred delta is still a
+                    # real cost worth deferring under a tight budget.
                     #
                     # d9c76caa addressed the WARM-tree case (skip when
                     # _fts_built AND deadline passed) but NOT the COLD-tree
                     # case: on a first-ever call _fts_built is always False,
-                    # so the old guard never fired and _rebuild_fts() ran
-                    # unconditionally -- confirming the bug was live against a
-                    # 66k-file tree (both calls returned total_indexed=0
-                    # because _rebuild_fts() itself hit the ~4min external
-                    # client timeout, crashing the whole call).
+                    # so the old guard never fired.
                     #
                     # Fix (b1789c0d): skip _rebuild_fts() whenever the deadline
                     # has already passed -- regardless of whether _fts_built is
@@ -1273,13 +1462,33 @@ class OutputsFtsIndex:
             self._row_cache.pop(path, None)
 
     def _rebuild_fts(self, con: Any) -> None:
-        con.execute("INSTALL fts")
-        con.execute("LOAD fts")
-        con.execute(
-            "PRAGMA create_fts_index("
-            "'outputs_index', 'path', 'content', "
-            "stemmer = 'porter', stopwords = 'none', overwrite = 1)"
-        )
+        """77443d83 -- commit exactly the rows that changed as one small
+        Tantivy transaction (this call's own delta, plus anything
+        accumulated across a previously-deferred call), instead of DuckDB's
+        full non-incremental ``PRAGMA create_fts_index`` rebuild. Tantivy's
+        own background segment merge handles consolidation, not us.
+
+        ``con`` is still accepted (rather than dropped) because the one-time
+        migration check (8163816e) needs it to read pre-existing DuckDB rows,
+        and because callers/tests hold a bound reference to this method and
+        call it as ``_rebuild_fts(con)``.
+        """
+        import tantivy  # noqa: PLC0415
+        index, writer = self._connect_tantivy()
+        deletes, self._pending_tantivy_deletes = self._pending_tantivy_deletes, set()
+        upserts, self._pending_tantivy_upserts = self._pending_tantivy_upserts, {}
+        if deletes or upserts:
+            for p in deletes:
+                writer.delete_documents("path", p)
+            for row in upserts.values():
+                writer.add_document(
+                    tantivy.Document(path=row.path, content=row.content or "")
+                )
+            writer.commit()
+            index.reload()
+        if not self._tantivy_migration_checked:
+            self._tantivy_migration_checked = True
+            self._migrate_duckdb_rows_to_tantivy_if_needed(con, index, writer)
         self._fts_built = True
 
     def search(
@@ -1287,12 +1496,17 @@ class OutputsFtsIndex:
     ) -> list[dict[str, Any]]:
         """BM25 search over the FTS index.  Best-effort: errors yield [].
 
-        Filtering (``bm25 IS NOT NULL``), ordering (``ORDER BY bm25 DESC``), and
-        row-count limiting (``LIMIT``) are all pushed into the SQL query so that
-        only the top-N matching rows are transferred from DuckDB to Python.  A
-        Python sort is still applied afterwards to honour the archival score
-        penalty (archival rows get bm25 * 0.5) without adding complexity to the
-        SQL.
+        a6056886 -- queries the Tantivy index (77443d83) instead of DuckDB
+        FTS, but preserves the exact same external contract: the returned
+        hit shape (path/score/bm25/is_archival/canonical_path/kind/
+        generating_script/csv_columns/json_keys/size/mtime), the archival
+        score penalty (bm25 * 0.5), and the DESC-by-score ordering are all
+        unchanged. Tantivy only ever stores path+content (see
+        _tantivy_schema); every other column still lives in DuckDB, so a
+        match is resolved to path+bm25 first, then hydrated via a targeted
+        ``WHERE path IN (...)`` lookup against the metadata table -- same
+        division of labour as before (FTS engine ranks, DuckDB holds data),
+        just with the ranking engine swapped out.
 
         b1789c0d: when _fts_pending is True (rows exist in the table from a
         prior partial rebuild but _rebuild_fts() was deferred because that
@@ -1313,20 +1527,30 @@ class OutputsFtsIndex:
                 if not self._fts_built:
                     # b1789c0d: _fts_pending means rows are ready in the table
                     # but FTS was deferred from a prior rebuild(). Attempt a
-                    # lazy build now. An empty table (no rows yet) is a no-op
-                    # (DuckDB FTS over an empty table is fast and harmless).
+                    # lazy build now. An empty pending delta is a no-op
+                    # (mirrors the old "FTS over an empty table is harmless").
                     self._fts_pending = False
                     self._rebuild_fts(con)
+                index, _writer = self._connect_tantivy()
+                parsed_query = index.parse_query(q, ["content"])
+                tantivy_hits = index.searcher().search(parsed_query, safe_limit).hits
+                if not tantivy_hits:
+                    return []
+                searcher = index.searcher()
+                bm25_by_path: dict[str, float] = {}
+                for score, addr in tantivy_hits:
+                    path = searcher.doc(addr).get_first("path")
+                    if path is not None:
+                        bm25_by_path[path] = float(score)
+                if not bm25_by_path:
+                    return []
+                placeholders = ",".join("?" for _ in bm25_by_path)
                 sql = (
                     "SELECT path, content, mtime, sha256, size, generating_script, "
-                    "kind, is_archival, canonical_path, csv_columns, json_keys, "
-                    "fts_main_outputs_index.match_bm25(path, ?) AS bm25 "
-                    "FROM outputs_index "
-                    "WHERE fts_main_outputs_index.match_bm25(path, ?) IS NOT NULL "
-                    "ORDER BY bm25 DESC "
-                    "LIMIT ?"
+                    "kind, is_archival, canonical_path, csv_columns, json_keys "
+                    f"FROM outputs_index WHERE path IN ({placeholders})"
                 )
-                relation = con.execute(sql, [q, q, safe_limit])
+                relation = con.execute(sql, list(bm25_by_path.keys()))
                 columns = [c[0] for c in relation.description]
                 fetched = relation.fetchall()
             except Exception:  # noqa: BLE001
@@ -1335,7 +1559,7 @@ class OutputsFtsIndex:
         hits: list[dict[str, Any]] = []
         for row in fetched:
             rec = dict(zip(columns, row))
-            bm25 = rec.get("bm25")
+            bm25 = bm25_by_path.get(rec["path"])
             if bm25 is None:
                 continue
             is_arch = bool(rec.get("is_archival"))
@@ -1434,6 +1658,19 @@ class OutputsFtsIndex:
             if self._owns_con:
                 self._con = None
                 self._fts_built = False
+            # 77443d83 -- the Tantivy writer is always owned by this instance
+            # (never passed in via the constructor, unlike `connection`), so
+            # it's cleaned up unconditionally.
+            if self._tantivy_writer is not None:
+                try:
+                    self._tantivy_writer.wait_merging_threads()
+                except Exception:  # noqa: BLE001
+                    _log.debug(
+                        "OutputsFtsIndex.close: tantivy writer cleanup failed",
+                        exc_info=True,
+                    )
+                self._tantivy_writer = None
+            self._tantivy_index = None
 
 
 # ---------------------------------------------------------------------------

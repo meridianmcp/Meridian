@@ -13549,7 +13549,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const data = await api("/tunnel/plugins");
       const btn = document.getElementById(`vtab-codeintel-${projectId}`);
       if (!btn) return;
-      const isActive = !!(data && data.active && data.active.code);
+      const isActive = !!(data && data.active && (data.active.code || data.active.outputs));
       btn.style.display = isActive ? "" : "none";
     } catch (_2) {
     }
@@ -14164,8 +14164,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         api("/me"),
         loadProjectSettings2(projectId)
       ]);
-      if (!pluginsData?.active?.code) {
-        body.innerHTML = '<div class="empty" style="color:var(--muted)">Code intel tunnel is not active. Run <code>meridian --tunnel</code> to connect it.</div>';
+      const _codeActive = !!pluginsData?.active?.code;
+      const _outputsActive = !!pluginsData?.active?.outputs;
+      if (!_codeActive && !_outputsActive) {
+        body.innerHTML = '<div class="empty" style="color:var(--muted)">No tunnel slots are active. Run <code>meridian --tunnel</code> to connect code-intel and/or outputs indexing.</div>';
         return;
       }
       const tenantId = meData?.tenant_id;
@@ -14174,6 +14176,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         return;
       }
       const codeBase = `/code/mcp/${tenantId}/mcp`;
+      const _outputsBase = `/outputs/mcp/${tenantId}/mcp`;
       async function _codeMcpCall(method, params) {
         const r3 = await fetch(codeBase, {
           method: "POST",
@@ -14199,11 +14202,38 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         if (parsed.error) throw new Error(parsed.error.message || String(parsed.error));
         return parsed.result;
       }
+      async function _outputsMcpCall(method, params) {
+        const r3 = await fetch(_outputsBase, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params || {} })
+        });
+        if (!r3.ok) throw new Error(`HTTP ${r3.status}`);
+        const text = await r3.text();
+        let parsed = null;
+        if (text.trim().startsWith("{")) {
+          parsed = JSON.parse(text);
+        } else {
+          for (const line of text.split("\n")) {
+            if (line.startsWith("data:")) {
+              try {
+                parsed = JSON.parse(line.slice(5).trim());
+              } catch (_2) {
+              }
+            }
+          }
+        }
+        if (!parsed) throw new Error("empty response from outputs MCP");
+        if (parsed.error) throw new Error(parsed.error.message || String(parsed.error));
+        return parsed.result;
+      }
       let toolCount = 0;
-      try {
-        const tlResult = await _codeMcpCall("tools/list", {});
-        toolCount = (tlResult?.tools || []).length;
-      } catch (_2) {
+      if (_codeActive) {
+        try {
+          const tlResult = await _codeMcpCall("tools/list", {});
+          toolCount = (tlResult?.tools || []).length;
+        } catch (_2) {
+        }
       }
       const execCfg = settingsData?.executor_config || {};
       const repoPaths = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
@@ -14214,11 +14244,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       let _graphArch = null;
       let _archError = "";
       const _cgId = `ci-forcegraph-${projectId}`;
-      html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
-      <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
-      <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
-      ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? "s" : ""}</span>` : ""}
-    </div>`;
+      html += `<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">`;
+      if (_codeActive) {
+        html += `<span style="display:inline-flex;align-items:center;gap:6px">
+        <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
+        <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
+        ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? "s" : ""}</span>` : ""}
+      </span>`;
+      }
+      if (_outputsActive) {
+        html += `<span style="display:inline-flex;align-items:center;gap:6px">
+        <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
+        <span style="font-size:11px;color:var(--text);font-weight:600">Outputs Live</span>
+      </span>`;
+      }
+      html += `</div>`;
       let _docsCount = 0;
       try {
         const _dp = await api(`/projects/${projectId}/notes?paginate=true&limit=200`);
@@ -14233,69 +14273,119 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         <div>Documents: <b>${_docsCount}</b> ingested <span style="color:var(--muted)">(kind=document)</span></div>
       </div>
     </div>`;
-      html += `<div style="margin-bottom:16px">
-      <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Code Tree</div>
-      <div id="${_cgId}-codegraph"></div>
-    </div>`;
-      html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
-      html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
-      if (repoPaths.length) {
-        for (const rp of repoPaths) {
-          const cwd = typeof rp === "string" ? rp : rp.cwd || "";
-          const hostname = typeof rp === "object" ? rp.hostname || "" : "";
-          if (!cwd) continue;
-          try {
-            const result = await _codeMcpCall("tools/call", { name: "index_status", arguments: { project: _repoPathToProject(cwd) } });
-            const text = (result?.content || []).map((c3) => c3.text || "").join("").trim();
-            html += `<div style="margin-bottom:10px">
-            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> \xB7 ${escapeHtml(hostname)}</span>` : ""}</div>
-            <pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(text || "(no status returned)")}</pre>
-          </div>`;
-          } catch (e3) {
-            html += `<div style="margin-bottom:10px">
-            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}</div>
-            <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e3))}</div>
-          </div>`;
+      if (_codeActive) {
+        html += `<div style="margin-bottom:16px">
+        <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Code Tree</div>
+        <div id="${_cgId}-codegraph"></div>
+      </div>`;
+        html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
+        html += `<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Index Status</span><button id="${_cgId}-reindex" class="secondary" style="padding:2px 10px;font-size:10px" title="Re-run index_repository for each repo path (31d0caa6)">&#8635; Reindex</button></div>`;
+        if (repoPaths.length) {
+          for (const rp of repoPaths) {
+            const cwd = typeof rp === "string" ? rp : rp.cwd || "";
+            const hostname = typeof rp === "object" ? rp.hostname || "" : "";
+            if (!cwd) continue;
+            try {
+              const result = await _codeMcpCall("tools/call", { name: "index_status", arguments: { project: _repoPathToProject(cwd) } });
+              const text = (result?.content || []).map((c3) => c3.text || "").join("").trim();
+              html += `<div style="margin-bottom:10px">
+              <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> \xB7 ${escapeHtml(hostname)}</span>` : ""}</div>
+              <pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(text || "(no status returned)")}</pre>
+            </div>`;
+            } catch (e3) {
+              html += `<div style="margin-bottom:10px">
+              <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}</div>
+              <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e3))}</div>
+            </div>`;
+            }
           }
+        } else {
+          html += `<div style="font-size:10px;color:var(--muted)">No repo paths configured. Add them in Settings \u2192 Executor Config to see index status.</div>`;
+        }
+        html += "</div>";
+        html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Architecture Summary</div>`;
+        try {
+          const archPath = repoPaths.length ? typeof repoPaths[0] === "string" ? repoPaths[0] : repoPaths[0].cwd || "" : "";
+          const archArgs = archPath ? { project: _repoPathToProject(archPath) } : {};
+          const archResult = await _codeMcpCall("tools/call", { name: "get_architecture", arguments: archArgs });
+          const archText = (archResult?.content || []).map((c3) => c3.text || "").join("").trim();
+          const archSection = _codeArchSection(archText);
+          html += archSection.html;
+          archCharts = archSection.charts;
+          try {
+            const _arch = JSON.parse(archText);
+            _graphArch = _arch;
+            _graphPackages = _resolvePackageLayers(_arch?.packages, _arch?.layers);
+          } catch (_2) {
+            _graphPackages = [];
+          }
+          if (_graphPackages.length) {
+            try {
+              const _edgeRes = await _codeMcpCall("tools/call", { name: "query_graph", arguments: {
+                ...archArgs,
+                cypher: "MATCH (a)-[r]->(b) WHERE a.package <> b.package RETURN a.package, b.package, count(r)"
+              } });
+              _graphEdges = _normalizeGraphEdges(_edgeRes);
+            } catch (_2) {
+              _graphEdges = [];
+            }
+          }
+        } catch (e3) {
+          _archError = String(e3);
+          html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e3))}</div>`;
+        }
+        html += `</div>`;
+      } else {
+        html += `<div style="margin-bottom:16px;padding:10px 12px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;font-size:11px;color:var(--muted)">
+        Code-intel tunnel not connected. Run <code>meridian --tunnel</code> with the code slot enabled to see architecture visualization and index status.
+      </div>`;
+      }
+      html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Outputs Index</div>`;
+      if (_outputsActive) {
+        let _outputsToolCount = 0;
+        try {
+          const _otl = await _outputsMcpCall("tools/list", {});
+          _outputsToolCount = (_otl?.tools || []).length;
+        } catch (_2) {
+        }
+        html += `<div style="margin-bottom:8px;font-size:10px;color:var(--muted)">${_outputsToolCount} tool${_outputsToolCount !== 1 ? "s" : ""} available via meridian-outputs</div>`;
+        const _outputsDirs = Array.isArray(execCfg.outputs_dirs) ? execCfg.outputs_dirs.map((d3) => String(d3 || "").trim()).filter(Boolean) : [];
+        if (_outputsDirs.length) {
+          for (const odir of _outputsDirs) {
+            html += `<div style="margin-bottom:12px">
+            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(odir)}</div>`;
+            try {
+              const _osResult = await _outputsMcpCall("tools/call", {
+                name: "search_outputs",
+                arguments: { outputs_dir: odir, query: "", limit: 0 }
+              });
+              const _osText = (_osResult?.content || []).map((c3) => c3.text || "").join("").trim();
+              let _totalIndexed = null;
+              try {
+                const _osParsed = JSON.parse(_osText);
+                if (typeof _osParsed.total_indexed === "number") _totalIndexed = _osParsed.total_indexed;
+              } catch (_2) {
+              }
+              if (_totalIndexed !== null) {
+                html += `<div style="font-size:11px;color:var(--text)"><b>${_totalIndexed}</b> file${_totalIndexed !== 1 ? "s" : ""} indexed</div>`;
+              } else {
+                html += `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(_osText || "(no status returned)")}</pre>`;
+              }
+            } catch (e3) {
+              html += `<div style="font-size:10px;color:var(--error)">search_outputs failed: ${escapeHtml(String(e3))}</div>`;
+            }
+            html += `</div>`;
+          }
+        } else {
+          html += `<div style="font-size:10px;color:var(--muted)">No outputs directories configured. Set <code>outputs_dirs</code> in your executor config (<code>set_executor_config</code>) to see indexing state.</div>`;
         }
       } else {
-        html += `<div style="font-size:10px;color:var(--muted)">No repo paths configured. Add them in Settings \u2192 Executor Config to see index status.</div>`;
+        html += `<div style="font-size:10px;color:var(--muted)">Outputs tunnel not connected. Run <code>meridian --tunnel</code> with the outputs slot enabled (meridian-outputs-mcp) to see indexing state.</div>`;
       }
-      html += "</div>";
-      html += `<div><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Architecture Summary</div>`;
-      try {
-        const archPath = repoPaths.length ? typeof repoPaths[0] === "string" ? repoPaths[0] : repoPaths[0].cwd || "" : "";
-        const archArgs = archPath ? { project: _repoPathToProject(archPath) } : {};
-        const archResult = await _codeMcpCall("tools/call", { name: "get_architecture", arguments: archArgs });
-        const archText = (archResult?.content || []).map((c3) => c3.text || "").join("").trim();
-        const archSection = _codeArchSection(archText);
-        html += archSection.html;
-        archCharts = archSection.charts;
-        try {
-          const _arch = JSON.parse(archText);
-          _graphArch = _arch;
-          _graphPackages = _resolvePackageLayers(_arch?.packages, _arch?.layers);
-        } catch (_2) {
-          _graphPackages = [];
-        }
-        if (_graphPackages.length) {
-          try {
-            const _edgeRes = await _codeMcpCall("tools/call", { name: "query_graph", arguments: {
-              ...archArgs,
-              cypher: "MATCH (a)-[r]->(b) WHERE a.package <> b.package RETURN a.package, b.package, count(r)"
-            } });
-            _graphEdges = _normalizeGraphEdges(_edgeRes);
-          } catch (_2) {
-            _graphEdges = [];
-          }
-        }
-      } catch (e3) {
-        _archError = String(e3);
-        html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e3))}</div>`;
-      }
+      html += `</div>`;
       html += `<div style="margin-top:8px;display:flex;gap:6px">
       <button class="secondary" style="font-size:10px;padding:3px 10px" onclick="loadCodeIntelTab(${JSON.stringify(projectId)})">\u21BA Refresh</button>
-    </div></div>`;
+    </div>`;
       body.innerHTML = html;
       if (window.Chart && archCharts.length) {
         for (const c3 of archCharts) {

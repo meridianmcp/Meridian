@@ -3082,6 +3082,37 @@ async def _migrate_pg_note_nickname(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_wave_gate_results(conn: PostgresConnection) -> None:
+    """d2430713 — wave_gate_results: persist complete_wave_gate evidence records.
+
+    Stores the verified run_verification payload when an executor calls
+    complete_wave_gate after successfully running a wave's gate action list.
+    One row per (project_id, wave_label) pair — UNIQUE constraint enforces
+    that each wave gate can only be completed once.
+
+    Mirrors db._migrate_wave_gate_results. Idempotent via CREATE TABLE IF NOT
+    EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS wave_gate_results ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    wave_label TEXT NOT NULL,"
+        "    gate_passed INTEGER NOT NULL DEFAULT 1,"
+        "    exit_code INTEGER,"
+        "    passed_count INTEGER,"
+        "    failed_count INTEGER,"
+        "    verification_status TEXT,"
+        "    evidence_snapshot TEXT,"
+        "    actor TEXT,"
+        "    completed_at TEXT NOT NULL DEFAULT (now()::text),"
+        "    UNIQUE(project_id, wave_label)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_gate_results_project "
+        "ON wave_gate_results(project_id, wave_label)"
+    )
+
+
 async def _migrate_pg_server_logs(conn: PostgresConnection) -> None:
     """f0a48685 — server_logs: application-wide WARNING/ERROR/EXCEPTION log capture.
 
@@ -3241,5 +3272,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_note_nickname,
     _migrate_pg_sprint_item_prospect_bypass,
     _migrate_pg_handoff_tokens,
+    _migrate_pg_wave_gate_results,
     _migrate_pg_server_logs,
 )

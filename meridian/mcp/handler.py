@@ -2192,12 +2192,16 @@ async def _handle_task_tools(
                 )
         except Exception:  # noqa: BLE001
             _goal_warn = None
-        # 642b1818 — hotfix: return the handoff as one plain-text copyable block
-        # (strip markdown code-fence markers anywhere they appear — incl. inline in
-        # rendered note bodies — so it pastes cleanly into a fenced chat / a
-        # dashboard textarea without breaking the surrounding fence).
-        import re as _re_fence  # noqa: PLC0415
-        _plain_content = _re_fence.sub(r"```[A-Za-z0-9_+.-]*", "", content)
+        # 5234877f — wrap content in exactly ONE plain 4-backtick code fence so it
+        # renders as a single copy-pasteable block in any MCP client regardless of
+        # how the caller's markdown renderer handles surrounding context.  Four
+        # backticks (not three) avoids collision with nested ``` fences that appear
+        # inside the handoff body (e.g. the start_session code block in the Jinja2
+        # template).  This replaces the 642b1818 strip approach, which destroyed
+        # formatting and was still unreliable because callers kept adding their own
+        # blockquote/header wrappers around the plain text — the fence makes the
+        # block unambiguously self-delimiting at the wire level.
+        _plain_content = f"````\n{content}\n````"
         # 5abf3e12 — surface the stored per-session goal-compliance metric
         # (generate_handoff computed & persisted it) so the caller / dashboard
         # sees whether this session's /goal item list was fully completed.
@@ -2774,6 +2778,7 @@ async def _handle_session_tools(
         handle_get_connection_log,
         handle_get_server_logs,
         handle_search_server_logs,
+        handle_get_server_log_checkpoint,
         handle_get_agent_instructions,
         handle_set_agent_instructions,
         handle_set_executor_config,
@@ -2793,6 +2798,7 @@ async def _handle_session_tools(
         "get_connection_log": handle_get_connection_log,
         "get_server_logs": handle_get_server_logs,
         "search_server_logs": handle_search_server_logs,
+        "get_server_log_checkpoint": handle_get_server_log_checkpoint,
         "get_agent_instructions": handle_get_agent_instructions,
         "set_agent_instructions": handle_set_agent_instructions,
         "set_executor_config": handle_set_executor_config,
@@ -2871,7 +2877,7 @@ async def _handle_sprint_tools(
     analyze_sprint, claim_sprint_item, add_subtask, split_sprint_item,
     merge_sprint_items, complete_sprint_item, add_sprint_item_pointer,
     get_sprint_item_pointers, resolve_sprint_item_pointers,
-    delete_sprint_item_pointer.
+    delete_sprint_item_pointer, complete_wave_gate.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -2901,6 +2907,7 @@ async def _handle_sprint_tools(
         handle_get_sprint_item_pointers,
         handle_resolve_sprint_item_pointers,
         handle_delete_sprint_item_pointer,
+        handle_complete_wave_gate,
     )
 
     _standard_dispatch: dict[str, Any] = {
@@ -2924,6 +2931,7 @@ async def _handle_sprint_tools(
         "get_sprint_item_pointers": handle_get_sprint_item_pointers,
         "resolve_sprint_item_pointers": handle_resolve_sprint_item_pointers,
         "delete_sprint_item_pointer": handle_delete_sprint_item_pointer,
+        "complete_wave_gate": handle_complete_wave_gate,
     }
 
     if name in _standard_dispatch:
@@ -3574,11 +3582,29 @@ async def _handle_plugin_tools(
                 manifest["list_changed_refired"] = False
         return manifest
     if name == "list_plugins":
-        from ..tunnel_plugins import BUILTIN_PLUGINS  # noqa: PLC0415
+        from ..tunnel_plugins import BUILTIN_PLUGINS, resolve_plugins  # noqa: PLC0415
         from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
         _slot_display = _tunnel_mod.SLOT_DISPLAY_NAMES
 
         builtin_by_slot = {p["slot"]: p for p in BUILTIN_PLUGINS}
+
+        # 3751af82 — derive enabled from the RESOLVED per-tenant config so that
+        # opt-in slots (word, powerpoint) whose tenant has enabled them in
+        # tunnel_plugins are reported enabled=True rather than the static default
+        # (False). Without this, enabled was read from BUILTIN_PLUGINS (always
+        # False for word/ppt), while active/invocable were derived from live
+        # WebSocket state — so an enabled-and-running word slot showed
+        # enabled=False but active=True/invocable=True (the reported bug).
+        _raw_tp = tenant.get("tunnel_plugins") if tenant else None
+        if isinstance(_raw_tp, str) and _raw_tp.strip():
+            import json as _json_tp  # noqa: PLC0415
+            try:
+                _raw_tp = _json_tp.loads(_raw_tp)
+            except Exception:  # noqa: BLE001
+                _raw_tp = None
+        _resolved_by_slot: dict[str, dict] = {
+            p["slot"]: p for p in resolve_plugins(_raw_tp)
+        }
 
         # Fetch tunnel tool counts + live tool names per slot (parallel, non-fatal).
         #
@@ -3684,7 +3710,12 @@ async def _handle_plugin_tools(
             entry: dict[str, Any] = {
                 "name": plugin["name"],
                 "slot": slot,
-                "enabled": plugin.get("enabled", False),
+                # 3751af82 — read enabled from the per-tenant resolved config
+                # (not the static BUILTIN_PLUGINS default) so opt-in slots the
+                # tenant has explicitly enabled report enabled=True. The static
+                # default for word/ppt is False, but a tenant who enabled them
+                # in tunnel_plugins gets True here — consistent with active/invocable.
+                "enabled": _resolved_by_slot.get(slot, plugin).get("enabled", False),
                 "description": plugin.get("description", ""),
                 "tool_count": tool_count,
                 "active": slot in slot_tool_counts,
