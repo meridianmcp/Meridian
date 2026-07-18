@@ -32,7 +32,7 @@ import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from . import db as db_module
-from .db.sprint_items import _item_is_unprospected
+from .db.sprint_items import _item_is_unprospected, _split_wave_label
 from .executor_config import build_executor_config_block, has_executor_config
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -633,6 +633,7 @@ def _build_quick_start_goal(
     loop_enabled: bool = False,
     parallel_groups: dict[str, Any] | None = None,
     model_tier_hints: bool = False,
+    wave_gate_pending: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -655,6 +656,16 @@ def _build_quick_start_goal(
     mode 0 — "stop if HITL triggered"; mode 1/2 — "Do NOT file HITLs, skip
     blocked items and continue" (the auto-answer path never blocks the executor,
     so the old "stop if HITL triggered" clause was dead code for modes 1/2).
+
+    ``wave_gate_pending`` (74a8f420) is the caller-precomputed list of configured
+    wave gates that have NOT yet passed (each dict has at least ``wave_end`` and
+    ``actions``, as returned by ``db.get_wave_gate_configs`` filtered to
+    ``gate_passed=False``). Any pending item whose wave sorts beyond a pending
+    gate's ``wave_end`` boundary is excluded from the claimable batch with a
+    structured ``<excluded_wave_gate_pending>`` note — mirroring what
+    claim_sprint_item's own WAVE_GATE_PENDING check will refuse at claim time.
+    This is what makes wave gates ENFORCED rather than advisory /goal prose: the
+    /goal never hands out an item the executor can't actually claim.
     """
     try:
         _turns = int(max_turns)
@@ -723,6 +734,60 @@ def _build_quick_start_goal(
             "session must call update_sprint_item(item_id=..., prospect_bypass=true). "
             "Executors must NOT set prospect_bypass themselves. -->"
         )
+    # 74a8f420 — WAVE GATE STRUCTURAL ENFORCEMENT: exclude items whose wave sits
+    # beyond a configured-but-unpassed wave gate boundary from the claimable
+    # batch, mirroring the unprospected-gate exclusion above. This is what makes
+    # wave gates ENFORCED rather than advisory /goal prose: claim_sprint_item
+    # will structurally refuse (WAVE_GATE_PENDING) any of these items anyway, so
+    # the /goal never hands one out as if it were immediately claimable.
+    _excluded_wave_gated: list[dict[str, Any]] = []
+    if wave_gate_pending:
+        _pending_gates = [
+            g for g in wave_gate_pending if not g.get("gate_passed")
+        ]
+
+        def _blocking_gate_for(_wave: str | None) -> dict[str, Any] | None:
+            _prefix, _num = _split_wave_label(_wave)
+            if _num is None:
+                return None
+            _best: dict[str, Any] | None = None
+            _best_num: int | None = None
+            for _g in _pending_gates:
+                _g_prefix, _g_num = _split_wave_label(_g.get("wave_end"))
+                if _g_num is None or _g_prefix != _prefix or _g_num >= _num:
+                    continue
+                if _best_num is None or _g_num < _best_num:
+                    _best, _best_num = _g, _g_num
+            return _best
+
+        _kept: list[dict[str, Any]] = []
+        for _it in pending_sprint_items:
+            _gate = _blocking_gate_for(_it.get("wave"))
+            if _gate is not None:
+                _excluded_wave_gated.append({**_it, "_blocking_gate": _gate})
+            else:
+                _kept.append(_it)
+        pending_sprint_items = _kept
+    _excluded_wave_gate_note = ""
+    if _excluded_wave_gated:
+        _exc_ids = ", ".join(it["id"] for it in _excluded_wave_gated if it.get("id"))
+        _exc_n = len(_excluded_wave_gated)
+        _boundaries = sorted({
+            it["_blocking_gate"].get("wave_end")
+            for it in _excluded_wave_gated
+            if it.get("_blocking_gate", {}).get("wave_end")
+        })
+        _excluded_wave_gate_note = (
+            f'\n<excluded_wave_gate_pending count="{_exc_n}">'
+            f"{_xml_escape(_exc_ids)}"
+            "</excluded_wave_gate_pending>"
+            "\n<!-- These items are structurally blocked by claim_sprint_item "
+            f"until the wave gate(s) at {_xml_escape(', '.join(_boundaries))} "
+            "complete: run the configured action pipeline (push_dev/push_main/"
+            "deploy/wait/run_verification) then call complete_wave_gate with the "
+            "real run_verification result. This is enforced at claim time, not "
+            "just this prose note. -->"
+        )
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     if not item_ids:
         # 5abf3e12 — empty-board branch: same constraints as before (verify,
@@ -742,6 +807,7 @@ def _build_quick_start_goal(
             f"{_xml_escape(_hitl_clause)}</stop_conditions>"
             f"{_manual_note}"
             f"{_excluded_unprospected_note}"
+            f"{_excluded_wave_gate_note}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -886,6 +952,7 @@ def _build_quick_start_goal(
         + _build_model_hints_clause(pending_sprint_items, enabled=model_tier_hints)
         + f"{_manual_note}"
         f"{_excluded_unprospected_note}"
+        f"{_excluded_wave_gate_note}"
     )
 
 
@@ -3362,6 +3429,16 @@ async def generate_handoff(
         _parallel_groups = await db_module.get_parallelizable_groups(db, project_id)
     except Exception:  # noqa: BLE001
         _parallel_groups = None
+    # 74a8f420 — feed configured-but-unpassed wave gates into the /goal so a
+    # gated item is excluded from the claimable batch instead of being handed
+    # out only to be refused by claim_sprint_item's WAVE_GATE_PENDING check.
+    # Guarded + fail-open: any failure (e.g. pre-migration DB) degrades to no
+    # wave-gate exclusion.
+    _wave_gate_pending = None
+    try:
+        _wave_gate_pending = await db_module.get_wave_gate_configs(db, project_id)
+    except Exception:  # noqa: BLE001
+        _wave_gate_pending = None
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=db_module.normalize_execution_mode(
@@ -3375,6 +3452,7 @@ async def generate_handoff(
         parallel_groups=_parallel_groups,
         # 81396666 — pass the model-tier toggle so the /goal includes per-item hints.
         model_tier_hints=_model_hints_on,
+        wave_gate_pending=_wave_gate_pending,
     )
     # dd07ece0 — embed a provenance token near the top of the /goal block so a
     # receiving session can call verify_handoff_token(project_id, token) to
@@ -3918,6 +3996,13 @@ async def _generate_starter_handoff(
         _s_parallel_groups = await db_module.get_parallelizable_groups(db, project["id"])
     except Exception:  # noqa: BLE001
         _s_parallel_groups = None
+    # 74a8f420 — see the twin comment in generate_handoff: exclude items gated
+    # behind a configured-but-unpassed wave gate boundary. Guarded, fail-open.
+    _s_wave_gate_pending = None
+    try:
+        _s_wave_gate_pending = await db_module.get_wave_gate_configs(db, project["id"])
+    except Exception:  # noqa: BLE001
+        _s_wave_gate_pending = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=db_module.normalize_execution_mode(
@@ -3929,6 +4014,7 @@ async def _generate_starter_handoff(
         goal_group_style=_goal_group_style_from_settings(settings),
         loop_enabled=_loop_enabled_from_settings(settings, _s_ws_settings),
         parallel_groups=_s_parallel_groups,
+        wave_gate_pending=_s_wave_gate_pending,
     )
     # 77a29c8b — fetch recent tasks so blocked/found diagnostic entries are
     # visible even in the minimal starter path (guarded: never break handoff).

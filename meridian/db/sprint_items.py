@@ -1472,6 +1472,39 @@ async def claim_sprint_item(
             ),
             "item_id": item_id,
         }
+    # 74a8f420 — WAVE GATE STRUCTURAL ENFORCEMENT: an item whose wave sits
+    # beyond a configured-but-not-yet-passed wave gate boundary cannot be
+    # claimed. This is what turns wave gates (deterministic action pipelines —
+    # push_dev/push_main/deploy/wait/run_verification — attached to a wave or
+    # wave-range via configure_wave_gate) from advisory /goal prose into an
+    # actual claim-time block, the same class of fix as the DEFERRED/
+    # SUPERSEDED/UNPROSPECTED gates above. Fail-open: any DB error (e.g. the
+    # wave_gate_configs table not yet migrated) lets the claim proceed so a
+    # structural defect never permanently wedges the board.
+    try:
+        _blocking_gate = await _get_blocking_wave_gate(db, project_id, item.get("wave"))
+    except Exception:  # noqa: BLE001 — gate must never wedge the board
+        _blocking_gate = None
+    if _blocking_gate is not None:
+        _gate_end = _blocking_gate.get("wave_end")
+        return {
+            "blocked": True,
+            "error": "WAVE_GATE_PENDING",
+            "reason": (
+                f"Sprint item is in wave {item.get('wave')!r}, which sits beyond "
+                f"wave {_gate_end!r}'s configured gate pipeline "
+                f"({_blocking_gate.get('actions')!r}). That gate has not completed "
+                "yet — run its action pipeline (push_dev/push_main/deploy/wait/"
+                "run_verification as configured) then call complete_wave_gate("
+                f"project_id=..., wave_label={_gate_end!r}, verification_payload="
+                "<real run_verification result>) before this item can be claimed."
+            ),
+            "wave": item.get("wave"),
+            "gate_wave_start": _blocking_gate.get("wave_start"),
+            "gate_wave_end": _gate_end,
+            "gate_actions": _blocking_gate.get("actions"),
+            "item_id": item_id,
+        }
     # 94c26322 — refuse an unprospected item at claim time unless a human
     # explicitly set prospect_bypass. At claim time, enrichment-time fields
     # (code_pointers / prospect_status) are NOT on the DB row, so we check the
@@ -3305,3 +3338,247 @@ async def complete_wave_gate(
         "next_wave_item_ids": next_wave_item_ids,
         "gate_id": gate_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# 74a8f420 — configure_wave_gate: deterministic, on-the-fly-configurable
+# action pipelines attached to a wave or wave-range, ENFORCED STRUCTURALLY by
+# claim_sprint_item (see the WAVE_GATE_PENDING check below) rather than being
+# advisory /goal prose. complete_wave_gate (d2430713, above) already recorded
+# *evidence* that a gate passed; this section adds the missing piece it
+# explicitly called out: a real config table so claim_sprint_item can look up
+# "is there a configured-but-unpassed gate between me and this item's wave"
+# instead of trusting the executor to have read the /goal text.
+#
+# A gate config is keyed by its ``wave_end`` — the boundary wave after which
+# the pipeline must run. ``wave_start`` documents the (possibly multi-wave)
+# range the gate covers (e.g. wave_start='wave-1', wave_end='wave-3' — one
+# gate checkpoint after waves 1-3, not one gate per wave). Only ``wave_end``
+# is used for enforcement: any item whose numeric wave sorts strictly after
+# wave_end, on the same "prefix-N" label family (e.g. 'wave-4' vs
+# 'wave-3'), is blocked at claim time until a matching wave_gate_results row
+# exists (written by complete_wave_gate once the pipeline's real
+# run_verification evidence is supplied).
+# ---------------------------------------------------------------------------
+
+# The only action types a gate pipeline may declare. push_dev/push_main/deploy
+# are executed by the executor via the trigger_workflow MCP tool; run_verification
+# maps 1:1 onto the run_verification MCP tool (whose real output is what
+# complete_wave_gate requires as evidence); wait is a plain pause step.
+_VALID_WAVE_GATE_ACTIONS = frozenset({
+    "push_dev", "push_main", "deploy", "wait", "run_verification",
+})
+
+_WAVE_GATE_CONFIGS_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS wave_gate_configs ("
+    "    id TEXT PRIMARY KEY,"
+    "    project_id TEXT NOT NULL,"
+    "    wave_start TEXT NOT NULL,"     # first wave covered by this gate (documentation)
+    "    wave_end TEXT NOT NULL,"       # boundary wave — enforcement key
+    "    actions TEXT NOT NULL,"        # JSON array of {"type": ..., ...params}
+    "    actor TEXT,"
+    "    created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+    "    updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
+    "    UNIQUE(project_id, wave_end)"  # one pipeline per boundary wave
+    ")"
+)
+
+
+async def _ensure_wave_gate_configs_table(db: aiosqlite.Connection) -> None:
+    """Idempotently create wave_gate_configs (called inline, tolerates concurrent init)."""
+    await db.execute(_WAVE_GATE_CONFIGS_TABLE_DDL)
+
+
+def _split_wave_label(wave_label: str | None) -> tuple[str | None, int | None]:
+    """Parse a 'prefix-N' wave label (e.g. 'wave-3') into (prefix, N).
+
+    Returns (None, None) for anything that doesn't match — callers treat that
+    as "not comparable" and fail open (no gate enforcement possible without a
+    parseable ordering), mirroring complete_wave_gate's own next-wave-label
+    parsing.
+    """
+    if not wave_label:
+        return (None, None)
+    _parts = str(wave_label).rsplit("-", 1)
+    if len(_parts) == 2 and _parts[1].isdigit():
+        return (_parts[0], int(_parts[1]))
+    return (None, None)
+
+
+async def configure_wave_gate(
+    db: aiosqlite.Connection,
+    project_id: str,
+    wave_end: str,
+    actions: list[dict[str, Any]],
+    wave_start: str | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """74a8f420 — configure (or on-the-fly reconfigure) a wave gate's action pipeline.
+
+    ``wave_end`` (e.g. 'wave-3') is the boundary: claim_sprint_item structurally
+    refuses to claim any item whose wave sorts strictly after wave_end until a
+    matching ``wave_gate_results`` row exists (written by complete_wave_gate).
+    ``wave_start`` (defaults to wave_end) documents the range covered — e.g.
+    wave_start='wave-1', wave_end='wave-3' is one deploy checkpoint after three
+    waves' worth of items, not three separate gates.
+
+    ``actions`` is the deterministic pipeline: an ordered, non-empty list of
+    dicts, each with a ``type`` in push_dev | push_main | deploy | wait |
+    run_verification (extra keys — e.g. {"type": "wait", "seconds": 30} — are
+    preserved verbatim for the executor to read).
+
+    Re-configuring an already-configured (but not yet passed) ``wave_end`` is
+    an upsert — this is the "on-the-fly-configurable" half of the spec: a
+    planner can revise the pipeline for a wave boundary right up until an
+    executor actually completes it. Once wave_gate_results has a row for
+    wave_end the config is immutable (raises ValueError) — rewriting a passed
+    gate's pipeline after the fact would silently invalidate evidence that
+    claim_sprint_item already relied on to unblock items.
+    """
+    wave_end = str(wave_end or "").strip()
+    if not wave_end:
+        raise ValueError("configure_wave_gate requires a non-empty wave_end")
+    wave_start = str(wave_start).strip() if wave_start else wave_end
+    if not isinstance(actions, list) or not actions:
+        raise ValueError(
+            "configure_wave_gate requires a non-empty actions list — the "
+            "deterministic pipeline (push_dev/push_main/deploy/wait/"
+            "run_verification) that must run before the next wave unlocks."
+        )
+    _normalized: list[dict[str, Any]] = []
+    for _i, _action in enumerate(actions):
+        if not isinstance(_action, dict) or not _action.get("type"):
+            raise ValueError(
+                f"configure_wave_gate: actions[{_i}] must be a dict with a "
+                f"'type' key, got {_action!r}"
+            )
+        _atype = str(_action["type"]).strip().lower()
+        if _atype not in _VALID_WAVE_GATE_ACTIONS:
+            raise ValueError(
+                f"configure_wave_gate: actions[{_i}].type={_atype!r} is not "
+                f"one of the supported actions: {sorted(_VALID_WAVE_GATE_ACTIONS)}"
+            )
+        _normalized.append({**_action, "type": _atype})
+
+    await _ensure_wave_gate_configs_table(db)
+    await _ensure_wave_gate_results_table(db)
+
+    # A passed gate's config is immutable — see docstring.
+    async with db.execute(
+        "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
+        (project_id, wave_end),
+    ) as _res_cur:
+        _already_passed = await _res_cur.fetchone()
+    if _already_passed is not None:
+        raise ValueError(
+            f"Wave gate for {wave_end!r} on project {project_id!r} has already "
+            "completed — its pipeline is immutable. Configure a NEW wave_end "
+            "boundary instead of reconfiguring a passed gate."
+        )
+
+    _actions_json = json.dumps(_normalized)
+    async with db.execute(
+        "SELECT id FROM wave_gate_configs WHERE project_id = ? AND wave_end = ?",
+        (project_id, wave_end),
+    ) as _cfg_cur:
+        _existing = await _cfg_cur.fetchone()
+    if _existing is not None:
+        _config_id = _existing["id"] if isinstance(_existing, dict) else _existing[0]
+        await db.execute(
+            "UPDATE wave_gate_configs SET wave_start = ?, actions = ?, actor = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (wave_start, _actions_json, actor, _config_id),
+        )
+    else:
+        _config_id = _new_id()
+        await db.execute(
+            "INSERT INTO wave_gate_configs "
+            "(id, project_id, wave_start, wave_end, actions, actor) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (_config_id, project_id, wave_start, wave_end, _actions_json, actor),
+        )
+    await db.commit()
+
+    return {
+        "configured": True,
+        "gate_config_id": _config_id,
+        "project_id": project_id,
+        "wave_start": wave_start,
+        "wave_end": wave_end,
+        "actions": _normalized,
+    }
+
+
+async def get_wave_gate_configs(
+    db: aiosqlite.Connection, project_id: str,
+) -> list[dict[str, Any]]:
+    """Read-only: list every configured wave gate for a project (oldest first),
+    each annotated with ``gate_passed`` (whether wave_gate_results already has
+    a matching row) so callers don't need a second query to know what's still
+    pending."""
+    await _ensure_wave_gate_configs_table(db)
+    await _ensure_wave_gate_results_table(db)
+    async with db.execute(
+        "SELECT * FROM wave_gate_configs WHERE project_id = ? ORDER BY created_at",
+        (project_id,),
+    ) as _cur:
+        _rows = await _cur.fetchall()
+    out: list[dict[str, Any]] = []
+    for _row in _rows:
+        _cfg = _row_to_dict(_row) or {}
+        try:
+            _cfg["actions"] = json.loads(_cfg.get("actions") or "[]")
+        except (TypeError, ValueError):
+            _cfg["actions"] = []
+        async with db.execute(
+            "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
+            (project_id, _cfg.get("wave_end")),
+        ) as _res_cur:
+            _cfg["gate_passed"] = (await _res_cur.fetchone()) is not None
+        out.append(_cfg)
+    return out
+
+
+async def _get_blocking_wave_gate(
+    db: aiosqlite.Connection, project_id: str, item_wave: str | None,
+) -> dict[str, Any] | None:
+    """Return the lowest-boundary configured-but-unpassed wave gate that
+    structurally blocks claiming an item in ``item_wave``, or None if nothing
+    blocks it (no wave on the item, no configs, an unparseable wave label, or
+    every configured boundary at-or-below this wave has already passed).
+
+    This is the function claim_sprint_item calls to turn wave gates from
+    advisory /goal prose into a real, structural claim-time block.
+    """
+    _item_prefix, _item_num = _split_wave_label(item_wave)
+    if _item_num is None:
+        return None
+    await _ensure_wave_gate_configs_table(db)
+    await _ensure_wave_gate_results_table(db)
+    async with db.execute(
+        "SELECT * FROM wave_gate_configs WHERE project_id = ?",
+        (project_id,),
+    ) as _cur:
+        _configs = await _cur.fetchall()
+    _blocking: dict[str, Any] | None = None
+    _blocking_num: int | None = None
+    for _row in _configs:
+        _cfg = _row_to_dict(_row) or {}
+        _cfg_prefix, _cfg_num = _split_wave_label(_cfg.get("wave_end"))
+        if _cfg_num is None or _cfg_prefix != _item_prefix or _cfg_num >= _item_num:
+            continue  # not a boundary strictly before this item's wave
+        async with db.execute(
+            "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
+            (project_id, _cfg.get("wave_end")),
+        ) as _res_cur:
+            _passed = await _res_cur.fetchone()
+        if _passed is not None:
+            continue  # this boundary's gate already passed
+        if _blocking_num is None or _cfg_num < _blocking_num:
+            try:
+                _cfg["actions"] = json.loads(_cfg.get("actions") or "[]")
+            except (TypeError, ValueError):
+                _cfg["actions"] = []
+            _blocking = _cfg
+            _blocking_num = _cfg_num
+    return _blocking

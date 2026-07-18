@@ -3113,6 +3113,33 @@ async def _migrate_pg_wave_gate_results(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_wave_gate_configs(conn: PostgresConnection) -> None:
+    """74a8f420 — wave_gate_configs: the on-the-fly-configurable action pipeline
+    (push_dev/push_main/deploy/wait/run_verification) attached to a wave or
+    wave-range, keyed by its boundary wave (``wave_end``). claim_sprint_item
+    reads this table (plus wave_gate_results) to structurally refuse claiming
+    any item whose wave sorts beyond a configured-but-unpassed boundary.
+
+    Mirrors db.migrations._migrate_wave_gate_configs. Idempotent via CREATE
+    TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS wave_gate_configs ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    wave_start TEXT NOT NULL,"
+        "    wave_end TEXT NOT NULL,"
+        "    actions TEXT NOT NULL,"
+        "    actor TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (now()::text),"
+        "    updated_at TEXT NOT NULL DEFAULT (now()::text),"
+        "    UNIQUE(project_id, wave_end)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_gate_configs_project "
+        "ON wave_gate_configs(project_id, wave_end)"
+    )
+
+
 async def _migrate_pg_server_logs(conn: PostgresConnection) -> None:
     """f0a48685 — server_logs: application-wide WARNING/ERROR/EXCEPTION log capture.
 
@@ -3273,5 +3300,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_prospect_bypass,
     _migrate_pg_handoff_tokens,
     _migrate_pg_wave_gate_results,
+    _migrate_pg_wave_gate_configs,
     _migrate_pg_server_logs,
 )

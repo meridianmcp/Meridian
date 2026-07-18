@@ -76,6 +76,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
     "assign_sprint_waves": 'assign_sprint_waves(project_id="abc-123")',
     "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
+    "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
@@ -1456,6 +1457,30 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "verification_payload": {"type": "object", "description": "The FULL dict returned by run_verification. Must have status='ok' and exit_code=0. Any other value (non-zero exit, error, not_configured, not_connected) is rejected. Do NOT fabricate or self-report — the server validates the payload."},
          "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."}},
          "required": ["wave_label", "verification_payload"]}},
+    {"name": "configure_wave_gate", "description":
+        "74a8f420 — PLANNING: configure (or on-the-fly reconfigure) a deterministic action "
+        "pipeline attached to a wave or wave-range, ENFORCED STRUCTURALLY — not just "
+        "advisory /goal prose. Once set, claim_sprint_item refuses (WAVE_GATE_PENDING) to "
+        "claim any item whose wave sorts beyond wave_end until complete_wave_gate records "
+        "real run_verification evidence for that boundary. actions is an ordered, non-empty "
+        "list of {\"type\": ...} dicts — type must be one of push_dev | push_main | deploy | "
+        "wait | run_verification (push_dev/push_main/deploy are run by the executor via "
+        "trigger_workflow; run_verification maps onto the run_verification tool whose output "
+        "complete_wave_gate requires as evidence; wait is a plain pause step; extra keys per "
+        "action, e.g. {\"type\": \"wait\", \"seconds\": 30}, are preserved verbatim). "
+        "wave_start (defaults to wave_end) documents a multi-wave range covered by one gate "
+        "checkpoint. Re-configuring an un-passed wave_end is an upsert — the pipeline can be "
+        "revised right up until an executor completes it; once passed the config is immutable "
+        "(returns {\"error\": ...}). Returns {configured, gate_config_id, project_id, "
+        "wave_start, wave_end, actions} on success.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "wave_end": {"type": "string", "description": "The boundary wave, e.g. 'wave-3'. Any item in a later wave (same 'prefix-N' family) is structurally blocked from claim_sprint_item until this gate completes."},
+         "wave_start": {"type": "string", "description": "Optional: first wave covered by this gate (documentation only, defaults to wave_end) — e.g. wave_start='wave-1' with wave_end='wave-3' covers waves 1-3 under one checkpoint."},
+         "actions": {"type": "array", "description": "Non-empty ordered list of {\"type\": push_dev|push_main|deploy|wait|run_verification, ...params} action dicts — the deterministic pipeline that must run before the next wave unlocks.", "items": {"type": "object"}},
+         "actor": {"type": "string", "description": "Optional session_id or actor name to record who configured the gate."}},
+         "required": ["wave_end", "actions"]}},
     {"name": "analyze_sprint", "description":
         "PLANNING: Read-only synthesis of the current sprint into one structured brief — "
         "parallelizability (conflict-free groups + max fan-out), dependency chains "
@@ -2012,6 +2037,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_parallelizable_groups":     "sprint-management",
     "assign_sprint_waves":           "sprint-management",
     "complete_wave_gate":            "sprint-management",
+    "configure_wave_gate":           "sprint-management",
     "analyze_sprint":                "sprint-management",
     "split_sprint_item":             "sprint-management",
     "merge_sprint_items":            "sprint-management",
@@ -2168,6 +2194,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     # ---- planner-focused ----
     "get_planning_brief":        "planner",
     "assign_sprint_waves":       "planner",
+    "configure_wave_gate":       "planner",
     "get_parallelizable_groups": "planner",
     "analyze_sprint":            "planner",
     "reconcile_sprint_drift":    "planner",
@@ -2531,6 +2558,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "reconcile_sprint_drift": "Reconcile Sprint Drift",
     "assign_sprint_waves": "Assign Sprint Waves",
     "complete_wave_gate": "Complete Wave Gate",
+    "configure_wave_gate": "Configure Wave Gate",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

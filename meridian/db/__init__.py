@@ -1073,6 +1073,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_prospect_bypass(db)
     await _migrate_handoff_tokens(db)
     await _migrate_wave_gate_results(db)
+    await _migrate_wave_gate_configs(db)
     await _migrate_server_logs(db)
     return db
 
@@ -10165,6 +10166,7 @@ from .sprint_items import (  # noqa: F401
     claim_sprint_item,
     complete_sprint_item,
     complete_wave_gate,
+    configure_wave_gate,
     count_pending_sprint_items,
     delete_sprint_item_pointer,
     fail_sprint_item,
@@ -10178,6 +10180,7 @@ from .sprint_items import (  # noqa: F401
     get_sprint_items_cached,
     get_sprint_items_for_resource,
     get_sprint_items_page,
+    get_wave_gate_configs,
     get_sprint_version_description,
     get_all_sprint_version_descriptions,
     upsert_sprint_version_description,
@@ -10219,6 +10222,8 @@ from .sprint_items import (  # noqa: F401
     _is_manual_sprint_item,
     _maybe_rollup_parent,
     _parse_deferral_ts,
+    _split_wave_label,
+    _get_blocking_wave_gate,
     _session_stall_summary,
     _sprint_item_nickname_base,
     _sprint_item_slug_base,

@@ -1290,3 +1290,61 @@ async def handle_complete_wave_gate(
         return {"error": str(exc)}
 
     return result
+
+
+async def handle_configure_wave_gate(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: configure_wave_gate.
+
+    74a8f420 — configure (or on-the-fly reconfigure) a deterministic action
+    pipeline (push_dev/push_main/deploy/wait/run_verification) attached to a
+    wave or wave-range. Once configured, claim_sprint_item STRUCTURALLY
+    refuses to claim any item whose wave sorts beyond ``wave_end`` until a
+    matching complete_wave_gate call records real run_verification evidence —
+    this is enforced at claim time, not just described in /goal prose.
+
+    Returns {configured, gate_config_id, project_id, wave_start, wave_end,
+    actions} on success, or {"error": ...} on bad input / an already-passed
+    (immutable) boundary.
+    """
+    project_id = str(args.get("project_id") or "").strip()
+    project_name = str(args.get("project_name") or "").strip()
+    if not project_id and project_name:
+        _proj = await db_module.get_project_by_name(db, project_name)
+        if _proj:
+            project_id = _proj.get("id", "")
+    if not project_id:
+        return {"error": "project_id is required"}
+
+    wave_end = str(args.get("wave_end") or "").strip()
+    if not wave_end:
+        return {"error": "wave_end is required (e.g. 'wave-3')"}
+
+    actions = args.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return {
+            "error": "actions is required and must be a non-empty list",
+            "hint": (
+                "Each entry is a dict with a 'type' in push_dev | push_main | "
+                "deploy | wait | run_verification, e.g. "
+                "[{\"type\": \"push_dev\"}, {\"type\": \"run_verification\"}, "
+                "{\"type\": \"push_main\"}, {\"type\": \"deploy\"}]."
+            ),
+        }
+
+    wave_start = str(args.get("wave_start") or "").strip() or None
+    actor = str(args.get("actor") or "").strip() or None
+
+    try:
+        result = await db_module.configure_wave_gate(
+            db, project_id, wave_end, actions, wave_start=wave_start, actor=actor,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    return result
