@@ -3091,3 +3091,199 @@ async def analyze_sprint(
         "blocked": groups_info.get("blocked", []),
         "running": groups_info.get("running", []),
     }
+
+
+# ---------------------------------------------------------------------------
+# d2430713 — complete_wave_gate: executor calls this AFTER running the gate's
+# action list (push / deploy / wait / run_verification) to signal that a wave's
+# gate has passed and unlock the next wave's items.  The only accepted evidence
+# is the REAL structured run_verification result payload — a plain self-reported
+# "I think it passed" boolean is explicitly rejected.
+#
+# Evidence contract (caller must supply AT LEAST ONE of):
+#   verification_payload — the full dict returned by run_verification:
+#       {status: "ok", exit_code: 0, passed: N, failed: 0, ...}
+#   Both status=="ok" AND exit_code==0 must hold.  Any other value (failed run,
+#   non-zero exit, error status, not_configured, not_connected) is rejected.
+#
+# On success this function:
+#   1. Writes a row into wave_gate_results with the evidence snapshot.
+#   2. Returns how many items in wave (wave_label + 1) are now unblocked
+#      (i.e. pending/todo items in the NEXT wave that exist in the project).
+#
+# "Unblocking" in the current model is purely informational: there is no
+# blocker_kind='wave_gate' mechanism yet — claim_sprint_item never checked wave.
+# The gate result itself is the artefact: the next wave's executor reads
+# wave_gate_results to confirm the prior wave's gate passed before claiming
+# next-wave items, and a future add to claim_sprint_item can query this table.
+# ---------------------------------------------------------------------------
+
+_WAVE_GATE_RESULTS_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS wave_gate_results ("
+    "    id TEXT PRIMARY KEY,"
+    "    project_id TEXT NOT NULL,"
+    "    wave_label TEXT NOT NULL,"         # e.g. 'wave-1'
+    "    gate_passed INTEGER NOT NULL DEFAULT 1,"  # always 1 (rejected gates never write)
+    "    exit_code INTEGER,"
+    "    passed_count INTEGER,"
+    "    failed_count INTEGER,"
+    "    verification_status TEXT,"
+    "    evidence_snapshot TEXT,"           # JSON of the full payload
+    "    actor TEXT,"
+    "    completed_at TEXT NOT NULL DEFAULT (datetime('now')),"
+    "    UNIQUE(project_id, wave_label)"    # one gate result per project+wave
+    ")"
+)
+
+
+async def _ensure_wave_gate_results_table(db: aiosqlite.Connection) -> None:
+    """Idempotently create wave_gate_results (called inline, tolerates concurrent init)."""
+    await db.execute(_WAVE_GATE_RESULTS_TABLE_DDL)
+
+
+async def complete_wave_gate(
+    db: aiosqlite.Connection,
+    project_id: str,
+    wave_label: str,
+    verification_payload: dict[str, Any],
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """d2430713 — record a verified wave gate completion and report next-wave readiness.
+
+    The caller MUST supply the full structured result dict from run_verification
+    as ``verification_payload``.  The dict is validated server-side:
+      * ``status`` must be ``"ok"`` (not "error", "not_configured", "not_connected").
+      * ``exit_code`` must be exactly ``0`` (integer).  Non-zero means tests failed.
+
+    Any other value raises ValueError with a clear diagnostic.  This means an
+    executor cannot satisfy the gate by passing a fabricated or self-reported payload;
+    only the genuine output of run_verification — which runs the REAL test suite on
+    the caller's machine — is accepted.
+
+    On success a row is written to ``wave_gate_results`` and the function returns::
+
+        {
+            "gate_completed": True,
+            "wave_label": "wave-1",
+            "next_wave_label": "wave-2",      # None if no next wave exists
+            "next_wave_item_count": <int>,    # how many pending/todo items in next wave
+            "next_wave_item_ids": [...],
+            "gate_id": "<uuid>",
+        }
+
+    Raises ValueError on evidence failure (bad payload) or if the gate for this
+    wave has already been completed.
+    """
+    # ── 1. Validate evidence ────────────────────────────────────────────────────
+    if not isinstance(verification_payload, dict):
+        raise ValueError(
+            "complete_wave_gate requires a verification_payload dict (the full result "
+            "from run_verification). Pass the dict directly — do not pass a boolean "
+            "or a self-report."
+        )
+
+    v_status = verification_payload.get("status")
+    v_exit = verification_payload.get("exit_code")
+    v_passed = verification_payload.get("passed")
+    v_failed = verification_payload.get("failed")
+
+    # Reject non-ok statuses up front with a clear diagnostic so the caller
+    # knows exactly what went wrong.
+    if v_status == "not_configured":
+        raise ValueError(
+            "Wave gate rejected: run_verification returned status='not_configured' — "
+            "no test_cmd is set for this project. Configure executor_config.test_cmd "
+            "via set_executor_config, then actually run run_verification and pass its "
+            "result here."
+        )
+    if v_status == "not_connected":
+        raise ValueError(
+            "Wave gate rejected: run_verification returned status='not_connected' — "
+            "the tunnel is not active. Start meridian --tunnel locally, run "
+            "run_verification so it executes the REAL test suite, and pass its result."
+        )
+    if v_status == "error":
+        raise ValueError(
+            f"Wave gate rejected: run_verification returned status='error' — "
+            f"the test runner itself crashed or was not found. Fix the command, "
+            f"re-run run_verification, and pass its result. "
+            f"Payload: {verification_payload!r}"
+        )
+    if v_status != "ok":
+        raise ValueError(
+            f"Wave gate rejected: verification_payload.status must be 'ok' but got "
+            f"{v_status!r}. Only a genuinely successful run_verification result "
+            f"(status='ok', exit_code=0) satisfies the gate."
+        )
+    if v_exit != 0:
+        raise ValueError(
+            f"Wave gate rejected: verification_payload.exit_code must be 0 but got "
+            f"{v_exit!r} (failed={v_failed!r}). Fix the failures, re-run "
+            f"run_verification, and pass the result when all tests pass."
+        )
+
+    # ── 2. Check for duplicate gate completion ────────────────────────────────────
+    await _ensure_wave_gate_results_table(db)
+    async with db.execute(
+        "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
+        (project_id, wave_label),
+    ) as _dup_cur:
+        _dup_row = await _dup_cur.fetchone()
+    if _dup_row is not None:
+        existing_id = _dup_row[0] if not isinstance(_dup_row, dict) else _dup_row["id"]
+        raise ValueError(
+            f"Wave gate for {wave_label!r} on project {project_id!r} has already been "
+            f"completed (gate_id={existing_id!r}). Each wave gate may only be completed "
+            f"once."
+        )
+
+    # ── 3. Determine the next wave label ─────────────────────────────────────────
+    # wave_label is expected to be 'wave-N'; next wave is 'wave-(N+1)'.
+    next_wave_label: str | None = None
+    _parts = wave_label.rsplit("-", 1)
+    if len(_parts) == 2 and _parts[1].isdigit():
+        next_wave_label = f"{_parts[0]}-{int(_parts[1]) + 1}"
+
+    # ── 4. Find next-wave items (informational) ───────────────────────────────────
+    next_wave_item_ids: list[str] = []
+    if next_wave_label is not None:
+        async with db.execute(
+            "SELECT id FROM sprint_items WHERE project_id = ? AND wave = ? "
+            "AND status IN ('pending', 'todo') ORDER BY added_at",
+            (project_id, next_wave_label),
+        ) as _nw_cur:
+            _nw_rows = await _nw_cur.fetchall()
+        next_wave_item_ids = [
+            (r["id"] if isinstance(r, dict) else r[0]) for r in _nw_rows
+        ]
+
+    # ── 5. Write gate result ──────────────────────────────────────────────────────
+    gate_id = _new_id()
+    evidence_snapshot = json.dumps(verification_payload)
+    await db.execute(
+        "INSERT INTO wave_gate_results "
+        "(id, project_id, wave_label, gate_passed, exit_code, passed_count, "
+        " failed_count, verification_status, evidence_snapshot, actor) "
+        "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+        (
+            gate_id,
+            project_id,
+            wave_label,
+            v_exit,
+            v_passed,
+            v_failed if v_failed is not None else 0,
+            v_status,
+            evidence_snapshot,
+            actor,
+        ),
+    )
+    await db.commit()
+
+    return {
+        "gate_completed": True,
+        "wave_label": wave_label,
+        "next_wave_label": next_wave_label,
+        "next_wave_item_count": len(next_wave_item_ids),
+        "next_wave_item_ids": next_wave_item_ids,
+        "gate_id": gate_id,
+    }

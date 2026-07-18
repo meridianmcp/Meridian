@@ -75,6 +75,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
     "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
     "assign_sprint_waves": 'assign_sprint_waves(project_id="abc-123")',
+    "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
@@ -1430,6 +1431,24 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "Optional: only assign waves to items in this sprint-version bucket."}},
          "required": []}},
+    {"name": "complete_wave_gate", "description":
+        "d2430713 — EXECUTOR GATE: call this AFTER you have actually run a wave's gate "
+        "action list (push, deploy, wait, run_verification) to unblock the next wave's "
+        "sprint items. You MUST pass the REAL structured result from run_verification as "
+        "verification_payload — the server validates it (status=='ok', exit_code==0). "
+        "A self-report ('I think it passed') or a fabricated payload is rejected with a "
+        "clear error. On success, writes a wave_gate_results row and returns "
+        "{gate_completed, wave_label, next_wave_label, next_wave_item_count, "
+        "next_wave_item_ids, gate_id}. Each wave gate may only be completed once "
+        "(duplicate calls return an error). Security note: this is a deploy-adjacent "
+        "gate — only actual run_verification output satisfies it.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "wave_label": {"type": "string", "description": "The wave whose gate is being completed, e.g. 'wave-1'. Must match the wave field on sprint_items that were just executed."},
+         "verification_payload": {"type": "object", "description": "The FULL dict returned by run_verification. Must have status='ok' and exit_code=0. Any other value (non-zero exit, error, not_configured, not_connected) is rejected. Do NOT fabricate or self-report — the server validates the payload."},
+         "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."}},
+         "required": ["wave_label", "verification_payload"]}},
     {"name": "analyze_sprint", "description":
         "PLANNING: Read-only synthesis of the current sprint into one structured brief — "
         "parallelizability (conflict-free groups + max fan-out), dependency chains "
@@ -1985,6 +2004,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_planning_brief":            "sprint-management",
     "get_parallelizable_groups":     "sprint-management",
     "assign_sprint_waves":           "sprint-management",
+    "complete_wave_gate":            "sprint-management",
     "analyze_sprint":                "sprint-management",
     "split_sprint_item":             "sprint-management",
     "merge_sprint_items":            "sprint-management",
@@ -2106,6 +2126,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     # ---- executor-focused ----
     "claim_sprint_item":         "executor",
     "complete_sprint_item":      "executor",
+    "complete_wave_gate":        "executor",
     "add_sprint_item":           "executor",
     "update_sprint_item":        "executor",
     "split_sprint_item":         "executor",
@@ -2502,6 +2523,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "set_agent_instructions": "Set Agent Instructions",
     "reconcile_sprint_drift": "Reconcile Sprint Drift",
     "assign_sprint_waves": "Assign Sprint Waves",
+    "complete_wave_gate": "Complete Wave Gate",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

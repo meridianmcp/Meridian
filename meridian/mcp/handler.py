@@ -2877,7 +2877,7 @@ async def _handle_sprint_tools(
     analyze_sprint, claim_sprint_item, add_subtask, split_sprint_item,
     merge_sprint_items, complete_sprint_item, add_sprint_item_pointer,
     get_sprint_item_pointers, resolve_sprint_item_pointers,
-    delete_sprint_item_pointer.
+    delete_sprint_item_pointer, complete_wave_gate.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -2907,6 +2907,7 @@ async def _handle_sprint_tools(
         handle_get_sprint_item_pointers,
         handle_resolve_sprint_item_pointers,
         handle_delete_sprint_item_pointer,
+        handle_complete_wave_gate,
     )
 
     _standard_dispatch: dict[str, Any] = {
@@ -2930,6 +2931,7 @@ async def _handle_sprint_tools(
         "get_sprint_item_pointers": handle_get_sprint_item_pointers,
         "resolve_sprint_item_pointers": handle_resolve_sprint_item_pointers,
         "delete_sprint_item_pointer": handle_delete_sprint_item_pointer,
+        "complete_wave_gate": handle_complete_wave_gate,
     }
 
     if name in _standard_dispatch:

@@ -1072,6 +1072,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_note_nickname(db)
     await _migrate_sprint_item_prospect_bypass(db)
     await _migrate_handoff_tokens(db)
+    await _migrate_wave_gate_results(db)
     await _migrate_server_logs(db)
     return db
 
@@ -10145,6 +10146,7 @@ from .sprint_items import (  # noqa: F401
     build_sprint_items_xml,
     claim_sprint_item,
     complete_sprint_item,
+    complete_wave_gate,
     count_pending_sprint_items,
     delete_sprint_item_pointer,
     fail_sprint_item,
