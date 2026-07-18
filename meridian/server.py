@@ -5289,11 +5289,14 @@ async def _start_session_composite(
     (project_id, session_name); NEVER on Mcp-Session-Id since ChatGPT
     regenerates that header per tool call.
 
-    ``expand_stale`` (2b4e69aa) only affects the full (``compact=False``)
-    payload's ``goal_xml``: it defaults to ``False`` so any goal field the
-    coherence check flagged stale (a week-old north_star / version_goal /
+    ``expand_stale`` (2b4e69aa; extended by 14847f20) only affects the full
+    (``compact=False``) payload: it defaults to ``False`` so any goal field
+    the coherence check flagged stale (a week-old north_star / version_goal /
     sprint) is collapsed to a one-line "expand for detail" summary instead of
-    dumped in full. Pass ``expand_stale=True`` to restore the full bodies; the
+    dumped in full — in ``goal_xml`` AND in the raw ``goal`` dict AND in
+    ``goal_cache_blocks``, so a stale field's dead weight isn't tripled up
+    across all three representations (the 269KB default payload). Pass
+    ``expand_stale=True`` to restore the full bodies everywhere; the
     ``coherence_warning`` flag is always preserved either way.
     """
     # c793377d — "just continue" resume. Auto-detect uses the 5-min heartbeat
@@ -5623,8 +5626,12 @@ async def _start_session_composite(
     )
     # v0.6.2 — Anthropic-API content blocks with cache_control on
     # the two static fields. Same ambient slice used by the XML.
+    # 14847f20 — same expand_stale collapsing as goal_xml above: a stale
+    # field flagged by coherence_warning shouldn't get dumped in full here
+    # either (it's a straight duplicate of the just-collapsed XML block).
     goal_cache_blocks = db_module.build_goal_cache_blocks(
-        goal, project_name, ambient_for_xml
+        goal, project_name, ambient_for_xml,
+        coherence_warning=coherence, expand_stale=expand_stale,
     )
     if goal is not None:
         goal["xml"] = goal_xml
@@ -5726,7 +5733,14 @@ async def _start_session_composite(
         "hitl_auto_answer_mode": _hitl_mode,
         "hitl_auto_answer_directive": _hitl_mode_directive(_hitl_mode),
         "sprint_version": scoped_version,  # a76cb7c0 — resolved scope (or None)
-        "goal": goal,
+        # 14847f20 — the raw goal dict gets the same stale-field collapse as
+        # goal_xml/goal_cache_blocks above; without it a week-old north_star
+        # / sprint was dumped in full here even though coherence_warning
+        # already flagged it stale, tripling up the same dead-weight text
+        # across goal/goal_xml/goal_cache_blocks (the 269KB default payload).
+        "goal": db_module.collapse_stale_goal_fields(
+            goal, coherence, expand_stale=expand_stale
+        ),
         "goal_xml": goal_xml,  # v0.6.1 — always present
         "goal_cache_blocks": goal_cache_blocks,  # v0.6.2 — ready for Anthropic
         "sprint_items": pending_items,  # v1.1 — active checklist (scoped)

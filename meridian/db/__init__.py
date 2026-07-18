@@ -1974,6 +1974,27 @@ def _stale_collapse_map(
     return out
 
 
+def _collapsed_field_summary(tag: str, meta: dict[str, Any]) -> str:
+    """Plain-text one-line stand-in for a stale goal field.
+
+    Shared by the XML collapse path (:func:`_collapsed_field_line`) and the
+    raw-dict / cache-block collapse path (14847f20) so the wording — and the
+    "pass expand_stale=true" escape hatch — stays in sync across every
+    representation of the same field.
+    """
+    date = meta.get("date")
+    age_days = meta.get("age_days")
+    if date and age_days is not None:
+        return (
+            f"[stale {tag} from {date} ({age_days}d old) — collapsed; pass "
+            "expand_stale=true or call get_session_brief for full text]"
+        )
+    return (
+        f"[stale {tag} — collapsed; pass expand_stale=true or call "
+        "get_session_brief for full text]"
+    )
+
+
 def _collapsed_field_line(
     tag: str, cache: str, meta: dict[str, Any], escape_fn: Any
 ) -> str:
@@ -1986,16 +2007,7 @@ def _collapsed_field_line(
     """
     date = meta.get("date")
     age_days = meta.get("age_days")
-    if date and age_days is not None:
-        summary = (
-            f"stale {tag} from {date} ({age_days}d old) — collapsed; pass "
-            "expand_stale=true or call get_session_brief for full text"
-        )
-    else:
-        summary = (
-            f"stale {tag} — collapsed; pass expand_stale=true or call "
-            "get_session_brief for full text"
-        )
+    summary = _collapsed_field_summary(tag, meta)
     parts = [f'  <{tag} cache="{cache}" stale="true" collapsed="true"']
     if date:
         parts.append(f' stale_since="{escape_fn(str(date))}"')
@@ -2135,10 +2147,55 @@ def build_goal_xml(
     return "\n".join(out)
 
 
+def collapse_stale_goal_fields(
+    goal: dict[str, Any] | None,
+    coherence_warning: dict[str, Any] | None,
+    expand_stale: bool = True,
+) -> dict[str, Any] | None:
+    """Trim coherence-flagged-stale text out of the raw ``goal`` dict.
+
+    2b4e69aa taught :func:`build_goal_xml` to collapse a stale north_star /
+    version_goal / sprint field to a one-line summary; the raw ``goal`` dict
+    handed back alongside ``goal_xml`` (e.g. by ``start_session``'s full
+    orientation) never got the same treatment — so a week-old field was
+    STILL dumped in full even though ``coherence_warning`` already flagged
+    it stale, and duplicated across ``goal``, ``goal["xml"]`` and
+    ``goal["cache_blocks"]``. That duplication of stale content was the
+    dominant contributor to a 269KB default ``start_session`` payload
+    (14847f20).
+
+    Mirrors ``build_goal_xml``'s default: ``expand_stale=True`` (the
+    default) returns ``goal`` unchanged so every existing caller keeps its
+    current behaviour byte-for-byte. Pass ``expand_stale=False`` to collapse.
+    Returns a shallow copy — the input dict (and anything already derived
+    from its FULL text, like ``goal["xml"]`` / ``goal["cache_blocks"]``
+    built before this runs) is never mutated.
+    """
+    if goal is None or expand_stale:
+        return goal
+    collapse = _stale_collapse_map(coherence_warning)
+    if not collapse:
+        return goal
+    trimmed = dict(goal)
+    if "north_star" in collapse and trimmed.get("north_star"):
+        trimmed["north_star"] = _collapsed_field_summary(
+            "north_star", collapse["north_star"]
+        )
+    if "version_goal" in collapse and trimmed.get("content"):
+        trimmed["content"] = _collapsed_field_summary(
+            "version_goal", collapse["version_goal"]
+        )
+    if "sprint" in collapse and trimmed.get("sprint"):
+        trimmed["sprint"] = _collapsed_field_summary("sprint", collapse["sprint"])
+    return trimmed
+
+
 def build_goal_cache_blocks(
     goal: dict[str, Any] | None,
     project_name: str,
     recent_tasks: list[dict[str, Any]] | None = None,
+    coherence_warning: dict[str, Any] | None = None,
+    expand_stale: bool = True,
 ) -> list[dict[str, Any]]:
     """Return goal text as Anthropic-API content blocks with cache hints.
 
@@ -2157,7 +2214,14 @@ def build_goal_cache_blocks(
     a prefix of the full prompt, so a hit requires the cached blocks
     to lead. Anything mutable that appears before a cached block
     invalidates the cache for every cold session.
+
+    ``expand_stale`` (14847f20, mirroring :func:`build_goal_xml`'s 2b4e69aa
+    flag): when ``False`` and ``coherence_warning`` flagged a field stale,
+    that block's body is replaced with the same one-line collapsed summary
+    used by the XML path, instead of the full text. Defaults to ``True`` so
+    every existing caller is unchanged.
     """
+    collapse = {} if expand_stale else _stale_collapse_map(coherence_warning)
     if goal is None:
         north_star = version_goal = sprint = ""
         version = 0
@@ -2172,6 +2236,15 @@ def build_goal_cache_blocks(
         else:
             version_goal = json.dumps(content, indent=2)
         sprint = goal.get("sprint") or ""
+
+    if "north_star" in collapse and north_star:
+        north_star = _collapsed_field_summary("north_star", collapse["north_star"])
+    if "version_goal" in collapse and version_goal:
+        version_goal = _collapsed_field_summary(
+            "version_goal", collapse["version_goal"]
+        )
+    if "sprint" in collapse and sprint:
+        sprint = _collapsed_field_summary("sprint", collapse["sprint"])
 
     header = (
         f"# Meridian goal — project: {project_name} (v{version})\n\n"
