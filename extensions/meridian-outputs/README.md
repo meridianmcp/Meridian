@@ -35,6 +35,7 @@ Or add to your MCP client config:
 | `resolve_figure_output` | Exact-path lookup of a figure in the index |
 | `npy_metadata` | Read .npy header (shape/dtype/size) without loading the array |
 | `file_fingerprint` | Cheap content signature (CSV columns, JSON keys, generating script) |
+| `search_logs` | Disposable regex log search: Tier 0 ripgrep scan + Tier 1 JSON/timestamp ranking, no persistent index |
 
 ## Security
 
