@@ -1616,17 +1616,25 @@ async def patch_sprint_item(
     wave: Any = _UNSET,
     sprint_name: Any = _UNSET,
     prospect_bypass: Any = _UNSET,
+    depends_on: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
     item_group, touches_resources, required_notes, deferred_until, track,
-    priority, blocker_kind, sprint_name, prospect_bypass. Only
+    priority, blocker_kind, sprint_name, prospect_bypass, depends_on. Only
     fields passed as non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
     so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
     / JSON string / comma-separated string of typed ids to set it.
+    ``depends_on`` (56f607ec) uses the ``_UNSET`` sentinel: omit to leave
+    unchanged, pass an empty string / ``None`` to CLEAR it (item becomes
+    independently claimable again), or another sprint item's id to set/fix
+    dependency ordering retroactively — previously ``depends_on`` could only
+    be set at creation time via ``add_sprint_item``, with no way to fix
+    ordering on an already-filed item. Raises ``ValueError`` if the id equals
+    ``item_id`` itself (a self-dependency would deadlock the item).
     ``deferred_until`` / ``track`` (dec69708) also use the ``_UNSET`` sentinel:
     omit to leave unchanged, pass an empty string / ``None`` to CLEAR the
     deferral (making the item immediately claimable again), or an ISO timestamp
@@ -1752,6 +1760,16 @@ async def patch_sprint_item(
         # it (re-enable the structural gate). Stored as INTEGER 0/1.
         ns_fields.append("prospect_bypass = ?")
         ns_values.append(1 if prospect_bypass else 0)
+    if depends_on is not _UNSET:
+        # 56f607ec — empty string / None CLEARS the dependency (item becomes
+        # independently claimable); otherwise set it to another item's id.
+        # Previously depends_on could only be fixed at creation time — this
+        # closes the gap that forced ordering into prose notes instead.
+        _dep = depends_on or None
+        if _dep is not None and _dep == item_id:
+            raise ValueError("depends_on cannot be the item's own id (self-dependency)")
+        ns_fields.append("depends_on = ?")
+        ns_values.append(_dep)
 
     if not ns_fields and status_value is None:
         return await get_sprint_item(db, item_id)

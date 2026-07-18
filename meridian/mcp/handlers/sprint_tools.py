@@ -349,6 +349,13 @@ async def handle_update_sprint_item(
     # False/0/null clears it (re-enables the structural gate).
     if "prospect_bypass" in args:
         _patch_kwargs["prospect_bypass"] = args.get("prospect_bypass")
+    # 56f607ec — set/clear depends_on. Only forward when the caller supplied the
+    # key (_UNSET sentinel), so omitting it leaves the stored value untouched;
+    # pass "" / null to clear (independently claimable), or another sprint
+    # item's id to set/fix dependency ordering retroactively. Previously this
+    # was creation-time-only via add_sprint_item.
+    if "depends_on" in args:
+        _patch_kwargs["depends_on"] = args.get("depends_on")
     try:
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"], **_patch_kwargs

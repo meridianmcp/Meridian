@@ -1318,10 +1318,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["items"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "
-        "group, deferred_until (enforced deferral), or track. Only the fields you pass are "
-        "changed; omitted fields are left untouched. Pass an empty string for human_id, group, "
-        "deferred_until, or track to clear it. Returns the updated item, or an error if the id "
-        "is unknown.",
+        "group, deferred_until (enforced deferral), track, or depends_on (dependency ordering). "
+        "Only the fields you pass are changed; omitted fields are left untouched. Pass an empty "
+        "string for human_id, group, deferred_until, track, or depends_on to clear it. Returns "
+        "the updated item, or an error if the id is unknown.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -1342,7 +1342,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "wave": {"type": "string",
                   "description": "58a45b92 — set/clear the stored wave label (e.g. 'wave-1') for enforced parallel-batch grouping. Hand-override of what assign_sprint_waves computes. Pass an empty string to CLEAR (unassigned); omit to leave unchanged."},
          "prospect_bypass": {"type": "boolean",
-                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. Set false to re-enable the structural gate. Omit to leave unchanged. Executor sessions must NOT set this field."}},
+                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. Set false to re-enable the structural gate. Omit to leave unchanged. Executor sessions must NOT set this field."},
+         "depends_on": {"type": "string",
+                        "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "
