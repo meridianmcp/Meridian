@@ -170,6 +170,15 @@ jobs:
       # a rule into the blocking select set (above) once its count reaches 0.
       - name: Lint (full rule set — warn only, does not fail CI)
         run: ruff check . --select F,E --statistics || true
+      # 178ed93e (refiled, original 691d367b stuck) — BLOCKING pre-merge AST
+      # check for orphaned local references: renamed/removed first-party
+      # functions with a dangling `from X import Y` or `module.attr` caller.
+      # Deliberately NOT the codebase graph's CALLS-edge confidence (too
+      # noisy, confirmed live) — a dedicated deterministic AST
+      # name-resolution walk instead. Stdlib-only (ast/dataclasses/pathlib),
+      # no pixi env needed. At 0 violations as of this change.
+      - name: AST check for orphaned local references
+        run: python3 scripts/check_orphaned_refs.py
 
   frontend:
     # 8e29733e — TypeScript strict type-check + Preact component coverage gate.
