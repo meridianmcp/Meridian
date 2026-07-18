@@ -76,6 +76,50 @@ start_session(session_name="describe-what-youre-doing")
 The env var takes precedence over the toml value.  An explicit `project_id`
 or `project_name` argument always wins over both.
 
+### First-time executor install: register the /goal skill (GitHub issue #9)
+
+Claude Code surfaces `/goal` as a slash command only when a matching skill or
+custom command exists in the target repo's `.claude/` directory.  A fresh
+executor session in a repo that has never run Meridian before will see
+"skill not found" if this step is skipped — that is what caused the overnight
+blockage in issue #9.
+
+**One-time setup per target repo:**
+
+```bash
+# From the root of the target repo:
+mkdir -p .claude/skills/goal
+curl -fsSL https://usemeridian.us/install/goal-skill.md \
+  -o .claude/skills/goal/SKILL.md
+# or, without curl, copy the content manually — see below.
+```
+
+If curl is unavailable, create `.claude/skills/goal/SKILL.md` with:
+
+```markdown
+---
+name: goal
+description: >-
+  Run a Meridian executor session: claim and complete pending sprint items.
+  Trigger when the user types /goal or pastes a /goal block from generate_handoff.
+---
+
+You are a Meridian executor.  The human has given you a /goal block
+(or you should call start_session to fetch one).
+
+1. Call start_session(project_id=..., session_name="...", role="executor").
+2. For each pending sprint item: claim_sprint_item → do the work → complete_sprint_item.
+3. Call log_task after each meaningful step.
+4. Call generate_handoff before ending.
+```
+
+Commit `.claude/skills/goal/SKILL.md` into the target repo so every future
+executor session in that repo recognises `/goal` without repeating this step.
+
+> **Self-hosted Meridian repos already have this file** — the Meridian repo
+> itself ships with it.  Only *target repos* (the repos you're working on
+> via Meridian, separate from the Meridian installation) need it added.
+
 ### Context7 (library/framework docs MCP)
 
 Context7 (by Upstash) indexes React, Tailwind, Next.js, and thousands of other

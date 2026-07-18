@@ -303,6 +303,54 @@ async def handle_start_session(
             )
     except Exception:  # noqa: BLE001 — orientation must not break
         pass
+    # 74e79d15 — executor /goal skill presence check (GitHub issue #9).
+    # When role=executor and a repo_path is configured, verify that the target
+    # repo has a .claude/skills/goal/ directory (or .claude/commands/goal.md)
+    # so the /goal slash command is recognised by Claude Code.  Without this
+    # file a fresh executor session silently cannot respond to /goal blocks,
+    # blocking real work (the issue that prompted this fix).  Best-effort:
+    # never break start_session if the check or the path look-up fails.
+    try:
+        if (
+            isinstance(result, dict)
+            and "continuation" not in result
+            and args.get("role") == "executor"
+        ):
+            import os as _os  # noqa: PLC0415
+
+            _exec_cfg_check: dict | None = None
+            try:
+                _exec_cfg_check = await db_module.get_executor_config(db, _pid)
+            except Exception:  # noqa: BLE001
+                pass
+            _repo_path_check = (
+                (_exec_cfg_check or {}).get("repo_path") or ""
+            ).strip()
+            if _repo_path_check:
+                # Normalise: split on both "/" and "\" so Windows paths work on
+                # any platform without relying on pathlib.Path.name (which is
+                # platform-native and breaks Windows-style paths on Linux CI).
+                _rp = _repo_path_check.rstrip("/\\")
+                _skill_dir = _rp + "/.claude/skills/goal"
+                _cmd_file = _rp + "/.claude/commands/goal.md"
+                _has_skill = _os.path.isdir(_skill_dir)
+                _has_cmd = _os.path.isfile(_cmd_file)
+                if not _has_skill and not _has_cmd:
+                    result["setup_warning"] = (
+                        "The /goal slash command is not registered in this "
+                        f"repo ({_repo_path_check}). "
+                        "Claude Code will not recognise /goal blocks until "
+                        "you add a skill file. "
+                        "Run: mkdir -p .claude/skills/goal && "
+                        "curl -fsSL https://usemeridian.us/install/goal-skill.md "
+                        "-o .claude/skills/goal/SKILL.md "
+                        "(or copy the template from the AGENTS.md 'First-time "
+                        "executor install' section). "
+                        "Commit the file so all future sessions in this repo "
+                        "recognise /goal automatically."
+                    )
+    except Exception:  # noqa: BLE001 — setup_warning must never break orientation
+        pass
     return result
 
 
