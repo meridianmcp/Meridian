@@ -214,6 +214,14 @@ async def handle_get_context_block(
     sprint_items = await db_module.get_sprint_items(
         db, project_id, status="pending"
     )
+    # 3fc6ff11 — annotate each pending item with its resolved sprint_item_pointers,
+    # mirroring the same annotation pass that generate_handoff's L1 section uses.
+    # Fully guarded: any failure degrades to plain title-only output, never crashes.
+    try:
+        from meridian.handoff import _annotate_resolved_pointers  # noqa: PLC0415
+        sprint_items = await _annotate_resolved_pointers(db, project_id, list(sprint_items))
+    except Exception:  # noqa: BLE001
+        pass
     all_tasks = await db_module.get_tasks(db, project_id, limit=20)
     pending_tasks = [
         t for t in all_tasks if t.get("status") in ("pending", "in_progress", "done")

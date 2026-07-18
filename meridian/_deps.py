@@ -695,6 +695,15 @@ def _render_context_block(
         lines += ["", "PENDING SPRINT ITEMS:"]
         for it in sprint_items[:10]:
             lines.append(f"- [{it.get('status', '?')}] {it.get('title', '')}")
+            rp: list[dict] = it.get("resolved_pointers") or []
+            if rp:
+                lines.append("  Resolved pointers:")
+                for ptr in rp:
+                    label = ptr.get("label")
+                    stype = ptr.get("source_type") or "code"
+                    for loc in ptr.get("targets") or []:
+                        prefix = f"{label}: " if label else ""
+                        lines.append(f"  - {prefix}{loc} [{stype}]")
     if pending_tasks:
         cap = 10 if mode == "full" else 5
         lines += ["", f"RECENT TASKS (last {min(len(pending_tasks), cap)}):"]
