@@ -3170,6 +3170,37 @@ async def _migrate_pg_server_logs(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_custom_hooks(conn: PostgresConnection) -> None:
+    """273287cb — custom_hooks: user-creatable Claude Code hooks.
+
+    Generalizes past the single auto-written sprint_guard.sh/.ps1 pair so a
+    project can define its own arbitrary PreToolUse/PostToolUse/Stop hooks
+    that get written into .claude/hooks/ by generate_handoff.
+
+    Mirrors db._migrate_custom_hooks. Idempotent via CREATE TABLE IF NOT
+    EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS custom_hooks ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    name TEXT NOT NULL,"
+        "    slug TEXT NOT NULL,"
+        "    event TEXT NOT NULL CHECK (event IN ('PreToolUse','PostToolUse','Stop')),"
+        "    matcher TEXT,"
+        "    script_sh TEXT NOT NULL,"
+        "    script_ps1 TEXT,"
+        "    blocking INTEGER NOT NULL DEFAULT 1,"
+        "    enabled INTEGER NOT NULL DEFAULT 1,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE(project_id, slug)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_custom_hooks_project "
+        "ON custom_hooks(project_id, event)"
+    )
+
+
 async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> None:
     """94c26322 — human-set bypass flag for the prospecting safety gate.
 
@@ -3302,4 +3333,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_wave_gate_results,
     _migrate_pg_wave_gate_configs,
     _migrate_pg_server_logs,
+    _migrate_pg_custom_hooks,
 )

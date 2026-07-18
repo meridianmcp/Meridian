@@ -1075,6 +1075,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_wave_gate_results(db)
     await _migrate_wave_gate_configs(db)
     await _migrate_server_logs(db)
+    await _migrate_custom_hooks(db)
     return db
 
 
@@ -10344,4 +10345,16 @@ from .workspace import (  # noqa: F401
     update_workspace_member,
     get_workspaces_for_email,
     get_scoped_project_ids_for_member,
+)
+
+
+from .hooks import (  # noqa: F401
+    VALID_HOOK_EVENTS,
+    _RESERVED_HOOK_SLUGS,
+    _sanitize_hook_slug,
+    add_custom_hook,
+    get_custom_hooks,
+    get_custom_hook,
+    update_custom_hook,
+    delete_custom_hook,
 )

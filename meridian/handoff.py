@@ -2932,14 +2932,118 @@ exit 0
 """
 
 
+def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
+    """273287cb — render the file(s) to write for one ``custom_hooks`` row.
+
+    Returns a ``{filename: content}`` mapping (relative to ``.claude/hooks/``).
+    One to three files depending on ``blocking`` / whether ``script_ps1`` is set:
+
+    * ``blocking=True``  — the script is written byte-for-byte (one file per
+      language provided). Its own exit code drives Claude Code's real
+      exit-code-blocking semantics (exit 2 blocks a PreToolUse call / a Stop /
+      feeds PostToolUse output back to the model) — same contract as
+      sprint_guard.{sh,ps1} today.
+    * ``blocking=False`` — "strong suggestion power" without determinism: the
+      script still runs and its stderr/stdout still surface, but an exit code
+      of 2 is downgraded to 1 so it can never hard-block.
+        - sh: wrapped in a ``( ... )`` subshell (a genuine child process, so a
+          bare ``exit N`` inside the user's script only ends the subshell —
+          the wrapper script keeps running to inspect ``$?`` and decide the
+          real exit code).
+        - ps1: PowerShell's ``exit`` statement cannot be intercepted within a
+          single process (it isn't a shadow-able function), so the user's body
+          is written to a companion ``<slug>_body.ps1`` and the wrapper
+          invokes it as a genuine child process (``& powershell -File ...``),
+          which inherits stdin/stdout/stderr and reports its exit code via
+          ``$LASTEXITCODE`` — the same isolation the sh subshell gets for free.
+    """
+    slug = hook["slug"]
+    name = hook.get("name") or slug
+    event = hook["event"]
+    matcher = hook.get("matcher") or ""
+    blocking = bool(hook.get("blocking", 1))
+    header_bits = [f"event={event}"]
+    if matcher:
+        header_bits.append(f"matcher={matcher}")
+    header_bits.append("blocking" if blocking else "advisory (non-blocking)")
+    header = (
+        f"# Meridian user-defined hook '{name}' ({', '.join(header_bits)}).\n"
+        f"# Auto-written by generate_handoff from custom_hooks (273287cb) — edit via "
+        f"the add_custom_hook/update_custom_hook MCP tools, not this file directly.\n"
+    )
+    out: dict[str, str] = {}
+
+    script_sh = (hook.get("script_sh") or "").strip("\n")
+    if script_sh:
+        if blocking:
+            out[f"{slug}.sh"] = header + script_sh + "\n"
+        else:
+            out[f"{slug}.sh"] = (
+                header
+                + "set -uo pipefail\n"
+                + "(\n"
+                + script_sh + "\n"
+                + ")\n"
+                + '_meridian_hook_rc=$?\n'
+                + 'if [ "$_meridian_hook_rc" -eq 2 ]; then\n'
+                + f'  echo "Meridian: hook \'{name}\' would have blocked '
+                  '(advisory mode -- downgraded to non-blocking)" >&2\n'
+                + "  exit 1\n"
+                + "fi\n"
+                + 'exit "$_meridian_hook_rc"\n'
+            )
+
+    script_ps1 = (hook.get("script_ps1") or "").strip("\n")
+    if script_ps1:
+        if blocking:
+            out[f"{slug}.ps1"] = header + script_ps1 + "\n"
+        else:
+            body_name = f"{slug}_body.ps1"
+            out[body_name] = header + script_ps1 + "\n"
+            out[f"{slug}.ps1"] = (
+                header
+                + "$ErrorActionPreference = 'SilentlyContinue'\n"
+                + f'& powershell -NoProfile -NonInteractive -File "$PSScriptRoot\\{body_name}"\n'
+                + "$_meridianHookRc = $LASTEXITCODE\n"
+                + "if ($_meridianHookRc -eq 2) {\n"
+                + f"    [Console]::Error.WriteLine(\"Meridian: hook '{name}' would have "
+                  "blocked (advisory mode - downgraded to non-blocking)\")\n"
+                + "    exit 1\n"
+                + "}\n"
+                + "exit $_meridianHookRc\n"
+            )
+    return out
+
+
+async def _write_custom_hooks(db: aiosqlite.Connection, project_id: str, hooks_dir: Path) -> None:
+    """273287cb — (re)write every enabled ``custom_hooks`` row for ``project_id``
+    into ``hooks_dir``. Called from ``_write_sprint_guard_hooks`` under the same
+    best-effort try/except (a failure here must never break the handoff).
+    Never touches ``sprint_guard.{sh,ps1}`` — ``add_custom_hook`` already
+    rejects the reserved ``sprint_guard`` slug, and this is a second,
+    defense-in-depth skip in case a row somehow bypassed that check.
+    """
+    hooks = await db_module.get_custom_hooks(db, project_id, enabled_only=True)
+    for hook in hooks:
+        if hook.get("slug") in db_module._RESERVED_HOOK_SLUGS:  # noqa: SLF001
+            continue
+        for filename, content in _render_custom_hook_files(hook).items():
+            (hooks_dir / filename).write_text(content, encoding="utf-8")
+
+
 async def _write_sprint_guard_hooks(
     db: aiosqlite.Connection, project_id: str, root: Path | None = None
 ) -> None:
     """c0d2356d — write .claude/hooks/sprint_guard.{sh,ps1} into the repo with
     ``project_id`` + MERIDIAN_URL baked in. Best-effort: a read-only /
     site-packages install (no writable .claude) must never break the mandatory
-    handoff, so all failures are swallowed. Only ever writes the sprint_guard.*
-    files — never the token-rotation hooks.* scripts.
+    handoff, so all failures are swallowed.
+
+    273287cb — generalized past sprint_guard: after writing the (always-on)
+    sprint_guard files, also (re)writes every enabled row from this project's
+    ``custom_hooks`` table (see ``_write_custom_hooks`` / ``_render_custom_hook_files``)
+    — user-creatable PreToolUse/PostToolUse/Stop hooks, injected into the repo
+    by the same mechanism as sprint_guard.
 
     Skips the repo-side write during the test suite (it would dirty the committed
     .claude/hooks); tests pass an isolated ``root`` to exercise it directly.
@@ -2975,6 +3079,7 @@ async def _write_sprint_guard_hooks(
         ps1 = _SPRINT_GUARD_PS1.replace("__PROJECT_ID__", project_id).replace("__URL__", url)
         (hooks_dir / "sprint_guard.sh").write_text(sh, encoding="utf-8")
         (hooks_dir / "sprint_guard.ps1").write_text(ps1, encoding="utf-8")
+        await _write_custom_hooks(db, project_id, hooks_dir)
     except Exception:  # noqa: BLE001 — never break handoff on a hook-write failure
         pass
 

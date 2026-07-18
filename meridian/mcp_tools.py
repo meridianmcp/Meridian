@@ -93,6 +93,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "set_active_repo": 'set_active_repo(repo_path="C:\\\\Users\\\\me\\\\project")',
     "analyze_model_efficiency": 'analyze_model_efficiency(title="Refactor auth across 12 files + migration", file_count=12, touches_resources=["auth_db", "sessions_table"], size="xl")',
     "run_verification": 'run_verification(project_id="abc-123")  # runs stored test_cmd on your local machine via tunnel',
+    "add_custom_hook": 'add_custom_hook(project_id="abc-123", name="no-secrets", event="PreToolUse", matcher="Read|Bash", script_sh="grep -q SECRET_KEY <<<\\"$(cat)\\" && exit 2 || exit 0", blocking=True)',
+    "get_custom_hooks": 'get_custom_hooks(project_id="abc-123", event="PreToolUse")',
+    "delete_custom_hook": 'delete_custom_hook(project_id="abc-123", hook_id="hook-uuid")',
 }
 
 
@@ -1936,6 +1939,54 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Resources (DB/schema/infra/services) the task touches. May also be an integer count. More/any resources -> more expensive."},
          "size": {"type": "string", "enum": ["xs", "s", "m", "l", "xl"], "description": "Optional explicit sprint-item size estimate (case-insensitive). Larger -> more expensive."}},
          "required": []}},
+    {"name": "add_custom_hook", "description":
+        "273287cb — define a user-creatable Claude Code hook (PreToolUse | PostToolUse | "
+        "Stop), generalizing past sprint_guard.sh/.ps1 (the only hook Meridian auto-writes "
+        "today). Written into the repo's .claude/hooks/<slug>.sh / .ps1 on the next "
+        "generate_handoff — the same auto-inject mechanism sprint_guard already uses. "
+        "script_sh (POSIX shell body) is required; script_ps1 (PowerShell body) is "
+        "optional — omit it to only ever write the .sh file. matcher is a Claude Code "
+        "tool-name regex (e.g. \"Edit|Write\"), ignored for Stop hooks. blocking (default "
+        "true) controls determinism vs. suggestion power: true writes the script "
+        "byte-for-byte so its own exit code drives REAL Claude Code exit-code-blocking "
+        "semantics (exit 2 blocks a PreToolUse call / a Stop / feeds PostToolUse output "
+        "back to the model); false wraps it so an exit 2 is downgraded to 1 before it's "
+        "written — the hook still runs and its output still surfaces, but it can never "
+        "hard-block ('strong suggestion power' without determinism). name must not be "
+        "'sprint_guard' (reserved for Meridian's own hook) or collide with an existing "
+        "hook's derived slug on this project — both raise a clear {error}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "name": {"type": "string", "description": "Human-readable hook name; sanitized to a filesystem-safe slug used for the written filename(s). Must not be 'sprint_guard'."},
+         "event": {"type": "string", "enum": ["PreToolUse", "PostToolUse", "Stop"], "description": "Which Claude Code hook event this fires on."},
+         "script_sh": {"type": "string", "description": "POSIX shell script body (required). Receives the same stdin JSON payload Claude Code passes to any hook."},
+         "script_ps1": {"type": "string", "description": "Optional PowerShell script body. Omit to only write the .sh file."},
+         "matcher": {"type": "string", "description": "Optional Claude Code tool-name matcher regex (e.g. \"Edit|Write\"); ignored for Stop hooks."},
+         "blocking": {"type": "boolean", "description": "Default true. true = real exit-code-blocking semantics (script written verbatim). false = advisory/non-blocking (an exit 2 is downgraded to 1 before writing)."},
+         "enabled": {"type": "boolean", "description": "Default true. Disabled hooks are skipped on the next generate_handoff write (their files aren't touched, but also aren't refreshed)."}},
+         "required": ["name", "event", "script_sh"]}},
+    {"name": "get_custom_hooks", "description":
+        "273287cb — list a project's user-defined hooks (newest first). Optional event "
+        "filter and enabled_only flag. Each entry includes the derived slug (the "
+        "filename stem used when written to .claude/hooks/) alongside the stored fields.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "event": {"type": "string", "enum": ["PreToolUse", "PostToolUse", "Stop"], "description": "Optional filter to only this event's hooks."},
+         "enabled_only": {"type": "boolean", "description": "When true, only return hooks with enabled=true."}},
+         "required": []}},
+    {"name": "delete_custom_hook", "description":
+        "273287cb — delete a user-defined hook by id (the id returned by add_custom_hook "
+        "/ get_custom_hooks). Idempotent: deleting an already-gone hook returns "
+        "{deleted:false} rather than erroring, matching delete_sprint_item_pointer's "
+        "convention. Does NOT remove any already-written .claude/hooks/<slug>.* files — "
+        "those are simply no longer refreshed on the next generate_handoff.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "hook_id": {"type": "string", "description": "The hook id to delete."}},
+         "required": ["hook_id"]}},
 ]
 
 _READ_ONLY_TOOLS = {
@@ -1964,8 +2015,9 @@ _READ_ONLY_TOOLS = {
     "prospect_symbol",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
+    "get_custom_hooks",
 }
-_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer"}
+_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook"}
 
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
@@ -2151,6 +2203,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "set_executor_config": "config",
     "set_active_repo":     "config",
     "run_verification":    "config",
+    "add_custom_hook":     "config",
+    "get_custom_hooks":    "config",
+    "delete_custom_hook":  "config",
     # research
     "paper_search": "research",
 }
@@ -2254,6 +2309,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_agent_instructions":    "both",
     "set_agent_instructions":    "both",
     "set_executor_config":       "both",
+    "add_custom_hook":           "both",
+    "get_custom_hooks":          "both",
+    "delete_custom_hook":        "both",
     "add_note":                  "both",
     "get_notes":                 "both",
     "read_note":                 "both",
@@ -2448,6 +2506,9 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "set_agent_instructions":     "maintenance-only",
     "get_agent_instructions":     "maintenance-only",
     "set_active_repo":            "maintenance-only",
+    "add_custom_hook":            "maintenance-only",
+    "get_custom_hooks":           "maintenance-only",
+    "delete_custom_hook":         "maintenance-only",
     # goal / sprint editing (planning boundaries only)
     "set_goal":                   "maintenance-only",
     "set_north_star":             "maintenance-only",

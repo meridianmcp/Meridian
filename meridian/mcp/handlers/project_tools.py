@@ -451,3 +451,81 @@ async def handle_merge_project(
         db, _src, _tgt,
         archive_source=bool(args.get("archive_source", True)),
     )
+
+
+async def handle_add_custom_hook(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: add_custom_hook (273287cb).
+
+    Creates a user-defined PreToolUse/PostToolUse/Stop hook for a project.
+    Written into the repo's ``.claude/hooks/`` on the next ``generate_handoff``
+    (see ``handoff._write_sprint_guard_hooks`` / ``_write_custom_hooks``), the
+    same mechanism that already auto-writes sprint_guard.{sh,ps1}. The db
+    layer raises ValueError for a bad event, empty name/script_sh, the
+    reserved 'sprint_guard' name, or a duplicate slug — surfaced as {error}.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    script_sh = args.get("script_sh")
+    if not script_sh:
+        return {"error": "script_sh is required"}
+    try:
+        return await db_module.add_custom_hook(
+            db, _pid,
+            name=args.get("name") or "",
+            event=args.get("event") or "",
+            script_sh=script_sh,
+            script_ps1=args.get("script_ps1"),
+            matcher=args.get("matcher"),
+            blocking=bool(args.get("blocking", True)),
+            enabled=bool(args.get("enabled", True)),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_custom_hooks(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_custom_hooks (273287cb). List a project's user-defined hooks."""
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    hooks = await db_module.get_custom_hooks(
+        db, _pid,
+        event=args.get("event"),
+        enabled_only=bool(args.get("enabled_only", False)),
+    )
+    return {"project_id": _pid, "hooks": hooks}
+
+
+async def handle_delete_custom_hook(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: delete_custom_hook (273287cb).
+
+    Idempotent: deleting an already-gone hook returns {"deleted": False}, not
+    an error (matches delete_sprint_item_pointer's convention). Does not
+    remove any already-written .claude/hooks/<slug>.* files — see
+    handoff._write_custom_hooks / db.delete_custom_hook docstrings.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    _hook_id = (args.get("hook_id") or "").strip()
+    if not _pid or not _hook_id:
+        return {"error": "project_id and hook_id are both required"}
+    deleted = await db_module.delete_custom_hook(db, _pid, _hook_id)
+    return {"hook_id": _hook_id, "deleted": deleted}
