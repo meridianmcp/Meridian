@@ -177,6 +177,52 @@ async def test_get_context_block_not_found(db):
         )
 
 
+@pytest.mark.asyncio
+async def test_get_context_block_xml_envelope_structure(db, project):
+    """4c9f501a — MCP tool surface wraps content in <meridian_context> XML
+    envelope (v2.5+). The 'text' field must open and close with the correct
+    tags so AI clients can parse it structurally. This test pins the actual
+    behavior so the docstring can never silently drift back to claiming plain-text."""
+    result = await st_mod.handle_get_context_block(
+        {"project_id": project["id"], "mode": "full"}, db, _DATA_DIR, None, None
+    )
+    text = result["text"]
+    # Must open with the XML envelope tag (with project_id and mode attrs).
+    assert text.startswith("<meridian_context "), (
+        "MCP get_context_block text must begin with <meridian_context ...>"
+    )
+    assert 'project_id="' in text
+    assert 'mode="full"' in text
+    # Must close with matching closing tag.
+    assert text.rstrip().endswith("</meridian_context>"), (
+        "MCP get_context_block text must end with </meridian_context>"
+    )
+    # The inner content must still contain the expected plain-text fields.
+    assert "PROJECT:" in text
+    assert "start_session" in text
+
+
+@pytest.mark.asyncio
+async def test_get_context_block_mcp_description_mentions_xml(db, project):
+    """4c9f501a — The MCP tool description must accurately describe the XML-wrapped
+    output rather than calling it 'plain-text'. Guards against future docstring
+    regressions that would again contradict the actual behavior."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+    tool = next((t for t in _MCP_TOOLS_LIST if t["name"] == "get_context_block"), None)
+    assert tool is not None, "get_context_block must be in _MCP_TOOLS_LIST"
+    desc = tool["description"]
+    # Description must mention the XML envelope, not falsely promise bare plain text.
+    assert "meridian_context" in desc or "XML" in desc, (
+        "get_context_block description must mention XML wrapping (<meridian_context>) "
+        f"instead of falsely promising plain-text output. Got: {desc!r}"
+    )
+    # Must NOT claim 'plain-text' without qualification (the historical bug).
+    assert "plain-text project context block" not in desc, (
+        "get_context_block description must not claim to return a 'plain-text project "
+        "context block' — the MCP surface wraps it in XML. Got: {desc!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # get_agent_instructions / set_agent_instructions
 # ---------------------------------------------------------------------------

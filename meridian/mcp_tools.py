@@ -239,10 +239,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
              "description": "The token value from the <goal_token>…</goal_token> line in the /goal block."}},
          "required": ["token"]}},
     {"name": "get_context_block", "description":
-        "Read-only: Return a compact plain-text project context block (north star, sprint, "
-        "pending sprint items, recent tasks, recent decisions, active sessions). "
+        "Read-only: Return a compact project context block (north star, sprint, "
+        "pending sprint items, recent tasks, recent decisions, active sessions) "
+        "wrapped in a <meridian_context project_id=\"...\" mode=\"...\"> XML envelope "
+        "for structured parsing by AI clients (v2.5+). "
+        "The 'text' field in the response contains the XML-wrapped content. "
         "mode='full' (default) for Code Handoff into a fresh Claude Code session; "
-        "mode='chat' for a shorter paste into a new claude.ai conversation.",
+        "mode='chat' for a shorter paste into a new claude.ai conversation. "
+        "The HTTP route /projects/{id}/context-block returns the same content as "
+        "unwrapped plain text.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "chat"]}},

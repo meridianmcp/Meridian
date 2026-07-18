@@ -197,7 +197,13 @@ async def handle_get_context_block(
     v2.3 — assemble the same shape as /projects/{id}/context-block but
     return both the rendered text AND the source dict so MCP clients
     can choose to render their own variant.
-    v2.5 — wrap in semantic XML for better Claude Code parsing.
+    v2.5 — wrap in semantic XML for better Claude Code parsing. The
+    returned 'text' field is XML-wrapped:
+      <meridian_context project_id="..." mode="...">
+        ... plain-text context ...
+      </meridian_context>
+    The HTTP route /projects/{id}/context-block returns the same content
+    as unwrapped plain text (suitable for clipboard paste).
     """
     project_id = args["project_id"]
     mode = args.get("mode", "full")

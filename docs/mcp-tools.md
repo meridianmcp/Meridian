@@ -474,7 +474,7 @@ generate_handoff(project_id="abc-123", mode="delta", session_id="session-uuid")
 
 
 ### `get_context_block`
-Read-only: Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` for a shorter paste into claude.ai.
+Read-only: Return a compact project context block (north star, sprint, pending sprint items, recent tasks, recent decisions, active sessions) wrapped in a <meridian_context> XML envelope for structured parsing by AI clients (v2.5+). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` for a shorter paste into claude.ai. The HTTP route `/projects/{id}/context-block` returns the same content as unwrapped plain text.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
