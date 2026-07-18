@@ -3368,6 +3368,24 @@ async def _migrate_pg_manual_issue_screening_toggle(conn: PostgresConnection) ->
     )
 
 
+async def _migrate_pg_workspace_tool_priority_map(conn: PostgresConnection) -> None:
+    """490e100d — workspace_settings.tool_priority_map (mirrors SQLite).
+
+    Nullable TEXT, JSON-encoded ``{category: tool}`` dict — the workspace-level
+    generalization of 4d1fb28f's per-item ``required_tool`` pin. When set,
+    handoff._build_quick_start_goal renders a hard, unconditional
+    ``<workspace_tool_priority>`` directive for every pending item whose
+    title/notes match a configured category and that has no item-level
+    override.
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db._migrate_workspace_tool_priority_map.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS tool_priority_map TEXT"
+    )
+
+
 async def _migrate_pg_action_audit_log_table(conn: PostgresConnection) -> None:
     """5dfe34b2 / cd495afa — action_audit_log: append-only WHAT-MERIDIAN-DID
     record (toggle flips, velocity/anomaly escalations, manual-issue link
@@ -3498,4 +3516,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_manual_issue_screening_toggle,
     _migrate_pg_action_audit_log_table,
     _migrate_pg_manual_issue_content_log_table,
+    _migrate_pg_workspace_tool_priority_map,
 )

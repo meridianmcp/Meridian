@@ -7568,10 +7568,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_manual_issue_screening_toggle",
         "_migrate_pg_action_audit_log_table",
         "_migrate_pg_manual_issue_content_log_table",
+        "_migrate_pg_workspace_tool_priority_map",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 122
+    assert len(allnames) == len(set(allnames)) == 123
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

@@ -1085,6 +1085,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "projects in this workspace (existing projects are unchanged). "
         "loop_enabled_default (bool) is the workspace default for /loop auto-continue "
         "that projects inherit when their loop_enabled is 'workspace'. "
+        "tool_priority_map (object) sets a durable default MCP tool per semantic task "
+        "category (e.g. {\"code-reading\": \"Serena: find_symbol\"}) — generalizes the "
+        "per-item required_tool pin up one level; rendered as a HARD, unconditional "
+        "directive in every /goal for matching pending items that have no item-level "
+        "required_tool override. Pass {} to clear it. "
         "Pass an empty string to revert a field to the server default.",
      "inputSchema": {"type": "object", "properties": {
          "hitl_auto_answer_default": {"type": "boolean"},
@@ -1092,7 +1097,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "handoff_template": {"type": "string"},
          "execution_mode_default": {"type": "string", "description": "Seed new projects' execution mode: 'autonomous', 'interactive', or '' to clear."},
          "code_intel_enabled_default": {"type": "boolean", "description": "Seed new projects' code-intel toggle."},
-         "loop_enabled_default": {"type": "boolean", "description": "Workspace default for /loop auto-continue; projects with loop_enabled='workspace' inherit it. True = sessions auto-continue."}},
+         "loop_enabled_default": {"type": "boolean", "description": "Workspace default for /loop auto-continue; projects with loop_enabled='workspace' inherit it. True = sessions auto-continue."},
+         "tool_priority_map": {"type": "object", "description": "Default MCP tool per semantic task category, e.g. {\"code-reading\": \"Serena: find_symbol\"}. Hard-enforced in /goal. {} clears."}},
          "required": []}},
     {"name": "save_blog_post", "description":
         "Create or update a workspace-scoped blog post (draft|published|archived "

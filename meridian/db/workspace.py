@@ -834,7 +834,8 @@ async def get_workspace_settings(
         "execution_mode_default, code_intel_enabled_default, "
         "loop_enabled_default, auto_refresh_enabled, refresh_interval_turns, "
         "refresh_triggers, handoff_inline_pointers, "
-        "active_session_warning_minutes, manual_issue_screening_enabled, updated_at "
+        "active_session_warning_minutes, manual_issue_screening_enabled, "
+        "tool_priority_map, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -877,6 +878,24 @@ async def get_workspace_settings(
     # 10 minutes (matches the previous hardcoded constant). Minimum 1 minute.
     _asw_mins_raw = data.get("active_session_warning_minutes")
     _active_session_warning_minutes = max(1, int(_asw_mins_raw)) if _asw_mins_raw is not None else 10
+    # 490e100d — workspace-level default MCP tool priority per semantic task
+    # category (generalizes 4d1fb28f's per-item required_tool pin up one
+    # level). NULL/missing/malformed ⇒ None ("no workspace default set");
+    # a stored JSON object ⇒ the {category: tool} dict, non-string values
+    # coerced to str so a stray non-string JSON value can't break callers.
+    _tool_priority_map_raw = data.get("tool_priority_map")
+    _tool_priority_map: dict[str, str] | None = None
+    if _tool_priority_map_raw:
+        try:
+            _decoded_tpm = json.loads(_tool_priority_map_raw)
+            if isinstance(_decoded_tpm, dict) and _decoded_tpm:
+                _tool_priority_map = {
+                    str(k): str(v) for k, v in _decoded_tpm.items() if k and v
+                }
+                if not _tool_priority_map:
+                    _tool_priority_map = None
+        except Exception:  # noqa: BLE001 — malformed row ⇒ no workspace default
+            _tool_priority_map = None
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -901,6 +920,7 @@ async def get_workspace_settings(
         # toggle's risk clearly" requirement.
         "manual_issue_screening_enabled": bool(data.get("manual_issue_screening_enabled")),
         "manual_issue_screening_risk_warning": _MANUAL_ISSUE_SCREENING_RISK_WARNING,
+        "tool_priority_map": _tool_priority_map,
         "updated_at": data.get("updated_at"),
     }
 
@@ -921,6 +941,7 @@ async def update_workspace_settings(
     refresh_triggers: "list[str] | str | None" = None,
     handoff_inline_pointers: "bool | int | str | None" = None,
     active_session_warning_minutes: int | None = None,
+    tool_priority_map: "dict[str, str] | str | None" = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -929,6 +950,18 @@ async def update_workspace_settings(
     or ``display_name=""`` explicitly clears that label. ``execution_mode_default=""``
     clears the execution-mode default (new projects revert to their own default);
     ``code_intel_enabled_default`` accepts a bool/0/1 or the string ``""`` to clear.
+
+    ``tool_priority_map`` (490e100d) — workspace-level default MCP tool
+    priority per semantic task category, generalizing 4d1fb28f's per-item
+    ``required_tool`` pin up one level (e.g. ``{"code-reading": "Serena:
+    find_symbol"}``). A ``dict`` is JSON-encoded; an empty dict or the string
+    ``""`` clears the workspace default entirely (reverts to ordinary
+    executor discretion / per-item pins only); a non-empty string is stored
+    verbatim (assumed already JSON-encoded, mirrors ``refresh_triggers``).
+    Rendered as a HARD, unconditional directive by
+    ``handoff._build_quick_start_goal`` — not a soft hint — for every pending
+    item whose title/notes match a configured category and that has no
+    item-level ``required_tool`` override (the item-level pin always wins).
     """
     settings_key = _ws_settings_key(tenant_id)
     # Ensure the row exists before updating individual fields.
@@ -1001,6 +1034,17 @@ async def update_workspace_settings(
         # Minimum 1 minute; 0 or negative values are clamped to 1.
         updates.append("active_session_warning_minutes = ?")
         params.append(max(1, int(active_session_warning_minutes)))
+    if tool_priority_map is not None:
+        # 490e100d — workspace-level default tool priority per task category.
+        # A dict ⇒ JSON-encode (empty dict clears); "" clears; any other
+        # string is stored verbatim (already JSON, mirrors refresh_triggers).
+        updates.append("tool_priority_map = ?")
+        if isinstance(tool_priority_map, dict):
+            params.append(json.dumps(tool_priority_map) if tool_priority_map else None)
+        elif isinstance(tool_priority_map, str):
+            params.append(tool_priority_map.strip() or None)
+        else:
+            params.append(None)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

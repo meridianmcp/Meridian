@@ -1084,6 +1084,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_manual_issue_screening_toggle(db)
     await _migrate_action_audit_log_table(db)
     await _migrate_manual_issue_content_log_table(db)
+    await _migrate_workspace_tool_priority_map(db)
     return db
 
 

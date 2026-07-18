@@ -634,6 +634,7 @@ def _build_quick_start_goal(
     parallel_groups: dict[str, Any] | None = None,
     model_tier_hints: bool = False,
     wave_gate_pending: list[dict[str, Any]] | None = None,
+    tool_priority_map: dict[str, str] | None = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -666,6 +667,15 @@ def _build_quick_start_goal(
     claim_sprint_item's own WAVE_GATE_PENDING check will refuse at claim time.
     This is what makes wave gates ENFORCED rather than advisory /goal prose: the
     /goal never hands out an item the executor can't actually claim.
+
+    ``tool_priority_map`` (490e100d) — the workspace-level default MCP tool
+    priority per semantic task category (``get_workspace_settings()``'s
+    ``tool_priority_map``), e.g. ``{"code-reading": "Serena: find_symbol"}``.
+    Generalizes 4d1fb28f's per-item ``required_tool`` pin up one level: every
+    pending item whose title/notes match a configured category — and that
+    does NOT already carry its own item-level ``required_tool`` pin — gets
+    the same hard, unconditional ``<workspace_tool_priority>`` directive that
+    an explicit pin gets. ``None``/empty means no workspace default is set.
     """
     try:
         _turns = int(max_turns)
@@ -953,6 +963,10 @@ def _build_quick_start_goal(
         # 4d1fb28f — item-level tool/plugin pin: hard guidance, unconditional
         # (unlike the model-tier hint above, which is opt-in and soft).
         + _build_required_tool_clause(pending_sprint_items)
+        # 490e100d — workspace-level default tool priority per semantic task
+        # category: same hard, unconditional treatment, for items with no
+        # item-level pin of their own.
+        + _build_workspace_tool_priority_clause(pending_sprint_items, tool_priority_map)
         + f"{_manual_note}"
         f"{_excluded_unprospected_note}"
         f"{_excluded_wave_gate_note}"
@@ -1013,6 +1027,108 @@ def _build_required_tool_clause(items: list[dict[str, Any]]) -> str:
         "a hard requirement, not a suggestion: " + "; ".join(pins)
     )
     return f"\n<required_tool>{_xml_escape(body)}</required_tool>"
+
+
+# ---------------------------------------------------------------------------
+# 490e100d — workspace-level default MCP tool priority per semantic task
+# category. Generalizes 4d1fb28f's per-item required_tool pin up one level:
+# a workspace admin sets a durable default (e.g. {"code-reading": "Serena:
+# find_symbol"}) via update_workspace_settings(tool_priority_map=...) ONCE,
+# instead of a planner pinning required_tool on every matching item. Same
+# structural-enforcement fix class as 22b7f3f1 found missing for advisory-only
+# tool preference: rendered UNCONDITIONALLY (hard directive), not a hint that
+# can lose to attention decay. An item-level required_tool pin always wins —
+# this is only consulted for items that do NOT already carry one.
+# ---------------------------------------------------------------------------
+
+_BUILTIN_TASK_CATEGORY_KEYWORDS: dict[str, frozenset[str]] = {
+    "code-reading": frozenset({
+        "read", "understand", "review", "explore", "inspect", "investigate",
+        "audit", "trace", "locate", "look at", "analyze", "analyse",
+        "familiarize",
+    }),
+    "code-writing": frozenset({
+        "implement", "write", "add", "refactor", "build", "create",
+        "rewrite", "patch", "generate",
+    }),
+    "bug-fixing": frozenset({"fix", "bug", "regression", "broken", "crash"}),
+    "research": frozenset({
+        "research", "search for", "look up", "docs", "documentation",
+        "paper", "investigate",
+    }),
+    "testing": frozenset({"test", "verify", "validate", "coverage", "regression"}),
+    "planning": frozenset({"plan", "design", "spec", "scope", "architecture"}),
+}
+
+
+def _task_category_keywords(category: str) -> frozenset[str]:
+    """Return the keyword set used to match a sprint item against ``category``.
+
+    Known categories (``_BUILTIN_TASK_CATEGORY_KEYWORDS``) use a curated
+    keyword set; unknown/custom categories fall back to the significant
+    words in the category name itself (kebab/snake/space-split, 3+ chars),
+    so a workspace admin can define a category the classifier has never seen
+    (e.g. ``"database-work"``) and still get a reasonable match without a
+    code change."""
+    known = _BUILTIN_TASK_CATEGORY_KEYWORDS.get(category.strip().lower())
+    if known:
+        return known
+    words = re.findall(r"[a-z0-9]+", category.lower())
+    return frozenset(w for w in words if len(w) >= 3)
+
+
+def _classify_sprint_item_task_category(
+    item: dict[str, Any], categories: list[str]
+) -> str | None:
+    """Return the first ``categories`` entry whose keywords appear in the
+    item's title/notes, or None if none match. ``categories`` order is the
+    caller's priority order (a workspace admin's dict insertion order)."""
+    text = f"{item.get('title') or ''} {item.get('notes') or ''}".lower()
+    for category in categories:
+        if any(kw in text for kw in _task_category_keywords(category)):
+            return category
+    return None
+
+
+def _build_workspace_tool_priority_clause(
+    items: list[dict[str, Any]],
+    tool_priority_map: dict[str, str] | None,
+) -> str:
+    """490e100d — build a ``<workspace_tool_priority>`` XML clause for the
+    /goal block from the workspace-level ``tool_priority_map`` default.
+
+    Mirrors ``_build_required_tool_clause``'s hard-guidance rendering
+    (unconditional, no opt-in flag — unlike the soft model-tier hint) but the
+    pin source is a workspace/project default keyed by semantic task category
+    instead of a per-item field. An item that already carries its own
+    ``required_tool`` pin is skipped here — the item-level pin always wins,
+    consistent with 4d1fb28f being the more specific override. Returns an
+    empty string when ``tool_priority_map`` is unset/empty or no pending item
+    matches any configured category.
+    """
+    if not tool_priority_map:
+        return ""
+    categories = list(tool_priority_map.keys())
+    pins: list[str] = []
+    for it in items:
+        iid = it.get("id")
+        if not iid or it.get("required_tool"):
+            continue
+        category = _classify_sprint_item_task_category(it, categories)
+        if category is None:
+            continue
+        tool = tool_priority_map.get(category)
+        if not tool:
+            continue
+        pins.append(f"{iid} ({category}): {tool}")
+    if not pins:
+        return ""
+    body = (
+        "The following sprint items match a workspace default tool-priority "
+        "category — this is a hard requirement, not a suggestion: "
+        + "; ".join(pins)
+    )
+    return f"\n<workspace_tool_priority>{_xml_escape(body)}</workspace_tool_priority>"
 
 
 def build_item_briefing(
@@ -3619,6 +3735,8 @@ async def generate_handoff(
         # 81396666 — pass the model-tier toggle so the /goal includes per-item hints.
         model_tier_hints=_model_hints_on,
         wave_gate_pending=_wave_gate_pending,
+        # 490e100d — workspace-level default tool priority per task category.
+        tool_priority_map=(_ws_settings_for_loop or {}).get("tool_priority_map"),
     )
     # dd07ece0 — embed a provenance token near the top of the /goal block so a
     # receiving session can call verify_handoff_token(project_id, token) to
@@ -4181,6 +4299,8 @@ async def _generate_starter_handoff(
         loop_enabled=_loop_enabled_from_settings(settings, _s_ws_settings),
         parallel_groups=_s_parallel_groups,
         wave_gate_pending=_s_wave_gate_pending,
+        # 490e100d — workspace-level default tool priority per task category.
+        tool_priority_map=(_s_ws_settings or {}).get("tool_priority_map"),
     )
     # 77a29c8b — fetch recent tasks so blocked/found diagnostic entries are
     # visible even in the minimal starter path (guarded: never break handoff).

@@ -1645,6 +1645,9 @@ async def handle_update_workspace_settings(
         loop_enabled_default=args.get("loop_enabled_default"),
         # 36fea6ca — inline resolved sprint-item pointers in the handoff.
         handoff_inline_pointers=args.get("handoff_inline_pointers"),
+        # 490e100d — workspace-level default MCP tool priority per semantic
+        # task category (hard-enforced in the /goal block).
+        tool_priority_map=args.get("tool_priority_map"),
         tenant_id=_mcp_tenant_id,
     )
 
