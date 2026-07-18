@@ -170,3 +170,41 @@ def test_docs_full_command_form():
     assert cmd[3] == "meridian-docs-mcp", (
         f"cmd[3] (entry-point) must be 'meridian-docs-mcp', got {cmd[3]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# (F) 6ee033c0 — the [project] name in pyproject.toml is ALSO renamed, not
+# just the console-script entry-point.
+# ---------------------------------------------------------------------------
+
+def test_pyproject_project_name_is_not_bare_meridian_docs():
+    """extensions/meridian-docs/pyproject.toml's [project] table must declare
+    name = "meridian-docs-mcp" (or any name distinct from the bare
+    "meridian-docs" string), not just rename the console-script entry-point.
+
+    58a044c7 only renamed [project.scripts]; the [project] name itself was
+    left as the literal "meridian-docs" string, which is the gap 6ee033c0
+    reports as still unfixed. A distribution name that still reads
+    "meridian-docs" keeps `uvx --from <local-path> ...` ambiguous with the
+    (nonexistent) PyPI package of the same name.
+    """
+    import tomllib
+
+    pyproject = Path(tp._MERIDIAN_DOCS_LOCAL_PATH) / "pyproject.toml"
+    assert pyproject.is_file(), (
+        f"pyproject.toml not found at {pyproject}; extensions/meridian-docs "
+        "must have a valid pyproject.toml"
+    )
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    project_name = data["project"]["name"]
+    assert project_name != "meridian-docs", (
+        "[project] name in pyproject.toml is still the bare 'meridian-docs' "
+        "string (6ee033c0) — only the console-script entry-point was renamed "
+        "by 58a044c7. Rename [project] name too (e.g. 'meridian-docs-mcp') so "
+        "the distribution name itself doesn't collide with the nonexistent "
+        "PyPI package of the same name."
+    )
+    assert project_name == "meridian-docs-mcp", (
+        f"[project] name should be 'meridian-docs-mcp' to match the renamed "
+        f"console-script entry-point, got {project_name!r}"
+    )
