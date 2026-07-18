@@ -346,6 +346,60 @@ def remove_caption(
 
 
 @mcp.tool()
+def insert_cross_reference(
+    docx_path: str,
+    anchor_para_id: str,
+    target_caption_para_id: str | None = None,
+    bookmark_name: str | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """1c59cb90 — Insert a live Word REF-field cross-reference into a .docx file.
+
+    REFILED (original 7b5bfb00) — insert_caption above only gives captions
+    Word's SEQ-field auto-numbering. This adds the other half: a REF field in
+    prose ELSEWHERE that quotes a caption's number (e.g. "as shown in Figure
+    3"). A hand-typed "Figure 3" string goes stale the instant captions are
+    reordered; this REF field tracks the SAME field-refresh cycle (F9) that
+    keeps the caption's own SEQ number correct, because it targets the
+    caption's own cross-reference bookmark rather than a fixed string.
+
+    Appends a REF complex field to the paragraph at anchor_para_id, with
+    cached display text like "Figure 3". Identify the target caption EITHER
+    way (exactly one required):
+      - target_caption_para_id: the caption paragraph's w14:paraId / p{N}.
+        If it has no _Ref bookmark yet (predates this feature), one is
+        created now as part of the same write.
+      - bookmark_name: an existing _Ref<digits> bookmark, e.g. the
+        ref_bookmark field returned by a prior insert_caption call.
+
+    A separating space is inserted first if the anchor paragraph's existing
+    text doesn't already end in whitespace, so the field reads naturally as
+    trailing prose.
+
+    Args:
+      docx_path:              Absolute path to the .docx file (mutated in place).
+      anchor_para_id:         w14:paraId or p{N} of the paragraph the field is
+                               appended into.
+      target_caption_para_id: w14:paraId or p{N} of the Figure/Table Caption
+                               paragraph being referenced.
+      bookmark_name:          Alternative to target_caption_para_id — an
+                               existing _Ref<digits> bookmark name.
+      index_db_path:          If supplied, sidecar is invalidated after write.
+
+    Returns:
+      {status, anchor_para_id, bookmark_name, kind, seq_number, display_text,
+      docx_path} or {error: <message>} on failure (file NOT mutated on error).
+    """
+    return docs_intel.insert_cross_reference(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        target_caption_para_id=target_caption_para_id,
+        bookmark_name=bookmark_name,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
 def insert_citation(
     docx_path: str,
     anchor_para_id: str,
