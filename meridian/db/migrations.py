@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended', '_migrate_connection_events', '_migrate_redis_overage_fields', '_migrate_sprint_version_descriptions', '_migrate_workspace_settings_active_session_threshold', '_migrate_sprint_item_sprint_name', '_migrate_proposal_slug_nickname', '_migrate_decision_slug_nickname', '_migrate_note_nickname', '_migrate_sprint_item_prospect_bypass', '_migrate_handoff_tokens', '_migrate_wave_gate_results', '_migrate_wave_gate_configs', '_migrate_server_logs', '_migrate_custom_hooks', '_migrate_sprint_item_require_verification', '_migrate_sprint_item_verifications_table', '_migrate_proposal_github_issue', '_migrate_sprint_item_required_tool', '_migrate_sprint_item_github_issue_link']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended', '_migrate_connection_events', '_migrate_redis_overage_fields', '_migrate_sprint_version_descriptions', '_migrate_workspace_settings_active_session_threshold', '_migrate_sprint_item_sprint_name', '_migrate_proposal_slug_nickname', '_migrate_decision_slug_nickname', '_migrate_note_nickname', '_migrate_sprint_item_prospect_bypass', '_migrate_handoff_tokens', '_migrate_wave_gate_results', '_migrate_wave_gate_configs', '_migrate_server_logs', '_migrate_custom_hooks', '_migrate_sprint_item_require_verification', '_migrate_sprint_item_verifications_table', '_migrate_proposal_github_issue', '_migrate_sprint_item_required_tool', '_migrate_sprint_item_github_issue_link', '_migrate_manual_issue_screening_toggle', '_migrate_action_audit_log_table', '_migrate_manual_issue_content_log_table']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -3204,3 +3204,126 @@ async def _migrate_sprint_item_github_issue_link(db: aiosqlite.Connection) -> No
     await _migrate_add_column_if_missing(db, "sprint_items", "github_issue_number", "INTEGER")
     await _migrate_add_column_if_missing(db, "sprint_items", "github_issue_url", "TEXT")
     await _migrate_add_column_if_missing(db, "sprint_items", "github_issue_source", "TEXT")
+
+
+async def _migrate_manual_issue_screening_toggle(db: aiosqlite.Connection) -> None:
+    """5dfe34b2 / cd495afa — workspace_settings.manual_issue_screening_enabled:
+    the OFF-by-default toggle that lets the fdaa5b55 GitHub-issue automation
+    (comment/propose — never auto-close) extend its reach to issues Meridian
+    itself did not create (``github_issue_source='manual'``) via the new
+    :func:`meridian.db.manual_issue_intel.discover_and_link_manual_issue`
+    discovery path.
+
+    Nullable-safe ``INTEGER NOT NULL DEFAULT 0`` column, guarded-migration
+    style (plain ADD COLUMN, no inline index). Idempotent
+    (``_migrate_add_column_if_missing`` no-ops when already present).
+
+    SECURITY (cd495afa): this column has exactly ONE writer in the whole
+    codebase — :func:`meridian.db.workspace.set_manual_issue_screening_enabled`
+    — and that function refuses to flip it to enabled unless given the id of
+    an ``answered`` + approved HITL request of
+    ``kind='manual_issue_screening_toggle'`` that was itself created with
+    ``require_human=True`` (persisted in the request's payload — see
+    ``e43e6941`` / ``request_hitl``). ``require_human=True`` structurally
+    forbids Meridian's own auto-answer machinery from ever answering it, so
+    only a genuine human reply (dashboard / API) can enable this mode — an
+    autonomous/executor session or a compromised API token cannot
+    self-escalate into it. Disabling has no such gate (turning the riskier
+    mode OFF is the fail-safe direction) but is still funnelled through the
+    same single-writer function so every flip is audit-logged (see
+    ``_migrate_action_audit_log_table``).
+
+    Mirrored in pg_adapter._migrate_pg_manual_issue_screening_toggle.
+    """
+    await _migrate_add_column_if_missing(
+        db, "workspace_settings", "manual_issue_screening_enabled", "INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_action_audit_log_table(db: aiosqlite.Connection) -> None:
+    """5dfe34b2 / cd495afa — action_audit_log: append-only record of WHAT
+    MERIDIAN DID for security-relevant, discretionary actions — starting with
+    manual-issue-screening toggle flips and velocity/anomaly escalations
+    (d86d70a5), extensible to future action-audit entries.
+
+    Distinct from ``manual_issue_content_log`` (2178b161), which records WHAT
+    MERIDIAN SAW (raw issue content, pre-screening) — this table records what
+    Meridian subsequently DID about it, so a post-incident review can tell
+    "was the content malicious" (content log) apart from "did something
+    downstream mishandle it" (this log).
+
+    Columns:
+      event_type   — e.g. 'manual_issue_screening_enabled',
+                      'manual_issue_screening_disabled', 'velocity_anomaly',
+                      'manual_issue_linked', 'manual_issue_link_flagged'.
+      tenant_id    — workspace scope (NULL on self-host).
+      project_id   — nullable; set when the event pertains to one project.
+      actor        — free-text identifier of who/what triggered the event
+                      (session id, 'human', 'auto', hitl id, ...).
+      detail       — free-text / JSON blob with event-specific context.
+      created_at   — wall-clock UTC timestamp.
+
+    No UPDATE/DELETE helper is ever provided for this table anywhere in the
+    codebase — append-only by construction, not just by convention. Idempotent
+    via CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS. Mirrored in
+    pg_adapter._migrate_pg_action_audit_log_table.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS action_audit_log (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            project_id TEXT,
+            event_type TEXT NOT NULL,
+            actor TEXT,
+            detail TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_action_audit_log_scope "
+        "ON action_audit_log(tenant_id, project_id, created_at DESC)"
+    )
+    await db.commit()
+
+
+async def _migrate_manual_issue_content_log_table(db: aiosqlite.Connection) -> None:
+    """5dfe34b2 / 2178b161 — manual_issue_content_log: append-only, hashed,
+    timestamped forensic log of the RAW content read from a manually-filed
+    GitHub issue (title + body + comments), written BEFORE any screening or
+    processing touches it.
+
+    This is what makes "was the content malicious" a separately-answerable
+    question from "did Meridian mishandle it" (see action_audit_log docstring
+    above) — a post-incident reviewer can pull the exact bytes Meridian saw,
+    independent of whatever the screening heuristic did or didn't flag.
+
+    Columns:
+      content_hash — sha256 hex digest of raw_content, for tamper-evidence
+                     (NOT encryption — "hashed" per the design spec means a
+                     content hash column is sufficient here).
+      raw_content  — the actual raw text read from GitHub (title/body/comments
+                     concatenated), unmodified, unescaped, unscreened.
+      issue_number — the GitHub issue this content came from.
+      project_id   — which project's linked repo the issue belongs to.
+      created_at   — wall-clock UTC timestamp.
+
+    No UPDATE/DELETE helper is ever provided for this table anywhere in the
+    codebase — append-only by construction. Idempotent via CREATE TABLE IF NOT
+    EXISTS + CREATE INDEX IF NOT EXISTS. Mirrored in
+    pg_adapter._migrate_pg_manual_issue_content_log_table.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS manual_issue_content_log (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            raw_content TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_manual_issue_content_log_scope "
+        "ON manual_issue_content_log(project_id, issue_number, created_at DESC)"
+    )
+    await db.commit()

@@ -2460,6 +2460,37 @@ async def _on_hitl_answered(
                 pass
         return {"applied": True, "github_issue_number": issue_number, "github_issue_url": issue_url}
 
+    if kind == "manual_issue_screening_toggle":
+        # 5dfe34b2 / cd495afa — the ONLY place a completed require_human=True
+        # HITL of this kind is translated into an actual toggle flip. Even a
+        # forged/tampered request_row cannot bypass the real gate: the write
+        # path (db_module.set_manual_issue_screening_enabled) independently
+        # re-reads the HITL row from the DB by id and re-verifies kind,
+        # status, require_human, and answer itself — this branch is a
+        # convenience trigger, not the trust boundary.
+        raw = request_row.get("payload")
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            payload = {}
+        tenant_id_for_toggle = (tenant.get("id") if isinstance(tenant, dict) else None) or payload.get("tenant_id")
+        if not approved:
+            return {"applied": False, "reason": "rejected"}
+        answer = (request_row.get("answer") or "").strip().lower()
+        enable = answer.startswith("yes")
+        try:
+            updated = await db_module.set_manual_issue_screening_enabled(
+                db, enable,
+                tenant_id=tenant_id_for_toggle,
+                actor=f"hitl:{request_row.get('id')}",
+                hitl_id=request_row.get("id") if enable else None,
+            )
+        except db_module.ManualIssueScreeningToggleError as exc:
+            return {"applied": False, "apply_error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — never crash the answer flow
+            return {"applied": False, "apply_error": f"toggle update failed: {exc}"}
+        return {"applied": True, "manual_issue_screening_enabled": updated.get("manual_issue_screening_enabled")}
+
     if kind == "hook_project_select" and approved:
         # Store hostname → project mapping so future hooks auto-route
         raw = request_row.get("payload")

@@ -834,7 +834,7 @@ async def get_workspace_settings(
         "execution_mode_default, code_intel_enabled_default, "
         "loop_enabled_default, auto_refresh_enabled, refresh_interval_turns, "
         "refresh_triggers, handoff_inline_pointers, "
-        "active_session_warning_minutes, updated_at "
+        "active_session_warning_minutes, manual_issue_screening_enabled, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -893,6 +893,14 @@ async def get_workspace_settings(
         "refresh_triggers": _refresh_triggers,
         "handoff_inline_pointers": (True if _inline_ptrs is None else bool(_inline_ptrs)),
         "active_session_warning_minutes": _active_session_warning_minutes,
+        # 5dfe34b2 / cd495afa — OFF-by-default opt-in toggle. Deliberately NOT a
+        # parameter of update_workspace_settings below: the ONLY writer is
+        # set_manual_issue_screening_enabled, gated on a completed
+        # require_human=True HITL (see that function's docstring). Surfaced here
+        # alongside a human-readable risk label per the design spec's "label the
+        # toggle's risk clearly" requirement.
+        "manual_issue_screening_enabled": bool(data.get("manual_issue_screening_enabled")),
+        "manual_issue_screening_risk_warning": _MANUAL_ISSUE_SCREENING_RISK_WARNING,
         "updated_at": data.get("updated_at"),
     }
 
@@ -1042,6 +1050,209 @@ async def seed_workspace_settings_from_toml(db: aiosqlite.Connection) -> None:
         )
     except Exception:  # noqa: BLE001 — seeding must never block startup
         pass
+
+
+# ---------------------------------------------------------------------------
+# 5dfe34b2 / cd495afa — manual-issue-screening toggle + action audit trail
+#
+# The toggle governs WHO can trigger a read of a manually-filed GitHub issue
+# (an internal person choosing to enable it), not whether the CONTENT read is
+# trustworthy — anyone on the internet can file a GitHub issue regardless of
+# who flipped the toggle. Hardcoded protections must hold "just in case of
+# internal hacking": (a) a compromised/malicious internal session or token
+# must not be able to silently self-enable this mode, and (b) enabling it must
+# not, on its own, make unscreened content actionable (see
+# meridian.db.manual_issue_intel for the content-screening side of that).
+# ---------------------------------------------------------------------------
+
+_MANUAL_ISSUE_SCREENING_RISK_WARNING = (
+    "RISK: enabling this lets Meridian's automated GitHub-issue comment/propose "
+    "flow (never auto-close) act on issues filed directly on GitHub by ANYONE, "
+    "not just issues Meridian itself created. Content is heuristically screened "
+    "for prompt-injection shapes before use, but no screening technique is a "
+    "complete mitigation (OWASP LLM01) — treat flagged/borderline content with "
+    "human judgment, not blind trust."
+)
+
+
+async def record_action_audit_event(
+    db: aiosqlite.Connection,
+    event_type: str,
+    *,
+    tenant_id: str | None = None,
+    project_id: str | None = None,
+    actor: str | None = None,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    """cd495afa / d86d70a5 — append a row to the action_audit_log.
+
+    Append-only: this module never exposes an update/delete for this table.
+    Used for toggle enable/disable events AND velocity/anomaly escalations
+    (WHAT MERIDIAN DID — distinct from manual_issue_intel's raw-content log,
+    which records WHAT MERIDIAN SAW). Never raises on a logging failure from
+    the caller's perspective is NOT guaranteed here — callers that must not be
+    blocked by audit-log trouble should wrap this in their own try/except (as
+    e.g. the velocity-anomaly escalation path does), since a silently-dropped
+    audit entry would defeat the point of an audit trail.
+    """
+    aid = _new_id()
+    await db.execute(
+        "INSERT INTO action_audit_log (id, tenant_id, project_id, event_type, actor, detail) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (aid, tenant_id, project_id, event_type, actor, detail),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM action_audit_log WHERE id = ?", (aid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {"id": aid}
+
+
+async def get_action_audit_log(
+    db: aiosqlite.Connection,
+    *,
+    tenant_id: str | None = None,
+    project_id: str | None = None,
+    event_type: str | None = None,
+    since: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Read the action_audit_log, newest first. All filters optional/AND'd.
+
+    ``since`` is an inclusive lower bound on ``created_at`` (string-comparable
+    ``YYYY-MM-DD HH:MM:SS`` form, matching this codebase's other TEXT
+    timestamps) — used by the velocity/anomaly check to scope a time window.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if tenant_id is not None:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    if project_id is not None:
+        clauses.append("project_id = ?")
+        params.append(project_id)
+    if event_type is not None:
+        clauses.append("event_type = ?")
+        params.append(event_type)
+    if since is not None:
+        clauses.append("created_at >= ?")
+        params.append(since)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(max(1, int(limit)))
+    async with db.execute(
+        f"SELECT * FROM action_audit_log{where} ORDER BY created_at DESC LIMIT ?",
+        params,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+class ManualIssueScreeningToggleError(ValueError):
+    """Raised when set_manual_issue_screening_enabled(True, ...) is called
+    without a genuine, completed, require_human=True HITL approval backing
+    it. Distinct exception type so callers can distinguish "you tried to
+    self-escalate" from an ordinary validation error."""
+
+
+async def set_manual_issue_screening_enabled(
+    db: aiosqlite.Connection,
+    enabled: bool,
+    *,
+    tenant_id: str | None = None,
+    actor: str | None = None,
+    hitl_id: str | None = None,
+) -> dict[str, Any]:
+    """cd495afa — the ONE and ONLY writer of
+    workspace_settings.manual_issue_screening_enabled anywhere in this
+    codebase. ``update_workspace_settings`` (the generic, MCP-exposed
+    settings-patch function) deliberately does NOT accept this field as a
+    parameter — there is no update_workspace_settings-style direct write path
+    to this column at all.
+
+    Enabling (``enabled=True``) requires ``hitl_id`` naming a HITL request
+    that, at the moment this function is called, is ALL of:
+      1. found (exists in hitl_requests),
+      2. ``kind == 'manual_issue_screening_toggle'``,
+      3. ``status == 'answered'``,
+      4. its stored payload has ``require_human: true`` (the e43e6941
+         guarantee — this was persisted at request_hitl() time and can never
+         be forged after the fact by an answer),
+      5. its ``answer`` affirms enabling (case-insensitively starts with
+         'yes').
+    Any failure raises :class:`ManualIssueScreeningToggleError` and writes
+    NOTHING — there is no partial-enable state. Because ``require_human=True``
+    HITLs are structurally exempt from Meridian's auto-answer machinery (see
+    ``request_hitl`` / ``_hitl_should_auto_answer``), condition 3+4 together
+    mean a genuine human reply is the only way condition 3 can ever become
+    true for this ``kind`` — an autonomous/executor session or a compromised
+    API token cannot manufacture an 'answered' row for a require_human HITL by
+    itself.
+
+    Disabling (``enabled=False``) has no HITL gate — turning the riskier mode
+    OFF is the fail-safe direction — but every flip, either direction, is
+    recorded to action_audit_log (cd495afa point 2) before returning.
+
+    Returns the updated get_workspace_settings() dict.
+    """
+    settings_key = _ws_settings_key(tenant_id)
+    if enabled:
+        if not hitl_id:
+            raise ManualIssueScreeningToggleError(
+                "enabling manual_issue_screening requires hitl_id referencing a "
+                "completed require_human=True HITL of "
+                "kind='manual_issue_screening_toggle' — there is no direct-write path"
+            )
+        async with db.execute(
+            "SELECT * FROM hitl_requests WHERE id = ?", (hitl_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        hitl = _row_to_dict(row)
+        if hitl is None:
+            raise ManualIssueScreeningToggleError(f"hitl request '{hitl_id}' not found")
+        if hitl.get("kind") != "manual_issue_screening_toggle":
+            raise ManualIssueScreeningToggleError(
+                f"hitl request '{hitl_id}' is kind={hitl.get('kind')!r}, not "
+                "'manual_issue_screening_toggle'"
+            )
+        if hitl.get("status") != "answered":
+            raise ManualIssueScreeningToggleError(
+                f"hitl request '{hitl_id}' is not answered (status={hitl.get('status')!r})"
+            )
+        try:
+            _payload = json.loads(hitl.get("payload") or "{}")
+        except (TypeError, ValueError):
+            _payload = {}
+        if not (isinstance(_payload, dict) and _payload.get("require_human") is True):
+            raise ManualIssueScreeningToggleError(
+                f"hitl request '{hitl_id}' was not filed with require_human=True — "
+                "refusing to trust it as a self-escalation-proof approval"
+            )
+        _answer = (hitl.get("answer") or "").strip().lower()
+        if not _answer.startswith("yes"):
+            raise ManualIssueScreeningToggleError(
+                f"hitl request '{hitl_id}' answer ({hitl.get('answer')!r}) does not "
+                "affirm enabling"
+            )
+    # Ensure the settings row exists (same upsert pattern as update_workspace_settings).
+    await db.execute(
+        "INSERT INTO workspace_settings (id, tenant_id) VALUES (?, ?) "
+        "ON CONFLICT(id) DO NOTHING",
+        (settings_key, tenant_id),
+    )
+    await db.execute(
+        "UPDATE workspace_settings SET manual_issue_screening_enabled = ? WHERE id = ?",
+        (1 if enabled else 0, settings_key),
+    )
+    await db.commit()
+    await record_action_audit_event(
+        db,
+        "manual_issue_screening_enabled" if enabled else "manual_issue_screening_disabled",
+        tenant_id=tenant_id,
+        actor=actor or (f"hitl:{hitl_id}" if hitl_id else None),
+        detail=json.dumps({"hitl_id": hitl_id}) if hitl_id else None,
+    )
+    return await get_workspace_settings(db, tenant_id=tenant_id)
 
 
 # ---------------------------------------------------------------------------

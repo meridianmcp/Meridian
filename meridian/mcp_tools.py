@@ -368,6 +368,41 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "request_id": {"type": "string"}},
          "required": ["request_id"]}},
+    {"name": "request_manual_issue_screening_toggle", "description":
+        "5dfe34b2 — request enabling/disabling the OFF-by-default opt-in extension "
+        "that lets the automated GitHub-issue comment/propose flow (never auto-close) "
+        "also act on issues Meridian did not itself create, gated behind hardcoded "
+        "content screening. enable=true ALWAYS files a require_human=true HITL "
+        "(kind/require_human are hardcoded — this tool cannot be used to self-escalate; "
+        "only a genuine human answering in the dashboard/API can enable it). "
+        "enable=false disables immediately with no HITL (fail-safe direction) and is "
+        "audit-logged either way.",
+     "inputSchema": {"type": "object", "properties": {
+         "enable": {"type": "boolean", "description": "true to request enabling (files a human-only HITL); false to disable immediately."},
+         "project_id": {"type": "string", "description": "Optional — a project to file the enable-request HITL under; defaults to a workspace-level request."},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "context": {"type": "string"}},
+         "required": ["enable"]}},
+    {"name": "link_manual_github_issue", "description":
+        "5dfe34b2 — attempt to link a manually-filed GitHub issue (one Meridian did "
+        "NOT create) to a sprint item, extending fdaa5b55's automated comment/propose "
+        "flow to it. No-ops safely (action='skipped') unless "
+        "manual_issue_screening_enabled is on. When enabled: reads the issue's raw "
+        "content, logs it (hashed, append-only) before any processing, runs a "
+        "wave-relative velocity/anomaly check (non-blocking escalation only), then "
+        "screens title/body/comments for hardcoded injection shapes — flagged content "
+        "is never auto-linked (a human-review HITL is filed instead); only "
+        "screening-clean content gets linked (github_issue_source='manual'). Linking "
+        "NEVER by itself closes the issue — fdaa5b55's existing propose+HITL flow "
+        "still applies at sprint-item completion time.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "item_id": {"type": "string", "description": "The sprint item to link the issue to."},
+         "issue_number": {"type": "integer"},
+         "session_id": {"type": "string"}},
+         "required": ["item_id", "issue_number"]}},
     {"name": "add_note", "description":
         "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
         "Free-form title/body; comma-separated tags optional. Optional kind "

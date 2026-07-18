@@ -3351,6 +3351,65 @@ async def _migrate_pg_sprint_item_github_issue_link(conn: PostgresConnection) ->
     )
 
 
+async def _migrate_pg_manual_issue_screening_toggle(conn: PostgresConnection) -> None:
+    """5dfe34b2 / cd495afa — workspace_settings.manual_issue_screening_enabled
+    (mirrors SQLite). The ONE writer is
+    meridian.db.workspace.set_manual_issue_screening_enabled, which refuses to
+    enable it without an answered + approved require_human=True HITL of
+    kind='manual_issue_screening_toggle'. Disabling has no HITL gate (fail-safe
+    direction) but is still audit-logged.
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db._migrate_manual_issue_screening_toggle.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "manual_issue_screening_enabled INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_action_audit_log_table(conn: PostgresConnection) -> None:
+    """5dfe34b2 / cd495afa — action_audit_log: append-only WHAT-MERIDIAN-DID
+    record (toggle flips, velocity/anomaly escalations, manual-issue link
+    actions). Mirrors db._migrate_action_audit_log_table. Idempotent via
+    CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS action_audit_log ("
+        "    id TEXT PRIMARY KEY,"
+        "    tenant_id TEXT,"
+        "    project_id TEXT,"
+        "    event_type TEXT NOT NULL,"
+        "    actor TEXT,"
+        "    detail TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_action_audit_log_scope "
+        "ON action_audit_log(tenant_id, project_id, created_at DESC)"
+    )
+
+
+async def _migrate_pg_manual_issue_content_log_table(conn: PostgresConnection) -> None:
+    """5dfe34b2 / 2178b161 — manual_issue_content_log: append-only, hashed,
+    timestamped forensic log of RAW manual-issue content (title+body+
+    comments), written BEFORE screening. Mirrors
+    db._migrate_manual_issue_content_log_table. Idempotent via CREATE TABLE IF
+    NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS manual_issue_content_log ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    issue_number INTEGER NOT NULL,"
+        "    content_hash TEXT NOT NULL,"
+        "    raw_content TEXT NOT NULL,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_manual_issue_content_log_scope "
+        "ON manual_issue_content_log(project_id, issue_number, created_at DESC)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3436,4 +3495,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_github_issue,
     _migrate_pg_sprint_item_required_tool,
     _migrate_pg_sprint_item_github_issue_link,
+    _migrate_pg_manual_issue_screening_toggle,
+    _migrate_pg_action_audit_log_table,
+    _migrate_pg_manual_issue_content_log_table,
 )

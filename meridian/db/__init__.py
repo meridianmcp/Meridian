@@ -1081,6 +1081,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_proposal_github_issue(db)
     await _migrate_sprint_item_required_tool(db)
     await _migrate_sprint_item_github_issue_link(db)
+    await _migrate_manual_issue_screening_toggle(db)
+    await _migrate_action_audit_log_table(db)
+    await _migrate_manual_issue_content_log_table(db)
     return db
 
 
@@ -10415,6 +10418,12 @@ from .workspace import (  # noqa: F401
     get_workspace_settings,
     update_workspace_settings,
     seed_workspace_settings_from_toml,
+    # 5dfe34b2 / cd495afa — manual-issue-screening toggle + audit trail
+    _MANUAL_ISSUE_SCREENING_RISK_WARNING,
+    ManualIssueScreeningToggleError,
+    set_manual_issue_screening_enabled,
+    record_action_audit_event,
+    get_action_audit_log,
     # Public workspace-member / invite functions
     create_workspace_invite,
     get_workspace_invite_by_token_hash,
@@ -10430,6 +10439,19 @@ from .workspace import (  # noqa: F401
     update_workspace_member,
     get_workspaces_for_email,
     get_scoped_project_ids_for_member,
+)
+
+# 5dfe34b2 — manual-issue content-screening extension. Imported last (after
+# workspace's set_manual_issue_screening_enabled / get_action_audit_log are
+# already bound on this module) since manual_issue_intel's velocity-anomaly
+# check lazily imports those names back from meridian.db.
+from .manual_issue_intel import (  # noqa: F401
+    screen_manual_issue_content,
+    screen_manual_issue,
+    sanitize_manual_issue_excerpt,
+    log_raw_manual_issue_content,
+    get_raw_manual_issue_content_log,
+    check_manual_issue_action_velocity,
 )
 
 
