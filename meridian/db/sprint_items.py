@@ -1068,6 +1068,181 @@ class SprintItemEvidenceRequired(ValueError):
     (5823db0b) — the item is flagged required_notes but has no evidence."""
 
 
+class SprintItemVerificationRequired(ValueError):
+    """Raised when complete_sprint_item is blocked by the require_verification
+    gate (e2e1b682) — the item needs an independent, fresh-session PASS on
+    file (filed by a session distinct from the one completing it) before the
+    completion is allowed to stick."""
+
+
+# ---------------------------------------------------------------------------
+# e2e1b682 — independent fresh-session verifier gate for sprint completion.
+#
+# Closes the "hallucinated-compliance completion" gap: without this, nothing
+# stopped the SAME session that did (or merely claims to have done) the work
+# from also being the one that reports it done — required_notes only checks
+# that *some* evidence text exists, not that anyone independent looked at it.
+#
+# sprint_items.require_verification (opt-in INTEGER 0/1, mirrors
+# prospect_bypass's structural-gate shape) marks an item as needing an
+# INDEPENDENT PASS before complete_sprint_item is allowed to stick.
+#
+# Trust boundary (same shape as verify_handoff_token, see AGENTS.md 2ee0000c):
+# this layer structurally proves WHO filed the verdict and THAT it differs
+# from the completing actor — it does NOT (and cannot, from the DB layer
+# alone) prove HOW the verdict was derived. The "fresh, no-memory subsession
+# with read-only tools" contract is a process-level convention the launcher
+# of the verifier subsession must honour; what IS enforced here, structurally:
+#   1. A PASS verdict must exist on file (sprint_item_verifications).
+#   2. Its verifier_session_id must differ from the actor completing the item
+#      (independence — the same session cannot mark its own homework).
+#   3. A FAIL verdict (or no verdict at all) refuses completion outright.
+# ---------------------------------------------------------------------------
+
+_SPRINT_ITEM_VERIFICATIONS_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS sprint_item_verifications ("
+    "    id TEXT PRIMARY KEY,"
+    "    project_id TEXT NOT NULL,"
+    "    sprint_item_id TEXT NOT NULL,"
+    "    verdict TEXT NOT NULL,"              # 'pass' | 'fail'
+    "    verifier_session_id TEXT NOT NULL,"
+    "    notes TEXT,"
+    "    seq INTEGER NOT NULL DEFAULT 0,"     # per-item insertion order (see below)
+    "    created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+    ")"
+)
+
+_VALID_VERIFICATION_VERDICTS = {"pass", "fail"}
+
+
+async def _ensure_sprint_item_verifications_table(db: aiosqlite.Connection) -> None:
+    """Idempotently create sprint_item_verifications (tolerates concurrent init;
+    mirrors _ensure_wave_gate_results_table)."""
+    await db.execute(_SPRINT_ITEM_VERIFICATIONS_TABLE_DDL)
+
+
+async def record_sprint_item_verification(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    verifier_session_id: str,
+    verdict: str,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Persist one independent fresh-session PASS/FAIL verdict for a sprint item.
+
+    ``verifier_session_id`` identifies the session that performed the
+    independent check. Whether it is genuinely a *different* session from the
+    one that implemented / is completing the item is checked at the
+    ``complete_sprint_item`` gate, not here — this function only records the
+    verdict. Returns the stored row (dict).
+
+    ``seq`` — NOT wall-clock ``created_at`` — is what determines "latest":
+    computed here as ``1 + MAX(existing seq for this item)``. Neither
+    backend's clock is trustworthy enough for strict per-item ordering — the
+    random-UUID ``id`` doesn't correlate with insertion order at all, SQLite's
+    ``datetime('now')`` is only second-granular, and even Python's own
+    ``datetime.now()`` can tie between two awaited calls on coarser system
+    timers (observed on Windows). A FAIL followed by a same-tick re-check PASS
+    (the core "fix and re-verify" workflow this table exists for) must never
+    be ambiguous, so ordering is driven by an explicit, clock-independent
+    counter instead. Not fully race-proof under truly concurrent writers on
+    the SAME item across processes (same caveat as this server's other
+    single-process-assuming counters, e.g. routes/sprint.py's stop-override
+    budget) — acceptable here since a rare mis-ordered tie only affects which
+    of two verdicts filed in the same instant is treated as "latest", never
+    data loss or a false PASS.
+    """
+    if not (verifier_session_id or "").strip():
+        raise ValueError(
+            "record_sprint_item_verification requires a non-empty verifier_session_id"
+        )
+    verdict_norm = (verdict or "").strip().lower()
+    if verdict_norm not in _VALID_VERIFICATION_VERDICTS:
+        raise ValueError(
+            f"verdict must be one of {sorted(_VALID_VERIFICATION_VERDICTS)}, got {verdict!r}"
+        )
+    await _ensure_sprint_item_verifications_table(db)
+    vid = _new_id()
+    async with db.execute(
+        "SELECT COALESCE(MAX(seq), 0) AS m FROM sprint_item_verifications "
+        "WHERE project_id = ? AND sprint_item_id = ?",
+        (project_id, item_id),
+    ) as cur:
+        _seq_row = await cur.fetchone()
+    next_seq = int((_seq_row["m"] if isinstance(_seq_row, dict) else _seq_row[0]) or 0) + 1
+    await db.execute(
+        "INSERT INTO sprint_item_verifications "
+        "(id, project_id, sprint_item_id, verdict, verifier_session_id, notes, seq) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (vid, project_id, item_id, verdict_norm, verifier_session_id, notes, next_seq),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM sprint_item_verifications WHERE id = ?", (vid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {}
+
+
+async def get_latest_sprint_item_verification(
+    db: aiosqlite.Connection, project_id: str, item_id: str
+) -> dict[str, Any] | None:
+    """Return the most recently filed verification row for a sprint item, or
+    None if it has never been independently verified.
+
+    Ordered by ``seq DESC`` (see :func:`record_sprint_item_verification` for
+    why wall-clock ``created_at`` isn't a reliable enough ordering key on its
+    own); ``created_at DESC, id DESC`` are kept only as defensive tiebreakers
+    for pre-existing rows with ``seq = 0`` (the column's default, e.g. rows
+    written before this counter existed).
+    """
+    await _ensure_sprint_item_verifications_table(db)
+    async with db.execute(
+        "SELECT * FROM sprint_item_verifications "
+        "WHERE project_id = ? AND sprint_item_id = ? "
+        "ORDER BY seq DESC, created_at DESC, id DESC LIMIT 1",
+        (project_id, item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) if row is not None else None
+
+
+async def count_sprint_items_awaiting_verification(
+    db: aiosqlite.Connection, project_id: str
+) -> int:
+    """e2e1b682 — count of in_progress, require_verification items that do NOT
+    yet have an independent on-file PASS (no verdict at all, a FAIL, or only a
+    same-session self-report). Purely informational: backs the Stop-hook
+    guard's advisory ``verification_pending_count`` (routes/sprint.py's
+    ``/sprint/pending_count`` endpoint) so a human watching the guard's output
+    sees that a fresh check is still owed even though this never blocks a
+    session from stopping (only complete_sprint_item's structural gate blocks
+    the completion itself).
+    """
+    async with db.execute(
+        "SELECT id, actor FROM sprint_items "
+        "WHERE project_id = ? AND status = 'in_progress' AND require_verification = 1",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        return 0
+    n = 0
+    for r in rows:
+        row = _row_to_dict(r) or {}
+        item_id = row.get("id")
+        actor = row.get("actor")
+        verification = await get_latest_sprint_item_verification(db, project_id, item_id)
+        if (
+            verification is None
+            or verification.get("verdict") != "pass"
+            or (actor and verification.get("verifier_session_id") == actor)
+        ):
+            n += 1
+    return n
+
+
 class SprintItemStatusRace(ValueError):
     """Raised by _update_sprint_item_status (fa3e3331) when an ``expected_statuses``
     guard rejects a transition — the item exists but is no longer in an expected
@@ -1210,6 +1385,9 @@ async def complete_sprint_item(
     task_id: str | None = None,
     notes: str | None = None,
     actor: str | None = None,
+    verifier_session_id: str | None = None,
+    verification_verdict: str | None = None,
+    verification_notes: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
 
@@ -1230,10 +1408,64 @@ async def complete_sprint_item(
     ADVISORY ONLY — it never blocks completion and never raises. The heuristic
     is conservative (high thresholds, three simple structural rules) to avoid
     false positives on legitimate autonomous workflows.
+
+    e2e1b682 — independent fresh-session verifier gate: when the item is
+    flagged ``require_verification``, completion is refused (raises
+    :class:`SprintItemVerificationRequired`) unless an on-file
+    ``sprint_item_verifications`` row has ``verdict == "pass"`` AND its
+    ``verifier_session_id`` differs from ``actor`` (the session completing the
+    item) — a same-session self-report does not satisfy the gate. Pass
+    ``verifier_session_id`` + ``verification_verdict`` (``"pass"``/``"fail"``,
+    optionally ``verification_notes``) to file a fresh verdict and have it
+    checked in this same call; omit them to check whatever verdict is already
+    on file. This is a STRUCTURAL gate — it never silently downgrades to an
+    advisory warning the way the evidence-quality heuristic does.
     """
     item = await get_sprint_item(db, item_id)
     _evidence_quality_warning: str | None = None
     if item is not None and item.get("project_id") == project_id:
+        if item.get("require_verification"):
+            if verifier_session_id and verification_verdict:
+                await record_sprint_item_verification(
+                    db, project_id, item_id, verifier_session_id,
+                    verification_verdict, notes=verification_notes,
+                )
+            verification = await get_latest_sprint_item_verification(db, project_id, item_id)
+            _completing_actor = (actor or "").strip()
+            if verification is None:
+                raise SprintItemVerificationRequired(
+                    f"item {item_id} requires an independent fresh-session "
+                    "verification before it can be completed (require_verification "
+                    "is set) — no verification is on file yet. Spin up a fresh, "
+                    "no-memory subsession with read-only tools to independently "
+                    "inspect the change, then retry complete_sprint_item passing "
+                    "verifier_session_id=<that session's own id> and "
+                    "verification_verdict='pass' (or 'fail')."
+                )
+            if verification.get("verdict") != "pass":
+                _vnote = verification.get("notes")
+                raise SprintItemVerificationRequired(
+                    f"item {item_id}'s latest fresh verification is FAIL "
+                    f"(filed by session {verification.get('verifier_session_id')!r}"
+                    f"{': ' + _vnote if _vnote else ''}). Address the issue the "
+                    "verifier found and obtain a fresh independent PASS before "
+                    "completing."
+                )
+            if not _completing_actor:
+                raise SprintItemVerificationRequired(
+                    f"item {item_id} requires an independent fresh-session "
+                    "verification, but complete_sprint_item was not given an "
+                    "actor= identity — cannot confirm the on-file PASS was filed "
+                    "by a session other than the one completing it. Pass actor=."
+                )
+            if verification.get("verifier_session_id") == _completing_actor:
+                raise SprintItemVerificationRequired(
+                    f"item {item_id}'s only PASS verification was filed by the "
+                    f"same session ({_completing_actor!r}) that is completing it "
+                    "— that is not independent. A fresh, separate subsession "
+                    "(different session_id, no memory of the implementation) "
+                    "must file the PASS verdict."
+                )
         if item.get("required_notes"):
             has_evidence = bool(
                 (notes or "").strip()
@@ -1650,13 +1882,14 @@ async def patch_sprint_item(
     sprint_name: Any = _UNSET,
     prospect_bypass: Any = _UNSET,
     depends_on: Any = _UNSET,
+    require_verification: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
     item_group, touches_resources, required_notes, deferred_until, track,
-    priority, blocker_kind, sprint_name, prospect_bypass, depends_on. Only
-    fields passed as non-None are changed;
+    priority, blocker_kind, sprint_name, prospect_bypass, depends_on,
+    require_verification. Only fields passed as non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
     so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
@@ -1685,6 +1918,12 @@ async def patch_sprint_item(
     item through the goal-generation and claim gates), or ``False`` / ``0`` to
     CLEAR it (re-enabling the structural gate). Settable by planning/human sessions
     only — executor sessions should not set this field.
+    ``require_verification`` (e2e1b682) uses the ``_UNSET`` sentinel: omit to
+    leave unchanged, pass ``True`` / ``1`` to SET the independent
+    fresh-session verifier gate (completion via ``complete_sprint_item``
+    then requires an on-file PASS filed by a session distinct from the one
+    completing it), or ``False`` / ``0`` to CLEAR it (ordinary completion,
+    evidence gate only).
     """
     # 6a17e735 / ARCH 1B — separate the status change (routed through
     # _transition_status for guaranteed cache bust + live event) from the
@@ -1803,6 +2042,13 @@ async def patch_sprint_item(
             raise ValueError("depends_on cannot be the item's own id (self-dependency)")
         ns_fields.append("depends_on = ?")
         ns_values.append(_dep)
+    if require_verification is not _UNSET:
+        # e2e1b682 — True/1 SETS the independent fresh-session verifier gate
+        # (complete_sprint_item then requires an on-file PASS filed by a
+        # session distinct from the one completing it); False/0/None CLEARS it
+        # (ordinary completion, evidence gate only). Stored as INTEGER 0/1.
+        ns_fields.append("require_verification = ?")
+        ns_values.append(1 if require_verification else 0)
 
     if not ns_fields and status_value is None:
         return await get_sprint_item(db, item_id)

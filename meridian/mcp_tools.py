@@ -1348,21 +1348,31 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "prospect_bypass": {"type": "boolean",
                              "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. Set false to re-enable the structural gate. Omit to leave unchanged. Executor sessions must NOT set this field."},
          "depends_on": {"type": "string",
-                        "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."}},
+                        "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."},
+         "require_verification": {"type": "boolean",
+                             "description": "e2e1b682 — set true to require an independent fresh-session PASS (see complete_sprint_item's verifier_session_id/verification_verdict) before the item can be completed. A same-session self-report does not satisfy this gate. Set false to re-enable ordinary completion (evidence gate only). Omit to leave unchanged."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "
         "Pass session_id to get a board_change field (items injected mid-run) and an "
         "active-worktree merge reminder in the response. If the item is flagged "
         "required_notes, you MUST pass notes= (evidence: what shipped / how verified) "
-        "or a task_id, or completion is refused (EVIDENCE_REQUIRED).",
+        "or a task_id, or completion is refused (EVIDENCE_REQUIRED). If the item is "
+        "flagged require_verification (e2e1b682), completion is refused "
+        "(VERIFICATION_REQUIRED) unless an independent PASS is on file: pass "
+        "verifier_session_id (a DIFFERENT session id from actor — a fresh, no-memory "
+        "subsession that inspected the change with read-only tools) and "
+        "verification_verdict='pass' to file and check the verdict in this same call.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
          "task_id": {"type": "string"},
          "notes": {"type": "string", "description": "Evidence for the completion (what shipped / how it was verified). Persisted on the item; satisfies the required_notes gate."},
          "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id)."},
-         "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."}},
+         "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."},
+         "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must differ from actor/session_id or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
+         "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
+         "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
         "Read-only: Cross-reference pending sprint items against recent git commits and "

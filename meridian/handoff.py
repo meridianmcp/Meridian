@@ -2870,6 +2870,10 @@ _SPRINT_GUARD_SH = """#!/usr/bin/env bash
 # b4ce3274 — bounded retry ceiling: the server stops reporting pending>0 for a
 # session after MERIDIAN_STOP_OVERRIDE_CEILING forced continuations, so this
 # guard then lets the stop through (exit 0) instead of blocking forever.
+# e2e1b682 — verification_pending_count is ADVISORY ONLY: it surfaces items
+# flagged require_verification that are still missing an independent
+# fresh-session PASS, but never changes the exit code (only
+# complete_sprint_item's structural gate blocks the completion itself).
 set -uo pipefail
 PROJECT_ID="__PROJECT_ID__"
 MERIDIAN_URL="${MERIDIAN_URL:-__URL__}"
@@ -2895,6 +2899,10 @@ fi
 if printf '%s' "$resp" | grep -Eq '"stopped_at_ceiling"[[:space:]]*:[[:space:]]*true'; then
   echo "Meridian: stop-override ceiling reached — allowing stop despite pending items; generate a delta handoff." >&2
 fi
+verpending="$(printf '%s' "$resp" | grep -oE '"verification_pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
+if [ -n "$verpending" ] && [ "$verpending" -gt 0 ] 2>/dev/null; then
+  echo "Meridian: $verpending item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet)." >&2
+fi
 exit 0
 """
 
@@ -2904,6 +2912,10 @@ _SPRINT_GUARD_PS1 = """# c0d2356d — Claude Code Stop hook (auto-written by gen
 # b4ce3274 — bounded retry ceiling: after MERIDIAN_STOP_OVERRIDE_CEILING forced
 # continuations the server reports pending 0 + stopped_at_ceiling, so this guard
 # lets the stop through instead of blocking forever.
+# e2e1b682 — verification_pending_count is ADVISORY ONLY: it surfaces items
+# flagged require_verification that are still missing an independent
+# fresh-session PASS, but never changes the exit code (only
+# complete_sprint_item's structural gate blocks the completion itself).
 $ErrorActionPreference = 'SilentlyContinue'
 $ProjectId = '__PROJECT_ID__'
 $Url = if ($env:MERIDIAN_URL) { $env:MERIDIAN_URL } else { '__URL__' }
@@ -2927,6 +2939,9 @@ if ($pending -gt 0) {
 }
 if ($r.stopped_at_ceiling -eq $true) {
     [Console]::Error.WriteLine("Meridian: stop-override ceiling reached - allowing stop despite pending items; generate a delta handoff.")
+}
+if ($null -ne $r.verification_pending_count -and [int]$r.verification_pending_count -gt 0) {
+    [Console]::Error.WriteLine("Meridian: $([int]$r.verification_pending_count) item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet).")
 }
 exit 0
 """

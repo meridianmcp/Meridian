@@ -356,6 +356,13 @@ async def handle_update_sprint_item(
     # was creation-time-only via add_sprint_item.
     if "depends_on" in args:
         _patch_kwargs["depends_on"] = args.get("depends_on")
+    # e2e1b682 — set/clear require_verification. Only forward when the caller
+    # supplied the key (_UNSET sentinel). True/1 sets the independent
+    # fresh-session verifier gate (complete_sprint_item then requires an
+    # on-file PASS filed by a session distinct from the one completing it);
+    # False/0/null clears it (ordinary completion, evidence gate only).
+    if "require_verification" in args:
+        _patch_kwargs["require_verification"] = args.get("require_verification")
     try:
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -969,10 +976,23 @@ async def handle_complete_sprint_item(
             task_id=args.get("task_id"),
             notes=args.get("notes"),
             actor=_complete_actor,
+            # e2e1b682 — a fresh, independent verifier subsession passes its
+            # own session id + PASS/FAIL verdict so complete_sprint_item can
+            # check (and, when supplied, file) the require_verification gate
+            # in the same call. Ignored entirely for items without the gate.
+            verifier_session_id=args.get("verifier_session_id"),
+            verification_verdict=args.get("verification_verdict"),
+            verification_notes=args.get("verification_notes"),
         )
     except db_module.SprintItemEvidenceRequired as exc:
         return {
             "error": "EVIDENCE_REQUIRED",
+            "item_id": args["item_id"],
+            "message": str(exc),
+        }
+    except db_module.SprintItemVerificationRequired as exc:
+        return {
+            "error": "VERIFICATION_REQUIRED",
             "item_id": args["item_id"],
             "message": str(exc),
         }

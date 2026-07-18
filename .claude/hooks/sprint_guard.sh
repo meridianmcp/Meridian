@@ -5,6 +5,10 @@
 # b4ce3274 — bounded retry ceiling: the server stops reporting pending>0 for a
 # session after MERIDIAN_STOP_OVERRIDE_CEILING forced continuations, so this
 # guard then lets the stop through (exit 0) instead of blocking forever.
+# e2e1b682 — verification_pending_count is ADVISORY ONLY: it surfaces items
+# flagged require_verification that are still missing an independent
+# fresh-session PASS, but never changes the exit code (only
+# complete_sprint_item's structural gate blocks the completion itself).
 set -uo pipefail
 PROJECT_ID="5787cc92-ba7d-4788-b17c-28ab7938b839"
 MERIDIAN_URL="${MERIDIAN_URL:-http://localhost:7878}"
@@ -29,5 +33,9 @@ fi
 # surface the ceiling case so the human/agent knows to generate a delta handoff.
 if printf '%s' "$resp" | grep -Eq '"stopped_at_ceiling"[[:space:]]*:[[:space:]]*true'; then
   echo "Meridian: stop-override ceiling reached — allowing stop despite pending items; generate a delta handoff." >&2
+fi
+verpending="$(printf '%s' "$resp" | grep -oE '"verification_pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
+if [ -n "$verpending" ] && [ "$verpending" -gt 0 ] 2>/dev/null; then
+  echo "Meridian: $verpending item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet)." >&2
 fi
 exit 0

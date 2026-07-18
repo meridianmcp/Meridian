@@ -1076,6 +1076,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_wave_gate_configs(db)
     await _migrate_server_logs(db)
     await _migrate_custom_hooks(db)
+    await _migrate_sprint_item_require_verification(db)
+    await _migrate_sprint_item_verifications_table(db)
     return db
 
 
@@ -10169,6 +10171,7 @@ from .sprint_items import (  # noqa: F401
     complete_wave_gate,
     configure_wave_gate,
     count_pending_sprint_items,
+    count_sprint_items_awaiting_verification,
     delete_sprint_item_pointer,
     fail_sprint_item,
     fan_out_sprint_items,
@@ -10182,6 +10185,7 @@ from .sprint_items import (  # noqa: F401
     get_sprint_items_for_resource,
     get_sprint_items_page,
     get_wave_gate_configs,
+    get_latest_sprint_item_verification,
     get_sprint_version_description,
     get_all_sprint_version_descriptions,
     upsert_sprint_version_description,
@@ -10191,6 +10195,7 @@ from .sprint_items import (  # noqa: F401
     patch_sprint_item,
     provisional_complete_sprint_item,
     push_sprint_item,
+    record_sprint_item_verification,
     requeue_or_fail_stalled_item,
     skip_sprint_item,
     split_sprint_item,
@@ -10199,6 +10204,7 @@ from .sprint_items import (  # noqa: F401
     # Public classes
     SprintItemEvidenceRequired,
     SprintItemStatusRace,
+    SprintItemVerificationRequired,
     # Private helpers also imported directly in tests/callers
     _ACTIVE_SPRINT_STATUSES,
     _DUP_BLOCKING_SPRINT_STATUSES,

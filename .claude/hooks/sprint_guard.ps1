@@ -4,6 +4,10 @@
 # b4ce3274 — bounded retry ceiling: after MERIDIAN_STOP_OVERRIDE_CEILING forced
 # continuations the server reports pending 0 + stopped_at_ceiling, so this guard
 # lets the stop through instead of blocking forever.
+# e2e1b682 — verification_pending_count is ADVISORY ONLY: it surfaces items
+# flagged require_verification that are still missing an independent
+# fresh-session PASS, but never changes the exit code (only
+# complete_sprint_item's structural gate blocks the completion itself).
 $ErrorActionPreference = 'SilentlyContinue'
 $ProjectId = '5787cc92-ba7d-4788-b17c-28ab7938b839'
 $Url = if ($env:MERIDIAN_URL) { $env:MERIDIAN_URL } else { 'http://localhost:7878' }
@@ -27,5 +31,8 @@ if ($pending -gt 0) {
 }
 if ($r.stopped_at_ceiling -eq $true) {
     [Console]::Error.WriteLine("Meridian: stop-override ceiling reached - allowing stop despite pending items; generate a delta handoff.")
+}
+if ($null -ne $r.verification_pending_count -and [int]$r.verification_pending_count -gt 0) {
+    [Console]::Error.WriteLine("Meridian: $([int]$r.verification_pending_count) item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet).")
 }
 exit 0

@@ -3220,6 +3220,45 @@ async def _migrate_pg_sprint_item_prospect_bypass(conn: PostgresConnection) -> N
     )
 
 
+async def _migrate_pg_sprint_item_require_verification(conn: PostgresConnection) -> None:
+    """e2e1b682 — opt-in independent fresh-session verifier gate flag.
+
+    require_verification (INTEGER 0/1, NOT NULL DEFAULT 0) marks a sprint item
+    as needing an on-file, independent PASS (see sprint_item_verifications)
+    before complete_sprint_item will let the completion stick.
+
+    ADD COLUMN IF NOT EXISTS is idempotent; existing rows default to 0.
+    Mirrors db._migrate_sprint_item_require_verification.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS "
+        "require_verification INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_sprint_item_verifications_table(conn: PostgresConnection) -> None:
+    """e2e1b682 — sprint_item_verifications: durable audit trail of independent
+    fresh-session PASS/FAIL verdicts filed against a sprint item.
+
+    Mirrors db._migrate_sprint_item_verifications_table. Idempotent via CREATE
+    TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sprint_item_verifications ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    sprint_item_id TEXT NOT NULL,"
+        "    verdict TEXT NOT NULL,"
+        "    verifier_session_id TEXT NOT NULL,"
+        "    notes TEXT,"
+        "    seq INTEGER NOT NULL DEFAULT 0,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_sprint_item_verifications_item "
+        "ON sprint_item_verifications(sprint_item_id, seq DESC)"
+    )
+
+
 async def _migrate_pg_handoff_tokens(conn: PostgresConnection) -> None:
     """cb8e7c0f — handoff_tokens: DB-backed provenance token store for cross-machine
     verify_handoff_token.
@@ -3334,4 +3373,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_wave_gate_configs,
     _migrate_pg_server_logs,
     _migrate_pg_custom_hooks,
+    _migrate_pg_sprint_item_require_verification,
+    _migrate_pg_sprint_item_verifications_table,
 )
