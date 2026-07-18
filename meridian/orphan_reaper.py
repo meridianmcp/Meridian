@@ -41,7 +41,6 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
@@ -66,19 +65,19 @@ def _proc_name_is_target(name: str) -> bool:
 
 
 def _norm_path(p: str) -> str:
-    """Normalize a filesystem path for prefix/substring comparison: resolve
-    when possible, forward slashes, lowercase on Windows (case-insensitive
-    filesystem). Never raises — falls back to a lightly-normalized raw string
-    if resolution fails (e.g. the path no longer exists, or *p* is actually a
-    whole command-line string rather than a bare path)."""
-    try:
-        resolved = str(Path(p).resolve())
-    except Exception:  # noqa: BLE001 — best-effort normalization only
-        resolved = p
-    resolved = resolved.replace("\\", "/")
-    if os.name == "nt" or sys.platform == "win32":
-        resolved = resolved.lower()
-    return resolved
+    """Normalize a path-like string for prefix/substring comparison: forward
+    slashes, lowercased. Deliberately PURE STRING normalization — no
+    filesystem resolution (Path.resolve()). The values compared here are
+    often a dead worktree directory (which may no longer exist on disk by
+    the time this runs) or a whole process cmdline string, neither of which
+    is a real, resolvable path on this process's own filesystem; resolving
+    against the filesystem would silently rewrite them relative to CWD and
+    corrupt the comparison instead of leaving the caller's own recorded
+    string intact. Always lowercased rather than OS-conditional so the same
+    dead_paths/cmdline pairing (always recorded on the same host OS in real
+    usage) compares consistently regardless of which OS this function itself
+    happens to run on."""
+    return p.replace("\\", "/").lower()
 
 
 def process_belongs_to_dead_worktree(
