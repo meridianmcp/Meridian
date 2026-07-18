@@ -279,6 +279,58 @@ def _format_content(content) -> str:
     return json.dumps(content, indent=2)
 
 
+# 08c355c2 — staleness threshold for the legacy goal_states.sprint free-text
+# field. Once sprint-item tracking is in use, this field is never updated, so
+# months-old text silently renders at equal weight to current data. Any sprint
+# text not updated within this many days IS demoted / warned in the handoff;
+# a project with no sprint items (not yet using item tracking) is exempt since
+# the free-text field is still the only sprint signal available.
+_SPRINT_STALE_DAYS = 30
+
+
+def _sprint_stale_days(
+    goal: "dict[str, Any] | None",
+    has_sprint_items: bool,
+) -> "int | None":
+    """08c355c2 — return how many whole days the goal.sprint field has been
+    stale, or None when it is NOT considered stale.
+
+    A sprint is stale when:
+    * the project has sprint items (item-tracking is active — the free-text
+      field is therefore superseded and no longer maintained), AND
+    * the ``sprint_updated_at`` timestamp on the goal row is older than
+      ``_SPRINT_STALE_DAYS``.
+
+    Returns ``None`` when:
+    * ``has_sprint_items`` is False (item tracking not yet active; the field
+      is still the only signal and must be shown),
+    * the sprint field itself is empty/None (nothing to demote),
+    * ``sprint_updated_at`` is absent/unparseable (pre-migration rows; fail-
+      safe: don't demote on missing data),
+    * the field is within the freshness window.
+
+    This is a pure function — no I/O — so it is trivially unit-testable.
+    """
+    if not has_sprint_items:
+        return None
+    if not goal:
+        return None
+    sprint_text = (goal.get("sprint") or "").strip()
+    if not sprint_text:
+        return None
+    updated_at_raw = goal.get("sprint_updated_at") or goal.get("updated_at")
+    if not updated_at_raw:
+        return None  # no timestamp — fail-safe: don't demote
+    updated_dt = _parse_ts(updated_at_raw)
+    if updated_dt is None:
+        return None  # unparseable — fail-safe
+    now = datetime.now()  # naive, same as _parse_ts output
+    age_days = (now - updated_dt).days
+    if age_days >= _SPRINT_STALE_DAYS:
+        return age_days
+    return None
+
+
 # 2d6d8677 — cap each embedded per-item body so a handoff can't balloon past the
 # MCP tool-result token cap. The renderer used to embed EVERY workspace/pinned
 # decision + note + task with FULL untruncated bodies (blog drafts, long
@@ -2917,13 +2969,21 @@ async def _generate_handoff_l0(
 
 
 def _build_readiness_block(
-    sprint: str | None,
+    sprint: "str | None",
     pending_count: int,
     decisions_count: int,
+    sprint_stale_days: "int | None" = None,
 ) -> str:
     """Build the =HANDOFF READINESS= header block prepended to every handoff."""
     lines = ["=== HANDOFF READINESS ==="]
-    if sprint:
+    if sprint_stale_days is not None:
+        # 08c355c2 — sprint field is stale: demote it with an age warning so
+        # an executor reading the readiness block sees that this text is old
+        # and sprint items are the authoritative source of work.
+        lines.append(
+            f"⚠ Sprint (STALE — {sprint_stale_days}d old, superseded by sprint items): {sprint}"
+        )
+    elif sprint:
         lines.append(f"✓ Sprint: {sprint}")
     else:
         lines.append("⚠ No sprint name set")
@@ -3378,6 +3438,13 @@ async def generate_handoff(
             l1_tasks, goal.get("sprint"), summarizer=summarizer
         )
 
+    # 08c355c2 — compute how stale the legacy goal.sprint free-text field is.
+    # This is used in both the full Jinja2 template and the readiness block to
+    # demote/warn about months-old sprint text that hasn't been updated since
+    # sprint-item tracking took over as the authoritative source of work.
+    _has_any_sprint_items = bool(sprint_items_all)
+    _sprint_stale = _sprint_stale_days(goal, _has_any_sprint_items)
+
     if mode == "delta":
         # 00dbeed0 — since_ts MUST be durable, not the in-memory
         # _SESSION_HANDOFF_STATE dict, which is a plain per-process Python dict:
@@ -3469,6 +3536,9 @@ async def generate_handoff(
                 decisions_log=decisions_log,
                 ai_summary=ai_summary,
                 quick_start_goal=quick_start_goal,
+                # 08c355c2 — staleness days for the legacy sprint text field;
+                # None when fresh/exempt (no items, or updated recently).
+                sprint_stale_days=_sprint_stale,
             )
 
     # 302db181 — computed session span: first + last activity, distinct calendar
@@ -3493,6 +3563,7 @@ async def generate_handoff(
         sprint=goal.get("sprint"),
         pending_count=len(pending_sprint_items),
         decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
+        sprint_stale_days=_sprint_stale,
     )
     content = f"{readiness_block}\n\n{content}"
 

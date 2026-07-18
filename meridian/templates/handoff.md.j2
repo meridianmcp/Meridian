@@ -48,7 +48,12 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 
 ## L1 — Current State (~1500 tokens)
 
+{% if sprint_stale_days is not none and sprint_stale_days is defined -%}
+**Sprint (STALE — {{ sprint_stale_days }}d old, superseded by sprint items):** ~~{{ goal.sprint }}~~
+_This free-text sprint field has not been updated in {{ sprint_stale_days }} days. Sprint items are the authoritative source of work — see Pending Sprint Items below. Update via `set_sprint()` or `mcp__meridian__set_sprint` to clear this warning._
+{%- else -%}
 **Sprint:** {{ goal.sprint or "(not set)" }}
+{%- endif %}
 
 **Version Goal (v{{ goal.version }}):**
 
