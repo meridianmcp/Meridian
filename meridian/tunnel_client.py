@@ -89,7 +89,15 @@ _PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
 # 105e56b9 — docs/zotero also use uvx and trigger a cold venv build from a local
 # path (`uvx --from <local-path> meridian-docs-mcp` / `uvx zotero-mcp`), so they need
 # the same larger budget on a cold cache to avoid a spurious preflight FAILED.
-_COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc", "ppt", "word", "docs", "zotero"})
+# 12afe021 — outputs (`uvx --from <local-path> meridian-outputs-mcp`, same local-venv
+# cold build as docs) and debug (`npx -y @debugmcp/mcp-debugger`, same first-install
+# npx fetch as dc) are the same cold-fetch shape; now that run_tunnel actually spawns
+# them (previously they were never wired at all — see 12afe021), they need this same
+# larger budget or their first spawn would spuriously fail the standard-budget
+# preflight health check on a cold cache, exactly like docs/zotero did pre-105e56b9.
+_COLD_FETCH_SLOTS: "frozenset[str]" = frozenset(
+    {"dc", "ppt", "word", "docs", "zotero", "outputs", "debug"}
+)
 
 
 def _cold_spawn_budget(label: str) -> "tuple[int, float]":
@@ -4023,6 +4031,7 @@ async def run_tunnel(
     from .tunnel_plugins import (
         resolve_plugins, resolve_custom_plugins, detect_office_binaries,
         expand_command, SERENA_EXTRACT_COMMAND,
+        DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT,
     )
     # Auto-enable Office slots whose launcher is installed on this machine, unless
     # the user explicitly configured them. Resolve locally from the raw config
@@ -4043,6 +4052,12 @@ async def run_tunnel(
     # 105e56b9 — docs (meridian-docs) and zotero (zotero-mcp) slots.
     docs_plugin = by_slot.get("docs") or {}
     zotero_plugin = by_slot.get("zotero") or {}
+    # 12afe021 — outputs (meridian-outputs) and debug (mcp-debugger) slots. Both
+    # are fully wired server-side (routes/tunnel.py: /tunnel-outputs, /tunnel-debug)
+    # and declared in BUILTIN_PLUGINS, but run_tunnel never created a SlotProxy or
+    # reconnect loop for them — enabling either from the dashboard had zero effect.
+    outputs_plugin = by_slot.get("outputs") or {}
+    debug_plugin = by_slot.get("debug") or {}
     # Per-slot effective ports (override > the run_tunnel arg default).
     fs_port = int(fs_plugin.get("port") or port)
     code_port = int(code_plugin.get("port") or code_port)
@@ -4056,6 +4071,11 @@ async def run_tunnel(
     # inside the function, for the resolve_plugins call above).
     docs_port = int(docs_plugin.get("port") or 8818)
     zotero_port = int(zotero_plugin.get("port") or 8819)
+    # 12afe021 — outputs/debug default ports; these ARE imported above (unlike the
+    # docs/zotero literals) since the tunnel_plugins import happens earlier in this
+    # same function, so there's no circular-import concern to work around here.
+    outputs_port = int(outputs_plugin.get("port") or DEFAULT_OUTPUTS_PORT)
+    debug_port = int(debug_plugin.get("port") or DEFAULT_DEBUG_PORT)
 
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
@@ -4140,7 +4160,10 @@ async def run_tunnel(
     # 105e56b9 — include docs/zotero alongside the traditional office slots so
     # they share the same lazy-spawn + idle-kill + WebSocket reconnect infrastructure.
     office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port,
-                    "docs": docs_port, "zotero": zotero_port}
+                    "docs": docs_port, "zotero": zotero_port,
+                    # 12afe021 — outputs/debug now share the office-family lazy-spawn
+                    # + reconnect-loop wiring below instead of being silently dropped.
+                    "outputs": outputs_port, "debug": debug_port}
     # 4ea1b9d5 — slots whose session_mode is "persistent" (e.g. Desktop
     # Commander): they keep a stateful inner process, so they skip the
     # idle-killer that would otherwise tear the session down after 30min.
@@ -4245,16 +4268,27 @@ async def run_tunnel(
                     flush=True,
                 )
 
-    # 4b. Office MCP slots (ppt/word/dc/docs/zotero). Off by default; enabled via dashboard.
+    # 4b. Office MCP slots (ppt/word/dc/docs/zotero/outputs/debug). Off by default;
+    # enabled via dashboard.
     # 105e56b9 — docs (meridian-docs DOCX intelligence) and zotero (zotero-mcp citation
     # resolution) added here alongside the traditional office slots; they use the same
     # lazy-spawn + mcp-proxy pattern and are wired to their server-side WS routes
     # (/tunnel-docs and /tunnel-zotero in routes/tunnel.py, added by 9665538a/39c117b1).
+    # 12afe021 — outputs (meridian-outputs) and debug (mcp-debugger) were declared in
+    # BUILTIN_PLUGINS and fully wired server-side (routes/tunnel.py: /tunnel-outputs,
+    # /tunnel-debug) but never added to this iteration source, so enabling them from
+    # the dashboard had zero effect on the client. Both are opt-in (enabled=False by
+    # default, same as docs/zotero/dc above) — the `plugin.get("enabled", False)`
+    # check right below already gates on that per-plugin flag, so simply joining this
+    # tuple gives both slots the same lazy-spawn + reconnect-loop wiring, respecting
+    # whatever "enabled" state the tenant's config actually has.
     for slot, plugin, human in (("ppt", ppt_plugin, "PowerPoint"),
                                 ("word", word_plugin, "Word"),
                                 ("dc", dc_plugin, "Desktop Commander"),
                                 ("docs", docs_plugin, "meridian-docs"),
-                                ("zotero", zotero_plugin, "zotero-mcp")):
+                                ("zotero", zotero_plugin, "zotero-mcp"),
+                                ("outputs", outputs_plugin, "meridian-outputs"),
+                                ("debug", debug_plugin, "mcp-debugger")):
         if not plugin.get("enabled", False):
             continue
         cmd = _office_slot_command(slot, plugin)
@@ -4435,9 +4469,11 @@ async def run_tunnel(
     # the relay prepends to that slot's tools/list. Slots whose inner server
     # already self-prefixes carry prefix=None (no-op).
     # 105e56b9 — include docs/zotero so their tool-name prefixes are relayed correctly.
+    # 12afe021 — include outputs/debug for the same reason.
     slot_prefixes = {
         s: (by_slot.get(s) or {}).get("prefix")
-        for s in ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero")
+        for s in ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero",
+                   "outputs", "debug")
     }
     ws_fs = _ws_url(base_url, tenant_id, token)
     ws_code = _ws_code_url(base_url, tenant_id, token)
