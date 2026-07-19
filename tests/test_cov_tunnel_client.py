@@ -368,6 +368,77 @@ def test_slotproxy_idle_seconds_and_touch(monkeypatch):
     assert sp.idle_seconds() == 42.0
 
 
+def test_slotproxy_ensure_running_spawn_does_not_block_event_loop(monkeypatch):
+    """31de9cf7 — a slow/stuck spawn must not freeze the event loop.
+
+    ensure_running() used to call ``_spawn_with_cache_retry`` as a plain
+    synchronous function inside an async method. That function contains
+    genuinely blocking calls deep inside it (time.sleep(0.1), and — on a
+    fast-exit failure — Popen.communicate(timeout=5.0) via
+    _probe_tar_entry_error). Since asyncio is single-threaded/cooperative, a
+    plain synchronous call there froze the ENTIRE event loop for the duration
+    of the spawn, starving every OTHER slot's WebSocket handshake/keepalive
+    coroutine on the same loop — reproducing the live bug where one slot's
+    stuck cold-spawn cascaded into all 7 slots timing out "during opening
+    handshake" simultaneously.
+
+    This test simulates a slow spawn by monkeypatching
+    ``_spawn_with_cache_retry`` to do a real blocking ``time.sleep`` before
+    returning, then runs ``ensure_running()`` concurrently (via
+    ``asyncio.gather``) with a lightweight heartbeat coroutine that ticks a
+    counter on a short ``asyncio.sleep`` interval. If the event loop is
+    frozen while the spawn is in flight, the heartbeat cannot advance at all
+    during that window (count stays 0). With the fix (``asyncio.to_thread``
+    offloading the blocking call to a worker thread) the heartbeat keeps
+    ticking throughout. Verified by temporarily reverting the fix (plain
+    synchronous call) — this test fails (heartbeat count == 0) — and passes
+    again with ``asyncio.to_thread`` restored.
+    """
+    import contextlib
+    import time as _time
+
+    SPAWN_SECONDS = 0.5
+    HEARTBEAT_INTERVAL = 0.05
+
+    def slow_spawn(cmd, env, label):
+        # Stands in for the real blocking chain (time.sleep + Popen.communicate)
+        # inside _spawn_with_cache_retry — a real, thread-blocking sleep, not an
+        # asyncio one, so it only "yields" if run off the event loop thread.
+        _time.sleep(SPAWN_SECONDS)
+        return _FakeProc(cmd)
+
+    monkeypatch.setattr(tc, "_spawn_with_cache_retry", slow_spawn)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(tc, "_port_is_open", lambda port: False)
+
+    sp = tc.SlotProxy(["proxy", "cmd"], 8899, "fs")
+    heartbeats = {"count": 0}
+
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            heartbeats["count"] += 1
+
+    async def run():
+        hb_task = asyncio.create_task(heartbeat())
+        await sp.ensure_running()
+        hb_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb_task
+
+    asyncio.run(run())
+
+    # SPAWN_SECONDS / HEARTBEAT_INTERVAL == 10 possible ticks. A frozen event
+    # loop would show 0 (maybe 1 from scheduling slop right at the boundary);
+    # an unblocked loop should tick close to the full budget. Require a
+    # healthy majority to keep the assertion robust against CI scheduling jitter.
+    assert heartbeats["count"] >= 5, (
+        f"heartbeat only ticked {heartbeats['count']} times during a "
+        f"{SPAWN_SECONDS}s spawn — event loop appears to have been blocked"
+    )
+    assert sp.is_running
+
+
 def test_idle_killer_kills_idle_proxy_then_cancels(monkeypatch):
     """_idle_killer kills a running proxy once it exceeds the idle window."""
     monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FakeProc())
