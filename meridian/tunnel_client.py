@@ -91,6 +91,29 @@ _PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
 # the same larger budget on a cold cache to avoid a spurious preflight FAILED.
 _COLD_FETCH_SLOTS: "frozenset[str]" = frozenset({"dc", "ppt", "word", "docs", "zotero"})
 
+
+def _cold_spawn_budget(label: str) -> "tuple[int, float]":
+    """Return the (attempts, delay) first-spawn pre-flight probe budget for *label*.
+
+    050dcb6b — single source of truth for "is this slot a cold-fetch slot"
+    budget selection. Cold-fetch slots (``_COLD_FETCH_SLOTS`` — dc/ppt/word/
+    docs/zotero) trigger a network/venv cold-fetch on their very first spawn
+    that can take tens of seconds, so they get the larger
+    ``_PREFLIGHT_BUDGET_COLD_FETCH``; every other slot gets the smaller
+    ``_PREFLIGHT_BUDGET_DEFAULT``. Both :func:`_preflight_slot` and
+    :meth:`SlotProxy.ensure_running` call this so their independent readiness
+    probes can never drift apart again — that drift (``ensure_running`` had a
+    hardcoded ``attempts=6, delay=3.0`` with zero cold-fetch awareness) was the
+    root cause of meridian-docs/outputs repeatedly missing its readiness
+    window on a genuinely cold local uvx build.
+    """
+    return (
+        _PREFLIGHT_BUDGET_COLD_FETCH
+        if label in _COLD_FETCH_SLOTS
+        else _PREFLIGHT_BUDGET_DEFAULT
+    )
+
+
 # 3db4f8d8 — pin Desktop Commander to a known-good npm version instead of
 # @latest.  @latest means every cold spawn re-resolves (slower, moving target,
 # and more likely to trigger AV/Defender write-lock interference during tar
@@ -451,12 +474,23 @@ class SlotProxy:
             # protect against. _probe_slot_health already exists and is proven
             # for exactly this "is the proxy actually answering yet" check (it
             # backs the reactive post-timeout watchdog); reuse it here instead
-            # of inventing a new mechanism. attempts=6/delay=3.0 gives up to
-            # ~15-18s of real polling — generous for a slow cold resolve while
-            # staying comfortably under the 28s caller-side request timeout
-            # referenced below, so a slow-but-eventually-successful spawn is
-            # still usually caught before the caller's own request fires.
-            healthy = await _probe_slot_health(self.port, attempts=6, delay=3.0)
+            # of inventing a new mechanism.
+            #
+            # 050dcb6b — this budget MUST be cold-fetch-aware, via the same
+            # _cold_spawn_budget(label) lookup _preflight_slot already uses.
+            # A hardcoded attempts=6/delay=3.0 (~15-18s) here — independent of
+            # _COLD_FETCH_SLOTS — was silently shorter than the ~55s a
+            # genuinely cold uvx/npx first-spawn (dc/ppt/word/docs/zotero) can
+            # need, so those slots kept missing their own readiness window on
+            # a cold cache (confirmed live for meridian-docs/outputs via
+            # tunnel.log) even though _preflight_slot's separate probe already
+            # knew to give them more time. Non-cold-fetch slots are unaffected:
+            # _cold_spawn_budget falls back to the same (2, 3.0) default as
+            # before.
+            _probe_attempts, _probe_delay = _cold_spawn_budget(self.label)
+            healthy = await _probe_slot_health(
+                self.port, attempts=_probe_attempts, delay=_probe_delay
+            )
             if not healthy:
                 # Don't raise — the existing behavior never raised here either.
                 # A caller's actual request will now get an honest connection
@@ -722,15 +756,12 @@ async def _preflight_slot(
     * ``attempts``/``delay`` override the pre-flight probe budget so cold-fetch
       slots (dc/office, which npx-download on first launch) can be given a longer
       first-spawn budget. When omitted, the default budget is derived from the
-      slot label: cold-fetch slots use ``_PREFLIGHT_BUDGET_COLD_FETCH``, all
-      others ``_PREFLIGHT_BUDGET_DEFAULT``.
+      slot label via :func:`_cold_spawn_budget` — the same lookup
+      :meth:`SlotProxy.ensure_running` uses (050dcb6b), so the two independent
+      first-spawn readiness probes always agree on cold-fetch slots.
     """
     if attempts is None or delay is None:
-        _def_attempts, _def_delay = (
-            _PREFLIGHT_BUDGET_COLD_FETCH
-            if label in _COLD_FETCH_SLOTS
-            else _PREFLIGHT_BUDGET_DEFAULT
-        )
+        _def_attempts, _def_delay = _cold_spawn_budget(label)
         if attempts is None:
             attempts = _def_attempts
         if delay is None:
