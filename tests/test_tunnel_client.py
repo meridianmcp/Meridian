@@ -2206,31 +2206,50 @@ def test_proc_watchdog_leaves_running_proc(monkeypatch):
     assert spawned == []  # a running proc is never relaunched
 
 
-def test_proc_watchdog_gives_up_after_max_retries(monkeypatch):
-    """Crash isolation (edff64a6): a proxy that keeps exiting (e.g. ENOENT) is
-    relaunched at most ``max_retries`` times, then the watchdog gives up and
-    returns instead of spin-looping forever. No _StopLoop needed — if the loop
-    were still unbounded this test would hang."""
+def test_proc_watchdog_cools_down_instead_of_giving_up(monkeypatch):
+    """b9e4967d (root-caused live 2026-07-18): a proxy that keeps exiting (e.g.
+    ENOENT) is relaunched at the fast cadence for at most ``max_retries``
+    attempts, but the watchdog must NOT exit permanently after that — a bare
+    ``return`` there used to end the watchdog task forever, so a slot's local
+    proxy stayed dead even after the underlying bug was fixed out-of-band,
+    while the WebSocket layer kept reporting tunnel_active: true. Instead the
+    watchdog keeps retrying at the long ``cooldown`` cadence, so it can still
+    self-heal."""
     holder = {"proc": _DeadProc(), "cmd": ["broken-cmd"], "env": None, "label": "extract"}
     spawned = []
 
-    # Every relaunch yields another already-dead proc → the slot never recovers.
+    # Every relaunch yields another already-dead proc — the slot never recovers
+    # on its own, but the watchdog should keep trying rather than give up.
     def fake_popen(cmd, env=None, **kwargs):
         spawned.append(cmd)
         return _DeadProc()
 
     monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
 
-    async def fake_sleep(_d):  # no real waiting; backoff values don't matter here
-        return None
+    sleeps = []
+    calls = {"n": 0}
+
+    async def fake_sleep(d):
+        sleeps.append(d)
+        calls["n"] += 1
+        # Let it run well past max_retries (3) so we observe the cooldown phase.
+        if calls["n"] >= 6:
+            raise _StopLoop()
 
     monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
 
-    # Terminates on its own via the give-up return (no exception).
-    asyncio.run(tc._proc_watchdog(holder, poll_interval=0, max_retries=3))
+    try:
+        asyncio.run(
+            tc._proc_watchdog(holder, poll_interval=0, max_retries=3, cooldown=999)
+        )
+    except _StopLoop:
+        pass
 
-    # Relaunched exactly max_retries times, then stopped.
-    assert len(spawned) == 3
+    # It kept relaunching past max_retries instead of giving up for good.
+    assert len(spawned) > 3
+    # Once fast retries are exhausted, the sleep duration switches to the long
+    # cooldown value (not the small exponential fast-retry backoff).
+    assert sleeps[-1] == 999
 
 
 def test_proc_watchdog_healthy_tick_resets_failure_streak(monkeypatch):

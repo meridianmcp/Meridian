@@ -47,8 +47,18 @@ DEFAULT_EXTRACT_PROXY_PORT = 8810
 _LOCAL_REQUEST_TIMEOUT = 28.0
 _MAX_BACKOFF = 30.0
 # Crash isolation: how many times the watchdog relaunches a slot's proxy that
-# keeps exiting (e.g. ENOENT on a missing binary) before giving up on that slot.
+# keeps exiting (e.g. ENOENT on a missing binary) before backing off to the
+# long-cooldown retry cadence below.
 _WATCHDOG_MAX_RETRIES = 5
+# b9e4967d — once a slot exhausts its fast retries, how long (seconds) between
+# relaunch attempts in the long-cooldown phase. The watchdog never exits for
+# good: a bare ``return`` after max_retries used to end the watchdog task
+# permanently, even after the underlying bug (missing binary, bad PATH, etc.)
+# was fixed out-of-band — the WebSocket reconnect layer would still report
+# tunnel_active: true while that slot's tool_count stayed 0 forever (confirmed
+# live 2026-07-18). 15 minutes is slow enough to not spam the terminal/logs but
+# still lets a slot self-heal without a manual tunnel restart.
+_WATCHDOG_COOLDOWN_SECONDS = 15 * 60.0
 # Lazy spawn: how long (seconds) a slot may stay idle before auto-kill.
 # 3649a61a — don't spawn at startup; kill after 30min of no requests.
 _IDLE_KILL_SECONDS = 30 * 60
@@ -3424,9 +3434,12 @@ async def _reconnect_loop(
 
 
 async def _proc_watchdog(
-    holder: dict, poll_interval: float = 3.0, max_retries: int = _WATCHDOG_MAX_RETRIES
+    holder: dict,
+    poll_interval: float = 3.0,
+    max_retries: int = _WATCHDOG_MAX_RETRIES,
+    cooldown: float = _WATCHDOG_COOLDOWN_SECONDS,
 ) -> None:
-    """Relaunch a slot's local subprocess if it dies — with bounded retries.
+    """Relaunch a slot's local subprocess if it dies — with bounded fast retries.
 
     ``holder`` is a mutable dict ``{"proc", "cmd", "env", "label"}``. Each tick
     polls ``holder["proc"].poll()``; if the process has exited it is re-spawned
@@ -3436,15 +3449,26 @@ async def _proc_watchdog(
 
     Crash isolation: a proxy whose command is broken (e.g. ENOENT on a missing
     binary) used to be relaunched every tick forever, spamming the terminal. Now
-    consecutive failures back off exponentially (capped at ``_MAX_BACKOFF``) and
-    the watchdog gives up after ``max_retries`` straight failures, leaving that
-    one slot down without taking the tunnel — or the terminal — down with it. A
-    proxy that comes back healthy resets the counter, so an occasional crash
-    still recovers. Runs until cancelled or it gives up on the slot.
+    consecutive failures back off exponentially (capped at ``_MAX_BACKOFF``), and
+    after ``max_retries`` straight failures the watchdog stops hammering the slot
+    at the fast cadence.
+
+    b9e4967d — it does NOT give up for good at that point. A bare ``return``
+    here used to end the watchdog task permanently for the rest of the tunnel's
+    life, even after the underlying bug (missing binary, bad PATH, transient
+    dependency outage, ...) got fixed out-of-band — the WebSocket reconnect
+    layer is unaffected by any of this, so ``tunnel_active: true`` kept showing
+    while the slot's ``tool_count`` stayed 0 forever (confirmed live
+    2026-07-18). Instead, once fast retries are exhausted the watchdog drops to
+    a long, fixed ``cooldown`` between relaunch attempts — slow enough not to
+    spam the terminal, but the slot keeps a standing chance to self-heal without
+    a manual tunnel restart. A relaunch that comes back healthy resets the
+    counter and the normal fast-retry cadence. Runs until cancelled.
     """
     label = holder.get("label", "?")
     failures = 0
     backoff = poll_interval
+    gave_up_fast_retry = False
     while True:
         await asyncio.sleep(backoff)
         proc = holder.get("proc")
@@ -3452,28 +3476,33 @@ async def _proc_watchdog(
             if proc is not None:  # a healthy tick clears the crash streak
                 failures = 0
                 backoff = poll_interval
+                gave_up_fast_retry = False
             continue
         failures += 1
         if failures > max_retries:
+            if not gave_up_fast_retry:
+                print(
+                    f"tunnel:{label}: local proxy keeps exiting (code {proc.returncode}); "
+                    f"giving up fast retries after {max_retries} attempts — will keep "
+                    f"retrying every {cooldown:.0f}s in case the issue clears; fix the "
+                    f"command to recover sooner.",
+                    file=sys.stderr, flush=True,
+                )
+                gave_up_fast_retry = True
+            backoff = cooldown
+        else:
             print(
-                f"tunnel:{label}: local proxy keeps exiting (code {proc.returncode}); "
-                f"giving up after {max_retries} retries — fix the command and restart "
-                f"the tunnel.",
+                f"tunnel:{label}: local proxy exited (code {proc.returncode}); relaunching "
+                f"(attempt {failures}/{max_retries})",
                 file=sys.stderr, flush=True,
             )
-            return
-        print(
-            f"tunnel:{label}: local proxy exited (code {proc.returncode}); relaunching "
-            f"(attempt {failures}/{max_retries})",
-            file=sys.stderr, flush=True,
-        )
+            backoff = min(max(backoff, poll_interval) * 2, _MAX_BACKOFF)
         try:
             holder["proc"] = subprocess.Popen(
                 holder["cmd"], env=holder.get("env"), **_spawn_kwargs()
             )
         except Exception as exc:  # noqa: BLE001 — count it, back off, may still recover
             print(f"tunnel:{label}: relaunch failed: {exc}", file=sys.stderr, flush=True)
-        backoff = min(max(backoff, poll_interval) * 2, _MAX_BACKOFF)
 
 
 # ---------------------------------------------------------------------------
