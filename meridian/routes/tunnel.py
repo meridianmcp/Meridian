@@ -1002,6 +1002,36 @@ async def _do_proxy(
             status_code=504,
             media_type="application/json",
         )
+    except asyncio.CancelledError:
+        # d0f05438 — tunnel_ws's disconnect cleanup force-cancels every pending
+        # future for this tenant (e.g. a server redeploy dropping the socket
+        # mid-request): `fut.cancel()`. Awaiting that cancelled `fut` inside
+        # wait_for re-raises CancelledError here — and since CancelledError is
+        # a BaseException (not Exception) as of Python 3.8, it used to skip the
+        # `except Exception` below entirely and propagate uncaught through
+        # call_tunnel_tool / the MCP dispatcher, surfacing to the caller as a
+        # bare, message-less failure (or no response at all) instead of a
+        # legible, retryable error — exactly the "dispatch errors sometimes
+        # carry no message text" symptom.
+        #
+        # This is NOT distinguishable from "this task's own cancellation was
+        # requested" by inspecting `fut.cancelled()` — asyncio.Task.cancel()
+        # cancels whatever the task is currently awaiting (here, `fut`, via
+        # `wait_for`), so `fut.cancelled()` is True in BOTH cases. Swallowing
+        # it here is safe regardless of which case it is: there is no further
+        # blocking work below (just cleanup + a return), so a genuine
+        # request/shutdown cancellation is still honored almost immediately —
+        # it just gets an honest response instead of vanishing as a bare
+        # CancelledError with empty message text.
+        pending.pop(req_id, None)
+        return Response(
+            content=(
+                '{"error":"tunnel disconnected mid-request '
+                '(reconnecting) — retry shortly"}'
+            ),
+            status_code=503,
+            media_type="application/json",
+        )
     except Exception as exc:
         pending.pop(req_id, None)
         _log.debug("%s proxy error for %s: %s", label, tenant_id[:8], exc)
@@ -2187,6 +2217,37 @@ async def send_run_cmd_control(
             "stderr_tail": "",
             "timed_out": True,
         }
+    except asyncio.CancelledError:
+        # d0f05438 — same shape as the identical guard in _do_proxy: tunnel_ws's
+        # disconnect cleanup (e.g. a server redeploy dropping the FS socket
+        # mid-run_verification) force-cancels every pending run_cmd future for
+        # this tenant via `fut.cancel()`. Awaiting that cancelled `fut` re-raises
+        # CancelledError here — which, being a BaseException (not an Exception)
+        # since Python 3.8, used to skip `except Exception` below and propagate
+        # uncaught, surfacing to the caller as a bare, message-less failure
+        # instead of an honest, retryable status.
+        #
+        # `fut.cancelled()` can't distinguish "our future was force-cancelled"
+        # from "this task's own cancellation was requested" — Task.cancel()
+        # cancels whatever the task is currently awaiting (here, `fut`, via
+        # wait_for), so `fut.cancelled()` is True either way. Swallowing it here
+        # is safe regardless: there's no further blocking work below (just
+        # cleanup + a return), so a genuine cancellation is still honored almost
+        # immediately — it just gets an honest status instead of vanishing as a
+        # bare CancelledError with empty message text.
+        _pending_run_cmd_reqs.pop(req_id, None)
+        return {
+            "status": "not_connected",
+            "message": (
+                "tunnel disconnected mid-request (server redeploy or "
+                "local network drop) — the client auto-reconnects; retry shortly"
+            ),
+            "exit_code": None,
+            "passed": None,
+            "failed": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
     except Exception as exc:  # noqa: BLE001
         _pending_run_cmd_reqs.pop(req_id, None)
         return {
@@ -2759,6 +2820,28 @@ def _parse_mcp_payload(raw: bytes | None) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _proxy_error_message(resp: Response) -> str:
+    """Best-effort legible message from a failed ``_do_proxy`` Response body.
+
+    d0f05438 — every synthetic error Response ``_do_proxy`` returns (not-
+    connected / saturated / timeout / disconnected-mid-request / generic relay
+    error) carries a JSON body with an ``"error"`` key, and the ``fly-replay``
+    miss response carries ``"message"`` instead. Tries both, falling back to a
+    generic status-code message when the body isn't parseable JSON or carries
+    neither key — used by :func:`_tunnel_jsonrpc` so that reason is preserved
+    for the caller instead of being discarded (see its docstring).
+    """
+    try:
+        payload = json.loads(resp.body)
+    except Exception:  # noqa: BLE001 — non-JSON/empty body → generic fallback
+        payload = None
+    if isinstance(payload, dict):
+        msg = payload.get("error") or payload.get("message")
+        if isinstance(msg, str) and msg.strip():
+            return msg
+    return f"tunnel request failed (HTTP {resp.status_code})"
+
+
 async def _tunnel_jsonrpc(
     tenant_id: str, label: str, method: str, params: dict | None,
     repo_path: str | None = None,
@@ -2768,6 +2851,19 @@ async def _tunnel_jsonrpc(
     4d9ad87b — ``repo_path`` is forwarded as ``X-Meridian-Repo-Path`` so the
     tunnel's SerenaDaemonPool can route code-intel requests to the correct
     per-repo daemon without the server knowing about the pool directly.
+
+    Returns ``None`` only when this instance holds no socket for *label* at
+    all (genuinely nothing to ask). Once a request is actually sent, ANY
+    proxy-level failure — not-connected race, saturated slot, timeout,
+    mid-request disconnect, generic relay error — RAISES a ``RuntimeError``
+    carrying the real reason (d0f05438) rather than silently collapsing into
+    ``None``. Before this fix a proxy error and "no active tunnel exposes this
+    tool" were indistinguishable to every caller (``call_tunnel_tool`` and, in
+    turn, the MCP dispatcher / prospect_symbol's graph rung), so a live but
+    erroring tunnel — e.g. still reconnecting in the seconds/minutes after a
+    server redeploy wiped the in-memory socket registry — surfaced as a
+    dispatch error with NO message text (or a misleading "unknown tool")
+    instead of the actionable underlying reason.
     """
     sockets, pending = _label_maps(label)
     if tenant_id not in sockets:
@@ -2788,7 +2884,7 @@ async def _tunnel_jsonrpc(
         tenant_id, "POST", "/mcp", "", headers, body, sockets, pending, label,
     )
     if resp.status_code >= 400:
-        return None
+        raise RuntimeError(_proxy_error_message(resp))
     return _parse_mcp_payload(resp.body)
 
 
@@ -3443,7 +3539,11 @@ async def call_tunnel_tool(
 
     Returns the MCP ``result`` object (with ``content``) on success, or None if
     no active tunnel exposes a tool by that name. Raises on a tunnel-reported
-    JSON-RPC error so the caller can surface it as a normal MCP error.
+    JSON-RPC error, and — as of d0f05438 — also on any proxy-level failure
+    (not-connected race, saturated slot, timeout, mid-request disconnect,
+    generic relay error) with the real underlying message, so the caller can
+    surface it as a normal MCP error instead of a misleading "unknown tool" or
+    a message-less failure.
 
     4d9ad87b — ``repo_path`` (explicit or from _tenant_active_repo cache) is
     forwarded as ``X-Meridian-Repo-Path`` so the SerenaDaemonPool on the tunnel
