@@ -1419,17 +1419,24 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "github_issue_action field: issues Meridian itself created (github_issue_source="
         "'meridian_auto') are commented on and auto-closed; any other issue (manual/legacy) "
         "only gets a proposed-closure comment plus a non-blocking HITL for human review — "
-        "never auto-closed.",
+        "never auto-closed. "
+        "8693b6a8 — claim-ownership gate: if the item is claimed by a DIFFERENT actor "
+        "than the one completing it, completion is refused (CLAIM_MISMATCH) UNLESS that "
+        "claim is stale (claimed 2h+ ago, or the claiming session is dead/closed) — the "
+        "exact stale-cleanup pattern of closing items left behind by a dead session keeps "
+        "working automatically. For a live, non-stale foreign claim, pass "
+        "force_foreign_claim=true to explicitly acknowledge and complete anyway.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
          "task_id": {"type": "string"},
          "notes": {"type": "string", "description": "Evidence for the completion (what shipped / how it was verified). Persisted on the item; satisfies the required_notes gate."},
-         "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id)."},
+         "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id). Checked against the item's claim owner (8693b6a8) — a mismatch on a live, non-stale claim is refused unless force_foreign_claim=true."},
          "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."},
          "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must differ from actor/session_id or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
          "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
-         "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."}},
+         "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."},
+         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit override, never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
         "Read-only: Cross-reference pending sprint items against recent git commits and "

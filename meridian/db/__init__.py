@@ -10338,6 +10338,7 @@ from .sprint_items import (  # noqa: F401
     sprint_test_coverage_expected,
     start_sprint_item,
     # Public classes
+    SprintItemClaimMismatch,
     SprintItemEvidenceRequired,
     SprintItemStatusRace,
     SprintItemVerificationRequired,
