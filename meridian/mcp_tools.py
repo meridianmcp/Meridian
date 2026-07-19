@@ -1168,10 +1168,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["title", "body"]}},
     {"name": "get_workspace_proposals", "description":
         "Read-only: List workspace proposals (human-authored flashes of insight), newest first. "
-        "Optional status filter (raw/investigating/promoted/rejected) and tag substring filter.",
+        "When status is omitted, defaults to 'live' proposals only (raw + investigating) — "
+        "terminal proposals (promoted/rejected) are excluded so the default view reflects "
+        "what's actually still open. Pass status='all' to fetch every status, or an explicit "
+        "status (including promoted/rejected) to filter to just that one. Optional tag "
+        "substring filter.",
      "inputSchema": {"type": "object", "properties": {
-         "status": {"type": "string", "enum": ["raw", "investigating", "promoted", "rejected"],
-                    "description": "Filter to proposals in this status."},
+         "status": {"type": "string", "enum": ["raw", "investigating", "promoted", "rejected", "all"],
+                    "description": "Filter to proposals in this status. Defaults to raw+investigating "
+                    "('live') when omitted; use 'all' for every status."},
          "tag": {"type": "string", "description": "Substring filter on tags."}},
          "required": []}},
     {"name": "advance_proposal_status", "description":

@@ -3947,7 +3947,10 @@ async def mcp_tools_doc() -> str:
         "Use `advance_proposal_status` to move through the lifecycle; `promote_proposal` to convert one into a real sprint item.")
     lines += _render_tool("get_workspace_proposals",
         "Read-only: List workspace proposals (human-authored flashes of insight), newest first. "
-        "Optional status filter (raw/investigating/promoted/rejected) and tag substring filter.")
+        "When status is omitted, defaults to 'live' proposals only (raw + investigating) — terminal "
+        "proposals (promoted/rejected) are excluded. Pass status='all' for every status, or an "
+        "explicit status (including promoted/rejected) to filter to just that one. Optional tag "
+        "substring filter.")
     lines += _render_tool("advance_proposal_status",
         "Transition a workspace proposal through its lifecycle (raw → investigating|rejected; "
         "investigating → promoted|rejected|raw; rejected → raw). 'promoted' is a terminal status "

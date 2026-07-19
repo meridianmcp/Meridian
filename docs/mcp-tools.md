@@ -586,11 +586,11 @@ add_workspace_proposal(title="IDEA: expose auth as plugin", body="Could ship aut
 
 
 ### `get_workspace_proposals`
-Read-only: List workspace proposals (human-authored flashes of insight), newest first. Optional status filter (raw/investigating/promoted/rejected) and tag substring filter.
+Read-only: List workspace proposals (human-authored flashes of insight), newest first. When status is omitted, defaults to 'live' proposals only (raw + investigating) — terminal proposals (promoted/rejected) are excluded. Pass status='all' for every status, or an explicit status (including promoted/rejected) to filter to just that one. Optional tag substring filter.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `status` | string | optional | Filter to proposals in this status. |
+| `status` | string | optional | Filter to proposals in this status. Defaults to raw+investigating ('live') when omitted; use 'all' for every status. |
 | `tag` | string | optional | Substring filter on tags. |
 
 **Example:**

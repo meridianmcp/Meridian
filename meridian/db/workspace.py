@@ -327,6 +327,11 @@ async def delete_workspace_decision(
 # status machine: raw → investigating → promoted | rejected.
 
 _VALID_PROPOSAL_STATUSES = {"raw", "investigating", "promoted", "rejected"}
+# 45c4c178 — "live" statuses: proposals still awaiting human triage. Terminal
+# statuses (promoted/rejected) are excluded from the default (status-omitted)
+# view of get_workspace_proposals so the common "what's still open" query
+# doesn't require the caller to already know to pass status= explicitly.
+_LIVE_PROPOSAL_STATUSES = {"raw", "investigating"}
 _PROPOSAL_TRANSITIONS: dict[str, set[str]] = {
     "raw": {"investigating", "rejected"},
     "investigating": {"promoted", "rejected", "raw"},
@@ -381,12 +386,22 @@ async def get_workspace_proposals(
     """Return workspace proposals, newest first.
 
     Optional filters: ``status`` (raw/investigating/promoted/rejected) and
-    ``tag`` (substring match). Scoped to ``tenant_id`` when provided."""
+    ``tag`` (substring match). Scoped to ``tenant_id`` when provided.
+
+    When ``status`` is omitted, defaults to "live" proposals only (raw +
+    investigating) — terminal proposals (promoted/rejected) are excluded so
+    the default view reflects what's actually still open. Pass
+    ``status="all"`` to fetch every status, or an explicit status value to
+    filter to just that one (including "promoted"/"rejected")."""
     clauses: list[str] = []
     params: list[Any] = []
-    if status:
+    if status and status != "all":
         clauses.append("status = ?")
         params.append(status)
+    elif not status:
+        placeholders = ", ".join("?" for _ in _LIVE_PROPOSAL_STATUSES)
+        clauses.append(f"status IN ({placeholders})")
+        params.extend(sorted(_LIVE_PROPOSAL_STATUSES))
     if tag:
         clauses.append("tags LIKE ?")
         params.append(f"%{tag}%")
