@@ -1288,10 +1288,20 @@ async def _handle_mcp_request(
                     # (docx) write path can consult file claims and refuse a
                     # concurrent-write conflict instead of silently last-save-wins
                     # overwriting another session's edit to the same document.
-                    tunnel_result = await _tunnel_mod.call_tunnel_tool(
-                        tenant["id"], name, args,
-                        db=db, session_id=(args.get("session_id") or "").strip() or None,
-                    )
+                    try:
+                        tunnel_result = await _tunnel_mod.call_tunnel_tool(
+                            tenant["id"], name, args,
+                            db=db, session_id=(args.get("session_id") or "").strip() or None,
+                        )
+                    except _tunnel_mod.TunnelCrossInstanceMiss:
+                        # 850f0e8e, extends cb8685c2/af5b5739 — has_active_tunnel()
+                        # passed because SOME slot has a local socket, but this
+                        # specific tool's slot lives on a sibling instance. Fail
+                        # legibly instead of falling through to a misleading
+                        # "unknown tool".
+                        return _server._jsonrpc_err(
+                            req_id, -32002, _tunnel_mod.CROSS_INSTANCE_MISS_MESSAGE,
+                        )
                     if tunnel_result is not None:
                         # Pass the tunneled server's result through verbatim — it
                         # already carries the MCP `content` envelope.
