@@ -81,10 +81,13 @@ FAILURE-CATEGORY COVERAGE MATRIX (design note 6271aa81's 7 predicted classes)
     under load, routed by the hosted relay); this harness cannot drive that
     concurrency from outside the relay. What IS real: static analysis
     confirmed a second, entirely independent pool -- Serena's per-repo daemon
-    pool -- allocates its FIRST daemon on ``SERENA_POOL_BASE_PORT`` (8820),
-    which is IDENTICAL to ``DEFAULT_OUTPUTS_PORT`` (also 8820). See
-    :func:`check_port_collisions` (a permanent regression check, not a
-    one-off observation).
+    pool -- allocated its FIRST daemon on ``SERENA_POOL_BASE_PORT``, which was
+    IDENTICAL to ``DEFAULT_OUTPUTS_PORT`` (both 8820). FIXED by a1a870d5
+    (2026-07-19): ``SERENA_POOL_BASE_PORT`` moved to 8700, below every fixed
+    port the tunnel-plugin catalog declares. See :func:`check_port_collisions`
+    -- now a general, permanent regression check across every declared port in
+    the codebase (not just this one historical pair), so it would have caught
+    this exact bug and stays green going forward.
  3. Fly-instance / routing mismatch  -- WEAK, local-only. ``test_slot``
     repeats its functional call a few seconds apart and flags an inconsistent
     pass/fail (``repeat_consistent``); a genuinely Fly-routing-caused flap
@@ -414,39 +417,81 @@ def check_client_wires_all_catalog_slots(
 
 
 def check_port_collisions() -> "list[str]":
-    """Return human-readable descriptions of any known STATIC port collision
-    between the tunnel-plugin catalog's declared ports and other port
-    allocators this codebase owns.
+    """Return human-readable descriptions of any STATIC port collision between
+    every fixed port this codebase declares.
 
-    Real finding (2026-07-19): ``meridian.serena_pool.SERENA_POOL_BASE_PORT``
-    is 8820 -- the port the code-extractor slot's default Serena daemon pool
+    This is a general regression check over the FULL set of statically
+    declared ports -- every ``tunnel_plugins.DEFAULT_*_PORT`` (fs/code/
+    extract/ppt/word/dc/docs/zotero/outputs/debug), every pre-allocated
+    ``tunnel_plugins.CUSTOM_SLOT_PORTS`` entry (p0-p3), and
+    ``serena_pool.SERENA_POOL_BASE_PORT`` -- not just one hardcoded pair. Two
+    constants naming the same port number means whatever they gate would
+    contend for the same TCP port if both were simultaneously active.
+
+    Real finding this check is permanent regression coverage for (2026-07-19,
+    fixed by a1a870d5): ``meridian.serena_pool.SERENA_POOL_BASE_PORT`` was
+    8820 -- the port the code-extractor slot's default Serena daemon pool
     allocates FIRST (see ``SerenaDaemonPool._next_port``, which starts at
     ``base_port`` and increments only when that port is already held by
     another live daemon in the SAME pool). ``tunnel_plugins.DEFAULT_OUTPUTS_PORT``
-    is also 8820. Since the code-extractor slot defaults to the Serena pool
+    was also 8820. Since the code-extractor slot defaults to the Serena pool
     (``run_tunnel`` only skips it when a tenant overrides the extract slot's
     command), a tenant with the default extract slot AND the outputs slot
     both active would have Serena's first-repo daemon and meridian-outputs
     contending for the same TCP port. 12afe021 wired the outputs slot into
     ``run_tunnel`` (see :func:`check_client_wires_all_catalog_slots`), which
-    turns this from a dormant static finding into a live collision the moment
-    a tenant enables both slots -- tracked separately as its own fix (a1a870d5),
-    not addressed here. This is independent of, and additional to, the design
-    note's predicted "multi-instance pooling contention" category -- it is a
-    static allocation bug, not a runtime race.
+    turned this from a dormant static finding into a live collision the moment
+    a tenant enables both slots -- fixed separately by moving
+    ``SERENA_POOL_BASE_PORT`` off 8820 (a1a870d5). This was independent of,
+    and additional to, the design note's predicted "multi-instance pooling
+    contention" category -- it was a static allocation bug, not a runtime
+    race. Checking every declared port (not just that one pair) means the
+    same class of bug -- any two fixed ports landing on the same number --
+    is caught going forward, regardless of which two constants collide next.
     """
-    from meridian.tunnel_plugins import DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT
+    from meridian.tunnel_plugins import (
+        CUSTOM_SLOT_PORTS,
+        DEFAULT_CODE_PORT,
+        DEFAULT_DC_PORT,
+        DEFAULT_DEBUG_PORT,
+        DEFAULT_DOCS_PORT,
+        DEFAULT_EXTRACT_PORT,
+        DEFAULT_FS_PORT,
+        DEFAULT_OUTPUTS_PORT,
+        DEFAULT_PPT_PORT,
+        DEFAULT_WORD_PORT,
+        DEFAULT_ZOTERO_PORT,
+    )
+
+    declared: "dict[str, int]" = {
+        "tunnel_plugins.DEFAULT_FS_PORT": DEFAULT_FS_PORT,
+        "tunnel_plugins.DEFAULT_CODE_PORT": DEFAULT_CODE_PORT,
+        "tunnel_plugins.DEFAULT_EXTRACT_PORT": DEFAULT_EXTRACT_PORT,
+        "tunnel_plugins.DEFAULT_PPT_PORT": DEFAULT_PPT_PORT,
+        "tunnel_plugins.DEFAULT_WORD_PORT": DEFAULT_WORD_PORT,
+        "tunnel_plugins.DEFAULT_DC_PORT": DEFAULT_DC_PORT,
+        "tunnel_plugins.DEFAULT_DOCS_PORT": DEFAULT_DOCS_PORT,
+        "tunnel_plugins.DEFAULT_ZOTERO_PORT": DEFAULT_ZOTERO_PORT,
+        "tunnel_plugins.DEFAULT_OUTPUTS_PORT": DEFAULT_OUTPUTS_PORT,
+        "tunnel_plugins.DEFAULT_DEBUG_PORT": DEFAULT_DEBUG_PORT,
+        "serena_pool.SERENA_POOL_BASE_PORT": SERENA_POOL_BASE_PORT,
+    }
+    for slot_name, port in CUSTOM_SLOT_PORTS.items():
+        declared[f"tunnel_plugins.CUSTOM_SLOT_PORTS[{slot_name!r}]"] = port
+
+    by_port: "dict[int, list[str]]" = {}
+    for name, port in declared.items():
+        by_port.setdefault(port, []).append(name)
 
     findings: list[str] = []
-    if SERENA_POOL_BASE_PORT == DEFAULT_OUTPUTS_PORT:
-        findings.append(
-            f"SERENA_POOL_BASE_PORT ({SERENA_POOL_BASE_PORT}) == "
-            f"DEFAULT_OUTPUTS_PORT ({DEFAULT_OUTPUTS_PORT}) -- the code-extractor "
-            "slot's default Serena daemon pool allocates its FIRST repo's daemon "
-            "on the exact port the outputs slot defaults to. A second concurrently-"
-            "active repo in the Serena pool would similarly collide with "
-            f"DEFAULT_DEBUG_PORT ({DEFAULT_DEBUG_PORT}) if it lands on {SERENA_POOL_BASE_PORT + 1}."
-        )
+    for port in sorted(by_port):
+        names = by_port[port]
+        if len(names) > 1:
+            findings.append(
+                f"port {port} is declared by multiple constants: "
+                f"{', '.join(sorted(names))} -- these would contend for the "
+                "same TCP port if simultaneously active."
+            )
     return findings
 
 

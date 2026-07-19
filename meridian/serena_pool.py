@@ -27,9 +27,29 @@ from typing import Any, Callable
 # in; the server forwards it and the tunnel relay uses it to pick the daemon.
 REPO_PATH_HEADER = "x-meridian-repo-path"
 
-# Serena HTTP daemons are allocated sequential ports starting here. Chosen above
-# the office-plugin ports (8811-8813) so they never collide with a fixed slot.
-SERENA_POOL_BASE_PORT = 8820
+# Serena HTTP daemons are allocated sequential ports starting here.
+#
+# a1a870d5 (2026-07-19) — this was 8820, IDENTICAL to
+# ``tunnel_plugins.DEFAULT_OUTPUTS_PORT``. The original comment's intent
+# ("chosen above the office-plugin ports 8811-8813 so it never collides with a
+# fixed slot") broke silently as later work grew that fixed range upward:
+# meridian-docs (8818), zotero (8819), outputs (8820), and debug (8821) each
+# claimed "the next free port above the current max" in turn, and 8820
+# eventually landed exactly on this pool's base port. Picking anything just
+# above the fixed range is fragile for the same reason — a future slot can
+# repeat the pattern.
+#
+# 8700 instead sits BELOW ``tunnel_plugins.DEFAULT_FS_PORT`` (8808, the lowest
+# fixed port the tunnel-plugin catalog declares), with 100+ ports of headroom
+# for this pool's sequential per-repo allocation (:meth:`SerenaDaemonPool.
+# _next_port`). Every built-in slot added since the catalog's inception has
+# grown the fixed range upward from 8808, never downward, so this range does
+# not need to be re-bumped every time a new built-in slot is added — unlike
+# ``tunnel_plugins._CUSTOM_PORT_START``, which historically has been bumped
+# repeatedly for exactly that reason (see its own comment history). See
+# :func:`scripts.tunnel_smoke_test.check_port_collisions` for the permanent
+# regression check across every declared port in the codebase.
+SERENA_POOL_BASE_PORT = 8700
 
 # A daemon untouched for this long is killed by :meth:`SerenaDaemonPool.reap_idle`.
 IDLE_KILL_SECONDS = 30 * 60  # 30 minutes

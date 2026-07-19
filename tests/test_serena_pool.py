@@ -58,6 +58,31 @@ def _pool(**kw):
 
 # ── command + header helpers ────────────────────────────────────────────────
 
+def test_base_port_does_not_collide_with_any_declared_tunnel_plugin_port():
+    """a1a870d5 (2026-07-19) regression: SERENA_POOL_BASE_PORT was 8820,
+    IDENTICAL to tunnel_plugins.DEFAULT_OUTPUTS_PORT (also 8820), since the
+    Serena pool allocates its first repo's daemon on base_port (see
+    SerenaDaemonPool._next_port). Assert the base port -- and the pool's
+    sequential range immediately above it -- avoids every fixed port
+    tunnel_plugins declares. See also
+    scripts.tunnel_smoke_test.check_port_collisions for the general
+    (not Serena-specific) regression check across ALL declared ports."""
+    from meridian import tunnel_plugins as tp
+
+    fixed_ports = {
+        tp.DEFAULT_FS_PORT, tp.DEFAULT_CODE_PORT, tp.DEFAULT_EXTRACT_PORT,
+        tp.DEFAULT_PPT_PORT, tp.DEFAULT_WORD_PORT, tp.DEFAULT_DC_PORT,
+        tp.DEFAULT_DOCS_PORT, tp.DEFAULT_ZOTERO_PORT, tp.DEFAULT_OUTPUTS_PORT,
+        tp.DEFAULT_DEBUG_PORT,
+        *tp.CUSTOM_SLOT_PORTS.values(),
+    }
+    # A generous window covering many concurrently-pooled repos, not just the
+    # first daemon -- the historical bug was on base_port itself, but a range
+    # check catches the same class of bug one port further along too.
+    pool_range = range(sp.SERENA_POOL_BASE_PORT, sp.SERENA_POOL_BASE_PORT + 50)
+    assert fixed_ports.isdisjoint(pool_range)
+
+
 def test_build_serena_command_has_transport_and_project():
     cmd = build_serena_command("/repo/x", 8825)
     assert "--transport" in cmd and "streamable-http" in cmd

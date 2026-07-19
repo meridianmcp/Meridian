@@ -222,18 +222,47 @@ def test_check_client_wires_all_catalog_slots_real_source_matches_known_gap():
 # check_port_collisions
 # ---------------------------------------------------------------------------
 
-def test_check_port_collisions_detects_real_current_collision():
-    """Documents the real 2026-07-19 finding: SERENA_POOL_BASE_PORT collides
-    with DEFAULT_OUTPUTS_PORT (both 8820) in the actual current source."""
+def test_check_port_collisions_clean_on_real_current_source():
+    """a1a870d5 (2026-07-19) fixed the real finding this check exists for:
+    SERENA_POOL_BASE_PORT used to collide with DEFAULT_OUTPUTS_PORT (both
+    8820). SERENA_POOL_BASE_PORT is now 8700, below every fixed port the
+    tunnel-plugin catalog declares, so the actual current source has zero
+    collisions across every declared port."""
+    findings = tst.check_port_collisions()
+    assert findings == []
+
+
+def test_check_port_collisions_detects_synthetic_collision_matching_historical_bug(monkeypatch):
+    """Proves the general checker would have caught the exact a1a870d5 bug:
+    reproduce SERENA_POOL_BASE_PORT == DEFAULT_OUTPUTS_PORT via monkeypatch
+    and confirm it is flagged."""
+    from meridian.tunnel_plugins import DEFAULT_OUTPUTS_PORT
+
+    monkeypatch.setattr(tst, "SERENA_POOL_BASE_PORT", DEFAULT_OUTPUTS_PORT)
     findings = tst.check_port_collisions()
     assert len(findings) == 1
-    assert "8820" in findings[0]
+    assert str(DEFAULT_OUTPUTS_PORT) in findings[0]
+    assert "serena_pool.SERENA_POOL_BASE_PORT" in findings[0]
+    assert "tunnel_plugins.DEFAULT_OUTPUTS_PORT" in findings[0]
 
 
 def test_check_port_collisions_no_collision_when_ports_differ(monkeypatch):
     monkeypatch.setattr(tst, "SERENA_POOL_BASE_PORT", 9500)
     findings = tst.check_port_collisions()
     assert findings == []
+
+
+def test_check_port_collisions_detects_any_pairwise_collision_among_fixed_ports(monkeypatch):
+    """The checker is general, not hardcoded to the Serena/outputs pair --
+    any two fixed constants sharing a port number get flagged."""
+    import meridian.tunnel_plugins as tp
+
+    monkeypatch.setattr(tp, "DEFAULT_PPT_PORT", tp.DEFAULT_WORD_PORT)
+    findings = tst.check_port_collisions()
+    assert len(findings) == 1
+    assert str(tp.DEFAULT_WORD_PORT) in findings[0]
+    assert "DEFAULT_PPT_PORT" in findings[0]
+    assert "DEFAULT_WORD_PORT" in findings[0]
 
 
 def test_check_port_collisions_flags_when_ports_match(monkeypatch):
@@ -632,12 +661,24 @@ async def test_test_slot_classifies_av_signature_on_spawn_failure(tmp_path):
 # static_findings — integration of the two static checks
 # ---------------------------------------------------------------------------
 
-def test_static_findings_no_longer_includes_wiring_gap_after_12afe021():
-    """12afe021 wired outputs/debug into run_tunnel, so static_findings()
-    against the real source should no longer raise a client_wiring_gap
-    finding for them (or anything else -- every catalog slot is wired).
-    port_collision is unrelated (tracked separately as a1a870d5) and stays."""
+def test_static_findings_clean_after_12afe021_and_a1a870d5():
+    """Both static findings this checker exists to catch are fixed against the
+    real repo: 12afe021 wired outputs/debug into run_tunnel (no more
+    client_wiring_gap), and a1a870d5 moved SERENA_POOL_BASE_PORT off
+    DEFAULT_OUTPUTS_PORT (no more port_collision)."""
     findings = tst.static_findings()
     categories = {f.category for f in findings}
     assert "client_wiring_gap" not in categories
-    assert "port_collision" in categories
+    assert "port_collision" not in categories
+
+
+def test_static_findings_reports_port_collision_when_reintroduced(monkeypatch):
+    """If SERENA_POOL_BASE_PORT ever regresses back onto a declared port,
+    static_findings must surface it as an action-needed port_collision."""
+    from meridian.tunnel_plugins import DEFAULT_OUTPUTS_PORT
+
+    monkeypatch.setattr(tst, "SERENA_POOL_BASE_PORT", DEFAULT_OUTPUTS_PORT)
+    findings = tst.static_findings()
+    port_findings = [f for f in findings if f.category == "port_collision"]
+    assert len(port_findings) == 1
+    assert port_findings[0].severity == "action-needed"
