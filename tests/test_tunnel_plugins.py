@@ -301,6 +301,49 @@ def test_resolve_plugins_flags_stale_word_docx_mcp_server_override():
         assert "previous_defaults" not in word  # internal — never leaked to clients
 
 
+def test_resolve_plugins_flags_stale_docs_pre_rename_override():
+    """4b5b1a74 — root cause of a live "meridian-docs was not found in the package
+    registry" crash: a tenant `tunnel_plugins` config saved BEFORE 58a044c7 renamed
+    the docs slot's command (["uvx", "--from", <path>, "meridian-docs"] ->
+    ["...", "meridian-docs-mcp"]) kept running the OLD, broken entry-point name
+    forever with zero signal, because the docs BUILTIN_PLUGINS entry never got a
+    `previous_defaults` list (unlike the extract/word slots, which did when THEIR
+    defaults changed — see test_resolve_plugins_flags_stale_extract_override /
+    test_resolve_plugins_flags_stale_word_docx_mcp_server_override above).
+
+    This regression guard asserts the docs slot now gets the same stale_override
+    detection: a saved override matching the pre-rename command is flagged, with
+    the current (fixed) default surfaced for the dashboard badge. Per the existing
+    cc904bfe contract we still warn rather than silently swap — the override
+    keeps running as saved."""
+    old_cmd = ["uvx", "--from", tp._MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs"]
+    cfg = {"meridian-docs": {"command": old_cmd}}
+    docs = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["docs"]
+    assert docs.get("stale_override") is True
+    assert docs["newer_default_command"] == [
+        "uvx", "--from", tp._MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp",
+    ]
+    assert docs.get("newer_default_label")
+    # The old, broken command must NOT be the one this test expects to reach uvx
+    # unnoticed: it must literally be the pre-58a044c7 command (positive control),
+    # so a future edit that changes the historical command string doesn't leave
+    # this test silently checking nothing.
+    assert old_cmd[-1] == "meridian-docs"
+    assert docs["command"] == old_cmd  # warn, don't silently swap (cc904bfe contract)
+    assert "previous_defaults" not in docs  # internal — never leaked to clients
+
+
+def test_resolve_plugins_no_stale_flag_for_docs_current_default():
+    """The badge does NOT fire for the current (fixed) docs default or a genuinely
+    custom docs command — mirrors test_resolve_plugins_no_stale_flag_for_default_or_custom
+    for the extract slot."""
+    docs_default = {p["slot"]: p for p in tp.resolve_plugins(None)}["docs"]
+    assert "stale_override" not in docs_default
+    cfg = {"meridian-docs": {"command": ["uvx", "my-own-docs-mcp"]}}
+    docs_custom = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["docs"]
+    assert "stale_override" not in docs_custom
+
+
 def test_office_binaries_word_launcher_is_docx_mcp():
     # 5b065c2e — PATH auto-enable (detect_office_binaries) must look for the NEW
     # launcher name so the word slot still self-enables when docx-mcp is installed.
