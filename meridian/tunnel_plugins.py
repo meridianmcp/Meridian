@@ -273,6 +273,27 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # command argument as a PyPI package lookup. See extensions/meridian-docs/
         # pyproject.toml for the full rationale.
         "command": ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp"],
+        # 4b5b1a74 — root cause of a "meridian-docs was not found in the package
+        # registry" crash seen live on 2026-07-19 even though the default above is
+        # already correct: unlike the `code-extractor`/`word` slots, this entry
+        # never got a `previous_defaults` list when 58a044c7 renamed the command
+        # (["uvx", "--from", <path>, "meridian-docs"] -> ["...", "meridian-docs-mcp"]).
+        # Any tenant `tunnel_plugins` config saved BEFORE that rename still stores
+        # the old, broken command; resolve_plugins() merges a stored `command`
+        # override unconditionally (see _OVERRIDABLE) and its cc904bfe
+        # stale-override check only fires when the override matches something in
+        # `previous_defaults` — so a pre-rename docs override ran forever with zero
+        # "newer default available" signal, silently reproducing the exact uvx
+        # registry-resolution failure the 58a044c7 rename was meant to eliminate.
+        # Backfilling the pre-rename command here (mirroring the pattern already
+        # used for `code-extractor`/`word`) makes resolve_plugins() flag it via
+        # `stale_override` so the dashboard badge surfaces it — the same
+        # warn-don't-silently-swap contract cc904bfe already guarantees elsewhere
+        # (see test_resolve_plugins_flags_stale_extract_override /
+        # test_resolve_plugins_flags_stale_word_docx_mcp_server_override).
+        "previous_defaults": [
+            ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs"],
+        ],
         "env": {},
         # meridian-docs exposes bare tool names (document_outline, parse_document,
         # …) — no self-prefix, so the server bridge namespaces them via

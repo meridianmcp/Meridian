@@ -15,9 +15,17 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from meridian import tunnel_client as tc
+
+
+def _http_error(status_code: int) -> httpx.HTTPStatusError:
+    """Build a real httpx.HTTPStatusError, e.g. to simulate a 401 from /me."""
+    request = httpx.Request("GET", "https://x/me")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(str(status_code), request=request, response=response)
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +955,7 @@ def test_run_tunnel_me_failure_returns_1(monkeypatch):
     monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
     monkeypatch.setattr(tc, "_resolve_token", lambda t: "sk_tok")
     monkeypatch.setattr(tc, "_fetch_me", AsyncMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(tc.asyncio, "sleep", AsyncMock(return_value=None))
     rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tc.Path.home()))
     assert rc == 1
 
@@ -971,25 +980,66 @@ def test_run_tunnel_non_pro_plan_returns_1(monkeypatch):
 
 
 def test_run_tunnel_cached_token_rejected_then_browser_fails(monkeypatch):
-    """Cached token path: /me fails, re-auth via browser also cancelled → 2."""
+    """Cached token path: /me actually rejects (401), re-auth via browser also
+    cancelled → 2."""
     monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
     monkeypatch.setattr(tc, "_resolve_token", lambda t: "")
     monkeypatch.setattr(tc, "_read_cached_token", lambda b: "sk_cached")
-    monkeypatch.setattr(tc, "_fetch_me", AsyncMock(side_effect=RuntimeError("401")))
+    monkeypatch.setattr(tc, "_fetch_me", AsyncMock(side_effect=_http_error(401)))
     monkeypatch.setattr(tc, "_browser_auth_flow", AsyncMock(return_value=""))
     rc = _run_tunnel(token=None, base_url="https://x")
     assert rc == 2
 
 
 def test_run_tunnel_cached_rejected_browser_ok_then_me_fails_returns_1(monkeypatch):
-    """Cached rejected → browser succeeds → second /me still fails → exit 1."""
+    """Cached token actually rejected (401) → browser succeeds → second /me
+    still fails → exit 1."""
     monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
     monkeypatch.setattr(tc, "_resolve_token", lambda t: "")
     monkeypatch.setattr(tc, "_read_cached_token", lambda b: "sk_cached")
-    monkeypatch.setattr(tc, "_fetch_me", AsyncMock(side_effect=RuntimeError("nope")))
+    monkeypatch.setattr(tc, "_fetch_me", AsyncMock(side_effect=_http_error(401)))
     monkeypatch.setattr(tc, "_browser_auth_flow", AsyncMock(return_value="sk_new"))
     rc = _run_tunnel(token=None, base_url="https://x")
     assert rc == 1
+
+
+def test_run_tunnel_cached_token_transient_failure_retries_then_succeeds(monkeypatch):
+    """dcf6d187 — a network hiccup (not an auth rejection) on the cached-token
+    /me check must NOT discard the cached token / force a browser re-auth. The
+    SAME token is retried once and, if that succeeds, the tunnel proceeds with
+    no re-authentication at all."""
+    monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
+    monkeypatch.setattr(tc, "_resolve_token", lambda t: "")
+    monkeypatch.setattr(tc, "_read_cached_token", lambda b: "sk_cached")
+    monkeypatch.setattr(tc.asyncio, "sleep", AsyncMock(return_value=None))
+    browser_auth = AsyncMock(return_value="sk_should_not_be_used")
+    monkeypatch.setattr(tc, "_browser_auth_flow", browser_auth)
+    fetch_me = AsyncMock(
+        side_effect=[
+            httpx.ConnectError("connection refused"),
+            {"tenant_id": "t1", "plan": "pro"},
+        ]
+    )
+    monkeypatch.setattr(tc, "_fetch_me", fetch_me)
+    monkeypatch.setattr(tc, "_write_cached_token", lambda *a, **k: None)
+    monkeypatch.setattr(tc, "_fetch_filesystem_roots", AsyncMock(return_value=([], [], "", [])))
+    monkeypatch.setattr(tc, "_ensure_node", lambda auto: False)
+    rc = _run_tunnel(token=None, base_url="https://x")
+    # Node missing → 1, but the point is: no browser re-auth was triggered and
+    # the cached token was reused after one transient-failure retry.
+    assert rc == 1
+    browser_auth.assert_not_called()
+    assert fetch_me.await_count == 2
+
+
+def test_fetch_me_with_retry_does_not_retry_auth_rejection(monkeypatch):
+    """A genuine 401/403 is raised immediately — no retry, no wasted backoff."""
+    monkeypatch.setattr(tc.asyncio, "sleep", AsyncMock(side_effect=AssertionError("should not sleep")))
+    fetch_me = AsyncMock(side_effect=_http_error(401))
+    monkeypatch.setattr(tc, "_fetch_me", fetch_me)
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(tc._fetch_me_with_retry("https://x", "sk_tok"))
+    assert fetch_me.await_count == 1
 
 
 # ---------------------------------------------------------------------------
