@@ -3152,7 +3152,7 @@ async def _handle_session_tools(
     """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log,
     get_session_activity, get_agent_instructions, set_agent_instructions,
     set_executor_config, idle_until_session_done, search_all, search_synthesis,
-    paper_search, get_session_brief.
+    paper_search, social_search, get_session_brief.
 
     81abd31f — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -3178,6 +3178,7 @@ async def _handle_session_tools(
         handle_search_all,
         handle_search_synthesis,
         handle_paper_search,
+        handle_social_search,
         handle_get_session_brief,
     )
 
@@ -3198,6 +3199,7 @@ async def _handle_session_tools(
         "search_all": handle_search_all,
         "search_synthesis": handle_search_synthesis,
         "paper_search": handle_paper_search,
+        "social_search": handle_social_search,
         "get_session_brief": handle_get_session_brief,
     }
 
