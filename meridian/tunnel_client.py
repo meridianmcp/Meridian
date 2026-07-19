@@ -450,7 +450,20 @@ class SlotProxy:
                 # a9d1ef7f — use _spawn_with_cache_retry so a uvx/npx spawn failure
                 # triggers a scoped cache clear for JUST that tool + one retry before
                 # surfacing the error. Zero overhead on the normal (success) path.
-                self._proc = _spawn_with_cache_retry(self.cmd, self.env, self.label)
+                #
+                # 31de9cf7 — MUST run off the event loop thread. _spawn_with_cache_retry
+                # contains genuinely blocking calls (time.sleep(0.1), and — on a fast-exit
+                # failure — Popen.communicate(timeout=5.0) inside _probe_tar_entry_error).
+                # asyncio is single-threaded/cooperative, so a plain synchronous call here
+                # froze the ENTIRE event loop for up to ~5s while one slot's spawn was
+                # stuck, which starved every other slot's WebSocket handshake/keepalive
+                # coroutine on the same loop — the observed "one slot's cold-spawn miss
+                # cascades into all 7 slots disconnecting simultaneously". Running the
+                # blocking chain on a worker thread via asyncio.to_thread lets the loop
+                # keep servicing other slots while this one's spawn is slow/failing.
+                self._proc = await asyncio.to_thread(
+                    _spawn_with_cache_retry, self.cmd, self.env, self.label
+                )
                 self.holder["proc"] = self._proc
                 # aaddb273 — record ownership so a subsequent tunnel startup can
                 # distinguish this live process from an orphan (see _write_slot_claim).
