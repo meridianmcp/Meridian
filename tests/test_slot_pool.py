@@ -331,9 +331,56 @@ def test_slot_pool_config_persistent_slot_never_pools():
 
 
 def test_slot_pool_config_honors_override_on_stateless_slot():
-    plugins = tp.resolve_plugins({"code-intel": {"pool": {"min": 2, "max": 4}}})
+    # code-extractor (Serena) is genuinely stateless and not hard-pinned, unlike
+    # code-intel (31648740) — it should still honor a tenant pool override.
+    plugins = tp.resolve_plugins({"code-extractor": {"pool": {"min": 2, "max": 4}}})
+    extract = next(p for p in plugins if p["slot"] == "extract")
+    assert tp.slot_pool_config(extract) == {"enabled": True, "min": 2, "max": 4}
+
+
+def test_slot_pool_config_code_intel_hard_pinned_to_single_copy():
+    # 31648740 — code-intel (codebase-memory-mcp.exe) has a documented Windows
+    # bug where its on-disk index rename fails if a second copy holds the .db
+    # file open. The default elastic pool (burst to 2) reproduces this live, so
+    # code-intel must always resolve to a single copy, with no override able to
+    # re-enable elastic pooling — mirroring the persistent-slot (dc) gate, but
+    # via an independent mechanism since code-intel correctly stays stateless.
+    code = tp.plugin_by_slot(None, "code")
+    assert code["session_mode"] == "stateless"
+    assert tp.slot_pool_config(code) == {"enabled": False, "min": 1, "max": 1}
+
+
+def test_slot_pool_config_code_intel_override_cannot_reenable_pooling():
+    # A tenant pool override trying to force elastic pooling on for code-intel
+    # must be ignored — the hard gate is checked before any override is read.
+    plugins = tp.resolve_plugins(
+        {"code-intel": {"pool": {"enabled": True, "min": 2, "max": 4}}}
+    )
     code = next(p for p in plugins if p["slot"] == "code")
-    assert tp.slot_pool_config(code) == {"enabled": True, "min": 2, "max": 4}
+    assert code.get("pool") == {"enabled": True, "min": 2, "max": 4}
+    assert tp.slot_pool_config(code) == {"enabled": False, "min": 1, "max": 1}
+
+    # Int shorthand and bare-bool overrides must also be ignored.
+    plugins2 = tp.resolve_plugins({"code-intel": {"pool": 4}})
+    code2 = next(p for p in plugins2 if p["slot"] == "code")
+    assert tp.slot_pool_config(code2) == {"enabled": False, "min": 1, "max": 1}
+
+
+def test_slot_pool_config_other_stateless_slots_unaffected():
+    # Genuinely-stateless slots other than code-intel still get the default
+    # elastic burst-to-2, confirming the hard-pin gate is code-intel-specific.
+    fs = tp.plugin_by_slot(None, "fs")
+    assert tp.slot_pool_config(fs) == {"enabled": True, "min": 1, "max": 2}
+    extract = tp.plugin_by_slot(None, "extract")
+    assert tp.slot_pool_config(extract) == {"enabled": True, "min": 1, "max": 2}
+
+
+def test_slot_pool_config_persistent_slot_unchanged_by_code_intel_fix():
+    # dc's existing persistent-slot gate must be unaffected by the new,
+    # independent code-intel hard-pin gate.
+    dc = tp.plugin_by_slot({"desktop-commander": {"pool": {"max": 4}}}, "dc")
+    assert dc["session_mode"] == "persistent"
+    assert tp.slot_pool_config(dc) == {"enabled": False, "min": 1, "max": 1}
 
 
 def test_slot_pool_config_int_shorthand_override():
