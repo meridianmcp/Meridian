@@ -765,6 +765,18 @@ No auth required.
 | `POST` | `/dc/mcp/{tenant_id}/{rest:path}` | Same as dc_mcp_proxy but for sub-paths |
 
 
+### `/debug`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/debug/mcp/{tenant_id}` | 121e6a27 — Proxy requests to the tenant's mcp-debugger server over the debug tunnel |
+| `OPTIONS` | `/debug/mcp/{tenant_id}` | 121e6a27 — Proxy requests to the tenant's mcp-debugger server over the debug tunnel |
+| `POST` | `/debug/mcp/{tenant_id}` | 121e6a27 — Proxy requests to the tenant's mcp-debugger server over the debug tunnel |
+| `GET` | `/debug/mcp/{tenant_id}/{rest:path}` | Same as debug_mcp_proxy but for sub-paths |
+| `OPTIONS` | `/debug/mcp/{tenant_id}/{rest:path}` | Same as debug_mcp_proxy but for sub-paths |
+| `POST` | `/debug/mcp/{tenant_id}/{rest:path}` | Same as debug_mcp_proxy but for sub-paths |
+
+
 ### `/demo`
 
 | Method | Path | Description |
