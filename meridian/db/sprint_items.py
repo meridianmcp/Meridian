@@ -1097,6 +1097,26 @@ class SprintItemVerificationRequired(ValueError):
     completion is allowed to stick."""
 
 
+class SprintItemClaimMismatch(ValueError):
+    """Raised when complete_sprint_item is blocked by the claim-ownership gate
+    (8693b6a8) — the completing actor differs from the item's claim owner and
+    the claim is neither stale nor force-acknowledged. See complete_sprint_item's
+    docstring for the staleness/force escape hatch."""
+
+
+# 8693b6a8 — claim-ownership staleness threshold for complete_sprint_item.
+#
+# Mirrors the pre-existing STALE_CLAIM concept used by claim_sprint_item's own
+# caller (meridian/mcp/handlers/sprint_tools.py, 10c0f6a0: "claimed > 2h ago
+# with no recent activity"), which itself mirrors db/locks.py's
+# _CLAIM_LIVE_HOURS (== _FILE_LOCK_TTL_HOURS == 2) heartbeat-expiry threshold
+# for file/symbol claims. Reusing the SAME 2h number here (rather than the
+# longer, planner-facing _SPRINT_STALL_FLAG_HOURS above) keeps "is this claim
+# stale" answering identically everywhere a caller might ask it — at claim
+# time, at completion time, or via the file-lock heartbeat sweep.
+_CLAIM_OWNERSHIP_STALE_HOURS = 2
+
+
 # ---------------------------------------------------------------------------
 # e2e1b682 — independent fresh-session verifier gate for sprint completion.
 #
@@ -1654,8 +1674,37 @@ async def complete_sprint_item(
     verifier_session_id: str | None = None,
     verification_verdict: str | None = None,
     verification_notes: str | None = None,
+    force_foreign_claim: bool = False,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
+
+    8693b6a8 — claim-ownership verification: previously ANY caller could
+    complete ANY ``in_progress`` item regardless of who held its claim (the
+    ``actor`` stamped on it by ``claim_sprint_item``) — a structural gap, not
+    a deliberate design. This adds the ownership check, but preserves the
+    established, legitimate pattern of a live session closing out items left
+    ``in_progress`` under a different, dead/abandoned session:
+
+    * If the item has no recorded claim ``actor``, or the completing
+      ``actor`` matches it exactly, completion proceeds as before — no change.
+    * If the completing ``actor`` differs from a *recorded* claim owner, the
+      claim must be verifiably stale before completion is allowed: either
+      ``claimed_at`` is older than :data:`_CLAIM_OWNERSHIP_STALE_HOURS` (the
+      same 2h threshold ``claim_sprint_item``'s own STALE_CLAIM detection
+      uses — see 10c0f6a0 / db/locks.py's ``_CLAIM_LIVE_HOURS``), or the
+      claiming session is itself dead (not found, or ``status`` is
+      ``closed``/``archived``, or its heartbeat ``last_seen`` has gone cold
+      past the same threshold).
+    * If neither is true, the caller may still complete by passing
+      ``force_foreign_claim=True`` — an explicit acknowledgement that this is
+      someone else's live, non-stale claim (mirrors the existing
+      ``override_ci`` escape-hatch shape used elsewhere in this module).
+      Otherwise :class:`SprintItemClaimMismatch` is raised.
+    * A completing call that supplies no ``actor`` at all cannot be checked
+      against anything and is left alone (fail-open), matching every other
+      structural gate in this module (deferred/superseded/unprospected all
+      fail open on missing/unparseable data) and preserving callers that have
+      never plumbed ``actor`` through (tests, the legacy stdio MCP path).
 
     4f02340e — when the completed item is part of a mixed-ownership subtask
     chain, advance the chain: an AI→human transition auto-files a HITL handoff,
@@ -1716,6 +1765,62 @@ async def complete_sprint_item(
     _evidence_quality_warning: str | None = None
     _stored_evidence_warning: str | None = None
     if item is not None and item.get("project_id") == project_id:
+        # 8693b6a8 — claim-ownership gate. See the docstring above for the
+        # full contract; short version: only block when we can actually
+        # compare two non-empty identities and they disagree, and even then
+        # only when the disagreement isn't explained by staleness/force.
+        _claim_owner = (item.get("actor") or "").strip()
+        _completing_actor = (actor or "").strip()
+        if _claim_owner and _completing_actor and _claim_owner != _completing_actor:
+            _claim_is_stale = False
+            _claimed_at_dt = _parse_deferral_ts(item.get("claimed_at"))
+            if _claimed_at_dt is not None:
+                from datetime import datetime as _dt_cls  # noqa: PLC0415
+                _age_hours = (
+                    _dt_cls.utcnow() - _claimed_at_dt
+                ).total_seconds() / 3600
+                if _age_hours > _CLAIM_OWNERSHIP_STALE_HOURS:
+                    _claim_is_stale = True
+            if not _claim_is_stale:
+                # Second staleness path: the claiming session itself is dead
+                # even though claimed_at hasn't crossed the time threshold —
+                # not found at all, explicitly closed/archived, or its own
+                # heartbeat (last_seen) has gone cold. Mirrors db/locks.py's
+                # heartbeat-expiry check for file/symbol claims. Best-effort:
+                # an actor string that isn't a known session id (e.g. a human
+                # name) yields no row here and is treated as "can't tell", not
+                # as proof of death.
+                try:
+                    async with db.execute(
+                        "SELECT status, last_seen FROM sessions WHERE id = ?",
+                        (_claim_owner,),
+                    ) as _owner_cur:
+                        _owner_row = await _owner_cur.fetchone()
+                    _owner_sess = _row_to_dict(_owner_row)
+                except Exception:  # noqa: BLE001 — never wedge completion on a DB hiccup
+                    _owner_sess = None
+                if _owner_sess is not None:
+                    if (_owner_sess.get("status") or "") in ("closed", "archived"):
+                        _claim_is_stale = True
+                    else:
+                        _owner_last_seen = _parse_deferral_ts(_owner_sess.get("last_seen"))
+                        if _owner_last_seen is not None:
+                            from datetime import datetime as _dt_cls  # noqa: PLC0415
+                            _seen_age_hours = (
+                                _dt_cls.utcnow() - _owner_last_seen
+                            ).total_seconds() / 3600
+                            if _seen_age_hours > _CLAIM_OWNERSHIP_STALE_HOURS:
+                                _claim_is_stale = True
+            if not _claim_is_stale and not force_foreign_claim:
+                raise SprintItemClaimMismatch(
+                    f"item {item_id} is claimed by actor {_claim_owner!r}, not "
+                    f"{_completing_actor!r} — refusing to complete a live claim "
+                    "held by a different session. If the claiming session is "
+                    "dead/abandoned but the claim hasn't crossed the "
+                    f"{_CLAIM_OWNERSHIP_STALE_HOURS}h staleness threshold yet, "
+                    "pass force_foreign_claim=true to acknowledge and complete "
+                    "anyway."
+                )
         if item.get("require_verification"):
             if verifier_session_id and verification_verdict:
                 await record_sprint_item_verification(

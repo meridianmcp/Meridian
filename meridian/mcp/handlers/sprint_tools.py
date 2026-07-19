@@ -1021,6 +1021,10 @@ async def handle_complete_sprint_item(
             verifier_session_id=args.get("verifier_session_id"),
             verification_verdict=args.get("verification_verdict"),
             verification_notes=args.get("verification_notes"),
+            # 8693b6a8 — claim-ownership gate escape hatch: explicit
+            # acknowledgement that the caller is completing a DIFFERENT,
+            # NON-stale session's live claim. Never inferred/defaulted true.
+            force_foreign_claim=bool(args.get("force_foreign_claim")),
         )
     except db_module.SprintItemEvidenceRequired as exc:
         return {
@@ -1031,6 +1035,16 @@ async def handle_complete_sprint_item(
     except db_module.SprintItemVerificationRequired as exc:
         return {
             "error": "VERIFICATION_REQUIRED",
+            "item_id": args["item_id"],
+            "message": str(exc),
+        }
+    except db_module.SprintItemClaimMismatch as exc:
+        # 8693b6a8 — completing actor doesn't hold this item's claim, and the
+        # claim is neither stale nor force-acknowledged. Surfaced distinctly
+        # so an executor can tell "not mine to complete" apart from evidence/
+        # verification gates and decide whether to force or back off.
+        return {
+            "error": "CLAIM_MISMATCH",
             "item_id": args["item_id"],
             "message": str(exc),
         }

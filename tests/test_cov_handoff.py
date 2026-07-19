@@ -1729,13 +1729,20 @@ async def test_goal_compliance_cross_session_completion_reattributes(db):
     reattributed to the completer, so credit follows B — A no longer counts it,
     B counts it as completed. Pins the documented attribution (complete overwrites
     actor, unlike claim which COALESCEs); this is correct for the common
-    single-session loop and defined behaviour for parallel/coordinator patterns."""
+    single-session loop and defined behaviour for parallel/coordinator patterns.
+
+    8693b6a8 — this is the coordinator/hand-off pattern the claim-ownership
+    gate's force_foreign_claim escape hatch exists for: B completing A's live,
+    non-stale claim on purpose. Pass force_foreign_claim=True to acknowledge
+    that explicitly, same as a real coordinator session would."""
     p = await db_module.create_project(db, "gc-xsession")
     a = (await db_module.register_session(db, p["id"], "claimer"))["id"]
     b = (await db_module.register_session(db, p["id"], "completer"))["id"]
     it = await db_module.add_sprint_item(db, p["id"], "v1", "handed-off item")
     await db_module.claim_sprint_item(db, p["id"], it["id"], actor=a)
-    await db_module.complete_sprint_item(db, p["id"], it["id"], actor=b)
+    await db_module.complete_sprint_item(
+        db, p["id"], it["id"], actor=b, force_foreign_claim=True
+    )
     ma = await db_module.compute_session_goal_compliance(db, p["id"], a)
     mb = await db_module.compute_session_goal_compliance(db, p["id"], b)
     # A claimed it but B finalised it → the item is now attributed to B.
