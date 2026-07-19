@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 from fastapi.responses import Response
 
 import meridian.server  # noqa: F401 — import first to avoid handler/server import cycle
+from meridian.mcp import handler as mh
 from meridian.routes import tunnel as tn
 
 
@@ -317,3 +319,95 @@ def test_extract_slot_plain_503_when_owner_unknown(monkeypatch):
         assert b"tunnel not connected" in resp.body
     finally:
         _reset(tid)
+
+
+# ---------------------------------------------------------------------------
+# 850f0e8e, extends cb8685c2 — call_tunnel_tool fly-replay parity
+#
+# call_tunnel_tool had zero fly-replay awareness, unlike _do_proxy's HTTP path:
+# its two "give up" gaps ('label is None' after cold-cache discovery, and
+# 'tenant_id not in sockets' after resolving a label) returned plain None
+# instead of checking fly_replay_target_for_id first — indistinguishable from
+# "no tunnel exposes this tool" to the tools/call caller, which then fell
+# through to a misleading "unknown tool" error instead of the legible
+# CROSS_INSTANCE_MISS_MESSAGE _do_proxy already surfaces. These tests cover
+# call_tunnel_tool raising TunnelCrossInstanceMiss at both gaps when a sibling
+# instance is known to own the socket, and staying a plain None otherwise.
+# ---------------------------------------------------------------------------
+
+def test_call_tunnel_tool_raises_cross_instance_miss_on_cold_route_gap(monkeypatch):
+    """The 'label is None' gap: cold route cache, discovery finds nothing on
+    this instance, but a sibling instance is a known owner."""
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    tid = "replay-call-tool-1"
+    try:
+        tn._tenant_owner_instance[tid] = "machine-sibling"
+
+        async def fake_list_tunnel_tools(tenant_id, reserved_names=frozenset()):
+            return []
+
+        monkeypatch.setattr(tn, "list_tunnel_tools", fake_list_tunnel_tools)
+        with pytest.raises(tn.TunnelCrossInstanceMiss) as exc_info:
+            asyncio.run(tn.call_tunnel_tool(tid, "codebase__search_graph", {}))
+        assert str(exc_info.value) == "instance=machine-sibling"
+    finally:
+        tn._tenant_owner_instance.pop(tid, None)
+        tn._tunnel_tool_routes.pop(tid, None)
+
+
+def test_call_tunnel_tool_raises_cross_instance_miss_on_socket_gap(monkeypatch):
+    """The 'tenant_id not in sockets' gap: the route WAS resolved (label
+    known), but this instance holds no socket for that slot, and a sibling
+    instance is a known owner."""
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    tid = "replay-call-tool-2"
+    try:
+        tn._tenant_owner_instance[tid] = "machine-sibling"
+        tn._tunnel_tool_routes[tid] = {"codebase__search_graph": "code"}
+        with pytest.raises(tn.TunnelCrossInstanceMiss) as exc_info:
+            asyncio.run(tn.call_tunnel_tool(tid, "codebase__search_graph", {}))
+        assert str(exc_info.value) == "instance=machine-sibling"
+    finally:
+        tn._tenant_owner_instance.pop(tid, None)
+        tn._tunnel_tool_routes.pop(tid, None)
+
+
+def test_call_tunnel_tool_plain_none_when_no_sibling_owner(monkeypatch):
+    """On Fly, but no owner recorded at all for the tenant — a genuinely
+    unknown tool, so call_tunnel_tool keeps its old plain-None contract
+    instead of raising."""
+    monkeypatch.setenv("FLY_MACHINE_ID", "machine-self")
+    tid = "replay-call-tool-3"
+    try:
+        async def fake_list_tunnel_tools(tenant_id, reserved_names=frozenset()):
+            return []
+
+        monkeypatch.setattr(tn, "list_tunnel_tools", fake_list_tunnel_tools)
+        assert asyncio.run(tn.call_tunnel_tool(tid, "no_such_tool", {})) is None
+    finally:
+        tn._tenant_owner_instance.pop(tid, None)
+        tn._tunnel_tool_routes.pop(tid, None)
+
+
+def test_handler_tools_call_reports_cross_instance_miss_not_unknown_tool(monkeypatch):
+    """Integration: when call_tunnel_tool raises TunnelCrossInstanceMiss, the
+    tools/call dispatch must surface the legible -32002 CROSS_INSTANCE_MISS_MESSAGE
+    error — not fall through to native dispatch's "unknown tool" (the exact
+    failure mode 850f0e8e was filed for: has_active_tunnel() is true because
+    SOME slot has a local socket, but the requested tool's slot doesn't)."""
+    tenant = {"id": "t1", "plan": "pro", "tunnel_active": True}
+    monkeypatch.setattr(tn, "has_active_tunnel", lambda tid: True)
+    monkeypatch.setattr(mh, "_meridian_tool_names", lambda: frozenset())
+
+    async def boom(tenant_id, name, args, **kw):
+        raise tn.TunnelCrossInstanceMiss("instance=machine-sibling")
+
+    monkeypatch.setattr(tn, "call_tunnel_tool", boom)
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "codebase__search_graph", "arguments": {}},
+    }
+    resp = asyncio.run(mh._handle_mcp_request(body, db=None, data_dir="/tmp", tenant=tenant))
+    assert "error" in resp
+    assert resp["error"]["code"] == -32002
+    assert resp["error"]["message"] == tn.CROSS_INSTANCE_MISS_MESSAGE

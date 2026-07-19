@@ -2538,6 +2538,20 @@ CROSS_INSTANCE_MISS_MESSAGE = (
 )
 
 
+class TunnelCrossInstanceMiss(RuntimeError):
+    """Raised by call_tunnel_tool (850f0e8e, extends cb8685c2/af5b5739).
+
+    has_active_tunnel() is an ANY-slot check, so a tenant with a live socket on
+    one slot (e.g. fs) locally still passes it even when the REQUESTED tool's
+    slot (e.g. code) has its socket on a sibling Fly instance. Without this,
+    call_tunnel_tool's route/socket lookups silently returned None in that case,
+    indistinguishable from "no tunnel exposes this tool" — the caller then fell
+    through to a misleading "unknown tool" error instead of the legible
+    CROSS_INSTANCE_MISS_MESSAGE already used elsewhere. Raised only when
+    fly_replay_target_for_id confirms a sibling instance actually owns the
+    socket; a genuinely unknown tool still returns plain None."""
+
+
 # af5b5739 / decision 229441bc — cross-instance tunnel routing via Fly-replay.
 #
 # The tunnel socket registry (``_tunnel_sockets`` &c.) is per-PROCESS in-memory, so
@@ -3474,9 +3488,21 @@ async def call_tunnel_tool(
             )
         label = (_tunnel_tool_routes.get(tenant_id) or {}).get(name)
     if label is None:
+        # af5b5739 parity — a cold route cache here can mean the tool's slot
+        # socket lives on a sibling Fly instance (discovery above only probes
+        # sockets THIS instance holds), not that no tunnel exposes it at all.
+        replay = fly_replay_target_for_id(tenant_id)
+        if replay is not None:
+            raise TunnelCrossInstanceMiss(replay)
         return None
     sockets, _ = _label_maps(label)
     if tenant_id not in sockets:
+        # Same af5b5739 gap: the route was known (e.g. from a prior discovery)
+        # but this instance holds no socket for it — check for a sibling owner
+        # before giving up.
+        replay = fly_replay_target_for_id(tenant_id)
+        if replay is not None:
+            raise TunnelCrossInstanceMiss(replay)
         return None
     # Filesystem tools require absolute paths. Relative paths resolve against
     # the mcp-proxy CWD (usually the home dir) — not the intended repo root —
