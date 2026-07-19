@@ -227,7 +227,20 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": None,  # spawned via npx @wonderwhy-er/desktop-commander@latest
+        # c5c309cc — ``command`` is intentionally left unset here, NOT a literal
+        # unpinned ``@latest`` spawn. 3db4f8d8 already pinned the real launcher to
+        # a known-good version (``_DC_PINNED_VERSION``) in tunnel_client.py:
+        # ``_office_slot_command()`` falls back to ``_dc_default_command()`` for
+        # the ``dc`` slot whenever ``command`` is None, and that fallback resolves
+        # ``npx -y @wonderwhy-er/desktop-commander@<pinned>`` (plus the Windows
+        # ``cmd /c`` wrapper needed so mcp-proxy can find npx via PATHEXT).
+        # Hardcoding a literal command list *here* instead would regress that
+        # Windows wrapper — verified as of 2026-07-19 (npm dist-tag `latest` for
+        # @wonderwhy-er/desktop-commander is 0.2.46, matching the current pin) that
+        # this None + fallback pattern is correct and the pin is live; do not
+        # "fix" this back to an explicit command without re-reading
+        # _dc_default_command()'s docstring in tunnel_client.py first.
+        "command": None,
         # Desktop Commander self-prefixes its tools — leave empty.
         "prefix": None,
         # 4ea1b9d5 — DC runs stateful terminal sessions: persistent so the inner

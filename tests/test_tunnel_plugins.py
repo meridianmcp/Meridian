@@ -536,3 +536,45 @@ def test_is_reserved_custom_name():
         assert tp.is_reserved_custom_name(n) is True
     for n in ("fetch", "git", "my-plugin", "", "   "):
         assert tp.is_reserved_custom_name(n) is False
+
+
+# ---------------------------------------------------------------------------
+# desktop-commander version pin (c5c309cc, follow-up to 3db4f8d8)
+# ---------------------------------------------------------------------------
+#
+# BUILTIN_PLUGINS' "desktop-commander" entry intentionally leaves "command" as
+# None: tunnel_client._office_slot_command() falls back to
+# tunnel_client._dc_default_command() for the "dc" slot, which is where the
+# actual npx version pin (and the Windows cmd/c wrapper) lives. These tests
+# cross-check that fallback resolves to the pinned version, not a literal
+# unpinned "@latest" spawn, so the two modules can't silently drift apart
+# again the way the comment here once did.
+
+def test_desktop_commander_command_is_none_by_design():
+    """The dc slot must keep command=None so the tunnel_client platform-aware,
+    version-pinned fallback (_dc_default_command) is what actually spawns it —
+    hardcoding a literal command list here would bypass that fallback (and, on
+    Windows, its cmd/c wrapper)."""
+    by_name = {p["name"]: p for p in tp.BUILTIN_PLUGINS}
+    assert by_name["desktop-commander"]["command"] is None
+    assert by_name["desktop-commander"]["slot"] == "dc"
+
+
+def test_desktop_commander_resolves_to_pinned_version_not_latest():
+    """resolve_plugins(None) must round-trip the dc entry's command=None through
+    to tunnel_client, whose _office_slot_command() then resolves a pinned
+    version — never a bare "@latest" spawn."""
+    from meridian import tunnel_client as tc
+
+    plugins = tp.resolve_plugins(None)
+    dc_plugin = next(p for p in plugins if p["slot"] == "dc")
+    assert dc_plugin["command"] is None
+
+    resolved_cmd = tc._office_slot_command("dc", dc_plugin)
+    assert resolved_cmd is not None
+    joined = " ".join(resolved_cmd)
+    assert "@wonderwhy-er/desktop-commander@" in joined
+    assert "@latest" not in joined
+    assert tc._DC_PINNED_VERSION in joined
+    # Sanity: the pin actually looks like a real semver, not a placeholder.
+    assert tc._DC_PINNED_VERSION[0].isdigit()
