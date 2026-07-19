@@ -3412,6 +3412,53 @@ async def _fetch_me(base_url: str, token: str) -> dict:
         return r.json()
 
 
+def _is_auth_rejection(exc: BaseException) -> bool:
+    """True only when the server actively rejected the token (401/403).
+
+    Every other failure out of :func:`_fetch_me` — DNS hiccup, connection
+    refused, a read timeout, a 5xx from a cold-starting hosted instance —
+    says nothing about whether the token itself is valid. Callers must not
+    treat those as "the cached token is bad" (dcf6d187).
+    """
+    import httpx
+
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403)
+
+
+async def _fetch_me_with_retry(
+    base_url: str, token: str, *, retries: int = 1, delay: float = 2.0
+) -> dict:
+    """Call :func:`_fetch_me`, retrying transient (non-auth) failures once.
+
+    dcf6d187 — a cached token was being discarded, and a full disruptive
+    browser re-auth forced, on *any* exception from ``/me`` — including
+    plain connectivity hiccups (client machine's network/DNS/VPN not fully
+    up yet right after process start, or the hosted server briefly
+    unreachable while waking from idle) that have nothing to do with the
+    token's validity. Since those are exactly the conditions most likely to
+    recur on every restart, the token was being needlessly re-minted (and
+    the previous one invalidated server-side, "one active tunnel-cli token
+    per tenant") over and over.
+
+    An explicit 401/403 means the server actually rejected the token — that
+    is raised immediately, with no retry, so the caller can still fall back
+    to re-authenticating. Anything else is retried once, after a short
+    backoff, with the SAME token before giving up.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return await _fetch_me(base_url, token)
+        except Exception as exc:  # noqa: BLE001
+            if _is_auth_rejection(exc):
+                raise
+            last_exc = exc
+            if attempt < retries:
+                await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 async def _run_connection(
     ws_url: str, port: int, label: str = "fs", tool_prefix: str | None = None
 ) -> None:
@@ -3907,12 +3954,18 @@ async def run_tunnel(
         return 2
     token = resolved_token
 
-    # 1. Resolve tenant_id + plan from /me.
+    # 1. Resolve tenant_id + plan from /me. A cached token gets one transient-
+    # failure retry (same token, short backoff) before anything is deemed
+    # "rejected" — see _fetch_me_with_retry (dcf6d187).
     try:
-        me = await _fetch_me(base_url, token)
+        me = await _fetch_me_with_retry(base_url, token)
     except Exception as exc:
-        # Cached token may be revoked — retry via browser flow once, then give up.
-        if _from_cache and not _browser_authed:
+        # Only an actual 401/403 means the server rejected THIS token — that's
+        # the one case worth burning a full browser re-auth on. Anything else
+        # (already retried once above) is a connectivity problem, not a bad
+        # token, so it falls straight to the generic error below instead of
+        # discarding a token that's probably still perfectly valid.
+        if _from_cache and not _browser_authed and _is_auth_rejection(exc):
             print("cached token rejected — re-authenticating...", file=sys.stderr, flush=True)
             token = await _browser_auth_flow(base_url)
             _browser_authed = bool(token)
