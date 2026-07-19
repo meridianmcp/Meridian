@@ -704,6 +704,33 @@ async def handle_paper_search(
     )
 
 
+async def handle_social_search(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: social_search.
+
+    d58000c6 — social-media / public-discussion search sibling to paper_search
+    (811881c6/f65f6111), following the identical per-source pattern: keyless
+    external lookup, degrades to {error}, never raises, no project scope needed.
+    One keyless source today: 'hn' (Hacker News, via the Algolia HN Search API).
+    """
+    from meridian.social_search import hn_search  # noqa: PLC0415
+    # 'source' is accepted (mirrors paper_search's dispatch shape) for forward
+    # compatibility, but 'hn' is the only keyless source wired up so far, so any
+    # value resolves to hn_search.
+    _ = str(args.get("source", "hn") or "hn").strip().lower()
+    search = hn_search
+    return await search(
+        args.get("query", ""),
+        limit=args.get("limit", 10),
+        sort_by=args.get("sort_by", "relevance"),
+    )
+
+
 async def handle_get_session_brief(
     args: dict[str, Any],
     db: Any,

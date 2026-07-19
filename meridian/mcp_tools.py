@@ -1686,6 +1686,19 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "source": {"type": "string", "enum": ["arxiv", "openalex"], "description": "Which keyless source to search (default 'arxiv'). 'openalex' covers published cross-discipline works."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recent first)."}},
          "required": ["query"]}},
+    {"name": "social_search", "description":
+        "Search public social-media / discussion content — a REAL external lookup "
+        "(keyless), sibling to paper_search but for social discussion rather than "
+        "academic papers. Currently one keyless source via the 'source' param: 'hn' "
+        "(default; Hacker News via the Algolia HN Search API, story submissions only, "
+        "not raw comments). Returns {query, count, results:[{title, authors, summary, "
+        "published, url, discussion_url, points, num_comments, hn_id, ...}]}.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "Search terms (matches title / story text)."},
+         "limit": {"type": "integer", "description": "Max results to return (default 10, max 50)."},
+         "source": {"type": "string", "enum": ["hn"], "description": "Which keyless source to search (default 'hn', the only source today)."},
+         "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recently submitted first)."}},
+         "required": ["query"]}},
     {"name": "get_agent_instructions", "description":
         "Read-only: Return the custom agent_instructions for a project. "
         "These are injected automatically by start_session so every session picks them up. "
@@ -2059,7 +2072,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
 _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_tasks", "search_tasks", "search_all", "search_synthesis",
-    "paper_search",
+    "paper_search", "social_search",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
@@ -2275,6 +2288,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "delete_custom_hook":  "config",
     # research
     "paper_search": "research",
+    "social_search": "research",
 }
 
 _TOOL_ROLE_RELEVANCE: dict[str, str] = {
@@ -2335,6 +2349,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "update_md_section":         "planner",
     "save_blog_post":            "planner",
     "paper_search":              "planner",
+    "social_search":             "planner",
     "capture_research_finding":  "planner",
     "add_insight":               "planner",
     "get_insights":              "planner",
@@ -2538,6 +2553,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_latex_structure":        "common-support",
     # research
     "paper_search":               "common-support",
+    "social_search":              "common-support",
     "capture_research_finding":   "common-support",
     "save_finding":               "common-support",
     # workspace proposals workflow arc
