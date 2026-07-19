@@ -24,8 +24,9 @@ def test_outputs_port_no_collision_with_other_builtins():
 
 
 def test_outputs_custom_port_start_above_outputs_port():
-    # _CUSTOM_PORT_START was bumped from 8820 to 8821 to make room for outputs.
-    assert tp._CUSTOM_PORT_START == 8821
+    # _CUSTOM_PORT_START was bumped from 8820 to 8821 to make room for outputs,
+    # then to 8822 (121e6a27) to make room for the debug slot.
+    assert tp._CUSTOM_PORT_START == 8822
     assert tp.DEFAULT_OUTPUTS_PORT < tp._CUSTOM_PORT_START
 
 

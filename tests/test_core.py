@@ -1072,7 +1072,7 @@ def test_websocket_receives_task_event(client):
 def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
     r = client.get("/tunnel/status/no-such-tenant")
     assert r.status_code == 200
-    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "zotero_active": False, "outputs_active": False, "slot_health": {}, "slot_status": {}}
+    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "zotero_active": False, "outputs_active": False, "debug_active": False, "slot_health": {}, "slot_status": {}}
 
 
 def test_fs_mcp_proxy_returns_503_when_not_hosted(client):
@@ -18044,6 +18044,34 @@ async def test_workspace_proposal_filter_by_status(db):
     inv = await db_module.get_workspace_proposals(db, status="investigating")
     assert {p["id"] for p in raw} == {p1["id"]}
     assert {p["id"] for p in inv} == {p2["id"]}
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_default_status_excludes_terminal(db):
+    """45c4c178: omitting status defaults to 'live' proposals only (raw +
+    investigating) — promoted/rejected are excluded so the default view
+    reflects what's actually still open. status='all' still returns every
+    status, and an explicit terminal status still works."""
+    proj = await db_module.create_project(db, "gwp-default-status-proj")
+    p_raw = await db_module.add_workspace_proposal(db, "raw-idea", "body")
+    p_inv = await db_module.add_workspace_proposal(db, "inv-idea", "body")
+    await db_module.advance_workspace_proposal_status(db, p_inv["id"], "investigating")
+    p_promoted = await db_module.add_workspace_proposal(db, "promoted-idea", "body")
+    await db_module.advance_workspace_proposal_status(db, p_promoted["id"], "investigating")
+    await db_module.promote_workspace_proposal(db, p_promoted["id"], proj["id"])
+    p_rejected = await db_module.add_workspace_proposal(db, "rejected-idea", "body")
+    await db_module.advance_workspace_proposal_status(db, p_rejected["id"], "rejected")
+
+    default_view = await db_module.get_workspace_proposals(db)
+    assert {p["id"] for p in default_view} == {p_raw["id"], p_inv["id"]}
+
+    all_view = await db_module.get_workspace_proposals(db, status="all")
+    assert {p["id"] for p in all_view} == {
+        p_raw["id"], p_inv["id"], p_promoted["id"], p_rejected["id"],
+    }
+
+    promoted_view = await db_module.get_workspace_proposals(db, status="promoted")
+    assert {p["id"] for p in promoted_view} == {p_promoted["id"]}
 
 
 @pytest.mark.asyncio

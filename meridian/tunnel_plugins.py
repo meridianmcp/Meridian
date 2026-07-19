@@ -46,7 +46,7 @@ _MERIDIAN_OUTPUTS_LOCAL_PATH: str = str(
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
 # another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs")
+SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
@@ -73,6 +73,14 @@ DEFAULT_ZOTERO_PORT = 8819
 # zotero (8819) and was previously the custom auto-assign start; _CUSTOM_PORT_START
 # is bumped to 8821 below so auto-assigned custom ports never collide with this slot.
 DEFAULT_OUTPUTS_PORT = 8820
+
+# 121e6a27 — mcp-debugger slot: @debugmcp/mcp-debugger, a 7-language DAP
+# (Debug Adapter Protocol) debugger, launched via `npx -y @debugmcp/mcp-debugger`
+# (npm-published, no local clone needed — unlike the meridian-docs/meridian-outputs
+# slots, which spawn from a local extensions/ checkout). Port 8821 sits just after
+# outputs (8820); _CUSTOM_PORT_START is bumped to 8822 below so auto-assigned
+# custom ports never collide with this slot.
+DEFAULT_DEBUG_PORT = 8821
 
 # 8fb69d54 — 4 pre-allocated custom slots (p0-p3) on ports 8814-8817 so a custom
 # plugin bound to a slot gets a real server route (/tunnel-p0 … /tunnel-p3) and
@@ -312,6 +320,33 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "description": "Local outputs index — BM25 search over CSV/JSON/NPY files (meridian-outputs)",
         "description_overrides": {},
     },
+    {
+        # 121e6a27 — mcp-debugger: @debugmcp/mcp-debugger, a 7-language DAP
+        # (Debug Adapter Protocol) debugger MCP. npm-published and npx-ready — no
+        # local clone or extensions/ checkout needed, unlike meridian-docs /
+        # meridian-outputs. A short-term standalone `.mcp.json` entry was added to
+        # the target project as a stopgap; this is the real tunnel-routed
+        # built-in, following the same slot pattern as dc/docs/zotero/outputs.
+        "name": "mcp-debugger",
+        "slot": "debug",
+        "port": DEFAULT_DEBUG_PORT,
+        "url_prefix": "/debug",
+        "enabled": False,
+        "builtin": True,
+        "core": False,
+        "command": ["npx", "-y", "@debugmcp/mcp-debugger"],
+        "env": {},
+        # A debug session (breakpoints, call stack, step state) is stateful across
+        # requests — the same reasoning as Desktop Commander's terminal sessions —
+        # so this slot is "persistent" (skips --stateless + the idle-killer) rather
+        # than the one-shot "stateless" relay the read-only slots use.
+        "session_mode": "persistent",
+        # mcp-debugger exposes bare tool names — no self-prefix, so the server
+        # bridge namespaces them via SLOT_DISPLAY_NAMES ("debug" → "mcp-debugger__…").
+        "prefix": None,
+        "description": "Debugging — 7-language DAP debugger (mcp-debugger)",
+        "description_overrides": {},
+    },
 ]
 
 # Editable per-slot fields that a tenant override may set.
@@ -462,6 +497,23 @@ KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
             "Local BM25 outputs index (CSV/JSON/NPY) — search_outputs, "
             "annotate_outputs, classify_outputs, resolve_figure_output, "
             "npy_metadata, file_fingerprint. All purely local, no hosted call."
+        ),
+    },
+    {
+        # 121e6a27 SHIPPED this as a first-class built-in on its own `debug` slot
+        # (server route + WS relay in routes/tunnel.py). @debugmcp/mcp-debugger is
+        # a 7-language DAP (Debug Adapter Protocol) debugger, npm-published and
+        # npx-ready — no local clone/extensions checkout needed, unlike
+        # meridian-docs / meridian-outputs above.
+        "name": "mcp-debugger",
+        "package": "@debugmcp/mcp-debugger",
+        "runtime": "npx",
+        "slot": "debug",
+        "bundled": True,
+        "owner_item": None,
+        "description": (
+            "7-language DAP (Debug Adapter Protocol) debugger — set breakpoints, "
+            "step, inspect variables/call stacks across a live debug session."
         ),
     },
     {
@@ -726,16 +778,17 @@ def slot_pool_config(plugin: Any) -> "dict":
 _BUILTIN_DEFAULT_PORTS = frozenset({
     DEFAULT_FS_PORT, DEFAULT_CODE_PORT, DEFAULT_EXTRACT_PORT,
     DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT, DEFAULT_DOCS_PORT,
-    DEFAULT_ZOTERO_PORT, DEFAULT_OUTPUTS_PORT,
+    DEFAULT_ZOTERO_PORT, DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT,
 })
 
 # 9811d04c — first port a freshly-added custom plugin (from the browse "Add"
 # button) is auto-assigned when the caller supplies no port. Starts just above
-# the built-in default range (8808–8820, incl. the 4 pre-allocated custom
-# slots and the outputs built-in at 8820), so an auto-assigned port never
-# collides with a built-in slot.
+# the built-in default range (8808–8821, incl. the 4 pre-allocated custom
+# slots, the outputs built-in at 8820, and the debug built-in at 8821), so an
+# auto-assigned port never collides with a built-in slot.
 # 469d89b4 — bumped from 8820 to 8821 to make room for DEFAULT_OUTPUTS_PORT.
-_CUSTOM_PORT_START = 8821
+# 121e6a27 — bumped from 8821 to 8822 to make room for DEFAULT_DEBUG_PORT.
+_CUSTOM_PORT_START = 8822
 
 # 9811d04c — the built-in *slot* names (fs/code/extract/ppt/word/dc). A custom
 # plugin's name must not collide with a built-in slot name (task rule) nor with a
