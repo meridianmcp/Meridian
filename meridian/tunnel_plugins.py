@@ -376,6 +376,32 @@ _OVERRIDABLE = ("enabled", "command", "port", "description", "description_overri
 DEFAULT_POOL_MIN_COPIES = 1
 DEFAULT_POOL_MAX_COPIES = 2
 
+# 31648740 — corrects the earlier e401221d diagnosis (that fix landed in
+# orphan_reaper.py's _norm_path for an unrelated path-normalization bug; it did
+# NOT touch pooling). The REAL root cause, confirmed live 2026-07-19: code-intel
+# (codebase-memory-mcp.exe) has a documented third-party Windows bug where its
+# on-disk index rename fails if a second copy of the same process holds the .db
+# file open. The default elastic pool bursts stateless slots to 2 copies under
+# load — for code-intel that means 2 codebase-memory-mcp.exe instances spawned
+# in the same second, one holding the .db open while the other renames its
+# index, producing the HTTP 406 seen tonight.
+#
+# code-intel must therefore always resolve to a single copy — the same outcome
+# ``session_mode="persistent"`` gives ``dc`` — but for a DIFFERENT reason, so it
+# needs its OWN hard gate rather than reuse of that mechanism: code-intel is
+# genuinely stateless (no per-session state to split across copies; --stateless
+# and the idle-killer both correctly apply to it), so flipping its session_mode
+# to "persistent" would be semantically wrong and would have real side effects
+# (disables --stateless, skips the idle-killer) that are not warranted here.
+#
+# This frozenset is a second, independent hard gate — mirroring the
+# ``_COLD_FETCH_SLOTS``-style per-slot exemption list in tunnel_client.py —
+# checked alongside the session_mode gate in :func:`slot_pool_config` so a
+# tenant's ``pool`` override cannot re-enable elastic pooling for this slot and
+# reintroduce the Windows file-lock bug. Keyed by ``slot`` (not ``name``) to
+# match how plugin dicts are looked up elsewhere in this module.
+_POOL_HARD_PINNED_SLOTS: "frozenset[str]" = frozenset({"code"})
+
 
 def builtin_names() -> tuple[str, ...]:
     """Names of the three built-in plugins, in display order."""
@@ -739,6 +765,12 @@ def slot_pool_config(plugin: Any) -> "dict":
     always resolves to ``enabled=False, min=1, max=1`` regardless of any override,
     because forking identical copies would split its per-session state.
 
+    A slot may also be hard-pinned to a single copy for a reason OTHER than
+    session_mode — see :data:`_POOL_HARD_PINNED_SLOTS` (31648740: code-intel's
+    Windows index-rename bug when 2 copies race on the same .db file). That gate
+    is checked here too, unconditionally, so a tenant ``pool`` override cannot
+    re-enable elastic pooling for a hard-pinned slot.
+
     For a stateless slot:
 
     * With no ``pool`` override, pooling is ON with the built-in defaults
@@ -758,6 +790,13 @@ def slot_pool_config(plugin: Any) -> "dict":
     # Only stateless slots may pool. Default missing session_mode to "stateless"
     # so a resolved built-in without the key (shouldn't happen) still behaves.
     if plugin.get("session_mode", "stateless") != "stateless":
+        return single
+    # 31648740 — second, independent hard gate: some stateless slots are still
+    # pinned to a single copy for a non-session_mode reason (code-intel's
+    # Windows .db-rename race under 2 concurrent copies). Checked before any
+    # override is read, so a tenant ``pool`` override can never re-enable
+    # elastic pooling here.
+    if plugin.get("slot") in _POOL_HARD_PINNED_SLOTS:
         return single
 
     ov = plugin.get("pool")
