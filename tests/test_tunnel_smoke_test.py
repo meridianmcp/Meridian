@@ -203,15 +203,19 @@ def test_check_client_wires_all_catalog_slots_core_slots_always_exempt():
 
 
 def test_check_client_wires_all_catalog_slots_real_source_matches_known_gap():
-    """Live check against the actual tunnel_client.py source: documents the
-    real 2026-07-19 finding this harness's own construction turned up. If a
-    future change wires 'outputs'/'debug' into run_tunnel, this test should be
-    updated (that would be a welcome fix, not a regression)."""
+    """Live check against the actual tunnel_client.py source: this harness's
+    own construction turned up a real 2026-07-19 finding ('outputs'/'debug'
+    were declared in the plugin catalog but never wired into run_tunnel).
+    FIXED by 12afe021 -- both slots now join the office-family SlotProxy +
+    reconnect-loop loop, so the real source has zero missing catalog slots.
+    This is now a permanent regression guard: any future slot added to
+    BUILTIN_PLUGINS without matching client wiring will flip this back to
+    non-empty."""
     real_source = Path(tst.__file__).resolve().parent.parent.joinpath(
         "meridian", "tunnel_client.py"
     ).read_text(encoding="utf-8")
     missing = tst.check_client_wires_all_catalog_slots(real_source, tst.SLOTS)
-    assert set(missing) == {"outputs", "debug"}
+    assert missing == []
 
 
 # ---------------------------------------------------------------------------
@@ -628,10 +632,12 @@ async def test_test_slot_classifies_av_signature_on_spawn_failure(tmp_path):
 # static_findings — integration of the two static checks
 # ---------------------------------------------------------------------------
 
-def test_static_findings_includes_wiring_gap_and_port_collision():
+def test_static_findings_no_longer_includes_wiring_gap_after_12afe021():
+    """12afe021 wired outputs/debug into run_tunnel, so static_findings()
+    against the real source should no longer raise a client_wiring_gap
+    finding for them (or anything else -- every catalog slot is wired).
+    port_collision is unrelated (tracked separately as a1a870d5) and stays."""
     findings = tst.static_findings()
     categories = {f.category for f in findings}
-    assert "client_wiring_gap" in categories
+    assert "client_wiring_gap" not in categories
     assert "port_collision" in categories
-    wiring_slots = {f.slot for f in findings if f.category == "client_wiring_gap"}
-    assert wiring_slots == {"outputs", "debug"}

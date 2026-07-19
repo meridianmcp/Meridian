@@ -170,10 +170,8 @@ from meridian.serena_pool import SERENA_POOL_BASE_PORT
 # Constants
 # ---------------------------------------------------------------------------
 
-# Slots the design note calls out as always-tested. "outputs" is included even
-# though (per check_client_wires_all_catalog_slots below) the live tunnel
-# client does not yet wire it into the WS relay -- the inner MCP server is
-# still directly testable via stdio, independent of that gap.
+# Slots the design note calls out as always-tested. "outputs" is included
+# because it is directly testable via stdio regardless of client wiring state.
 CORE_SLOTS: tuple[str, ...] = ("fs", "code", "extract")
 DEFAULT_TESTED_SLOTS: tuple[str, ...] = (
     "fs", "code", "extract", "ppt", "word", "dc", "docs", "outputs",
@@ -181,17 +179,28 @@ DEFAULT_TESTED_SLOTS: tuple[str, ...] = (
 # "mcp-debugger and zotero only if enabled" (design note) -- opt-in via --include-optional.
 OPTIONAL_SLOTS: tuple[str, ...] = ("zotero", "debug")
 
-# 2026-07-19 finding (this file's own construction): these catalog slots have
-# NO wiring at all in tunnel_client.run_tunnel -- no SlotProxy is ever created
-# for them, so even a tenant who enables them via the dashboard gets nothing
-# when they run `meridian --tunnel`. Confirmed by check_client_wires_all_catalog_slots.
-KNOWN_UNWIRED_SLOTS: tuple[str, ...] = ("outputs", "debug")
+# 2026-07-19 finding (this file's own construction): at the time this harness
+# was first built, these catalog slots had NO wiring at all in
+# tunnel_client.run_tunnel -- no SlotProxy was ever created for them, so even
+# a tenant who enabled them via the dashboard got nothing when they ran
+# `meridian --tunnel`. FIXED by 12afe021 (both slots now share the office-
+# family SlotProxy + reconnect-loop wiring); kept as an empty tuple -- rather
+# than deleted -- so a future regression that un-wires either slot has an
+# obvious place to land the two names back into, and
+# check_client_wires_all_catalog_slots (below) independently re-verifies the
+# real source on every run regardless of this constant's value.
+KNOWN_UNWIRED_SLOTS: tuple[str, ...] = ()
 
 # Slots whose FIRST spawn triggers a genuine cold network/venv build (mirrors
 # tunnel_client._COLD_FETCH_SLOTS, duplicated here as a constant rather than
 # imported since tunnel_client's set is keyed by its own internal slot labels
 # for a slightly different purpose -- the two are expected to stay in sync).
-COLD_FETCH_SLOTS: frozenset[str] = frozenset({"dc", "ppt", "word", "docs", "zotero", "outputs"})
+# 12afe021 -- "debug" added alongside "outputs": now that both are actually
+# wired and spawned, "debug" (npx -y @debugmcp/mcp-debugger) is a first-install
+# cold fetch exactly like "dc"'s npx launch.
+COLD_FETCH_SLOTS: frozenset[str] = frozenset(
+    {"dc", "ppt", "word", "docs", "zotero", "outputs", "debug"}
+)
 
 # Roughly mirrors tunnel_client._PREFLIGHT_BUDGET_COLD_FETCH (4 attempts * 5s
 # delay + processing => on the order of a minute). A cold spawn slower than
@@ -371,17 +380,23 @@ def check_client_wires_all_catalog_slots(
     nothing (no ``SlotProxy``, no reconnect loop, no printed status line).
 
     This is a real gap discovered while building this harness (2026-07-19):
-    at time of writing, ``outputs`` and ``debug`` are BOTH in this state --
-    the server side already has full WS routes for them
-    (``routes/tunnel.py``'s ``_tunnel_outputs_sockets`` /
-    ``@router.websocket("/tunnel-outputs/{tenant_id}")``), and
-    ``tunnel_plugins.BUILTIN_PLUGINS`` fully describes their commands/ports,
-    but the CLIENT never connects. A crude source-text-membership check
-    (rather than e.g. import-time introspection of ``run_tunnel``'s bytecode)
-    is deliberate: it is cheap, has zero import-time side effects, and is
-    exactly as precise as this needs to be -- every wired slot's short code
-    appears as a quoted literal somewhere in the office-slot loop or an
-    explicit ``by_slot.get(...)`` block; an unwired one appears nowhere.
+    at the time, ``outputs`` and ``debug`` were BOTH in this state -- the
+    server side already had full WS routes for them (``routes/tunnel.py``'s
+    ``_tunnel_outputs_sockets`` / ``@router.websocket("/tunnel-outputs/{tenant_id}")``),
+    and ``tunnel_plugins.BUILTIN_PLUGINS`` fully described their commands/ports,
+    but the CLIENT never connected. FIXED by 12afe021 -- both slots now join
+    the office-family loop in ``run_tunnel`` alongside ppt/word/dc/docs/zotero,
+    so this check should report an empty list against the real source going
+    forward (see ``test_check_client_wires_all_catalog_slots_real_source_matches_known_gap``
+    in tests/test_tunnel_smoke_test.py, which asserts exactly that). The check
+    itself is kept as a permanent regression guard: any future slot added to
+    ``BUILTIN_PLUGINS`` without matching client wiring will be caught the same
+    way. A crude source-text-membership check (rather than e.g. import-time
+    introspection of ``run_tunnel``'s bytecode) is deliberate: it is cheap, has
+    zero import-time side effects, and is exactly as precise as this needs to
+    be -- every wired slot's short code appears as a quoted literal somewhere
+    in the office-slot loop or an explicit ``by_slot.get(...)`` block; an
+    unwired one appears nowhere.
 
     Pure string operation -- *tunnel_client_source* is passed in (rather than
     read from disk here) so this stays fully unit-testable against synthetic
@@ -412,10 +427,13 @@ def check_port_collisions() -> "list[str]":
     (``run_tunnel`` only skips it when a tenant overrides the extract slot's
     command), a tenant with the default extract slot AND the outputs slot
     both active would have Serena's first-repo daemon and meridian-outputs
-    (were it wired -- see :func:`check_client_wires_all_catalog_slots`)
-    contending for the same TCP port. This is independent of, and additional
-    to, the design note's predicted "multi-instance pooling contention"
-    category -- it is a static allocation bug, not a runtime race.
+    contending for the same TCP port. 12afe021 wired the outputs slot into
+    ``run_tunnel`` (see :func:`check_client_wires_all_catalog_slots`), which
+    turns this from a dormant static finding into a live collision the moment
+    a tenant enables both slots -- tracked separately as its own fix (a1a870d5),
+    not addressed here. This is independent of, and additional to, the design
+    note's predicted "multi-instance pooling contention" category -- it is a
+    static allocation bug, not a runtime race.
     """
     from meridian.tunnel_plugins import DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT
 
