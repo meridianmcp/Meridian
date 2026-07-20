@@ -344,6 +344,68 @@ def test_resolve_plugins_no_stale_flag_for_docs_current_default():
     assert "stale_override" not in docs_custom
 
 
+def test_resolve_plugins_flags_stale_outputs_foreign_local_path_override():
+    """ff8d1b2f — root cause of a live "search_outputs unreachable, tunnel_tried=true"
+    failure: the outputs slot's shipped default `--from` path was already correct
+    (computed the same way as the docs slot), but the slot never got a
+    `previous_defaults` list, so a tenant `tunnel_plugins` config storing a
+    command captured on a DIFFERENT checkout/container (e.g. an absolute path
+    like "file:///C:/app/extensions/meridian-outputs" that doesn't exist on this
+    machine) merged in unconditionally with zero staleness signal — the tunnel
+    client kept trying to spawn an unreachable path on every call, forever.
+
+    Unlike the docs/word/extract slots (whose stale value is one fixed historical
+    string), a stale local `--from` path is inherently environment-specific and
+    can't be enumerated in a fixed previous_defaults list — so resolve_plugins()
+    must structurally detect "same runtime + entry-point, different local path"
+    (see _is_stale_local_from_override). This regression guard fails without that
+    detection and passes with it."""
+    foreign_cmd = [
+        "uvx", "--from", "file:///C:/app/extensions/meridian-outputs",
+        "meridian-outputs-mcp",
+    ]
+    cfg = {"meridian-outputs": {"command": foreign_cmd}}
+    outputs = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["outputs"]
+    assert outputs.get("stale_override") is True
+    assert outputs["newer_default_command"] == [
+        "uvx", "--from", tp._MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp",
+    ]
+    assert outputs.get("newer_default_label")
+    # Positive control: the foreign path must actually differ from what this
+    # machine computes, or the test would pass for the wrong reason.
+    assert "file:///C:/app" != tp._MERIDIAN_OUTPUTS_LOCAL_PATH
+    assert outputs["command"] == foreign_cmd  # warn, don't silently swap (cc904bfe)
+    assert "previous_defaults" not in outputs  # internal — never leaked to clients
+
+
+def test_resolve_plugins_no_stale_flag_for_outputs_current_default_or_custom():
+    """The badge does NOT fire for the current outputs default or a genuinely
+    custom (different runtime/entry-point) outputs command."""
+    outputs_default = {p["slot"]: p for p in tp.resolve_plugins(None)}["outputs"]
+    assert "stale_override" not in outputs_default
+    cfg = {"meridian-outputs": {"command": ["uvx", "my-own-outputs-mcp"]}}
+    outputs_custom = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["outputs"]
+    assert "stale_override" not in outputs_custom
+
+
+def test_is_stale_local_from_override_helper():
+    """Unit coverage for the structural detector itself: same runtime + entry-point
+    but a different --from path is stale; anything else (different entry-point,
+    different runtime, non --from-shaped, or the identical command) is not."""
+    base = ["uvx", "--from", "/repo/extensions/meridian-outputs", "meridian-outputs-mcp"]
+    same_shape_other_path = [
+        "uvx", "--from", "/other/checkout/meridian-outputs", "meridian-outputs-mcp",
+    ]
+    assert tp._is_stale_local_from_override(same_shape_other_path, base) is True
+    assert tp._is_stale_local_from_override(base, base) is False  # identical -> not stale
+    different_entry = [
+        "uvx", "--from", "/other/checkout/meridian-outputs", "meridian-outputs",
+    ]
+    assert tp._is_stale_local_from_override(different_entry, base) is False
+    assert tp._is_stale_local_from_override(["uvx", "my-own-outputs-mcp"], base) is False
+    assert tp._is_stale_local_from_override(None, base) is False
+
+
 def test_office_binaries_word_launcher_is_docx_mcp():
     # 5b065c2e — PATH auto-enable (detect_office_binaries) must look for the NEW
     # launcher name so the word slot still self-enables when docx-mcp is installed.

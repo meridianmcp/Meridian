@@ -345,6 +345,24 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "builtin": True,
         "core": False,
         "command": ["uvx", "--from", _MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp"],
+        # ff8d1b2f — root cause of a live "search_outputs unreachable,
+        # tunnel_tried=true" failure (2026-07-20): the default `--from` path above
+        # was already correct (computed the same way as _MERIDIAN_DOCS_LOCAL_PATH,
+        # not a hardcoded server path — that part of the original bug report did
+        # not match current code). The REAL bug: this slot never got a
+        # `previous_defaults` list, and unlike the docs/word/extract slots (whose
+        # stale overrides are single fixed historical strings — a rename), an
+        # `--from <local-path>` override going stale here is inherently
+        # environment-specific: a tenant's stored command can bake in an absolute
+        # checkout path from whatever machine/container it was captured on (e.g.
+        # a stray "file:///C:/app/extensions/meridian-outputs" from a differently
+        # rooted checkout). No fixed previous_defaults list can enumerate every
+        # possible stale path. resolve_plugins() below therefore also flags any
+        # override that is structurally `["uvx", "--from", <some-other-path>,
+        # "meridian-outputs-mcp"]` — same runtime + entry-point as the current
+        # default, different local path — as `stale_override`, so the dashboard
+        # badge fires instead of the tunnel client silently retrying an unreachable
+        # path on every call (see _is_stale_local_from_override).
         "env": {},
         # meridian-outputs exposes bare tool names (search_outputs, annotate_outputs,
         # …) — no self-prefix, so the server bridge namespaces them via
@@ -1031,6 +1049,37 @@ def resolve_custom_plugins(raw_config: Any) -> list[dict]:
     return out
 
 
+def _is_stale_local_from_override(ov_cmd: Any, base_cmd: Any) -> bool:
+    """ff8d1b2f — detect a stale ``uvx --from <local-path> <entry-point>`` override.
+
+    Complements the exact-match ``previous_defaults`` list: that list only catches
+    a *fixed* historical default (e.g. a one-time entry-point rename). A local
+    ``--from`` command embeds an absolute filesystem path computed from
+    ``Path(__file__).parent.parent`` at the time it was saved — if a tenant's
+    stored override was captured on a different checkout/container (a different
+    root than this machine currently computes), the path segment is permanently
+    wrong on this machine and no fixed string list could ever enumerate every
+    possible stale value.
+
+    Returns True when both commands share the same shape
+    ``["uvx", "--from", <path>, <entry-point>]`` with the same runtime and
+    entry-point but a *different* path — i.e. "this looks like our own default,
+    just pointed at a different local checkout" — without asserting anything
+    about paths that aren't ours to begin with (a genuinely custom command, e.g.
+    a different runtime or entry-point, is left untouched).
+    """
+    if (
+        not isinstance(ov_cmd, list) or not isinstance(base_cmd, list)
+        or len(ov_cmd) != 4 or len(base_cmd) != 4
+    ):
+        return False
+    if ov_cmd[0] != base_cmd[0] or ov_cmd[1] != "--from" or base_cmd[1] != "--from":
+        return False
+    if ov_cmd[3] != base_cmd[3]:
+        return False
+    return ov_cmd[2] != base_cmd[2]
+
+
 def resolve_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[dict]:
     """Merge per-tenant overrides over the built-in defaults.
 
@@ -1065,12 +1114,20 @@ def resolve_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[
         # tunnel still runs the override, but the dashboard surfaces a "newer
         # default available" badge so the user can opt back into the new default.
         # A genuinely-custom command (not in previous_defaults) is left untouched.
+        # ff8d1b2f — also flags a stale `uvx --from <local-path>` override whose
+        # path doesn't match what *this* machine currently computes (see
+        # _is_stale_local_from_override) — a fixed previous_defaults string list
+        # can't enumerate every possible stale absolute path a tenant's stored
+        # config might have baked in from a different checkout/container.
         ov_cmd = ov.get("command")
+        base_cmd = base.get("command")
         prev_defaults = base.get("previous_defaults") or []
-        if (ov_cmd and ov_cmd != base.get("command")
-                and any(ov_cmd == pd for pd in prev_defaults)):
+        if ov_cmd and ov_cmd != base_cmd and (
+            any(ov_cmd == pd for pd in prev_defaults)
+            or _is_stale_local_from_override(ov_cmd, base_cmd)
+        ):
             merged["stale_override"] = True
-            merged["newer_default_command"] = base.get("command")
+            merged["newer_default_command"] = base_cmd
             merged["newer_default_label"] = base.get("description")
         merged.pop("previous_defaults", None)  # internal — don't leak to clients
         resolved.append(merged)
