@@ -452,7 +452,9 @@ async def handle_get_sprint_progress(
     from ..handler import _board_change_for_session  # noqa: PLC0415
     _version_filter = args.get("version")
     _group_filter = args.get("item_group")
-    # 10s cache: parallel executors polling between tasks share one DB query.
+    # Short TTL cache (a1d75ff3): parallel executors polling between tasks share
+    # one DB query. Bounded, per-instance staleness only — see the a1d75ff3 note
+    # above _SPRINT_ITEMS_CACHE in meridian/db/sprint_items.py.
     _all = await db_module.get_sprint_items_cached(db, args["project_id"])
     if _version_filter:
         _all = [it for it in _all if it.get("version") == _version_filter]

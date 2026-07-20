@@ -15271,6 +15271,90 @@ async def test_get_sprint_items_cached_hits_and_invalidates(db):
 
 
 @pytest.mark.asyncio
+async def test_sprint_items_cache_cross_instance_staleness_is_ttl_bounded(db, monkeypatch):
+    """a1d75ff3 — _SPRINT_ITEMS_CACHE is a per-process dict. Write-time
+    invalidation only clears the WRITING instance's own dict, so on a
+    multi-instance deployment a sibling instance's already-cached entry is
+    untouched by another instance's write and keeps serving pre-write data
+    until ITS OWN local TTL naturally elapses.
+
+    Simulates two Fly machines by swapping the module-level cache dict that
+    get_sprint_items_cached() / _invalidate_sprint_items_cache() close over:
+      1. the writing instance is always immediately fresh (existing, correct
+         behavior — must not regress)
+      2. a sibling instance genuinely serves stale data across the write (the
+         real, confirmed bug — reproduced here)
+      3. the staleness is FINITE and bounded by _SPRINT_ITEMS_CACHE_TTL: once
+         the sibling's own TTL elapses, its very next read self-heals to the
+         true DB state with no cross-instance signalling required — proving
+         the bound is real (a short TTL), not "eventually consistent, no bound".
+    """
+    from meridian.db import sprint_items as sprint_items_module
+
+    p = await db_module.create_project(db, "cache-cross-instance")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "one")
+
+    # Shrink the TTL for a fast, deterministic test instead of sleeping out
+    # the real (already-short) production TTL.
+    monkeypatch.setattr(sprint_items_module, "_SPRINT_ITEMS_CACHE_TTL", 0.05)
+
+    # "Instance B" (sibling) primes its own cache dict with the pre-write state.
+    b_cache: dict = {}
+    monkeypatch.setattr(sprint_items_module, "_SPRINT_ITEMS_CACHE", b_cache)
+    b_before = await db_module.get_sprint_items_cached(db, pid)
+    assert len(b_before) == 1
+
+    # "Instance A" has its OWN cache dict and performs the write. Its own
+    # write-time invalidation only ever touches a_cache — b_cache is untouched.
+    a_cache: dict = {}
+    monkeypatch.setattr(sprint_items_module, "_SPRINT_ITEMS_CACHE", a_cache)
+    await db_module.add_sprint_item(db, pid, "v1", "two")
+    a_after = await db_module.get_sprint_items_cached(db, pid)
+    assert len(a_after) == 2  # writer instance: always immediately fresh
+
+    # Switch back to instance B, still inside its (shortened) TTL window: this
+    # is the real, confirmed bug — B still serves the stale, pre-write snapshot
+    # even though A's write has long since committed to Postgres.
+    monkeypatch.setattr(sprint_items_module, "_SPRINT_ITEMS_CACHE", b_cache)
+    b_still_stale = await db_module.get_sprint_items_cached(db, pid)
+    assert len(b_still_stale) == 1
+
+    # Once B's own local TTL elapses, B self-heals on its very next read — no
+    # cross-instance invalidation needed. Staleness is bounded, not indefinite.
+    await asyncio.sleep(0.08)
+    b_healed = await db_module.get_sprint_items_cached(db, pid)
+    assert len(b_healed) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_uncached_path_immune_to_cache_staleness(db):
+    """a1d75ff3 investigation finding: get_sprint_items() — used directly by
+    the get_sprint_items MCP tool and by _board_change_for_session — never
+    reads _SPRINT_ITEMS_CACHE at all; it issues a live SQL query on every
+    call. Guards against a future change accidentally routing it through the
+    cache (which would reintroduce a1d75ff3's cross-instance staleness window
+    for get_sprint_items too, not just get_sprint_progress) by asserting a
+    fresh write is visible on the very next call even while a deliberately
+    stale, unrelated cache entry sits in _SPRINT_ITEMS_CACHE for this project.
+    """
+    from meridian.db import sprint_items as sprint_items_module
+
+    p = await db_module.create_project(db, "cache-uncached-path")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "one")
+
+    # Plant a stale cache entry that does NOT reflect "one" — if
+    # get_sprint_items ever started reading this cache, it would wrongly
+    # return this snapshot instead of the live DB state.
+    sprint_items_module._SPRINT_ITEMS_CACHE[pid] = (time.monotonic(), [])
+
+    live = await db_module.get_sprint_items(db, pid, status="pending")
+    assert len(live) == 1
+    assert live[0]["title"] == "one"
+
+
+@pytest.mark.asyncio
 async def test_tenant_rate_limit_tiers(db, monkeypatch):
     """Free plan blocks past its per-minute budget; pro is unlimited; non-hosted
     and non-bearer traffic is never metered. FAIL-OPEN by construction."""
