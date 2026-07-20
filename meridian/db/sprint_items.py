@@ -3675,9 +3675,13 @@ async def assign_sprint_waves(
     claimable_statuses = {"pending", "todo"}
     # Only label pending/todo items that are not already in-flight or done.
     # In-progress items are mid-execution and must not be relabelled mid-run.
+    # 5a67c8e0 — also exclude deferred items: a future ``deferred_until`` leaves
+    # status='pending' untouched (see claim_sprint_item / _is_deferred), so without
+    # this check a backburnered item would still get labelled into a real wave.
     candidates = [
         it for it in items
         if (it.get("status") or "pending") in claimable_statuses
+        and not _is_deferred(it)
     ]
 
     # ── Urgent carve-out (f78d7644) ─────────────────────────────────────────────
