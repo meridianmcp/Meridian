@@ -46,6 +46,24 @@ DEFAULT_EXTRACT_PROXY_PORT = 8810
 # local response surfaces as our error rather than the server's tunnel timeout.
 _LOCAL_REQUEST_TIMEOUT = 28.0
 _MAX_BACKOFF = 30.0
+# 676e53a3 — every websockets.connect() below sets ping_interval=20 but used to
+# rely on the library's default ping_timeout (~20s): a single delayed pong
+# (e.g. the event loop busy relaying a slow local request, up to
+# _LOCAL_REQUEST_TIMEOUT=28s) made the CLIENT unilaterally close with "no
+# close frame received or sent" — that's us giving up, not a real server
+# close. 45s comfortably clears the local request budget so a legitimately
+# slow-but-alive relay never trips it, while still bounding genuine dead-peer
+# detection to a reasonable ping_interval + ping_timeout = ~65s worst case.
+_WS_PING_TIMEOUT = 45.0
+# 13161001 — close code 1012 ("Service Restart", RFC 6455 IANA registry) means
+# the server is cycling on purpose (deploy/restart), not that the connection
+# failed. websockets only treats codes 1000/1001 as a clean close that exits
+# `async for ws` without raising (ConnectionClosedOK); every other code —
+# including 1012 — raises ConnectionClosedError like a genuine abnormal drop.
+# Without special-casing it, the reconnect loops below climbed backoff on a
+# clean 1012 exactly like a repeated real failure. Reused by all three
+# reconnect loops via _is_clean_server_close() below.
+_CLEAN_RECONNECT_CLOSE_CODES = frozenset({1012})
 # Crash isolation: how many times the watchdog relaunches a slot's proxy that
 # keeps exiting (e.g. ENOENT on a missing binary) before backing off to the
 # long-cooldown retry cadence below.
@@ -862,6 +880,33 @@ async def _preflight_slot(
     return healthy
 
 
+def _is_clean_server_close(exc: BaseException) -> bool:
+    """True when *exc* is a server-initiated close whose code is in
+    ``_CLEAN_RECONNECT_CLOSE_CODES`` (13161001) — a signal that should reset
+    the reconnect backoff the same way a successful connection does, instead
+    of climbing it the same way a genuine repeated failure does. Mirrors the
+    healthy-tick counter reset in :func:`_proc_watchdog` (the "a healthy tick
+    clears the crash streak" branch), adapted to this loop's shape: since the
+    backoff sleep here sits at the BOTTOM of the reconnect loop (after both
+    the success and failure branches) rather than at the top, resetting
+    ``backoff`` in the caller's except-block achieves the same effect as
+    ``_proc_watchdog``'s early ``continue`` without duplicating the
+    sleep/growth code.
+    """
+    # `websockets`'s top-level package lazily aliases some names but does NOT
+    # guarantee `websockets.exceptions` is populated as an attribute just
+    # because `import websockets` ran elsewhere in the process — that only
+    # happens once something has explicitly imported the submodule. Import it
+    # directly here so this check is correct regardless of import order.
+    import websockets.exceptions
+
+    if not isinstance(exc, websockets.exceptions.ConnectionClosed):
+        return False
+    rcvd = getattr(exc, "rcvd", None)
+    code = rcvd.code if rcvd is not None else None
+    return code in _CLEAN_RECONNECT_CLOSE_CODES
+
+
 async def _run_connection_lazy(
     ws_url: str,
     proxy: "SlotProxy",
@@ -933,7 +978,9 @@ async def _run_connection_lazy(
             _reprobe_task = asyncio.ensure_future(_reprobe())
 
     try:
-        async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
+        async with websockets.connect(
+            ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
+        ) as ws:
             print(f"tunnel:{label}: connected (lazy mode)", flush=True)
             local_base = f"http://127.0.0.1:{proxy.port}"
             async with httpx.AsyncClient() as http_client:
@@ -1099,11 +1146,24 @@ async def _reconnect_loop_lazy(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(
-                f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
-                file=sys.stderr,
-                flush=True,
-            )
+            if _is_clean_server_close(exc):
+                # 13161001 — server-initiated clean close (e.g. 1012 service
+                # restart) is not a failure signal: reset backoff the same as
+                # a successful connection instead of climbing it, mirroring
+                # _proc_watchdog's healthy-tick reset.
+                backoff = 1.0
+                print(
+                    f"tunnel:{label}: disconnected (server restart, {exc}); "
+                    f"reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, _MAX_BACKOFF)
 
@@ -1167,7 +1227,9 @@ async def _run_extract_pool_connection(
             _reprobe_task = asyncio.ensure_future(_reprobe(ws))
 
     try:
-        async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
+        async with websockets.connect(
+            ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
+        ) as ws:
             print(f"tunnel:{label}: connected (Serena daemon pool)", flush=True)
             async with httpx.AsyncClient() as http_client:
                 async for raw in ws:
@@ -1269,11 +1331,23 @@ async def _reconnect_loop_extract_pool(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(
-                f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
-                file=sys.stderr,
-                flush=True,
-            )
+            if _is_clean_server_close(exc):
+                # 13161001 — see _reconnect_loop_lazy: a clean server-initiated
+                # close (e.g. 1012 service restart) resets backoff instead of
+                # climbing it, mirroring _proc_watchdog's healthy-tick reset.
+                backoff = 1.0
+                print(
+                    f"tunnel:{label}: disconnected (server restart, {exc}); "
+                    f"reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, _MAX_BACKOFF)
 
@@ -3607,7 +3681,9 @@ async def _run_connection(
     import websockets
 
     local_base = f"http://127.0.0.1:{port}"
-    async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
+    async with websockets.connect(
+        ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
+    ) as ws:
         print(f"tunnel:{label}: connected", flush=True)
         async with httpx.AsyncClient() as http_client:
             async for raw in ws:
@@ -3642,11 +3718,23 @@ async def _reconnect_loop(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(
-                f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
-                file=sys.stderr,
-                flush=True,
-            )
+            if _is_clean_server_close(exc):
+                # 13161001 — see _reconnect_loop_lazy: a clean server-initiated
+                # close (e.g. 1012 service restart) resets backoff instead of
+                # climbing it, mirroring _proc_watchdog's healthy-tick reset.
+                backoff = 1.0
+                print(
+                    f"tunnel:{label}: disconnected (server restart, {exc}); "
+                    f"reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, _MAX_BACKOFF)
 
