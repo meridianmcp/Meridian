@@ -148,11 +148,79 @@ def is_secret_path(path: str) -> bool:
     return False
 
 
-def _walk_safe_output_files(outputs_dir: str):
+# ---------------------------------------------------------------------------
+# fd4dd661 -- user-configurable exclude patterns (gitignore-style, v1)
+# ---------------------------------------------------------------------------
+#
+# Scope decision (documented per fd4dd661's own "your call on scope" note):
+# v1 is a PRAGMATIC fnmatch-based glob list, not a full gitignore-spec
+# parser.  Supported:
+#   - A bare glob (e.g. "*.tmp", "big_sweep_*") matches the file/directory
+#     BASENAME at any depth.
+#   - A glob containing "/" (e.g. "cache/generated") matches against the
+#     path RELATIVE to outputs_dir (forward-slash separated, regardless of
+#     host OS -- same normalisation :func:`_canonical_name` already uses).
+#   - A trailing "/" (e.g. "node_modules/") marks a DIRECTORY pattern: the
+#     directory (and everything under it) is PRUNED from the walk entirely
+#     -- not just filtered file-by-file -- which is what actually lets a
+#     huge never-useful subtree be skipped cheaply. Matched the same way
+#     (basename or relative path) with the trailing slash stripped first.
+# Deliberately NOT supported in v1 (kept simple, documented rather than
+# silently wrong): gitignore negation ("!pattern"), and per-directory
+# .gitignore file discovery (this is one explicit pattern list, not scattered
+# across the tree). Note fnmatch's "*" already matches across "/" boundaries
+# (it has no filesystem awareness), which is MORE permissive than real
+# gitignore's single "*" -- e.g. "cache/*" here also matches
+# "cache/sub/file.txt", not just direct children. Use a trailing "/" pattern
+# instead when a whole subtree should be pruned.
+_EXCLUDE_PATTERNS_ENV_VAR = "MERIDIAN_OUTPUTS_EXCLUDE_PATTERNS"
+
+
+def _default_exclude_patterns() -> tuple[str, ...]:
+    """Resolve the default exclude-pattern list from the environment.
+
+    Comma- or newline-separated glob list in
+    ``MERIDIAN_OUTPUTS_EXCLUDE_PATTERNS``, e.g.
+    ``"node_modules/,*.tmp,big_sweep_output/"``.  Empty/unset -> no patterns
+    (unchanged default behaviour: only secret-file exclusion applies).
+    Re-read on every call (cheap) rather than cached at import time, so a
+    changed env var takes effect on the next :class:`OutputsFtsIndex`
+    construction without a process restart -- same pattern as
+    :func:`_default_max_workers` (acac2599).
+    """
+    raw = os.environ.get(_EXCLUDE_PATTERNS_ENV_VAR, "")
+    if not raw.strip():
+        return ()
+    parts = re.split(r"[,\n]", raw)
+    return tuple(p.strip() for p in parts if p.strip())
+
+
+def _matches_exclude_pattern(
+    basename: str, rel_path: str, patterns: tuple[str, ...],
+) -> bool:
+    """True if ``basename`` or ``rel_path`` (forward-slash, relative to
+    outputs_dir) matches any glob in ``patterns``.  See the module-level
+    comment above for the exact (deliberately simple, v1) matching rules.
+    """
+    for pat in patterns:
+        p = pat.strip()
+        if not p:
+            continue
+        core = p[:-1] if p.endswith("/") else p
+        if not core:
+            continue
+        if fnmatch.fnmatch(basename, core) or fnmatch.fnmatch(rel_path, core):
+            return True
+    return False
+
+
+def _walk_safe_output_files(
+    outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
+):
     """Generator yielding regular files under ``outputs_dir`` that pass the
-    secret-file exclusion filter, in deterministic (sorted-directories,
-    sorted-files) order -- the same order :func:`_iter_safe_output_files`
-    has always returned.
+    secret-file exclusion filter AND the (optional) user exclude-pattern
+    list, in deterministic (sorted-directories, sorted-files) order -- the
+    same order :func:`_iter_safe_output_files` has always returned.
 
     This is a plain generator, which means pulling from it can be paused
     (simply stop calling ``next()``) and resumed later exactly where it left
@@ -162,22 +230,48 @@ def _walk_safe_output_files(outputs_dir: str):
     MERIDIAN_NOTES.md files are included (they are picked up for annotation
     ingestion in rebuild, not FTS content rows -- same behaviour as the
     original).  Hidden directories (names starting with ``.``) are pruned to
-    avoid walking .git/.env directories.
+    avoid walking .git/.env directories.  ``exclude_patterns`` (fd4dd661) --
+    directories matching a pattern are pruned the same way hidden
+    directories are (never descended into); files matching a pattern are
+    skipped, same as a secret-path match.
     """
     for root, dirs, files in os.walk(outputs_dir):
-        # Prune hidden directories in-place so os.walk doesn't descend them.
-        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        kept_dirs: list[str] = []
+        for d in sorted(dirs):
+            if d.startswith("."):
+                continue
+            if exclude_patterns:
+                rel = os.path.relpath(
+                    os.path.join(root, d), outputs_dir
+                ).replace("\\", "/")
+                if _matches_exclude_pattern(d, rel, exclude_patterns):
+                    _log.debug(
+                        "outputs_local: pruning user-excluded dir %r",
+                        os.path.join(root, d),
+                    )
+                    continue
+            kept_dirs.append(d)
+        # Prune in-place so os.walk doesn't descend into hidden/excluded dirs.
+        dirs[:] = kept_dirs
         for fn in sorted(files):
             p = os.path.join(root, fn)
             if is_secret_path(p):
                 _log.debug("outputs_local: skipping secret-pattern file %r", p)
                 continue
+            if exclude_patterns:
+                rel = os.path.relpath(p, outputs_dir).replace("\\", "/")
+                if _matches_exclude_pattern(fn, rel, exclude_patterns):
+                    _log.debug("outputs_local: skipping user-excluded file %r", p)
+                    continue
             yield p
 
 
-def _iter_safe_output_files(outputs_dir: str) -> list[str]:
+def _iter_safe_output_files(
+    outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
+) -> list[str]:
     """Walk ``outputs_dir`` recursively, returning regular files that pass the
-    secret-file exclusion filter, sorted for deterministic ordering.
+    secret-file exclusion filter (and the optional ``exclude_patterns``
+    user list, fd4dd661), sorted for deterministic ordering.
 
     This blocks until the walk completes -- fine for a one-shot, small-tree
     caller (e.g. :func:`build_output_rows`), but NOT deadline-aware: on a
@@ -187,7 +281,9 @@ def _iter_safe_output_files(outputs_dir: str) -> list[str]:
     :class:`_ResumableFileWalk` instead, which bounds each walk increment by
     ``rebuild()``'s own deadline (6ba77ada).
     """
-    return list(_walk_safe_output_files(outputs_dir))
+    return list(
+        _walk_safe_output_files(outputs_dir, exclude_patterns=exclude_patterns)
+    )
 
 
 class _ResumableFileWalk:
@@ -225,8 +321,12 @@ class _ResumableFileWalk:
     # Phase 1/2 can plausibly clear in a comparable amount of time.
     _MAX_BATCH = 2000
 
-    def __init__(self, outputs_dir: str) -> None:
-        self._iterator = _walk_safe_output_files(outputs_dir)
+    def __init__(
+        self, outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
+    ) -> None:
+        self._iterator = _walk_safe_output_files(
+            outputs_dir, exclude_patterns=exclude_patterns,
+        )
         self.exhausted = False
 
     def drain(self, deadline: float | None) -> list[str]:
@@ -523,6 +623,52 @@ def _sha256_file(path: str) -> str | None:
         return None
 
 
+def _xxh3_file(path: str) -> str | None:
+    """Fast, non-cryptographic content hash for archival-duplicate detection.
+
+    984b237c -- swaps SHA-256 for xxHash's XXH3-128 variant on the ONE
+    hasher this module uses for archival-vs-canonical duplicate detection
+    (:func:`classify_canonical_archival`'s ``cand_hash == twin_hash`` byte-
+    equality check).  That comparison is never a security/audit boundary --
+    collision resistance against an adversary is irrelevant here, only
+    "did this content change" -- so a non-cryptographic hash is the correct
+    tool, and xxHash is dramatically faster than SHA-256 on real files (see
+    ``TestXxh3Benchmark`` in the test suite for a live, on-box A/B
+    confirmation rather than just citing published numbers). Every OTHER
+    SHA-256 use in the wider Meridian codebase -- anywhere hashing serves a
+    genuine security/audit purpose -- is untouched; this swap is scoped to
+    ONLY this module's archival-dedup hasher.
+
+    MIGRATION (49b97a6a, resolved): an existing DB's rows are guarded by
+    ``_HASH_ALGO_VERSION`` / :func:`_check_hash_algo_version` so an upgrade
+    from a pre-xxHash DB forces a one-time full re-hash rather than ever
+    mixing SHA-256 and xxHash values in the same column.
+
+    Lazily imports ``xxhash`` so the extension's hard dependency surface
+    doesn't grow for callers that never touch archival classification, and
+    degrades gracefully to :func:`_sha256_file` when ``xxhash`` isn't
+    installed for any reason -- a missing optional dependency must never
+    turn a hash-algorithm swap into a broken indexer. The returned digest
+    format therefore differs depending on which path was taken (128-bit
+    xxh3 hex vs. 256-bit sha256 hex); callers must treat the hash purely as
+    an opaque equality token (which is exactly how
+    :func:`classify_canonical_archival` already uses it) and never assume a
+    fixed length or algorithm.
+    """
+    try:
+        import xxhash  # noqa: PLC0415 -- optional, lazy
+    except ImportError:
+        return _sha256_file(path)
+    try:
+        h = xxhash.xxh3_128()
+        with open(path, "rb", buffering=0) as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 def _infer_generating_script_from_text(text: str) -> str | None:
     m = _SCRIPT_HINT_RE.search(text)
     return m.group(1) if m else None
@@ -652,7 +798,7 @@ class ArchivalClassification:
 
 
 def classify_canonical_archival(
-    paths: list[str], *, hasher: Callable[[str], str | None] = _sha256_file,
+    paths: list[str], *, hasher: Callable[[str], str | None] = _xxh3_file,
 ) -> dict[str, ArchivalClassification]:
     """Two-stage canonical-vs-archival classification.  Deterministic output
     order: keys follow the input ``paths`` list order (caller sorts them)."""
@@ -715,10 +861,12 @@ class OutputRow:
 
 
 def build_output_rows(
-    outputs_dir: str, *, hasher: Callable[[str], str | None] = _sha256_file,
+    outputs_dir: str, *, hasher: Callable[[str], str | None] = _xxh3_file,
+    exclude_patterns: tuple[str, ...] = (),
 ) -> list[OutputRow]:
-    """Walk ``outputs_dir`` with secret-file exclusion and build OutputRows."""
-    paths = _iter_safe_output_files(outputs_dir)
+    """Walk ``outputs_dir`` with secret-file exclusion (and the optional
+    user ``exclude_patterns`` list, fd4dd661) and build OutputRows."""
+    paths = _iter_safe_output_files(outputs_dir, exclude_patterns=exclude_patterns)
     classifications = classify_canonical_archival(paths, hasher=hasher)
     rows: list[OutputRow] = []
     for path in paths:
@@ -774,14 +922,76 @@ def _analyse_file(path: str, hasher: Callable[[str], str | None]) -> "_FileAnaly
     for different paths.  The GIL is released during the file-read portions,
     so hashing a large file (e.g. a 5.9 MB sweep_results.json) overlaps with
     hashing and parsing other files.
+
+    e1fd4182 -- fingerprinting and hashing used to each open+read the file
+    separately (file_fingerprint(path) + hasher(path)). Live-benchmarked
+    2.15x/53.5% time saved on a real 70k-file tree by reading the bytes
+    ONCE and deriving both the hash and the capped-text fingerprint from
+    that single buffer -- verified byte-for-byte identical output (hash,
+    kind, csv_columns, json_keys, generating_script) across all 70,000
+    files before applying. Only takes this fast path for the default
+    hasher (`hasher is _sha256_file`); a custom/injected hasher (tests,
+    or the future xxHash swap in 984b237c once that lands) falls back to
+    the original two-read path unchanged, so the injectable-hasher
+    contract other callers rely on is fully preserved.
     """
-    fp = file_fingerprint(path)
     try:
         st = os.stat(path)
         size: int | None = st.st_size
         mtime: float | None = st.st_mtime
     except OSError:
         size = mtime = None
+
+    if hasher is _sha256_file or hasher is _xxh3_file:
+        try:
+            with open(path, "rb", buffering=0) as fh:
+                data = fh.read()
+        except OSError:
+            data = None
+        if data is not None:
+            # 984b237c -- fast path supports either hasher on the SAME single
+            # read; xxhash import failure inside _xxh3_file already degrades
+            # to SHA256 gracefully for the (rare) non-fast-path callers, but
+            # this fast path computes the hash directly rather than calling
+            # back through hasher(path) (which would re-read) -- so it needs
+            # its own lazy-import fallback, mirroring _xxh3_file's own.
+            if hasher is _xxh3_file:
+                try:
+                    import xxhash  # noqa: PLC0415
+                    h = xxhash.xxh3_128()
+                except ImportError:
+                    h = hashlib.sha256()
+            else:
+                h = hashlib.sha256()
+            h.update(data)
+            sha = h.hexdigest()
+            kind = _classify_suffix(path)
+            if kind != "text_content":
+                fp = FileFingerprint(path=path, kind=kind)
+            else:
+                # Match _read_text_capped's exact semantics (up to
+                # _MAX_CONTENT_CHARS characters). Over-read bytes (4/char
+                # worst case for UTF-8) then slice the DECODED text --
+                # avoids decoding a huge file unnecessarily, never cuts a
+                # multi-byte char differently than the original read did.
+                text = data[: _MAX_CONTENT_CHARS * 4].decode(
+                    "utf-8", errors="replace"
+                )[:_MAX_CONTENT_CHARS]
+                suffix = os.path.splitext(path)[1].lower()
+                if suffix == ".csv":
+                    columns, script = _extract_csv(text)
+                    fp = FileFingerprint(path=path, kind=kind,
+                                         csv_columns=columns, generating_script=script)
+                else:
+                    keys, script = _extract_json(text)
+                    fp = FileFingerprint(path=path, kind=kind,
+                                         json_keys=keys, generating_script=script)
+            return _FileAnalysis(path=path, fingerprint=fp, mtime=mtime,
+                                  size=size, sha256=sha)
+
+    # Fallback: OSError on the single read, or a non-default hasher injected
+    # (tests, or a future custom hasher) -- original two-read path, unchanged.
+    fp = file_fingerprint(path)
     sha = hasher(path)
     return _FileAnalysis(path=path, fingerprint=fp, mtime=mtime, size=size, sha256=sha)
 
@@ -793,6 +1003,108 @@ def _analyse_file(path: str, hasher: Callable[[str], str | None]) -> "_FileAnaly
 _MAX_CACHED_INDEXES = 32
 _index_cache_lock = threading.Lock()
 _index_cache: OrderedDict[str, "OutputsFtsIndex"] = OrderedDict()
+
+# 49b97a6a -- bump whenever the algorithm behind outputs_index.sha256
+# changes, so OutputsFtsIndex._check_hash_algo_version can detect an
+# on-disk DB written under a prior algorithm and force a one-time full
+# re-hash instead of ever silently mixing algorithms under one column.
+# 1 = legacy SHA-256 (pre-984b237c). 2 = xxHash XXH3-128 (984b237c).
+_HASH_ALGO_VERSION = 2
+
+# ---------------------------------------------------------------------------
+# acac2599 -- configurable Phase-1 ThreadPoolExecutor worker cap
+# ---------------------------------------------------------------------------
+_DEFAULT_MAX_WORKERS = 8
+_MAX_WORKERS_ENV_VAR = "MERIDIAN_OUTPUTS_MAX_WORKERS"
+
+
+def _default_max_workers() -> int:
+    """Resolve the default Phase-1 worker cap from the environment.
+
+    Checked fresh on every call (a cheap env lookup) rather than cached at
+    import time, so a changed ``MERIDIAN_OUTPUTS_MAX_WORKERS`` takes effect
+    on the next :class:`OutputsFtsIndex` construction without a process
+    restart. Falls back to the historical hardcoded default (8) for
+    anything not a positive integer, logging why so a typo'd env var is
+    diagnosable instead of silently ignored.
+    """
+    raw = os.environ.get(_MAX_WORKERS_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _DEFAULT_MAX_WORKERS
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        _log.warning(
+            "%s=%r is not a valid integer -- falling back to default (%d)",
+            _MAX_WORKERS_ENV_VAR, raw, _DEFAULT_MAX_WORKERS,
+        )
+        return _DEFAULT_MAX_WORKERS
+    if value < 1:
+        _log.warning(
+            "%s=%r must be >= 1 -- falling back to default (%d)",
+            _MAX_WORKERS_ENV_VAR, raw, _DEFAULT_MAX_WORKERS,
+        )
+        return _DEFAULT_MAX_WORKERS
+    return value
+
+
+def _resolve_max_workers(explicit: int | None) -> int:
+    """Precedence: explicit constructor arg > env var > hardcoded default.
+
+    Mirrors the precedence rule already used elsewhere in this codebase for
+    other explicit-arg/env-var/default triples (e.g. project_id resolution).
+    """
+    if explicit is not None:
+        if explicit >= 1:
+            return explicit
+        _log.warning(
+            "OutputsFtsIndex: max_workers=%r must be >= 1 -- falling back "
+            "to default (%d)", explicit, _DEFAULT_MAX_WORKERS,
+        )
+        return _DEFAULT_MAX_WORKERS
+    return _default_max_workers()
+
+
+# ---------------------------------------------------------------------------
+# 9a18a2b2 -- Tantivy single-writer lock conflict handling
+# ---------------------------------------------------------------------------
+
+class TantivyLockConflict(Exception):
+    """Raised when Tantivy's own single-writer lock is already held by
+    another writer (same process or a different one) for this index's
+    on-disk directory.
+
+    Tantivy already ships a real lock file with a clean, identifiable
+    failure (``LockBusy``) -- unlike code-intel's raw-SQLite Windows rename
+    bug, there is no ambiguous partial-write corruption risk here. This
+    class exists purely so :class:`OutputsFtsIndex` can recognise that ONE
+    specific, expected failure mode and surface a clear, actionable message
+    (see :meth:`OutputsFtsIndex._connect_tantivy`) instead of it vanishing
+    into the broad ``except Exception`` handlers that already wrap every
+    Tantivy call site (best-effort by design -- see
+    :meth:`OutputsFtsIndex.rebuild`/:meth:`OutputsFtsIndex.search`
+    docstrings). This is deliberately NOT a cross-process coordination
+    mechanism -- no retry loop, no new locking primitive, just a named,
+    loggable, testable failure instead of an opaque one.
+    """
+
+
+_TANTIVY_LOCK_MARKERS = ("lockbusy", "failed to acquire", "index lock")
+
+
+def _is_tantivy_lock_conflict(exc: BaseException) -> bool:
+    """Best-effort sniff for Tantivy's single-writer lock-conflict error.
+
+    The official ``tantivy`` PyPI bindings raise a plain ``ValueError`` (not
+    a dedicated exception type) whose message contains "LockBusy" / "Failed
+    to acquire index lock" (tantivy-rs's own ``LockError::LockBusy``
+    variant, confirmed live against this exact bindings version). String-
+    sniffing is the same pragmatic approach this module already takes for
+    other optional/lazy-imported libraries that don't expose typed
+    exceptions of their own.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in _TANTIVY_LOCK_MARKERS)
 
 
 class OutputsFtsIndex:
@@ -816,11 +1128,24 @@ class OutputsFtsIndex:
         *,
         db_path: str = ":memory:",
         connection: Any = None,
-        hasher: Callable[[str], str | None] = _sha256_file,
+        hasher: Callable[[str], str | None] = _xxh3_file,
+        max_workers: int | None = None,
+        exclude_patterns: tuple[str, ...] | None = None,
     ) -> None:
         self.outputs_dir = outputs_dir
         self._db_path = db_path
         self._hasher = hasher
+        # acac2599 -- Phase-1 ThreadPoolExecutor worker cap: explicit param >
+        # MERIDIAN_OUTPUTS_MAX_WORKERS env var > hardcoded default (8, the
+        # previous unconfigurable behaviour).
+        self._max_workers = _resolve_max_workers(max_workers)
+        # fd4dd661 -- user-configurable gitignore-style exclude patterns:
+        # explicit param > MERIDIAN_OUTPUTS_EXCLUDE_PATTERNS env var > empty
+        # (unchanged default behaviour -- only secret-file exclusion applies).
+        self._exclude_patterns: tuple[str, ...] = (
+            tuple(exclude_patterns) if exclude_patterns is not None
+            else _default_exclude_patterns()
+        )
         self._write_lock = IndexFileLock(db_path)
         self._read_lock = threading.RLock()  # in-process query serialisation
         self._con = connection
@@ -864,6 +1189,17 @@ class OutputsFtsIndex:
         # 8163816e -- gates the one-time-per-process migration check that
         # backfills Tantivy from any pre-existing DuckDB rows (upgrade path).
         self._tantivy_migration_checked = False
+        # 9a18a2b2 -- last Tantivy lock-conflict message (if any), surfaced
+        # by search_outputs() as an actionable warning. None whenever the
+        # last attempt to open/reuse the Tantivy writer succeeded (or none
+        # was ever attempted yet).
+        self._last_tantivy_error: str | None = None
+        # 49b97a6a -- set True when _check_hash_algo_version() (called from
+        # _connect()) detects this db_path's outputs_index table predates
+        # the xxHash swap (984b237c) and needs a one-time full re-hash.
+        # Cleared once a rebuild() call fully converges (walk complete, no
+        # deadline breach, empty backlog) -- see rebuild()'s tail.
+        self._pending_hash_upgrade = False
 
     def _connect(self) -> Any:
         if self._con is None:
@@ -886,6 +1222,22 @@ class OutputsFtsIndex:
                         "OutputsFtsIndex._connect: tantivy index probe failed",
                         exc_info=True,
                     )
+            # 49b97a6a -- follow-up to 984b237c's xxHash swap: a DB written
+            # before the swap can hold SHA-256 values under the same
+            # 'sha256' column xxHash now writes to. Rehydrating those rows
+            # as "already indexed" would let them silently mix algorithms
+            # with newly-hashed rows forever (archival-dedup would then
+            # false-negative across that boundary -- the exact bug this
+            # item fixes). Detect + flag BEFORE rehydration, since the flag
+            # decides whether rehydration should even run this connect.
+            needs_full_rehash = False
+            try:
+                needs_full_rehash = self._check_hash_algo_version(self._con)
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._connect: hash-algo version check failed",
+                    exc_info=True,
+                )
             # QUICK PATCH (2026-07-16, live diagnosis) -- 0c1a4349 made the
             # outputs_index TABLE persist to disk, but _manifest/_row_cache
             # (the in-memory staleness-detection state) were never rehydrated
@@ -898,13 +1250,21 @@ class OutputsFtsIndex:
             # from scratch instead of continuing past where the last one left
             # off. Rehydrate from the existing table (if any) so restarts
             # resume instead of restarting.
-            try:
-                self._rehydrate_cache_from_disk()
-            except Exception:  # noqa: BLE001
-                _log.debug(
-                    "OutputsFtsIndex._connect: cache rehydration failed",
-                    exc_info=True,
-                )
+            #
+            # 49b97a6a -- SKIPPED when needs_full_rehash is True: leaving
+            # _manifest/_row_cache empty makes every existing row look
+            # exactly as "cold" as a brand-new tree, so the already-proven
+            # incremental convergence machinery below (staleness detection,
+            # ThreadPoolExecutor analysis, Phase 2 write) re-analyses AND
+            # re-hashes every row for real, with zero new code paths.
+            if not needs_full_rehash:
+                try:
+                    self._rehydrate_cache_from_disk()
+                except Exception:  # noqa: BLE001
+                    _log.debug(
+                        "OutputsFtsIndex._connect: cache rehydration failed",
+                        exc_info=True,
+                    )
         return self._con
 
     def _rehydrate_cache_from_disk(self) -> None:
@@ -968,6 +1328,78 @@ class OutputsFtsIndex:
                 "cached rows from disk", len(fetched),
             )
 
+    def _read_hash_algo_version(self, con: Any) -> int:
+        """Return the ``hash_algo_version`` stored in ``outputs_index_meta``,
+        or 0 if unset/unreadable (covers both "brand-new DB" and "genuinely
+        pre-49b97a6a DB that never had this row at all")."""
+        try:
+            row = con.execute(
+                "SELECT value FROM outputs_index_meta "
+                "WHERE key = 'hash_algo_version'"
+            ).fetchone()
+        except Exception:  # noqa: BLE001
+            return 0
+        if row is None or row[0] is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
+    def _write_hash_algo_version(self, con: Any, version: int) -> None:
+        """Upsert ``hash_algo_version`` via delete-then-insert -- same
+        pattern :meth:`_add_annotation_locked` already uses, rather than
+        relying on DuckDB's ``ON CONFLICT`` support."""
+        con.execute(
+            "DELETE FROM outputs_index_meta WHERE key = 'hash_algo_version'"
+        )
+        con.execute(
+            "INSERT INTO outputs_index_meta (key, value) VALUES "
+            "('hash_algo_version', ?)",
+            [str(version)],
+        )
+
+    def _check_hash_algo_version(self, con: Any) -> bool:
+        """49b97a6a -- detect a pre-xxHash (984b237c) on-disk DB and flag it
+        for a one-time full re-hash instead of silently mixing SHA-256 (old
+        rows, untouched since before the upgrade) with xxHash (newly-stale
+        rows) under the same ``sha256`` column -- archival-dedup would
+        otherwise false-negative across that boundary forever.
+
+        Returns True when THIS instance needs a full re-hash -- the caller
+        (:meth:`_connect`) must then skip :meth:`_rehydrate_cache_from_disk`
+        so every existing row looks exactly as "cold" as a brand-new tree,
+        letting the ordinary incremental convergence machinery in
+        :meth:`rebuild` do the actual re-hashing with no separate code path.
+
+        A brand-new (empty) ``outputs_index`` table is NOT a legacy DB --
+        there is nothing to re-hash, so the current version is written
+        immediately and this returns False, matching pre-49b97a6a behaviour
+        exactly for the common (fresh-DB) case.
+        """
+        self._ensure_schema(con)
+        stored = self._read_hash_algo_version(con)
+        if stored >= _HASH_ALGO_VERSION:
+            return False
+        if stored == 0:
+            try:
+                has_rows = con.execute(
+                    "SELECT 1 FROM outputs_index LIMIT 1"
+                ).fetchone() is not None
+            except Exception:  # noqa: BLE001
+                has_rows = False
+            if not has_rows:
+                self._write_hash_algo_version(con, _HASH_ALGO_VERSION)
+                return False
+        _log.info(
+            "OutputsFtsIndex: hash_algo_version %d < current %d for %r -- "
+            "scheduling a one-time full re-hash (upgrading archival-dedup "
+            "hashing from SHA-256 to xxHash, 984b237c/49b97a6a)",
+            stored, _HASH_ALGO_VERSION, self._db_path,
+        )
+        self._pending_hash_upgrade = True
+        return True
+
     @staticmethod
     def _tantivy_schema() -> Any:
         import tantivy  # noqa: PLC0415
@@ -982,13 +1414,38 @@ class OutputsFtsIndex:
         """Directory Tantivy persists its index segments to, a sibling of the
         DuckDB cache file. None (RAM index, no persistence) when db_path is
         ':memory:' -- mirrors _resolve_index_db_path's own degrade-gracefully
-        behaviour for a directory that can't be created."""
+        behaviour for a directory that can't be created.
+
+        5d0b3866 -- MUST be unique per ``db_path``, not merely per PARENT
+        directory. The previous implementation used a single fixed
+        ``<parent>/tantivy_index`` name, so any two distinct ``db_path``
+        values sharing a parent (e.g. multiple .duckdb files dropped in the
+        same tmp/ folder during testing, or any future multi-db layout)
+        silently collided on ONE tantivy directory. Confirmed live: a
+        second index's :meth:`_connect` would find the FIRST index's
+        on-disk Tantivy segments already there via ``tantivy.Index.exists``
+        and set ``_fts_built = True`` from a completely unrelated index's
+        state, after which :meth:`search` queried Tantivy content that had
+        nothing to do with this instance's own DuckDB rows -- returning 0
+        hits for terms genuinely present in every one of the colliding
+        instances' own files.
+
+        Fixed by deriving the directory name from the full, absolute
+        ``db_path`` itself: a short content hash guarantees two distinct
+        ``db_path`` values NEVER collide (even after any sanitisation), and
+        a sanitised filename stem is appended purely for human
+        readability/debugging -- it plays no role in uniqueness.
+        """
         if self._db_path == ":memory:":
             return None
-        base = os.path.dirname(self._db_path)
+        canonical = os.path.abspath(self._db_path)
+        base = os.path.dirname(canonical)
         if not base:
             return None
-        tdir = os.path.join(base, "tantivy_index")
+        stem = os.path.splitext(os.path.basename(canonical))[0]
+        safe_stem = re.sub(r"[^A-Za-z0-9_.-]", "_", stem) or "index"
+        digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:10]
+        tdir = os.path.join(base, f"tantivy_index__{safe_stem}__{digest}")
         try:
             os.makedirs(tdir, exist_ok=True)
         except OSError:
@@ -1000,16 +1457,51 @@ class OutputsFtsIndex:
         same lifecycle pattern as :meth:`_connect` for the DuckDB connection.
         Tantivy allows only one live writer per index, so this instance keeps
         a single writer alive across calls rather than opening/closing one
-        per commit."""
+        per commit.
+
+        9a18a2b2 -- Tantivy enforces this with a real single-writer lock
+        file: a SECOND live writer against the same directory (this process
+        racing itself, or a different process/session indexing the same
+        outputs_dir concurrently) makes ``index.writer()`` raise a clean,
+        identifiable error (:func:`_is_tantivy_lock_conflict`) rather than
+        corrupting anything. This is intentionally NOT turned into a
+        cross-process coordination mechanism (no retry/backoff loop, no new
+        locking primitive) -- that's explicitly out of scope here. Instead
+        the conflict is recognised, logged at WARNING (not buried at DEBUG
+        inside the broad ``except Exception`` blocks that already wrap
+        every caller of this method -- rebuild()/search() stay best-effort
+        and never crash from this), and re-raised as
+        :class:`TantivyLockConflict` with an actionable message that
+        :attr:`_last_tantivy_error` records for callers (search_outputs()
+        surfaces it as ``result["tantivy_lock_warning"]``).
+        """
         if self._tantivy_index is None:
             import tantivy  # noqa: PLC0415
             schema = self._tantivy_schema()
             tdir = self._tantivy_dir()
-            self._tantivy_index = (
+            index = (
                 tantivy.Index(schema, path=tdir) if tdir is not None
                 else tantivy.Index(schema)
             )
-            self._tantivy_writer = self._tantivy_index.writer()
+            try:
+                writer = index.writer()
+            except Exception as exc:  # noqa: BLE001
+                if not _is_tantivy_lock_conflict(exc):
+                    raise
+                message = (
+                    f"Tantivy index at {tdir!r} is locked by another writer "
+                    "(this process or a different one is already indexing "
+                    "this outputs_dir). Rows already analysed this call "
+                    "remain safe in the DuckDB metadata table; the search "
+                    "index will catch up automatically on a later call "
+                    "once the other writer releases the lock."
+                )
+                self._last_tantivy_error = message
+                _log.warning("OutputsFtsIndex._connect_tantivy: %s", message)
+                raise TantivyLockConflict(message) from exc
+            self._last_tantivy_error = None
+            self._tantivy_index = index
+            self._tantivy_writer = writer
         return self._tantivy_index, self._tantivy_writer
 
     def _migrate_duckdb_rows_to_tantivy_if_needed(
@@ -1070,6 +1562,13 @@ class OutputsFtsIndex:
             "run_params_json VARCHAR, "
             "created_at DOUBLE NOT NULL, updated_at DOUBLE NOT NULL, "
             "source VARCHAR NOT NULL DEFAULT 'tool')"
+        )
+        # 49b97a6a -- small key/value metadata table; currently only holds
+        # 'hash_algo_version' (see _check_hash_algo_version), kept generic
+        # so future schema-version markers don't need a new table each time.
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS outputs_index_meta ("
+            "key VARCHAR PRIMARY KEY, value VARCHAR)"
         )
 
     def add_annotation(
@@ -1272,7 +1771,9 @@ class OutputsFtsIndex:
         newly_seen: list[str] = []
         if os.path.isdir(self.outputs_dir):
             if self._walk_state is None:
-                self._walk_state = _ResumableFileWalk(self.outputs_dir)
+                self._walk_state = _ResumableFileWalk(
+                    self.outputs_dir, exclude_patterns=self._exclude_patterns,
+                )
                 self._walk_accumulated = []
             if len(self._pending_stale) < _ResumableFileWalk._MAX_BATCH:
                 newly_seen = self._walk_state.drain(phase1_deadline)
@@ -1344,9 +1845,11 @@ class OutputsFtsIndex:
         # dict and processed in sorted order to guarantee determinism.
         precomputed: dict[str, _FileAnalysis] = {}
         if stale:
-            # Cap workers at 8 to avoid spawning hundreds of threads for a huge
-            # outputs tree; I/O is the bottleneck, not CPU count.
-            max_workers = min(8, len(stale))
+            # acac2599 -- cap workers at self._max_workers (constructor param
+            # > MERIDIAN_OUTPUTS_MAX_WORKERS env var > 8, see
+            # _resolve_max_workers) to avoid spawning hundreds of threads for
+            # a huge outputs tree; I/O is the bottleneck, not CPU count.
+            max_workers = min(self._max_workers, len(stale))
             # Not a `with` block: on a deadline breach we need
             # shutdown(wait=False, cancel_futures=True) so still-queued work is
             # dropped immediately. A `with` block's default __exit__ calls
@@ -1555,6 +2058,30 @@ class OutputsFtsIndex:
             # to catch this case.
             if self.last_rebuild_partial and not self._fts_built:
                 self._fts_pending = True
+            # 49b97a6a -- once a hash-algo upgrade is pending (_connect()
+            # found an old-version DB and skipped cache rehydration so every
+            # row would look cold), only persist the new version marker once
+            # THIS call has genuinely converged: the walk finished a full
+            # pass, no deadline was breached, and nothing is left in the
+            # stale backlog. Writing the marker any earlier would let a
+            # process restart mid-upgrade rehydrate a DB that still has a
+            # genuine SHA-256/xxHash mix as "fully current" -- the exact
+            # silent-mix bug this item exists to prevent.
+            if (self._pending_hash_upgrade and not self.last_rebuild_partial
+                    and not self._pending_stale):
+                try:
+                    upgrade_con = self._connect()
+                    self._write_hash_algo_version(upgrade_con, _HASH_ALGO_VERSION)
+                    self._pending_hash_upgrade = False
+                    _log.info(
+                        "OutputsFtsIndex: full re-hash upgrade complete for %r",
+                        self._db_path,
+                    )
+                except Exception:  # noqa: BLE001
+                    _log.debug(
+                        "OutputsFtsIndex.rebuild: failed to persist "
+                        "hash_algo_version", exc_info=True,
+                    )
             return len(rows)
 
     def _apply_precomputed(
@@ -1975,6 +2502,13 @@ def search_outputs(
         # caller knows to re-invoke (the next search() call will build FTS).
         result["fts_pending"] = True
         result["partial"] = True
+    if index._last_tantivy_error:
+        # 9a18a2b2 -- Tantivy's single-writer lock was held by another
+        # writer during this call. rebuild()/search() already degraded
+        # gracefully (never raised), but a caller silently getting fewer/no
+        # hits with no indication why isn't actionable -- surface the same
+        # clear message OutputsFtsIndex already logged at WARNING.
+        result["tantivy_lock_warning"] = index._last_tantivy_error
     return result
 
 

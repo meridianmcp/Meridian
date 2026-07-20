@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -1295,6 +1296,49 @@ def test_run_tunnel_extra_fs_roots_union(monkeypatch, tmp_path):
     assert roots is not None
     assert "/server/root" in roots                       # server roots preserved
     assert any("Outputs" in r for r in roots)            # extra root unioned in
+
+
+def test_run_tunnel_code_slot_wired_with_dedicated_cache_and_reuse(monkeypatch, tmp_path):
+    """3475c72f/8e10fb80 — the default (non-overridden) code-intel slot's
+    SlotProxy is constructed with reuse_existing=True and an env carrying a
+    dedicated CBM_CACHE_DIR, end-to-end through run_tunnel's real wiring (not
+    just the helper functions in isolation)."""
+    _stub_run_tunnel_spawn(monkeypatch, code_binary="/bin/codebase-memory-mcp")
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "tid-x", "plan": "pro"}),
+    )
+    monkeypatch.setattr(
+        tc, "_fetch_filesystem_roots",
+        AsyncMock(return_value=([], [], "", [])),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+
+    captured = {}
+    real_slot_proxy = tc.SlotProxy
+
+    class _RecordingSlotProxy(real_slot_proxy):
+        def __init__(self, cmd, port, label, env=None, client_id="", reuse_existing=False):
+            if label == "code":
+                captured["env"] = env
+                captured["reuse_existing"] = reuse_existing
+            super().__init__(
+                cmd, port, label, env=env, client_id=client_id,
+                reuse_existing=reuse_existing,
+            )
+
+    monkeypatch.setattr(tc, "SlotProxy", _RecordingSlotProxy)
+
+    rc = _run_tunnel(token="sk", base_url="https://x", repo_path=str(tmp_path))
+
+    assert rc == 0
+    assert captured["reuse_existing"] is True
+    env = captured["env"]
+    assert env is not None
+    assert env["CBM_CACHE_DIR"] == str(tc._code_intel_cache_dir())
+    # Popen(env=...) REPLACES the whole child env — PATH must survive the merge.
+    assert env["PATH"] == os.environ["PATH"]
 
 
 def _capture_serena_and_index(monkeypatch):

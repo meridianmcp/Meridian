@@ -316,6 +316,20 @@ class SlotProxy:
                    "orphaned from a dead prior-generation tunnel".  ``None`` /
                    empty string disables claim-file tracking (degrades safely to
                    the original 963d0bd kill-unconditionally behaviour).
+        reuse_existing: (8e10fb80) When True, an already-live, healthy occupant
+                   of ``port`` is treated as this slot's backing server instead
+                   of being killed-and-respawned (the orphan path) or refused
+                   (the live-peer path) — see :meth:`ensure_running`. Only safe
+                   for a slot whose inner server is NOT bound to one specific
+                   repo_path at spawn time (any live occupant is guaranteed to
+                   serve identical content), which today means the "code" slot
+                   only (codebase-memory-mcp self-manages per-project indices
+                   keyed by the repo_path passed to each tool call, so a
+                   pre-existing instance — ours from a prior generation, a
+                   peer's, or one left behind by a client that reconnected
+                   without a clean kill — is always safe and correct to reuse).
+                   Defaults False so fs/extract (repo_path-bound at spawn) keep
+                   their existing kill-or-refuse behaviour unchanged.
     """
 
     def __init__(
@@ -325,13 +339,20 @@ class SlotProxy:
         label: str,
         env: "dict | None" = None,
         client_id: str = "",
+        reuse_existing: bool = False,
     ) -> None:
         self.cmd = cmd
         self.port = port
         self.label = label
         self.env = env
         self.client_id: str = client_id
+        self.reuse_existing = reuse_existing
         self._proc: "subprocess.Popen | None" = None
+        # 8e10fb80 — True while this slot is fronting a process we did NOT
+        # spawn (detected via reuse_existing). Distinct from ``_proc`` so
+        # ``is_running``/``kill`` can tell "we own this" from "someone else
+        # owns this, we're just not duplicating it".
+        self._reused: bool = False
         self._last_used: float = 0.0
         self._lock = asyncio.Lock()
         # Holder dict for _proc_watchdog compatibility.
@@ -368,6 +389,14 @@ class SlotProxy:
         """
         if self._proc is not None and self._proc.poll() is None:
             return True
+        # 8e10fb80 — a reused (not-ours) occupant: cheap, synchronous port
+        # check rather than re-running the full async MCP health probe on
+        # every request. If it's gone, fall through to the normal not-running
+        # path so the next ensure_running() call re-detects or respawns.
+        if self._reused:
+            if _port_is_open(self.port):
+                return True
+            self._reused = False
         # Launcher handle absent or exited — the real server may still be
         # listening (Windows cmd/c + detached npx grandchild). Only probe the
         # port once we've actually attempted a spawn, so a never-started slot
@@ -432,6 +461,30 @@ class SlotProxy:
             # 105b5aa9 — check port occupancy right before spawning so we
             # never blindly double-spawn into an already-bound port.
             if _port_is_open(self.port):
+                # 8e10fb80 — reuse-eligible slots (currently just "code"):
+                # before treating the occupant as a peer-conflict or an
+                # orphan-to-kill, health-probe it. A live, healthy occupant is
+                # always safe to front for this slot's requests (see the
+                # reuse_existing docstring), so this closes BOTH confirmed
+                # live duplication modes: a prior generation's spawn left
+                # alive by a reconnect that skipped a clean kill (would
+                # otherwise hit the orphan-kill path below and throw away a
+                # warm index for no reason), and a second concurrent spawn
+                # racing an already-live instance (would otherwise either get
+                # killed by a peer's claim-check or collide on the same
+                # index-db file — see _code_intel_cache_dir).
+                if self.reuse_existing and await _probe_slot_health(
+                    self.port, attempts=1, delay=0.0
+                ):
+                    print(
+                        f"tunnel:{self.label}: an instance is already running on "
+                        f"port {self.port} — reusing it instead of spawning a "
+                        "duplicate",
+                        flush=True,
+                    )
+                    self._reused = True
+                    self.touch()
+                    return
                 if _is_slot_claimed_by_live_client(self.port, self.client_id):
                     # Port is held by a peer tunnel — do NOT kill it; fail
                     # loud so the operator can see the conflict clearly instead
@@ -531,7 +584,17 @@ class SlotProxy:
 
         aaddb273 — also clears the slot-claim file so a subsequent startup does
         not see a stale claim from this run after we explicitly tore down.
+
+        8e10fb80 — a reused occupant (``self._reused``) was never spawned by
+        us: it may belong to a peer tunnel, a prior generation, or an
+        external process entirely. Killing it would take down someone else's
+        live server. Just drop our reuse tracking instead — the next
+        ensure_running() call re-detects it (still there → reused again; gone
+        → this slot spawns its own).
         """
+        if self._reused:
+            self._reused = False
+            return
         _terminate_proc_tree(self._proc)
         self._proc = None
         self.holder["proc"] = None
@@ -2416,6 +2479,62 @@ def _managed_bin_dir() -> "Path":
     return Path.home() / ".meridian" / "bin"
 
 
+def _code_intel_cache_dir() -> "Path":
+    """Dedicated ``CBM_CACHE_DIR`` for the tunnel's OWN code-intel slot (3475c72f).
+
+    codebase-memory-mcp persists its per-project index under ``CBM_CACHE_DIR``
+    (default ``~/.cache/codebase-memory-mcp`` when unset), keyed only by a slug
+    of the indexed repo path — so with the default env, EVERY
+    codebase-memory-mcp instance on a machine that indexes the same repo
+    writes to the exact same ``.db`` file, no matter who spawned it or how.
+    Confirmed live: that shared-by-default file is the actual collision behind
+    the Windows rename-on-open-file bug documented at
+    ``_POOL_HARD_PINNED_SLOTS`` — two independently-spawned processes (the
+    tunnel's own slot vs. a Desktop-direct-connector entry, or two
+    Desktop-direct-connector generations after a reconnect that left the first
+    orphaned) both hold the same index file open at once.
+
+    Pointing the tunnel's own spawn at a private, Meridian-managed cache dir
+    sidesteps the collision entirely for the one consumer this codebase
+    controls: it can never again contend for the same file as any
+    externally-spawned copy of the binary. It does NOT — and cannot — stop two
+    externally-spawned copies from colliding with each other; that spawn path
+    is outside this process's control. (8e10fb80's reuse_existing guards the
+    case this code CAN control: the tunnel's own slot spawning a second copy
+    of itself.)
+    """
+    return Path.home() / ".meridian" / "code-intel-cache"
+
+
+def _code_intel_spawn_env() -> "dict[str, str]":
+    """Full ``subprocess.Popen`` env for the code-intel slot: the parent env
+    plus a dedicated ``CBM_CACHE_DIR`` (see :func:`_code_intel_cache_dir`) —
+    UNLESS the parent process already has ``CBM_CACHE_DIR`` set, in which
+    case that explicit choice is honoured unchanged. An operator who has
+    deliberately pointed codebase-memory-mcp at a shared/custom location
+    (e.g. a network path for the tool's own team-sharing artifact feature)
+    knows what they're doing; this fix's job is only to stop the *unset*
+    default from silently colliding across independently-spawned consumers,
+    not to overrule an intentional override.
+
+    ``Popen(env=...)`` REPLACES the child's entire environment when not
+    ``None`` — it does not merge with the parent — so this always starts from
+    a full copy of ``os.environ`` (PATH, etc. must survive) rather than a bare
+    override dict. Mirrors the existing ``_plugin_spawn_env`` /
+    ``_office_slot_spawn_env`` pattern used for the other slots.
+    """
+    env = dict(os.environ)
+    if not env.get("CBM_CACHE_DIR"):
+        cache_dir = _code_intel_cache_dir()
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:  # noqa: BLE001 — best-effort; codebase-memory-mcp
+            # creates its cache dir itself on first write if this didn't.
+            pass
+        env["CBM_CACHE_DIR"] = str(cache_dir)
+    return env
+
+
 def _win_shell_safe_path(path: str) -> str:
     """Make *path* safe to pass as a single token through mcp-proxy ``--shell``
     on Windows (89bc72c4).
@@ -4221,7 +4340,18 @@ async def run_tunnel(
                     flush=True, file=sys.stderr,
                 )
             print(f"  code-intel:        lazy-spawn on port {code_port}", flush=True)
-            proxy_code = SlotProxy(cmd_code, code_port, "code", client_id=_client_id)
+            # 3475c72f — a dedicated CBM_CACHE_DIR for this consumer's spawn so
+            # it can never collide (same on-disk index .db) with a
+            # Desktop-direct-connector spawn or a stray earlier generation —
+            # see _code_intel_cache_dir. 8e10fb80 — reuse_existing=True: this
+            # binary self-manages per-project indices keyed by repo_path, so
+            # any already-live, healthy occupant of code_port is safe to
+            # front instead of killing it or spawning a duplicate.
+            proxy_code = SlotProxy(
+                cmd_code, code_port, "code",
+                env=_code_intel_spawn_env(), client_id=_client_id,
+                reuse_existing=True,
+            )
             slot_proxies.append(proxy_code)
         else:
             print(
