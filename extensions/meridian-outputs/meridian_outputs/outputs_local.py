@@ -148,16 +148,22 @@ def is_secret_path(path: str) -> bool:
     return False
 
 
-def _iter_safe_output_files(outputs_dir: str) -> list[str]:
-    """Walk ``outputs_dir`` recursively, returning regular files that pass the
-    secret-file exclusion filter, sorted for deterministic ordering.
+def _walk_safe_output_files(outputs_dir: str):
+    """Generator yielding regular files under ``outputs_dir`` that pass the
+    secret-file exclusion filter, in deterministic (sorted-directories,
+    sorted-files) order -- the same order :func:`_iter_safe_output_files`
+    has always returned.
+
+    This is a plain generator, which means pulling from it can be paused
+    (simply stop calling ``next()``) and resumed later exactly where it left
+    off, at zero extra cost.  That property is what makes
+    :class:`_ResumableFileWalk` possible (6ba77ada) -- see its docstring.
 
     MERIDIAN_NOTES.md files are included (they are picked up for annotation
     ingestion in rebuild, not FTS content rows -- same behaviour as the
     original).  Hidden directories (names starting with ``.``) are pruned to
     avoid walking .git/.env directories.
     """
-    found: list[str] = []
     for root, dirs, files in os.walk(outputs_dir):
         # Prune hidden directories in-place so os.walk doesn't descend them.
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
@@ -166,8 +172,83 @@ def _iter_safe_output_files(outputs_dir: str) -> list[str]:
             if is_secret_path(p):
                 _log.debug("outputs_local: skipping secret-pattern file %r", p)
                 continue
-            found.append(p)
-    return found
+            yield p
+
+
+def _iter_safe_output_files(outputs_dir: str) -> list[str]:
+    """Walk ``outputs_dir`` recursively, returning regular files that pass the
+    secret-file exclusion filter, sorted for deterministic ordering.
+
+    This blocks until the walk completes -- fine for a one-shot, small-tree
+    caller (e.g. :func:`build_output_rows`), but NOT deadline-aware: on a
+    large tree (tens of thousands of files) this call alone can take far
+    longer than any reasonable budget.  :meth:`OutputsFtsIndex.rebuild` does
+    NOT call this directly for that reason -- it uses
+    :class:`_ResumableFileWalk` instead, which bounds each walk increment by
+    ``rebuild()``'s own deadline (6ba77ada).
+    """
+    return list(_walk_safe_output_files(outputs_dir))
+
+
+class _ResumableFileWalk:
+    """Deadline-bounded, resumable wrapper around :func:`_walk_safe_output_files`.
+
+    6ba77ada -- the plain, blocking :func:`_iter_safe_output_files` walk has
+    zero deadline awareness: on a large tree it can by itself take far
+    longer than :meth:`OutputsFtsIndex.rebuild`'s entire ``max_seconds``
+    budget, starving Phase 1/Phase 2 of any chance to run at all (confirmed
+    live: ~11s to walk a 70,000-file tree vs. the 5s default budget -- every
+    call returned 0 rows, forever, because by the time the walk finished both
+    Phase 1's own sub-deadline, 5845cc6d, AND the overall deadline had
+    already passed). :meth:`drain` pulls paths from the underlying generator
+    only until ``deadline`` (a ``time.monotonic()`` value) is reached, so a
+    single call can never consume more than its allotted share of the
+    budget. Because the wrapped object is a Python generator, pausing and
+    resuming it costs nothing extra: the next :meth:`drain` call continues
+    exactly where the previous one stopped, so a full walk of a huge tree is
+    amortised across as many ``rebuild()`` calls as it needs instead of
+    blocking the first one.
+    """
+
+    # 6ba77ada -- caps how many paths a single drain() can hand back, in
+    # addition to the time-based deadline. Enumerating a directory entry is
+    # cheap enough that a deadline-bound drain() can hand back tens of
+    # thousands of paths in one go on a fast disk -- far more than Phase 1/2
+    # (real per-file I/O: stat + read + hash + DB write) can realistically
+    # analyse and persist within the SAME call's remaining budget. Since the
+    # walk only resumes once `self._pending_stale` (the backlog this batch
+    # feeds) is empty (see rebuild()'s Phase 0 throttle), an oversized batch
+    # here directly becomes an oversized backlog that then takes many calls
+    # to work down -- not because the walk itself is slow, but because it
+    # was allowed to run so far ahead of the analysis/write stages. Capping
+    # the batch keeps each throttle cycle's backlog proportionate to what
+    # Phase 1/2 can plausibly clear in a comparable amount of time.
+    _MAX_BATCH = 2000
+
+    def __init__(self, outputs_dir: str) -> None:
+        self._iterator = _walk_safe_output_files(outputs_dir)
+        self.exhausted = False
+
+    def drain(self, deadline: float | None) -> list[str]:
+        """Pull paths until the walk is exhausted, ``deadline`` passes, or
+        ``_MAX_BATCH`` paths have been collected -- whichever comes first.
+
+        Always pulls at least one path per call (if any remain) before
+        checking the deadline, so a single ``drain()`` call can never spin
+        forever without making any progress even when ``deadline`` is
+        already in the past.
+        """
+        found: list[str] = []
+        if self.exhausted:
+            return found
+        for path in self._iterator:
+            found.append(path)
+            if len(found) >= self._MAX_BATCH:
+                return found
+            if deadline is not None and time.monotonic() > deadline:
+                return found
+        self.exhausted = True
+        return found
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +836,18 @@ class OutputsFtsIndex:
         self._manifest: dict[str, tuple[float | None, int | None]] = {}
         self._row_cache: dict[str, OutputRow] = {}
         self.last_rebuild_partial = False
+        # 6ba77ada -- resumable file-walk state (see _ResumableFileWalk). None
+        # when no walk pass is currently in progress; set at the start of a
+        # pass and cleared once that pass's walk finishes. _walk_accumulated
+        # holds every path discovered so far in the CURRENT in-progress pass.
+        self._walk_state: "_ResumableFileWalk | None" = None
+        self._walk_accumulated: list[str] = []
+        # 6ba77ada -- backlog of paths confirmed stale (by the staleness
+        # check below) but not yet successfully analysed + written. Persists
+        # across calls so a straggler is retried, not lost or re-detected
+        # from scratch, AND doubles as the signal the walk throttle (above)
+        # uses to pause further discovery until Phase 1/2 catch up.
+        self._pending_stale: dict[str, tuple[float | None, int | None]] = {}
         # 77443d83 -- Tantivy replaces DuckDB's own FTS extension for the
         # search index; DuckDB (self._con) remains the metadata store (path,
         # content, mtime, sha256, ... -- see _COLUMNS) that resolve_output and
@@ -1143,31 +1236,107 @@ class OutputsFtsIndex:
                             else time.monotonic() + max_seconds * _PHASE1_BUDGET_FRACTION)
 
         # ------------------------------------------------------------------
-        # Phase 1: read-only pre-analysis (no lock, may run in parallel)
+        # Phase 0: deadline-aware, resumable file walk (6ba77ada)
         # ------------------------------------------------------------------
-        all_paths: list[str] = (
-            _iter_safe_output_files(self.outputs_dir)
-            if os.path.isdir(self.outputs_dir) else []
-        )
+        # The plain, blocking _iter_safe_output_files() walk has no deadline
+        # awareness of its own and can by itself take far longer than the
+        # entire rebuild() budget on a huge tree (confirmed live: ~11s to
+        # walk a 70k-file tree vs. the 5s default budget -- Phase 1/Phase 2
+        # never got a chance to run at all, every call returning 0 rows
+        # forever). The walk shares Phase 1's own sub-deadline
+        # (`phase1_deadline`, computed above from the same start point as the
+        # overall `deadline`) -- this matches 5845cc6d's original intent,
+        # whose comment already assumed "time already spent on the walk"
+        # would eat into Phase 1's share; it just assumed the walk itself was
+        # bounded, which it wasn't. _ResumableFileWalk wraps a Python
+        # generator, so pausing/resuming a walk across multiple rebuild()
+        # calls costs nothing extra -- a full pass over a huge tree is
+        # amortised across as many calls as it needs instead of blocking the
+        # first one.
+        # The walk is additionally THROTTLED to only discover more files
+        # while the already-known backlog of confirmed-stale files still
+        # waiting on Phase 1/2 (`self._pending_stale`, populated below) is
+        # smaller than one walk batch. Without this, on a tree where the
+        # walk can discover files far faster than Phase 1/2 can
+        # analyse+persist them (which is exactly the situation this fix
+        # creates), the backlog would grow without bound and every call
+        # would waste most of its budget re-submitting/re-considering an
+        # ever-larger backlog instead of ever shrinking it. A backlog-size
+        # threshold (rather than "only when fully empty") matters for small
+        # trees too: a pathologically tight first call can leave a tiny
+        # (e.g. single-digit) backlog that Phase 1/2 will trivially clear
+        # alongside a full batch of freshly-discovered files on the very
+        # next call -- gating strictly on "empty" would instead stall
+        # discovery of the REST of a small tree for an extra call for no
+        # benefit, since there was never a risk of overwhelming Phase 1/2.
+        newly_seen: list[str] = []
+        if os.path.isdir(self.outputs_dir):
+            if self._walk_state is None:
+                self._walk_state = _ResumableFileWalk(self.outputs_dir)
+                self._walk_accumulated = []
+            if len(self._pending_stale) < _ResumableFileWalk._MAX_BATCH:
+                newly_seen = self._walk_state.drain(phase1_deadline)
+                self._walk_accumulated.extend(newly_seen)
+            walk_complete = self._walk_state.exhausted
+        else:
+            self._walk_state = None
+            self._walk_accumulated = []
+            self._pending_stale = {}
+            walk_complete = True
+
+        if walk_complete:
+            # A full pass just finished (or outputs_dir doesn't exist) -- this
+            # is now the authoritative on-disk picture, so removed-file
+            # detection is safe. Reset resumable state so the NEXT rebuild()
+            # call starts a fresh pass and keeps catching future on-disk
+            # changes.
+            all_paths: list[str] = sorted(self._walk_accumulated)
+            self._walk_state = None
+            self._walk_accumulated = []
+            removed_paths: set[str] = set(self._manifest) - set(all_paths)
+            # A path that vanished from disk can never become un-stale --
+            # drop it from the backlog so it isn't retried forever.
+            for p in removed_paths:
+                self._pending_stale.pop(p, None)
+        else:
+            # Walk pass still in progress -- we only know about the files
+            # revisited so far THIS pass, not the full tree. Optimistically
+            # keep every previously-indexed path in the picture (assume still
+            # present until the walk actually gets around to confirming
+            # otherwise) so the reported row count and search index never
+            # regress mid-pass. Removed-file detection is deferred until the
+            # pass completes.
+            all_paths = sorted(set(self._row_cache) | set(self._walk_accumulated))
+            removed_paths = set()
 
         path_set = set(all_paths)
 
-        # Determine which paths are removed or stale (mtime/size changed).
-        # We read _manifest without the lock here.  _manifest is only mutated
-        # inside the write lock (Phase 2), so reading it here is safe as long
-        # as no concurrent rebuild() is running -- which IndexFileLock prevents.
-        removed_paths: set[str] = set(self._manifest) - path_set
-        stale: list[str] = []
-        stale_sigs: dict[str, tuple[float | None, int | None]] = {}
-        for p in all_paths:
+        # ------------------------------------------------------------------
+        # Phase 1: read-only pre-analysis (no lock, may run in parallel)
+        # ------------------------------------------------------------------
+        # Staleness (mtime/size changed) is os.stat-checked exactly once per
+        # file: only for paths the walk revisited THIS call (`newly_seen`).
+        # A confirmed-stale path is added to `self._pending_stale` (path ->
+        # captured stat signature), which persists across calls until the
+        # path is actually analysed and written -- so a straggler that
+        # Phase 1/2 didn't get to before this call's own deadline is neither
+        # lost nor re-stat-ed again next call; it just stays queued. This is
+        # what makes the walk-throttling above safe: `self._pending_stale`
+        # IS the backlog the throttle is sized against. _manifest is read
+        # without the lock here; it is only mutated inside the write lock
+        # (Phase 2), so reading it here is safe as long as no concurrent
+        # rebuild() is running -- which IndexFileLock prevents.
+        for p in newly_seen:
             try:
                 st = os.stat(p)
                 sig: tuple[float | None, int | None] = (st.st_mtime, st.st_size)
             except OSError:
                 sig = (None, None)
             if self._manifest.get(p) != sig or p not in self._row_cache:
-                stale.append(p)
-                stale_sigs[p] = sig
+                self._pending_stale[p] = sig
+
+        stale: list[str] = list(self._pending_stale)
+        stale_sigs: dict[str, tuple[float | None, int | None]] = dict(self._pending_stale)
 
         # Parallel per-file analysis for stale paths (fingerprint + hash + stat).
         # Workers run before the write lock is taken so heavy I/O (e.g. hashing
@@ -1220,8 +1389,24 @@ class OutputsFtsIndex:
         # detect archival twins correctly.  It is read-only, so it runs here
         # before the lock.  Only computed when there are stale or removed paths
         # (i.e. when something actually changed) to avoid unnecessary hashing.
+        #
+        # 6ba77ada -- ALSO gated on `walk_complete`: this call has no deadline
+        # check of its own and costs O(len(all_paths)). Before the resumable
+        # walk, `all_paths` was always the complete tree exactly once per
+        # call, so this was already an implicit per-call cost every caller
+        # accepted. With a resumable walk, `all_paths` mid-pass is a
+        # continuously-growing (but not yet authoritative) approximation --
+        # paying this cost on every intermediate call as it grows would
+        # itself become a new way to blow the budget before Phase 2 ever
+        # gets to write anything (defeats the walk fix). Running it only
+        # once the pass is complete (the picture is both final and at its
+        # largest exactly once, not repeatedly) bounds the total cost to one
+        # full-tree scan per pass instead of one per call. Rows written from
+        # mid-pass stale files get a conservative is_archival=False default
+        # in the meantime; the existing "update non-stale cached rows" loop
+        # in _apply_precomputed corrects them once this finally runs.
         classifications: dict[str, ArchivalClassification] = {}
-        if stale or removed_paths:
+        if walk_complete and (stale or removed_paths):
             # Reuse hashes already computed by workers where possible so
             # classify_canonical_archival doesn't read the same file twice.
             _precomp_hashes: dict[str, str | None] = {
@@ -1267,6 +1452,19 @@ class OutputsFtsIndex:
                     precomputed, classifications, deadline,
                 )
             )
+            # 6ba77ada -- a path only leaves the pending-stale backlog once
+            # it's actually been analysed and staged for write (`new_rows`);
+            # anything in `stale` that _apply_precomputed didn't get to this
+            # call (its own deadline check breaks early) simply stays queued
+            # for the next call instead of being silently dropped.
+            for r in new_rows:
+                self._pending_stale.pop(r.path, None)
+            if not walk_complete:
+                # 6ba77ada -- the walk itself hasn't finished a full pass yet
+                # (it's being resumed across future rebuild() calls), so the
+                # index is known-incomplete regardless of whether Phase 1/2
+                # themselves hit their own deadlines this call.
+                self.last_rebuild_partial = True
             if changed:
                 try:
                     con = self._connect()

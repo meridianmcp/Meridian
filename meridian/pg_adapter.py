@@ -3448,6 +3448,25 @@ async def _migrate_pg_sprint_item_github_channel(conn: PostgresConnection) -> No
     )
 
 
+async def _migrate_pg_claim_verification_mode(conn: PostgresConnection) -> None:
+    """4ef6ce5e — workspace_settings.claim_verification_mode (mirrors SQLite).
+
+    Three states (off/advisory/strict) controlling whether a PostToolUse hook
+    (meridian.claim_verify) re-checks claim_sprint_item/complete_sprint_item
+    calls against live DB state and warns (advisory) or blocks (strict) on a
+    narration/reality mismatch. See db.migrations._migrate_workspace_claim_verification_mode
+    for the full incident/design writeup.
+
+    ``NOT NULL DEFAULT 'off'`` — unchanged behavior for every existing
+    deployment. ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db._migrate_workspace_claim_verification_mode.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "claim_verification_mode TEXT NOT NULL DEFAULT 'off'"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3538,4 +3557,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_manual_issue_content_log_table,
     _migrate_pg_workspace_tool_priority_map,
     _migrate_pg_sprint_item_github_channel,
+    _migrate_pg_claim_verification_mode,
 )

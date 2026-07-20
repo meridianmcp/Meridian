@@ -1049,6 +1049,7 @@ No auth required.
 | `GET` | `/projects/{project_id}/sprint-items` | List sprint items, optionally filtered by status |
 | `POST` | `/projects/{project_id}/sprint-items` | Append a todo sprint item. Body: ``{version, title, group?, human_id?}`` |
 | `DELETE` | `/projects/{project_id}/sprint-items/{item_id}` | Delete a sprint item permanently |
+| `GET` | `/projects/{project_id}/sprint-items/{item_id}` | 4ef6ce5e — fetch ONE sprint item's live row, scoped to ``project_id`` |
 | `PATCH` | `/projects/{project_id}/sprint-items/{item_id}` | Update editable fields (title, version) of a sprint item |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/complete` | Mark a sprint item ``done``. Optional body: ``{task_id}`` |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/fail` | Mark a sprint item ``failed``. Optional body: ``{reason}`` |

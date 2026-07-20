@@ -1648,6 +1648,9 @@ async def handle_update_workspace_settings(
         # 490e100d — workspace-level default MCP tool priority per semantic
         # task category (hard-enforced in the /goal block).
         tool_priority_map=args.get("tool_priority_map"),
+        # 4ef6ce5e — off/advisory/strict: does a PostToolUse hook re-check
+        # claim_sprint_item/complete_sprint_item against live DB state?
+        claim_verification_mode=args.get("claim_verification_mode"),
         tenant_id=_mcp_tenant_id,
     )
 

@@ -1261,6 +1261,208 @@ class TestRebuildPhase1Deadline:
 
 
 # ---------------------------------------------------------------------------
+# rebuild()'s initial file walk must itself be deadline-aware (6ba77ada)
+# ---------------------------------------------------------------------------
+#
+# Root cause: _iter_safe_output_files()/os.walk() has zero deadline
+# awareness of its own. On a large (tens-of-thousands-of-files) tree it can
+# by itself take far longer than rebuild()'s entire max_seconds budget --
+# confirmed live against a real 70,000-file tree: the walk alone took ~11s
+# vs. the 5s default budget, so Phase 1 (5845cc6d)/Phase 2's own deadline
+# checks never even got a chance to run -- every call returned 0 rows,
+# search() stayed empty, forever. This is distinct from d9c76caa/c2021725
+# (Phase 1's own sub-deadline, and skipping _rebuild_fts() past a deadline),
+# both of which assumed the walk feeding them was fast.
+#
+# These tests use small synthetic trees with an artificially SLOWED walk
+# (monkeypatching _walk_safe_output_files to sleep per yielded path) rather
+# than a real tens-of-thousands-of-files tree -- scripts/test_outputs_
+# indexing.py already covers that as an on-demand diagnostic against a real
+# large tree; this stays CI-fast while exercising the exact code path.
+
+class TestResumableFileWalkDeadlineAwareness:
+    """Unit coverage for _ResumableFileWalk: the walk must pause at (or
+    near) a deadline and resume later without ever losing or duplicating a
+    path, regardless of how tight the deadline is."""
+
+    def test_pauses_and_resumes_without_loss_or_duplication(
+        self, tmp_path: Path,
+    ) -> None:
+        n = 60
+        for i in range(n):
+            (tmp_path / f"f{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+
+        walk = OL._ResumableFileWalk(str(tmp_path))
+        collected: list[str] = []
+        calls = 0
+        while not walk.exhausted:
+            calls += 1
+            assert calls <= n + 5, "walk made no progress on some call"
+            # A deadline already in the past forces drain() to return after
+            # exactly one path per call -- the tightest possible resumption
+            # granularity, proving pause/resume never drops or repeats a path
+            # even in the worst case. The one exception is the FINAL call:
+            # since a generator only knows it's exhausted once a pull from it
+            # actually comes back empty, the call that discovers exhaustion
+            # may legitimately return zero paths.
+            chunk = walk.drain(time.monotonic() - 1.0)
+            assert len(chunk) >= 1 or walk.exhausted
+            collected.extend(chunk)
+
+        expected = sorted(OL._iter_safe_output_files(str(tmp_path)))
+        assert sorted(collected) == expected
+        assert len(collected) == len(set(collected)), (
+            "duplicate path yielded across resumed drain() calls"
+        )
+
+    def test_unlimited_deadline_drains_everything_in_one_call(
+        self, tmp_path: Path,
+    ) -> None:
+        for i in range(10):
+            (tmp_path / f"g{i}.csv").write_text("col\n1", encoding="utf-8")
+        walk = OL._ResumableFileWalk(str(tmp_path))
+        chunk = walk.drain(None)
+        assert walk.exhausted is True
+        assert len(chunk) == 10
+
+    def test_drain_after_exhausted_returns_empty(self, tmp_path: Path) -> None:
+        (tmp_path / "only.csv").write_text("col\n1", encoding="utf-8")
+        walk = OL._ResumableFileWalk(str(tmp_path))
+        walk.drain(None)
+        assert walk.exhausted is True
+        assert walk.drain(None) == []
+
+
+class TestRebuildWalkDeadlineAwareness:
+    """rebuild()-level regression coverage for 6ba77ada: a walk that alone
+    exceeds max_seconds must not prevent rebuild() from returning promptly
+    and making real, resumable progress across repeated calls."""
+
+    @staticmethod
+    def _install_slow_walk(monkeypatch: pytest.MonkeyPatch, delay: float) -> None:
+        """Wrap the real walk generator so every yielded path costs `delay`
+        seconds -- simulates a walk whose OWN pace (not Phase 1/2) is what
+        blows the budget, exactly 6ba77ada's reported signature."""
+        real_walk = OL._walk_safe_output_files
+
+        def slow_walk(outputs_dir: str):
+            for p in real_walk(outputs_dir):
+                time.sleep(delay)
+                yield p
+
+        monkeypatch.setattr(OL, "_walk_safe_output_files", slow_walk)
+
+    def test_bare_walk_exceeding_budget_does_not_block_rebuild(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        n = 40
+        for i in range(n):
+            (tmp_path / f"h{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        # 40 files * 0.02s/file = 0.8s to walk fully -- alone exceeds the
+        # 0.2s max_seconds budget used below.
+        self._install_slow_walk(monkeypatch, 0.02)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            start = time.monotonic()
+            idx.rebuild(max_seconds=0.2)
+            elapsed = time.monotonic() - start
+            # Before the fix this call blocked for the walk's full duration
+            # (here ~0.8s; on a real 70k-file tree, ~11s+) regardless of
+            # max_seconds, because the walk itself had no deadline check.
+            assert elapsed < 0.6, (
+                f"rebuild() took {elapsed:.2f}s with a 0.2s budget -- the "
+                "walk appears to have blocked past its own deadline"
+            )
+            assert idx.last_rebuild_partial is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_large_tree_converges_across_repeated_tight_budget_calls(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Mirrors scripts/test_outputs_indexing.py's convergence check at a
+        CI-fast scale: repeated rebuild() calls against a walk that alone
+        exceeds a single call's budget must still converge -- every file
+        indexed, FTS built, search returning real hits -- within a bounded
+        number of calls, not plateau (at 0 or any other count) forever."""
+        n = 50
+        for i in range(n):
+            (tmp_path / f"k{i:03d}.csv").write_text(
+                f"col\nvalue={i}\n", encoding="utf-8",
+            )
+        self._install_slow_walk(monkeypatch, 0.01)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            converged = False
+            for _ in range(30):
+                count = idx.rebuild(max_seconds=0.15)
+                if (count >= n and idx._fts_built and not idx._fts_pending
+                        and idx.search("value=1")):
+                    converged = True
+                    break
+            assert converged, (
+                "rebuild() never converged across repeated tight-budget "
+                "calls -- the walk fix must let every call make forward, "
+                "resumable progress instead of stalling indefinitely"
+            )
+        finally:
+            idx.close()
+
+    def test_removed_file_eventually_detected_after_slow_walk_completes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Removed-file detection must be deferred (not falsely triggered)
+        while a walk pass is still in progress, then correctly applied once
+        a full pass completes -- covers the resumable-walk correctness
+        tradeoff documented in rebuild()'s Phase 0."""
+        keep = tmp_path / "keep.csv"
+        remove = tmp_path / "remove.csv"
+        keep.write_text("col\n1", encoding="utf-8")
+        remove.write_text("col\n2", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            # Establish both files as fully, successfully indexed BEFORE the
+            # walk is slowed and the file removed -- so there's no window
+            # for the file to vanish between os.walk()'s internal per-
+            # directory listing snapshot and the staleness stat check (a
+            # pre-existing, unrelated TOCTOU edge case, not what this test
+            # targets).
+            idx.rebuild()
+            assert any("remove.csv" in p for p in idx._row_cache)
+            assert any("keep.csv" in p for p in idx._row_cache)
+
+            self._install_slow_walk(monkeypatch, 0.05)
+            remove.unlink()
+
+            # A call whose budget is exhausted mid-walk must not yet prune
+            # the removed file -- the walk hasn't reconfirmed the full tree.
+            idx.rebuild(max_seconds=0.01)
+            assert idx.last_rebuild_partial is True
+            assert any("remove.csv" in p for p in idx._row_cache), (
+                "removed file was pruned before a full walk pass confirmed "
+                "it was actually gone"
+            )
+
+            # Give it a generous budget so the in-progress pass (and any
+            # follow-up pass) can actually finish end to end.
+            for _ in range(20):
+                idx.rebuild(max_seconds=2.0)
+                if not any("remove.csv" in p for p in idx._row_cache):
+                    break
+            assert not any("remove.csv" in p for p in idx._row_cache), (
+                "removed file was never dropped from the cache once a full "
+                "walk pass completed"
+            )
+            assert any("keep.csv" in p for p in idx._row_cache)
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
 # Archival-classification hash persistence (sprint item 7a6a278f)
 # ---------------------------------------------------------------------------
 

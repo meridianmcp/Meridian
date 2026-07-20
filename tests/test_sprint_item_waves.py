@@ -5,6 +5,8 @@ grouping: assign_sprint_waves auto-fills it from the conflict-free groups, and
 update_sprint_item(wave=...) hand-edits it. Runs on both backends via the `db`
 fixture.
 """
+from datetime import datetime, timedelta
+
 import pytest
 
 from meridian import db as db_module
@@ -12,6 +14,11 @@ from meridian import server as srv
 from meridian.mcp_tools import (
     _MCP_TOOLS_LIST, _READ_ONLY_TOOLS, _TITLE_OVERRIDES, _TOOL_EXAMPLES,
 )
+
+
+def _future_iso(hours: int = 48) -> str:
+    """An ISO-8601 timestamp `hours` in the future (UTC, no tz suffix)."""
+    return (datetime.utcnow() + timedelta(hours=hours)).isoformat()
 
 
 async def _project(db):
@@ -99,6 +106,37 @@ async def test_assign_sprint_waves_maps_conflict_free_groups(db):
     assert set(result["waves"]["wave-1"]) | set(result["waves"]["wave-2"]) == {
         a["id"], b["id"], c["id"]
     }
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_skips_deferred_items(db):
+    """5a67c8e0 — a future-deferred pending item must NOT receive a wave label.
+
+    ``deferred_until`` in the future leaves ``status='pending'`` untouched (see
+    ``claim_sprint_item`` / ``_is_deferred``), so the candidate filter in
+    ``assign_sprint_waves`` must explicitly exclude it the same way it already
+    excludes manual-blocker items — otherwise a backburnered item silently gets
+    a real wave label on every run.
+    """
+    pid = await _project(db)
+    deferred = await db_module.add_sprint_item(
+        db, pid, "v1", "backburnered item", deferred_until=_future_iso(72),
+    )
+    normal = await db_module.add_sprint_item(db, pid, "v1", "normal item")
+
+    result = await db_module.assign_sprint_waves(db, pid)
+
+    r_deferred = await db_module.get_sprint_item(db, deferred["id"])
+    r_normal = await db_module.get_sprint_item(db, normal["id"])
+
+    # The deferred item must stay unlabelled (and unassigned).
+    assert r_deferred["wave"] is None
+    assert deferred["id"] not in {
+        item_id for ids in result["waves"].values() for item_id in ids
+    }
+    # The normal item in the same call DOES get labelled.
+    assert r_normal["wave"] is not None
+    assert result["assigned"] == 1
 
 
 @pytest.mark.asyncio

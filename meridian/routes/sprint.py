@@ -121,6 +121,28 @@ async def list_sprint_items(
         raise HTTPException(status_code=422, detail=str(exc))
 
 
+@router.get("/projects/{project_id}/sprint-items/{item_id}")
+async def get_sprint_item_endpoint(
+    project_id: str, item_id: str, request: Request
+) -> dict[str, Any]:
+    """4ef6ce5e — fetch ONE sprint item's live row, scoped to ``project_id``.
+
+    Added alongside ``claim_verification_mode``: this is what
+    ``meridian.claim_verify.fetch_sprint_item_live`` calls from the
+    PostToolUse hook to re-check a claim_sprint_item/complete_sprint_item
+    call's real, live outcome — deliberately a plain DB read straight from
+    the server, never anything the calling session's own narration could
+    influence. 404 when the item doesn't exist or belongs to a different
+    project (same not-found shape either way — no project-existence oracle
+    leaked through this endpoint).
+    """
+    db = await _db(request)
+    item = await db_module.get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="sprint item not found")
+    return item
+
+
 @router.get("/projects/{project_id}/sprint/pending_count")
 async def sprint_pending_count(
     project_id: str, request: Request, session_id: str | None = None

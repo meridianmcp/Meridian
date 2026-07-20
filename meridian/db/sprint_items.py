@@ -378,16 +378,53 @@ def _title_word_overlap(a: set[str], b: set[str]) -> float:
     return len(a & b) / min(len(a), len(b))
 
 # ---------------------------------------------------------------------------
-# get_sprint_progress 10s cache — one get_sprint_items DB query serves all
+# get_sprint_progress cache — one get_sprint_items DB query serves all
 # parallel sessions polling between tasks. Keyed by project_id; busted on any
 # sprint-item mutation so progress counts never read stale after a write.
+#
+# ONLY get_sprint_progress reads through this cache (via get_sprint_items_cached,
+# meridian/mcp/handlers/sprint_tools.py). The get_sprint_items MCP tool and
+# _board_change_for_session both call the uncached get_sprint_items() directly —
+# a live SQL query on every call — and are NEVER subject to the staleness
+# described below. Do not route either of them through this cache without
+# re-reading a1d75ff3's investigation notes.
+#
+# a1d75ff3 (2026-07-19) — cross-instance staleness on multi-instance Fly. This
+# dict is per-process: _invalidate_sprint_items_cache only pops the entry in
+# THIS instance's memory. Postgres (the single shared source of truth, and
+# already autocommit — no held-transaction/snapshot staleness) sees every
+# instance's write immediately, but a sibling instance's already-cached entry
+# is untouched by another instance's write and keeps serving the pre-write
+# snapshot until ITS OWN local TTL naturally elapses. That elapsing is real
+# and does happen — time.monotonic() correctly resets on every cache miss, so
+# no single instance can serve an entry older than _SPRINT_ITEMS_CACHE_TTL —
+# but "self-heals within the TTL" is still a genuine bug: any read landing on
+# a stale sibling during that window sees wrong data. True cross-instance
+# invalidation (pub/sub) would need new infra (Redis / Postgres LISTEN-NOTIFY;
+# the existing _publish_project_event fan-out is itself per-process, WS-only —
+# it does not reach sibling machines) — out of scope for the value delivered
+# here. Given that, the fix is: (1) keep write-time local invalidation, since
+# it is correct and gives the writing instance's own next read true
+# instant-freshness at zero cost — removing it would only make the common
+# "complete an item, then check progress" pattern worse without narrowing the
+# cross-instance gap at all, which is inherent to any pure-TTL cache without
+# cross-instance signalling; (2) shrink the TTL from 10s to 2s so the bound
+# any OTHER instance can be behind is small enough to be a non-issue in
+# practice, while still meaningfully absorbing tight polling loops.
 # ---------------------------------------------------------------------------
 _SPRINT_ITEMS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-_SPRINT_ITEMS_CACHE_TTL = 10.0  # seconds
+_SPRINT_ITEMS_CACHE_TTL = 2.0  # seconds — see a1d75ff3 note above for why 2s, not 10s
 
 
 def _invalidate_sprint_items_cache(project_id: str) -> None:
-    """Drop the cached sprint-item list for a project after a mutation."""
+    """Drop the cached sprint-item list for a project after a mutation.
+
+    a1d75ff3 — this only clears THIS process's own in-memory entry. On a
+    multi-instance deployment it does NOT reach sibling instances' caches;
+    see the module-level comment above _SPRINT_ITEMS_CACHE for the full
+    cross-instance staleness analysis and why that is an accepted, bounded
+    (TTL-sized) tradeoff rather than a fixed gap.
+    """
     _SPRINT_ITEMS_CACHE.pop(project_id, None)
 
 
@@ -398,7 +435,12 @@ async def get_sprint_items_cached(
 
     Parallel executors polling get_sprint_progress between tasks share one DB
     query within the TTL window. Any add/update mutation calls
-    _invalidate_sprint_items_cache so counts are never stale after a write.
+    _invalidate_sprint_items_cache so counts are never stale after a write ON
+    THE SAME PROCESS. On a multi-instance deployment a sibling process's cache
+    entry is NOT invalidated by another instance's write — see the a1d75ff3
+    note above _SPRINT_ITEMS_CACHE for why that residual, TTL-bounded gap is
+    the accepted tradeoff. Callers that need read-your-own-writes-anywhere
+    guarantees (not just same-process) must call get_sprint_items() directly.
     """
     now = time.monotonic()
     hit = _SPRINT_ITEMS_CACHE.get(project_id)
@@ -3633,9 +3675,13 @@ async def assign_sprint_waves(
     claimable_statuses = {"pending", "todo"}
     # Only label pending/todo items that are not already in-flight or done.
     # In-progress items are mid-execution and must not be relabelled mid-run.
+    # 5a67c8e0 — also exclude deferred items: a future ``deferred_until`` leaves
+    # status='pending' untouched (see claim_sprint_item / _is_deferred), so without
+    # this check a backburnered item would still get labelled into a real wave.
     candidates = [
         it for it in items
         if (it.get("status") or "pending") in claimable_statuses
+        and not _is_deferred(it)
     ]
 
     # ── Urgent carve-out (f78d7644) ─────────────────────────────────────────────
