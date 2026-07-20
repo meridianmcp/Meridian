@@ -271,6 +271,89 @@ def test_run_connection_relays_request_and_skips_noise(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 676e53a3 — explicit ping_timeout on every websockets.connect() call site
+# ---------------------------------------------------------------------------
+
+def test_websocket_connect_sites_set_explicit_ping_timeout(monkeypatch):
+    """All three tunnel connect() call sites (_run_connection,
+    _run_connection_lazy, _run_extract_pool_connection) must pass an explicit,
+    more-generous ping_timeout rather than relying on the websockets library
+    default (~20s) — a single delayed pong under load must not make the
+    CLIENT unilaterally close ("no close frame received or sent")."""
+    captured: list[dict] = []
+
+    class FakeWS:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise StopAsyncIteration  # no messages — connect() then exit cleanly
+
+    class FakeHttpClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+
+    def fake_connect(url, **kw):
+        captured.append(kw)
+        return FakeWS()
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", fake_connect)
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+
+    asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs"))
+
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
+
+    pool = MagicMock()
+    asyncio.run(
+        tc._run_extract_pool_connection("wss://x/tunnel/t", pool, "/repo", "extract")
+    )
+
+    assert len(captured) == 3, "expected exactly 3 websockets.connect() call sites"
+    for kw in captured:
+        assert kw.get("ping_interval") == 20
+        assert kw.get("ping_timeout") == tc._WS_PING_TIMEOUT
+    # The chosen timeout must be more generous than the ping interval itself,
+    # and comfortably clear the local relay request budget (28s) so a slow
+    # but alive relay never gets mistaken for a dead peer.
+    assert tc._WS_PING_TIMEOUT > 20
+    assert tc._WS_PING_TIMEOUT >= tc._LOCAL_REQUEST_TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# 13161001 — _is_clean_server_close: distinguish a clean server-initiated
+# close (1012 service restart) from a genuine connection failure
+# ---------------------------------------------------------------------------
+
+def test_is_clean_server_close_detects_1012_only():
+    import websockets.exceptions as _wse
+    import websockets.frames as _wsf
+
+    # A server-initiated 1012 ("Service Restart") close → clean, not a failure.
+    restart_exc = _wse.ConnectionClosedError(_wsf.Close(1012, "restart"), None)
+    assert tc._is_clean_server_close(restart_exc) is True
+
+    # Any other close code (e.g. 1011 internal error) is a genuine failure.
+    error_exc = _wse.ConnectionClosedError(_wsf.Close(1011, "internal error"), None)
+    assert tc._is_clean_server_close(error_exc) is False
+
+    # A ConnectionClosed with no received frame at all (abnormal closure).
+    abnormal_exc = _wse.ConnectionClosedError(None, None)
+    assert tc._is_clean_server_close(abnormal_exc) is False
+
+    # A plain non-websockets exception is never treated as a clean close.
+    assert tc._is_clean_server_close(RuntimeError("dropped")) is False
+
+
+# ---------------------------------------------------------------------------
 # _reconnect_loop (lines 714-730)
 # ---------------------------------------------------------------------------
 
@@ -297,6 +380,45 @@ def test_reconnect_loop_backs_off_then_cancels(monkeypatch):
         asyncio.run(tc._reconnect_loop("wss://x", 8808, "fs"))
     assert attempts["n"] == 2
     assert sleeps  # at least one backoff sleep happened
+
+
+def test_reconnect_loop_resets_backoff_on_clean_1012_but_climbs_on_real_failure(
+    monkeypatch,
+):
+    """13161001 — a clean server-initiated close (1012 service restart) must
+    reset backoff exactly like a successful connection, NOT climb it like a
+    repeated failure; a genuine repeated failure (RuntimeError) must still
+    climb backoff exponentially as before."""
+    import websockets.exceptions as _wse
+    import websockets.frames as _wsf
+
+    attempts = {"n": 0}
+
+    async def fake_run_connection(ws_url, port, label, tool_prefix=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            # Clean server-initiated restart — should NOT escalate backoff.
+            raise _wse.ConnectionClosedError(_wsf.Close(1012, "restart"), None)
+        if attempts["n"] in (2, 3):
+            # Genuine repeated failures — backoff SHOULD keep climbing.
+            raise RuntimeError("dropped")
+        raise asyncio.CancelledError
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(n):
+        sleeps.append(n)
+
+    monkeypatch.setattr(tc, "_run_connection", fake_run_connection)
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tc._reconnect_loop("wss://x", 8808, "fs"))
+
+    assert attempts["n"] == 4
+    # 1st sleep: base backoff after the clean 1012 close (reset, not climbed).
+    # 2nd/3rd sleeps: climbing exponentially across the two real failures.
+    assert sleeps == [1.0, 2.0, 4.0]
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +722,84 @@ def test_reconnect_loop_lazy_backs_off_then_cancels(monkeypatch):
         asyncio.run(tc._reconnect_loop_lazy("wss://x", proxy, "fs"))
     assert attempts["n"] == 2
     assert sleeps
+
+
+def test_reconnect_loop_lazy_resets_backoff_on_clean_1012_but_climbs_on_real_failure(
+    monkeypatch,
+):
+    """13161001 — same fix as _reconnect_loop, applied to the lazy-spawn loop:
+    a clean 1012 server restart resets backoff; real repeated failures still
+    climb it."""
+    import websockets.exceptions as _wse
+    import websockets.frames as _wsf
+
+    attempts = {"n": 0}
+
+    async def fake_run_connection_lazy(
+        ws_url, proxy, label, tool_prefix=None, known_repo_paths=None
+    ):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise _wse.ConnectionClosedError(_wsf.Close(1012, "restart"), None)
+        if attempts["n"] in (2, 3):
+            raise RuntimeError("dropped")
+        raise asyncio.CancelledError
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(n):
+        sleeps.append(n)
+
+    monkeypatch.setattr(tc, "_run_connection_lazy", fake_run_connection_lazy)
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tc._reconnect_loop_lazy("wss://x", proxy, "fs"))
+
+    assert attempts["n"] == 4
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_reconnect_loop_extract_pool_resets_backoff_on_clean_1012_but_climbs_on_real_failure(
+    monkeypatch,
+):
+    """13161001 — same fix applied to the pooled code-extractor reconnect
+    loop: a clean 1012 server restart resets backoff; real repeated failures
+    still climb it."""
+    import websockets.exceptions as _wse
+    import websockets.frames as _wsf
+
+    attempts = {"n": 0}
+
+    async def fake_run_extract_pool_connection(
+        ws_url, pool, default_repo_path, label, tool_prefix=None
+    ):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise _wse.ConnectionClosedError(_wsf.Close(1012, "restart"), None)
+        if attempts["n"] in (2, 3):
+            raise RuntimeError("dropped")
+        raise asyncio.CancelledError
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(n):
+        sleeps.append(n)
+
+    monkeypatch.setattr(
+        tc, "_run_extract_pool_connection", fake_run_extract_pool_connection
+    )
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    pool = MagicMock()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            tc._reconnect_loop_extract_pool("wss://x", pool, "/repo", "extract")
+        )
+
+    assert attempts["n"] == 4
+    assert sleeps == [1.0, 2.0, 4.0]
 
 
 # ---------------------------------------------------------------------------
