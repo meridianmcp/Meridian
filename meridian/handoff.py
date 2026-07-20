@@ -3266,6 +3266,23 @@ async def _write_sprint_guard_hooks(
             await _orphan_reaper.seed_orphan_reaper_hook(db, project_id, url)
         except Exception:  # noqa: BLE001 — best-effort seed, never break handoff
             pass
+        # 4ef6ce5e — mirror the orphan_reaper seeding pattern for the
+        # claim-verification guard: workspace_settings.claim_verification_mode
+        # (off/advisory/strict) decides whether the PostToolUse hook is
+        # registered at all, and blocking vs non-blocking when it is. Same
+        # best-effort inner guard — a seeding failure must never block the
+        # rest of the handoff.
+        try:
+            _ws_settings_cvm = await db_module.get_workspace_settings(db)
+            _claim_verification_mode = (_ws_settings_cvm or {}).get(
+                "claim_verification_mode", "off"
+            )
+            from . import claim_verify as _claim_verify  # noqa: PLC0415
+            await _claim_verify.seed_claim_verification_hook(
+                db, project_id, _claim_verification_mode, url
+            )
+        except Exception:  # noqa: BLE001 — best-effort seed, never break handoff
+            pass
         await _write_custom_hooks(db, project_id, hooks_dir)
     except Exception:  # noqa: BLE001 — never break handoff on a hook-write failure
         pass

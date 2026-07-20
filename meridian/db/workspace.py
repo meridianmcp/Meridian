@@ -823,6 +823,15 @@ async def complete_workspace_sprint_item(
 
 _WORKSPACE_SETTINGS_ID = "singleton"
 
+# 4ef6ce5e — claim_verification_mode: does a PostToolUse hook re-check
+# claim_sprint_item/complete_sprint_item calls against live DB state before
+# trusting the calling session's own narration? See
+# db.migrations._migrate_workspace_claim_verification_mode for the full
+# incident/design writeup; meridian/claim_verify.py is the hook's actual
+# comparison logic; handoff.seed_claim_verification_hook wires it into
+# .claude/hooks/ via the existing custom_hooks (273287cb) infra.
+_VALID_CLAIM_VERIFICATION_MODES: frozenset[str] = frozenset({"off", "advisory", "strict"})
+
 
 def _ws_settings_key(tenant_id: str | None) -> str:
     """Row key for the workspace_settings singleton.
@@ -850,7 +859,7 @@ async def get_workspace_settings(
         "loop_enabled_default, auto_refresh_enabled, refresh_interval_turns, "
         "refresh_triggers, handoff_inline_pointers, "
         "active_session_warning_minutes, manual_issue_screening_enabled, "
-        "tool_priority_map, updated_at "
+        "tool_priority_map, claim_verification_mode, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -911,6 +920,14 @@ async def get_workspace_settings(
                     _tool_priority_map = None
         except Exception:  # noqa: BLE001 — malformed row ⇒ no workspace default
             _tool_priority_map = None
+    # 4ef6ce5e — claim_verification_mode. NOT NULL DEFAULT 'off' at the column
+    # level, but a legacy row predating the column (or any unrecognized value
+    # that slipped in some other way) falls back to 'off' too — fail toward
+    # the no-enforcement, unchanged-behavior state rather than silently
+    # enabling a blocking hook nobody asked for.
+    _claim_verification_mode = data.get("claim_verification_mode")
+    if _claim_verification_mode not in _VALID_CLAIM_VERIFICATION_MODES:
+        _claim_verification_mode = "off"
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -936,6 +953,7 @@ async def get_workspace_settings(
         "manual_issue_screening_enabled": bool(data.get("manual_issue_screening_enabled")),
         "manual_issue_screening_risk_warning": _MANUAL_ISSUE_SCREENING_RISK_WARNING,
         "tool_priority_map": _tool_priority_map,
+        "claim_verification_mode": _claim_verification_mode,
         "updated_at": data.get("updated_at"),
     }
 
@@ -957,6 +975,7 @@ async def update_workspace_settings(
     handoff_inline_pointers: "bool | int | str | None" = None,
     active_session_warning_minutes: int | None = None,
     tool_priority_map: "dict[str, str] | str | None" = None,
+    claim_verification_mode: str | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -965,6 +984,16 @@ async def update_workspace_settings(
     or ``display_name=""`` explicitly clears that label. ``execution_mode_default=""``
     clears the execution-mode default (new projects revert to their own default);
     ``code_intel_enabled_default`` accepts a bool/0/1 or the string ``""`` to clear.
+
+    ``claim_verification_mode`` (4ef6ce5e) — ``"off"`` / ``"advisory"`` /
+    ``"strict"``, case-insensitive; ``""`` clears back to the default
+    (``"off"``). Unlike ``manual_issue_screening_enabled``, this is a PLAIN
+    parameter of this generic settings-patch function, not gated behind a
+    separate HITL-approved writer: moving TOWARD ``"strict"`` REDUCES risk
+    (it catches false-success narration rather than introducing a new
+    untrusted-content surface), so it doesn't need the self-escalation-proof
+    HITL gate that toggle has. Raises ``ValueError`` for any other non-empty
+    string. See ``get_workspace_settings`` for what each mode does.
 
     ``tool_priority_map`` (490e100d) — workspace-level default MCP tool
     priority per semantic task category, generalizing 4d1fb28f's per-item
@@ -1060,6 +1089,18 @@ async def update_workspace_settings(
             params.append(tool_priority_map.strip() or None)
         else:
             params.append(None)
+    if claim_verification_mode is not None:
+        # 4ef6ce5e — "" clears back to the 'off' default; any other value
+        # must be one of the three valid modes (case-insensitive).
+        _cvm = (claim_verification_mode or "").strip().lower()
+        if _cvm and _cvm not in _VALID_CLAIM_VERIFICATION_MODES:
+            raise ValueError(
+                f"claim_verification_mode must be one of "
+                f"{sorted(_VALID_CLAIM_VERIFICATION_MODES)} or '' to clear, got "
+                f"{claim_verification_mode!r}"
+            )
+        updates.append("claim_verification_mode = ?")
+        params.append(_cvm or "off")
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
