@@ -2556,6 +2556,219 @@ def test_ensure_running_noop_when_already_running(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 8e10fb80 — reuse_existing: detect-and-reuse an already-running occupant of
+# the slot's port instead of blindly spawning a duplicate. Scoped to slots
+# constructed with reuse_existing=True (currently just "code" — see the
+# SlotProxy docstring for why fs/extract must NOT opt in).
+# ---------------------------------------------------------------------------
+
+def test_slot_proxy_reuse_existing_defaults_false():
+    """A slot built the old way (no reuse_existing kwarg) keeps the pre-
+    8e10fb80 refuse/kill behaviour — reuse is strictly opt-in."""
+    proxy = tc.SlotProxy(["cmd"], 9300, "fs")
+    assert proxy.reuse_existing is False
+    assert proxy._reused is False
+
+
+def test_ensure_running_reuse_existing_live_healthy_reuses_no_spawn(monkeypatch):
+    """8e10fb80 — reuse_existing=True + a live, healthy occupant on the port:
+    ensure_running must NOT Popen a new process, must NOT consult the
+    claim-file/kill machinery at all, and must leave the slot usable
+    (is_running True) afterward."""
+    spawned = []
+    kill_calls = []
+    claim_checks = []
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: True)
+    monkeypatch.setattr(
+        tc, "_is_slot_claimed_by_live_client",
+        lambda port, cid: claim_checks.append(port) or False,
+    )
+    monkeypatch.setattr(
+        tc, "_kill_stale_port_occupant",
+        lambda port, label, current_client_id="": kill_calls.append(port),
+    )
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(
+        ["mcp-proxy", "--port", "9210"], 9210, "code",
+        client_id="cl-reuse-1", reuse_existing=True,
+    )
+    _run_sync(_run_ensure(proxy))
+
+    assert spawned == [], "must NOT spawn a duplicate when a healthy occupant already exists"
+    assert kill_calls == [], "must NOT kill the reused occupant"
+    assert claim_checks == [], "reuse short-circuits before the claim-file check"
+    assert proxy._reused is True
+    assert proxy.is_running is True
+
+
+def test_ensure_running_reuse_existing_unhealthy_falls_back_to_orphan_kill(monkeypatch):
+    """8e10fb80 — reuse_existing=True but the occupant does NOT answer as a
+    healthy MCP server (e.g. a genuinely dead/wedged process still holding the
+    port): falls back to the existing orphan kill-then-spawn path rather than
+    trusting an unresponsive occupant."""
+    spawned = []
+    kill_calls = []
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: True)
+    monkeypatch.setattr(tc, "_is_slot_claimed_by_live_client", lambda port, cid: False)
+    monkeypatch.setattr(
+        tc, "_kill_stale_port_occupant",
+        lambda port, label, current_client_id="": kill_calls.append((port, label)),
+    )
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+
+    proxy = tc.SlotProxy(
+        ["mcp-proxy", "--port", "9211"], 9211, "code",
+        client_id="cl-reuse-2", reuse_existing=True,
+    )
+    _run_sync(_run_ensure(proxy))
+
+    assert proxy._reused is False
+    assert kill_calls == [(9211, "code")]
+    assert len(spawned) == 1
+
+
+def test_ensure_running_reuse_existing_false_never_probes_health(monkeypatch):
+    """Regression guard — a slot NOT opted into reuse (reuse_existing=False,
+    the default for fs/extract) must never even consult the health probe, and
+    must keep the pre-8e10fb80 refuse-on-live-peer behaviour, even if a probe
+    WOULD report healthy."""
+    spawned = []
+    probe_calls = []
+
+    async def fake_probe(port, **kw):
+        probe_calls.append(port)
+        return True
+
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: True)
+    monkeypatch.setattr(tc, "_is_slot_claimed_by_live_client", lambda port, cid: True)
+    monkeypatch.setattr(tc, "_probe_slot_health", fake_probe)
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: spawned.append(cmd) or _FakeProc())
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9212"], 9212, "fs", client_id="cl-reuse-3")
+    _run_sync(_run_ensure(proxy))
+
+    assert probe_calls == [], "reuse_existing=False must skip the health probe entirely"
+    assert spawned == []
+    assert proxy._reused is False
+
+
+def test_slot_proxy_is_running_reused_tracks_live_port_and_self_clears(monkeypatch):
+    """A reused proxy (no owned _proc) reports running exactly while the port
+    stays open, and clears its own _reused flag once the port goes away so a
+    subsequent ensure_running() correctly re-detects (respawn or re-reuse)."""
+    proxy = tc.SlotProxy(["cmd"], 9213, "code", reuse_existing=True)
+    proxy._reused = True
+
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: True)
+    assert proxy.is_running is True
+    assert proxy._reused is True  # unchanged while still live
+
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    assert proxy.is_running is False
+    assert proxy._reused is False  # cleared once the occupant is gone
+
+
+def test_slot_proxy_kill_on_reused_does_not_terminate_or_clear_claim(monkeypatch):
+    """8e10fb80 — kill() on a reused proxy must NOT terminate the process (we
+    don't own it — it could belong to a peer tunnel or an external process)
+    and must NOT clear the port's slot-claim file (also not ours to clear).
+    It only drops our own reuse tracking."""
+    terminate_calls = []
+    clear_calls = []
+    monkeypatch.setattr(tc, "_terminate_proc_tree", lambda proc: terminate_calls.append(proc))
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda port: clear_calls.append(port))
+
+    proxy = tc.SlotProxy(["cmd"], 9214, "code", reuse_existing=True)
+    proxy._reused = True
+
+    proxy.kill()
+
+    assert terminate_calls == [], "must not terminate a process we don't own"
+    assert clear_calls == [], "must not clear a claim file we don't own"
+    assert proxy._reused is False
+
+
+def test_slot_proxy_kill_on_owned_proc_still_terminates_normally(monkeypatch):
+    """Regression guard — the reused-kill guard must not interfere with the
+    ordinary owned-process kill path."""
+    terminate_calls = []
+    clear_calls = []
+    monkeypatch.setattr(tc, "_terminate_proc_tree", lambda proc: terminate_calls.append(proc))
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda port: clear_calls.append(port))
+
+    proxy = tc.SlotProxy(["cmd"], 9215, "code", reuse_existing=True)
+    fake = _FakeProc()
+    proxy._proc = fake
+    proxy.holder["proc"] = fake
+
+    proxy.kill()
+
+    assert terminate_calls == [fake]
+    assert clear_calls == [9215]
+    assert proxy._proc is None
+    assert proxy.holder["proc"] is None
+
+
+# ---------------------------------------------------------------------------
+# 3475c72f — a dedicated CBM_CACHE_DIR for the tunnel's own code-intel spawn,
+# so it can never collide (same on-disk index .db) with any externally-
+# spawned copy of codebase-memory-mcp (Desktop-direct-connector, a stray
+# earlier generation, etc.).
+# ---------------------------------------------------------------------------
+
+def test_code_intel_cache_dir_is_dedicated_meridian_managed_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    cache_dir = tc._code_intel_cache_dir()
+    assert cache_dir == tmp_path / ".meridian" / "code-intel-cache"
+    # Distinct from _managed_bin_dir (the binary install dir) and from
+    # codebase-memory-mcp's own unset-env default (~/.cache/codebase-memory-mcp).
+    assert cache_dir != tc._managed_bin_dir()
+    assert "code-intel-cache" in str(cache_dir)
+
+
+def test_code_intel_spawn_env_sets_cbm_cache_dir_and_preserves_parent_env(monkeypatch, tmp_path):
+    """subprocess.Popen(env=...) REPLACES the child's whole environment when
+    not None — a bare {"CBM_CACHE_DIR": ...} override would silently drop
+    PATH and break the spawn entirely. Guard that the merge is a full copy of
+    the parent env plus the one override."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("MERIDIAN_TEST_SENTINEL_VAR", "sentinel-value-xyz")
+
+    env = tc._code_intel_spawn_env()
+
+    assert env["CBM_CACHE_DIR"] == str(tc._code_intel_cache_dir())
+    assert env["PATH"] == os.environ["PATH"]
+    assert env["MERIDIAN_TEST_SENTINEL_VAR"] == "sentinel-value-xyz"
+
+
+def test_code_intel_spawn_env_creates_cache_dir_on_disk(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    assert not (tmp_path / ".meridian" / "code-intel-cache").exists()
+    tc._code_intel_spawn_env()
+    assert (tmp_path / ".meridian" / "code-intel-cache").is_dir()
+
+
+def test_code_intel_spawn_env_honours_explicit_cbm_cache_dir_override(monkeypatch, tmp_path):
+    """An operator who already set CBM_CACHE_DIR (e.g. a shared/network path
+    for codebase-memory-mcp's own team-sharing artifact feature) is not
+    overridden — this fix targets the unset-default collision, not an
+    intentional operator choice."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    custom = str(tmp_path / "operator-chosen-cache")
+    monkeypatch.setenv("CBM_CACHE_DIR", custom)
+
+    env = tc._code_intel_spawn_env()
+
+    assert env["CBM_CACHE_DIR"] == custom
+    # And it must not have been silently created under our managed path.
+    assert not (tmp_path / ".meridian" / "code-intel-cache").exists()
+
+
+# ---------------------------------------------------------------------------
 # a9d1ef7f — scoped cache-clear + spawn retry on uvx/npx tool-spawn failure
 # ---------------------------------------------------------------------------
 
