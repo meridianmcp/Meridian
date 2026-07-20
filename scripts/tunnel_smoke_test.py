@@ -201,8 +201,17 @@ KNOWN_UNWIRED_SLOTS: tuple[str, ...] = ()
 # 12afe021 -- "debug" added alongside "outputs": now that both are actually
 # wired and spawned, "debug" (npx -y @debugmcp/mcp-debugger) is a first-install
 # cold fetch exactly like "dc"'s npx launch.
+#
+# 2026-07-20 finding: "code" is deliberately NOT in tunnel_client._COLD_FETCH_SLOTS
+# (production's SlotProxy reuse_existing=True usually adopts an already-warm
+# instance instead of needing a cold-build budget), but THIS harness always
+# spawns a brand-new codebase-memory-mcp process of its own -- see
+# _harness_code_intel_env() below for why it can't just reuse production's
+# cache dir. A genuinely cold first-time index build of this repo measured
+# >30s (STDIO_INIT_TIMEOUT_S) in a real run. Deliberately DIVERGES from
+# tunnel_client._COLD_FETCH_SLOTS here for that reason.
 COLD_FETCH_SLOTS: frozenset[str] = frozenset(
-    {"dc", "ppt", "word", "docs", "zotero", "outputs", "debug"}
+    {"dc", "ppt", "word", "docs", "zotero", "outputs", "debug", "code"}
 )
 
 # Roughly mirrors tunnel_client._PREFLIGHT_BUDGET_COLD_FETCH (4 attempts * 5s
@@ -786,11 +795,37 @@ class StdioMcpClient:
         self._proc.stdin.write(line)
         await self._proc.stdin.drain()
 
-    async def _recv(self, *, timeout: float) -> dict:
+    async def _recv(self, *, timeout: float, expected_id: int) -> dict:
+        """Read stdout lines until the RESPONSE to *expected_id* arrives.
+
+        2026-07-20 finding: this used to return the first parseable JSON-RPC
+        line, full stop -- with no check that it was actually a response to
+        the request just sent, rather than a server-initiated NOTIFICATION
+        (a message with no "id", which the MCP spec explicitly allows a
+        server to send at any time, e.g. `notifications/message` logging).
+        Desktop Commander does exactly this during startup: a burst of log
+        notifications arrives on stdout before the real tools/list response,
+        got returned as if it WERE that response (no "error" key, no
+        "result" key -> `(resp.get("result") or {}).get("tools")` silently
+        evaluated to `[]`), and the harness reported a clean-looking
+        "0 tools, no error" instead of the real tool list. Any MCP server
+        that emits notifications between a request and its response would
+        silently desync every subsequent request/response pairing on this
+        connection the same way -- not a Desktop-Commander-specific bug.
+        Skipping anything whose "id" doesn't match what THIS call sent fixes
+        it for every slot, not just this one.
+        """
         assert self._proc is not None and self._proc.stdout is not None
+        deadline = time.monotonic() + timeout
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise McpStdioError(
+                    f"{self.label}: timed out after {timeout}s waiting for a response "
+                    f"(stderr tail: {self.captured_stderr[-500:]!r})"
+                )
             try:
-                raw = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
+                raw = await asyncio.wait_for(self._proc.stdout.readline(), timeout=remaining)
             except asyncio.TimeoutError as exc:
                 raise McpStdioError(
                     f"{self.label}: timed out after {timeout}s waiting for a response "
@@ -802,15 +837,21 @@ class StdioMcpClient:
                     f"stderr tail: {self.captured_stderr[-500:]!r})"
                 )
             msg = parse_jsonrpc_message(raw.decode("utf-8", errors="replace"))
-            if msg is not None:
-                return msg
-            # Non-JSON stdout line (rare banner/log noise) -- keep reading.
+            if msg is None:
+                # Non-JSON stdout line (rare banner/log noise) -- keep reading.
+                continue
+            if msg.get("id") != expected_id:
+                # A notification (no "id") or a response to an earlier/other
+                # request on this connection -- not what this call is
+                # waiting for. Keep reading rather than misreport it.
+                continue
+            return msg
 
     async def initialize(self, *, timeout: float = STDIO_INIT_TIMEOUT_S) -> dict:
         req_id = self._next_id
         self._next_id += 1
         await self._send(build_initialize_request(req_id))
-        resp = await self._recv(timeout=timeout)
+        resp = await self._recv(timeout=timeout, expected_id=req_id)
         await self._send(build_initialized_notification())
         return resp
 
@@ -818,7 +859,7 @@ class StdioMcpClient:
         req_id = self._next_id
         self._next_id += 1
         await self._send(build_tools_list_request(req_id))
-        resp = await self._recv(timeout=timeout)
+        resp = await self._recv(timeout=timeout, expected_id=req_id)
         if "error" in resp:
             raise McpStdioError(f"{self.label}: tools/list error: {resp['error']}")
         return (resp.get("result") or {}).get("tools") or []
@@ -827,7 +868,7 @@ class StdioMcpClient:
         req_id = self._next_id
         self._next_id += 1
         await self._send(build_tools_call_request(name, arguments, req_id))
-        return await self._recv(timeout=timeout)
+        return await self._recv(timeout=timeout, expected_id=req_id)
 
     async def close(self) -> None:
         if self._proc is None:
@@ -838,7 +879,16 @@ class StdioMcpClient:
         await _terminate_proc_tree_async(self._proc)
         if self._stderr_task is not None:
             self._stderr_task.cancel()
-            with contextlib.suppress(Exception):
+            # asyncio.CancelledError is a BaseException (not Exception) since
+            # Python 3.8, so contextlib.suppress(Exception) alone does NOT
+            # catch the CancelledError that awaiting our own just-cancelled
+            # task raises -- it escaped close() uncaught and crashed the
+            # whole harness (run_cycle -> run_loop -> _amain) the moment a
+            # slot legitimately timed out. Standard "cancel then await, catch
+            # the resulting CancelledError" idiom: this is expected fallout
+            # of the .cancel() call two lines up, not an external cancellation
+            # that should keep propagating.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await self._stderr_task
 
 
@@ -874,6 +924,42 @@ def _resolve_launcher(cmd: "list[str]") -> "list[str]":
         if found:
             out[0] = found
     return out
+
+
+def _harness_code_intel_env() -> "dict[str, str]":
+    """Dedicated ``CBM_CACHE_DIR`` for THIS harness's own code-intel spawn.
+
+    2026-07-20 finding: build_slot_specs previously passed ``env=None`` for
+    the "code" slot, so its codebase-memory-mcp spawn used the unset default
+    cache location -- never the dedicated, already-warm one
+    ``tunnel_client._code_intel_spawn_env()`` gives production's own slot
+    (3475c72f/8e10fb80). That forced a full cold reindex of this repo on
+    EVERY harness run, timing out against the non-cold-fetch 30s budget.
+
+    Deliberately NOT the same directory as production's dedicated cache,
+    either: that directory can be held open by a live ``meridian --tunnel``
+    process's own code-intel slot at the exact moment this harness runs (a
+    live peer tunnel is exactly the scenario this harness's own
+    ``detect_live_peer_ports`` guard exists for elsewhere) -- two
+    independently-spawned codebase-memory-mcp processes both holding the same
+    index file open at once is the precise collision
+    ``tunnel_client._code_intel_cache_dir``'s docstring documents working
+    around for other external consumers. A third, harness-only location keeps
+    this harness's own spawns from ever colliding with either the unset
+    default or production's dedicated dir, while still staying warm/
+    persistent across repeated harness runs -- only the very first-ever run
+    against a fresh dir pays the real cold-build cost.
+    """
+    cache_dir = Path.home() / ".meridian" / "code-intel-cache-smoketest"
+    env = dict(os.environ)
+    if not env.get("CBM_CACHE_DIR"):
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:  # noqa: BLE001 — best-effort; codebase-memory-mcp
+            # creates its cache dir itself on first write if this didn't.
+            pass
+        env["CBM_CACHE_DIR"] = str(cache_dir)
+    return env
 
 
 async def build_slot_specs(
@@ -918,7 +1004,7 @@ async def build_slot_specs(
                                        skip_reason="codebase-memory-mcp could not be located or installed"))
                 continue
             specs.append(SlotSpec(slot, "code-intel", plugin.get("port", 8809), [binary],
-                                   None, "stateless", cold, optional, wired))
+                                   _harness_code_intel_env(), "stateless", cold, optional, wired))
         elif slot == "extract":
             cmd = _resolve_launcher(expand_command(SERENA_EXTRACT_COMMAND, repo_path=repo_path) or [])
             specs.append(SlotSpec(slot, "code-extractor", plugin.get("port", 8810), cmd,
@@ -985,7 +1071,20 @@ async def test_slot(
     client = StdioMcpClient(spec.cmd, env=_plugin_spawn_env(spec.env), cwd=repo_path, label=spec.slot)
     t0 = time.monotonic()
     try:
-        await client.start()
+        # 2026-07-20 finding (this run's own construction): every other await in
+        # this function is timeout-wrapped, but client.start() (a bare
+        # asyncio.create_subprocess_exec) was not -- an OS-level stall before the
+        # child process even starts talking on stdio (AV on-access scan of a
+        # freshly-downloaded/npx-cached binary, a first-run GUI/elevation prompt
+        # from an Office-family slot, etc.) hung the entire harness indefinitely
+        # with near-zero CPU, since nothing downstream ever got a chance to time
+        # it out. Bounding it here means a stall like that surfaces as a normal
+        # boot_failure-style SlotResult instead of an unkillable-from-inside hang.
+        # NB: if create_subprocess_exec is cancelled after the OS process actually
+        # exists but before the Process wrapper is returned, that child can be
+        # left orphaned (an inherent asyncio limitation) -- acceptable tradeoff
+        # vs. hanging the whole run forever.
+        await asyncio.wait_for(client.start(), timeout=timeout)
         await asyncio.wait_for(client.initialize(timeout=timeout), timeout=timeout + 5.0)
         tools = await asyncio.wait_for(client.list_tools(timeout=timeout), timeout=timeout + 5.0)
     except (McpStdioError, asyncio.TimeoutError) as exc:
