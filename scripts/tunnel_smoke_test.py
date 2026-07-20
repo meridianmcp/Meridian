@@ -703,7 +703,12 @@ async def _terminate_proc_tree_async(proc: "asyncio.subprocess.Process | None") 
                 "taskkill", "/F", "/T", "/PID", str(proc.pid),
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
-            await kill_proc.wait()
+            # Bounded the same way as the proc.wait() below -- taskkill
+            # itself can stall (AV/Defender interference, an unkillable
+            # target) and must not hang this function forever. TimeoutError
+            # is an Exception subclass so it's caught by the clause below,
+            # same as a spawn failure.
+            await asyncio.wait_for(kill_proc.wait(), timeout=5.0)
         except Exception:  # noqa: BLE001 — fall back to terminate below
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()

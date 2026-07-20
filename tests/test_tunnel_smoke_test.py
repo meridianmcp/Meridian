@@ -741,6 +741,58 @@ async def test_build_slot_specs_code_slot_uses_dedicated_harness_cache_dir(tmp_p
 
 
 # ---------------------------------------------------------------------------
+# _terminate_proc_tree_async
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_terminate_proc_tree_async_bounds_stalled_taskkill(monkeypatch):
+    """A stalled ``taskkill /F /T /PID`` (observed under AV/Defender
+    interference, or an unkillable target process) must not hang
+    _terminate_proc_tree_async forever. The very next await in the same
+    function (``proc.wait()``) is already wrapped in
+    ``asyncio.wait_for(..., timeout=5.0)``; the taskkill wait must be bounded
+    the same way so a stall there still reaches the ``proc.terminate()``
+    fallback instead of blocking every caller (StdioMcpClient.close(),
+    TunnelSubprocess.stop()) indefinitely.
+
+    Reproduced by making the spawned taskkill helper process's own ``wait()``
+    never resolve, then bounding the whole call with an outer watchdog that
+    is longer than the function's internal 5s timeout but far shorter than
+    "forever" -- before the fix this outer watchdog is what fires (proving
+    the function itself has no bound); after the fix the function returns on
+    its own well within the outer watchdog.
+    """
+    monkeypatch.setattr(tst.sys, "platform", "win32")
+
+    class _HangingKillProc:
+        def __init__(self):
+            self.pid = 999
+
+        async def wait(self):
+            await asyncio.Event().wait()  # never resolves
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        return _HangingKillProc()
+
+    monkeypatch.setattr(tst.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    class _FakeTargetProc:
+        def __init__(self):
+            self.pid = 123
+            self.terminate_called = False
+
+        def terminate(self):
+            self.terminate_called = True
+
+        async def wait(self):
+            return 0
+
+    target = _FakeTargetProc()
+    await asyncio.wait_for(tst._terminate_proc_tree_async(target), timeout=8.0)
+    assert target.terminate_called is True
+
+
+# ---------------------------------------------------------------------------
 # test_slot orchestration (mocked StdioMcpClient -- no real spawn)
 # ---------------------------------------------------------------------------
 
