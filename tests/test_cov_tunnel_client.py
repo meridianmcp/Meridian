@@ -1613,6 +1613,82 @@ def test_run_tunnel_command_overrides_and_index(monkeypatch, tmp_path):
     assert indexed and indexed[0][0] == 9002
 
 
+# ---------------------------------------------------------------------------
+# 12afe021 — outputs/debug slots must actually be wired into run_tunnel
+# (previously declared in BUILTIN_PLUGINS + fully wired server-side, but the
+# client never created a SlotProxy or reconnect loop for either).
+# ---------------------------------------------------------------------------
+
+def test_run_tunnel_wires_outputs_slot_when_enabled(monkeypatch, tmp_path):
+    """Enabling the 'outputs' slot (meridian-outputs) via tunnel_plugins_config
+    must spawn its SlotProxy through the same office-family lazy-spawn +
+    reconnect-loop path used by ppt/word/dc/docs/zotero — the exact wiring
+    that was previously entirely missing for this slot."""
+    procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "tid-outputs", "plan": "pro",
+            "tunnel_plugins_config": [
+                {"name": "meridian-outputs", "enabled": True},
+            ],
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    # fs + code + extract (core, default-enabled) + the newly-wired outputs slot.
+    assert len(procs) == 4
+    outputs_spawns = [p for p in procs if any("meridian-outputs-mcp" in str(t) for t in p.cmd)]
+    assert outputs_spawns, "outputs slot (meridian-outputs-mcp) was not spawned"
+
+
+def test_run_tunnel_wires_debug_slot_when_enabled(monkeypatch, tmp_path):
+    """Enabling the 'debug' slot (mcp-debugger) via tunnel_plugins_config must
+    spawn its SlotProxy the same way. debug's session_mode is 'persistent'
+    (BUILTIN_PLUGINS), so it must be added to office_ports/office_proxies and
+    NOT get an idle-killer, mirroring Desktop Commander."""
+    procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "tid-debug", "plan": "pro",
+            "tunnel_plugins_config": [
+                {"name": "mcp-debugger", "enabled": True},
+            ],
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    assert len(procs) == 4
+    debug_spawns = [p for p in procs if any("@debugmcp/mcp-debugger" in str(t) for t in p.cmd)]
+    assert debug_spawns, "debug slot (mcp-debugger) was not spawned"
+
+
+def test_run_tunnel_debug_slot_disabled_by_default_stays_unwired(monkeypatch, tmp_path):
+    """debug (like zotero) is opt-in / disabled-by-default in BUILTIN_PLUGINS
+    (121e6a27) — with NO override at all, it must NOT spawn. This is the other
+    half of the 12afe021 fix: joining the office-family loop must respect each
+    plugin's own `enabled` flag, not spawn unconditionally."""
+    procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "tid-nodebug", "plan": "pro"}),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    # Only the core fs/code/extract slots spawn — outputs/debug stay disabled
+    # by default, matching BUILTIN_PLUGINS' enabled=False for both.
+    assert len(procs) == 3
+    assert not any("mcp-debugger" in str(t) for p in procs for t in p.cmd)
+    assert not any("meridian-outputs-mcp" in str(t) for p in procs for t in p.cmd)
+
+
 def test_run_tunnel_fs_lazy_spawn_enoent_keeps_tunnel_up(monkeypatch, tmp_path):
     """Lazy spawn (3649a61a) changes fs-failure semantics: under eager spawn an
     fs npx ENOENT aborted startup (exit 1); now the Popen is deferred to the first

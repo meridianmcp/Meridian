@@ -81,10 +81,13 @@ FAILURE-CATEGORY COVERAGE MATRIX (design note 6271aa81's 7 predicted classes)
     under load, routed by the hosted relay); this harness cannot drive that
     concurrency from outside the relay. What IS real: static analysis
     confirmed a second, entirely independent pool -- Serena's per-repo daemon
-    pool -- allocates its FIRST daemon on ``SERENA_POOL_BASE_PORT`` (8820),
-    which is IDENTICAL to ``DEFAULT_OUTPUTS_PORT`` (also 8820). See
-    :func:`check_port_collisions` (a permanent regression check, not a
-    one-off observation).
+    pool -- allocated its FIRST daemon on ``SERENA_POOL_BASE_PORT``, which was
+    IDENTICAL to ``DEFAULT_OUTPUTS_PORT`` (both 8820). FIXED by a1a870d5
+    (2026-07-19): ``SERENA_POOL_BASE_PORT`` moved to 8700, below every fixed
+    port the tunnel-plugin catalog declares. See :func:`check_port_collisions`
+    -- now a general, permanent regression check across every declared port in
+    the codebase (not just this one historical pair), so it would have caught
+    this exact bug and stays green going forward.
  3. Fly-instance / routing mismatch  -- WEAK, local-only. ``test_slot``
     repeats its functional call a few seconds apart and flags an inconsistent
     pass/fail (``repeat_consistent``); a genuinely Fly-routing-caused flap
@@ -170,10 +173,8 @@ from meridian.serena_pool import SERENA_POOL_BASE_PORT
 # Constants
 # ---------------------------------------------------------------------------
 
-# Slots the design note calls out as always-tested. "outputs" is included even
-# though (per check_client_wires_all_catalog_slots below) the live tunnel
-# client does not yet wire it into the WS relay -- the inner MCP server is
-# still directly testable via stdio, independent of that gap.
+# Slots the design note calls out as always-tested. "outputs" is included
+# because it is directly testable via stdio regardless of client wiring state.
 CORE_SLOTS: tuple[str, ...] = ("fs", "code", "extract")
 DEFAULT_TESTED_SLOTS: tuple[str, ...] = (
     "fs", "code", "extract", "ppt", "word", "dc", "docs", "outputs",
@@ -181,17 +182,28 @@ DEFAULT_TESTED_SLOTS: tuple[str, ...] = (
 # "mcp-debugger and zotero only if enabled" (design note) -- opt-in via --include-optional.
 OPTIONAL_SLOTS: tuple[str, ...] = ("zotero", "debug")
 
-# 2026-07-19 finding (this file's own construction): these catalog slots have
-# NO wiring at all in tunnel_client.run_tunnel -- no SlotProxy is ever created
-# for them, so even a tenant who enables them via the dashboard gets nothing
-# when they run `meridian --tunnel`. Confirmed by check_client_wires_all_catalog_slots.
-KNOWN_UNWIRED_SLOTS: tuple[str, ...] = ("outputs", "debug")
+# 2026-07-19 finding (this file's own construction): at the time this harness
+# was first built, these catalog slots had NO wiring at all in
+# tunnel_client.run_tunnel -- no SlotProxy was ever created for them, so even
+# a tenant who enabled them via the dashboard got nothing when they ran
+# `meridian --tunnel`. FIXED by 12afe021 (both slots now share the office-
+# family SlotProxy + reconnect-loop wiring); kept as an empty tuple -- rather
+# than deleted -- so a future regression that un-wires either slot has an
+# obvious place to land the two names back into, and
+# check_client_wires_all_catalog_slots (below) independently re-verifies the
+# real source on every run regardless of this constant's value.
+KNOWN_UNWIRED_SLOTS: tuple[str, ...] = ()
 
 # Slots whose FIRST spawn triggers a genuine cold network/venv build (mirrors
 # tunnel_client._COLD_FETCH_SLOTS, duplicated here as a constant rather than
 # imported since tunnel_client's set is keyed by its own internal slot labels
 # for a slightly different purpose -- the two are expected to stay in sync).
-COLD_FETCH_SLOTS: frozenset[str] = frozenset({"dc", "ppt", "word", "docs", "zotero", "outputs"})
+# 12afe021 -- "debug" added alongside "outputs": now that both are actually
+# wired and spawned, "debug" (npx -y @debugmcp/mcp-debugger) is a first-install
+# cold fetch exactly like "dc"'s npx launch.
+COLD_FETCH_SLOTS: frozenset[str] = frozenset(
+    {"dc", "ppt", "word", "docs", "zotero", "outputs", "debug"}
+)
 
 # Roughly mirrors tunnel_client._PREFLIGHT_BUDGET_COLD_FETCH (4 attempts * 5s
 # delay + processing => on the order of a minute). A cold spawn slower than
@@ -371,17 +383,23 @@ def check_client_wires_all_catalog_slots(
     nothing (no ``SlotProxy``, no reconnect loop, no printed status line).
 
     This is a real gap discovered while building this harness (2026-07-19):
-    at time of writing, ``outputs`` and ``debug`` are BOTH in this state --
-    the server side already has full WS routes for them
-    (``routes/tunnel.py``'s ``_tunnel_outputs_sockets`` /
-    ``@router.websocket("/tunnel-outputs/{tenant_id}")``), and
-    ``tunnel_plugins.BUILTIN_PLUGINS`` fully describes their commands/ports,
-    but the CLIENT never connects. A crude source-text-membership check
-    (rather than e.g. import-time introspection of ``run_tunnel``'s bytecode)
-    is deliberate: it is cheap, has zero import-time side effects, and is
-    exactly as precise as this needs to be -- every wired slot's short code
-    appears as a quoted literal somewhere in the office-slot loop or an
-    explicit ``by_slot.get(...)`` block; an unwired one appears nowhere.
+    at the time, ``outputs`` and ``debug`` were BOTH in this state -- the
+    server side already had full WS routes for them (``routes/tunnel.py``'s
+    ``_tunnel_outputs_sockets`` / ``@router.websocket("/tunnel-outputs/{tenant_id}")``),
+    and ``tunnel_plugins.BUILTIN_PLUGINS`` fully described their commands/ports,
+    but the CLIENT never connected. FIXED by 12afe021 -- both slots now join
+    the office-family loop in ``run_tunnel`` alongside ppt/word/dc/docs/zotero,
+    so this check should report an empty list against the real source going
+    forward (see ``test_check_client_wires_all_catalog_slots_real_source_matches_known_gap``
+    in tests/test_tunnel_smoke_test.py, which asserts exactly that). The check
+    itself is kept as a permanent regression guard: any future slot added to
+    ``BUILTIN_PLUGINS`` without matching client wiring will be caught the same
+    way. A crude source-text-membership check (rather than e.g. import-time
+    introspection of ``run_tunnel``'s bytecode) is deliberate: it is cheap, has
+    zero import-time side effects, and is exactly as precise as this needs to
+    be -- every wired slot's short code appears as a quoted literal somewhere
+    in the office-slot loop or an explicit ``by_slot.get(...)`` block; an
+    unwired one appears nowhere.
 
     Pure string operation -- *tunnel_client_source* is passed in (rather than
     read from disk here) so this stays fully unit-testable against synthetic
@@ -399,36 +417,81 @@ def check_client_wires_all_catalog_slots(
 
 
 def check_port_collisions() -> "list[str]":
-    """Return human-readable descriptions of any known STATIC port collision
-    between the tunnel-plugin catalog's declared ports and other port
-    allocators this codebase owns.
+    """Return human-readable descriptions of any STATIC port collision between
+    every fixed port this codebase declares.
 
-    Real finding (2026-07-19): ``meridian.serena_pool.SERENA_POOL_BASE_PORT``
-    is 8820 -- the port the code-extractor slot's default Serena daemon pool
+    This is a general regression check over the FULL set of statically
+    declared ports -- every ``tunnel_plugins.DEFAULT_*_PORT`` (fs/code/
+    extract/ppt/word/dc/docs/zotero/outputs/debug), every pre-allocated
+    ``tunnel_plugins.CUSTOM_SLOT_PORTS`` entry (p0-p3), and
+    ``serena_pool.SERENA_POOL_BASE_PORT`` -- not just one hardcoded pair. Two
+    constants naming the same port number means whatever they gate would
+    contend for the same TCP port if both were simultaneously active.
+
+    Real finding this check is permanent regression coverage for (2026-07-19,
+    fixed by a1a870d5): ``meridian.serena_pool.SERENA_POOL_BASE_PORT`` was
+    8820 -- the port the code-extractor slot's default Serena daemon pool
     allocates FIRST (see ``SerenaDaemonPool._next_port``, which starts at
     ``base_port`` and increments only when that port is already held by
     another live daemon in the SAME pool). ``tunnel_plugins.DEFAULT_OUTPUTS_PORT``
-    is also 8820. Since the code-extractor slot defaults to the Serena pool
+    was also 8820. Since the code-extractor slot defaults to the Serena pool
     (``run_tunnel`` only skips it when a tenant overrides the extract slot's
     command), a tenant with the default extract slot AND the outputs slot
     both active would have Serena's first-repo daemon and meridian-outputs
-    (were it wired -- see :func:`check_client_wires_all_catalog_slots`)
-    contending for the same TCP port. This is independent of, and additional
-    to, the design note's predicted "multi-instance pooling contention"
-    category -- it is a static allocation bug, not a runtime race.
+    contending for the same TCP port. 12afe021 wired the outputs slot into
+    ``run_tunnel`` (see :func:`check_client_wires_all_catalog_slots`), which
+    turned this from a dormant static finding into a live collision the moment
+    a tenant enables both slots -- fixed separately by moving
+    ``SERENA_POOL_BASE_PORT`` off 8820 (a1a870d5). This was independent of,
+    and additional to, the design note's predicted "multi-instance pooling
+    contention" category -- it was a static allocation bug, not a runtime
+    race. Checking every declared port (not just that one pair) means the
+    same class of bug -- any two fixed ports landing on the same number --
+    is caught going forward, regardless of which two constants collide next.
     """
-    from meridian.tunnel_plugins import DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT
+    from meridian.tunnel_plugins import (
+        CUSTOM_SLOT_PORTS,
+        DEFAULT_CODE_PORT,
+        DEFAULT_DC_PORT,
+        DEFAULT_DEBUG_PORT,
+        DEFAULT_DOCS_PORT,
+        DEFAULT_EXTRACT_PORT,
+        DEFAULT_FS_PORT,
+        DEFAULT_OUTPUTS_PORT,
+        DEFAULT_PPT_PORT,
+        DEFAULT_WORD_PORT,
+        DEFAULT_ZOTERO_PORT,
+    )
+
+    declared: "dict[str, int]" = {
+        "tunnel_plugins.DEFAULT_FS_PORT": DEFAULT_FS_PORT,
+        "tunnel_plugins.DEFAULT_CODE_PORT": DEFAULT_CODE_PORT,
+        "tunnel_plugins.DEFAULT_EXTRACT_PORT": DEFAULT_EXTRACT_PORT,
+        "tunnel_plugins.DEFAULT_PPT_PORT": DEFAULT_PPT_PORT,
+        "tunnel_plugins.DEFAULT_WORD_PORT": DEFAULT_WORD_PORT,
+        "tunnel_plugins.DEFAULT_DC_PORT": DEFAULT_DC_PORT,
+        "tunnel_plugins.DEFAULT_DOCS_PORT": DEFAULT_DOCS_PORT,
+        "tunnel_plugins.DEFAULT_ZOTERO_PORT": DEFAULT_ZOTERO_PORT,
+        "tunnel_plugins.DEFAULT_OUTPUTS_PORT": DEFAULT_OUTPUTS_PORT,
+        "tunnel_plugins.DEFAULT_DEBUG_PORT": DEFAULT_DEBUG_PORT,
+        "serena_pool.SERENA_POOL_BASE_PORT": SERENA_POOL_BASE_PORT,
+    }
+    for slot_name, port in CUSTOM_SLOT_PORTS.items():
+        declared[f"tunnel_plugins.CUSTOM_SLOT_PORTS[{slot_name!r}]"] = port
+
+    by_port: "dict[int, list[str]]" = {}
+    for name, port in declared.items():
+        by_port.setdefault(port, []).append(name)
 
     findings: list[str] = []
-    if SERENA_POOL_BASE_PORT == DEFAULT_OUTPUTS_PORT:
-        findings.append(
-            f"SERENA_POOL_BASE_PORT ({SERENA_POOL_BASE_PORT}) == "
-            f"DEFAULT_OUTPUTS_PORT ({DEFAULT_OUTPUTS_PORT}) -- the code-extractor "
-            "slot's default Serena daemon pool allocates its FIRST repo's daemon "
-            "on the exact port the outputs slot defaults to. A second concurrently-"
-            "active repo in the Serena pool would similarly collide with "
-            f"DEFAULT_DEBUG_PORT ({DEFAULT_DEBUG_PORT}) if it lands on {SERENA_POOL_BASE_PORT + 1}."
-        )
+    for port in sorted(by_port):
+        names = by_port[port]
+        if len(names) > 1:
+            findings.append(
+                f"port {port} is declared by multiple constants: "
+                f"{', '.join(sorted(names))} -- these would contend for the "
+                "same TCP port if simultaneously active."
+            )
     return findings
 
 

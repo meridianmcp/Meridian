@@ -472,6 +472,64 @@ def test_call_tunnel_tool_surfaces_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# d0f05438 — _tunnel_jsonrpc / call_tunnel_tool must surface the REAL proxy
+# error (not-connected race, timeout, saturated slot, generic relay error)
+# instead of silently collapsing it into a bare None, which was
+# indistinguishable from "no active tunnel exposes this tool" and made
+# dispatch errors during e.g. a post-redeploy reconnect window carry no
+# message text at all.
+# ---------------------------------------------------------------------------
+
+def test_tunnel_jsonrpc_raises_with_real_message_on_proxy_error(monkeypatch):
+    """A >=400 Response from _do_proxy used to make _tunnel_jsonrpc return a
+    bare None, discarding the real reason. It must now raise with that reason."""
+    tn._tunnel_sockets["t1"] = object()
+
+    async def fake_do_proxy(tenant_id, method, path, query, headers, body, sockets, pending, label):
+        return Response(
+            content='{"error":"tunnel timeout"}', status_code=504,
+            media_type="application/json",
+        )
+    monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
+
+    with pytest.raises(RuntimeError, match="tunnel timeout"):
+        asyncio.run(tn._tunnel_jsonrpc("t1", "fs", "tools/list", {}))
+
+
+def test_tunnel_jsonrpc_falls_back_to_generic_message_on_unparseable_body(monkeypatch):
+    """A non-JSON / message-less error body still raises SOMETHING legible
+    (status-code based), never silently returns None."""
+    tn._tunnel_sockets["t1"] = object()
+
+    async def fake_do_proxy(tenant_id, method, path, query, headers, body, sockets, pending, label):
+        return Response(content=b"", status_code=502, media_type="application/json")
+    monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
+
+    with pytest.raises(RuntimeError, match="502"):
+        asyncio.run(tn._tunnel_jsonrpc("t1", "fs", "tools/list", {}))
+
+
+def test_call_tunnel_tool_surfaces_proxy_not_connected_race(monkeypatch):
+    """Integration: call_tunnel_tool's own socket-presence check can race a
+    disconnect that happens between that check and _do_proxy actually running
+    (e.g. a server redeploy tearing the socket down mid-dispatch). Before the
+    fix this silently returned None (indistinguishable from "no such tool");
+    it must now raise with the real, actionable proxy message."""
+    tn._tunnel_code_sockets["t1"] = object()
+    tn._tunnel_tool_routes["t1"] = {"trace_path": "code"}
+
+    async def fake_do_proxy(tenant_id, method, path, query, headers, body, sockets, pending, label):
+        return Response(
+            content='{"error":"code tunnel not connected"}', status_code=503,
+            media_type="application/json",
+        )
+    monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
+
+    with pytest.raises(RuntimeError, match="code tunnel not connected"):
+        asyncio.run(tn.call_tunnel_tool("t1", "trace_path", {}))
+
+
+# ---------------------------------------------------------------------------
 # Handler integration: tools/list aggregation + tools/call routing
 # ---------------------------------------------------------------------------
 
@@ -782,6 +840,73 @@ def test_do_proxy_502_on_send_failure():
         tn._tunnel_sockets, tn._pending_reqs, "fs",
     ))
     assert resp.status_code == 502
+    assert tn._pending_reqs == {}
+
+
+# ---------------------------------------------------------------------------
+# d0f05438 — _do_proxy must not let a force-cancelled pending future escape
+# as a bare, message-less asyncio.CancelledError. tunnel_ws's disconnect
+# cleanup calls fut.cancel() on every in-flight request future for a tenant
+# whose socket just dropped (e.g. a server redeploy wiping the in-memory
+# socket registry mid-request) — CancelledError is a BaseException (not
+# Exception) since Python 3.8, so it used to skip `except Exception` and
+# propagate uncaught out through call_tunnel_tool / the MCP dispatcher.
+# ---------------------------------------------------------------------------
+
+class _NeverRespondsWS:
+    """Accepts the send but never resolves the pending future — same shape as
+    _SilentWS, kept separate so this section stands alone."""
+
+    async def send_json(self, payload):
+        return None
+
+
+def test_do_proxy_force_cancelled_future_returns_legible_503():
+    async def run():
+        tn._tunnel_sockets["t1"] = _NeverRespondsWS()
+        task = asyncio.ensure_future(tn._do_proxy(
+            "t1", "POST", "/mcp", "", {}, b"x",
+            tn._tunnel_sockets, tn._pending_reqs, "fs",
+        ))
+        for _ in range(200):
+            if tn._pending_reqs:
+                break
+            await asyncio.sleep(0.01)
+        assert tn._pending_reqs, "request future never registered"
+        [(_, fut)] = list(tn._pending_reqs.items())
+        fut.cancel()  # exactly what tunnel_ws's disconnect cleanup does
+        return await asyncio.wait_for(task, timeout=2.0)
+
+    resp = asyncio.run(run())
+    assert resp.status_code == 503
+    assert b"disconnected" in resp.body
+    assert tn._pending_reqs == {}  # cleaned up, no leaked future/semaphore slot
+
+
+def test_do_proxy_task_cancel_resolves_bounded_not_hung():
+    """Cancelling the caller's own task (not just the pending future) lands in
+    the SAME except clause — asyncio.Task.cancel() cancels whatever the task is
+    currently awaiting (`fut`, via wait_for), so `fut.cancelled()` is True
+    either way and there's no reliable signal to tell them apart. The handler
+    does no further blocking work after the catch, so this still resolves
+    (not hangs) almost immediately with a legible response instead of an
+    unhandled, message-less CancelledError."""
+    async def run():
+        tn._tunnel_sockets["t1"] = _NeverRespondsWS()
+        task = asyncio.ensure_future(tn._do_proxy(
+            "t1", "POST", "/mcp", "", {}, b"x",
+            tn._tunnel_sockets, tn._pending_reqs, "fs",
+        ))
+        for _ in range(200):
+            if tn._pending_reqs:
+                break
+            await asyncio.sleep(0.01)
+        assert tn._pending_reqs, "request future never registered"
+        task.cancel()
+        return await asyncio.wait_for(task, timeout=2.0)
+
+    resp = asyncio.run(run())
+    assert resp.status_code == 503
     assert tn._pending_reqs == {}
 
 

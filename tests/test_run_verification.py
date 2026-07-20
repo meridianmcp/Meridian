@@ -106,6 +106,100 @@ async def test_send_run_cmd_control_not_connected():
 
 
 # ---------------------------------------------------------------------------
+# 3b. d0f05438 — send_run_cmd_control must not let a force-cancelled pending
+#     future escape as a bare, message-less asyncio.CancelledError.
+# ---------------------------------------------------------------------------
+
+class _NeverRespondsWS:
+    """Accepts the run_cmd send but never resolves the pending future."""
+
+    async def send_json(self, payload):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_send_run_cmd_control_force_cancelled_future_returns_legible_status():
+    """tunnel_ws's disconnect cleanup calls ``fut.cancel()`` on every pending
+    run_cmd future for a tenant whose FS socket just dropped — e.g. a server
+    redeploy wiping the in-memory socket registry mid-``run_verification``.
+    Before d0f05438, awaiting that force-cancelled future re-raised
+    ``asyncio.CancelledError`` — a ``BaseException`` (not ``Exception``) since
+    Python 3.8 — which slipped past ``except Exception`` and propagated
+    uncaught out of ``send_run_cmd_control``, surfacing to the MCP caller as a
+    bare, message-less dispatch failure instead of an honest, retryable
+    status. It must now return a legible dict, and the pending-request map
+    must still be cleaned up.
+    """
+    tenant_id = "tenant-cancel-run-cmd"
+    import asyncio as _asyncio  # noqa: PLC0415
+
+    tun._tunnel_sockets[tenant_id] = _NeverRespondsWS()
+    try:
+        task = _asyncio.ensure_future(
+            tun.send_run_cmd_control(tenant_id, cmd="pytest", cwd=None)
+        )
+        # Wait for the pending future to be registered, then force-cancel it —
+        # exactly what tunnel_ws's disconnect cleanup does on a dropped socket.
+        for _ in range(200):
+            if tun._pending_run_cmd_reqs:
+                break
+            await _asyncio.sleep(0.01)
+        assert tun._pending_run_cmd_reqs, "run_cmd future never registered"
+        [(_, fut)] = list(tun._pending_run_cmd_reqs.items())
+        fut.cancel()
+
+        result = await _asyncio.wait_for(task, timeout=2.0)
+    finally:
+        tun._tunnel_sockets.pop(tenant_id, None)
+        tun._pending_run_cmd_reqs.clear()
+
+    assert result["status"] == "not_connected"
+    assert result["message"]  # non-empty — the whole point of the fix
+    assert result["exit_code"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_run_cmd_control_task_cancel_resolves_bounded_not_hung():
+    """Cancelling the enclosing TASK (not just the pending future) is
+    indistinguishable, from inside ``send_run_cmd_control``, from tunnel_ws's
+    disconnect cleanup calling ``fut.cancel()`` directly — asyncio.Task.cancel()
+    cancels whatever the task is currently awaiting (``fut``, via wait_for), so
+    ``fut.cancelled()`` is True in both cases and there is no reliable signal to
+    tell them apart. The fix therefore treats both the same way: it resolves to
+    the legible dict rather than re-raising. This is safe because the handler
+    does no further blocking work after the catch (just a dict-pop and return),
+    so a genuine cancellation is still honored almost immediately — the task
+    completes right away either way, it just returns cleanly instead of
+    raising a bare, message-less CancelledError.
+    """
+    tenant_id = "tenant-real-cancel-run-cmd"
+    import asyncio as _asyncio  # noqa: PLC0415
+
+    tun._tunnel_sockets[tenant_id] = _NeverRespondsWS()
+    try:
+        task = _asyncio.ensure_future(
+            tun.send_run_cmd_control(tenant_id, cmd="pytest", cwd=None)
+        )
+        for _ in range(200):
+            if tun._pending_run_cmd_reqs:
+                break
+            await _asyncio.sleep(0.01)
+        assert tun._pending_run_cmd_reqs, "run_cmd future never registered"
+
+        # Cancel the TASK itself — this is what a real shutdown/client-abort
+        # looks like (as opposed to tunnel_ws's disconnect cleanup calling
+        # `fut.cancel()` on the pending future directly).
+        task.cancel()
+        result = await _asyncio.wait_for(task, timeout=2.0)
+    finally:
+        tun._tunnel_sockets.pop(tenant_id, None)
+        tun._pending_run_cmd_reqs.clear()
+
+    assert result["status"] == "not_connected"
+    assert result["message"]
+
+
+# ---------------------------------------------------------------------------
 # 4. run_verification: not_configured when no test_cmd stored
 #    Tests the actual DB path without invoking the full MCP stack.
 # ---------------------------------------------------------------------------
