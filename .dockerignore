@@ -12,6 +12,7 @@ logs/
 # Not needed in the container
 .git/
 .github/
+.claude/
 docs/
 tests/
 extensions/
