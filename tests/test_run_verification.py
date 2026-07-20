@@ -15,10 +15,14 @@ real subprocess or network needed for the tunnel-integration tests.
 """
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 from meridian import db as db_module
 from meridian.routes import tunnel as tun
+from meridian import tunnel_client as tc
 from meridian.tunnel_client import _parse_test_counts, _handle_run_cmd
 
 
@@ -88,6 +92,86 @@ async def test_handle_run_cmd_shell_string():
     )
     assert result["status"] == "ok"
     assert result["exit_code"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 2b. B_unbounded_await regression — proc.communicate() must be bounded.
+#
+# Every sibling await in the FS slot's message-dispatch loop is bounded
+# (proxy.ensure_running()'s spawn budget, _relay_request's
+# _LOCAL_REQUEST_TIMEOUT). Before this fix, _handle_run_cmd's
+# ``await proc.communicate()`` had no timeout at all: a hung/interactive
+# local command (e.g. one waiting on stdin) would block the coroutine
+# forever, freezing the whole WebSocket message loop for that slot since the
+# caller awaits _handle_run_cmd inline with no wait_for around it.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_run_cmd_times_out_instead_of_hanging(monkeypatch):
+    """A command that never exits must be killed and reported, not hang forever.
+
+    Regression test: with a small timeout budget, a subprocess that sleeps
+    far longer than the budget must be force-killed and _handle_run_cmd must
+    return promptly with status='error' — proving the await is bounded.
+    """
+    monkeypatch.setattr(tc, "_run_cmd_timeout", lambda: 0.3)
+
+    started = time.monotonic()
+    result = await asyncio.wait_for(
+        _handle_run_cmd(
+            ["python", "-c", "import time; time.sleep(30)"],
+            cwd=None,
+        ),
+        # Outer safety net for the test itself — if the fix regressed, this
+        # wait_for is what actually fails the test instead of hanging the
+        # whole suite.
+        timeout=10.0,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result["status"] == "error"
+    assert "timed out" in result["message"]
+    assert result["exit_code"] is None
+    # Should resolve close to the (mocked) 0.3s budget, nowhere near the
+    # subprocess's real 30s sleep.
+    assert elapsed < 5.0
+
+
+@pytest.mark.asyncio
+async def test_handle_run_cmd_timeout_kills_child_process(monkeypatch):
+    """On timeout the child process is actually killed, not leaked."""
+    killed = {"called": False}
+    waited = {"called": False}
+
+    class _FakeProc:
+        returncode = None
+
+        async def communicate(self):
+            # Never resolves on its own — simulates a hung process.
+            await asyncio.sleep(1000)
+
+        def kill(self):
+            killed["called"] = True
+
+        async def wait(self):
+            waited["called"] = True
+            return -9
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr(tc, "_run_cmd_timeout", lambda: 0.2)
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _fake_create_subprocess_exec
+    )
+
+    result = await asyncio.wait_for(
+        _handle_run_cmd(["python", "-c", "pass"], cwd=None), timeout=5.0
+    )
+
+    assert result["status"] == "error"
+    assert killed["called"], "hung subprocess was never killed on timeout"
+    assert waited["called"], "hung subprocess was never reaped after kill"
 
 
 # ---------------------------------------------------------------------------

@@ -3101,6 +3101,26 @@ def _parse_test_counts(text: str) -> "tuple[int | None, int | None]":
         return None, None
 
 
+# 0e973e52 — mirrors routes.tunnel._run_cmd_timeout()'s default: the SERVER
+# already bounds how long it waits for our run_cmd_result to 300s (configurable
+# via MERIDIAN_RUN_CMD_TIMEOUT), but that only bounds the server's own wait —
+# it can't unstick this client's event loop if proc.communicate() below hangs
+# forever (interactive prompt on stdin, deadlocked test suite, ...). Every
+# other await in the same _run_connection_lazy message loop is bounded
+# (proxy.ensure_running()'s spawn budget, _relay_request's _LOCAL_REQUEST_TIMEOUT),
+# so give the local subprocess wait a matching, configurable ceiling too.
+def _run_cmd_timeout() -> float:
+    raw = os.environ.get("MERIDIAN_RUN_CMD_TIMEOUT", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    return 300.0
+
+
 async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
     """0e973e52 — spawn *cmd* as a local process and return structured results.
 
@@ -3109,10 +3129,17 @@ async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
     16 KiB each (tail-trimmed so the most informative end is preserved). Limits
     the output so a verbose test suite never floods the tunnel with megabytes.
 
+    ``proc.communicate()`` is bounded by ``_run_cmd_timeout()`` — without it a
+    hung/interactive local command would block this coroutine forever, which
+    (since callers await it inline from the FS slot's WebSocket message loop)
+    freezes that entire connection: no further request/ping/run_cmd is ever
+    processed again for the slot.
+
     Returns a dict with keys: exit_code (int), passed (int|None),
     failed (int|None), stdout_tail (str), stderr_tail (str), status (str).
     """
     import asyncio as _asyncio  # noqa: PLC0415
+    import contextlib  # noqa: PLC0415
     import shlex as _shlex  # noqa: PLC0415
 
     _TAIL_BYTES = 16_384
@@ -3143,7 +3170,25 @@ async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
                 stderr=_asyncio.subprocess.PIPE,
                 cwd=cwd or None,
             )
-        stdout_b, stderr_b = await proc.communicate()
+        try:
+            stdout_b, stderr_b = await _asyncio.wait_for(
+                proc.communicate(), timeout=_run_cmd_timeout()
+            )
+        except _asyncio.TimeoutError:
+            # Don't leak the child — kill it and reap it before returning.
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            return {
+                "status": "error",
+                "message": f"command timed out after {_run_cmd_timeout():.0f}s",
+                "exit_code": None,
+                "passed": None,
+                "failed": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
         exit_code: int = proc.returncode if proc.returncode is not None else -1
 
         stdout_str = stdout_b[-_TAIL_BYTES:].decode("utf-8", errors="replace") if stdout_b else ""

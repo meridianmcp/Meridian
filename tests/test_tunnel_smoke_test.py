@@ -563,6 +563,48 @@ _FAKE_SERVER_SRC = textwrap.dedent(r"""
 _HANGING_SERVER_SRC = "import sys, time\nsys.stdin.readline()\ntime.sleep(60)\n"
 _EXIT_IMMEDIATELY_SRC = "import sys\nsys.exit(0)\n"
 
+# 2026-07-20 finding: modeled directly on a real, reproduced live capture of
+# @wonderwhy-er/desktop-commander@0.2.46 -- it emits several
+# `notifications/message` (no "id") log lines on stdout in between the real
+# initialize response and the real tools/list response. Any spec-compliant
+# MCP server may do this (server-initiated notifications are explicitly
+# allowed at any time); this fake reproduces exactly that interleaving.
+_CHATTY_SERVER_SRC = textwrap.dedent(r"""
+    import json, sys
+
+    def send(msg):
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
+
+    def notify(text):
+        send({"jsonrpc": "2.0", "method": "notifications/message",
+              "params": {"level": "info", "logger": "chatty", "data": text}})
+
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        req = json.loads(raw)
+        method = req.get("method")
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": req["id"], "result": {"serverInfo": {"name": "chatty"}}})
+        elif method == "notifications/initialized":
+            continue
+        elif method == "tools/list":
+            notify("loading configuration")
+            notify("connecting server")
+            notify("setting up request handlers")
+            send({"jsonrpc": "2.0", "id": req["id"], "result": {"tools": [
+                {"name": "get_status", "inputSchema": {}},
+            ]}})
+        elif method == "tools/call":
+            notify("dispatching call")
+            name = req["params"]["name"]
+            send({"jsonrpc": "2.0", "id": req["id"], "result": {"content": [
+                {"type": "text", "text": f"called {name}"}
+            ]}})
+""")
+
 
 @pytest.mark.asyncio
 async def test_stdio_mcp_client_full_happy_path():
@@ -595,6 +637,33 @@ async def test_stdio_mcp_client_times_out_on_unresponsive_server():
 
 
 @pytest.mark.asyncio
+async def test_stdio_mcp_client_close_does_not_raise_when_stderr_task_still_pending(monkeypatch):
+    """2026-07-20 finding: contextlib.suppress(Exception) does NOT catch
+    asyncio.CancelledError -- a BaseException, not an Exception, since Python
+    3.8. close() cancels self._stderr_task then awaits it; if the drain loop
+    was still genuinely blocked on a read() (true whenever the real child
+    process/tree is slower to die than _terminate_proc_tree_async, e.g. a
+    Serena/language-server process tree observed live), the resulting
+    CancelledError escaped close() uncaught and crashed the whole harness
+    (run_cycle -> run_loop -> _amain) on an otherwise-ordinary slot timeout.
+    Reproduced by stubbing _terminate_proc_tree_async as a no-op so the
+    stderr task is still pending -- not already EOF-completed -- when
+    close() cancels it."""
+    async def _no_op_terminate(proc):
+        return None
+
+    monkeypatch.setattr(tst, "_terminate_proc_tree_async", _no_op_terminate)
+    client = tst.StdioMcpClient([sys.executable, "-c", _EXIT_IMMEDIATELY_SRC], label="race")
+    await client.start()
+    # Force the stderr-drain task into a state that's still pending (blocked)
+    # regardless of how fast the real trivial subprocess's own stderr pipe
+    # closed, so close()'s .cancel() genuinely interrupts a live await.
+    client._stderr_task.cancel()
+    client._stderr_task = asyncio.ensure_future(asyncio.sleep(60))
+    await client.close()  # must not raise
+
+
+@pytest.mark.asyncio
 async def test_stdio_mcp_client_raises_when_process_exits_early():
     client = tst.StdioMcpClient([sys.executable, "-c", _EXIT_IMMEDIATELY_SRC], label="exit")
     await client.start()
@@ -606,10 +675,121 @@ async def test_stdio_mcp_client_raises_when_process_exits_early():
 
 
 @pytest.mark.asyncio
+async def test_stdio_mcp_client_skips_notifications_interleaved_before_response():
+    """2026-07-20 finding: _recv() used to return the FIRST parseable JSON-RPC
+    line, with no check that it was actually the response to the request just
+    sent rather than a server-initiated notification (no "id", legal at any
+    time per the MCP spec). Live-reproduced against
+    @wonderwhy-er/desktop-commander@0.2.46: its startup notifications got
+    returned as if they WERE the tools/list response, silently yielding
+    `tools=0, error=None` instead of the real (non-empty) tool list. This
+    exercises the exact same interleaving via _CHATTY_SERVER_SRC and asserts
+    list_tools() correctly skips the notifications and returns the real
+    tools, not an empty list."""
+    client = tst.StdioMcpClient([sys.executable, "-c", _CHATTY_SERVER_SRC], label="chatty")
+    await client.start()
+    try:
+        init_resp = await client.initialize(timeout=10.0)
+        assert init_resp["result"]["serverInfo"]["name"] == "chatty"
+
+        tools = await client.list_tools(timeout=10.0)
+        assert [t["name"] for t in tools] == ["get_status"]
+
+        call_resp = await client.call_tool("get_status", {}, timeout=10.0)
+        assert "called get_status" in call_resp["result"]["content"][0]["text"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_stdio_mcp_client_raises_mcpstdioerror_on_missing_binary():
     client = tst.StdioMcpClient(["this-binary-does-not-exist-anywhere-xyz"], label="missing")
     with pytest.raises(tst.McpStdioError, match="spawn failed"):
         await client.start()
+
+
+# ---------------------------------------------------------------------------
+# build_slot_specs -- code-intel cache-dir parity
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_build_slot_specs_code_slot_uses_dedicated_harness_cache_dir(tmp_path, monkeypatch):
+    """2026-07-20 finding: the "code" SlotSpec used to pass env=None, so its
+    codebase-memory-mcp spawn used the default (unset) CBM_CACHE_DIR instead
+    of a warm, dedicated one -- forcing a full cold reindex (and a false 30s
+    timeout) on every harness run. Confirms build_slot_specs now gives it a
+    real, harness-only CBM_CACHE_DIR distinct from both the unset default and
+    production's own dedicated dir (tunnel_client._code_intel_cache_dir), and
+    is now treated as a cold-fetch slot (gets the larger spawn budget +
+    warm-repeat check on cycle 1)."""
+    async def _fake_ensure(*a, **kw):
+        return str(tmp_path / "fake-codebase-memory-mcp")
+
+    monkeypatch.delenv("CBM_CACHE_DIR", raising=False)
+    monkeypatch.setattr(tst, "_ensure_codebase_memory_mcp", _fake_ensure)
+    specs = await tst.build_slot_specs(str(tmp_path), slots=["code"])
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.cold_fetch is True
+    assert "code" in tst.COLD_FETCH_SLOTS
+    assert spec.env is not None
+    assert spec.env.get("CBM_CACHE_DIR")
+    assert "code-intel-cache-smoketest" in spec.env["CBM_CACHE_DIR"]
+
+    from meridian.tunnel_client import _code_intel_cache_dir
+    assert spec.env["CBM_CACHE_DIR"] != str(_code_intel_cache_dir())
+
+
+# ---------------------------------------------------------------------------
+# _terminate_proc_tree_async
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_terminate_proc_tree_async_bounds_stalled_taskkill(monkeypatch):
+    """A stalled ``taskkill /F /T /PID`` (observed under AV/Defender
+    interference, or an unkillable target process) must not hang
+    _terminate_proc_tree_async forever. The very next await in the same
+    function (``proc.wait()``) is already wrapped in
+    ``asyncio.wait_for(..., timeout=5.0)``; the taskkill wait must be bounded
+    the same way so a stall there still reaches the ``proc.terminate()``
+    fallback instead of blocking every caller (StdioMcpClient.close(),
+    TunnelSubprocess.stop()) indefinitely.
+
+    Reproduced by making the spawned taskkill helper process's own ``wait()``
+    never resolve, then bounding the whole call with an outer watchdog that
+    is longer than the function's internal 5s timeout but far shorter than
+    "forever" -- before the fix this outer watchdog is what fires (proving
+    the function itself has no bound); after the fix the function returns on
+    its own well within the outer watchdog.
+    """
+    monkeypatch.setattr(tst.sys, "platform", "win32")
+
+    class _HangingKillProc:
+        def __init__(self):
+            self.pid = 999
+
+        async def wait(self):
+            await asyncio.Event().wait()  # never resolves
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        return _HangingKillProc()
+
+    monkeypatch.setattr(tst.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    class _FakeTargetProc:
+        def __init__(self):
+            self.pid = 123
+            self.terminate_called = False
+
+        def terminate(self):
+            self.terminate_called = True
+
+        async def wait(self):
+            return 0
+
+    target = _FakeTargetProc()
+    await asyncio.wait_for(tst._terminate_proc_tree_async(target), timeout=8.0)
+    assert target.terminate_called is True
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +837,27 @@ async def test_test_slot_classifies_av_signature_on_spawn_failure(tmp_path):
     assert result.classification == "av_interference"
 
 
+@pytest.mark.asyncio
+async def test_test_slot_times_out_on_hung_process_spawn(tmp_path, monkeypatch):
+    """2026-07-20 finding: client.start() (a bare asyncio.create_subprocess_exec)
+    was the one await in test_slot with no timeout wrapper -- an OS-level stall
+    before the child process ever talks on stdio (AV on-access scan, a first-run
+    GUI/elevation prompt from an Office-family slot, etc.) hung the whole harness
+    indefinitely. Simulates that stall by making StdioMcpClient.start() never
+    return, and asserts test_slot still resolves within spawn_timeout instead of
+    hanging -- the outer asyncio.wait_for is this test's own regression guard."""
+    async def _hang_forever(self):
+        await asyncio.sleep(999)
+
+    monkeypatch.setattr(tst.StdioMcpClient, "start", _hang_forever)
+    spec = tst.SlotSpec("dc", "desktop-commander", 8813, [sys.executable, "-c", _EXIT_IMMEDIATELY_SRC],
+                         None, "persistent", True)
+    result = await asyncio.wait_for(
+        tst.test_slot(spec, str(tmp_path), spawn_timeout=0.5), timeout=5.0,
+    )
+    assert result.passed is False
+
+
 # ---------------------------------------------------------------------------
 # static_findings — integration of the two static checks
 # ---------------------------------------------------------------------------
@@ -682,3 +883,63 @@ def test_static_findings_reports_port_collision_when_reintroduced(monkeypatch):
     port_findings = [f for f in findings if f.category == "port_collision"]
     assert len(port_findings) == 1
     assert port_findings[0].severity == "action-needed"
+
+
+# ---------------------------------------------------------------------------
+# TunnelSubprocess.start() unbounded-await regression (matches the sibling
+# StdioMcpClient.start() bug already fixed in test_slot()): a stall inside
+# asyncio.create_subprocess_exec itself must not hang run_cycle /
+# check_auth_reuse forever -- both call sites now bound it with
+# asyncio.wait_for(..., timeout=STARTUP_HARD_TIMEOUT_S).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_check_auth_reuse_bounds_hung_subprocess_spawn(tmp_path, monkeypatch):
+    """Before the fix, ``await boot.start()`` in check_auth_reuse was never
+    wrapped in asyncio.wait_for, so a stall inside create_subprocess_exec
+    itself (simulated here) hung the coroutine forever. After the fix it must
+    return a boot_failure Finding within STARTUP_HARD_TIMEOUT_S instead."""
+    monkeypatch.setattr(tst, "detect_live_peer_ports", lambda ports: [])
+    monkeypatch.setattr(tst, "kill_stale_ports", lambda ports, client_id=None: None)
+    monkeypatch.setattr(tst, "STARTUP_HARD_TIMEOUT_S", 0.2)
+
+    never_set = asyncio.Event()
+
+    async def _hanging_create_subprocess_exec(*args, **kwargs):
+        await never_set.wait()  # simulates an AV scan / pixi resolution stall
+        raise AssertionError("should never get here")  # pragma: no cover
+
+    monkeypatch.setattr(tst.asyncio, "create_subprocess_exec", _hanging_create_subprocess_exec)
+
+    ctx = tst.RunContext(repo_path=str(tmp_path), log_dir=tmp_path)
+
+    # Outer bound is a generous safety net only -- if the fix regresses, this
+    # call hangs until the outer wait_for cancels it and the test fails with
+    # asyncio.TimeoutError instead of the expected Finding.
+    finding = await asyncio.wait_for(tst.check_auth_reuse(ctx), timeout=5.0)
+    assert finding.category == "boot_failure"
+    assert "spawn" in finding.summary.lower()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_bounds_hung_subprocess_spawn(tmp_path, monkeypatch):
+    """Same regression as above, but for run_cycle's boot leg."""
+    monkeypatch.setattr(tst, "detect_live_peer_ports", lambda ports: [])
+    monkeypatch.setattr(tst, "kill_stale_ports", lambda ports, client_id=None: None)
+    monkeypatch.setattr(tst, "STARTUP_HARD_TIMEOUT_S", 0.2)
+
+    never_set = asyncio.Event()
+
+    async def _hanging_create_subprocess_exec(*args, **kwargs):
+        await never_set.wait()
+        raise AssertionError("should never get here")  # pragma: no cover
+
+    monkeypatch.setattr(tst.asyncio, "create_subprocess_exec", _hanging_create_subprocess_exec)
+
+    ctx = tst.RunContext(repo_path=str(tmp_path), slots=(), log_dir=tmp_path, with_tunnel_boot=True)
+    tracker = tst.ConvergenceTracker()
+
+    cycle = await asyncio.wait_for(tst.run_cycle(ctx, 1, tracker), timeout=5.0)
+    assert cycle.tunnel_boot_ok is False
+    boot_findings = [f for f in cycle.findings if f.category == "boot_failure"]
+    assert boot_findings and "spawn" in boot_findings[0].summary.lower()
