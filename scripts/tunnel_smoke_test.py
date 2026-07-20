@@ -1426,27 +1426,43 @@ async def run_cycle(ctx: RunContext, cycle_num: int, tracker: ConvergenceTracker
             kill_stale_ports(ALL_KNOWN_PORTS, ctx.client_id)
             log_path = (ctx.log_dir / f"tunnel_boot_cycle{cycle_num}.log") if ctx.log_dir else None
             boot = TunnelSubprocess(ctx.repo_path, base_url=ctx.base_url, log_path=log_path)
-            await boot.start()
-            settle = await boot.wait_for_settle()
-            tunnel_boot_ok = settle in ("confirm_line", "timeout_settle_window")
-            classification = classify_captured_output(boot.captured)
-            if classification == "av_interference":
-                findings.append(Finding(category="av_interference", severity="hard-stop", slot=None,
-                                         summary="TAR_ENTRY_ERROR detected in tunnel boot output.",
-                                         detail="Needs Adam's one-time Defender/AV exclusion -- "
-                                                "this harness will never attempt that itself."))
-            elif classification == "browser_auth_required":
-                findings.append(Finding(category="auth_reissuance", severity="action-needed", slot=None,
-                                         summary="Tunnel boot required a fresh browser OAuth click.",
-                                         detail="Blocks fully unattended looping past this point."))
-            if not tunnel_boot_ok:
-                findings.append(Finding(category="boot_failure", severity="action-needed", slot=None,
-                                         summary=f"Tunnel subprocess did not reach a settled boot state ({settle}).",
-                                         detail=boot.captured[-2000:]))
-            for msg in detect_cascading_disconnect(boot.lines):
-                findings.append(Finding(category="cascading_disconnect", severity="action-needed",
-                                         slot=None, summary="Possible cascading cross-slot disconnect.",
-                                         detail=msg))
+            try:
+                # Bounded the same as wait_for_settle's own hard_timeout below --
+                # without this, a stall inside create_subprocess_exec itself (AV
+                # on-access scan, pixi env resolution) hangs this coroutine
+                # forever with no timeout machinery downstream ever getting a
+                # chance to run.
+                await asyncio.wait_for(boot.start(), timeout=STARTUP_HARD_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                tunnel_boot_ok = False
+                findings.append(Finding(
+                    category="boot_failure", severity="action-needed", slot=None,
+                    summary=f"Tunnel subprocess failed to spawn within {STARTUP_HARD_TIMEOUT_S:.0f}s.",
+                    detail="create_subprocess_exec() itself never returned -- possibly an AV "
+                           "on-access scan of the freshly-invoked pixi/python launcher, or pixi "
+                           "environment resolution stalling.",
+                ))
+            else:
+                settle = await boot.wait_for_settle()
+                tunnel_boot_ok = settle in ("confirm_line", "timeout_settle_window")
+                classification = classify_captured_output(boot.captured)
+                if classification == "av_interference":
+                    findings.append(Finding(category="av_interference", severity="hard-stop", slot=None,
+                                             summary="TAR_ENTRY_ERROR detected in tunnel boot output.",
+                                             detail="Needs Adam's one-time Defender/AV exclusion -- "
+                                                    "this harness will never attempt that itself."))
+                elif classification == "browser_auth_required":
+                    findings.append(Finding(category="auth_reissuance", severity="action-needed", slot=None,
+                                             summary="Tunnel boot required a fresh browser OAuth click.",
+                                             detail="Blocks fully unattended looping past this point."))
+                if not tunnel_boot_ok:
+                    findings.append(Finding(category="boot_failure", severity="action-needed", slot=None,
+                                             summary=f"Tunnel subprocess did not reach a settled boot state ({settle}).",
+                                             detail=boot.captured[-2000:]))
+                for msg in detect_cascading_disconnect(boot.lines):
+                    findings.append(Finding(category="cascading_disconnect", severity="action-needed",
+                                             slot=None, summary="Possible cascading cross-slot disconnect.",
+                                             detail=msg))
 
     specs = await build_slot_specs(ctx.repo_path, slots=ctx.slots, include_optional=ctx.include_optional)
     slot_results: "list[SlotResult]" = []
@@ -1536,7 +1552,20 @@ async def check_auth_reuse(ctx: RunContext) -> Finding:
         kill_stale_ports(ALL_KNOWN_PORTS, ctx.client_id)
         boot = TunnelSubprocess(ctx.repo_path, base_url=ctx.base_url,
                                  log_path=ctx.log_dir / f"auth_check_run{i}.log")
-        await boot.start()
+        try:
+            # Same bound as run_cycle's boot leg -- a stall inside
+            # create_subprocess_exec itself must not hang this coroutine (and
+            # therefore the whole check) forever.
+            await asyncio.wait_for(boot.start(), timeout=STARTUP_HARD_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return Finding(
+                category="boot_failure", severity="action-needed", slot=None,
+                summary=f"Tunnel subprocess (auth-reuse run {i}) failed to spawn within "
+                        f"{STARTUP_HARD_TIMEOUT_S:.0f}s.",
+                detail="create_subprocess_exec() itself never returned -- possibly an AV "
+                       "on-access scan of the freshly-invoked pixi/python launcher, or pixi "
+                       "environment resolution stalling. Auth-reuse check aborted.",
+            )
         await boot.wait_for_settle()
         results.append(BROWSER_AUTH_SIGNATURE in boot.captured)
         await boot.stop()

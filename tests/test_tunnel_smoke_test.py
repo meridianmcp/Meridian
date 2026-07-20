@@ -883,3 +883,63 @@ def test_static_findings_reports_port_collision_when_reintroduced(monkeypatch):
     port_findings = [f for f in findings if f.category == "port_collision"]
     assert len(port_findings) == 1
     assert port_findings[0].severity == "action-needed"
+
+
+# ---------------------------------------------------------------------------
+# TunnelSubprocess.start() unbounded-await regression (matches the sibling
+# StdioMcpClient.start() bug already fixed in test_slot()): a stall inside
+# asyncio.create_subprocess_exec itself must not hang run_cycle /
+# check_auth_reuse forever -- both call sites now bound it with
+# asyncio.wait_for(..., timeout=STARTUP_HARD_TIMEOUT_S).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_check_auth_reuse_bounds_hung_subprocess_spawn(tmp_path, monkeypatch):
+    """Before the fix, ``await boot.start()`` in check_auth_reuse was never
+    wrapped in asyncio.wait_for, so a stall inside create_subprocess_exec
+    itself (simulated here) hung the coroutine forever. After the fix it must
+    return a boot_failure Finding within STARTUP_HARD_TIMEOUT_S instead."""
+    monkeypatch.setattr(tst, "detect_live_peer_ports", lambda ports: [])
+    monkeypatch.setattr(tst, "kill_stale_ports", lambda ports, client_id=None: None)
+    monkeypatch.setattr(tst, "STARTUP_HARD_TIMEOUT_S", 0.2)
+
+    never_set = asyncio.Event()
+
+    async def _hanging_create_subprocess_exec(*args, **kwargs):
+        await never_set.wait()  # simulates an AV scan / pixi resolution stall
+        raise AssertionError("should never get here")  # pragma: no cover
+
+    monkeypatch.setattr(tst.asyncio, "create_subprocess_exec", _hanging_create_subprocess_exec)
+
+    ctx = tst.RunContext(repo_path=str(tmp_path), log_dir=tmp_path)
+
+    # Outer bound is a generous safety net only -- if the fix regresses, this
+    # call hangs until the outer wait_for cancels it and the test fails with
+    # asyncio.TimeoutError instead of the expected Finding.
+    finding = await asyncio.wait_for(tst.check_auth_reuse(ctx), timeout=5.0)
+    assert finding.category == "boot_failure"
+    assert "spawn" in finding.summary.lower()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_bounds_hung_subprocess_spawn(tmp_path, monkeypatch):
+    """Same regression as above, but for run_cycle's boot leg."""
+    monkeypatch.setattr(tst, "detect_live_peer_ports", lambda ports: [])
+    monkeypatch.setattr(tst, "kill_stale_ports", lambda ports, client_id=None: None)
+    monkeypatch.setattr(tst, "STARTUP_HARD_TIMEOUT_S", 0.2)
+
+    never_set = asyncio.Event()
+
+    async def _hanging_create_subprocess_exec(*args, **kwargs):
+        await never_set.wait()
+        raise AssertionError("should never get here")  # pragma: no cover
+
+    monkeypatch.setattr(tst.asyncio, "create_subprocess_exec", _hanging_create_subprocess_exec)
+
+    ctx = tst.RunContext(repo_path=str(tmp_path), slots=(), log_dir=tmp_path, with_tunnel_boot=True)
+    tracker = tst.ConvergenceTracker()
+
+    cycle = await asyncio.wait_for(tst.run_cycle(ctx, 1, tracker), timeout=5.0)
+    assert cycle.tunnel_boot_ok is False
+    boot_findings = [f for f in cycle.findings if f.category == "boot_failure"]
+    assert boot_findings and "spawn" in boot_findings[0].summary.lower()
