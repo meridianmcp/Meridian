@@ -21,6 +21,15 @@ dependencies = [
     # PyPI package (3 releases, last an rc, unrelated author). Verified via
     # PyPI JSON API + GitHub search before adding.
     "tantivy>=0.22",
+    # 984b237c -- xxHash (XXH3-128) replaces SHA-256 as the hasher behind
+    # OutputsFtsIndex's archival-duplicate-detection ("is this file byte-
+    # identical to its canonical twin?") check -- non-cryptographic use
+    # case, real measured speedup on large files (see
+    # TestXxh3Benchmark/_xxh3_file's docstring). outputs_local.py lazily
+    # imports this and degrades to SHA-256 if it's ever missing at runtime,
+    # but it's declared as a real, non-optional dependency here so a normal
+    # install always gets the fast path.
+    "xxhash>=3.4",
 ]
 
 [project.optional-dependencies]

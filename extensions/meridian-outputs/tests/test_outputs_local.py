@@ -16,6 +16,7 @@ Covers:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -1345,8 +1346,8 @@ class TestRebuildWalkDeadlineAwareness:
         blows the budget, exactly 6ba77ada's reported signature."""
         real_walk = OL._walk_safe_output_files
 
-        def slow_walk(outputs_dir: str):
-            for p in real_walk(outputs_dir):
+        def slow_walk(outputs_dir: str, *, exclude_patterns: tuple = ()):
+            for p in real_walk(outputs_dir, exclude_patterns=exclude_patterns):
                 time.sleep(delay)
                 yield p
 
@@ -1950,6 +1951,593 @@ class TestTantivyDependency:
         query = index.parse_query("hello", ["body"])
         hits = index.searcher().search(query, 10).hits
         assert len(hits) == 1
+
+
+# ---------------------------------------------------------------------------
+# 5d0b3866 -- _tantivy_dir() must be unique per db_path, not per parent dir
+# ---------------------------------------------------------------------------
+
+class TestTantivyDirUniqueness:
+    """5d0b3866 -- _tantivy_dir() must derive a path unique per db_path, not
+    merely per PARENT directory. Two OutputsFtsIndex instances pointed at
+    DIFFERENT db_path values in the SAME parent folder must never share a
+    Tantivy index directory -- confirmed live: sharing one caused a SECOND
+    index's _connect() to detect the FIRST index's on-disk Tantivy segments
+    via tantivy.Index.exists() and set _fts_built=True from a completely
+    unrelated index's state, after which search() returned 0 hits for terms
+    genuinely present in the second index's own files."""
+
+    def test_distinct_db_paths_get_distinct_tantivy_dirs(self, tmp_path: Path) -> None:
+        shared_parent = tmp_path / "shared"
+        shared_parent.mkdir()
+        db_a = str(shared_parent / "a.duckdb")
+        db_b = str(shared_parent / "b.duckdb")
+        idx_a = OL.OutputsFtsIndex(str(tmp_path), db_path=db_a)
+        idx_b = OL.OutputsFtsIndex(str(tmp_path), db_path=db_b)
+        try:
+            tdir_a = idx_a._tantivy_dir()
+            tdir_b = idx_b._tantivy_dir()
+            assert tdir_a is not None and tdir_b is not None
+            assert tdir_a != tdir_b, (
+                "two distinct db_path values in the SAME parent dir must "
+                "get genuinely separate tantivy directories"
+            )
+        finally:
+            idx_a.close()
+            idx_b.close()
+
+    def test_tantivy_dir_is_stable_for_the_same_db_path(self, tmp_path: Path) -> None:
+        """Determinism requirement (requirement 3): the SAME db_path must
+        always resolve to the SAME tantivy dir, across instances."""
+        db_path = str(tmp_path / "same.duckdb")
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            assert idx1._tantivy_dir() == idx2._tantivy_dir()
+        finally:
+            idx1.close()
+            idx2.close()
+
+    @duckdb_required
+    def test_two_indexes_in_same_parent_dir_do_not_see_each_others_state(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression for the EXACT reported scenario: distinct .duckdb
+        files in the same parent dir must never make one instance's
+        _fts_built flip True from the OTHER's on-disk tantivy index, and
+        search results must stay genuinely isolated."""
+        outputs_a = tmp_path / "outputs_a"
+        outputs_b = tmp_path / "outputs_b"
+        outputs_a.mkdir()
+        outputs_b.mkdir()
+        (outputs_a / "alpha.csv").write_text(
+            "uniquetermalpha,val\n1,2", encoding="utf-8",
+        )
+        (outputs_b / "beta.csv").write_text(
+            "uniquetermbeta,val\n3,4", encoding="utf-8",
+        )
+
+        shared_cache = tmp_path / "shared_cache"
+        shared_cache.mkdir()
+        db_a = str(shared_cache / "index_a.duckdb")
+        db_b = str(shared_cache / "index_b.duckdb")
+
+        idx_a = OL.OutputsFtsIndex(str(outputs_a), db_path=db_a)
+        idx_a.rebuild()
+        idx_a.close()
+
+        idx_b = OL.OutputsFtsIndex(str(outputs_b), db_path=db_b)
+        try:
+            # Before the fix: idx_b._connect() would find idx_a's on-disk
+            # tantivy_index/ dir (a SHARED parent) and incorrectly set
+            # _fts_built=True from index A's existence check alone.
+            idx_b._connect()
+            assert idx_b._fts_built is False, (
+                "a fresh index for a DIFFERENT db_path must not inherit "
+                "_fts_built=True from an unrelated index's tantivy dir"
+            )
+            idx_b.rebuild()
+            hits_b = idx_b.search("uniquetermbeta")
+            assert any("beta.csv" in h["path"] for h in hits_b)
+            assert idx_b.search("uniquetermalpha") == [], (
+                "index B must never see index A's content"
+            )
+        finally:
+            idx_b.close()
+
+
+# ---------------------------------------------------------------------------
+# 9a18a2b2 -- Tantivy single-writer lock conflict handling
+# ---------------------------------------------------------------------------
+
+class TestTantivyLockConflictDetection:
+    """_is_tantivy_lock_conflict must recognise Tantivy's real LockBusy
+    failure (confirmed live against this bindings version, see
+    _connect_tantivy's docstring) and NOT flag unrelated errors."""
+
+    def test_detects_real_lock_busy_message(self) -> None:
+        exc = ValueError(
+            "Failed to acquire Lockfile: LockBusy. Some(\"Failed to "
+            "acquire index lock. If you are using a regular directory, "
+            "this means there is already an `IndexWriter` working on this "
+            "`Directory`, in this process or in a different process.\")"
+        )
+        assert OL._is_tantivy_lock_conflict(exc) is True
+
+    def test_does_not_flag_unrelated_errors(self) -> None:
+        assert OL._is_tantivy_lock_conflict(ValueError("boom")) is False
+        assert OL._is_tantivy_lock_conflict(OSError("disk full")) is False
+        assert OL._is_tantivy_lock_conflict(RuntimeError("")) is False
+
+
+class TestTantivyLockHandling:
+    """9a18a2b2 -- OutputsFtsIndex must handle a locked Tantivy index
+    gracefully: no uncaught exception from rebuild()/search() (best-effort
+    contract preserved), plus a clear, actionable message left behind --
+    not just a silent empty result indistinguishable from "no matches"."""
+
+    @staticmethod
+    def _hold_tantivy_lock(tdir: str):
+        import tantivy  # noqa: PLC0415
+        schema = OL.OutputsFtsIndex._tantivy_schema()
+        blocking_index = tantivy.Index(schema, path=tdir)
+        blocking_writer = blocking_index.writer()
+        return blocking_index, blocking_writer
+
+    @duckdb_required
+    def test_locked_index_does_not_raise_and_sets_actionable_message(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "data.csv").write_text("term,value\n1,2", encoding="utf-8")
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        tdir = idx._tantivy_dir()
+        assert tdir is not None
+        blocking_index, blocking_writer = self._hold_tantivy_lock(tdir)
+        try:
+            # rebuild()/search() must not raise -- best-effort by contract.
+            count = idx.rebuild()
+            assert isinstance(count, int)
+            hits = idx.search("term")
+            assert hits == []  # best-effort contract preserved: no crash
+            assert idx._last_tantivy_error is not None, (
+                "a lock conflict must leave a clear, actionable message "
+                "behind, not disappear silently"
+            )
+            assert "lock" in idx._last_tantivy_error.lower()
+        finally:
+            idx.close()
+            del blocking_writer
+            del blocking_index
+
+    @duckdb_required
+    def test_connect_tantivy_raises_typed_conflict_directly(
+        self, tmp_path: Path,
+    ) -> None:
+        """Calling _connect_tantivy() directly (bypassing rebuild()/
+        search()'s own broad except) must raise the TYPED
+        TantivyLockConflict, not disappear or raise something opaque --
+        confirms the failure is genuinely identifiable."""
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        tdir = idx._tantivy_dir()
+        assert tdir is not None
+        blocking_index, blocking_writer = self._hold_tantivy_lock(tdir)
+        try:
+            with pytest.raises(OL.TantivyLockConflict):
+                idx._connect_tantivy()
+        finally:
+            idx.close()
+            del blocking_writer
+            del blocking_index
+
+    @duckdb_required
+    def test_search_outputs_surfaces_lock_warning(self, tmp_path: Path) -> None:
+        (tmp_path / "data.csv").write_text("term,value\n1,2", encoding="utf-8")
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        probe = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        tdir = probe._tantivy_dir()
+        probe.close()
+        assert tdir is not None
+        blocking_index, blocking_writer = self._hold_tantivy_lock(tdir)
+        try:
+            result = OL.search_outputs(str(tmp_path), "term")
+            assert "tantivy_lock_warning" in result
+            assert "lock" in result["tantivy_lock_warning"].lower()
+        finally:
+            del blocking_writer
+            del blocking_index
+
+
+# ---------------------------------------------------------------------------
+# 984b237c -- xxHash swap for the archival-duplicate-detection hasher
+# ---------------------------------------------------------------------------
+
+class TestXxh3Hasher:
+    """_xxh3_file swaps SHA-256 for xxHash on the archival-dedup hasher;
+    must degrade gracefully to SHA-256 when xxhash is unavailable, and must
+    actually be wired in as the default everywhere that matters."""
+
+    def test_returns_a_real_hash_for_real_content(self, tmp_path: Path) -> None:
+        f = tmp_path / "data.bin"
+        f.write_bytes(b"hello xxhash world" * 100)
+        digest = OL._xxh3_file(str(f))
+        assert digest is not None
+        assert isinstance(digest, str)
+        assert len(digest) > 0
+
+    def test_deterministic_for_same_content(self, tmp_path: Path) -> None:
+        f1 = tmp_path / "a.bin"
+        f2 = tmp_path / "b.bin"
+        content = b"identical content for hashing" * 50
+        f1.write_bytes(content)
+        f2.write_bytes(content)
+        assert OL._xxh3_file(str(f1)) == OL._xxh3_file(str(f2))
+
+    def test_different_for_different_content(self, tmp_path: Path) -> None:
+        f1 = tmp_path / "a.bin"
+        f2 = tmp_path / "b.bin"
+        f1.write_bytes(b"content A")
+        f2.write_bytes(b"content B")
+        assert OL._xxh3_file(str(f1)) != OL._xxh3_file(str(f2))
+
+    def test_missing_file_returns_none(self) -> None:
+        assert OL._xxh3_file("/no/such/file.bin") is None
+
+    def test_degrades_to_sha256_when_xxhash_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        f = tmp_path / "data.bin"
+        f.write_bytes(b"degrade path content")
+        # sys.modules[name] = None is the standard mechanism for forcing
+        # ImportError on the next `import name`, regardless of any prior
+        # caching -- confirmed live against this Python version.
+        monkeypatch.setitem(sys.modules, "xxhash", None)
+        digest = OL._xxh3_file(str(f))
+        assert digest == OL._sha256_file(str(f))
+
+    def test_default_hasher_is_xxh3_on_classify_canonical_archival(self) -> None:
+        import inspect
+        sig = inspect.signature(OL.classify_canonical_archival)
+        assert sig.parameters["hasher"].default is OL._xxh3_file
+
+    def test_default_hasher_is_xxh3_on_build_output_rows(self) -> None:
+        import inspect
+        sig = inspect.signature(OL.build_output_rows)
+        assert sig.parameters["hasher"].default is OL._xxh3_file
+
+    def test_default_hasher_is_xxh3_on_outputs_fts_index(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._hasher is OL._xxh3_file
+        finally:
+            idx.close()
+
+
+class TestXxh3Benchmark:
+    """984b237c -- live, on-box A/B confirmation that xxHash is genuinely
+    faster than SHA-256 on a real file, not just citing published numbers
+    (the item's own notes explicitly require live confirmation). Uses a
+    real ~6MB file on real disk, best-of-N timing for both algorithms (cuts
+    scheduler/OS noise), and a deliberately modest safety margin (xxHash
+    must be at least 1.5x faster) -- well under xxHash's commonly-cited
+    5-10x -- so this stays robust on a slow/virtualised CI runner while
+    still proving a real, substantial speedup rather than a coin-flip."""
+
+    @staticmethod
+    def _best_of(fn, path: str, repeats: int = 7) -> float:
+        best = float("inf")
+        for _ in range(repeats):
+            start = time.perf_counter()
+            fn(path)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    def test_xxh3_faster_than_sha256_on_real_file(self, tmp_path: Path) -> None:
+        try:
+            import xxhash  # noqa: F401
+        except ImportError:
+            pytest.skip("xxhash not installed")
+
+        f = tmp_path / "bench.bin"
+        # Real, non-trivial content (not all-zero -- avoids either hasher
+        # taking a degenerate fast path on a repeating byte pattern).
+        chunk = bytes((i * 2654435761) % 256 for i in range(65536))
+        with open(f, "wb") as fh:
+            for _ in range(96):  # ~6 MB
+                fh.write(chunk)
+
+        # Warm the OS page cache identically for both so the comparison is
+        # CPU-bound (hashing throughput), not first-read disk I/O.
+        OL._sha256_file(str(f))
+        OL._xxh3_file(str(f))
+
+        sha256_best = self._best_of(OL._sha256_file, str(f))
+        xxh3_best = self._best_of(OL._xxh3_file, str(f))
+
+        assert xxh3_best * 1.5 <= sha256_best, (
+            f"expected xxHash to be at least 1.5x faster than SHA-256 on a "
+            f"real ~6MB file; got xxh3_best={xxh3_best:.4f}s "
+            f"sha256_best={sha256_best:.4f}s "
+            f"(speedup={sha256_best / xxh3_best:.2f}x)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 49b97a6a -- hash-algo version marker forces a one-time full re-hash
+# ---------------------------------------------------------------------------
+
+class TestHashAlgoVersionUpgrade:
+    """Upgrading from a pre-xxHash (984b237c) on-disk DB must trigger a
+    one-time full re-hash of every row -- never leave a silent SHA-256/
+    xxHash mix sitting under the same 'sha256' column."""
+
+    @duckdb_required
+    def test_fresh_db_is_marked_current_immediately(self, tmp_path: Path) -> None:
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            con = idx._connect()
+            assert idx._pending_hash_upgrade is False
+            assert idx._read_hash_algo_version(con) == OL._HASH_ALGO_VERSION
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_legacy_db_triggers_full_rehash_on_upgrade(self, tmp_path: Path) -> None:
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+
+        # Simulate a genuinely pre-49b97a6a on-disk DB: real content rows
+        # with an old-style SHA-256 hash, and NO version marker at all
+        # (mirrors an install that predates this marker existing).
+        f = tmp_path / "legacy.csv"
+        f.write_bytes(b"legacy content for hashing")
+        old_sha = hashlib.sha256(b"legacy content for hashing").hexdigest()
+
+        idx0 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        con0 = idx0._connect()
+        idx0._ensure_schema(con0)
+        st = os.stat(f)
+        con0.execute(
+            "INSERT INTO outputs_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                str(f), "legacy content for hashing", st.st_mtime, old_sha,
+                st.st_size, None, "binary_metadata", False, None, None, None,
+            ],
+        )
+        con0.execute(
+            "DELETE FROM outputs_index_meta WHERE key = 'hash_algo_version'"
+        )
+        idx0.close()
+
+        # Fresh instance reconnecting to the SAME on-disk db_path -- the
+        # realistic "upgrade" scenario (existing DB, new code).
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx1._connect()
+            assert idx1._pending_hash_upgrade is True
+            assert str(f) not in idx1._row_cache, (
+                "legacy row must NOT be rehydrated as already-indexed -- "
+                "it must look stale so rebuild() genuinely re-hashes it"
+            )
+
+            idx1.rebuild()
+
+            new_row = idx1.resolve_output(str(f))
+            assert new_row is not None
+            assert new_row["sha256"] != old_sha, (
+                "row must be re-hashed with the new algorithm after "
+                "upgrade, not left with its stale SHA-256 value"
+            )
+            assert new_row["sha256"] == OL._xxh3_file(str(f)), (
+                "re-hashed value must match the current default hasher "
+                "(_xxh3_file)"
+            )
+            assert idx1._pending_hash_upgrade is False, (
+                "upgrade flag must clear once the full re-hash pass converges"
+            )
+            con1 = idx1._connect()
+            assert idx1._read_hash_algo_version(con1) == OL._HASH_ALGO_VERSION
+        finally:
+            idx1.close()
+
+    @duckdb_required
+    def test_already_current_db_is_not_flagged_again(self, tmp_path: Path) -> None:
+        """An already-upgraded DB (version already current) must take the
+        normal fast path on reconnect -- no forced re-hash, rows rehydrate
+        as usual."""
+        (tmp_path / "data.csv").write_text("col\n1", encoding="utf-8")
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild()
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx2._connect()
+            assert idx2._pending_hash_upgrade is False
+            assert any("data.csv" in p for p in idx2._row_cache), (
+                "an already-current DB must rehydrate normally, not be "
+                "treated as needing another full re-hash"
+            )
+        finally:
+            idx2.close()
+
+
+# ---------------------------------------------------------------------------
+# acac2599 -- configurable Phase-1 ThreadPoolExecutor worker cap
+# ---------------------------------------------------------------------------
+
+class TestConfigurableMaxWorkers:
+    def test_default_is_eight(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._max_workers == 8
+        finally:
+            idx.close()
+
+    def test_constructor_override(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), max_workers=2)
+        try:
+            assert idx._max_workers == 2
+        finally:
+            idx.close()
+
+    def test_env_var_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL._MAX_WORKERS_ENV_VAR, "3")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._max_workers == 3
+        finally:
+            idx.close()
+
+    def test_constructor_overrides_env_var(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL._MAX_WORKERS_ENV_VAR, "3")
+        idx = OL.OutputsFtsIndex(str(tmp_path), max_workers=5)
+        try:
+            assert idx._max_workers == 5
+        finally:
+            idx.close()
+
+    def test_invalid_env_var_falls_back_to_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL._MAX_WORKERS_ENV_VAR, "not-an-int")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._max_workers == 8
+        finally:
+            idx.close()
+
+    def test_non_positive_constructor_value_falls_back_to_default(
+        self, tmp_path: Path,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), max_workers=0)
+        try:
+            assert idx._max_workers == 8
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_override_actually_changes_effective_worker_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Confirms the override actually reaches ThreadPoolExecutor, not
+        just the stored attribute."""
+        for i in range(5):
+            (tmp_path / f"f{i}.csv").write_text(f"col{i}\n1", encoding="utf-8")
+        seen: list[int] = []
+        real_executor = OL.concurrent.futures.ThreadPoolExecutor
+
+        def _spy(*args, **kwargs):
+            seen.append(kwargs.get("max_workers"))
+            return real_executor(*args, **kwargs)
+
+        monkeypatch.setattr(OL.concurrent.futures, "ThreadPoolExecutor", _spy)
+        idx = OL.OutputsFtsIndex(str(tmp_path), max_workers=2)
+        try:
+            idx.rebuild()
+        finally:
+            idx.close()
+        assert seen, "ThreadPoolExecutor was never constructed"
+        assert seen[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# fd4dd661 -- user-configurable exclude patterns (gitignore-style, v1)
+# ---------------------------------------------------------------------------
+
+class TestExcludePatterns:
+    def test_matches_exclude_pattern_basename_glob(self) -> None:
+        assert OL._matches_exclude_pattern("run.tmp", "sub/run.tmp", ("*.tmp",))
+        assert not OL._matches_exclude_pattern("run.csv", "sub/run.csv", ("*.tmp",))
+
+    def test_matches_exclude_pattern_relative_path_glob(self) -> None:
+        assert OL._matches_exclude_pattern("data.csv", "cache/data.csv", ("cache/*",))
+        assert not OL._matches_exclude_pattern("data.csv", "keep/data.csv", ("cache/*",))
+
+    def test_directory_pattern_trailing_slash(self) -> None:
+        assert OL._matches_exclude_pattern(
+            "node_modules", "node_modules", ("node_modules/",)
+        )
+
+    def test_empty_patterns_never_match(self) -> None:
+        assert not OL._matches_exclude_pattern("a.csv", "a.csv", ())
+
+    @duckdb_required
+    def test_iter_safe_output_files_respects_exclude_patterns(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "keep.csv").write_text("a\n1", encoding="utf-8")
+        (tmp_path / "skip.tmp").write_text("a\n1", encoding="utf-8")
+        big_dir = tmp_path / "big_sweep_output"
+        big_dir.mkdir()
+        (big_dir / "inner.csv").write_text("a\n1", encoding="utf-8")
+
+        paths = OL._iter_safe_output_files(
+            str(tmp_path), exclude_patterns=("*.tmp", "big_sweep_output/"),
+        )
+        basenames = {os.path.basename(p) for p in paths}
+        assert "keep.csv" in basenames
+        assert "skip.tmp" not in basenames
+        assert "inner.csv" not in basenames, (
+            "a directory-pattern match must prune the WHOLE subtree, not "
+            "just filter the directory's own listing"
+        )
+
+    @duckdb_required
+    def test_outputs_fts_index_respects_exclude_patterns(self, tmp_path: Path) -> None:
+        (tmp_path / "keep.csv").write_text("uniquekeepterm\n1", encoding="utf-8")
+        (tmp_path / "skip.tmp").write_text("uniqueskiptermxyz\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), exclude_patterns=("*.tmp",))
+        try:
+            count = idx.rebuild()
+            assert count == 1
+            assert idx.resolve_output(str(tmp_path / "skip.tmp")) is None
+            assert idx.resolve_output(str(tmp_path / "keep.csv")) is not None
+        finally:
+            idx.close()
+
+    def test_default_exclude_patterns_from_env(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(
+            OL._EXCLUDE_PATTERNS_ENV_VAR, "*.tmp, node_modules/\nbuild/"
+        )
+        patterns = OL._default_exclude_patterns()
+        assert "*.tmp" in patterns
+        assert "node_modules/" in patterns
+        assert "build/" in patterns
+
+    def test_default_exclude_patterns_empty_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv(OL._EXCLUDE_PATTERNS_ENV_VAR, raising=False)
+        assert OL._default_exclude_patterns() == ()
+
+    def test_constructor_exclude_overrides_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL._EXCLUDE_PATTERNS_ENV_VAR, "*.csv")
+        idx = OL.OutputsFtsIndex(str(tmp_path), exclude_patterns=())
+        try:
+            assert idx._exclude_patterns == ()
+        finally:
+            idx.close()
+
+    def test_env_var_used_when_constructor_arg_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL._EXCLUDE_PATTERNS_ENV_VAR, "*.csv")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._exclude_patterns == ("*.csv",)
+        finally:
+            idx.close()
 
 
 # ---------------------------------------------------------------------------
