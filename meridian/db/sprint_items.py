@@ -3292,12 +3292,24 @@ async def add_sprint_item_pointer(
 ) -> dict[str, Any]:
     """2976e168 — persist a GENERIC POINTER on a sprint item; return the stored row.
 
-    Validates the ``{source_type, targets:[{uri, selector, subSelector?}], label?}``
+    Validates the
+    ``{source_type, targets:[{uri, selector, subSelector?, target_kind?}], label?}``
     shape via :mod:`meridian.pointers` (raising ``ValueError`` on a malformed
     pointer BEFORE any write), serializes ``targets`` to the JSON column, and
     inserts one ``sprint_item_pointers`` row. ``targets`` is an ARRAY (native
     multi-file); the composite shape is stored as JSON, NOT per-domain columns.
     The returned dict is the deserialized pointer (targets back as a list).
+
+    ``target_kind`` (300a063d) — per-target ``"existing"`` (default) |
+    ``"planned_new"``. When a caller EXPLICITLY marks a target
+    ``target_kind: "existing"`` on a local-path-looking uri, validation
+    verifies the path is actually present on disk and raises ``ValueError`` if
+    not — closing the gap where a new-file item could point at a nonexistent
+    path and be indistinguishable from real, verified prospecting.
+    ``planned_new`` explicitly opts out of that check. Omitting ``target_kind``
+    (the pre-300a063d shape) is unaffected: it normalizes to ``"existing"`` in
+    the stored row but is never filesystem-checked, so no pointer written
+    before this field existed is retroactively invalidated.
 
     psycopg3: ``?`` placeholders are converted to ``%s`` by the adapter; the
     shared connection is autocommit on Postgres, and ``commit()`` is a real
