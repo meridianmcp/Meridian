@@ -278,6 +278,10 @@ extensions/mcp-text-editor/.pixi/
 launch/
 
 .mcp.json
+# 6397cb68 — .cursor/mcp.json is a local copy that may carry a real bearer
+# token, same as .mcp.json above; the pattern didn't extend to the dot-prefixed
+# .cursor/ subdirectory before, letting it stay tracked.
+.cursor/mcp.json
 
 # Codex session state files
 .codex-*-state.json
