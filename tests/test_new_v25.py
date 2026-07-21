@@ -392,60 +392,9 @@ def test_magic_link_request_includes_dev_link_when_resend_absent(client):
     assert "dev_link" in body
 
 
-def test_auth_magic_is_rate_limited(client):
-    """POST /auth/magic is capped at 5/minute — the 6th call returns 429.
-
-    Guards the brute-force / email-bomb protection on the magic-link endpoint.
-    slowapi keys on the client address, so all TestClient calls share one
-    bucket; the `client` fixture resets the limiter's in-memory counters
-    (`_reset_limiter_counts`) fresh before every test (8a52dd26).
-
-    Occasionally flaky under CI's parallel `-n auto` load (rare cross-test
-    timing interaction with slowapi's shared in-process storage — never
-    reproduces standalone or under `-p no:xdist`, only intermittently under
-    load). Retries with an explicit re-reset between attempts rather than a
-    blind sleep-and-retry: a genuine regression fails every attempt just the
-    same, since each attempt starts from a truly clean counter state.
-    """
-    from meridian._deps import _reset_limiter_counts
-
-    last_statuses: list[int] = []
-    for attempt in range(3):
-        if attempt:
-            _reset_limiter_counts()
-        last_statuses = [
-            client.post("/auth/magic", json={"email": f"rl{attempt}-{i}@example.com"}).status_code
-            for i in range(6)
-        ]
-        if all(s != 429 for s in last_statuses[:5]) and last_statuses[5] == 429:
-            return
-    # First 5 within the 5/minute budget must not be rate-limited.
-    assert all(s != 429 for s in last_statuses[:5]), last_statuses
-    # The 6th exceeds the limit.
-    assert last_statuses[5] == 429, last_statuses
-
-
-def test_export_my_data_is_rate_limited(client):
-    """GET /export/my-data is capped at 3/minute — the 4th call returns 429.
-
-    The limiter runs before the handler, so the cap holds regardless of auth
-    state (unauthenticated calls 404 in self-host mode, but still count).
-
-    See test_auth_magic_is_rate_limited's docstring for why this retries with
-    an explicit re-reset between attempts (rare CI-load-only flake, never
-    reproduces standalone).
-    """
-    from meridian._deps import _reset_limiter_counts
-
-    last_statuses: list[int] = []
-    for attempt in range(3):
-        if attempt:
-            _reset_limiter_counts()
-        last_statuses = [client.get("/export/my-data").status_code for _ in range(4)]
-        if all(s != 429 for s in last_statuses[:3]) and last_statuses[3] == 429:
-            return
-    assert all(s != 429 for s in last_statuses[:3]), last_statuses
-    assert last_statuses[3] == 429, last_statuses
+# test_auth_magic_is_rate_limited and test_export_my_data_is_rate_limited moved
+# to tests/test_rate_limit_serial.py — they need to run outside the -n auto +
+# --cov sweep; see that file's module docstring for why.
 
 
 def test_magic_link_verify_rejects_bad_token(client):
