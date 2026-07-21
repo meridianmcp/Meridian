@@ -2197,24 +2197,33 @@ async def claim_sprint_item(
             "gate_actions": _blocking_gate.get("actions"),
             "item_id": item_id,
         }
-    # 94c26322 — refuse an unprospected item at claim time unless a human
-    # explicitly set prospect_bypass. At claim time, enrichment-time fields
-    # (code_pointers / prospect_status) are NOT on the DB row, so we check the
-    # durable sprint_item_pointers table instead (persistently pinned pointers).
-    # An item is considered evidenced if it has >= 1 row in sprint_item_pointers.
-    # Mirrors the goal-generation gate so claim cannot silently circumvent /goal
-    # exclusions. Fail-open: any DB error lets the claim proceed so a structural
-    # defect never permanently wedges the board.
+    # 94c26322/d5849a67 — refuse an unprospected item at claim time unless a
+    # human explicitly set prospect_bypass. At claim time, enrichment-time
+    # fields (code_pointers / prospect_status) are NOT on the DB row, so we
+    # check the durable sprint_item_pointers table instead (persistently
+    # pinned pointers). An item is considered evidenced if it has >= 1 row in
+    # sprint_item_pointers.
     #
-    # SCOPE GUARD: only applies when the item actually declared touches_resources
-    # (i.e. was a real prospecting candidate at add-time). An item with no
-    # declared resources was never attempted — nothing for _persist_prospected_pointer
-    # to prospect — and gating it here would block the overwhelming majority of
+    # d5849a67 — the final pass/fail decision below runs through
+    # is_item_claim_prospected(), the SAME shared helper generate_handoff's
+    # excluded_unprospected list uses (with a batch-resolved evidence signal —
+    # see get_pointer_evidence_item_ids). This is what makes the two checks
+    # agree: previously handoff's exclusion never looked at touches_resources
+    # or the durable pointers table at all, so an item could sit outside
+    # <excluded_unprospected> yet still be refused here.
+    #
+    # SCOPE GUARD (is_item_claim_prospected / _item_declares_resources): only
+    # gated when the item actually declared touches_resources (i.e. was a real
+    # prospecting candidate at add-time). An item with no declared resources
+    # was never attempted — nothing for _persist_prospected_pointer to
+    # prospect — and gating it here would block the overwhelming majority of
     # ordinary items (manual tasks, proposals, anything filed without explicit
     # file/route/tool targets), not just genuinely-risky unprospected ones.
-    _touches_raw = item.get("touches_resources")
-    _has_declared_resources = bool(_touches_raw) and _touches_raw not in ("[]", "null")
-    if _has_declared_resources and not bool(item.get("prospect_bypass")):
+    #
+    # Fail-open: any DB error leaves has_pointer_evidence=True so the claim
+    # proceeds — a structural defect never permanently wedges the board.
+    _has_pointer_evidence = True
+    if _item_declares_resources(item) and not bool(item.get("prospect_bypass")):
         try:
             async with db.execute(
                 "SELECT COUNT(*) AS cnt FROM sprint_item_pointers WHERE sprint_item_id = ?",
@@ -2225,23 +2234,24 @@ async def claim_sprint_item(
                 (_ptr_row[0] if not isinstance(_ptr_row, dict) else _ptr_row.get("cnt"))
                 if _ptr_row else 0
             ) or 0
-            if not _ptr_count:
-                return {
-                    "blocked": True,
-                    "error": "UNPROSPECTED",
-                    "reason": (
-                        "Sprint item has no durable pointers (sprint_item_pointers is "
-                        "empty). It cannot be claimed without explicit human approval. "
-                        "A human/planning session must either add a pointer via "
-                        "add_sprint_item_pointer() or call "
-                        "update_sprint_item(item_id=..., prospect_bypass=true) to "
-                        "explicitly allow this item. Executors must NOT set "
-                        "prospect_bypass themselves."
-                    ),
-                    "item_id": item_id,
-                }
+            _has_pointer_evidence = bool(_ptr_count)
         except Exception:  # noqa: BLE001 — gate must never wedge the board
-            pass
+            _has_pointer_evidence = True
+    if not is_item_claim_prospected(item, has_pointer_evidence=_has_pointer_evidence):
+        return {
+            "blocked": True,
+            "error": "UNPROSPECTED",
+            "reason": (
+                "Sprint item has no durable pointers (sprint_item_pointers is "
+                "empty). It cannot be claimed without explicit human approval. "
+                "A human/planning session must either add a pointer via "
+                "add_sprint_item_pointer() or call "
+                "update_sprint_item(item_id=..., prospect_bypass=true) to "
+                "explicitly allow this item. Executors must NOT set "
+                "prospect_bypass themselves."
+            ),
+            "item_id": item_id,
+        }
     blocked = {"in_progress", "done", "failed", "skipped"}
     if (item.get("status") or "pending") in blocked:
         raise ValueError(
@@ -3222,6 +3232,93 @@ def _item_is_unprospected(it: dict[str, Any], *, enrichment_failure_only: bool =
     # Default (broad) mode: everything with no evidence is flagged.
     # enrichment_failure_only mode: ps is a failure status (no_match, error, no_query).
     return True
+
+
+def _item_declares_resources(item: dict[str, Any]) -> bool:
+    """d5849a67 — shared SCOPE GUARD: True iff ``item`` declared ``touches_resources``,
+    i.e. it was a real prospecting candidate in the first place (something for
+    ``add_sprint_item``'s inline prospecting, or a human, to have pointed at).
+
+    Extracted so both ``claim_sprint_item`` and ``generate_handoff``'s
+    ``excluded_unprospected`` list apply the IDENTICAL scope test. Before this fix,
+    handoff's exclusion computation ignored ``touches_resources`` entirely, so it
+    could exclude items ``claim_sprint_item`` would never gate at all (no declared
+    resources) while failing to exclude items ``claim_sprint_item`` WOULD gate
+    (declared resources, no durable pointer) — see ``is_item_claim_prospected``.
+    """
+    raw = item.get("touches_resources")
+    return bool(raw) and raw not in ("[]", "null")
+
+
+def is_item_claim_prospected(item: dict[str, Any], *, has_pointer_evidence: bool) -> bool:
+    """d5849a67 — SINGLE SOURCE OF TRUTH for "would ``claim_sprint_item``'s
+    UNPROSPECTED gate let this item through?"
+
+    Both ``claim_sprint_item`` (resolving ``has_pointer_evidence`` via a live
+    single-item ``sprint_item_pointers`` count query) and ``generate_handoff``'s
+    ``excluded_unprospected`` list (resolving it via a batch query across all
+    pending items — see ``get_pointer_evidence_item_ids``) call this SAME
+    function to make the final claimable/excluded decision. That closes the
+    drift bug (d5849a67) where an item could sit outside the /goal's
+    ``<excluded_unprospected>`` tag yet still have ``claim_sprint_item`` refuse
+    it as UNPROSPECTED: the two call sites previously used different signals
+    (transient enrichment-time ``code_pointers``/``pointers``/``prospect_status``
+    fields in handoff vs. the durable ``sprint_item_pointers`` table in claim).
+
+    Returns True (claimable / not excluded) when ANY of:
+    - ``prospect_bypass`` is explicitly set on the item (human override).
+    - the item declared NO ``touches_resources`` — it was never a real
+      prospecting candidate (see ``_item_declares_resources``).
+    - ``has_pointer_evidence`` is True — the item has >=1 durable row in
+      ``sprint_item_pointers``, the ONLY evidence ``claim_sprint_item`` actually
+      checks. This is deliberately NOT the same as the transient, in-memory-only
+      ``code_pointers``/``pointers``/``prospect_status`` fields that
+      ``_annotate_code_pointers`` (handoff.py) attaches during handoff
+      generation — those are best-effort title-match guesses that are never
+      persisted to ``sprint_item_pointers``, so an item showing
+      ``prospect_status='prospected'`` can still have zero durable rows and
+      would still be refused by ``claim_sprint_item``.
+    """
+    if bool(item.get("prospect_bypass")):
+        return True
+    if not _item_declares_resources(item):
+        return True
+    return bool(has_pointer_evidence)
+
+
+async def get_pointer_evidence_item_ids(
+    db: aiosqlite.Connection, item_ids: "list[str] | set[str] | None"
+) -> "set[str] | None":
+    """d5849a67 — batch-resolve which of ``item_ids`` have >=1 durable row in
+    ``sprint_item_pointers``, so ``generate_handoff`` can call
+    ``is_item_claim_prospected`` with the SAME evidence signal
+    ``claim_sprint_item`` checks per-item at claim time.
+
+    Returns ``None`` (NOT an empty set) on any DB error — a query failure must
+    never be mistaken for "confirmed no evidence" and mass-exclude every
+    pending item from the /goal. Callers should treat ``None`` as "unknown,
+    fail open" (``is_item_claim_prospected`` is called with
+    ``has_pointer_evidence=True`` in that case), mirroring
+    ``claim_sprint_item``'s own try/except fail-open behaviour.
+    """
+    ids = [i for i in (item_ids or []) if i]
+    if not ids:
+        return set()
+    try:
+        placeholders = ", ".join("?" for _ in ids)
+        async with db.execute(
+            "SELECT DISTINCT sprint_item_id FROM sprint_item_pointers "
+            f"WHERE sprint_item_id IN ({placeholders})",
+            tuple(ids),
+        ) as cur:
+            rows = await cur.fetchall()
+        return {
+            _sid for r in rows if r
+            for _sid in [(_row_to_dict(r) or {}).get("sprint_item_id")]
+            if _sid
+        }
+    except Exception:  # noqa: BLE001 — batch fetch is best-effort, never fatal
+        return None
 
 
 def build_sprint_items_xml(items: list[dict[str, Any]]) -> str:

@@ -4933,6 +4933,15 @@ async def _build_continue_payload(
     except Exception:  # noqa: BLE001
         _max_turns = handoff_module._DEFAULT_GOAL_MAX_TURNS
     _hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
+    # d5849a67 — same durable pointer-evidence resolution as generate_handoff,
+    # so this resume payload's excluded_unprospected list also agrees with
+    # what claim_sprint_item will actually enforce. Guarded, fail-open.
+    try:
+        _continue_pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+            db, [it.get("id") for it in pending]
+        )
+    except Exception:  # noqa: BLE001
+        _continue_pointer_evidence_ids = None
     # `goal_string` (not `goal`) deliberately — consumers like hooks_session_start
     # treat a result `goal` key as the goal *dict* (north_star/sprint); this is the
     # ready-to-paste /goal *command* string, a distinct shape.
@@ -4942,6 +4951,7 @@ async def _build_continue_payload(
         execution_mode=_mode,
         max_turns=_max_turns,
         hitl_auto_answer_mode=_hitl_mode,
+        pointer_evidence_ids=_continue_pointer_evidence_ids,
     )
     recent = await db_module.get_tasks(db, project_id, limit=5)
     pending_slim = [
