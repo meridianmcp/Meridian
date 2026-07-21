@@ -329,18 +329,38 @@ async def _db(request: Request) -> Any:
 # ---------------------------------------------------------------------------
 
 
+
+# 20889f40 — sentinel distinguishing "not yet resolved" from a legitimately
+# resolved ``None`` (self-hosted / demo / unauthenticated), so the memoized
+# result can be cached on request.state even when that result IS None.
+_TENANT_UNSET = object()
+
+
 async def _get_tenant_from_request(request: Request) -> "dict | None":
     """Return the tenant record from the auth DB for this request, or None.
 
     Returns None in self-hosted (non-hosted) mode, demo mode, or when the
     request carries no valid auth credential. Callers use this to check plan
     limits without coupling every route to tenant-aware logic.
+
+    20889f40 — memoized on ``request.state._tenant`` (mirrors the
+    ``request.state._db_conn`` pattern used by ``_db()`` above): 3+ helpers
+    (``_require_workspace_perm``, ``_enforcement_context``,
+    ``_scoped_project_ids_for_request``, and per-route ``_tenant_id`` helpers)
+    each call this independently, so without memoization a single request can
+    pay the session/token DB round-trip repeatedly.
     """
+    cached = getattr(request.state, "_tenant", _TENANT_UNSET)
+    if cached is not _TENANT_UNSET:
+        return cached
+
     import hashlib as _hashlib
 
     if not _hosted_mode():
+        request.state._tenant = None
         return None
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
+        request.state._tenant = None
         return None
 
     from .hosted import _SESSION_COOKIE, _read_session_cookie
@@ -354,14 +374,19 @@ async def _get_tenant_from_request(request: Request) -> "dict | None":
         if session_id:
             session = await db_module.get_user_session(auth_db, session_id)
             if session:
-                return await db_module.get_tenant_by_id(auth_db, session["tenant_id"])
+                tenant = await db_module.get_tenant_by_id(auth_db, session["tenant_id"])
+                request.state._tenant = tenant
+                return tenant
 
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
         token_hash = _hashlib.sha256(token.encode()).hexdigest()
-        return await db_module.get_tenant_from_token_hash(auth_db, token_hash)
+        tenant = await db_module.get_tenant_from_token_hash(auth_db, token_hash)
+        request.state._tenant = tenant
+        return tenant
 
+    request.state._tenant = None
     return None
 
 

@@ -379,3 +379,96 @@ def test_magic_verify_missing_token_returns_html(client):
     assert r.status_code == 400
     assert "text/html" in r.headers.get("content-type", "")
     assert "Request a new link" in r.text
+
+
+# ---------------------------------------------------------------------------
+# 20889f40 — _get_tenant_from_request memoized on request.state
+# ---------------------------------------------------------------------------
+
+def test_get_tenant_from_request_memoized_per_request(monkeypatch):
+    """_get_tenant_from_request must hit the DB at most once per request, even
+    when called repeatedly by different helpers (_require_workspace_perm,
+    _enforcement_context, per-route _tenant_id, ...) — mirrors the
+    request.state._db_conn memoization pattern already used by _db()."""
+    import asyncio
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from meridian import _deps
+    from meridian import db as db_module
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    calls: list[str] = []
+    tenant_row = {"id": "tenant-1", "email": "a@b.com"}
+
+    async def _fake_lookup(auth_db, token_hash):
+        calls.append(token_hash)
+        return tenant_row
+
+    monkeypatch.setattr(db_module, "get_tenant_from_token_hash", _fake_lookup)
+
+    fake_app = SimpleNamespace(state=SimpleNamespace(db=object()))
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/workspace/settings",
+        "headers": [(b"authorization", b"Bearer sometesttoken")],
+        "app": fake_app,
+    }
+    request = Request(scope)
+
+    async def _call_thrice():
+        first = await _deps._get_tenant_from_request(request)
+        second = await _deps._get_tenant_from_request(request)
+        third = await _deps._get_tenant_from_request(request)
+        return first, second, third
+
+    first, second, third = asyncio.run(_call_thrice())
+
+    assert first == tenant_row
+    assert second == tenant_row
+    assert third == tenant_row
+    assert len(calls) == 1, f"expected exactly 1 DB lookup across 3 calls, got {len(calls)}"
+
+
+def test_get_tenant_from_request_memoizes_none_result(monkeypatch):
+    """A legitimately-resolved None (no valid credential) must also be cached —
+    not re-attempted as if it were 'unset' — so an unauthenticated request
+    doesn't retry the (cheap but still real) resolution path on every call."""
+    import asyncio
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from meridian import _deps
+    from meridian import db as db_module
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    calls: list[str] = []
+
+    async def _fake_lookup(auth_db, token_hash):
+        calls.append(token_hash)
+        return None
+
+    monkeypatch.setattr(db_module, "get_tenant_from_token_hash", _fake_lookup)
+
+    fake_app = SimpleNamespace(state=SimpleNamespace(db=object()))
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/workspace/settings",
+        "headers": [(b"authorization", b"Bearer badtoken")],
+        "app": fake_app,
+    }
+    request = Request(scope)
+
+    async def _call_twice():
+        return (
+            await _deps._get_tenant_from_request(request),
+            await _deps._get_tenant_from_request(request),
+        )
+
+    first, second = asyncio.run(_call_twice())
+
+    assert first is None
+    assert second is None
+    assert len(calls) == 1, f"expected exactly 1 DB lookup across 2 calls, got {len(calls)}"
