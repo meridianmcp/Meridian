@@ -831,6 +831,310 @@ def sync_bibliography(
     )
 
 
+@mcp.tool()
+def get_section_content(docx_path: str, heading_id: str) -> dict[str, Any]:
+    """178a82dd — Targeted read of ONE section's content (no full parse_document dump).
+
+    A "section" is the heading paragraph at heading_id plus every block that
+    follows it up to (not including) the next heading at the same or a
+    shallower level, or the end of the document. Read-only; builds no index.
+    Building block for move_section / copy_section below.
+
+    Args:
+      docx_path:  Absolute path to the .docx file.
+      heading_id: w14:paraId (or synthesised p{N}) of the section's OWN
+                  heading paragraph.
+
+    Returns:
+      {heading_id, heading_text, level, start_index, end_index, blocks,
+      paragraph_count, table_count, figure_caption_count,
+      table_caption_count, docx_path} or {error: <message>}.
+    """
+    return docs_intel.get_section_content(docx_path=docx_path, heading_id=heading_id)
+
+
+@mcp.tool()
+def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
+    """fea654f9 — Find everything that points AT a figure/table/heading id.
+
+    The missing inverse of insert_cross_reference: given a target (a
+    Figure/Table caption's para_id, a heading's para_id, or an existing
+    bookmark name directly), scans the whole document for REF / PAGEREF /
+    NOTEREF fields whose instruction targets that same bookmark. Needed for
+    safe renumbering/moving without breaking references elsewhere.
+
+    Args:
+      docx_path: Absolute path to the .docx file.
+      target_id: A caption/heading para_id, or an existing bookmark name.
+
+    Returns:
+      {target_id, target_kind, bookmark_names, references, reference_count,
+      docx_path} or {error: <message>}.
+    """
+    return docs_intel.find_references_to(docx_path=docx_path, target_id=target_id)
+
+
+@mcp.tool()
+def scan_stale_notes(docx_path: str) -> dict[str, Any]:
+    """563118d4 — Scan a .docx for placeholder/TODO-shaped text that may now be outdated.
+
+    Recurring pattern this catches: an ad-hoc bracket-header or inline note
+    (e.g. "[NOTE: currently pending relocation]") that never got updated
+    after the thing it describes actually happened. Paragraphs already using
+    the structured internal-note style (insert_highlighted_note) are
+    excluded — those are already tracked via list_internal_notes.
+
+    Args:
+      docx_path: Absolute path to the .docx file.
+
+    Returns:
+      {docx_path, findings, finding_count} where each finding is {para_id,
+      index, text, matched_terms, bracket_header, section_path}, or
+      {error: <message>}.
+    """
+    return docs_intel.scan_stale_notes(docx_path=docx_path)
+
+
+@mcp.tool()
+def renumber_sequences(docx_path: str, index_db_path: str | None = None) -> dict[str, Any]:
+    """595ccea1 — Re-scan SEQ Figure / SEQ Table fields and confirm/fix sequential numbering.
+
+    Motivated directly by a real Figure 41/42 numbering collision found by
+    hand after a structural move. Walks the document once in true body
+    order, computes the correct 1-based number for each kind, and rewrites
+    any cached SEQ number that doesn't match. Any REF field elsewhere caching
+    the OLD "<Kind> <N>" display text for a corrected caption is also
+    updated. A first-class primitive so move_section / copy_section can call
+    into it rather than duplicate renumbering logic.
+
+    Args:
+      docx_path:      Absolute path to the .docx file (mutated in place only
+                      if a correction is needed).
+      index_db_path:  If supplied, sidecar is invalidated after a write.
+
+    Returns:
+      {status, figure_count, table_count, collisions_found, corrections,
+      ref_fields_updated, docx_path} or {error: <message>}.
+    """
+    return docs_intel.renumber_sequences(docx_path=docx_path, index_db_path=index_db_path)
+
+
+@mcp.tool()
+def insert_highlighted_note(
+    docx_path: str,
+    text: str,
+    anchor_para_id: str,
+    position: str = "after",
+    style: str = "internal_note",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """65c8eb31 — Insert a genuinely highlighted internal-author-note paragraph.
+
+    Addresses a real recurring pattern: bracket-header/NOTE-block text left
+    inline in results-section prose, indistinguishable from real
+    dissertation content. Writes a structurally distinct paragraph instead —
+    a real w:highlight run property plus a dedicated paragraph style name and
+    its own bookmark — so notes can be found and stripped programmatically
+    (see list_internal_notes / scan_stale_notes) before final submission.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      text:            Note content (no bracket/NOTE-prefix decoration
+                       needed — the highlight + style ARE the signal).
+      anchor_para_id:  w14:paraId (or p{N}) of the paragraph to anchor on.
+      position:        "before" or "after" (default) the anchor.
+      style:           Must be "internal_note" (the only supported style
+                       today).
+      index_db_path:   If supplied, the note is ALSO recorded in the
+                       sidecar's docx_internal_notes table so
+                       list_internal_notes can find it.
+
+    Returns:
+      {status, note_id, text, anchor_para_id, position, style, docx_path}
+      or {error: <message>} (file NOT mutated on error).
+    """
+    return docs_intel.insert_highlighted_note(
+        docx_path=docx_path,
+        text=text,
+        anchor_para_id=anchor_para_id,
+        position=position,
+        style=style,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def list_internal_notes(index_db_path: str) -> list[dict[str, Any]]:
+    """65c8eb31 — List internal-author-note paragraphs recorded in the sidecar.
+
+    Reads the docx_internal_notes table populated by insert_highlighted_note.
+    Sidecar QUERY (matching the convention of get_equations /
+    get_local_structure_elements) — reports notes recorded at insertion
+    time, not a live re-scan of the .docx. A note inserted without
+    index_db_path set will NOT appear here even though it exists in the
+    document.
+
+    Args:
+      index_db_path: Path to the sidecar SQLite index.
+
+    Returns:
+      A list of {note_id, anchor_para_id, text} dicts. [] when the sidecar
+      doesn't exist yet or has no recorded notes.
+    """
+    return docs_intel.list_internal_notes(index_db_path=index_db_path)
+
+
+@mcp.tool()
+def write_section(
+    docx_path: str,
+    heading_text: str,
+    level: int,
+    content_spec: list[dict[str, Any]],
+    anchor_para_id: str,
+    position: str = "after",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """82d22824 — Create a whole new section (heading + body + figure/table
+    references) as ONE atomic operation from a structured spec.
+
+    Replaces the failure-prone pattern of separate insert_caption /
+    insert_cross_reference / raw-paragraph calls that can each independently
+    fail or land at the wrong position: every block is validated before any
+    XML is touched, then spliced into the document in a single write.
+
+    content_spec is an ordered list of block dicts, each with a "type":
+      {"type": "paragraph", "text": str, "references": [ref_spec, ...]}
+        ref_spec is {"target_caption_para_id": ...} or
+        {"bookmark_name": ...} (exactly one) — appends a live REF
+        cross-reference field at the end of the paragraph.
+      {"type": "caption", "kind": "Figure"|"Table", "label_text": str}
+        A Caption-styled paragraph with its own SEQ field. NOTE: this module
+        has no image/table INSERTION primitive — the caller places the
+        actual image/table separately, same as insert_caption requires today.
+
+    Every paragraph created (heading included) gets a fresh w14:paraId
+    immediately, so returned para_ids are usable right away by
+    insert_cross_reference / find_references_to / move_section.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      heading_text:    Text of the new section's heading.
+      level:           Heading level (1 = Heading1, 2 = Heading2, ...).
+      content_spec:    Ordered list of block specs (see above).
+      anchor_para_id:  w14:paraId (or p{N}) of the paragraph/table to anchor on.
+      position:        "before" or "after" (default) the anchor.
+      index_db_path:   If supplied, sidecar is invalidated after the write.
+
+    Returns:
+      {status, heading_para_id, heading_text, level, block_para_ids,
+      docx_path} or {error: <message>} (file NOT mutated on error).
+    """
+    return docs_intel.write_section(
+        docx_path=docx_path,
+        heading_text=heading_text,
+        level=level,
+        content_spec=content_spec,
+        anchor_para_id=anchor_para_id,
+        position=position,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def move_section(
+    docx_path: str,
+    section_id: str,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """6ff24136 — Move an existing section (heading + its content) to a new
+    location in the document.
+
+    Cuts the heading at section_id and every block up to (not including) the
+    next same-or-shallower heading, then re-inserts that exact range
+    relative to destination_anchor_para_id. Existing paraIds/bookmarks are
+    preserved (not regenerated), so cross-references INTO the moved section
+    stay valid. After the move, automatically calls renumber_sequences (the
+    move may have reordered Figure/Table captions) and find_references_to
+    for section_id itself (in case something references the section's own
+    heading).
+
+    Args:
+      docx_path:                    Absolute path to the .docx file (mutated
+                                     in place).
+      section_id:                   w14:paraId (or p{N}) of the section's OWN
+                                     heading paragraph.
+      destination_anchor_para_id:   w14:paraId (or p{N}) of the paragraph/
+                                     table to move the section next to. Must
+                                     be OUTSIDE the section being moved.
+      destination_position:         "before" or "after" (default).
+      index_db_path:                If supplied, sidecar is invalidated
+                                     (and threaded into renumber_sequences).
+
+    Returns:
+      {status, section_id, heading_text, moved_block_count,
+      destination_anchor_para_id, destination_position, renumber_sequences,
+      find_references_to, docx_path} or {error: <message>} (file NOT
+      mutated on error).
+    """
+    return docs_intel.move_section(
+        docx_path=docx_path,
+        section_id=section_id,
+        destination_anchor_para_id=destination_anchor_para_id,
+        destination_position=destination_position,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def copy_section(
+    docx_path: str,
+    section_id: str,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """8213050a — Duplicate an existing section (heading + its content) to a
+    new location, leaving the original untouched.
+
+    Same section-boundary rule as move_section, but deep-COPIES the range:
+    every copied paragraph gets a FRESH w14:paraId, and every bookmark name
+    inside the copied range is renamed to a fresh unique name (duplicate
+    paraIds/bookmark names would silently break paraId-addressed tools and
+    cross-reference resolution). A REF/PAGEREF/NOTEREF field inside the
+    copied range that targets a bookmark ALSO inside the copy is repointed
+    at the copy's own renamed bookmark; a field targeting something outside
+    the copy is left pointing at the (shared) original. Calls
+    renumber_sequences as the final step, same as move_section.
+
+    Args:
+      docx_path:                    Absolute path to the .docx file (mutated
+                                     in place).
+      section_id:                   w14:paraId (or p{N}) of the section's OWN
+                                     heading paragraph (the ORIGINAL, not the
+                                     copy).
+      destination_anchor_para_id:   w14:paraId (or p{N}) to copy the section
+                                     next to.
+      destination_position:         "before" or "after" (default).
+      index_db_path:                If supplied, sidecar is invalidated
+                                     (and threaded into renumber_sequences).
+
+    Returns:
+      {status, section_id, heading_text, new_heading_para_id,
+      copied_block_count, para_id_map, bookmark_map,
+      destination_anchor_para_id, destination_position, renumber_sequences,
+      docx_path} or {error: <message>} (file NOT mutated on error).
+    """
+    return docs_intel.copy_section(
+        docx_path=docx_path,
+        section_id=section_id,
+        destination_anchor_para_id=destination_anchor_para_id,
+        destination_position=destination_position,
+        index_db_path=index_db_path,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx meridian-docs``)."""
     mcp.run()
