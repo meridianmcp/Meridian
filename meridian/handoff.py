@@ -2763,6 +2763,26 @@ def _render_delta_handoff(
     ``diagnostic_tasks`` (77a29c8b), when non-empty, surfaces recent blocked/found
     entries so repeated gate failures are not silently dropped from delta mode.
     """
+    # bc834237 — cap the pending list so a large backlog never bloats the delta
+    # payload. Delta is richer than starter (session-continuity context), so the
+    # cap is 20 items (vs starter's 3) with titles truncated to 150 chars
+    # (vs starter's 80 but consistent with the 200-char diagnostic precedent).
+    # Selection is priority-ranked (urgent > high > normal > low), NOT raw
+    # incoming order: _prepare_pending_sprint_items only sorts by dependency
+    # topology, which has no relationship to priority, so a genuinely urgent
+    # item could otherwise land past position 20 purely by chance and be
+    # silently hidden. A stable sort preserves the caller's relative ordering
+    # within each priority tier.
+    _DELTA_PENDING_CAP = 20
+    # 7732e096 — completed_items had ZERO cap, unlike pending (bc834237): a
+    # session's first delta call on a project with a long completed-item
+    # history (even after the since_ts scoping fix above) could still iterate
+    # every historical done/skipped/failed/pushed item with full untruncated
+    # titles. Mirror the exact same cap/truncation pattern used for pending
+    # (same 20-item cap, same 150-char title truncation, same "+N more"
+    # summary line) so this section is bounded the same way.
+    _DELTA_COMPLETED_CAP = 20
+    _DELTA_TITLE_MAX = 150
     # 04f03ee4 — one-liner start instruction at very top of delta output
     lines = [
         f"To start fresh: start_session(project_name=\"{project['name']}\", session_name=\"describe-what-youre-doing\"{_human_id_clause(identity)})  # project_id={project['id']}",
@@ -2782,22 +2802,15 @@ def _render_delta_handoff(
         lines.append("")
     lines.append("Completed since last handoff:")
     if completed_items:
-        for item in completed_items:
-            lines.append(f"- {item['id']} — {item['title']}")
+        shown_completed = completed_items[:_DELTA_COMPLETED_CAP]
+        hidden_completed = completed_items[_DELTA_COMPLETED_CAP:]
+        for item in shown_completed:
+            short_title = (item.get("title") or "").strip()[:_DELTA_TITLE_MAX]
+            lines.append(f"- {item['id']} — {short_title}")
+        if hidden_completed:
+            lines.append(f"  +{len(hidden_completed)} more completed")
     else:
         lines.append("- none")
-    # bc834237 — cap the pending list so a large backlog never bloats the delta
-    # payload. Delta is richer than starter (session-continuity context), so the
-    # cap is 20 items (vs starter's 3) with titles truncated to 150 chars
-    # (vs starter's 80 but consistent with the 200-char diagnostic precedent).
-    # Selection is priority-ranked (urgent > high > normal > low), NOT raw
-    # incoming order: _prepare_pending_sprint_items only sorts by dependency
-    # topology, which has no relationship to priority, so a genuinely urgent
-    # item could otherwise land past position 20 purely by chance and be
-    # silently hidden. A stable sort preserves the caller's relative ordering
-    # within each priority tier.
-    _DELTA_PENDING_CAP = 20
-    _DELTA_TITLE_MAX = 150
     _PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
     lines += ["", "Pending:"]
     if pending_sprint_items:
@@ -4058,6 +4071,24 @@ async def generate_handoff(
                     since_ts = _prior[0].get("created_at") or since_ts
             except Exception:  # noqa: BLE001 — durable lookup is best-effort
                 pass
+        # 7732e096 — a session's genuinely FIRST delta call (no in-memory value,
+        # no durable prior-handoff row for this session_id) previously left
+        # since_ts as None, which _completed_after treats as "no lower bound":
+        # the "Completed since last handoff" list then dumped the ENTIRE
+        # project's historical done/skipped/failed/pushed items (confirmed live:
+        # 496KB+, reproduced worse at 577KB). There genuinely is no "last
+        # handoff" boundary on a first call, but there IS a natural scope for
+        # a per-SESSION delta: this session's own start time. Fall back to the
+        # session row's created_at so a fresh session's first delta reports
+        # "what's happened since I started", not "everything that ever
+        # happened on this project" — scoped and bounded either way, and the
+        # completed_items cap below (mirroring bc834237's pending cap) is a
+        # second, independent bound for pathological cases (e.g. a long-lived
+        # session that has been open for weeks).
+        if since_ts is None and session_id:
+            _sess_row = next((s for s in sessions if s.get("id") == session_id), None)
+            if _sess_row:
+                since_ts = _sess_row.get("created_at")
         completed_items = [
             item for item in sprint_items_all
             if item.get("status") in {"done", "skipped", "failed", "pushed"}
@@ -4132,11 +4163,30 @@ async def generate_handoff(
     # 302db181 — computed session span: first + last activity, distinct calendar
     # days touched, total elapsed wall-clock. Built server-side from the real
     # task_log + session timestamps (handles both datetime (PG) and str (SQLite)).
-    session_span = compute_session_span(
-        [t.get("created_at") for t in tasks]
-        + [s.get("created_at") for s in sessions]
-        + [s.get("last_seen") for s in sessions]
-    )
+    # 7732e096 — for mode='delta' this footer previously pulled from `tasks` /
+    # `sessions`, which are PROJECT-WIDE (get_tasks/get_sessions have no
+    # session_id filter) — so a session open for an hour would report a span
+    # covering the project's entire multi-week history. 'full' intentionally
+    # keeps the project-wide span (it IS a whole-project state dump), but delta
+    # is a per-session update, so scope its footer to just this session: only
+    # this session's own task_log rows plus its own created_at/last_seen.
+    if mode == "delta" and session_id:
+        _span_sess_row = next((s for s in sessions if s.get("id") == session_id), None)
+        _span_timestamps = [
+            t.get("created_at") for t in tasks if t.get("session_id") == session_id
+        ]
+        if _span_sess_row:
+            _span_timestamps += [
+                _span_sess_row.get("created_at"),
+                _span_sess_row.get("last_seen"),
+            ]
+        session_span = compute_session_span(_span_timestamps)
+    else:
+        session_span = compute_session_span(
+            [t.get("created_at") for t in tasks]
+            + [s.get("created_at") for s in sessions]
+            + [s.get("last_seen") for s in sessions]
+        )
     span_block = _render_session_span_block(session_span)
     if span_block:
         content = f"{content}\n\n{span_block}"
