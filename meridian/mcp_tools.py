@@ -1481,10 +1481,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "assumptions, the last session's output (last_session), and a new-handoff signal. "
         "No session registration needed. Designed for planning chat sessions that need to see "
         "project state without side effects. Pass `since` (a prior call's generated_at) to flag "
-        "only handoffs filed since you last checked.",
+        "only handoffs filed since you last checked. pending_items/in_progress default-collapse "
+        "any parent_id/item_group cluster (2+ items) into one summary row — pass expand=true "
+        "for the full ungrouped list.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "since": {"type": "string", "description": "Optional ISO timestamp (a prior brief's generated_at). When given, new_handoff_available flags only handoffs filed after it."}},
+         "since": {"type": "string", "description": "Optional ISO timestamp (a prior brief's generated_at). When given, new_handoff_available flags only handoffs filed after it."},
+         "expand": {"type": "boolean", "description": "Default false: collapse parent_id/item_group clusters in pending_items/in_progress into one summary row each. Pass true for the full ungrouped list."}},
          "required": []}},
     {"name": "refresh_context", "description":
         "Single-call post-compaction recovery for planning chats. Returns a "
@@ -1499,13 +1502,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "get_sprint_items", "description":
         "Read-only: List sprint items for a project. Optional status filter "
         "(todo|pending|in_progress|provisional_complete|done|failed|skipped|pushed|indeterminate). "
-        "Cold sessions read this to know what's still owed.",
+        "Cold sessions read this to know what's still owed. By default, items sharing a "
+        "``parent_id`` (subtasks) or ``item_group`` collapse into one summary row per "
+        "cluster ({collapsed, cluster_kind, item_group_or_parent, count, done, description, ids}) "
+        "instead of listing every item — pass expand=true for the full ungrouped list.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "status": {"type": "string",
                     "enum": ["pending", "todo", "in_progress", "provisional_complete",
                              "done", "failed", "skipped", "pushed", "indeterminate"],
-                    "description": "Filter by status."}},
+                    "description": "Filter by status."},
+         "expand": {"type": "boolean",
+                    "description": "Default false: collapse parent_id/item_group clusters "
+                    "(2+ items) into one summary row each. Pass true for the full "
+                    "ungrouped item list (pre-9d8e858c behavior)."}},
          "required": []}},
     {"name": "get_parallelizable_groups", "description":
         "Read-only: Return clusters of pending sprint items that are safe to run "
@@ -1684,11 +1694,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "search_all", "description":
         "Read-only: Universal search across all project content: tasks, notes, pinned decisions, "
         "and sprint items. Uses LIKE matching (SQLite) or ILIKE (Postgres). "
-        "Returns grouped results: {tasks, notes, decisions, sprint_items, total}.",
+        "Returns grouped results: {tasks, notes, decisions, sprint_items, total}. "
+        "sprint_items default-collapse any parent_id/item_group cluster (2+ items) into one "
+        "summary row — pass expand=true for the full ungrouped list.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "query": {"type": "string"},
-         "limit": {"type": "integer", "description": "Max results per type (default 10)."}},
+         "limit": {"type": "integer", "description": "Max results per type (default 10)."},
+         "expand": {"type": "boolean", "description": "Default false: collapse parent_id/item_group clusters in sprint_items into one summary row each. Pass true for the full ungrouped list."}},
          "required": ["query"]}},
     {"name": "search_synthesis", "description":
         "Read-only: Natural-language search that returns a short, CITED answer "
