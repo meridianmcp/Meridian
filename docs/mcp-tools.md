@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **143 tools** over MCP.
+Meridian exposes **144 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -516,6 +516,7 @@ Read-only: Return a compact planning context (sprint, north star, pending items,
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `since` | string | optional | Optional ISO timestamp (a prior brief's generated_at). When given, new_handoff_available flags only handoffs filed after it. |
+| `expand` | boolean | optional | Default false: collapse parent_id/item_group clusters in pending_items/in_progress into one summary row each. Pass true for the full ungrouped list. |
 
 **Example:**
 ```
