@@ -51,6 +51,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
     "annotate_outputs": 'annotate_outputs(outputs_dir="/repo/outputs", path="/repo/outputs/run_42", note="PCA on, BFS off — final params", run_params={"lr": 0.001, "epochs": 100})',
     "search_code_semantic": 'search_code_semantic(root_dir="/repo/src", query="parse the auth token and refresh it")',
+    "get_flag_registry": 'get_flag_registry(root_dir="/repo/src")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -854,6 +855,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "kind": {"type": "string", "description": "Optional chunk-kind filter: one of 'function', 'class', 'method', 'interface', 'enum', 'module'."},
          "reindex": {"type": "boolean", "description": "Default true — run an incremental Merkle-diff reindex before searching so results reflect the current tree. Set false to search the last-built index as-is."}},
          "required": ["root_dir", "query"]}},
+    {"name": "get_flag_registry", "description":
+        "45802b67 — scan a source tree for `os.environ.get(...)` / `os.getenv(...)` "
+        "call sites (AST-based, not regex) and return a flat inventory of every "
+        "config flag the codebase reads: {flag_name, file, line, default}. "
+        "Only call sites where the flag name is a STRING LITERAL first argument "
+        "are included — dynamic names (a variable, f-string, etc.) are skipped "
+        "gracefully rather than erroring. The default is best-effort literal-eval'd "
+        "from the second positional arg (or a `default=` keyword); a non-literal "
+        "default evaluates to null. Useful for auditing config drift — 'what env "
+        "flags exist, where are they read, what do they default to' — without "
+        "grepping by hand. Returns {repo_root, flags:[...], count, "
+        "unique_flag_names:[...], unique_count}. A missing/empty tree returns an "
+        "empty flags list, never an error.",
+     "inputSchema": {"type": "object", "properties": {
+         "root_dir": {"type": "string", "description": "Absolute path to the source-tree root to scan recursively (vendored/build/cache dirs like node_modules/.git/dist/__pycache__ are pruned). Defaults to the server's current working directory (the current project's repo root) when omitted."}},
+         "required": []}},
     {"name": "prospect_symbol", "description":
         "2ce5bc76 — ROBUST symbol prospecting with a three-rung fallback chain: "
         "tries codebase__search_graph FIRST (fast, graph-indexed); when it returns "
@@ -2136,6 +2153,7 @@ _READ_ONLY_TOOLS = {
     "search_outputs",
     "search_code_semantic",
     "prospect_symbol",
+    "get_flag_registry",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
     "get_custom_hooks",
@@ -2284,6 +2302,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     # code-intel
     "search_code_semantic": "code-intel",
     "prospect_symbol":      "code-intel",
+    "get_flag_registry":    "code-intel",
     "search_outputs":       "code-intel",
     "annotate_outputs":     "code-intel",
     "snapshot_graph_metrics": "code-intel",
@@ -2461,6 +2480,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "dismiss_hitl":              "both",
     "search_code_semantic":      "both",
     "prospect_symbol":           "both",
+    "get_flag_registry":         "both",
     "search_outputs":            "both",
     "get_document_structure":    "both",
     "get_latex_structure":       "both",
@@ -2588,6 +2608,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # code-intel (used when searching codebase)
     "search_code_semantic":       "common-support",
     "prospect_symbol":            "common-support",
+    "get_flag_registry":          "common-support",
     "search_outputs":             "common-support",
     "annotate_outputs":           "common-support",
     # sprint decomposition / pointers
@@ -2775,6 +2796,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "search_code_semantic": "Search Code Semantic",
     "run_verification": "Run Verification",
     "prospect_symbol": "Prospect Symbol",
+    "get_flag_registry": "Get Flag Registry",
     "search_server_logs": "Search Server Logs",
     "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }

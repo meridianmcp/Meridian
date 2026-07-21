@@ -4668,9 +4668,20 @@ async def _handle_code_index_tools(
     _mcp_tenant_id: Any,
 ) -> Any:
     """Dispatch group: search_code_semantic (93fce816 — Cursor-style local code
-    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS)
-    and prospect_symbol (2ce5bc76 — three-rung fallback chain for robust
-    symbol prospecting)."""
+    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS),
+    prospect_symbol (2ce5bc76 — three-rung fallback chain for robust
+    symbol prospecting), and get_flag_registry (45802b67 — AST scan of
+    os.environ.get()/os.getenv() call sites into a flat flag inventory)."""
+    if name == "get_flag_registry":
+        from .. import flag_registry as _flag_registry  # noqa: PLC0415
+        root_dir = str(args.get("root_dir") or "").strip()
+        if not root_dir:
+            root_dir = os.getcwd()
+        # Tolerate an accidentally-quoted path, same normalization as the
+        # search_code_semantic root_dir handling below.
+        if len(root_dir) >= 2 and root_dir[0] == root_dir[-1] and root_dir[0] in ("'", '"'):
+            root_dir = root_dir[1:-1]
+        return await asyncio.to_thread(_flag_registry.get_flag_registry, root_dir)
     if name == "prospect_symbol":
         symbol = str(args.get("symbol") or "").strip()
         if not symbol:
