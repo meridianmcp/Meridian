@@ -384,8 +384,24 @@ jobs:
     continue-on-error: true
     steps:
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Spread machines across iad,ord
-        run: flyctl scale count 2 --region iad,ord --app meridian-hosted --yes
+      # 4da86be7 -- `flyctl scale count 2 --region iad,ord` (a single combined
+      # invocation) does NOT force redistribution when the app is already
+      # concentrated in one region: confirmed live that with 7 existing iad
+      # machines, this computed "iad: -5 (7->2), ord: untouched" -- it only
+      # trims the existing region down to the target total, never creating a
+      # machine in a region that had zero presence, because no NEW machine
+      # creation was needed to satisfy the count. `fly regions add` (the more
+      # obvious fix) is no longer supported for Machines-platform apps ("use
+      # fly scale count" is the error message) -- confirmed live. What DOES
+      # work, confirmed live: scoping each region to its OWN `scale count`
+      # call forces real placement (`+1 machines ... region 'ord'`, an actual
+      # machine created) instead of a combined, ambiguous multi-region count.
+      - name: Ensure 1 machine in ord (secondary region)
+        run: flyctl scale count 1 --region ord --app meridian-hosted --yes
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      - name: Ensure 1 machine in iad (primary region)
+        run: flyctl scale count 1 --region iad --app meridian-hosted --yes
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
