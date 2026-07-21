@@ -23,7 +23,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import outputs_local
+from . import annotate, outputs_local
 
 mcp = FastMCP("meridian-outputs")
 
@@ -97,6 +97,88 @@ def annotate_outputs(
     return outputs_local.annotate_outputs(
         outputs_dir, path, note, run_params=run_params,
     )
+
+
+@mcp.tool()
+def record_provenance(
+    outputs_dir: str,
+    path: str,
+    generating_script: str | None = None,
+    params: dict[str, Any] | None = None,
+    sprint_item_id: str | None = None,
+    decision_id: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Attach lightweight reproducibility metadata to one output file.
+
+    Distinct from ``annotate_outputs`` (free-form human notes): this records
+    the machine-oriented facts needed to reconstruct "what produced this
+    file, with what parameters, when, and under which sprint-item/decision"
+    without reopening the output itself. Stored as an append-only JSONL
+    sidecar log at ``<outputs_dir>/.meridian-outputs-cache/provenance.jsonl``
+    -- fully local, no hosted call, no DB engine. Calling this again for the
+    same path supersedes the previous record (newest wins on read).
+
+    Args:
+      outputs_dir:        Absolute path to the outputs directory.
+      path:                The output file this record describes.
+      generating_script:  Path/name of the script that produced `path`. If
+                          omitted, falls back to a best-effort inference via
+                          ``file_fingerprint``.
+      params:              Key parameters used for this run, e.g.
+                          {"radius_scale": 4.0, "use_pca": False}.
+      sprint_item_id:      Optional linked Meridian sprint-item id.
+      decision_id:         Optional linked Meridian decision id.
+      note:                Optional short note (kept separate from
+                          ``annotate_outputs``'s longer free-form notes).
+
+    Returns:
+      The stored record as {path, generating_script, params, sprint_item_id,
+      decision_id, note, recorded_at, recorded_at_iso}, or {error: ...}.
+    """
+    return annotate.record_provenance(
+        outputs_dir,
+        path,
+        generating_script=generating_script,
+        params=params,
+        sprint_item_id=sprint_item_id,
+        decision_id=decision_id,
+        note=note,
+    )
+
+
+@mcp.tool()
+def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
+    """Look up the most recent reproducibility record for one output file.
+
+    Queryable WITHOUT opening/parsing the output file itself -- reads only
+    the lightweight JSONL sidecar log written by ``record_provenance``.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file to look up.
+
+    Returns:
+      {path, generating_script, params, sprint_item_id, decision_id, note,
+      recorded_at, recorded_at_iso}, or None if nothing has been recorded for
+      this path under this outputs_dir.
+    """
+    return annotate.get_provenance(outputs_dir, path)
+
+
+@mcp.tool()
+def list_provenance(outputs_dir: str) -> list[dict[str, Any]]:
+    """List the latest reproducibility record for every path recorded under
+    an outputs directory (sorted by path, deterministic).
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+
+    Returns:
+      A list of record dicts (same shape as ``get_provenance``'s return
+      value); ``[]`` if nothing has been recorded yet.
+    """
+    return annotate.list_provenance(outputs_dir)
 
 
 @mcp.tool()

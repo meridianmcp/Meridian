@@ -36,12 +36,14 @@ synthetic in-memory .docx (see tests/test_docs_intel.py).
 """
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
 import re
 import shutil
 import sqlite3
+import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 from typing import Any
@@ -471,6 +473,19 @@ def _connect(index_db_path: str) -> sqlite3.Connection:
     tbl_cols = {row[1] for row in conn.execute("PRAGMA table_info(docx_tables)").fetchall()}
     if "ref_bookmark" not in tbl_cols:
         conn.execute("ALTER TABLE docx_tables ADD COLUMN ref_bookmark TEXT")
+    # f1a92d6e -- internal-author-note audit table: records notes written by
+    # insert_highlighted_note so list_internal_notes can query them without
+    # re-parsing the .docx. See the "9 new primitives" section near the end
+    # of this module.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docx_internal_notes (
+            note_id TEXT PRIMARY KEY,
+            anchor_para_id TEXT,
+            text TEXT NOT NULL
+        )
+        """
+    )
     # 32d84131 — SQLite FTS5 external-content table for BM25 full-text search
     # over paragraph text. Uses external-content mode pointing at docx_paragraphs
     # so the text is not duplicated on disk. The FTS index is rebuilt atomically
@@ -4402,3 +4417,1484 @@ def fts5_search_chunks(
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# f1a92d6e -- 9 new primitives (sprint items 178a82dd/fea654f9/563118d4/
+# 595ccea1/65c8eb31/82d22824/6ff24136/8213050a):
+#
+#   1. get_section_content   -- targeted single-section read (178a82dd)
+#   2. find_references_to    -- inverse of insert_cross_reference (fea654f9)
+#   3. scan_stale_notes      -- ad-hoc TODO/bracket-note detector (563118d4)
+#   4. renumber_sequences    -- SEQ Figure/Table re-sync (595ccea1)
+#   5. insert_highlighted_note / list_internal_notes -- structured, audit-
+#      able author notes (65c8eb31)
+#   6. write_section         -- atomic heading+body+refs section build (82d22824)
+#   7. move_section           (6ff24136)
+#   8. copy_section           (8213050a)
+#
+# Design notes (see server.py / task report for the full write-up):
+#   - Everything here operates directly on word/document.xml via the same
+#     _load_docx_xml_stdlib / _save_docx_xml_stdlib / _find_para_by_id /
+#     _invalidate_sidecar_mtime primitives the caption/citation/equation/
+#     bibliography write-back code above already uses -- no new I/O layer.
+#   - move_section / copy_section / write_section all mint FRESH w14:paraId
+#     values for any paragraph they create or duplicate (via _new_para_id)
+#     rather than leaving Word to assign one on next open. Two paragraphs
+#     sharing a paraId would silently break every paraId-addressed tool in
+#     this file, so this is treated as a hard invariant, not an optimisation.
+#   - copy_section additionally renames every bookmark name inside the
+#     copied range (_Ref### caption cross-refs, _MNote### internal notes)
+#     so REF fields resolve unambiguously -- see copy_section's docstring.
+# ---------------------------------------------------------------------------
+
+# 65c8eb31 -- internal-author-note paragraph type: a real highlighted run +
+# a dedicated paragraph style name, wrapped in its own bookmark scheme
+# (mirrors the _Ref<digits> scheme _next_ref_bookmark_name uses for
+# captions). Deliberately NOT a Word Comment (comments live in a separate
+# word/comments.xml part + [Content_Types].xml override + a document.xml.rels
+# relationship; every other write-back function in this module only ever
+# rewrites word/document.xml and preserves all other ZIP members byte-for-
+# byte via _save_docx_xml_stdlib -- adding a new part would break that
+# invariant and there is no test coverage for the extra plumbing). A
+# highlighted run + distinct style is visually and structurally
+# distinguishable and stays inside the existing single-part write model.
+_INTERNAL_NOTE_STYLE_DEFAULT = "MeridianInternalNote"
+_INTERNAL_NOTE_HIGHLIGHT_COLOR = "yellow"
+_INTERNAL_NOTE_BOOKMARK_PREFIX = "_MNote"
+_INTERNAL_NOTE_BOOKMARK_RE = re.compile(r"^_MNote(\d+)$")
+
+# 563118d4 -- stale-note detection patterns. Deliberately broad: false
+# positives (flagging real prose that happens to contain "TBD") are cheap for
+# a human to dismiss during a pre-submission audit pass; false negatives (a
+# genuinely stale placeholder note that ships in the final document) are the
+# expensive failure mode this tool exists to catch.
+_STALE_NOTE_RE = re.compile(
+    r"\b(TODO|FIXME|XXX|TBD|PLACEHOLDER|DRAFT[- ]ONLY|NOTE\s+TO\s+SELF|"
+    r"REMOVE\s+BEFORE\s+(?:SUBMISSION|DEFENSE|FINAL)|"
+    r"PENDING\s+RELOCATION|CURRENTLY\s+PENDING|"
+    r"(?:TO\s+BE|WILL\s+BE)\s+(?:MOVED|RELOCATED|UPDATED)|"
+    r"TEMPORARILY\s+(?:LOCATED|HERE|PLACED)|"
+    r"UNDER\s+CONSTRUCTION|COMING\s+SOON|"
+    r"FOR\s+REVIEW\s+ONLY|INTERNAL\s+USE\s+ONLY)\b",
+    re.IGNORECASE,
+)
+# A bracket/angle-bracket "header" line such as "[NOTE: ...]" or
+# "<<TODO ...>>" or "**DRAFT**" left inline in prose -- the exact
+# bracket-header anti-pattern insert_highlighted_note (65c8eb31) replaces
+# with a real, structural note type.
+_BRACKET_HEADER_RE = re.compile(r"^\s*[\[<]{1,2}\s*(NOTE|TODO|DRAFT|INTERNAL)\b", re.IGNORECASE)
+
+
+def _existing_para_ids(root: ET.Element) -> set[str]:
+    """Every native w14:paraId currently present anywhere in the document."""
+    w14_paraId = _q(_W14, "paraId")
+    return {
+        pid
+        for p in root.iter(_q(_W, "p"))
+        if (pid := p.get(w14_paraId))
+    }
+
+
+def _new_para_id(taken: set[str]) -> str:
+    """Mint a fresh w14:paraId (Word's own 8 hex-char format), reserving it in
+    ``taken`` immediately so repeated calls within the same batch never
+    collide with each other (not just with paraIds already on disk)."""
+    while True:
+        candidate = uuid.uuid4().hex[:8].upper()
+        if candidate not in taken:
+            taken.add(candidate)
+            return candidate
+
+
+def _next_note_bookmark_name(root: ET.Element) -> str:
+    """Return the next unused ``_MNote<digits>`` internal-note bookmark name.
+
+    Mirrors :func:`_next_ref_bookmark_name` but with its own numbering track
+    so internal-note bookmarks never collide with caption cross-reference
+    bookmarks even though both live in the same w:bookmarkStart namespace.
+    """
+    max_seen = 0
+    for bm in root.iter(_q(_W, "bookmarkStart")):
+        name = bm.get(_q(_W, "name")) or ""
+        m = _INTERNAL_NOTE_BOOKMARK_RE.match(name)
+        if m:
+            max_seen = max(max_seen, int(m.group(1)))
+    return f"{_INTERNAL_NOTE_BOOKMARK_PREFIX}{max_seen + 1}"
+
+
+def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.Element:
+    """Build a ``<w:p>`` for a highlighted internal-author-note paragraph.
+
+    Produces a paragraph styled ``style`` (falls back to Normal rendering in
+    Word if that style isn't defined in styles.xml -- the run-level
+    ``w:highlight`` is what guarantees visible distinctiveness regardless),
+    wrapped in a ``_MNote<digits>`` bookmark so :func:`list_internal_notes`
+    and future tooling can locate it precisely instead of re-matching on text.
+    """
+    p = ET.Element(_q(_W, "p"))
+    pPr = ET.SubElement(p, _q(_W, "pPr"))
+    pStyle = ET.SubElement(pPr, _q(_W, "pStyle"))
+    pStyle.set(_q(_W, "val"), style)
+
+    bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
+    bm_start.set(_q(_W, "id"), "0")
+    bm_start.set(_q(_W, "name"), note_id)
+
+    r = ET.SubElement(p, _q(_W, "r"))
+    rPr = ET.SubElement(r, _q(_W, "rPr"))
+    highlight = ET.SubElement(rPr, _q(_W, "highlight"))
+    highlight.set(_q(_W, "val"), _INTERNAL_NOTE_HIGHLIGHT_COLOR)
+    t = ET.SubElement(r, _q(_W, "t"))
+    t.set(_q(_XML_NS, "space"), "preserve")
+    t.text = text
+
+    bm_end = ET.SubElement(p, _q(_W, "bookmarkEnd"))
+    bm_end.set(_q(_W, "id"), "0")
+    return p
+
+
+def _upsert_sidecar_note(index_db_path: str, note_id: str, text: str, anchor_para_id: str) -> None:
+    """Best-effort record of a newly-inserted internal note into the sidecar.
+
+    Mirrors :func:`_upsert_sidecar_caption` -- exceptions are swallowed so the
+    caller's main result (the successful docx write) is unaffected.
+    """
+    try:
+        conn = _connect(index_db_path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO docx_internal_notes (note_id, anchor_para_id, text) "
+                "VALUES (?, ?, ?)",
+                (note_id, anchor_para_id, text),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _locate_section_bounds(
+    body: ET.Element, heading_id: str
+) -> tuple[int, int, str, int] | None:
+    """Find a heading paragraph's body-child index range for move/copy_section.
+
+    Returns ``(start_idx, end_idx, heading_text, level)`` where ``start_idx``
+    is the body-child index of the heading paragraph itself and ``end_idx``
+    is the index of the first body child AFTER the section: the next heading
+    at the same or shallower level, a body-level ``<w:sectPr>`` (the
+    OOXML-mandated final body child -- never moved/copied into or out of
+    position), or the end of the body.
+
+    Works directly on the LIVE ``body`` element (not a fresh re-parse, unlike
+    :func:`get_section_content`'s document_content_tree-based read) so the
+    caller can cut/move/copy the exact same elements afterward without a
+    second parse losing paraId/bookmark identity.
+
+    Returns ``None`` when no heading paragraph with that para_id is found.
+    """
+    body_list = list(body)
+    w_p = _q(_W, "p")
+    w_sectPr = _q(_W, "sectPr")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+    w14_paraId = _q(_W14, "paraId")
+
+    def _style_of(p: ET.Element) -> str | None:
+        ppr = p.find(w_pPr)
+        if ppr is None:
+            return None
+        ps = ppr.find(w_pStyle)
+        return ps.get(w_val) if ps is not None else None
+
+    global_p_idx = 0
+    start_idx: int | None = None
+    level = 1
+    heading_text = ""
+
+    for idx, child in enumerate(body_list):
+        if child.tag == w_sectPr:
+            if start_idx is not None:
+                return (start_idx, idx, heading_text, level)
+            continue
+        if child.tag == w_p:
+            real_id = child.get(w14_paraId)
+            pid = real_id or f"p{global_p_idx}"
+            style = _style_of(child)
+            if start_idx is None:
+                if pid == heading_id and _is_heading(style):
+                    start_idx = idx
+                    level = _heading_level(style)
+                    heading_text = "".join(t.text or "" for t in child.iter(w_t))
+            elif _is_heading(style) and _heading_level(style) <= level:
+                return (start_idx, idx, heading_text, level)
+            global_p_idx += 1
+        else:
+            # Tables etc: not addressable as a heading themselves, but their
+            # nested paragraphs (table cells) still consume synthetic p{N}
+            # slots -- keep the counter aligned with _find_para_by_id's scheme.
+            for _p in child.iter(w_p):
+                global_p_idx += 1
+
+    if start_idx is None:
+        return None
+    return (start_idx, len(body_list), heading_text, level)
+
+
+def _iter_complex_fields(para_elem: ET.Element) -> list[dict[str, Any]]:
+    """Generic Word complex-field scanner (begin/instrText/separate/cached/end).
+
+    Unlike :func:`_scan_citation_field` (which looks for exactly one
+    CSL_CITATION field and stops), this returns EVERY complex field in a
+    paragraph regardless of instruction type, together with the actual
+    ``instrText`` element(s) and the cached-display ``<w:t>`` element so a
+    caller can rewrite them in place. Used by :func:`renumber_sequences`
+    (to refresh REF fields' cached display text after a SEQ number changes)
+    and :func:`copy_section` (to repoint an internal REF field at its
+    duplicated bookmark).
+
+    Returns a list of ``{instruction, instr_elements, display_run}`` dicts,
+    where ``display_run`` is the ``<w:t>`` element holding the cached display
+    text (``None`` if the field has no cached run).
+    """
+    children = list(para_elem)
+    w_r = _q(_W, "r")
+    w_fldChar = _q(_W, "fldChar")
+    w_instrText = _q(_W, "instrText")
+    w_fldCharType = _q(_W, "fldCharType")
+    w_t = _q(_W, "t")
+
+    fields: list[dict[str, Any]] = []
+    i = 0
+    while i < len(children):
+        el = children[i]
+        if el.tag == w_r:
+            fc = el.find(w_fldChar)
+            if fc is not None and fc.get(w_fldCharType) == "begin":
+                j = i + 1
+                instr_parts: list[str] = []
+                instr_elements: list[ET.Element] = []
+                display_run: ET.Element | None = None
+                past_sep = False
+                while j < len(children):
+                    el2 = children[j]
+                    if el2.tag == w_r:
+                        fc2 = el2.find(w_fldChar)
+                        if fc2 is not None:
+                            ftype = fc2.get(w_fldCharType)
+                            if ftype == "separate":
+                                past_sep = True
+                            elif ftype == "end":
+                                fields.append({
+                                    "instruction": "".join(instr_parts).strip(),
+                                    "instr_elements": instr_elements,
+                                    "display_run": display_run,
+                                })
+                                break
+                        it = el2.find(w_instrText)
+                        if it is not None and not past_sep:
+                            instr_parts.append(it.text or "")
+                            instr_elements.append(it)
+                        if past_sep:
+                            t_el = el2.find(w_t)
+                            if t_el is not None:
+                                display_run = t_el
+                    j += 1
+        i += 1
+    return fields
+
+
+def _rename_bookmark_for_copy(
+    old_name: str,
+    ref_seed: list[int],
+    note_seed: list[int],
+    fallback_seed: list[int],
+) -> str:
+    """Mint a fresh, unique bookmark name for a duplicated bookmark.
+
+    Uses the SAME naming scheme as the original when recognised (``_Ref<n>``
+    caption cross-references, ``_MNote<n>`` internal notes) so the copy's
+    bookmarks remain indistinguishable in *shape* from natively-created ones;
+    anything else (e.g. a ``bibkey_`` bibliography bookmark, or a hand-authored
+    bookmark this module didn't itself create) gets a generic ``<name>_copyN``
+    suffix -- unique, but deliberately NOT pretending to understand a naming
+    scheme it doesn't own.
+    """
+    if _REF_BOOKMARK_RE.match(old_name):
+        name = f"{_REF_BOOKMARK_PREFIX}{ref_seed[0]}"
+        ref_seed[0] += 1
+        return name
+    if _INTERNAL_NOTE_BOOKMARK_RE.match(old_name):
+        name = f"{_INTERNAL_NOTE_BOOKMARK_PREFIX}{note_seed[0]}"
+        note_seed[0] += 1
+        return name
+    name = f"{old_name}_copy{fallback_seed[0]}"
+    fallback_seed[0] += 1
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Public API 1/9: get_section_content (178a82dd)
+# ---------------------------------------------------------------------------
+
+def get_section_content(docx_path: str, heading_id: str) -> dict[str, Any]:
+    """178a82dd -- targeted read of ONE section's content, without a full
+    parse_document dump.
+
+    A "section" is the heading paragraph at ``heading_id`` plus every block
+    that follows it up to (not including) the next heading at the same or a
+    shallower level, or the end of the document. Read-only; builds no index.
+    This is the building block :func:`move_section` / :func:`copy_section`
+    use to report what they moved/copied, and a light-weight alternative to
+    calling :func:`parse_document` and filtering client-side when a caller
+    only cares about one section.
+
+    Args:
+        docx_path:  Absolute path to the .docx file.
+        heading_id: ``w14:paraId`` (or synthesised ``p{N}``) of the section's
+                    OWN heading paragraph.
+
+    Returns:
+        ``{heading_id, heading_text, level, start_index, end_index, blocks,
+        paragraph_count, table_count, figure_caption_count,
+        table_caption_count, docx_path}`` where ``blocks`` is the ordered
+        list of block dicts (``kind`` in ``"heading"``/``"paragraph"``/
+        ``"table"``, same shape as :func:`document_content_tree`'s
+        ``blocks``) from the heading itself through the end of the section.
+        ``end_index`` is the document-order ``index`` of the first block
+        NOT included (``None`` when the section runs to the end of the
+        document).
+
+        ``{"error": <message>}`` when ``docx_path`` cannot be read, or
+        ``heading_id`` does not identify a heading paragraph.
+    """
+    try:
+        _load_docx_xml_stdlib(docx_path)  # validates the file up front
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    from ._vendored_content_tree import document_content_tree  # noqa: PLC0415
+
+    tree = document_content_tree(docx_path)
+    blocks: list[dict[str, Any]] = tree.get("blocks") or []
+
+    heading_pos: int | None = None
+    for i, b in enumerate(blocks):
+        if b.get("kind") == "heading" and b.get("para_id") == heading_id:
+            heading_pos = i
+            break
+    if heading_pos is None:
+        return {
+            "error": (
+                f"heading_id {heading_id!r} not found (or is not a heading "
+                f"paragraph) in {docx_path}"
+            )
+        }
+
+    heading_block = blocks[heading_pos]
+    level = heading_block.get("level", 1)
+
+    end_pos = len(blocks)
+    for j in range(heading_pos + 1, len(blocks)):
+        b = blocks[j]
+        if b.get("kind") == "heading" and b.get("level", 1) <= level:
+            end_pos = j
+            break
+
+    section_blocks = blocks[heading_pos:end_pos]
+
+    return {
+        "heading_id": heading_id,
+        "heading_text": heading_block.get("text", ""),
+        "level": level,
+        "start_index": heading_block.get("index"),
+        "end_index": blocks[end_pos]["index"] if end_pos < len(blocks) else None,
+        "blocks": section_blocks,
+        "paragraph_count": sum(1 for b in section_blocks if b.get("kind") in ("paragraph", "heading")),
+        "table_count": sum(1 for b in section_blocks if b.get("kind") == "table"),
+        "figure_caption_count": sum(
+            1 for b in section_blocks if b.get("kind") == "paragraph" and _is_figure_caption(b)
+        ),
+        "table_caption_count": sum(
+            1 for b in section_blocks if b.get("kind") == "paragraph" and _is_table_caption(b)
+        ),
+        "docx_path": docx_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API 2/9: find_references_to (fea654f9)
+# ---------------------------------------------------------------------------
+
+def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
+    """fea654f9 -- find everything that points AT a figure/table/heading id.
+
+    The missing inverse of :func:`insert_cross_reference`: given a target
+    (a Figure/Table caption's para_id, a heading's para_id, or an existing
+    bookmark name directly, e.g. ``"_Ref123456789"``), scans the whole
+    document for REF / PAGEREF / NOTEREF fields whose instruction targets
+    that same bookmark, so a caller can check "is anything pointing at this
+    before I move/renumber/delete it".
+
+    ``target_id`` resolution (exactly one of these applies):
+      - Already a bookmark name (matches ``_Ref<digits>`` or starts with
+        ``bibkey_``): used directly, after confirming it exists somewhere.
+      - A Figure/Table Caption paragraph's para_id: resolved to its
+        ``_Ref<digits>`` cross-reference bookmark (the one
+        :func:`insert_caption` / :func:`insert_cross_reference` create/use).
+      - Any other paragraph's para_id (e.g. a heading): every
+        ``w:bookmarkStart`` name found directly on that paragraph is used
+        (covers manually-bookmarked headings; there is no automatic
+        heading-bookmark mechanism elsewhere in this module).
+
+    This is read-only -- it never mutates ``docx_path`` and never retrofits a
+    missing bookmark (unlike :func:`insert_cross_reference`, which creates
+    one when the target caption predates cross-reference support).
+
+    Args:
+        docx_path: Absolute path to the .docx file.
+        target_id: A caption/heading para_id, or an existing bookmark name.
+
+    Returns:
+        ``{target_id, target_kind, bookmark_names, references,
+        reference_count, docx_path}`` where each entry in ``references`` is
+        ``{para_id, index, field_type, bookmark_name, display_text,
+        paragraph_text}``.
+
+        ``{"error": <message>}`` when ``docx_path`` cannot be read, or
+        ``target_id`` cannot be resolved to anything in the document.
+    """
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    bookmark_names: list[str] = []
+    target_kind = "bookmark"
+
+    if _REF_BOOKMARK_RE.match(target_id) or target_id.startswith(_BIBKEY_BOOKMARK_PREFIX) \
+            or _INTERNAL_NOTE_BOOKMARK_RE.match(target_id):
+        found_directly = any(
+            bm.get(_q(_W, "name")) == target_id for bm in body.iter(_q(_W, "bookmarkStart"))
+        )
+        if not found_directly:
+            return {"error": f"bookmark {target_id!r} not found in {docx_path}"}
+        bookmark_names.append(target_id)
+    else:
+        result = _find_para_by_id(root, target_id)
+        if result is None:
+            return {"error": f"para_id {target_id!r} not found in {docx_path}"}
+        _body, target_elem, _idx = result
+
+        kind_seq = _caption_kind_and_seq(target_elem)
+        if kind_seq is not None:
+            target_kind = kind_seq[0]
+            ref_name = _find_caption_ref_bookmark(target_elem)
+            if ref_name:
+                bookmark_names.append(ref_name)
+
+        for bm in target_elem.iter(_q(_W, "bookmarkStart")):
+            name = bm.get(_q(_W, "name")) or ""
+            if name and name not in bookmark_names:
+                bookmark_names.append(name)
+
+    if not bookmark_names:
+        return {
+            "target_id": target_id,
+            "target_kind": target_kind,
+            "bookmark_names": [],
+            "references": [],
+            "reference_count": 0,
+            "note": (
+                "target paragraph carries no bookmark, so no REF/PAGEREF field "
+                "could possibly point at it yet -- nothing to find. If this is "
+                "a Figure/Table caption that predates cross-reference support, "
+                "call insert_cross_reference once (it retrofits a bookmark) "
+                "and re-run find_references_to."
+            ),
+            "docx_path": docx_path,
+        }
+
+    from ._vendored_content_tree import document_content_tree  # noqa: PLC0415
+
+    tree = document_content_tree(docx_path)
+    blocks: list[dict[str, Any]] = tree.get("blocks") or []
+
+    references: list[dict[str, Any]] = []
+    for block in blocks:
+        for fld in block.get("fields", []):
+            ftype = fld.get("field_type")
+            if ftype not in ("REF", "PAGEREF", "NOTEREF"):
+                continue
+            parts = (fld.get("instruction") or "").split()
+            bm_target = parts[1] if len(parts) > 1 else None
+            if bm_target in bookmark_names:
+                references.append({
+                    "para_id": block.get("para_id"),
+                    "index": block.get("index"),
+                    "field_type": ftype,
+                    "bookmark_name": bm_target,
+                    "display_text": fld.get("cached_result"),
+                    "paragraph_text": block.get("text", ""),
+                })
+
+    return {
+        "target_id": target_id,
+        "target_kind": target_kind,
+        "bookmark_names": bookmark_names,
+        "references": references,
+        "reference_count": len(references),
+        "docx_path": docx_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API 3/9: scan_stale_notes (563118d4)
+# ---------------------------------------------------------------------------
+
+def scan_stale_notes(docx_path: str) -> dict[str, Any]:
+    """563118d4 -- scan a .docx for placeholder/TODO-shaped text that may now
+    be outdated.
+
+    Recurring pattern this catches: an ad-hoc bracket-header or inline note
+    like ``"[NOTE: currently pending relocation to Section 4]"`` that never
+    got removed/updated after the thing it describes actually happened (the
+    section WAS moved, the note wasn't). This is a plain-text regex scan --
+    it has no notion of "did the described event actually occur"; it flags
+    every paragraph that LOOKS like a stale/placeholder note so a human can
+    triage the list before final submission.
+
+    Paragraphs already using the structured internal-note style (written by
+    :func:`insert_highlighted_note`) are excluded -- those are already
+    tracked/auditable via :func:`list_internal_notes` and are not the ad-hoc
+    pattern this function targets.
+
+    Args:
+        docx_path: Absolute path to the .docx file.
+
+    Returns:
+        ``{docx_path, findings, finding_count}`` where each finding is
+        ``{para_id, index, text, matched_terms, bracket_header,
+        section_path}`` -- ``section_path`` is the ancestor heading text
+        stack (root first) so a hit can be located without re-opening the
+        whole document.
+
+        ``{"error": <message>}`` when ``docx_path`` cannot be read.
+    """
+    try:
+        _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    paras = parse_docx(docx_path)
+
+    heading_stack: list[dict[str, Any]] = []  # {level, text}
+    findings: list[dict[str, Any]] = []
+
+    for p in paras:
+        style = p.get("style")
+        text = p.get("text") or ""
+
+        if _is_heading(style):
+            lvl = _heading_level(style)
+            while heading_stack and heading_stack[-1]["level"] >= lvl:
+                heading_stack.pop()
+            heading_stack.append({"level": lvl, "text": text})
+            continue
+
+        if style == _INTERNAL_NOTE_STYLE_DEFAULT:
+            continue
+
+        matched_terms = sorted({m.group(0) for m in _STALE_NOTE_RE.finditer(text)})
+        bracket_header = bool(_BRACKET_HEADER_RE.match(text))
+        if not matched_terms and not bracket_header:
+            continue
+
+        findings.append({
+            "para_id": p.get("para_id"),
+            "index": p.get("index"),
+            "text": text,
+            "matched_terms": matched_terms,
+            "bracket_header": bracket_header,
+            "section_path": [h["text"] for h in heading_stack],
+        })
+
+    return {
+        "docx_path": docx_path,
+        "findings": findings,
+        "finding_count": len(findings),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API 4/9: renumber_sequences (595ccea1)
+# ---------------------------------------------------------------------------
+
+def renumber_sequences(docx_path: str, index_db_path: str | None = None) -> dict[str, Any]:
+    """595ccea1 -- re-scan every SEQ Figure / SEQ Table field and confirm/fix
+    sequential numbering.
+
+    Motivated directly by a real Figure 41/42 numbering collision found by
+    hand after a structural move: two captions ended up caching the same
+    number because whatever moved them didn't re-derive numbering from
+    actual document order afterward. This walks the document ONCE in true
+    body order (including captions nested in table cells), computes the
+    correct 1-based number for each kind (Figure / Table counted
+    independently, matching :func:`insert_caption`'s own counting rule), and
+    rewrites any cached SEQ number that doesn't match -- Word will confirm
+    the same numbers on its own next field refresh (F9), so this is
+    "pre-computing" that refresh rather than fighting it.
+
+    Any REF field elsewhere in the document that caches the OLD "<Kind> <N>"
+    display text for a caption whose number this call corrects is ALSO
+    updated to the new text, so cross-references don't silently show a
+    stale number until the next manual Word field refresh.
+
+    A first-class primitive (not a private helper) precisely so
+    :func:`move_section` and :func:`copy_section` can call into it rather
+    than duplicate renumbering logic, per the sprint note.
+
+    Args:
+        docx_path:     Absolute path to the .docx file (mutated in place --
+                       only if a correction is actually needed).
+        index_db_path: If supplied, sidecar is invalidated after a write.
+
+    Returns:
+        ``{status, figure_count, table_count, collisions_found, corrections,
+        ref_fields_updated, docx_path}``. ``status`` is ``"unchanged"`` when
+        every cached number was already correct (no write performed) or
+        ``"corrected"`` otherwise. ``collisions_found`` lists any TWO
+        captions of the same kind that cached the identical number BEFORE
+        this call fixed them (the exact class of bug that motivated this
+        tool). ``{"error": <message>}`` on failure.
+    """
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    w_p = _q(_W, "p")
+    w_fldSimple = _q(_W, "fldSimple")
+    w_instr = _q(_W, "instr")
+    w_t = _q(_W, "t")
+
+    seq_fields: dict[str, list[dict[str, Any]]] = {"Figure": [], "Table": []}
+    for p in body.iter(w_p):
+        for fld in p.findall(w_fldSimple):
+            instr = fld.get(w_instr) or ""
+            if _SEQ_FIGURE_RE.search(instr):
+                kind = "Figure"
+            elif _SEQ_TABLE_RE.search(instr):
+                kind = "Table"
+            else:
+                continue
+            # The cached number lives on a <w:t> NESTED inside a <w:r> child
+            # of fldSimple (see _build_caption_paragraph), not a direct child
+            # of fldSimple itself -- must search descendants, not .find().
+            t_el = next(iter(fld.iter(w_t)), None)
+            if t_el is None:
+                r_new = ET.SubElement(fld, _q(_W, "r"))
+                t_el = ET.SubElement(r_new, w_t)
+            seq_fields[kind].append({"para": p, "t_el": t_el, "cached": t_el.text or ""})
+
+    corrections: list[dict[str, Any]] = []
+    collisions: list[dict[str, Any]] = []
+
+    for kind, entries in seq_fields.items():
+        seen_numbers: dict[str, int] = {}
+        for n, entry in enumerate(entries, start=1):
+            cached = entry["cached"]
+            if cached in seen_numbers:
+                collisions.append({
+                    "kind": kind,
+                    "cached_number": cached,
+                    "occurrence_positions": [seen_numbers[cached], n],
+                })
+            else:
+                seen_numbers[cached] = n
+            expected = str(n)
+            if cached != expected:
+                bookmark = _find_caption_ref_bookmark(entry["para"])
+                corrections.append({
+                    "kind": kind,
+                    "position": n,
+                    "old_cached": cached,
+                    "new_cached": expected,
+                    "ref_bookmark": bookmark,
+                })
+                entry["t_el"].text = expected
+
+    if not corrections:
+        return {
+            "status": "unchanged",
+            "figure_count": len(seq_fields["Figure"]),
+            "table_count": len(seq_fields["Table"]),
+            "collisions_found": collisions,
+            "corrections": [],
+            "ref_fields_updated": 0,
+            "docx_path": docx_path,
+        }
+
+    # Propagate corrected numbers into any REF field elsewhere caching the
+    # OLD "<Kind> <N>" display text for a corrected bookmark.
+    updated_display: dict[str, str] = {
+        c["ref_bookmark"]: f"{c['kind']} {c['new_cached']}"
+        for c in corrections
+        if c["ref_bookmark"]
+    }
+    ref_updates = 0
+    if updated_display:
+        for p in body.iter(w_p):
+            for fld in _iter_complex_fields(p):
+                parts = fld["instruction"].split()
+                if len(parts) < 2 or parts[0].upper() != "REF":
+                    continue
+                new_text = updated_display.get(parts[1])
+                if new_text is not None and fld["display_run"] is not None:
+                    fld["display_run"].text = new_text
+                    ref_updates += 1
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "corrected",
+        "figure_count": len(seq_fields["Figure"]),
+        "table_count": len(seq_fields["Table"]),
+        "collisions_found": collisions,
+        "corrections": corrections,
+        "ref_fields_updated": ref_updates,
+        "docx_path": docx_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API 5/9: insert_highlighted_note + list_internal_notes (65c8eb31)
+# ---------------------------------------------------------------------------
+
+def insert_highlighted_note(
+    docx_path: str,
+    text: str,
+    anchor_para_id: str,
+    position: str = "after",
+    style: str = "internal_note",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """65c8eb31 -- insert a genuinely highlighted internal-author-note paragraph.
+
+    Addresses a real recurring pattern: bracket-header/NOTE-block text
+    (``"[NOTE: ...]"``) left inline in results-section prose, indistinguishable
+    from real dissertation content until a human re-reads every paragraph
+    looking for it. This writes a STRUCTURALLY distinct paragraph instead --
+    a real ``w:highlight`` run property (renders visibly highlighted in Word
+    regardless of whether the ``style`` name below is defined in styles.xml)
+    plus a dedicated paragraph style name and its own ``_MNote<digits>``
+    bookmark -- so notes can be found and stripped programmatically (see
+    :func:`list_internal_notes` and :func:`scan_stale_notes`) before final
+    submission, rather than grepped for by hoping the author's bracket
+    convention was followed consistently.
+
+    ``text`` should be the note's plain content -- no bracket/NOTE-prefix
+    decoration needed; the highlight + dedicated style ARE the signal.
+
+    Args:
+        docx_path:      Absolute path to the .docx file (mutated in place).
+        text:            Note content.
+        anchor_para_id:  w14:paraId (or p{N}) of the paragraph to anchor on.
+        position:        "before" or "after" (default) the anchor.
+        style:           Must be ``"internal_note"`` -- the only supported
+                         note style today. Present as an explicit parameter
+                         (rather than hard-coded) so a future note *kind*
+                         (e.g. a reviewer-question style distinct from an
+                         author-note style) can be added without an API
+                         break.
+        index_db_path:   If supplied, the note is ALSO recorded in the
+                         sidecar's docx_internal_notes table so
+                         :func:`list_internal_notes` can find it. Without
+                         it the note still exists in the .docx (findable via
+                         :func:`scan_stale_notes`'s style exclusion, or by
+                         its ``MeridianInternalNote`` paragraph style /
+                         ``_MNote`` bookmark directly) but won't show up in
+                         a sidecar-backed audit query -- see the "risks"
+                         section of the accompanying task report.
+
+    Returns:
+        ``{status, note_id, text, anchor_para_id, position, style, docx_path}``
+        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+    """
+    if not text or not str(text).strip():
+        return {"error": "text must be a non-empty string"}
+    if position not in ("before", "after"):
+        return {"error": f"position must be 'before' or 'after', got {position!r}"}
+    if style != "internal_note":
+        return {"error": f"style must be 'internal_note' (the only supported note style), got {style!r}"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, anchor_para_id)
+    if result is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    body, _anchor_elem, child_idx = result
+
+    note_id = _next_note_bookmark_name(root)
+    note_p = _build_internal_note_paragraph(text.strip(), note_id, _INTERNAL_NOTE_STYLE_DEFAULT)
+
+    insert_at = child_idx if position == "before" else child_idx + 1
+    body.insert(insert_at, note_p)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    if index_db_path and os.path.exists(index_db_path):
+        _upsert_sidecar_note(index_db_path, note_id, text.strip(), anchor_para_id)
+
+    return {
+        "status": "inserted",
+        "note_id": note_id,
+        "text": text.strip(),
+        "anchor_para_id": anchor_para_id,
+        "position": position,
+        "style": _INTERNAL_NOTE_STYLE_DEFAULT,
+        "docx_path": docx_path,
+    }
+
+
+def list_internal_notes(index_db_path: str) -> list[dict[str, Any]]:
+    """65c8eb31 -- list internal-author-note paragraphs recorded in the sidecar.
+
+    Reads the ``docx_internal_notes`` table populated by
+    :func:`insert_highlighted_note`. This is a sidecar QUERY (matching the
+    convention of :func:`get_equations` / :func:`get_local_structure_elements`
+    in this module) -- it reports notes recorded at insertion time, not a
+    live re-scan of the .docx. A note inserted without ``index_db_path`` set
+    will NOT appear here even though it really exists in the document (see
+    the caveat on :func:`insert_highlighted_note`); use
+    :func:`scan_stale_notes`'s style-aware exclusion, or a direct structural
+    scan for the ``MeridianInternalNote`` paragraph style, as a live
+    cross-check before treating this list as exhaustive.
+
+    Args:
+        index_db_path: Path to the sidecar SQLite index.
+
+    Returns:
+        A list of ``{note_id, anchor_para_id, text}`` dicts. ``[]`` when the
+        sidecar doesn't exist yet or has no recorded notes.
+    """
+    if not os.path.exists(index_db_path):
+        return []
+    conn = _connect(index_db_path)
+    try:
+        rows = conn.execute(
+            "SELECT note_id, anchor_para_id, text FROM docx_internal_notes ORDER BY note_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{"note_id": r[0], "anchor_para_id": r[1], "text": r[2]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Public API 6/9: write_section (82d22824)
+# ---------------------------------------------------------------------------
+
+def write_section(
+    docx_path: str,
+    heading_text: str,
+    level: int,
+    content_spec: list[dict[str, Any]],
+    anchor_para_id: str,
+    position: str = "after",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """82d22824 -- create a whole new section (heading + body + figure/table
+    references) as ONE atomic operation from a structured spec.
+
+    Replaces the failure-prone pattern of separate insert_caption /
+    insert_cross_reference / raw-paragraph calls that can each independently
+    fail or land at the wrong position: every block is built in memory first
+    and validated BEFORE any XML is touched, then spliced into the document
+    in a single write. Either the whole section lands correctly, or the file
+    is not modified at all.
+
+    ``content_spec`` is an ordered list of block dicts, each with a ``type``:
+
+      ``{"type": "paragraph", "text": str, "references": [ref_spec, ...]}``
+        A plain body paragraph. Each optional ``ref_spec`` is
+        ``{"target_caption_para_id": ...}`` or ``{"bookmark_name": ...}``
+        (exactly one) and appends a live REF cross-reference field at the
+        end of the paragraph -- the same mechanism as
+        :func:`insert_cross_reference` -- so "as shown in Figure 3" prose
+        can be authored as part of the new section instead of a separate
+        follow-up call.
+
+      ``{"type": "caption", "kind": "Figure"|"Table", "label_text": str}``
+        A Caption-styled paragraph with its own SEQ field, numbered by
+        counting existing same-kind captions already in the document (same
+        rule :func:`insert_caption` uses, extended across this whole batch
+        so two captions of the same kind in one ``content_spec`` get
+        consecutive numbers). NOTE: this module has no image/table
+        INSERTION primitive -- this block type declares a caption's
+        position; the caller is responsible for placing the actual
+        image/table itself (e.g. via a separate tool), same as
+        :func:`insert_caption` already requires today.
+
+    Every paragraph created here (the heading included) is assigned a fresh
+    ``w14:paraId`` immediately via :func:`_new_para_id` rather than leaving
+    Word to assign one on next open, so the returned para_ids are usable
+    right away by :func:`insert_cross_reference` / :func:`find_references_to`
+    / :func:`move_section` without a save-reload round trip.
+
+    Args:
+        docx_path:      Absolute path to the .docx file (mutated in place).
+        heading_text:   Text of the new section's heading.
+        level:          Heading level (1 = Heading1, 2 = Heading2, ...).
+        content_spec:   Ordered list of block specs (see above).
+        anchor_para_id: w14:paraId (or p{N}) of the paragraph/table to anchor on.
+        position:       "before" or "after" (default) the anchor.
+        index_db_path:  If supplied, sidecar is invalidated after the write.
+
+    Returns:
+        ``{status, heading_para_id, heading_text, level, block_para_ids,
+        docx_path}`` where ``block_para_ids`` is a list parallel to
+        ``content_spec`` (``{"type": "paragraph", "para_id": ...}`` or
+        ``{"type": "caption", "kind", "para_id", "seq_number",
+        "ref_bookmark"}``).
+
+        ``{"error": <message>}`` on any validation or write failure (file
+        NOT mutated on error -- validation happens before the file is
+        touched).
+    """
+    if not heading_text or not str(heading_text).strip():
+        return {"error": "heading_text must be a non-empty string"}
+    try:
+        level_int = int(level)
+    except (TypeError, ValueError):
+        return {"error": f"level must be an integer, got {level!r}"}
+    if level_int < 1:
+        return {"error": f"level must be >= 1, got {level_int}"}
+    if position not in ("before", "after"):
+        return {"error": f"position must be 'before' or 'after', got {position!r}"}
+    if not isinstance(content_spec, list):
+        return {"error": "content_spec must be a list of block specs"}
+    for i, block in enumerate(content_spec):
+        if not isinstance(block, dict) or "type" not in block:
+            return {"error": f"content_spec[{i}] must be a dict with a 'type' key"}
+        if block["type"] not in ("paragraph", "caption"):
+            return {"error": f"content_spec[{i}]['type'] must be 'paragraph' or 'caption', got {block['type']!r}"}
+        if block["type"] == "paragraph" and not str(block.get("text", "")).strip():
+            return {"error": f"content_spec[{i}] (paragraph) requires a non-empty 'text'"}
+        if block["type"] == "caption":
+            if block.get("kind") not in ("Figure", "Table"):
+                return {"error": f"content_spec[{i}] (caption) requires kind='Figure' or 'Table'"}
+            if not str(block.get("label_text", "")).strip():
+                return {"error": f"content_spec[{i}] (caption) requires a non-empty 'label_text'"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, anchor_para_id)
+    if result is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    body, _anchor_elem, child_idx = result
+
+    taken_ids = _existing_para_ids(root)
+
+    # Newly-created captions in THIS batch aren't attached to `root` until
+    # the final splice below, so _next_ref_bookmark_name(root) alone would
+    # hand out the SAME name twice for two captions in one content_spec.
+    # Reserve names from a local monotonic seed instead.
+    seed_match = _REF_BOOKMARK_RE.match(_next_ref_bookmark_name(root))
+    ref_seed = [int(seed_match.group(1))]
+
+    def _reserve_ref_bookmark() -> str:
+        name = f"{_REF_BOOKMARK_PREFIX}{ref_seed[0]}"
+        ref_seed[0] += 1
+        return name
+
+    heading_id = _new_para_id(taken_ids)
+    heading_p = ET.Element(_q(_W, "p"))
+    heading_p.set(_q(_W14, "paraId"), heading_id)
+    hPr = ET.SubElement(heading_p, _q(_W, "pPr"))
+    hStyle = ET.SubElement(hPr, _q(_W, "pStyle"))
+    hStyle.set(_q(_W, "val"), f"Heading{level_int}")
+    hr = ET.SubElement(heading_p, _q(_W, "r"))
+    ht = ET.SubElement(hr, _q(_W, "t"))
+    ht.text = heading_text.strip()
+
+    new_elements: list[ET.Element] = [heading_p]
+    block_para_ids: list[dict[str, Any]] = []
+
+    fig_seq = _count_seq_captions(root, "Figure")
+    tbl_seq = _count_seq_captions(root, "Table")
+
+    for block in content_spec:
+        if block["type"] == "paragraph":
+            pid = _new_para_id(taken_ids)
+            p = ET.Element(_q(_W, "p"))
+            p.set(_q(_W14, "paraId"), pid)
+            r = ET.SubElement(p, _q(_W, "r"))
+            t = ET.SubElement(r, _q(_W, "t"))
+            t.set(_q(_XML_NS, "space"), "preserve")
+            t.text = str(block["text"])
+
+            for ref_spec in block.get("references") or []:
+                target_pid = ref_spec.get("target_caption_para_id")
+                bm_name = ref_spec.get("bookmark_name")
+                if bool(target_pid) == bool(bm_name):
+                    return {
+                        "error": (
+                            "each entry in a paragraph block's 'references' must give "
+                            "exactly one of target_caption_para_id or bookmark_name"
+                        )
+                    }
+                if target_pid is not None:
+                    target_result = _find_para_by_id(root, target_pid)
+                    if target_result is None:
+                        return {"error": f"target_caption_para_id {target_pid!r} not found in {docx_path}"}
+                    _tb, caption_elem, _ti = target_result
+                    kind_seq = _caption_kind_and_seq(caption_elem)
+                    if kind_seq is None:
+                        return {
+                            "error": f"paragraph {target_pid!r} is not a Figure/Table Caption paragraph"
+                        }
+                    kind, seq_cached = kind_seq
+                    ref_name = _find_caption_ref_bookmark(caption_elem)
+                    if ref_name is None:
+                        ref_name = _reserve_ref_bookmark()
+                        _wrap_caption_in_ref_bookmark(caption_elem, ref_name)
+                else:
+                    found = _find_caption_by_ref_bookmark(root, bm_name)
+                    if found is None:
+                        return {
+                            "error": (
+                                f"bookmark {bm_name!r} not found (or not a caption "
+                                "cross-reference bookmark)"
+                            )
+                        }
+                    _ce, kind_seq = found
+                    kind, seq_cached = kind_seq
+                    ref_name = bm_name
+
+                display_text = f"{kind} {seq_cached}"
+                existing_texts = [tt.text or "" for tt in p.iter(_q(_W, "t"))]
+                trailing = existing_texts[-1] if existing_texts else ""
+                if trailing and not trailing[-1].isspace():
+                    r_sp = ET.SubElement(p, _q(_W, "r"))
+                    t_sp = ET.SubElement(r_sp, _q(_W, "t"))
+                    t_sp.set(_q(_XML_NS, "space"), "preserve")
+                    t_sp.text = " "
+                for run_el in _build_complex_field_runs(f"REF {ref_name} \\h", display_text):
+                    p.append(run_el)
+
+            new_elements.append(p)
+            block_para_ids.append({"type": "paragraph", "para_id": pid})
+        else:  # "caption"
+            kind = block["kind"]
+            if kind == "Figure":
+                fig_seq += 1
+                seq_number = fig_seq
+            else:
+                tbl_seq += 1
+                seq_number = tbl_seq
+            ref_bookmark = _reserve_ref_bookmark()
+            cap_p = _build_caption_paragraph(
+                kind=kind,
+                label_text=str(block["label_text"]).strip(),
+                seq_cached=str(seq_number),
+                ref_bookmark=ref_bookmark,
+            )
+            pid = _new_para_id(taken_ids)
+            cap_p.set(_q(_W14, "paraId"), pid)
+            new_elements.append(cap_p)
+            block_para_ids.append({
+                "type": "caption",
+                "kind": kind,
+                "para_id": pid,
+                "seq_number": seq_number,
+                "ref_bookmark": ref_bookmark,
+            })
+
+    insert_at = child_idx if position == "before" else child_idx + 1
+    for offset, el in enumerate(new_elements):
+        body.insert(insert_at + offset, el)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "inserted",
+        "heading_para_id": heading_id,
+        "heading_text": heading_text.strip(),
+        "level": level_int,
+        "block_para_ids": block_para_ids,
+        "docx_path": docx_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API 7/9: move_section (6ff24136)
+# ---------------------------------------------------------------------------
+
+def move_section(
+    docx_path: str,
+    section_id: str,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """6ff24136 -- move an existing section (heading + its content) to a new
+    location in the document.
+
+    Cuts the heading at ``section_id`` and every block up to (not including)
+    the next same-or-shallower heading (see :func:`_locate_section_bounds`
+    -- the same boundary rule :func:`get_section_content` reports), then
+    re-inserts that exact same range of elements relative to
+    ``destination_anchor_para_id``. Operates on a single live parse so every
+    paragraph keeps its original ``w14:paraId`` and every bookmark keeps its
+    original name -- existing cross-references INTO the moved section stay
+    valid (they don't care where in the document their target lives).
+
+    After the move, this calls :func:`renumber_sequences` (the move may have
+    reordered Figure/Table captions relative to each other) and
+    :func:`find_references_to` for ``section_id`` itself (in case something
+    elsewhere references the section's own heading) -- exactly the two
+    follow-up checks the sprint note calls for, run automatically rather
+    than left to the caller to remember.
+
+    Args:
+        docx_path:                   Absolute path to the .docx file
+                                      (mutated in place).
+        section_id:                  w14:paraId (or p{N}) of the section's
+                                      OWN heading paragraph.
+        destination_anchor_para_id:  w14:paraId (or p{N}) of the paragraph/
+                                      table to move the section next to.
+                                      Must be OUTSIDE the section being moved.
+        destination_position:        "before" or "after" (default) the
+                                      destination anchor.
+        index_db_path:                If supplied, sidecar is invalidated
+                                      (and threaded into the renumber_sequences
+                                      call) after the write.
+
+    Returns:
+        ``{status, section_id, heading_text, moved_block_count,
+        destination_anchor_para_id, destination_position,
+        renumber_sequences, find_references_to, docx_path}``.
+
+        ``{"error": <message>}`` when ``section_id`` /
+        ``destination_anchor_para_id`` can't be resolved, the destination
+        falls inside the section being moved, or the write fails (file NOT
+        mutated on error).
+    """
+    if destination_position not in ("before", "after"):
+        return {
+            "error": f"destination_position must be 'before' or 'after', got {destination_position!r}"
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    bounds = _locate_section_bounds(body, section_id)
+    if bounds is None:
+        return {
+            "error": (
+                f"heading_id {section_id!r} not found (or is not a heading "
+                f"paragraph) in {docx_path}"
+            )
+        }
+    start_idx, end_idx, heading_text, _level = bounds
+
+    dest_result = _find_para_by_id(root, destination_anchor_para_id)
+    if dest_result is None:
+        return {"error": f"para_id {destination_anchor_para_id!r} not found in {docx_path}"}
+    _dbody, _delem, dest_idx = dest_result
+
+    if start_idx <= dest_idx < end_idx:
+        return {
+            "error": (
+                "destination_anchor_para_id falls INSIDE the section being moved "
+                f"(body indices [{start_idx}, {end_idx})); choose an anchor outside it"
+            )
+        }
+
+    body_list = list(body)
+    moved_elements = body_list[start_idx:end_idx]
+    removed_count = end_idx - start_idx
+
+    for el in moved_elements:
+        body.remove(el)
+
+    # Adjust the destination index ARITHMETICALLY rather than re-resolving
+    # destination_anchor_para_id by string after the removal: if it's a
+    # synthesised p{N} id, removing `removed_count` paragraphs earlier in the
+    # document shifts every later paragraph's synthetic id, so re-searching
+    # for the OLD literal string post-removal could silently match the wrong
+    # paragraph (or none). Arithmetic shift sidesteps that entirely.
+    dest_idx_after = dest_idx - removed_count if dest_idx >= end_idx else dest_idx
+
+    insert_at = dest_idx_after if destination_position == "before" else dest_idx_after + 1
+    for offset, el in enumerate(moved_elements):
+        body.insert(insert_at + offset, el)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    renumber_result = renumber_sequences(docx_path, index_db_path=index_db_path)
+    references_result = find_references_to(docx_path, section_id)
+
+    return {
+        "status": "moved",
+        "section_id": section_id,
+        "heading_text": heading_text,
+        "moved_block_count": len(moved_elements),
+        "destination_anchor_para_id": destination_anchor_para_id,
+        "destination_position": destination_position,
+        "renumber_sequences": renumber_result,
+        "find_references_to": references_result,
+        "docx_path": docx_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API 8/9: copy_section (8213050a)
+# ---------------------------------------------------------------------------
+
+def copy_section(
+    docx_path: str,
+    section_id: str,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """8213050a -- duplicate an existing section (heading + its content) to a
+    new location in the document, leaving the original untouched.
+
+    Same section-boundary rule as :func:`move_section`
+    (:func:`_locate_section_bounds`), but deep-COPIES the range instead of
+    cutting it:
+
+      - Every copied ``<w:p>`` gets a FRESH ``w14:paraId`` (via
+        :func:`_new_para_id`) -- duplicate paraIds across a document would
+        silently break every paraId-addressed tool in this module, so this
+        is a hard invariant, not an optimisation.
+      - Every bookmark name inside the copied range (caption ``_Ref<n>``
+        cross-reference bookmarks, internal-note ``_MNote<n>`` bookmarks,
+        bibliography ``bibkey_`` bookmarks, or anything else) is renamed to
+        a fresh unique name (:func:`_rename_bookmark_for_copy`). Copying a
+        Figure caption verbatim would otherwise leave TWO captions answering
+        to the SAME bookmark name -- :func:`find_references_to` / Word's own
+        field resolution would then nondeterministically pick whichever one
+        occurs first in document order, silently misdirecting any existing
+        cross-reference into either the original or the copy.
+      - A REF/PAGEREF/NOTEREF field INSIDE the copied range that targets a
+        bookmark ALSO inside the copied range (an internal
+        "as shown in Figure 3 above" self-reference) is repointed at the
+        COPY's own renamed bookmark, so the duplicated section is internally
+        self-consistent. A field targeting a bookmark OUTSIDE the copied
+        range is left pointing at the original (shared) target, since that
+        target was not duplicated.
+
+    :func:`renumber_sequences` is called as the final step (same as
+    :func:`move_section`) -- since the copy's SEQ fields start out with the
+    SAME cached numbers as the original (deep copy), inserting the copy
+    almost always leaves at least one caption's position/number mismatched,
+    which also refreshes any now-stale REF display text for the copy's own
+    captions as a side effect.
+
+    Args:
+        docx_path:                   Absolute path to the .docx file
+                                      (mutated in place).
+        section_id:                  w14:paraId (or p{N}) of the section's
+                                      OWN heading paragraph (the ORIGINAL,
+                                      not the copy).
+        destination_anchor_para_id:  w14:paraId (or p{N}) to copy the section
+                                      next to.
+        destination_position:        "before" or "after" (default).
+        index_db_path:                If supplied, sidecar is invalidated
+                                      (and threaded into renumber_sequences)
+                                      after the write.
+
+    Returns:
+        ``{status, section_id, heading_text, new_heading_para_id,
+        copied_block_count, para_id_map, bookmark_map,
+        destination_anchor_para_id, destination_position,
+        renumber_sequences, docx_path}`` -- ``para_id_map`` /
+        ``bookmark_map`` are ``{old: new}`` dicts for every paraId/bookmark
+        that existed in the original section and was renamed in the copy
+        (originals lacking a native paraId aren't keyed in ``para_id_map``,
+        but the copy still gets one -- see ``new_heading_para_id``).
+
+        ``{"error": <message>}`` on failure (file NOT mutated on error).
+    """
+    if destination_position not in ("before", "after"):
+        return {
+            "error": f"destination_position must be 'before' or 'after', got {destination_position!r}"
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    bounds = _locate_section_bounds(body, section_id)
+    if bounds is None:
+        return {
+            "error": (
+                f"heading_id {section_id!r} not found (or is not a heading "
+                f"paragraph) in {docx_path}"
+            )
+        }
+    start_idx, end_idx, heading_text, _level = bounds
+
+    dest_result = _find_para_by_id(root, destination_anchor_para_id)
+    if dest_result is None:
+        return {"error": f"para_id {destination_anchor_para_id!r} not found in {docx_path}"}
+    _dbody, _delem, dest_idx = dest_result
+
+    body_list = list(body)
+    original_elements = body_list[start_idx:end_idx]
+    if not original_elements:
+        return {"error": f"section {section_id!r} has no content to copy"}
+
+    taken_ids = _existing_para_ids(root)
+    w14_paraId = _q(_W14, "paraId")
+    w_p = _q(_W, "p")
+    w_bookmarkStart = _q(_W, "bookmarkStart")
+    w_name = _q(_W, "name")
+
+    ref_seed_match = _REF_BOOKMARK_RE.match(_next_ref_bookmark_name(root))
+    ref_seed = [int(ref_seed_match.group(1))]
+    note_seed_match = _INTERNAL_NOTE_BOOKMARK_RE.match(_next_note_bookmark_name(root))
+    note_seed = [int(note_seed_match.group(1))]
+    fallback_seed = [1]
+
+    para_id_map: dict[str, str] = {}
+    bookmark_map: dict[str, str] = {}
+    copied_elements: list[ET.Element] = []
+
+    # Pass 1: deep-copy every element, minting fresh paraIds + bookmark names.
+    for el in original_elements:
+        new_el = copy.deepcopy(el)
+
+        for p in new_el.iter(w_p):
+            old_pid = p.get(w14_paraId)
+            new_pid = _new_para_id(taken_ids)
+            if old_pid:
+                para_id_map[old_pid] = new_pid
+            p.set(w14_paraId, new_pid)
+
+        for bm in new_el.iter(w_bookmarkStart):
+            old_name = bm.get(w_name)
+            if not old_name:
+                continue
+            if old_name not in bookmark_map:
+                bookmark_map[old_name] = _rename_bookmark_for_copy(
+                    old_name, ref_seed, note_seed, fallback_seed
+                )
+            bm.set(w_name, bookmark_map[old_name])
+
+        copied_elements.append(new_el)
+
+    # Pass 2: repoint any REF/PAGEREF/NOTEREF field that targets a bookmark
+    # ALSO inside the copied range at the copy's own renamed bookmark. Fields
+    # targeting a bookmark outside the copy are left alone (still valid --
+    # that target wasn't duplicated).
+    for new_el in copied_elements:
+        for p in new_el.iter(w_p):
+            for fld in _iter_complex_fields(p):
+                parts = fld["instruction"].split()
+                if len(parts) < 2 or parts[0].upper() not in ("REF", "PAGEREF", "NOTEREF"):
+                    continue
+                old_target = parts[1]
+                new_target = bookmark_map.get(old_target)
+                if new_target and new_target != old_target:
+                    for it_el in fld["instr_elements"]:
+                        if it_el.text and old_target in it_el.text:
+                            it_el.text = it_el.text.replace(old_target, new_target)
+
+    new_heading_para_id = (
+        copied_elements[0].get(w14_paraId) if copied_elements[0].tag == w_p else None
+    )
+
+    insert_at = dest_idx if destination_position == "before" else dest_idx + 1
+    for offset, el in enumerate(copied_elements):
+        body.insert(insert_at + offset, el)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    renumber_result = renumber_sequences(docx_path, index_db_path=index_db_path)
+
+    return {
+        "status": "copied",
+        "section_id": section_id,
+        "heading_text": heading_text,
+        "new_heading_para_id": new_heading_para_id,
+        "copied_block_count": len(copied_elements),
+        "para_id_map": para_id_map,
+        "bookmark_map": bookmark_map,
+        "destination_anchor_para_id": destination_anchor_para_id,
+        "destination_position": destination_position,
+        "renumber_sequences": renumber_result,
+        "docx_path": docx_path,
+    }
