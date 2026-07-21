@@ -361,13 +361,25 @@ jobs:
   # existing, and `gh run list` history showed ensure-regions skipped (0s) on
   # every recent workflow_dispatch-triggered deploy. So under real, everyday
   # operation this job never actually ran, and the intended iad+ord spread was
-  # never applied — the second region only ever existed after one of the rare
-  # direct-push incidents, and was never re-asserted since. Widening the
-  # condition to also cover workflow_dispatch makes it actually fire on every
-  # real prod deploy, matching the `deploy` job's own effective trigger scope.
+  # never applied.
+  #
+  # First widening attempt (github.event_name == 'push' || == 'workflow_dispatch',
+  # no status function) STILL skipped on the very next workflow_dispatch deploy
+  # despite `deploy` reporting a clean success — confirmed live via the Jobs API
+  # (conclusion: skipped) even though this exact `if` text was present on the
+  # commit the run actually checked out (head_sha verified). Rather than keep
+  # guessing at why the implicit success()-ANDing didn't take effect as
+  # expected, this now explicitly spells out `always()` + `needs.deploy.result`,
+  # mirroring the `deploy` job's OWN condition shape immediately above (which
+  # demonstrably works reliably under workflow_dispatch) instead of relying on
+  # an implicit, less-observable status check.
   ensure-regions:
     needs: deploy
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: >
+      always() &&
+      needs.deploy.result == 'success' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
