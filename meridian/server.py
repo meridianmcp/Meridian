@@ -968,6 +968,12 @@ async def project_scope_enforcement(request: Request, call_next):
     here covers them all at once. Returns 403 (not 404) so existence isn't leaked.
     The MCP dispatch layer enforces the same rule separately (see /mcp).
     """
+    # sprint 6941fd0f — TEMPORARY: this is the first-registered middleware, i.e.
+    # the outermost layer a request passes through, so stamping the entry time
+    # here lets _remote_mcp_inner compute "everything before the /mcp handler"
+    # (every other middleware in the stack) as a single diagnostic bucket.
+    if os.environ.get("MERIDIAN_PROFILE_MCP_STAGES", "").lower() in ("1", "true", "yes"):
+        request.state._prof_entry_t = time.perf_counter()
     m = _PROJECT_ID_PATH_RE.match(request.url.path)
     if m is not None:
         from ._deps import _scoped_project_ids_for_request  # noqa: PLC0415
@@ -1349,11 +1355,26 @@ async def _tenant_rate_limit_decision(request: Request):
 
 @app.middleware("http")
 async def _tenant_rate_limit_middleware(request: Request, call_next):
+    # sprint 6941fd0f — TEMPORARY diagnostic timing, see _mcp_profile_enabled below
+    # (defined near _remote_mcp_inner). Logged separately from the /mcp handler's
+    # own stage breakdown because this middleware runs BEFORE that handler and is
+    # the "rate-limiting" stage the sprint item asks to isolate.
+    _prof_rl = (
+        os.environ.get("MERIDIAN_PROFILE_MCP_STAGES", "").lower() in ("1", "true", "yes")
+        and (request.url.path == "/mcp" or request.url.path.startswith("/mcp/"))
+    )
+    _t0_rl = time.perf_counter() if _prof_rl else 0.0
     blocked = None
     try:
         blocked = await _tenant_rate_limit_decision(request)
     except Exception:  # FAIL OPEN — a limiter bug must never break live traffic
         blocked = None
+    if _prof_rl:
+        _logging.getLogger("meridian.mcp_perf").info(
+            "[mcp_perf] request_id=%s rate_limit=%.3fms",
+            getattr(request.state, "request_id", "unknown"),
+            (time.perf_counter() - _t0_rl) * 1000,
+        )
     if blocked is not None:
         return blocked
     return await call_next(request)
@@ -7419,6 +7440,28 @@ async def _log_connection_event(
         pass
 
 
+# sprint 6941fd0f — TEMPORARY diagnostic instrumentation for the "real request-path
+# latency" investigation. Zero-cost when MERIDIAN_PROFILE_MCP_STAGES is unset (a
+# single dict.get + falsy check per request); stage timings are logged through the
+# stdlib logger so they show up next to every other request log line, matching the
+# existing logging.getLogger("meridian.mcp_auth") pattern used a few lines below.
+# To be removed (or promoted to a permanent structured-log field) once the sprint
+# item is resolved — see DEVLOG/DECISIONS for the sprint 6941fd0f writeup.
+_MCP_PROFILE_LOGGER = _logging.getLogger("meridian.mcp_perf")
+
+
+def _mcp_profile_enabled() -> bool:
+    return os.environ.get("MERIDIAN_PROFILE_MCP_STAGES", "").lower() in ("1", "true", "yes")
+
+
+def _mcp_profile_log(request_id: str, stages: "list[tuple[str, float]]") -> None:
+    """Log per-stage elapsed ms for one /mcp request. ``stages`` is an ordered
+    list of (label, elapsed_seconds) pairs already diffed by the caller."""
+    parts = " ".join(f"{label}={elapsed * 1000:.3f}ms" for label, elapsed in stages)
+    total_ms = sum(elapsed for _, elapsed in stages) * 1000
+    _MCP_PROFILE_LOGGER.info("[mcp_perf] request_id=%s %s total=%.3fms", request_id, parts, total_ms)
+
+
 async def _remote_mcp_inner(request: Request) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
 
@@ -7427,6 +7470,14 @@ async def _remote_mcp_inner(request: Request) -> Any:
     Accepts a single JSON-RPC 2.0 message or a batch (list).
     """
     from fastapi.responses import JSONResponse
+
+    _prof = _mcp_profile_enabled()
+    _prof_stages: "list[tuple[str, float]]" = []
+    _t_prev = time.perf_counter() if _prof else 0.0
+    if _prof:
+        _entry_t = getattr(request.state, "_prof_entry_t", None)
+        if _entry_t is not None:
+            _prof_stages.append(("pre_handler_middleware", _t_prev - _entry_t))
 
     # b12cc29f — capture UA once for connection-event logging throughout.
     _conn_ua = (request.headers.get("user-agent", "") or "")[:200] or None
@@ -7581,9 +7632,20 @@ async def _remote_mcp_inner(request: Request) -> Any:
         )
         return JSONResponse(_oa_result)
 
+    if _prof:
+        _t_now = time.perf_counter()
+        _prof_stages.append(("oauth_precheck", _t_now - _t_prev))
+        _t_prev = _t_now
+
     tenant = None
     if _bearer_hash:
         tenant = await db_module.get_tenant_from_token_hash(request.app.state.db, _bearer_hash)
+
+    if _prof:
+        _t_now = time.perf_counter()
+        _prof_stages.append(("auth_token_lookup", _t_now - _t_prev))
+        _t_prev = _t_now
+
     if tenant is None:
         import logging as _logging
         _raw_auth = request.headers.get("authorization", "")
@@ -7643,8 +7705,18 @@ async def _remote_mcp_inner(request: Request) -> Any:
         )
         return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
 
+    if _prof:
+        _t_now = time.perf_counter()
+        _prof_stages.append(("body_parse", _t_now - _t_prev))
+        _t_prev = _t_now
+
     db = await _db(request)
     data_dir = _data_dir(request)
+
+    if _prof:
+        _t_now = time.perf_counter()
+        _prof_stages.append(("tenant_routing", _t_now - _t_prev))
+        _t_prev = _t_now
 
     # 393eed0a — compute a workspace-role gate only when an X-Workspace-Tenant-Id
     # header rides along (an API-token client targeting an invited workspace). The
@@ -7669,6 +7741,11 @@ async def _remote_mcp_inner(request: Request) -> Any:
         except Exception:
             _scoped_pids = None
 
+    if _prof:
+        _t_now = time.perf_counter()
+        _prof_stages.append(("role_scope_check", _t_now - _t_prev))
+        _t_prev = _t_now
+
     _req_method = body.get("method", "") if isinstance(body, list) else (body.get("method", "") if isinstance(body, dict) else "batch")
     if isinstance(body, list):
         results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids) for item in body]
@@ -7690,6 +7767,13 @@ async def _remote_mcp_inner(request: Request) -> Any:
         return JSONResponse(results)
 
     result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids)
+
+    if _prof:
+        _t_now = time.perf_counter()
+        _prof_stages.append(("dispatch", _t_now - _t_prev))
+        _t_prev = _t_now
+        _mcp_profile_log(getattr(request.state, "request_id", "unknown"), _prof_stages)
+
     # b12cc29f — log every successful /mcp dispatch. tools/list captures tool count.
     _tools_ret2: "int | None" = None
     if _req_method == "tools/list":

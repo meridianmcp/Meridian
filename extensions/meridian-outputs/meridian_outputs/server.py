@@ -1,9 +1,18 @@
 """Thin MCP stdio server exposing local outputs indexing as tools.
 
 Run with ``uvx --from <path> meridian-outputs-mcp`` (console entry point) or
-``python -m meridian_outputs.server``.  Every tool delegates to the fully-local
-:mod:`meridian_outputs.outputs_local` module -- NO hosted call is made by any
-tool in this package.
+``python -m meridian_outputs.server``.  Every tool delegates to a fully-local
+module in this package -- NO hosted call is made by any tool here.  Most
+tools delegate straight to :mod:`meridian_outputs.outputs_local`; a handful
+(``search_outputs``, ``classify_outputs``, ``resolve_figure_output``,
+``find_outputs_by_source``, ``tag_output``, ``check_staleness``,
+``find_stale_by_script``, ``script_content_hash``) delegate instead to the
+additive sibling modules built alongside it (:mod:`meridian_outputs.search`,
+:mod:`meridian_outputs.classify`, :mod:`meridian_outputs.provenance`,
+:mod:`meridian_outputs.fingerprint`) that each layer a drop-in-superset fix
+on top of ``outputs_local``'s public API without touching it directly (item
+a26ad8da wired these in; see each sibling module's docstring for the gap it
+closes).
 
 This is the wave-1 stopgap for local outputs indexing.  The hosted-aware
 smart-routing layer (item 1365e01a) is deliberately out of scope here.
@@ -23,7 +32,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import annotate, outputs_local
+from . import annotate, classify, fingerprint, outputs_local, provenance, search
 
 mcp = FastMCP("meridian-outputs")
 
@@ -35,7 +44,8 @@ def search_outputs(
     limit: int = 10,
     include_archival: bool = True,
 ) -> dict[str, Any]:
-    """BM25 full-text search over a local outputs directory tree.
+    """BM25 full-text search over a local outputs directory tree, with a
+    literal-filename-match boost (item c6236ef4).
 
     Indexes CSV, JSON, and NPY files under ``outputs_dir`` (recursive) and
     returns ranked hits.  The index is built and cached locally -- no network
@@ -44,6 +54,14 @@ def search_outputs(
 
     The index cache directory (if a persistent db_path is used) is
     automatically added to .gitignore so it is never accidentally committed.
+
+    Delegates to :func:`outputs_local.search_outputs` for all indexing and
+    BM25 scoring, then re-ranks so any hit whose basename literally contains
+    the (separator-normalized) query string precedes hits that only matched
+    via loose BM25 token overlap -- fixes a real case where a longer,
+    decoy-suffixed archival file BM25-outranked its exact-match canonical
+    twin. Purely additive: same hits, same count, same every-other-field,
+    plus one new ``literal_match: bool`` field per hit.
 
     Args:
       outputs_dir:      Absolute path to the outputs directory to index.
@@ -56,9 +74,10 @@ def search_outputs(
     Returns:
       {outputs_dir, query, hits, total_indexed} plus optional {partial, error}.
       Each hit has: path, score, bm25, is_archival, canonical_path, kind,
-      generating_script, csv_columns, json_keys, size, mtime, annotations.
+      generating_script, csv_columns, json_keys, size, mtime, annotations,
+      literal_match.
     """
-    return outputs_local.search_outputs(
+    return search.search_outputs(
         outputs_dir,
         query,
         limit=limit,
@@ -185,40 +204,105 @@ def list_provenance(outputs_dir: str) -> list[dict[str, Any]]:
 def classify_outputs(
     paths: list[str],
 ) -> dict[str, Any]:
-    """Classify a list of output file paths as canonical or archival.
+    """Classify a list of output file paths as canonical or archival (item
+    2820ab1f's broader superset).
 
-    Uses the two-stage classification from outputs_local:
+    Delegates to outputs_local's two-stage classification for everything it
+    already resolves:
       Stage 1 (cheap): filename heuristic (``*_old.csv``, ``_results.csv`` etc.)
       Stage 2 (SHA-256): byte-identity check against the canonical twin.
 
+    ...then adds a broader stage-1b naming heuristic (``_backup``/``_bak``/
+    ``_deprecated``/``_mislabeled``/``_wip``/``_copy``/``_stale``/``_archived``
+    suffixes, plus a whole extra suffix appended after the real extension like
+    ``.bak_41img_mislabeled`` or a trailing ``~``) for paths outputs_local's
+    own ``_old``/``_old_N`` convention doesn't recognise, and surfaces
+    ``size``/``mtime``/``mtime_iso`` directly on every record.
+
     Returns {total, classifications} where each classification has:
-      path, is_archival, canonical_path, reason.
+      path, is_archival, canonical_path, reason, size, mtime, mtime_iso.
     Results are in stable sorted order (sorted by path).
     """
-    return outputs_local.classify_outputs(paths)
+    return classify.classify_outputs(paths)
 
 
 @mcp.tool()
 def resolve_figure_output(
     outputs_dir: str,
     file_path: str,
+    fuzzy_limit: int = 25,
 ) -> dict[str, Any] | None:
-    """Exact-path lookup: is this figure already indexed as an output?
+    """Forward resolution: a document figure's ``file_path`` -> its
+    generating source (item e422de44's relocation-tolerant superset).
 
-    Given a document figure's ``file_path``, returns the outputs_index row for
-    the SAME file if it is present in the local index -- or None if no match.
-    Matching is path-normalised (handles back-slashes/forward-slashes, case
-    differences on Windows, relative vs absolute).
+    Two tiers, tried in order:
+      1. Exact-path (legacy contract, unchanged): the figure file IS itself
+         an indexed output at that same path. Matching is path-normalised
+         (handles back-slashes/forward-slashes, case differences on Windows,
+         relative vs absolute).
+      2. Basename fallback: when the exact path misses -- the figure was
+         relocated/copied/renamed relative to when it was indexed -- searches
+         the outputs index for files sharing the same basename and returns
+         the best-scoring candidate. Catches a figure whose docx-embedded
+         copy no longer lives where it was generated, which the old
+         exact-path-only lookup silently missed (returned None with no
+         further signal).
 
     Args:
       outputs_dir:  Absolute path to the outputs directory.
       file_path:    The figure's file path to resolve.
+      fuzzy_limit:  Max search hits considered for the basename tier
+                    (default 25).
 
     Returns:
-      {path, generating_script, is_archival, canonical_path, sha256, kind,
-      size, mtime, csv_columns, json_keys} or null if no match.
+      ``None`` only when NEITHER tier finds anything. Otherwise the resolved
+      row (path, generating_script, is_archival, canonical_path, sha256*,
+      kind, size, mtime, csv_columns, json_keys -- *sha256 only present on an
+      exact match) plus ``match_type`` (``"exact"`` or ``"basename"``),
+      ``queried_path``, and (basename tier only) ``candidate_count`` -- more
+      than 1 means the match is ambiguous and ``generating_script`` should be
+      treated as a best guess, not a certainty.
     """
-    return outputs_local.resolve_figure_output(outputs_dir, file_path)
+    return provenance.resolve_figure_output(
+        outputs_dir, file_path, fuzzy_limit=fuzzy_limit,
+    )
+
+
+@mcp.tool()
+def find_outputs_by_source(
+    outputs_dir: str,
+    source_path: str,
+    limit: int = 25,
+    search_limit: int = 200,
+) -> dict[str, Any]:
+    """Reverse resolution: a script/data ``source_path`` -> the outputs it
+    produced (item e422de44's new direction -- did not exist before this).
+
+    Given the generating script or data file, scans the outputs index for
+    rows whose recorded ``generating_script`` traces back to it (exact-string
+    or basename match) -- i.e. "what did this thing produce?". This is the
+    direction needed to catch a docx figure quietly citing STALE data: walk
+    the source's outputs forward, newest first, and compare against what the
+    docx actually shows.
+
+    Args:
+      outputs_dir:   Absolute path to the outputs directory.
+      source_path:   The script or data file to trace forward from.
+      limit:         Max number of matched outputs to return (default 25).
+      search_limit:  How many underlying search hits to scan before filtering
+                    (default 200; generous, since only a subset will match).
+
+    Returns:
+      {source_path, outputs, total} where each output row has the same
+      fields as a search hit (path, generating_script, is_archival,
+      canonical_path, kind, size, mtime, csv_columns, json_keys), sorted
+      newest-first by mtime. ``total`` is the full match count before
+      ``limit`` truncation. ``outputs`` is empty (not an error) when nothing
+      in the tree cites this source.
+    """
+    return provenance.find_outputs_by_source(
+        outputs_dir, source_path, limit=limit, search_limit=search_limit,
+    )
 
 
 @mcp.tool()
@@ -298,6 +382,116 @@ def search_logs(
     return outputs_local.search_logs(
         logs_dir, query, limit=limit, timeout_seconds=timeout_seconds,
     )
+
+
+@mcp.tool()
+def tag_output(
+    output_path: str,
+    outputs_dir: str,
+    script_path: str | None = None,
+    search_root: str | None = None,
+) -> dict[str, Any]:
+    """Fingerprint one output file and record it in a persistent ledger,
+    stamped with its generating script's content hash AT THIS MOMENT (item
+    7518bfcd).
+
+    Reuses ``file_fingerprint``'s cheap per-file signature (csv_columns /
+    json_keys / generating_script) and adds one more dimension on top: the
+    SHA-256 of the generating script's own on-disk content, so two runs of
+    the same script (one buggy, one fixed) that happen to produce
+    byte-identical-looking outputs can still be told apart later via
+    ``check_staleness``/``find_stale_by_script``.
+
+    Stored in ``<outputs_dir>/.meridian-outputs-cache/fingerprint_ledger.json``
+    -- fully local, no hosted call. Calling this again for the same
+    ``output_path`` supersedes the previous ledger entry.
+
+    Args:
+      output_path:  Absolute path to the output file to tag.
+      outputs_dir:  Root outputs directory (the ledger lives under its
+                    ``.meridian-outputs-cache/`` subdirectory).
+      script_path:  Explicit path to the generating script, if already known.
+                    Takes priority over the content-derived
+                    ``generating_script`` hint.
+      search_root:  Optional directory to resolve a bare script-name hint
+                    against (e.g. a repo root) when ``script_path`` isn't
+                    given explicitly.
+
+    Returns:
+      {path, kind, csv_columns, json_keys, generating_script, script_path,
+      script_hash, tagged_at} -- the ledger entry that was written.
+    """
+    return fingerprint.tag_output(
+        output_path, outputs_dir, script_path=script_path, search_root=search_root,
+    ).to_dict()
+
+
+@mcp.tool()
+def check_staleness(outputs_dir: str) -> list[dict[str, Any]]:
+    """Re-hash every generating script referenced in the ``tag_output``
+    ledger and report which previously-tagged outputs are now stale (item
+    7518bfcd).
+
+    An output is flagged stale when its generating script's CURRENT content
+    hash differs from the hash recorded at tag time -- the script has been
+    edited (bug fix or otherwise) since that output was produced, so the
+    output may still reflect the OLD script behaviour even though the output
+    file itself never changed and looks perfectly valid/cached. Also flagged
+    stale if the generating script can no longer be read at all
+    (deleted/moved).
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+
+    Returns:
+      A list of {path, script_path, tagged_script_hash, current_script_hash,
+      is_stale, reason} dicts, one per ledger entry, in stable sorted order
+      (by output path). ``[]`` if nothing has ever been tagged.
+    """
+    return [r.to_dict() for r in fingerprint.check_staleness(outputs_dir)]
+
+
+@mcp.tool()
+def find_stale_by_script(outputs_dir: str, script_path: str) -> list[str]:
+    """All ledger-tagged output paths produced by ``script_path`` in a
+    content state OTHER than its current on-disk content (item 7518bfcd).
+
+    The direct tool for the motivating scenario: "``script_path`` was just
+    found buggy and fixed -- which previously-tagged outputs did the buggy
+    (pre-fix) version produce?" Every ledger entry tagged against this script
+    whose recorded hash doesn't match the script's CURRENT hash was
+    generated by a script content-state that no longer exists on disk --
+    i.e. potentially the just-fixed bug.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      script_path:  The generating script to check tagged outputs against.
+
+    Returns:
+      A list of output paths (stable sorted order); ``[]`` if none are stale
+      relative to this script's current content.
+    """
+    return fingerprint.find_stale_by_script(outputs_dir, script_path)
+
+
+@mcp.tool()
+def script_content_hash(script_path: str) -> str | None:
+    """SHA-256 of a generating script's current on-disk content (item
+    7518bfcd).
+
+    The same primitive ``tag_output``/``check_staleness``/
+    ``find_stale_by_script`` use internally, exposed directly for a quick
+    "what would tagging this script right now record?" check without
+    needing an outputs_dir or an actual output file at hand.
+
+    Args:
+      script_path:  Absolute (or resolvable) path to the script file.
+
+    Returns:
+      The hex SHA-256 digest, or None if the file can't be read (missing,
+      moved, permissions) -- never raises.
+    """
+    return fingerprint.script_content_hash(script_path)
 
 
 def main() -> None:

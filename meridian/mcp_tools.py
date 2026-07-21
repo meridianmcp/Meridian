@@ -1712,6 +1712,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "source": {"type": "string", "enum": ["hn"], "description": "Which keyless source to search (default 'hn', the only source today)."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recently submitted first)."}},
          "required": ["query"]}},
+    {"name": "github_search", "description":
+        "Search GitHub — a REAL external lookup (keyless), sibling to paper_search/"
+        "social_search for external prior-art / competitive-repo research. Distinct "
+        "from search_code, which only searches the CALLING project's own connected "
+        "repo. Two keyless endpoints via the 'type' param: 'code' (default; GitHub "
+        "Code Search — actual usage of a symbol/pattern/API across public repos) and "
+        "'repo' (GitHub Repository Search — competitor/prior-art repositories by "
+        "topic/description/stars). Returns {query, count, results:[{title, authors, "
+        "summary, published, url, ...}]} — code rows carry path/repo/sha/score, repo "
+        "rows carry repo/stars/forks/language/score.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "Search terms (GitHub search-qualifier syntax is accepted, e.g. 'language:python foo')."},
+         "limit": {"type": "integer", "description": "Max results to return (default 10, max 50)."},
+         "type": {"type": "string", "enum": ["code", "repo"], "description": "Which keyless GitHub endpoint to search (default 'code')."},
+         "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recently indexed/updated first)."}},
+         "required": ["query"]}},
     {"name": "get_agent_instructions", "description":
         "Read-only: Return the custom agent_instructions for a project. "
         "These are injected automatically by start_session so every session picks them up. "
@@ -2085,7 +2101,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
 _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_tasks", "search_tasks", "search_all", "search_synthesis",
-    "paper_search", "social_search",
+    "paper_search", "social_search", "github_search",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
@@ -2302,6 +2318,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     # research
     "paper_search": "research",
     "social_search": "research",
+    "github_search": "research",
 }
 
 _TOOL_ROLE_RELEVANCE: dict[str, str] = {
@@ -2363,6 +2380,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "save_blog_post":            "planner",
     "paper_search":              "planner",
     "social_search":             "planner",
+    "github_search":             "planner",
     "capture_research_finding":  "planner",
     "add_insight":               "planner",
     "get_insights":              "planner",
@@ -2481,7 +2499,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
 #   - search_code_semantic, prospect_symbol, search_outputs: common-support
 #   - ingest_document, get_document_structure, get_latex_structure: common-support
 #     in document-focused sessions (occasional for code-only sessions)
-#   - paper_search, capture_research_finding, save_finding: common-support
+#   - paper_search, social_search, github_search, capture_research_finding,
+#     save_finding: common-support
 #   - get_workspace_proposals, advance_proposal_status: common-support — part of
 #     the add_workspace_proposal -> promote_proposal main-workflow arc
 #   - run_verification: common-support — routine test running in executor sessions
@@ -2567,6 +2586,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # research
     "paper_search":               "common-support",
     "social_search":              "common-support",
+    "github_search":              "common-support",
     "capture_research_finding":   "common-support",
     "save_finding":               "common-support",
     # workspace proposals workflow arc

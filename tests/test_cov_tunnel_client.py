@@ -329,6 +329,84 @@ def test_websocket_connect_sites_set_explicit_ping_timeout(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 0b3ea61a — explicit open_timeout on every websockets.connect() call site
+# ---------------------------------------------------------------------------
+
+def test_tunnel_connect_timeout_env_resolution(monkeypatch):
+    """_tunnel_connect_timeout() mirrors _run_cmd_timeout()'s env-var-with-
+    fallback convention: MERIDIAN_TUNNEL_CONNECT_TIMEOUT overrides the 30.0s
+    default, and an invalid/non-numeric value falls back rather than raising."""
+    monkeypatch.delenv("MERIDIAN_TUNNEL_CONNECT_TIMEOUT", raising=False)
+    assert tc._tunnel_connect_timeout() == 30.0
+
+    monkeypatch.setenv("MERIDIAN_TUNNEL_CONNECT_TIMEOUT", "45")
+    assert tc._tunnel_connect_timeout() == 45.0
+
+    monkeypatch.setenv("MERIDIAN_TUNNEL_CONNECT_TIMEOUT", "not-a-number")
+    assert tc._tunnel_connect_timeout() == 30.0
+
+    monkeypatch.setenv("MERIDIAN_TUNNEL_CONNECT_TIMEOUT", "0")
+    assert tc._tunnel_connect_timeout() == 30.0  # non-positive → fallback
+
+    monkeypatch.setenv("MERIDIAN_TUNNEL_CONNECT_TIMEOUT", "-5")
+    assert tc._tunnel_connect_timeout() == 30.0  # negative → fallback
+
+
+def test_websocket_connect_sites_set_explicit_open_timeout(monkeypatch):
+    """0b3ea61a — all three tunnel connect() call sites (_run_connection,
+    _run_connection_lazy, _run_extract_pool_connection) must pass an explicit
+    open_timeout rather than silently relying on the websockets library
+    default (10s) for the CONNECT handshake itself. That default sits earlier
+    in the sequence than ping/pong (676e53a3) or any relayed request, and is
+    NOT reachable by MCP_TIMEOUT (a `claude` CLI env var, unrelated to this
+    process) — a cold Fly.io machine wake can plausibly exceed it, flatly
+    failing a connect attempt that would have succeeded moments later."""
+    captured: list[dict] = []
+
+    class FakeWS:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise StopAsyncIteration  # no messages — connect() then exit cleanly
+
+    class FakeHttpClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+
+    def fake_connect(url, **kw):
+        captured.append(kw)
+        return FakeWS()
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", fake_connect)
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+    monkeypatch.setenv("MERIDIAN_TUNNEL_CONNECT_TIMEOUT", "37")
+
+    asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs"))
+
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
+
+    pool = MagicMock()
+    asyncio.run(
+        tc._run_extract_pool_connection("wss://x/tunnel/t", pool, "/repo", "extract")
+    )
+
+    assert len(captured) == 3, "expected exactly 3 websockets.connect() call sites"
+    for kw in captured:
+        # Picks up the env override, proving it is not hardcoded independent
+        # of any configuration mechanism.
+        assert kw.get("open_timeout") == 37.0
+
+
+# ---------------------------------------------------------------------------
 # 13161001 — _is_clean_server_close: distinguish a clean server-initiated
 # close (1012 service restart) from a genuine connection failure
 # ---------------------------------------------------------------------------

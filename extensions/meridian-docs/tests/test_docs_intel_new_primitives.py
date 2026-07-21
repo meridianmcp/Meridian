@@ -380,6 +380,56 @@ def test_write_section_rejects_bad_reference_target(tmp_path):
     assert "error" in result
 
 
+def test_write_section_after_heading_anchor_does_not_swallow_section_body(tmp_path):
+    """6822b142 regression: anchoring "after" a HEADING paragraph (instead of
+    that section's own last body paragraph) must land the new section after
+    the WHOLE anchor section, not right after the heading itself -- a literal
+    splice there would silently re-parent the anchor heading's own body
+    paragraph(s) under the newly-inserted heading."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    content_spec = [{"type": "paragraph", "text": "New section body."}]
+
+    result = docs_intel.write_section(
+        path, "New Section", 1, content_spec, "H0000001", position="after"
+    )
+    assert result["status"] == "inserted"
+
+    # Introduction's own section must still contain its original body
+    # paragraph -- not have lost it to the new section.
+    intro = docs_intel.get_section_content(path, "H0000001")
+    intro_texts = [b["text"] for b in intro["blocks"] if b["kind"] == "paragraph"]
+    assert intro_texts == ["Intro body paragraph."]
+
+    # The new section lands after Introduction's body, before Results.
+    paras = docs_intel.parse_docx(path)
+    ids_in_order = [p["para_id"] for p in paras]
+    heading_id = result["heading_para_id"]
+    assert ids_in_order.index(heading_id) == ids_in_order.index("P0000001") + 1
+    assert ids_in_order.index(heading_id) < ids_in_order.index("H0000002")
+
+
+def test_write_section_before_heading_anchor_unchanged(tmp_path):
+    """position="before" a heading anchor is unambiguous already (nothing of
+    the anchor's own content sits between "before it" and the heading) --
+    confirm the 6822b142 fix left this path untouched."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    content_spec = [{"type": "paragraph", "text": "New section body."}]
+
+    result = docs_intel.write_section(
+        path, "New Section", 1, content_spec, "H0000002", position="before"
+    )
+    assert result["status"] == "inserted"
+
+    paras = docs_intel.parse_docx(path)
+    ids_in_order = [p["para_id"] for p in paras]
+    heading_id = result["heading_para_id"]
+    body_id = result["block_para_ids"][0]["para_id"]
+    # New heading, then its own body paragraph, then (immediately) H0000002 --
+    # nothing existing was displaced or re-parented by the insertion.
+    assert ids_in_order.index(heading_id) == ids_in_order.index("H0000002") - 2
+    assert ids_in_order.index(body_id) == ids_in_order.index("H0000002") - 1
+
+
 def test_write_section_two_new_figures_get_consecutive_ref_bookmarks(tmp_path):
     """Regression guard: two brand-new captions in one call must not collide
     on the same _Ref bookmark name (see write_section's _reserve_ref_bookmark
@@ -440,16 +490,344 @@ def test_move_section_unknown_section_errors(tmp_path):
 def test_move_section_to_end_of_document(tmp_path):
     path = _write_docx(tmp_path, _TWO_SECTION_XML)
     # Move Introduction (first section) after Conclusion's LAST paragraph --
-    # destination_position anchors on the specific paragraph given (same
-    # paragraph-level semantics as insert_caption/insert_citation elsewhere
-    # in this module), not "after the whole section the anchor heads", so
-    # anchoring on the Conclusion HEADING would land content between the
-    # heading and its own body paragraph instead of at the document's end.
+    # an ordinary (non-heading) anchor, so this is a literal splice: it lands
+    # immediately after P0000004 regardless of section boundaries.
     result = docs_intel.move_section(path, "H0000001", "P0000004", destination_position="after")
     assert result["status"] == "moved"
     paras = docs_intel.parse_docx(path)
     order = [p["para_id"] for p in paras]
     assert order[-2:] == ["H0000001", "P0000001"]
+
+
+def test_move_section_after_heading_anchor_does_not_swallow_dest_section(tmp_path):
+    """027b7ada regression: destination_anchor_para_id anchored on a HEADING
+    with destination_position="after" must land the moved section after the
+    destination heading's WHOLE section (same 6822b142 fix write_section
+    got), not immediately after the heading paragraph -- otherwise the
+    moved-in heading would silently re-parent the destination section's own
+    body paragraph(s) underneath it."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+
+    # Move Introduction to "after Conclusion" using the CONCLUSION HEADING
+    # itself as the anchor (not its last body paragraph).
+    result = docs_intel.move_section(path, "H0000001", "H0000004", destination_position="after")
+    assert result["status"] == "moved"
+
+    # Conclusion's own section must still contain its original body
+    # paragraph -- not have lost it to the moved-in Introduction section.
+    conclusion = docs_intel.get_section_content(path, "H0000004")
+    conclusion_texts = [b["text"] for b in conclusion["blocks"] if b["kind"] == "paragraph"]
+    assert conclusion_texts == ["Conclusion body paragraph."]
+
+    paras = docs_intel.parse_docx(path)
+    order = [p["para_id"] for p in paras]
+    # Conclusion's body paragraph (P0000004) comes before the moved-in
+    # Introduction section, which is now the last thing in the document.
+    assert order.index("P0000004") < order.index("H0000001")
+    assert order[-2:] == ["H0000001", "P0000001"]
+
+
+# ---------------------------------------------------------------------------
+# e87b8338 -- reference-safety check gates BEFORE the write, not after
+# ---------------------------------------------------------------------------
+
+_SPLIT_BOOKMARK_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="H0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000001">
+      <w:bookmarkStart w:id="42" w:name="_Ref999999999"/>
+      <w:r><w:t>Intro body paragraph, bookmark starts here.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="H0000002">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Results</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000002">
+      <w:r><w:t>Results body paragraph, bookmark ends here.</w:t></w:r>
+      <w:bookmarkEnd w:id="42"/>
+    </w:p>
+    <w:p w14:paraId="H0000003">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Conclusion</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000003">
+      <w:r><w:t>Conclusion body paragraph.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def test_move_section_gates_before_write_on_bookmark_split(tmp_path):
+    """A bookmark spanning INTO the section being moved (start inside,
+    end outside) must abort the move -- and, critically, the file must be
+    byte-for-byte untouched, proving the check ran BEFORE the cut/splice/
+    save rather than as a post-hoc report after an already-committed write.
+    """
+    path = _write_docx(tmp_path, _SPLIT_BOOKMARK_XML, name="split.docx")
+    with open(path, "rb") as fh:
+        original_bytes = fh.read()
+
+    result = docs_intel.move_section(path, "H0000001", "P0000003", destination_position="after")
+    assert "error" in result
+    assert result["split_bookmarks"] == ["_Ref999999999"]
+
+    with open(path, "rb") as fh:
+        assert fh.read() == original_bytes, "file was mutated despite the gate rejecting the move"
+
+
+def test_move_section_allow_bookmark_split_override(tmp_path):
+    path = _write_docx(tmp_path, _SPLIT_BOOKMARK_XML, name="split2.docx")
+    result = docs_intel.move_section(
+        path, "H0000001", "P0000003", destination_position="after",
+        allow_bookmark_split=True,
+    )
+    assert result["status"] == "moved"
+
+
+# ---------------------------------------------------------------------------
+# 6ff24136 -- end-to-end: a section containing a TABLE + a FIGURE caption
+# moves as one atomic unit, past another Figure caption, forcing a genuine
+# SEQ Figure renumbering collision AND a REF-field display-text update --
+# all inside the single move_section call (this is the exact motivating bug,
+# "Figure 41/42 collision", reproduced deliberately and proven fixed within
+# one atomic operation rather than by a separate renumber_sequences call).
+# ---------------------------------------------------------------------------
+
+_MOVE_SECTION_TABLE_AND_CAPTIONS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="H0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="H0000002">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Setup</w:t></w:r>
+    </w:p>
+    <w:tbl>
+      <w:tr><w:tc><w:p><w:r><w:t>Setup table cell.</w:t></w:r></w:p></w:tc></w:tr>
+    </w:tbl>
+    <w:p w14:paraId="C0000001">
+      <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+      <w:bookmarkStart w:id="0" w:name="_Ref100000001"/>
+      <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
+      <w:fldSimple w:instr="SEQ Figure \\* ARABIC"><w:r><w:t>1</w:t></w:r></w:fldSimple>
+      <w:bookmarkEnd w:id="0"/>
+      <w:r><w:t xml:space="preserve">. The setup figure.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="H0000003">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Results</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="C0000002">
+      <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+      <w:bookmarkStart w:id="1" w:name="_Ref100000002"/>
+      <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
+      <w:fldSimple w:instr="SEQ Figure \\* ARABIC"><w:r><w:t>2</w:t></w:r></w:fldSimple>
+      <w:bookmarkEnd w:id="1"/>
+      <w:r><w:t xml:space="preserve">. The results figure.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="R0000001">
+      <w:r><w:t xml:space="preserve">As shown above in </w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> REF _Ref100000001 \\h </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t xml:space="preserve">Figure 1</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:t xml:space="preserve">.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="H0000004">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Conclusion</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000004">
+      <w:r><w:t>Conclusion body paragraph.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def test_move_section_relocates_table_and_caption_and_fixes_seq_and_ref_atomically(tmp_path):
+    path = _write_docx(tmp_path, _MOVE_SECTION_TABLE_AND_CAPTIONS_XML, name="move_seq.docx")
+
+    # Move "Setup" (heading + table + Figure-1 caption, 3 body children) to
+    # land right after "Results" (whose own Figure-2 caption + REF-to-Setup
+    # paragraph precede it) -- i.e. after R0000001, before Conclusion. This
+    # flips on-disk Figure order (2 then 1), which is exactly the collision
+    # class renumber_sequences exists to catch and fix.
+    result = docs_intel.move_section(path, "H0000002", "R0000001", destination_position="after")
+    assert result["status"] == "moved"
+    assert result["moved_block_count"] == 3  # heading + table + caption
+
+    # --- atomicity: SEQ renumbering happened as part of THIS call's return ---
+    renumber = result["renumber_sequences"]
+    assert renumber["status"] == "corrected"
+    corrected_kinds_positions = {
+        (c["kind"], c["old_cached"], c["new_cached"]) for c in renumber["corrections"]
+    }
+    assert ("Figure", "2", "1") in corrected_kinds_positions  # Results' caption, now first
+    assert ("Figure", "1", "2") in corrected_kinds_positions  # Setup's caption, now second
+    # The REF field (pointing at Setup's caption, bookmark _Ref100000001)
+    # cached the stale "Figure 1" display text -- must be resynced to "Figure 2".
+    assert renumber["ref_fields_updated"] == 1
+
+    # --- re-read the saved file fresh: everything above must be durably true ---
+    _raw, root = docs_intel._load_docx_xml_stdlib(path)
+    body = root.find(docs_intel._q(_W, "body"))
+    body_list = list(body)
+    tags_and_ids = [
+        (el.tag.rsplit("}", 1)[-1], el.get(docs_intel._q(_W14, "paraId")))
+        for el in body_list
+    ]
+    # Document order now: Intro, Results-heading, Results-caption, REF-para,
+    # Setup-heading, tbl, Setup-caption, Conclusion-heading, Conclusion-body.
+    ordered_ids = [pid for _tag, pid in tags_and_ids if pid]
+    assert ordered_ids.index("H0000003") < ordered_ids.index("H0000002")  # Results before Setup
+    assert ordered_ids.index("R0000001") < ordered_ids.index("H0000002")  # REF-para before Setup
+    assert ordered_ids.index("H0000002") < ordered_ids.index("H0000004")  # Setup before Conclusion
+    # The table moved WITH its section (immediately after Setup's heading,
+    # immediately before Setup's caption) -- not left behind or dropped.
+    setup_pos = next(i for i, (_t, pid) in enumerate(tags_and_ids) if pid == "H0000002")
+    assert tags_and_ids[setup_pos + 1][0] == "tbl"
+    assert tags_and_ids[setup_pos + 2][1] == "C0000001"
+
+    # SEQ cached numbers on disk match the corrected values.
+    fld_texts: dict[str, str] = {}
+    for p in body.iter(docs_intel._q(_W, "p")):
+        pid = p.get(docs_intel._q(_W14, "paraId"))
+        if pid in ("C0000001", "C0000002"):
+            t_el = next(iter(p.iter(docs_intel._q(_W, "t"))), None)
+            fld = p.find(docs_intel._q(_W, "fldSimple"))
+            seq_t = next(iter(fld.iter(docs_intel._q(_W, "t"))), None)
+            fld_texts[pid] = seq_t.text
+    assert fld_texts["C0000002"] == "1"  # Results' caption, now first in doc order
+    assert fld_texts["C0000001"] == "2"  # Setup's caption, now second
+
+    # REF field's cached display text was updated in place, on disk.
+    ref_para = next(
+        p for p in body.iter(docs_intel._q(_W, "p"))
+        if p.get(docs_intel._q(_W14, "paraId")) == "R0000001"
+    )
+    display_texts = [t.text for t in ref_para.iter(docs_intel._q(_W, "t")) if t.text]
+    assert "Figure 2" in display_texts
+    assert "Figure 1" not in display_texts
+
+
+# ---------------------------------------------------------------------------
+# 7600db1c regression: move_section must work when section_id /
+# destination_anchor_para_id are synthesized "sp<hash>" ids, not just native
+# w14:paraId -- this is the id scheme almost every REAL document's headings
+# and captions actually carry (Word does not assign w14:paraId to every
+# paragraph). Before 7600db1c, find_references_to's pre-move safety check
+# (called with section_id) could only resolve p{N}/native ids, so calling
+# move_section with the realistic id a caller would actually have obtained
+# from document_outline/parse_document failed on ~every real document
+# (documented as a BLOCKING GAP against find_references_to, item fea654f9).
+# This test builds a document with NO native w14:paraId anywhere, discovers
+# ids the same way a real caller must (via document_outline), and confirms
+# the whole move_section call -- including the find_references_to gate --
+# succeeds using only synth ids.
+# ---------------------------------------------------------------------------
+
+_NO_NATIVE_IDS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>Intro body paragraph.</w:t></w:r></w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Setup</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+      <w:bookmarkStart w:id="0" w:name="_Ref100000001"/>
+      <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
+      <w:fldSimple w:instr="SEQ Figure \\* ARABIC"><w:r><w:t>1</w:t></w:r></w:fldSimple>
+      <w:bookmarkEnd w:id="0"/>
+      <w:r><w:t xml:space="preserve">. The setup figure.</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Conclusion</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>Conclusion body paragraph.</w:t></w:r></w:p>
+    <w:p>
+      <w:r><w:t xml:space="preserve">External mention of </w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> REF _Ref100000001 \\h </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t xml:space="preserve">Figure 1</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:t xml:space="preserve">.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def test_move_section_resolves_synth_ids_no_native_paraid_in_document(tmp_path):
+    path = _write_docx(tmp_path, _NO_NATIVE_IDS_XML, name="no_native_ids.docx")
+
+    # No paragraph anywhere has a native w14:paraId -- confirm the fixture is
+    # honest about that before relying on it.
+    _raw0, root0 = docs_intel._load_docx_xml_stdlib(path)
+    assert not any(
+        p.get(docs_intel._q(_W14, "paraId")) for p in root0.iter(docs_intel._q(_W, "p"))
+    )
+
+    # Discover ids the way a REAL caller with a live structural index would:
+    # via index_docx_structure/get_local_structure_elements (the docx_headings
+    # sidecar table, populated from document_content_tree) -- this is what
+    # emits "sp<hash>" ids for headings, as opposed to parse_docx/
+    # document_outline's older "p{N}" positional fallback (which also works,
+    # but exercises a different, already-well-covered id scheme -- see the
+    # p{N}-based tests above). e2ae4c91 documented this exact id-scheme split
+    # between docx_paragraphs (p{N}) and docx_headings (sp<hash>).
+    index_db_path = str(tmp_path / "structure_index.sqlite3")
+    docs_intel.index_docx_structure(path, index_db_path)
+    elements = docs_intel.get_local_structure_elements(index_db_path)
+    headings_by_text = {h["text"]: h["para_id"] for h in elements["headings"]}
+    setup_id = headings_by_text["Setup"]
+    conclusion_id = headings_by_text["Conclusion"]
+    assert setup_id.startswith("sp") and conclusion_id.startswith("sp")
+
+    result = docs_intel.move_section(path, setup_id, conclusion_id, destination_position="before")
+    assert result["status"] == "moved"
+    assert result["moved_block_count"] == 2  # Setup heading + its Figure caption
+
+    # The pre-move find_references_to(section_id) gate ran and resolved
+    # cleanly (not an id-resolution error) -- it just found nothing pointing
+    # at the SECTION'S OWN heading (as opposed to its caption's bookmark,
+    # which is a separate, external, untouched reference).
+    assert "error" not in result["find_references_to"]
+
+    # The external REF (outside the moved section, pointing at the caption's
+    # bookmark) is untouched and still resolves -- confirmed independently.
+    refs = docs_intel.find_references_to(path, "_Ref100000001")
+    assert "error" not in refs
+    assert refs["reference_count"] == 1
+
+    outline_after = docs_intel.document_outline(path)
+    order = [h["text"] for h in outline_after["headings"]]
+    assert order == ["Introduction", "Setup", "Conclusion"]
 
 
 # ---------------------------------------------------------------------------
@@ -577,3 +955,328 @@ def test_copy_section_unknown_section_errors(tmp_path):
     path = _write_docx(tmp_path, _TWO_SECTION_XML)
     result = docs_intel.copy_section(path, "NOPE", "H0000001")
     assert "error" in result
+
+
+def test_copy_section_trim_original_to_leaves_pointer(tmp_path):
+    """8213050a -- trim_original_to duplicates the section at the destination
+    AND replaces the ORIGINAL location's body with a short pointer, keeping
+    the original heading (and its bookmark/section_id) intact."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+
+    # Copy "Introduction" (H0000001 + its one body paragraph) to the very end
+    # of the document (destination_position="after" a heading anchor resolves
+    # to after that heading's WHOLE section -- Conclusion is the last section,
+    # so this lands the copy at the tail), trimming the original in place.
+    result = docs_intel.copy_section(
+        path,
+        "H0000001",
+        "H0000004",
+        destination_position="after",
+        trim_original_to="See Introduction (copied to the end) below.",
+    )
+    assert result["status"] == "copied"
+    assert result["trimmed_original"] is True
+    assert result["copied_block_count"] == 2  # heading + its one body paragraph
+
+    paras = docs_intel.parse_docx(path)
+    ids = [p["para_id"] for p in paras]
+    by_id = {p["para_id"]: p for p in paras}
+
+    # Original heading is preserved (section_id still resolvable).
+    assert "H0000001" in ids
+    # Original body paragraph was REMOVED (not just moved -- it lived only in
+    # the trimmed range, and the copy's body paragraph got its own fresh id).
+    assert "P0000001" not in ids
+    assert "P0000001" in result["para_id_map"]
+
+    # The trimmed original's very next paragraph is the pointer text.
+    intro_idx = ids.index("H0000001")
+    assert by_id[ids[intro_idx + 1]]["text"] == "See Introduction (copied to the end) below."
+
+    # The copy landed at the tail, after Conclusion's own body.
+    outline = docs_intel.document_outline(path)
+    headings = [h["text"] for h in outline["headings"]]
+    assert headings == ["Introduction", "Results", "Sub-results", "Conclusion", "Introduction"]
+
+    copy_heading_id = result["new_heading_para_id"]
+    assert copy_heading_id != "H0000001"
+    copy_idx = ids.index(copy_heading_id)
+    assert by_id[ids[copy_idx + 1]]["text"] == "Intro body paragraph."
+    # Copy is the last content in the document.
+    assert copy_idx + 1 == len(ids) - 1
+
+
+def test_copy_section_trim_original_to_rejects_destination_inside_section(tmp_path):
+    """trim_original_to implies a real removal from the original location, so
+    (unlike a plain untouched copy) the destination must resolve OUTSIDE the
+    section being copied -- mirrors move_section's own invariant."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    result = docs_intel.copy_section(
+        path,
+        "H0000002",
+        "H0000003",
+        destination_position="before",
+        trim_original_to="Moved elsewhere.",
+    )
+    assert "error" in result
+    assert "INSIDE" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# 48daaf66 -- copy_section: reuse move_section's fixed anchor logic
+# (027b7ada) and pre-write reference check (e87b8338); optional
+# trim_original_to.
+# ---------------------------------------------------------------------------
+
+
+def test_copy_section_after_heading_anchor_does_not_swallow_dest_section(tmp_path):
+    """48daaf66/027b7ada: destination_anchor_para_id anchored on a HEADING
+    with destination_position="after" must land the copy after the
+    destination heading's WHOLE section, not immediately after the heading
+    paragraph -- otherwise the copied-in heading would silently re-parent
+    the destination section's own body paragraph underneath it."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+
+    result = docs_intel.copy_section(path, "H0000001", "H0000004", destination_position="after")
+    assert result["status"] == "copied"
+
+    conclusion = docs_intel.get_section_content(path, "H0000004")
+    conclusion_texts = [b["text"] for b in conclusion["blocks"] if b["kind"] == "paragraph"]
+    assert conclusion_texts == ["Conclusion body paragraph."]
+
+    paras = docs_intel.parse_docx(path)
+    order = [p["para_id"] for p in paras]
+    assert order.index("P0000004") < order.index(result["new_heading_para_id"])
+    assert order[-2:] == [result["new_heading_para_id"], result["para_id_map"]["P0000001"]]
+    # Original Introduction section must still be intact and untouched.
+    assert "H0000001" in order and "P0000001" in order
+
+
+def test_copy_section_includes_find_references_to_and_trimmed_original_false(tmp_path):
+    """48daaf66: result must carry find_references_to (the new pre-write
+    check) and trimmed_original=False when trim_original_to is not given."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    result = docs_intel.copy_section(path, "H0000001", "H0000002", destination_position="before")
+    assert result["status"] == "copied"
+    assert "find_references_to" in result
+    assert "error" not in result["find_references_to"]
+    assert result["trimmed_original"] is False
+
+
+def test_copy_section_gates_before_write_on_bookmark_split_when_trimming(tmp_path):
+    """48daaf66/e87b8338: trimming the original away must abort (file
+    untouched) if a bookmark spans INTO the section being trimmed."""
+    path = _write_docx(tmp_path, _SPLIT_BOOKMARK_XML, name="split_copy.docx")
+    with open(path, "rb") as fh:
+        original_bytes = fh.read()
+
+    result = docs_intel.copy_section(
+        path, "H0000001", "P0000003", destination_position="after",
+        trim_original_to="See below.",
+    )
+    assert "error" in result
+    assert result["split_bookmarks"] == ["_Ref999999999"]
+
+    with open(path, "rb") as fh:
+        assert fh.read() == original_bytes, (
+            "file was mutated despite the gate rejecting the trim"
+        )
+
+
+def test_copy_section_trim_original_replaces_body_keeps_heading(tmp_path):
+    """48daaf66: trim_original_to replaces the ORIGINAL section's body with a
+    single placeholder paragraph, but keeps the heading itself (and
+    therefore section_id / its bookmark) intact -- and the copy at the
+    destination is unaffected."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+
+    result = docs_intel.copy_section(
+        path, "H0000002", "H0000004", destination_position="after",
+        trim_original_to="Moved to Conclusion, see there.",
+    )
+    assert result["status"] == "copied"
+    assert result["trimmed_original"] is True
+    assert result["copied_block_count"] == 4  # heading + body + sub-heading + sub-body
+
+    # Original location: heading preserved, body replaced by ONE placeholder.
+    original = docs_intel.get_section_content(path, "H0000002")
+    assert original["heading_text"] == "Results"
+    original_texts = [b["text"] for b in original["blocks"]]
+    assert original_texts == ["Results", "Moved to Conclusion, see there."]
+
+    # The copy landed intact at the destination with fresh ids.
+    paras = docs_intel.parse_docx(path)
+    by_id = {p["para_id"]: p for p in paras}
+    copy_heading_id = result["new_heading_para_id"]
+    assert by_id[copy_heading_id]["text"] == "Results"
+    order = [p["para_id"] for p in paras]
+    copy_start = order.index(copy_heading_id)
+    assert [by_id[pid]["text"] for pid in order[copy_start:copy_start + 4]] == [
+        "Results", "Results body paragraph.", "Sub-results", "Sub-results body paragraph.",
+    ]
+
+
+def test_copy_section_trim_rejects_destination_inside_original_section(tmp_path):
+    """48daaf66: when trim_original_to is set, destination_anchor_para_id
+    falling inside the section being trimmed must be rejected (mirrors
+    move_section's own invariant) -- otherwise the trim step would delete
+    the copy this same call just inserted."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    result = docs_intel.copy_section(
+        path, "H0000002", "P0000002", destination_position="after",
+        trim_original_to="See elsewhere.",
+    )
+    assert "error" in result
+    assert "INSIDE" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# 75da13f0 -- structure-aware verification of move_section/copy_section on a
+# REALISTIC mixed-id document: real headings, a real figure caption, a mix of
+# native w14:paraId, synth-map sp<hash> (via _build_synth_id_map), and no-id
+# paragraphs. Unit tests alone (every fixture above uses a native id on EVERY
+# paragraph) missed the original id-scheme bug (7600db1c) -- only a
+# structure-aware check that actually resolves synth ids the way a real
+# caller would (via document_content_tree, not hand-computed hashes) catches
+# it. Scratch documents only, never the real OneDrive/thesis file.
+# ---------------------------------------------------------------------------
+
+_MIXED_ID_SCHEME_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="H0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>Intro body paragraph with no native id at all.</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Results</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+      <w:bookmarkStart w:id="0" w:name="_Ref200000001"/>
+      <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
+      <w:fldSimple w:instr="SEQ Figure \\* ARABIC"><w:r><w:t>1</w:t></w:r></w:fldSimple>
+      <w:bookmarkEnd w:id="0"/>
+      <w:r><w:t xml:space="preserve">. The results figure, no native id.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000002">
+      <w:r><w:t>Results body paragraph WITH a native id.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="H0000004">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Conclusion</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>Conclusion body paragraph, no native id at all.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def _synth_id_for_text(path: str, text: str) -> str:
+    """Look up a paragraph's REAL para_id (native or synth) the way a real
+    caller would: via document_content_tree, never by hand-computing the
+    synth hash. Fails loudly if the text isn't found or is ambiguous, so a
+    test bug can't silently pass."""
+    from meridian_docs._vendored_content_tree import document_content_tree
+
+    matches = [b["para_id"] for b in document_content_tree(path)["blocks"] if b["text"] == text]
+    assert len(matches) == 1, f"expected exactly one block with text {text!r}, got {matches}"
+    return matches[0]
+
+
+def test_synth_ids_actually_differ_from_native_ids_in_fixture(tmp_path):
+    """Sanity check on the fixture itself: the no-native-id paragraphs must
+    really resolve to sp<hash> synth ids (not p{N} legacy ids), proving this
+    fixture actually exercises the synth-id path 7600db1c fixed -- otherwise
+    the rest of this test class would be exercising nothing new."""
+    path = _write_docx(tmp_path, _MIXED_ID_SCHEME_XML, name="mixed.docx")
+    results_heading_id = _synth_id_for_text(path, "Results")
+    assert results_heading_id.startswith("sp"), (
+        f"expected a synth sp<hash> id for the no-native-id 'Results' heading, "
+        f"got {results_heading_id!r}"
+    )
+
+
+def test_get_section_content_resolves_synth_id_heading(tmp_path):
+    """75da13f0: a heading with NO native w14:paraId (real-world common case
+    -- Word doesn't assign one to every paragraph) must resolve via its
+    synth id exactly as a native-id heading would."""
+    path = _write_docx(tmp_path, _MIXED_ID_SCHEME_XML, name="mixed.docx")
+    results_heading_id = _synth_id_for_text(path, "Results")
+
+    result = docs_intel.get_section_content(path, results_heading_id)
+    assert "error" not in result, f"synth id lookup failed: {result}"
+    assert result["heading_text"] == "Results"
+    assert result["paragraph_count"] == 3  # heading + caption + native-id body para
+
+
+def test_move_section_resolves_synth_id_section_and_destination(tmp_path):
+    """75da13f0: move_section must resolve BOTH section_id and
+    destination_anchor_para_id via synth id, mirroring real usage where a
+    caller reads ids from get_section_content/document_content_tree rather
+    than a document where every paragraph happens to carry a native id."""
+    path = _write_docx(tmp_path, _MIXED_ID_SCHEME_XML, name="mixed.docx")
+    results_heading_id = _synth_id_for_text(path, "Results")
+    conclusion_body_id = _synth_id_for_text(
+        path, "Conclusion body paragraph, no native id at all."
+    )
+
+    result = docs_intel.move_section(
+        path, results_heading_id, conclusion_body_id, destination_position="after"
+    )
+    assert "error" not in result, f"move_section failed on synth ids: {result}"
+    assert result["status"] == "moved"
+
+    # Confirm the section actually moved (Results now after Conclusion).
+    paras = docs_intel.parse_docx(path)
+    order = [p["text"] for p in paras]
+    assert order.index("Conclusion body paragraph, no native id at all.") < order.index("Results")
+
+
+def test_copy_section_resolves_synth_id_section_and_destination(tmp_path):
+    """75da13f0: copy_section must resolve BOTH section_id and
+    destination_anchor_para_id via synth id too."""
+    path = _write_docx(tmp_path, _MIXED_ID_SCHEME_XML, name="mixed.docx")
+    results_heading_id = _synth_id_for_text(path, "Results")
+
+    result = docs_intel.copy_section(
+        path, results_heading_id, "H0000001", destination_position="before"
+    )
+    assert "error" not in result, f"copy_section failed on synth ids: {result}"
+    assert result["status"] == "copied"
+
+    # The original (synth-id) section must still resolve after the copy.
+    still_there = docs_intel.get_section_content(path, results_heading_id)
+    assert "error" not in still_there, (
+        f"original synth-id section no longer resolves after copy: {still_there}"
+    )
+    assert still_there["heading_text"] == "Results"
+
+
+def test_move_section_after_synth_id_heading_anchor_does_not_swallow_dest_section(tmp_path):
+    """75da13f0 + 027b7ada combined: the heading-anchor-after fix must also
+    work when the DESTINATION anchor itself is a synth-id (no native id)
+    heading, not just when it's a native-id one (the only case the earlier
+    027b7ada-specific unit test covered)."""
+    path = _write_docx(tmp_path, _MIXED_ID_SCHEME_XML, name="mixed.docx")
+    conclusion_synth_id = _synth_id_for_text(path, "Conclusion")
+    intro_native_id = "H0000001"
+
+    result = docs_intel.move_section(
+        path, intro_native_id, conclusion_synth_id, destination_position="after"
+    )
+    assert "error" not in result, f"move_section failed: {result}"
+
+    # Conclusion's own body paragraph must not have been swallowed/re-parented.
+    conclusion = docs_intel.get_section_content(path, conclusion_synth_id)
+    conclusion_texts = [b["text"] for b in conclusion["blocks"] if b["kind"] == "paragraph"]
+    assert conclusion_texts == ["Conclusion body paragraph, no native id at all."]

@@ -1178,10 +1178,34 @@ def _find_para_by_id(
 ) -> tuple[ET.Element, ET.Element, int] | None:
     """Return ``(body, paragraph_element, body_child_index)`` for the given para_id.
 
-    Searches the body's direct children by ``w14:paraId`` attribute first, then
-    by synthesised ``p{N}`` index (counting every ``<w:p>`` in document order
-    including those inside tables). Returns ``None`` when not found.
+    7600db1c -- resolution order matches the same three id schemes
+    :func:`_vendored_content_tree.document_content_tree` (and therefore
+    :func:`get_section_content`, :func:`document_outline`,
+    :func:`parse_document`) already resolve paragraphs by, so any id those
+    functions hand back to a caller resolves correctly here too:
 
+      1. Native ``w14:paraId`` (Word-assigned, 8 hex digits).
+      2. Synthesized ``sp<hash>`` id from
+         :func:`_vendored_content_tree._build_synth_id_map` -- the stable,
+         content-derived id emitted for any direct-body-child paragraph that
+         lacks a native id. This is the id real documents actually carry for
+         almost all figure/table captions and most headings (Word does not
+         assign w14:paraId to every paragraph), so resolving it here is what
+         makes every one of this helper's 17 call sites (insert_caption,
+         insert_cross_reference, insert_equation_local, write_section,
+         move_section, copy_section, find_references_to, etc.) work on real
+         documents instead of only on synthetic fixtures built with native
+         ids on every paragraph.
+      3. The old positional ``p{N}`` fallback (kept for backward
+         compatibility with any caller still passing it; ``N`` counts every
+         ``<w:p>`` in document order, including inside tables).
+
+    Only schemes 1 and 3 apply to paragraphs inside tables -- like
+    ``document_content_tree``, the synth-id map is built over direct body
+    children only (table-cell paragraphs are not part of the
+    heading-path/synth-id scheme).
+
+    Returns ``None`` when ``para_id`` matches none of the three schemes.
     The ``body_child_index`` is the index of the direct body child that contains
     or IS the matching paragraph — callers use it for before/after insertion.
     """
@@ -1190,20 +1214,31 @@ def _find_para_by_id(
         return None
     w_p = _q(_W, "p")
     w14_para_id = _q(_W14, "paraId")
+
+    from ._vendored_content_tree import _build_synth_id_map  # noqa: PLC0415
+
+    synth_map = _build_synth_id_map(body)
+
     global_p_idx = 0
     for child_idx, child in enumerate(list(body)):
         if child.tag == w_p:
             real_id = child.get(w14_para_id)
-            synth_id = f"p{global_p_idx}"
-            if real_id == para_id or synth_id == para_id:
+            synth_id = synth_map.get(id(child))
+            legacy_id = f"p{global_p_idx}"
+            if (
+                real_id == para_id
+                or (synth_id is not None and synth_id == para_id)
+                or legacy_id == para_id
+            ):
                 return body, child, child_idx
             global_p_idx += 1
         else:
-            # Walk into tables to find paragraphs inside cells.
+            # Walk into tables to find paragraphs inside cells. No synth id
+            # applies here (see docstring) -- only native and legacy ids.
             for p in child.iter(w_p):
                 real_id = p.get(w14_para_id)
-                synth_id = f"p{global_p_idx}"
-                if real_id == para_id or synth_id == para_id:
+                legacy_id = f"p{global_p_idx}"
+                if real_id == para_id or legacy_id == para_id:
                     # Paragraph is inside a table; body_child_index points at
                     # the table so callers can insert relative to it.
                     return body, p, child_idx
@@ -4592,6 +4627,16 @@ def _locate_section_bounds(
     caller can cut/move/copy the exact same elements afterward without a
     second parse losing paraId/bookmark identity.
 
+    6822b142 -- ``heading_id`` is resolved with the same three id schemes as
+    :func:`_find_para_by_id` (native ``w14:paraId``, synthesized ``sp<hash>``
+    via :func:`_vendored_content_tree._build_synth_id_map`, legacy ``p{N}``):
+    this function has its own inline id-matching loop (it needs the live
+    ``body`` element and heading level/text as it walks, which
+    ``_find_para_by_id`` doesn't return), so it needs the same fix
+    independently -- headings identified by a caller via their synth id
+    (i.e. almost every real heading) would otherwise fail to resolve here
+    even after ``_find_para_by_id`` learned about synth ids.
+
     Returns ``None`` when no heading paragraph with that para_id is found.
     """
     body_list = list(body)
@@ -4602,6 +4647,10 @@ def _locate_section_bounds(
     w_val = _q(_W, "val")
     w_t = _q(_W, "t")
     w14_paraId = _q(_W14, "paraId")
+
+    from ._vendored_content_tree import _build_synth_id_map  # noqa: PLC0415
+
+    synth_map = _build_synth_id_map(body)
 
     def _style_of(p: ET.Element) -> str | None:
         ppr = p.find(w_pPr)
@@ -4622,7 +4671,8 @@ def _locate_section_bounds(
             continue
         if child.tag == w_p:
             real_id = child.get(w14_paraId)
-            pid = real_id or f"p{global_p_idx}"
+            synth_id = synth_map.get(id(child))
+            pid = real_id or synth_id or f"p{global_p_idx}"
             style = _style_of(child)
             if start_idx is None:
                 if pid == heading_id and _is_heading(style):
@@ -5380,8 +5430,27 @@ def write_section(
         heading_text:   Text of the new section's heading.
         level:          Heading level (1 = Heading1, 2 = Heading2, ...).
         content_spec:   Ordered list of block specs (see above).
-        anchor_para_id: w14:paraId (or p{N}) of the paragraph/table to anchor on.
+        anchor_para_id: w14:paraId (or synthesized/legacy id, same schemes
+                        :func:`_find_para_by_id` accepts) of the paragraph/
+                        table/heading to anchor on.
         position:       "before" or "after" (default) the anchor.
+
+                        6822b142 -- when ``anchor_para_id`` is itself a
+                        HEADING paragraph and ``position="after"``, this
+                        lands the new section after that heading's ENTIRE
+                        existing section (its own body paragraphs and any
+                        subsections), not immediately after the heading
+                        paragraph itself. A literal "next body child" splice
+                        there would insert the new section's heading between
+                        the anchor heading and its own body, which silently
+                        re-parents that pre-existing content under the new
+                        heading on the next read (sections are delimited by
+                        document order + heading level, not authorship) --
+                        i.e. it would look like the anchor heading's content
+                        had vanished. There is no ambiguity for "before" (an
+                        anchor heading, or any other anchor kind) or for
+                        "after" a non-heading anchor -- both remain a literal
+                        splice at that exact position.
         index_db_path:  If supplied, sidecar is invalidated after the write.
 
     Returns:
@@ -5431,6 +5500,21 @@ def write_section(
     if result is None:
         return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
     body, _anchor_elem, child_idx = result
+
+    # 6822b142 -- resolve "after this section" semantics when anchor_para_id
+    # is itself a heading. A literal child_idx + 1 splice would land the new
+    # section between the anchor heading and that heading's OWN body/
+    # subsections, which silently re-parents that pre-existing content under
+    # the newly-inserted heading on the very next read (get_section_content /
+    # document_content_tree group body blocks by the nearest PRECEDING
+    # heading in document order, not by who authored them) -- i.e. from the
+    # anchor heading's perspective its own content just vanished. Anchoring
+    # "before" a heading has no such ambiguity (nothing of the anchor's own
+    # is between "before it" and the heading itself), so it is unchanged.
+    # _locate_section_bounds only matches when anchor_para_id resolves to a
+    # HEADING paragraph (returns None otherwise), so this is a safe no-op for
+    # every other anchor kind (plain paragraph, caption, table).
+    section_bounds = _locate_section_bounds(body, anchor_para_id) if position == "after" else None
 
     taken_ids = _existing_para_ids(root)
 
@@ -5549,7 +5633,17 @@ def write_section(
                 "ref_bookmark": ref_bookmark,
             })
 
-    insert_at = child_idx if position == "before" else child_idx + 1
+    if position == "before":
+        insert_at = child_idx
+    elif section_bounds is not None:
+        # anchor_para_id is a heading -- land after its entire section
+        # (including any subsections), not right after the heading paragraph
+        # itself. See the section_bounds comment above for why the literal
+        # child_idx + 1 splice is unsafe here.
+        _anchor_start_idx, anchor_end_idx, _anchor_heading_text, _anchor_level = section_bounds
+        insert_at = anchor_end_idx
+    else:
+        insert_at = child_idx + 1
     for offset, el in enumerate(new_elements):
         body.insert(insert_at + offset, el)
 
@@ -5574,12 +5668,66 @@ def write_section(
 # Public API 7/9: move_section (6ff24136)
 # ---------------------------------------------------------------------------
 
+def _bookmarks_split_by_range(
+    body_list: list[ET.Element], start_idx: int, end_idx: int
+) -> list[str]:
+    """e87b8338 -- names of any bookmark whose ``w:bookmarkStart``/
+    ``w:bookmarkEnd`` pair would end up on OPPOSITE sides of the
+    ``[start_idx, end_idx)`` body-child boundary.
+
+    A Word bookmark can validly span multiple paragraphs (bookmarkStart in
+    one paragraph, bookmarkEnd many paragraphs later) -- e.g. a manually
+    bookmarked range covering a heading plus some of its neighbours. Moving
+    exactly the ``[start_idx, end_idx)`` slice while leaving the rest of the
+    document in place would tear such a bookmark's start and end apart into
+    two disconnected locations, which is the one thing about a move that is
+    genuinely, structurally broken (as opposed to REF/PAGEREF/NOTEREF fields
+    targeting a bookmark by name, which stay valid regardless of where in
+    the document the bookmark now lives).
+
+    ``w:id`` (not ``w:name`` -- ``bookmarkEnd`` carries no name) pairs each
+    bookmarkStart with its bookmarkEnd; ``w:id`` is only required to be
+    unique within one bookmarkStart/bookmarkEnd pair, so this pairs by id
+    within the whole document, matching how Word itself resolves the range.
+    """
+    w_bookmarkStart = _q(_W, "bookmarkStart")
+    w_bookmarkEnd = _q(_W, "bookmarkEnd")
+    w_id = _q(_W, "id")
+    w_name = _q(_W, "name")
+
+    start_positions: dict[str, int] = {}
+    end_positions: dict[str, int] = {}
+    names: dict[str, str] = {}
+    for idx, child in enumerate(body_list):
+        for bm in child.iter(w_bookmarkStart):
+            bm_id = bm.get(w_id)
+            if bm_id is not None:
+                start_positions[bm_id] = idx
+                names[bm_id] = bm.get(w_name) or bm_id
+        for bm in child.iter(w_bookmarkEnd):
+            bm_id = bm.get(w_id)
+            if bm_id is not None:
+                end_positions[bm_id] = idx
+
+    split_names: list[str] = []
+    for bm_id, s_idx in start_positions.items():
+        e_idx = end_positions.get(bm_id)
+        if e_idx is None:
+            continue  # unmatched bookmarkStart -- not this check's concern
+        s_inside = start_idx <= s_idx < end_idx
+        e_inside = start_idx <= e_idx < end_idx
+        if s_inside != e_inside:
+            split_names.append(names[bm_id])
+    return split_names
+
+
 def move_section(
     docx_path: str,
     section_id: str,
     destination_anchor_para_id: str,
     destination_position: str = "after",
     index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
 ) -> dict[str, Any]:
     """6ff24136 -- move an existing section (heading + its content) to a new
     location in the document.
@@ -5593,26 +5741,60 @@ def move_section(
     original name -- existing cross-references INTO the moved section stay
     valid (they don't care where in the document their target lives).
 
-    After the move, this calls :func:`renumber_sequences` (the move may have
-    reordered Figure/Table captions relative to each other) and
-    :func:`find_references_to` for ``section_id`` itself (in case something
-    elsewhere references the section's own heading) -- exactly the two
-    follow-up checks the sprint note calls for, run automatically rather
-    than left to the caller to remember.
+    e87b8338 -- the reference-safety check runs and GATES the operation
+    BEFORE anything is cut/spliced/saved, not after: this used to call
+    :func:`find_references_to` for ``section_id`` only after the mutated
+    document was already written to disk, which made it a post-hoc report
+    that could not actually prevent anything -- by the time a problem was
+    visible, it was already permanent. Now, before any mutation:
+      1. :func:`find_references_to` for ``section_id`` runs against the
+         still-intact file (same info either way -- REF/PAGEREF/NOTEREF
+         fields resolve by bookmark name, unaffected by the section's
+         position -- but a failure here now aborts cleanly with the file
+         untouched instead of surfacing after the write).
+      2. :func:`_bookmarks_split_by_range` checks whether the move would tear
+         apart any bookmark that spans the ``[start_idx, end_idx)`` boundary
+         (start inside the moved section, end outside, or vice versa) --
+         this IS a genuinely broken bookmark (REF-by-name safety does not
+         cover it). If any are found, the move is aborted with a clear error
+         UNLESS the caller passes ``allow_bookmark_split=True``.
+
+    :func:`renumber_sequences` still runs AFTER the write (it must -- it
+    reads the moved document's new SEQ ordering from disk) -- that part of
+    the post-move follow-up is unchanged.
 
     Args:
         docx_path:                   Absolute path to the .docx file
                                       (mutated in place).
         section_id:                  w14:paraId (or p{N}) of the section's
                                       OWN heading paragraph.
-        destination_anchor_para_id:  w14:paraId (or p{N}) of the paragraph/
-                                      table to move the section next to.
-                                      Must be OUTSIDE the section being moved.
+        destination_anchor_para_id:  w14:paraId (or synthesized/legacy id,
+                                      same schemes :func:`_find_para_by_id`
+                                      accepts) of the paragraph/table/heading
+                                      to move the section next to. Must be
+                                      OUTSIDE the section being moved.
         destination_position:        "before" or "after" (default) the
                                       destination anchor.
+
+                                      027b7ada -- when
+                                      destination_anchor_para_id is itself a
+                                      HEADING and destination_position is
+                                      "after", the moved section lands after
+                                      that heading's ENTIRE section (its own
+                                      body + subsections), not immediately
+                                      after the heading paragraph -- same
+                                      "after this section" fix as
+                                      write_section (6822b142), for the same
+                                      re-parenting reason. "before" and
+                                      "after" a non-heading anchor are an
+                                      unchanged literal splice.
         index_db_path:                If supplied, sidecar is invalidated
                                       (and threaded into the renumber_sequences
                                       call) after the write.
+        allow_bookmark_split:         Explicit override (default ``False``)
+                                      to proceed even when the move would
+                                      split a bookmark's start/end across the
+                                      move boundary (see e87b8338 above).
 
     Returns:
         ``{status, section_id, heading_text, moved_block_count,
@@ -5621,8 +5803,9 @@ def move_section(
 
         ``{"error": <message>}`` when ``section_id`` /
         ``destination_anchor_para_id`` can't be resolved, the destination
-        falls inside the section being moved, or the write fails (file NOT
-        mutated on error).
+        falls inside the section being moved, the move would split a
+        bookmark (and ``allow_bookmark_split`` is not set), or the write
+        fails (file NOT mutated on error in every one of these cases).
     """
     if destination_position not in ("before", "after"):
         return {
@@ -5663,7 +5846,46 @@ def move_section(
             )
         }
 
+    # 027b7ada -- same "after this section" fix as write_section (6822b142):
+    # when the destination anchor is itself a heading and
+    # destination_position is "after", resolve to after that heading's WHOLE
+    # section (its own body + subsections), not a literal next-body-child
+    # splice -- otherwise the just-moved section's heading would land between
+    # the destination heading and its own body, silently re-parenting that
+    # pre-existing content. _locate_section_bounds only matches when
+    # destination_anchor_para_id resolves to a heading (None otherwise), so
+    # this is a no-op for every other destination anchor kind.
+    dest_section_bounds = (
+        _locate_section_bounds(body, destination_anchor_para_id)
+        if destination_position == "after"
+        else None
+    )
+
+    # e87b8338 -- reference-safety check(s) run and GATE here, BEFORE any
+    # mutation. Nothing has been cut, spliced, or saved yet at this point.
+    references_result = find_references_to(docx_path, section_id)
+    if "error" in references_result:
+        return {
+            "error": (
+                "aborting move_section: pre-move find_references_to check "
+                f"failed: {references_result['error']}"
+            )
+        }
+
     body_list = list(body)
+    split_bookmarks = _bookmarks_split_by_range(body_list, start_idx, end_idx)
+    if split_bookmarks and not allow_bookmark_split:
+        return {
+            "error": (
+                f"aborting move_section: moving section {section_id!r} would "
+                f"split bookmark(s) {split_bookmarks!r} across the move "
+                "boundary (their w:bookmarkStart and w:bookmarkEnd would end "
+                "up in two disconnected parts of the document) -- pass "
+                "allow_bookmark_split=True to force the move anyway"
+            ),
+            "split_bookmarks": split_bookmarks,
+        }
+
     moved_elements = body_list[start_idx:end_idx]
     removed_count = end_idx - start_idx
 
@@ -5676,9 +5898,25 @@ def move_section(
     # document shifts every later paragraph's synthetic id, so re-searching
     # for the OLD literal string post-removal could silently match the wrong
     # paragraph (or none). Arithmetic shift sidesteps that entirely.
-    dest_idx_after = dest_idx - removed_count if dest_idx >= end_idx else dest_idx
+    def _shift(idx: int) -> int:
+        if idx >= end_idx:
+            return idx - removed_count
+        if idx >= start_idx:
+            # Only reachable for dest_section_bounds' end_idx, when the
+            # destination heading's OWN section extends up to/into the
+            # section being moved (e.g. moving a subsection to "after" its
+            # own parent heading) -- the parent's content now ends exactly
+            # where the removed range used to start.
+            return start_idx
+        return idx
 
-    insert_at = dest_idx_after if destination_position == "before" else dest_idx_after + 1
+    dest_idx_after = _shift(dest_idx)
+
+    if dest_section_bounds is not None:
+        _dest_start_idx, dest_end_idx, _dest_heading_text, _dest_level = dest_section_bounds
+        insert_at = _shift(dest_end_idx)
+    else:
+        insert_at = dest_idx_after if destination_position == "before" else dest_idx_after + 1
     for offset, el in enumerate(moved_elements):
         body.insert(insert_at + offset, el)
 
@@ -5690,7 +5928,6 @@ def move_section(
     _invalidate_sidecar_mtime(index_db_path)
 
     renumber_result = renumber_sequences(docx_path, index_db_path=index_db_path)
-    references_result = find_references_to(docx_path, section_id)
 
     return {
         "status": "moved",
@@ -5715,9 +5952,11 @@ def copy_section(
     destination_anchor_para_id: str,
     destination_position: str = "after",
     index_db_path: str | None = None,
+    trim_original_to: str | None = None,
 ) -> dict[str, Any]:
     """8213050a -- duplicate an existing section (heading + its content) to a
-    new location in the document, leaving the original untouched.
+    new location in the document, leaving the original untouched (unless
+    ``trim_original_to`` is given -- see below).
 
     Same section-boundary rule as :func:`move_section`
     (:func:`_locate_section_bounds`), but deep-COPIES the range instead of
@@ -5744,6 +5983,38 @@ def copy_section(
         range is left pointing at the original (shared) target, since that
         target was not duplicated.
 
+    48daaf66 -- ``destination_position="after"`` onto a HEADING anchor
+    resolves to after that heading's ENTIRE section (own body + subsections),
+    not a literal next-body-child splice -- the exact same fix
+    :func:`move_section` got in 027b7ada, reusing the same
+    :func:`_locate_section_bounds` call rather than reimplementing it.
+
+    48daaf66 -- a pre-write reference-safety check runs BEFORE any mutation,
+    reusing the same two checks :func:`move_section` runs (e87b8338):
+    :func:`find_references_to` for ``section_id`` (aborts cleanly, file
+    untouched, if it fails) and -- only when ``trim_original_to`` makes this
+    a real removal from the original location -- :func:`_bookmarks_split_by_range`
+    over the range that would be trimmed away.
+
+    ``trim_original_to`` (48daaf66, optional): when given, the ORIGINAL
+    section's body (everything after its heading paragraph, up to
+    ``end_idx``) is replaced with a single short paragraph containing this
+    text -- a "moved to <destination>, see there" pointer/summary -- instead
+    of leaving the original fully untouched. The heading paragraph itself
+    (and therefore ``section_id`` / its bookmark / any existing reference
+    that targets the section BY HEADING) is always preserved. Content that
+    lived in the trimmed body but was never copied anywhere else (e.g. a
+    figure caption with its own bookmark) is genuinely gone from that
+    bookmark name after this -- this is exactly the same class of risk
+    :func:`move_section`'s e87b8338 fix gates on, which is why the same
+    pre-write reference check applies here too. ``destination_anchor_para_id``
+    must resolve OUTSIDE ``[start_idx, end_idx)`` when ``trim_original_to``
+    is set (mirroring :func:`move_section`'s own invariant) -- otherwise the
+    trim step would delete the copy this same call just inserted.
+    The copy is inserted BEFORE the trim runs, so index arithmetic for the
+    trim step accounts for the just-inserted copy the same way
+    :func:`move_section`'s ``_shift`` accounts for its own cut.
+
     :func:`renumber_sequences` is called as the final step (same as
     :func:`move_section`) -- since the copy's SEQ fields start out with the
     SAME cached numbers as the original (deep copy), inserting the copy
@@ -5758,21 +6029,30 @@ def copy_section(
                                       OWN heading paragraph (the ORIGINAL,
                                       not the copy).
         destination_anchor_para_id:  w14:paraId (or p{N}) to copy the section
-                                      next to.
-        destination_position:        "before" or "after" (default).
+                                      next to. Must be OUTSIDE the section
+                                      being copied when ``trim_original_to``
+                                      is set.
+        destination_position:        "before" or "after" (default) the
+                                      destination anchor.
         index_db_path:                If supplied, sidecar is invalidated
                                       (and threaded into renumber_sequences)
                                       after the write.
+        trim_original_to:            Optional replacement text for the
+                                      original section's body (heading kept).
+                                      ``None`` (default) leaves the original
+                                      fully untouched.
 
     Returns:
         ``{status, section_id, heading_text, new_heading_para_id,
         copied_block_count, para_id_map, bookmark_map,
         destination_anchor_para_id, destination_position,
-        renumber_sequences, docx_path}`` -- ``para_id_map`` /
-        ``bookmark_map`` are ``{old: new}`` dicts for every paraId/bookmark
-        that existed in the original section and was renamed in the copy
-        (originals lacking a native paraId aren't keyed in ``para_id_map``,
-        but the copy still gets one -- see ``new_heading_para_id``).
+        renumber_sequences, find_references_to, trimmed_original, docx_path}``
+        -- ``para_id_map`` / ``bookmark_map`` are ``{old: new}`` dicts for
+        every paraId/bookmark that existed in the original section and was
+        renamed in the copy (originals lacking a native paraId aren't keyed
+        in ``para_id_map``, but the copy still gets one -- see
+        ``new_heading_para_id``). ``trimmed_original`` is False when
+        ``trim_original_to`` was not given.
 
         ``{"error": <message>}`` on failure (file NOT mutated on error).
     """
@@ -5807,7 +6087,48 @@ def copy_section(
         return {"error": f"para_id {destination_anchor_para_id!r} not found in {docx_path}"}
     _dbody, _delem, dest_idx = dest_result
 
+    if trim_original_to is not None and start_idx <= dest_idx < end_idx:
+        return {
+            "error": (
+                "destination_anchor_para_id falls INSIDE the section being "
+                f"trimmed (body indices [{start_idx}, {end_idx})); choose an "
+                "anchor outside it, or omit trim_original_to"
+            )
+        }
+
+    # 48daaf66 -- same "after this section" fix as move_section (027b7ada):
+    # resolve a heading anchor + destination_position="after" to after that
+    # heading's WHOLE section, not a literal next-body-child splice.
+    dest_section_bounds = (
+        _locate_section_bounds(body, destination_anchor_para_id)
+        if destination_position == "after"
+        else None
+    )
+
+    # 48daaf66 -- same pre-write reference-safety gate as move_section
+    # (e87b8338): runs and GATES here, BEFORE any mutation.
+    references_result = find_references_to(docx_path, section_id)
+    if "error" in references_result:
+        return {
+            "error": (
+                "aborting copy_section: pre-copy find_references_to check "
+                f"failed: {references_result['error']}"
+            )
+        }
+
     body_list = list(body)
+    if trim_original_to is not None:
+        split_bookmarks = _bookmarks_split_by_range(body_list, start_idx + 1, end_idx)
+        if split_bookmarks:
+            return {
+                "error": (
+                    f"aborting copy_section: trimming section {section_id!r} "
+                    f"would split bookmark(s) {split_bookmarks!r} across the "
+                    "trim boundary"
+                ),
+                "split_bookmarks": split_bookmarks,
+            }
+
     original_elements = body_list[start_idx:end_idx]
     if not original_elements:
         return {"error": f"section {section_id!r} has no content to copy"}
@@ -5872,9 +6193,43 @@ def copy_section(
         copied_elements[0].get(w14_paraId) if copied_elements[0].tag == w_p else None
     )
 
-    insert_at = dest_idx if destination_position == "before" else dest_idx + 1
+    # 48daaf66 -- same "after this section" resolution as move_section
+    # (027b7ada): a heading anchor + "after" lands after that heading's WHOLE
+    # section, not a literal next-body-child splice.
+    if dest_section_bounds is not None:
+        _dest_start_idx, dest_end_idx, _dest_heading_text, _dest_level = dest_section_bounds
+        insert_at = dest_end_idx
+    else:
+        insert_at = dest_idx if destination_position == "before" else dest_idx + 1
+
     for offset, el in enumerate(copied_elements):
         body.insert(insert_at + offset, el)
+
+    # 48daaf66 -- trim_original_to runs AFTER the copy is inserted (not
+    # before): destination_anchor_para_id was already required to resolve
+    # OUTSIDE [start_idx, end_idx) above, so the insertion above only shifts
+    # start_idx/end_idx when it landed AT OR BEFORE start_idx -- the same
+    # arithmetic-shift reasoning move_section's own post-cut _shift relies on,
+    # just for an insert instead of a removal.
+    trimmed = False
+    if trim_original_to is not None:
+        inserted_count = len(copied_elements)
+        shift = inserted_count if insert_at <= start_idx else 0
+        trim_start = start_idx + shift + 1  # keep the heading itself
+        trim_end = end_idx + shift
+        body_list_now = list(body)
+        to_remove = body_list_now[trim_start:trim_end]
+        for el in to_remove:
+            body.remove(el)
+        if trim_original_to:
+            placeholder = ET.Element(_q(_W, "p"))
+            r = ET.SubElement(placeholder, _q(_W, "r"))
+            t = ET.SubElement(r, _q(_W, "t"))
+            t.set(_q(_XML_NS, "space"), "preserve")
+            t.text = trim_original_to
+            placeholder.set(w14_paraId, _new_para_id(taken_ids))
+            body.insert(trim_start, placeholder)
+        trimmed = True
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
@@ -5896,5 +6251,7 @@ def copy_section(
         "destination_anchor_para_id": destination_anchor_para_id,
         "destination_position": destination_position,
         "renumber_sequences": renumber_result,
+        "find_references_to": references_result,
+        "trimmed_original": trimmed,
         "docx_path": docx_path,
     }
