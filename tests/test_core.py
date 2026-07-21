@@ -7571,10 +7571,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_workspace_tool_priority_map",
         "_migrate_pg_sprint_item_github_channel",
         "_migrate_pg_claim_verification_mode",
+        "_migrate_pg_handoff_tokens_consumed_at",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 125
+    assert len(allnames) == len(set(allnames)) == 126
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
