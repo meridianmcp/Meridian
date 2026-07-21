@@ -166,6 +166,10 @@ def classify_outputs(paths: list[str]) -> dict[str, Any]:
                 this_mtime, twin_mtime = entry["mtime"], twin_signal["mtime"]
                 entry["canonical_path"] = guess
                 if this_size is not None and twin_size is not None and this_size != twin_size:
+                    # BUGFIX (found live): content genuinely differs from the
+                    # guessed twin, so this must NOT be flagged archival --
+                    # is_archival correctly stays whatever outputs_local's own
+                    # stage-1/stage-2 check already determined (rec.is_archival).
                     entry["reason"] = (
                         f"broader archival-naming heuristic matched (canonical twin "
                         f"guess '{guess}' present in batch), but sizes differ "
@@ -173,6 +177,12 @@ def classify_outputs(paths: list[str]) -> dict[str, Any]:
                         "differs, not a duplicate"
                     )
                 else:
+                    # BUGFIX (found live): a same-size match against a present
+                    # canonical twin is exactly the case this heuristic exists to
+                    # catch -- entry["is_archival"] was never actually being set
+                    # here, so every match still reported is_archival=False
+                    # despite finding and naming the real canonical twin.
+                    entry["is_archival"] = True
                     relation = "unknown"
                     if this_mtime is not None and twin_mtime is not None:
                         relation = (

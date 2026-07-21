@@ -115,6 +115,65 @@ _IDLE_KILL_SECONDS = 30 * 60
 # the server to re-advertise the slot's tools.
 _SLOT_REPROBE_INTERVAL = 60.0
 
+
+class _TeeStream:
+    """2026-07-19 — mirror writes to the original stream AND a persistent log
+    file, so tunnel diagnostics (watchdog retries, TAR_ENTRY_ERROR detection,
+    spawn failures — everything currently only ever ``print(file=sys.stderr)``)
+    survive even when nobody has a live console attached. Motivated directly by
+    tonight's own investigation: every question about which slot hit which
+    failure had to be reverse-engineered from process timestamps and cache
+    directories, because none of the tunnel's own diagnostic trail was ever
+    persisted anywhere. Never raises — a broken log file must not take down the
+    tunnel's real stdout/stderr.
+    """
+
+    def __init__(self, original, log_file) -> None:
+        self._original = original
+        self._log_file = log_file
+
+    def write(self, data):
+        self._original.write(data)
+        try:
+            self._log_file.write(data)
+            self._log_file.flush()
+        except Exception:  # noqa: BLE001 — logging must never break the tunnel
+            pass
+        return len(data)
+
+    def flush(self) -> None:
+        self._original.flush()
+        try:
+            self._log_file.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _install_tunnel_log_tee() -> None:
+    """Mirror stdout/stderr to ~/.meridian/tunnel.log (append mode, one line
+    header per run) so the watchdog/spawn-retry diagnostics that normally only
+    ever reach an attached console are recoverable after the fact — pairs with
+    1662873f's lightweight log-search tool. Best-effort: any failure to open
+    the log file silently skips teeing rather than blocking tunnel startup.
+    """
+    try:
+        log_dir = Path.home() / ".meridian"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "tunnel.log"
+        log_file = open(log_path, "a", encoding="utf-8", errors="replace")
+        log_file.write(
+            f"\n=== tunnel started {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(pid={os.getpid()}) ===\n"
+        )
+        log_file.flush()
+        sys.stdout = _TeeStream(sys.stdout, log_file)
+        sys.stderr = _TeeStream(sys.stderr, log_file)
+    except Exception:  # noqa: BLE001 — logging must never block tunnel startup
+        pass
+
 # 089a936a — the DEFAULT first-spawn pre-flight probe budget (attempts, delay):
 # attempts=2 × delay=3s with a 10s per-attempt httpx timeout ≈ up to ~23s. Fine
 # for slots whose launcher is already on disk.
@@ -1738,6 +1797,65 @@ def _probe_tar_entry_error(
         return False
 
 
+_stable_cache_env_cache: "dict[str, str] | None" = None
+
+
+def _resolve_stable_cache_env() -> "dict[str, str]":
+    """2026-07-19 — explicitly resolve UV_CACHE_DIR / npm_config_cache from the
+    tunnel's OWN process context, rather than letting each spawned uvx/npx
+    child re-derive its own cache path from its own %LOCALAPPDATA%.
+
+    Confirmed live: when the tunnel's launch chain traces back through Claude
+    Desktop's Windows AppContainer sandbox (Desktop is a genuine Store app —
+    C:\\Program Files\\WindowsApps\\Claude_...), %LOCALAPPDATA% silently
+    virtualizes to Packages\\Claude_*\\LocalCache\\Local\\... for grandchild
+    processes — same uv.exe/uvx.exe binary, genuinely different cache
+    directory underneath it, invisible without inspecting the live process
+    tree. The tunnel process ITSELF is not sandboxed (a plain top-level
+    ``pixi run`` invocation), so resolving here — once, in a context that is
+    actually trustworthy — and handing children an explicit, already-resolved
+    path removes their need to resolve anything themselves. This sidesteps the
+    virtualization mechanism entirely rather than depending on correctly
+    diagnosing every possible inheritance path.
+
+    Best-effort and memoized (computed once per tunnel process lifetime): any
+    resolution failure returns {} (spawns fall back to today's behavior,
+    inheriting the parent env's own — possibly virtualized — resolution)
+    rather than blocking a spawn.
+    """
+    global _stable_cache_env_cache
+    if _stable_cache_env_cache is not None:
+        return _stable_cache_env_cache
+    try:
+        home = Path.home()
+        if sys.platform == "win32":
+            uv_cache = home / "AppData" / "Local" / "uv" / "cache"
+            npm_cache = home / "AppData" / "Local" / "npm-cache"
+        else:
+            uv_cache = home / ".cache" / "uv"
+            npm_cache = home / ".npm"
+        uv_cache.mkdir(parents=True, exist_ok=True)
+        npm_cache.mkdir(parents=True, exist_ok=True)
+        resolved = {"UV_CACHE_DIR": str(uv_cache), "npm_config_cache": str(npm_cache)}
+        # Sanity flag (log-only, never blocks): if even the tunnel's OWN
+        # resolution lands inside a Packages\ sandbox path, the tunnel process
+        # itself is unexpectedly sandboxed too — a different, deeper problem
+        # than this fix addresses. Surface it rather than silently pinning to
+        # a still-virtualized path.
+        if "Packages" in str(uv_cache):
+            print(
+                "tunnel: WARNING — resolved cache dir still looks sandboxed "
+                f"({uv_cache}); the tunnel process itself may be running "
+                "inside an AppContainer. This fix assumes an unsandboxed "
+                "tunnel process and may not help in that case.",
+                file=sys.stderr, flush=True,
+            )
+        _stable_cache_env_cache = resolved
+    except Exception:  # noqa: BLE001 — never block a spawn over a cache-dir resolve failure
+        _stable_cache_env_cache = {}
+    return _stable_cache_env_cache
+
+
 def _spawn_with_cache_retry(
     cmd: "list[str]",
     env: "dict | None",
@@ -1770,6 +1888,14 @@ def _spawn_with_cache_retry(
     (a9d1ef7f, 3db4f8d8)
     """
     kwargs = _spawn_kwargs()
+    # 2026-07-19 — merge in explicitly-resolved, sandbox-immune cache-dir vars
+    # for every spawn through this central choke point (see
+    # _resolve_stable_cache_env). When env was None (inherit parent), start
+    # from a full copy of the parent env so nothing is lost — only the two
+    # cache vars are forced on top, not a narrowing to just those two.
+    _cache_env = _resolve_stable_cache_env()
+    if _cache_env:
+        env = {**(env if env is not None else dict(os.environ)), **_cache_env}
     try:
         proc = subprocess.Popen(cmd, env=env, **kwargs)
     except Exception as first_exc:  # noqa: BLE001
@@ -4407,6 +4533,7 @@ async def run_tunnel(
     codebase without any manual tool call.
     """
     _force_utf8_io()
+    _install_tunnel_log_tee()
     # Resolve base_url first — it's the cache key for the stored token.
     base_url = _resolve_base_url(base_url)
     # b970fe07 — remember whether the caller explicitly set repo_path / code_dirs
