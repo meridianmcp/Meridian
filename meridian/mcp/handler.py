@@ -192,6 +192,16 @@ async def _build_executor_goal_messages(
         _goal_settings = await db_module.get_project_settings(db, pid)
     except Exception:  # noqa: BLE001
         _goal_settings = None
+    # d5849a67 — same durable pointer-evidence resolution as generate_handoff,
+    # so this template's excluded_unprospected list also agrees with what
+    # claim_sprint_item will actually enforce. Guarded, fail-open.
+    _tpl_pointer_evidence_ids = None
+    try:
+        _tpl_pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+            db, [it.get("id") for it in pending]
+        )
+    except Exception:  # noqa: BLE001
+        _tpl_pointer_evidence_ids = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         version=scoped_version,
@@ -200,6 +210,7 @@ async def _build_executor_goal_messages(
             project.get("execution_mode")
         ),
         max_turns=_max_turns_from_settings(_goal_settings),
+        pointer_evidence_ids=_tpl_pointer_evidence_ids,
     )
     if pending:
         item_lines = "\n".join(

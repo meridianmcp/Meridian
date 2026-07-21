@@ -32,7 +32,7 @@ import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from . import db as db_module
-from .db.sprint_items import _is_deferred, _item_is_unprospected, _split_wave_label
+from .db.sprint_items import _is_deferred, is_item_claim_prospected, _split_wave_label
 from .executor_config import build_executor_config_block, has_executor_config
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -758,6 +758,7 @@ def _build_quick_start_goal(
     wave_gate_pending: list[dict[str, Any]] | None = None,
     tool_priority_map: dict[str, str] | None = None,
     force_included_ids: "frozenset[str] | set[str] | None" = None,
+    pointer_evidence_ids: "frozenset[str] | set[str] | None" = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -806,6 +807,16 @@ def _build_quick_start_goal(
     does NOT already carry its own item-level ``required_tool`` pin — gets
     the same hard, unconditional ``<workspace_tool_priority>`` directive that
     an explicit pin gets. ``None``/empty means no workspace default is set.
+
+    ``pointer_evidence_ids`` (d5849a67) — the caller-precomputed set of pending
+    item ids that have >=1 durable row in ``sprint_item_pointers`` (see
+    ``db.get_pointer_evidence_item_ids``). This is the SAME evidence signal
+    ``claim_sprint_item`` checks at claim time, so the ``excluded_unprospected``
+    tag built below is guaranteed to agree with what claim will actually
+    enforce — see ``is_item_claim_prospected``. ``None`` means "unknown /
+    query failed" and is treated as fail-open (nothing is excluded on that
+    basis) rather than "confirmed no evidence" (which would risk mass-excluding
+    every resource-declaring item on a transient DB hiccup).
     """
     try:
         _turns = int(max_turns)
@@ -850,25 +861,38 @@ def _build_quick_start_goal(
         if it.get("id") in _force_included or not _is_backburner_sprint_item(it)
     ]
     _backburner_note = _build_backburner_todo_note(_backburner_items)
-    # 94c26322 — STRUCTURAL PROSPECTING GATE: an item with no real prospecting
-    # evidence (no code_pointers / pointers, no confirmed prospect_status) MUST
-    # NOT be silently included in the auto-run claimable batch. The ONLY exception
-    # is an explicit human-set bypass flag (prospect_bypass=True on the item).
-    # Without evidence AND without bypass: the item is excluded here AND surfaced
-    # as a visible, structured warning in the /goal output — NOT buried prose.
-    # This is the same class of fix as dec69708 (deferred_until enforcement):
-    # a mechanism already existed (prospecting_status / code_pointers), it just
-    # wasn't wired into the one place that makes it protective (goal generation).
+    # 94c26322/d5849a67 — STRUCTURAL PROSPECTING GATE: an item that DECLARED
+    # real code-touching resources (touches_resources) but has no durable
+    # pointer evidence (sprint_item_pointers) MUST NOT be silently included in
+    # the auto-run claimable batch. The ONLY exception is an explicit human-set
+    # bypass flag (prospect_bypass=True on the item). Without evidence AND
+    # without bypass: the item is excluded here AND surfaced as a visible,
+    # structured warning in the /goal output — NOT buried prose. This is the
+    # same class of fix as dec69708 (deferred_until enforcement): a mechanism
+    # already existed (sprint_item_pointers / prospect_bypass), it just wasn't
+    # wired into the one place that makes it protective (goal generation).
+    #
+    # d5849a67 — this loop now calls is_item_claim_prospected(), the SAME
+    # shared helper claim_sprint_item's own gate uses, with the SAME durable
+    # evidence signal (pointer_evidence_ids, batch-resolved from
+    # sprint_item_pointers — NOT the transient enrichment-time code_pointers/
+    # pointers/prospect_status fields the old check here used). Previously the
+    # two checks disagreed in both directions: this loop could exclude items
+    # claim_sprint_item never even gates (no declared touches_resources), and
+    # could pass through items with a "prospected" in-memory annotation that
+    # were never actually persisted to sprint_item_pointers — so claim refused
+    # them anyway despite them not appearing in <excluded_unprospected>.
     _excluded_unprospected: list[dict[str, Any]] = []
     _included_sprint_items: list[dict[str, Any]] = []
     for _it in pending_sprint_items:
-        _has_bypass = bool(_it.get("prospect_bypass"))
-        # 94c26322 — enrichment_failure_only=True: only exclude items that went
-        # through enrichment and got an explicit failure status. Items that have
-        # never been enriched (no prospect_status) are left in the batch — they
-        # are "not yet tried", not "confirmed failures". This prevents the gate
-        # from blocking plain DB items or items added before enrichment runs.
-        if _has_bypass or not _item_is_unprospected(_it, enrichment_failure_only=True):
+        # Fail-open when pointer_evidence_ids is None (query failed / not
+        # supplied): treat as "has evidence" so a transient DB hiccup never
+        # mass-excludes the batch.
+        _has_evidence = (
+            True if pointer_evidence_ids is None
+            else _it.get("id") in pointer_evidence_ids
+        )
+        if is_item_claim_prospected(_it, has_pointer_evidence=_has_evidence):
             _included_sprint_items.append(_it)
         else:
             _excluded_unprospected.append(_it)
@@ -3943,6 +3967,14 @@ async def generate_handoff(
             session_names.setdefault(t["session_id"], "(unknown-session)")
     except Exception:  # noqa: BLE001 — cross-check is best-effort
         pass
+    # d5849a67 — batch-resolve durable pointer evidence for the pending batch so
+    # the excluded_unprospected list below uses the SAME evidence signal
+    # claim_sprint_item checks per-item (sprint_item_pointers rows), not the
+    # transient enrichment-time code_pointers/pointers annotations. None on
+    # failure (fail-open — see _build_quick_start_goal's docstring).
+    _pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+        db, [it.get("id") for it in pending_sprint_items]
+    )
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=db_module.normalize_execution_mode(
@@ -3963,6 +3995,9 @@ async def generate_handoff(
         # deferred exclusion below; that override exists specifically to bring
         # a deferred item back into scope for this one call.
         force_included_ids=frozenset(force_include_ids) if force_include_ids else None,
+        # d5849a67 — durable pointer evidence, batch-resolved above, so the
+        # excluded_unprospected tag agrees with claim_sprint_item's own gate.
+        pointer_evidence_ids=_pointer_evidence_ids,
     )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
@@ -4478,6 +4513,16 @@ async def _generate_starter_handoff(
         _s_wave_gate_pending = await db_module.get_wave_gate_configs(db, project["id"])
     except Exception:  # noqa: BLE001
         _s_wave_gate_pending = None
+    # d5849a67 — see the twin comment in generate_handoff: batch-resolve durable
+    # pointer evidence so the starter handoff's excluded_unprospected list also
+    # agrees with claim_sprint_item's own gate. Guarded, fail-open.
+    _s_pointer_evidence_ids = None
+    try:
+        _s_pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+            db, [it.get("id") for it in pending]
+        )
+    except Exception:  # noqa: BLE001
+        _s_pointer_evidence_ids = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=db_module.normalize_execution_mode(
@@ -4492,6 +4537,7 @@ async def _generate_starter_handoff(
         wave_gate_pending=_s_wave_gate_pending,
         # 490e100d — workspace-level default tool priority per task category.
         tool_priority_map=(_s_ws_settings or {}).get("tool_priority_map"),
+        pointer_evidence_ids=_s_pointer_evidence_ids,
     )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the

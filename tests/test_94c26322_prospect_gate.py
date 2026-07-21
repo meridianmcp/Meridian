@@ -40,6 +40,7 @@ def _make_item(
     code_pointers: list | None = None,
     pointers: list | None = None,
     prospect_bypass: bool = False,
+    touches_resources: list | None = None,
     version: str = "v1",
     status: str = "pending",
 ) -> dict[str, Any]:
@@ -56,6 +57,8 @@ def _make_item(
         d["code_pointers"] = code_pointers
     if pointers is not None:
         d["pointers"] = pointers
+    if touches_resources is not None:
+        d["touches_resources"] = touches_resources
     return d
 
 
@@ -74,21 +77,32 @@ async def _make_db() -> Any:
 
 # ---------------------------------------------------------------------------
 # 1. Goal gate: unprospected items excluded + visible tag
+#
+# d5849a67 — REWRITTEN. The exclusion decision now mirrors claim_sprint_item's
+# actual gate exactly (is_item_claim_prospected): only items that DECLARED
+# touches_resources and lack a DURABLE row in sprint_item_pointers are
+# excluded. The old version of this section exercised the pre-fix behaviour
+# (excluding/including based on transient prospect_status/code_pointers/
+# pointers fields, ignoring touches_resources entirely), which is exactly
+# what caused generate_handoff's excluded_unprospected list to disagree with
+# claim_sprint_item's real enforcement -- see the "5. End-to-end consistency"
+# section below for tests that exercise both checks against the same item.
+#
+# pointer_evidence_ids is passed explicitly in every test below to stand in
+# for the batch-resolved durable-pointer signal (db.get_pointer_evidence_item_ids)
+# that generate_handoff supplies in production.
 # ---------------------------------------------------------------------------
 
 def test_goal_gate_excludes_unprospected_item():
-    """An item that went through enrichment and got no_match (no evidence, no bypass)
-    must be excluded from the /goal's claimable ids but appears in the excluded tag.
-
-    94c26322 — the gate fires for items where enrichment ran and explicitly found
-    nothing (prospect_status in no_match/error/no_query), not for plain DB rows
-    that simply haven't been enriched yet.
+    """An item that declared touches_resources but has no durable pointer
+    evidence (absent from pointer_evidence_ids) and no bypass must be
+    excluded from the /goal's claimable ids but appear in the excluded tag.
     """
     items = [
-        # Enriched and found no match — this is the primary gap the gate closes.
-        _make_item("id-no-evidence", "Fix login", prospect_status="no_match"),
+        _make_item("id-no-evidence", "Fix login",
+                   touches_resources=["file:meridian/x.py:sym"]),
     ]
-    goal = _build_quick_start_goal(items)
+    goal = _build_quick_start_goal(items, pointer_evidence_ids=set())
     # Must appear in the exclusion tag (so it's visible to a human reviewing the /goal)
     assert '<excluded_unprospected' in goal
     assert 'count="1"' in goal
@@ -98,83 +112,84 @@ def test_goal_gate_excludes_unprospected_item():
     assert "id-no-evidence" not in items_clause
 
 
-def test_goal_gate_includes_prospected_item():
-    """A prospected item (prospect_status='prospected') IS included."""
+def test_goal_gate_includes_item_without_declared_resources():
+    """An item with NO declared touches_resources was never a real prospecting
+    candidate (SCOPE GUARD) -- it is included regardless of prospect_status or
+    pointer_evidence_ids, mirroring claim_sprint_item's own scope guard.
+    """
     items = [
-        _make_item("id-good", "Fix auth", prospect_status="prospected",
-                   code_pointers=[{"file": "auth.py"}]),
+        _make_item("id-no-resources", "Write docs", prospect_status="no_match"),
     ]
-    goal = _build_quick_start_goal(items)
+    goal = _build_quick_start_goal(items, pointer_evidence_ids=set())
+    assert "id-no-resources" in goal
+    assert '<excluded_unprospected' not in goal
+
+
+def test_goal_gate_includes_item_with_durable_pointer_evidence():
+    """An item with touches_resources declared AND present in
+    pointer_evidence_ids (a durable sprint_item_pointers row) IS included."""
+    items = [
+        _make_item("id-good", "Fix auth", touches_resources=["file:meridian/auth.py:login"]),
+    ]
+    goal = _build_quick_start_goal(items, pointer_evidence_ids={"id-good"})
     assert "id-good" in goal
     assert '<excluded_unprospected' not in goal
 
 
-def test_goal_gate_includes_cached_item():
-    """A cached item (prior pointer reused) IS included."""
+def test_goal_gate_transient_enrichment_annotation_is_not_sufficient():
+    """d5849a67 regression: an item carrying a transient, in-memory-only
+    code_pointers / prospect_status='prospected' annotation (as attached by
+    handoff-time enrichment, _annotate_code_pointers) but with NO durable
+    sprint_item_pointers row must still be EXCLUDED. Before this fix, those
+    transient fields alone were enough to pass the gate here even though
+    claim_sprint_item only ever checks the durable table -- exactly the drift
+    the executor hit (items absent from <excluded_unprospected> yet refused
+    at claim time).
+    """
     items = [
-        _make_item("id-cached", "Update routes", prospect_status="cached",
-                   code_pointers=[{"file": "routes.py"}]),
+        _make_item(
+            "id-transient-only", "Looks prospected but isn't durable",
+            touches_resources=["file:meridian/x.py:sym"],
+            prospect_status="prospected", code_pointers=[{"file": "x.py"}],
+        ),
     ]
-    goal = _build_quick_start_goal(items)
-    assert "id-cached" in goal
-    assert '<excluded_unprospected' not in goal
-
-
-def test_goal_gate_includes_item_with_code_pointers_no_status():
-    """An item with code_pointers but no prospect_status IS included (evidence exists)."""
-    items = [
-        _make_item("id-ptr", "Refactor DB", code_pointers=[{"file": "db.py"}]),
-    ]
-    goal = _build_quick_start_goal(items)
-    assert "id-ptr" in goal
-    assert '<excluded_unprospected' not in goal
-
-
-def test_goal_gate_includes_item_with_generic_pointers():
-    """An item with pointers (docs/generic) but no code_pointers IS included."""
-    items = [
-        _make_item("id-gen", "Write docs", pointers=[{"uri": "doc://x"}]),
-    ]
-    goal = _build_quick_start_goal(items)
-    assert "id-gen" in goal
-    assert '<excluded_unprospected' not in goal
+    goal = _build_quick_start_goal(items, pointer_evidence_ids=set())
+    assert '<excluded_unprospected' in goal
+    items_clause = goal.split('<sprint_items>')[1].split('</sprint_items>')[0] if '<sprint_items>' in goal else ""
+    assert "id-transient-only" not in items_clause
 
 
 def test_goal_gate_bypassed_with_prospect_bypass():
-    """An item with no_match status AND prospect_bypass=True IS included (bypass wins)."""
+    """An item with touches_resources declared, no durable evidence, BUT
+    prospect_bypass=True IS included (bypass wins)."""
     items = [
-        # Enriched, got no_match, BUT human explicitly bypassed it — should be included.
-        _make_item("id-bypass", "Unusual task", prospect_status="no_match",
-                   prospect_bypass=True),
+        _make_item("id-bypass", "Unusual task",
+                   touches_resources=["file:meridian/x.py:sym"], prospect_bypass=True),
     ]
-    goal = _build_quick_start_goal(items)
+    goal = _build_quick_start_goal(items, pointer_evidence_ids=set())
     assert "id-bypass" in goal
     assert '<excluded_unprospected' not in goal
 
 
 def test_goal_gate_mixed_items_selective_exclusion():
-    """Mixed list: only enrichment-failed, non-bypassed items are excluded."""
+    """Mixed list: only resource-declaring, non-bypassed items lacking durable
+    evidence are excluded."""
     items = [
-        # Enriched, got no_match → excluded (this is the gap the gate closes)
-        _make_item("id-excl", "No evidence", prospect_status="no_match"),
-        _make_item("id-incl", "Has evidence",           # included (prospected + code_pointers)
-                   prospect_status="prospected",
-                   code_pointers=[{"file": "db.py"}]),
-        _make_item("id-bypass", "Bypassed",             # included via bypass
-                   prospect_bypass=True),
-        _make_item("id-skip", "Review logs",            # included (skipped_cap is deliberate)
-                   prospect_status="skipped_cap"),      # skipped_cap = NOT unprospected
+        _make_item("id-excl", "No evidence", touches_resources=["file:meridian/a.py:a"]),
+        _make_item("id-incl", "Has durable evidence", touches_resources=["file:meridian/b.py:b"]),
+        _make_item("id-bypass", "Bypassed",
+                   touches_resources=["file:meridian/c.py:c"], prospect_bypass=True),
+        _make_item("id-no-res", "No resources declared"),
     ]
-    goal = _build_quick_start_goal(items)
-    # Claimable items section must include id-incl, id-bypass, id-skip
+    goal = _build_quick_start_goal(items, pointer_evidence_ids={"id-incl"})
+    # Claimable items section must include id-incl, id-bypass, id-no-res
     items_clause = goal.split('<sprint_items>')[1].split('</sprint_items>')[0] if '<sprint_items>' in goal else ""
     assert "id-excl" not in items_clause, "id-excl must be excluded from claimable list"
-    assert "id-incl" in items_clause, "id-incl (prospected) must be included"
+    assert "id-incl" in items_clause, "id-incl (durable evidence) must be included"
     assert "id-bypass" in items_clause, "id-bypass (bypass set) must be included"
-    assert "id-skip" in items_clause, "id-skip (skipped_cap) must be included"
+    assert "id-no-res" in items_clause, "id-no-res (no declared resources) must be included"
     # Only id-excl was excluded
     assert 'count="1"' in goal
-    # id-excl must appear in the exclusion tag
     exc_section = goal.split('<excluded_unprospected')[1].split('</excluded_unprospected>')[0] if '<excluded_unprospected' in goal else ""
     assert "id-excl" in exc_section
 
@@ -182,70 +197,53 @@ def test_goal_gate_mixed_items_selective_exclusion():
 def test_goal_gate_excluded_tag_contains_item_ids():
     """The <excluded_unprospected> tag must list the excluded item ids."""
     items = [
-        # Both enriched and got explicit failure status → excluded
-        _make_item("aaa-111", "Item A", prospect_status="no_match"),
-        _make_item("bbb-222", "Item B", prospect_status="no_query"),
+        _make_item("aaa-111", "Item A", touches_resources=["file:meridian/a.py:a"]),
+        _make_item("bbb-222", "Item B", touches_resources=["file:meridian/b.py:b"]),
     ]
-    goal = _build_quick_start_goal(items)
-    # Both excluded: tag should contain both ids
+    goal = _build_quick_start_goal(items, pointer_evidence_ids=set())
     assert "aaa-111" in goal
     assert "bbb-222" in goal
-    # Both must appear in the exclusion tag region
     exc_section = goal.split('<excluded_unprospected')[1].split('</excluded_unprospected>')[0]
     assert "aaa-111" in exc_section
     assert "bbb-222" in exc_section
 
 
 def test_goal_gate_no_excluded_tag_when_none_excluded():
-    """No <excluded_unprospected> tag is emitted when all items have evidence."""
+    """No <excluded_unprospected> tag is emitted when all items have durable evidence."""
     items = [
-        _make_item("id-ok", "Prospected", prospect_status="prospected",
-                   code_pointers=[{"file": "server.py"}]),
+        _make_item("id-ok", "Prospected", touches_resources=["file:meridian/server.py:run"]),
     ]
-    goal = _build_quick_start_goal(items)
+    goal = _build_quick_start_goal(items, pointer_evidence_ids={"id-ok"})
     assert '<excluded_unprospected' not in goal
 
 
 def test_goal_gate_empty_board_after_exclusion():
     """When all items are excluded, the empty-board branch is returned WITH the tag."""
     items = [
-        # Both enriched with explicit failure → excluded
-        _make_item("id-x1", "Item X1", prospect_status="no_match"),
-        _make_item("id-x2", "Item X2", prospect_status="error"),
+        _make_item("id-x1", "Item X1", touches_resources=["file:meridian/a.py:a"]),
+        _make_item("id-x2", "Item X2", touches_resources=["file:meridian/b.py:b"]),
     ]
-    goal = _build_quick_start_goal(items)
+    goal = _build_quick_start_goal(items, pointer_evidence_ids=set())
     # The exclusion tag must be present with both ids
     assert '<excluded_unprospected count="2">' in goal
     # Item ids must appear ONLY in the exclusion region (not in any claimable list)
     assert '<sprint_items>' not in goal, "No claimable items section when all are excluded"
-    # Both ids appear in the exclusion tag
     exc_section = goal.split('<excluded_unprospected')[1].split('</excluded_unprospected>')[0]
     assert "id-x1" in exc_section
     assert "id-x2" in exc_section
 
 
-def test_goal_gate_no_match_status_is_unprospected():
-    """prospect_status='no_match' has no evidence — must be excluded."""
+def test_goal_gate_unknown_evidence_fails_open():
+    """d5849a67 — when pointer_evidence_ids is None (the batch DB query
+    failed), the gate fails OPEN: nothing is excluded on that basis, even for
+    resource-declaring items, so a transient DB hiccup never mass-excludes
+    the claimable batch (mirrors claim_sprint_item's own fail-open try/except)."""
     items = [
-        _make_item("id-nm", "No match", prospect_status="no_match"),
+        _make_item("id-unknown", "Item", touches_resources=["file:meridian/a.py:a"]),
     ]
-    goal = _build_quick_start_goal(items)
-    assert '<excluded_unprospected' in goal
-    # Must not appear in any claimable items section
-    assert '<sprint_items>' not in goal
-    # Must appear in the exclusion tag
-    exc_section = goal.split('<excluded_unprospected')[1].split('</excluded_unprospected>')[0]
-    assert "id-nm" in exc_section
-
-
-def test_goal_gate_skipped_manual_not_excluded():
-    """Items with skipped_manual prospect_status are intentional skips — NOT excluded."""
-    items = [
-        _make_item("id-sm", "Talk to advisor", prospect_status="skipped_manual"),
-    ]
-    goal = _build_quick_start_goal(items)
-    # skipped_manual is not flagged as unprospected, so it passes the gate
+    goal = _build_quick_start_goal(items, pointer_evidence_ids=None)
     assert '<excluded_unprospected' not in goal
+    assert "id-unknown" in goal
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +381,163 @@ def test_claim_allows_item_with_durable_pointer():
         assert isinstance(result, dict)
         assert not result.get("blocked")
         assert result.get("status") == "in_progress"
+        await db.close()
+
+    _run(run())
+
+
+# ---------------------------------------------------------------------------
+# 5. d5849a67 — get_pointer_evidence_item_ids: the batch DB helper generate_handoff
+# uses to resolve the same durable-evidence signal claim_sprint_item checks.
+# ---------------------------------------------------------------------------
+
+def test_pointer_evidence_batch_returns_ids_with_durable_pointer():
+    """Only ids with >=1 sprint_item_pointers row are returned."""
+    async def run():
+        db = await _make_db()
+        proj = await db_module.create_project(db, "Test Project")
+        pid = proj["id"]
+        item_with = await db_module.add_sprint_item(
+            db, pid, "v1", "Has pointer", touches_resources=["file:meridian/server.py"])
+        item_without = await db_module.add_sprint_item(
+            db, pid, "v1", "No pointer", touches_resources=["file:meridian/other.py"])
+        await db_module.add_sprint_item_pointer(
+            db, pid, item_with["id"], "code",
+            [{"uri": "file:meridian/server.py",
+              "selector": {"type": "range", "start_line": 1, "end_line": 5}}],
+        )
+        ids = await db_module.get_pointer_evidence_item_ids(
+            db, [item_with["id"], item_without["id"]]
+        )
+        assert ids == {item_with["id"]}
+        await db.close()
+
+    _run(run())
+
+
+def test_pointer_evidence_batch_empty_input_returns_empty_set():
+    async def run():
+        db = await _make_db()
+        result = await db_module.get_pointer_evidence_item_ids(db, [])
+        assert result == set()
+        result_none = await db_module.get_pointer_evidence_item_ids(db, None)
+        assert result_none == set()
+        await db.close()
+
+    _run(run())
+
+
+# ---------------------------------------------------------------------------
+# 6. d5849a67 — End-to-end consistency: excluded_unprospected agrees with
+# claim_sprint_item. This is the exact disagreement the executor hit: 6 of 8
+# nominal "batch 1" items were blocked as UNPROSPECTED at claim time despite
+# NOT appearing in generate_handoff's own <excluded_unprospected> list. Each
+# test below drives BOTH checks against the SAME live-DB item and asserts
+# they agree.
+# ---------------------------------------------------------------------------
+
+def test_e2e_excluded_item_actually_fails_claim():
+    """An item _build_quick_start_goal excludes (using the real DB-backed
+    get_pointer_evidence_item_ids helper) must ALSO be refused by
+    claim_sprint_item -- the two checks must never disagree.
+    """
+    async def run():
+        db = await _make_db()
+        proj = await db_module.create_project(db, "Test Project")
+        pid = proj["id"]
+        item = await db_module.add_sprint_item(
+            db, pid, "v1", "Declared but unprospected",
+            touches_resources=["file:meridian/nonexistent_module_xyz.py:no_such_symbol"],
+        )
+        iid = item["id"]
+        pending = [await db_module.get_sprint_item(db, iid)]
+        pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+            db, [it["id"] for it in pending]
+        )
+        goal = _build_quick_start_goal(pending, pointer_evidence_ids=pointer_evidence_ids)
+        assert '<excluded_unprospected' in goal
+        exc_section = goal.split('<excluded_unprospected')[1].split('</excluded_unprospected>')[0]
+        assert iid in exc_section
+
+        result = await db_module.claim_sprint_item(db, pid, iid)
+        assert isinstance(result, dict)
+        assert result.get("blocked") is True
+        assert result.get("error") == "UNPROSPECTED"
+        await db.close()
+
+    _run(run())
+
+
+def test_e2e_included_item_actually_succeeds_claim():
+    """An item _build_quick_start_goal does NOT exclude (a real durable
+    pointer is present) must ALSO succeed at claim_sprint_item.
+    """
+    async def run():
+        db = await _make_db()
+        proj = await db_module.create_project(db, "Test Project")
+        pid = proj["id"]
+        item = await db_module.add_sprint_item(
+            db, pid, "v1", "Declared and prospected",
+            touches_resources=["file:meridian/server.py:run"],
+        )
+        iid = item["id"]
+        await db_module.add_sprint_item_pointer(
+            db, pid, iid, "code",
+            [{"uri": "file:meridian/server.py",
+              "selector": {"type": "range", "start_line": 1, "end_line": 10}}],
+        )
+        pending = [await db_module.get_sprint_item(db, iid)]
+        pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+            db, [it["id"] for it in pending]
+        )
+        goal = _build_quick_start_goal(pending, pointer_evidence_ids=pointer_evidence_ids)
+        assert '<excluded_unprospected' not in goal
+        assert iid in goal
+
+        result = await db_module.claim_sprint_item(db, pid, iid)
+        assert isinstance(result, dict)
+        assert not result.get("blocked")
+        assert result.get("status") == "in_progress"
+        await db.close()
+
+    _run(run())
+
+
+def test_e2e_transient_enrichment_pointer_without_durable_row_agrees_with_claim():
+    """Reproduces the exact reported drift: an item enriched at handoff time
+    with a transient code_pointers/prospect_status='prospected' annotation
+    (never persisted to sprint_item_pointers) must be excluded from the goal
+    AND refused by claim. Before d5849a67, generate_handoff's exclusion check
+    trusted those transient fields and would have silently included this item
+    in the claimable batch, while claim_sprint_item (which only ever checks
+    the durable table) refused it anyway.
+    """
+    async def run():
+        db = await _make_db()
+        proj = await db_module.create_project(db, "Test Project")
+        pid = proj["id"]
+        item = await db_module.add_sprint_item(
+            db, pid, "v1", "Enriched but not durable",
+            touches_resources=["file:meridian/x.py:sym"],
+        )
+        iid = item["id"]
+        # Simulate handoff-time enrichment (_annotate_code_pointers): transient
+        # fields set on the fetched dict, WITHOUT persisting a
+        # sprint_item_pointers row (that function never does).
+        fetched = await db_module.get_sprint_item(db, iid)
+        fetched["prospect_status"] = "prospected"
+        fetched["code_pointers"] = [{"file": "x.py"}]
+
+        pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(db, [iid])
+        goal = _build_quick_start_goal([fetched], pointer_evidence_ids=pointer_evidence_ids)
+        assert '<excluded_unprospected' in goal
+        exc_section = goal.split('<excluded_unprospected')[1].split('</excluded_unprospected>')[0]
+        assert iid in exc_section
+
+        result = await db_module.claim_sprint_item(db, pid, iid)
+        assert isinstance(result, dict)
+        assert result.get("blocked") is True
+        assert result.get("error") == "UNPROSPECTED"
         await db.close()
 
     _run(run())
