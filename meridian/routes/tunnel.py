@@ -81,6 +81,28 @@ _SLOT_ACQUIRE_TIMEOUT = 1.0
 # ``tools/list``), so it needs the identical guard.
 _TOOL_DISCOVERY_TIMEOUT = 5.0
 
+# 6941fd0f — live-data root cause for the "tools/list takes ~12.5s" outage report.
+# The 2026-07-17 hotfix wraps list_tunnel_tools in an OUTER asyncio.wait_for(5.0)
+# (handler.py tools/list) expecting that to cancel every slot's retry loop by the
+# 5s mark. In practice, cancelling a task blocked inside _do_proxy's own
+# `await asyncio.wait_for(fut, timeout=_PROXY_TIMEOUT)` lands on _do_proxy's
+# `except asyncio.CancelledError` branch (there for a DIFFERENT, legitimate reason
+# — a tunnel-disconnect force-cancelling a pending future mid-request) and that
+# branch RETURNS a normal Response instead of re-raising. Whether or not that
+# re-propagates cleanly through every layer of nested wait_for/gather in all
+# asyncio versions is subtle enough that it is not safe to assume — and live
+# connection-event timing (get_connection_log) shows requests with a
+# tunnel-augmented tools_returned count taking 5-8s+ despite the nominal 5s outer
+# cap, i.e. the outer cancellation is not reliably cutting the retry loop off in
+# production. Rather than touch _do_proxy's cancellation handling (shared by
+# call_tunnel_tool too, and deliberately subtle — see its own comment), give
+# _fetch_slot_tools a SECOND, independent safety net: a plain wall-clock budget
+# checked with time.monotonic(), which works regardless of whether any ancestor's
+# asyncio cancellation actually reaches this coroutine. This can only shorten the
+# worst case (never lengthens the success path) and keeps a single slow/wedged
+# slot from consuming its full ~14s per-slot retry budget.
+_SLOT_TOOLS_FETCH_BUDGET = 4.0
+
 _slot_inflight: dict[str, asyncio.Semaphore] = {}
 
 
@@ -2889,16 +2911,28 @@ async def _tunnel_jsonrpc(
 
 
 async def _fetch_slot_tools(tenant_id: str, label: str) -> "tuple[str, list[dict]]":
-    """Fetch tools/list for one tunnel slot with retries. Returns (label, tools)."""
+    """Fetch tools/list for one tunnel slot with retries. Returns (label, tools).
+
+    6941fd0f — bounded to ``_SLOT_TOOLS_FETCH_BUDGET`` wall-clock seconds total,
+    independent of the caller's own asyncio-cancellation-based timeout (see the
+    comment on ``_SLOT_TOOLS_FETCH_BUDGET`` for why that alone is not reliable).
+    Each attempt's own timeout is shrunk to whatever's left of the budget so a
+    slot that's merely slow (not hung) still gets its full remaining allowance,
+    while the loop can never spend more than the budget in aggregate.
+    """
     sockets, _ = _label_maps(label)
     if tenant_id not in sockets:
         return label, []
     tools: list[dict] = []
+    started = time.monotonic()
     for _attempt in range(4):  # initial try + up to 3 retries
+        remaining = _SLOT_TOOLS_FETCH_BUDGET - (time.monotonic() - started)
+        if remaining <= 0:
+            break
         try:
             resp = await asyncio.wait_for(
                 _tunnel_jsonrpc(tenant_id, label, "tools/list", {}),
-                timeout=3.0,
+                timeout=min(3.0, remaining),
             )
             tools = ((resp.get("result") or {}).get("tools")) or [] if resp else []
         except Exception as exc:  # noqa: BLE001
@@ -2906,8 +2940,11 @@ async def _fetch_slot_tools(tenant_id: str, label: str) -> "tuple[str, list[dict
             tools = []
         if tools:
             break
-        if _attempt < 3:
+        remaining = _SLOT_TOOLS_FETCH_BUDGET - (time.monotonic() - started)
+        if _attempt < 3 and remaining > 0.5:
             await asyncio.sleep(0.5)
+        elif _attempt < 3:
+            break
     return label, tools
 
 

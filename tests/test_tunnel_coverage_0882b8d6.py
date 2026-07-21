@@ -684,6 +684,61 @@ def test_list_tunnel_tools_namespaces_annotation_title(monkeypatch):
     assert t["annotations"]["readOnlyHint"] is True
 
 
+def test_fetch_slot_tools_bounds_wall_clock_even_if_every_attempt_times_out(monkeypatch):
+    """6941fd0f — _fetch_slot_tools must not spend more than
+    ``_SLOT_TOOLS_FETCH_BUDGET`` wall-clock seconds in total, even when every
+    single attempt exhausts its own per-attempt timeout (the old worst case was
+    ~13.5s: 4 attempts * 3s + 3 * 0.5s sleeps). This is a SECOND, independent
+    safety net alongside the outer asyncio.wait_for(5.0) in handler.py's
+    tools/list branch — it must hold even if that outer cancellation never
+    reaches this coroutine."""
+    tn._tunnel_code_sockets["t-slow-slot"] = object()
+
+    async def hangs(tenant_id, method, path, query, headers, body, sockets, pending, label):
+        await asyncio.sleep(30)  # far longer than any per-attempt timeout
+        raise AssertionError("should never actually complete — timeout should fire first")
+
+    monkeypatch.setattr(tn, "_do_proxy", hangs)
+
+    start = time.monotonic()
+    label, tools = asyncio.run(tn._fetch_slot_tools("t-slow-slot", "code"))
+    elapsed = time.monotonic() - start
+
+    assert label == "code"
+    assert tools == []
+    # Bounded near the budget (small margin for scheduling overhead), nowhere
+    # near the old ~13.5s worst case.
+    assert elapsed < tn._SLOT_TOOLS_FETCH_BUDGET + 1.0, (
+        f"_fetch_slot_tools took {elapsed:.1f}s — wall-clock budget did not bound it"
+    )
+
+
+def test_fetch_slot_tools_succeeds_within_budget_on_a_later_attempt(monkeypatch):
+    """A slot that fails once (e.g. a transient hiccup) but succeeds on retry,
+    well within the budget, still returns the discovered tools normally — the
+    new budget check must not make an otherwise-healthy-but-flaky slot worse."""
+    tn._tunnel_code_sockets["t-flaky-slot"] = object()
+
+    calls = {"n": 0}
+
+    async def flaky(tenant_id, method, path, query, headers, body, sockets, pending, label):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            resp = {"error": {"message": "transient"}}
+            return Response(content=json.dumps(resp).encode(), status_code=502,
+                            media_type="application/json")
+        resp = {"result": {"tools": [{"name": "trace_path"}]}}
+        return Response(content=json.dumps(resp).encode(), status_code=200,
+                        media_type="application/json")
+
+    monkeypatch.setattr(tn, "_do_proxy", flaky)
+
+    label, tools = asyncio.run(tn._fetch_slot_tools("t-flaky-slot", "code"))
+    assert label == "code"
+    assert [t["name"] for t in tools] == ["trace_path"]
+    assert calls["n"] == 2
+
+
 # ===========================================================================
 # 15. _do_proxy fly-replay path (cross-instance miss fallback)
 # ===========================================================================
