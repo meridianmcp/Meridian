@@ -2877,7 +2877,8 @@ def _managed_bin_dir() -> "Path":
 
 
 def _code_intel_cache_dir() -> "Path":
-    """Dedicated ``CBM_CACHE_DIR`` for the tunnel's OWN code-intel slot (3475c72f).
+    """Dedicated ``CBM_CACHE_DIR`` for the tunnel's OWN code-intel slot (3475c72f),
+    unique PER TUNNEL PROCESS GENERATION (dee49d99).
 
     codebase-memory-mcp persists its per-project index under ``CBM_CACHE_DIR``
     (default ``~/.cache/codebase-memory-mcp`` when unset), keyed only by a slug
@@ -2899,8 +2900,95 @@ def _code_intel_cache_dir() -> "Path":
     is outside this process's control. (8e10fb80's reuse_existing guards the
     case this code CAN control: the tunnel's own slot spawning a second copy
     of itself.)
+
+    dee49d99 — a single FIXED path shared across every tunnel invocation
+    reproduces the exact same collision one level down on a fast restart.
+    ``_kill_all_previously_spawned_pids`` (6884a668) sends the dying
+    generation's codebase-memory-mcp process a kill signal well before the
+    new generation's own spawn, but on Windows ``taskkill /F`` returns as
+    soon as the target is asked to terminate — it does NOT block until the OS
+    has finished process rundown and released the dying process's open
+    handle on the index ``.db``. A fast enough respawn can therefore still
+    open the SAME file while the dying copy still holds it, reproducing
+    3475c72f's rename-on-open-file failure one level down (this is a
+    different mechanism than an orphan still running — 6884a668 closes that
+    one, not this one). Suffixing the path with THIS process's own pid +
+    create_time gives every tunnel invocation ("generation") a private cache
+    dir that no other generation's spawn can ever open, closing the race
+    unconditionally instead of depending on kill/spawn timing. Falls back to
+    a pid-only suffix (still unique across concurrently-live generations,
+    just not across a pid-reuse window) when psutil is unavailable or the
+    lookup fails. Recomputed on every call (not memoized) rather than cached
+    at module scope — the underlying identity is stable for this process's
+    entire lifetime, but per-call recomputation keeps tests free to
+    monkeypatch ``Path.home``/``os.getpid`` without needing to reset a
+    process-lifetime cache. See :func:`_cleanup_stale_code_intel_cache_dirs`
+    for the matching sweep that reclaims a dead generation's directory.
     """
-    return Path.home() / ".meridian" / "code-intel-cache"
+    base = Path.home() / ".meridian" / "code-intel-cache"
+    pid = os.getpid()
+    suffix = str(pid)
+    try:
+        import psutil  # noqa: PLC0415 — optional dependency, mirrors the other pid-identity guards in this module
+
+        create_time = psutil.Process(pid).create_time()
+        suffix = f"{pid}-{int(create_time * 1000)}"
+    except Exception:  # noqa: BLE001 — psutil unavailable/pid lookup failed; pid alone still de-dupes concurrently-live generations
+        pass
+    return base / suffix
+
+
+def _cleanup_stale_code_intel_cache_dirs() -> None:
+    """Reclaim OLD per-generation code-intel cache dirs (dee49d99).
+
+    Every tunnel invocation now gets its own private cache dir under
+    ``~/.meridian/code-intel-cache/<pid>[-<create_time_ms>]`` (see
+    :func:`_code_intel_cache_dir`), which closes the fast-restart collision
+    but also means each restarted generation leaves its own warm index behind
+    forever unless something sweeps it. Called once at startup, alongside
+    :func:`_kill_all_previously_spawned_pids`: any subdirectory whose
+    embedded pid does not belong to a still-live process (verified via
+    psutil + create_time, mirroring the PID-reuse guards used throughout this
+    module) is safe to delete — its owning tunnel generation is gone and
+    nothing will ever reopen that index. Never touches the CURRENT process's
+    own directory (it either doesn't exist yet or is about to be reused).
+    Best-effort and silent on any failure — must never block tunnel startup;
+    worst case just leaves an old dir on disk for the next run to retry.
+    """
+    base = Path.home() / ".meridian" / "code-intel-cache"
+    try:
+        if not base.is_dir():
+            return
+        try:
+            import psutil  # type: ignore  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 — psutil unavailable; can't safely tell live from dead, skip entirely
+            return
+        own_pid = os.getpid()
+        for entry in base.iterdir():
+            if not entry.is_dir():
+                continue
+            parts = entry.name.split("-", 1)
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue  # not one of our pid-suffixed dirs; leave it alone
+            if pid == own_pid:
+                continue
+            alive = False
+            try:
+                proc = psutil.Process(pid)
+                if len(parts) > 1:
+                    recorded_ms = int(parts[1])
+                    alive = abs(proc.create_time() - recorded_ms / 1000.0) < 1.0
+                else:
+                    alive = True  # pid-only suffix (psutil was unavailable at creation) -- fall back to PID-only liveness
+            except Exception:  # noqa: BLE001 — psutil.NoSuchProcess or any lookup failure -- pid is gone
+                alive = False
+            if alive:
+                continue  # still genuinely owned by a live generation -- leave it
+            shutil.rmtree(entry, ignore_errors=True)
+    except Exception:  # noqa: BLE001 — best-effort, never block tunnel startup
+        pass
 
 
 def _code_intel_spawn_env() -> "dict[str, str]":
@@ -4929,6 +5017,12 @@ async def run_tunnel(
     # hours predating same-session fixes, plus duplicate same-second
     # meridian-outputs-mcp.exe processes from a watchdog-relaunch race.
     _kill_all_previously_spawned_pids()
+
+    # dee49d99 — reclaim dead generations' per-process code-intel cache dirs
+    # (see _code_intel_cache_dir / _cleanup_stale_code_intel_cache_dirs). Runs
+    # here, alongside the PID sweep above, so disk usage doesn't grow
+    # unbounded now that every restart gets its own private directory.
+    _cleanup_stale_code_intel_cache_dirs()
 
     # 44892730 — before anything spawns, clear any stale prior-generation
     # process still bound to each registered slot's port (see
