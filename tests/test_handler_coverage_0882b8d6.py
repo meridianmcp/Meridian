@@ -504,6 +504,163 @@ async def test_get_plugin_details_known_plugin_no_tunnel(db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# c889a1cc — reset_plugin_override: clear a stale/custom per-tenant plugin
+# override programmatically (previously only dashboard editing could).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reset_plugin_override_requires_slot(db):
+    out = await mh._dispatch_mcp_tool(
+        "reset_plugin_override", {}, db, "/tmp", tenant={"id": "t1"},
+    )
+    assert "error" in out
+    assert "slot is required" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_reset_plugin_override_unknown_slot(db):
+    out = await mh._dispatch_mcp_tool(
+        "reset_plugin_override", {"slot": "nonexistent-slot-xyz"}, db, "/tmp",
+        tenant={"id": "t1"},
+    )
+    assert "error" in out
+    assert "unknown plugin slot/name" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_reset_plugin_override_no_tenant_context(db):
+    out = await mh._dispatch_mcp_tool(
+        "reset_plugin_override", {"slot": "fs"}, db, "/tmp", tenant=None,
+    )
+    assert "error" in out
+    assert "no tenant context" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_reset_plugin_override_hosted_mode_refuses(db, monkeypatch):
+    """c889a1cc: in hosted mode, the tool call's db handle is the tenant's OWN
+    data-plane database, not the control-plane one tunnel_plugins lives on --
+    must refuse explicitly rather than risk a silent wrong-db write."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    calls = []
+    monkeypatch.setattr(
+        db_module, "update_tenant",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+
+    out = await mh._dispatch_mcp_tool(
+        "reset_plugin_override", {"slot": "fs"}, db, "/tmp",
+        tenant={"id": "t1", "tunnel_plugins": json.dumps([{"name": "filesystem", "command": ["custom"]}])},
+    )
+    assert "error" in out
+    assert "hosted mode" in out["error"]
+    assert calls == [], "must not attempt a write in hosted mode"
+
+
+@pytest.mark.asyncio
+async def test_reset_plugin_override_noop_when_nothing_to_reset(db, monkeypatch):
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        db_module, "update_tenant",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+
+    out = await mh._dispatch_mcp_tool(
+        "reset_plugin_override", {"slot": "fs"}, db, "/tmp",
+        tenant={"id": "t1", "tunnel_plugins": None},
+    )
+    assert out["ok"] is True
+    assert out["changed"] is False
+    assert calls == [], "must not write when there was nothing to clear"
+
+
+@pytest.mark.asyncio
+async def test_reset_plugin_override_clears_default_override(db, monkeypatch):
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    from meridian.tunnel_plugins import BUILTIN_PLUGINS
+    fs_base_cmd = next(p for p in BUILTIN_PLUGINS if p["name"] == "filesystem")["command"]
+
+    stored = json.dumps([
+        {"name": "filesystem", "command": ["stale", "--from", "/old/path", "entry"]},
+        {"name": "code-intel", "enabled": False},
+    ])
+    calls = []
+
+    async def _fake_update_tenant(conn, tenant_id, **fields):
+        calls.append((tenant_id, fields))
+
+    monkeypatch.setattr(db_module, "update_tenant", _fake_update_tenant)
+
+    out = await mh._dispatch_mcp_tool(
+        "reset_plugin_override", {"slot": "fs"}, db, "/tmp",
+        tenant={"id": "t1", "tunnel_plugins": stored},
+    )
+
+    assert out["ok"] is True
+    assert out["changed"] is True
+    assert out["plugin_name"] == "filesystem"
+    assert len(calls) == 1
+    tenant_id, fields = calls[0]
+    assert tenant_id == "t1"
+    remaining = json.loads(fields["tunnel_plugins"])
+    # filesystem's override is gone; code-intel's is untouched. Stored form is
+    # the normalized {plugin_name: override_dict} shape (matches
+    # put_tunnel_plugins' own storage convention), not the raw input list.
+    assert list(remaining.keys()) == ["code-intel"]
+
+
+@pytest.mark.asyncio
+async def test_reset_plugin_override_clears_entire_blob_when_last_override_removed(db, monkeypatch):
+    stored = json.dumps([{"name": "filesystem", "command": ["stale", "--from", "/old/path", "entry"]}])
+    calls = []
+
+    async def _fake_update_tenant(conn, tenant_id, **fields):
+        calls.append((tenant_id, fields))
+
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    monkeypatch.setattr(db_module, "update_tenant", _fake_update_tenant)
+
+    out = await mh._dispatch_mcp_tool(
+        "reset_plugin_override", {"slot": "fs"}, db, "/tmp",
+        tenant={"id": "t1", "tunnel_plugins": stored},
+    )
+    assert out["ok"] is True
+    _, fields = calls[0]
+    assert fields["tunnel_plugins"] is None, "empty override set -> NULL (built-in defaults)"
+
+
+@pytest.mark.asyncio
+async def test_reset_plugin_override_per_host(db, monkeypatch):
+    """hostname param resets only that machine's tunnel_plugins_by_host slice."""
+    by_host = {
+        "laptop-a": [{"name": "filesystem", "command": ["stale", "--from", "/a", "entry"]}],
+        "laptop-b": [{"name": "filesystem", "command": ["stale", "--from", "/b", "entry"]}],
+    }
+    calls = []
+
+    async def _fake_update_tenant(conn, tenant_id, **fields):
+        calls.append((tenant_id, fields))
+
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    monkeypatch.setattr(db_module, "update_tenant", _fake_update_tenant)
+
+    out = await mh._dispatch_mcp_tool(
+        "reset_plugin_override", {"slot": "fs", "hostname": "laptop-a"}, db, "/tmp",
+        tenant={"id": "t1", "tunnel_plugins_by_host": json.dumps(by_host)},
+    )
+    assert out["ok"] is True
+    assert out["changed"] is True
+    assert out["hostname"] == "laptop-a"
+    _, fields = calls[0]
+    remaining_by_host = json.loads(fields["tunnel_plugins_by_host"])
+    # laptop-a's override is fully gone (its only override was removed);
+    # laptop-b's is untouched.
+    assert "laptop-a" not in remaining_by_host
+    assert remaining_by_host["laptop-b"] == by_host["laptop-b"]
+
+
+# ---------------------------------------------------------------------------
 # ea2c7aed — cross-instance-aware tunnel reachability in list_plugins /
 # get_plugin_details.
 #

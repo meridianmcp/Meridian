@@ -1922,6 +1922,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string", "description": "Plugin name as returned by list_plugins (e.g. 'filesystem', 'code-intel', 'code-extractor')."}},
          "required": ["name"]}},
+    {"name": "reset_plugin_override", "description":
+        "Clear a tenant's stored command/config override for one plugin slot, "
+        "resetting it back to the built-in default. Fixes the gap where "
+        "stale_override detection (surfaced by list_plugins/get_plugin_details) "
+        "could flag a stale per-tenant override but nothing could programmatically "
+        "clear it — only dashboard editing worked. Self-hosted only for now: in "
+        "hosted mode, returns an explicit error rather than risk writing to the "
+        "wrong database (tunnel_plugins lives on the control-plane tenants table, "
+        "which this tool call's db handle cannot reach there) — use the dashboard's "
+        "Tunnel Plugins settings page for hosted tenants.",
+     "inputSchema": {"type": "object", "properties": {
+         "slot": {"type": "string", "description": "Plugin slot or name to reset (e.g. 'docs', 'outputs', or the plugin's 'name' field from list_plugins)."},
+         "hostname": {"type": "string", "description": "Optional: reset only this machine's override (tunnel_plugins_by_host) instead of the per-tenant default."}},
+         "required": ["slot"]}},
     {"name": "refresh_tool_manifest", "description":
         "Read-only: return the authoritative, compact manifest of ALL built-in "
         "Meridian MCP tools (name + one-line summary). Call this when you suspect "
@@ -2308,6 +2322,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     # plugin management
     "list_plugins":      "plugin",
     "get_plugin_details": "plugin",
+    "reset_plugin_override": "plugin",
     # config / infra
     "set_executor_config": "config",
     "set_active_repo":     "config",
@@ -2462,6 +2477,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "idle_until_all_done":       "both",
     "list_plugins":              "both",
     "get_plugin_details":        "both",
+    "reset_plugin_override":     "both",
     "refresh_tool_manifest":     "both",
     "ingest_document":           "both",
     "fan_out_sprint_items":      "both",  # orchestrators also use it; keep "both"
@@ -2682,6 +2698,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # plugin / manifest management
     "list_plugins":               "maintenance-only",
     "get_plugin_details":         "maintenance-only",
+    "reset_plugin_override":      "maintenance-only",
     "refresh_tool_manifest":      "maintenance-only",
     # analysis / graph
     "analyze_model_efficiency":   "maintenance-only",
@@ -2740,6 +2757,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",
     "get_plugin_details": "Get Plugin Details",
+    "reset_plugin_override": "Reset Plugin Override",
     "refresh_tool_manifest": "Refresh Tool Manifest",
     "set_active_repo": "Set Active Repo",
     "analyze_model_efficiency": "Analyze Model Efficiency",

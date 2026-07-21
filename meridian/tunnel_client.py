@@ -1781,11 +1781,19 @@ def _spawn_with_cache_retry(
         )
         _scoped_cache_clear(cmd, label)
         try:
-            return subprocess.Popen(cmd, env=env, **kwargs)
+            retried = subprocess.Popen(cmd, env=env, **kwargs)
+            _record_spawned_pid(retried, label)  # 6884a668
+            return retried
         except Exception:  # noqa: BLE001 — retry also failed; surface the original
             raise first_exc from None
 
-    # Popen succeeded. Check whether the process immediately exits with a
+    # Popen succeeded — record it in the all-spawned registry (6884a668)
+    # regardless of what happens next (TAR_ENTRY_ERROR retry below, or a
+    # long healthy life) so a future tunnel startup can find and kill it if
+    # it ever outlives this generation without ever binding to its expected
+    # port (the gap _kill_stale_port_occupant alone cannot close).
+    _record_spawned_pid(proc, label)
+    # Check whether the process immediately exits with a
     # TAR_ENTRY_ERROR — the 3db4f8d8 distinct failure class.
     # poll() after a tiny delay: a healthy server process won't have exited yet;
     # a broken extraction dies within milliseconds.
@@ -1810,7 +1818,9 @@ def _spawn_with_cache_retry(
             )
             _scoped_cache_clear(cmd, label)
         try:
-            return subprocess.Popen(cmd, env=env, **kwargs)
+            retried = subprocess.Popen(cmd, env=env, **kwargs)
+            _record_spawned_pid(retried, label)  # 6884a668
+            return retried
         except Exception as retry_exc:  # noqa: BLE001
             raise retry_exc from None
 
@@ -1974,6 +1984,162 @@ def _clear_slot_claim(port: int) -> None:
     """
     try:
         _slot_claim_path(port).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _all_spawned_registry_path() -> Path:
+    """Return the path to the durable registry of every child PID this
+    tunnel client has ever spawned (6884a668).
+
+    Distinct from ``_slot_claim_dir()``: a slot claim tracks WHICH PROCESS
+    currently HOLDS A GIVEN PORT (one file per port, overwritten on each
+    respawn). This registry tracks EVERY child process ever spawned via
+    :func:`_spawn_with_cache_retry`, regardless of whether it ever bound to
+    its expected port. Confirmed live: ``_kill_stale_port_occupant`` only
+    ever looks at whoever currently occupies a slot's EXPECTED port, so a
+    process that lost a startup race (two meridian-docs-mcp.exe/
+    meridian-outputs-mcp.exe instances spawned close together, one wins the
+    port bind, the other silently keeps running unbound to any port Meridian
+    checks) or a process orphaned from a still-earlier generation (8+ hours
+    observed live) is invisible to the port-occupant sweep forever. A single
+    JSON file (not per-port) since this is a flat list, appended to on every
+    spawn and fully cleared after each kill-pass.
+    """
+    return Path.home() / ".meridian" / "spawned_pids.json"
+
+
+def _record_spawned_pid(proc: object, label: str) -> None:
+    """Append a freshly-spawned child's identity to the all-spawned registry.
+
+    Takes the ``Popen``-like object itself (not a bare pid) and extracts
+    ``.pid`` inside its own try/except, so a test double or any object
+    missing that attribute degrades to a silent no-op rather than raising --
+    consistent with every other guard in this function being best-effort.
+
+    Best-effort, append-only: a read/write failure here must never block or
+    crash a spawn. Records the child's own ``create_time`` (when psutil is
+    available) so a later kill-pass can verify PID identity rather than
+    trusting a possibly PID-reused number (same hardening as the port-claim
+    file) -- AND the OWNING tunnel process's own pid + create_time
+    (``os.getpid()``, since this runs in-process inside the tunnel client
+    that did the spawning) so a later kill-pass on a DIFFERENT machine-wide
+    tunnel invocation can tell "orphan from a dead generation" (owning
+    tunnel no longer alive -- kill the child) apart from "still legitimately
+    owned by another currently-running tunnel" (owning tunnel alive -- leave
+    it alone), the same distinction :func:`_is_slot_claimed_by_live_client`
+    already makes for port occupants.
+    """
+    try:
+        pid = proc.pid  # type: ignore[attr-defined]
+        entry: "dict[str, object]" = {
+            "pid": pid, "label": label, "owner_tunnel_pid": os.getpid(),
+        }
+        try:
+            import psutil  # type: ignore
+            entry["create_time"] = psutil.Process(pid).create_time()
+            entry["owner_tunnel_create_time"] = psutil.Process(os.getpid()).create_time()
+        except Exception:  # noqa: BLE001 — psutil unavailable/pid already gone
+            pass
+        path = _all_spawned_registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:  # noqa: BLE001 — missing/corrupt file; start fresh
+            existing = []
+        existing.append(entry)
+        path.write_text(json.dumps(existing), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — best-effort, never block spawn
+        pass
+
+
+def _kill_all_previously_spawned_pids(label: str = "startup") -> None:
+    """Kill every process recorded in the all-spawned registry, then clear it.
+
+    Called once at tunnel startup, BEFORE the per-slot
+    ``_kill_stale_port_occupant`` sweep and before anything is spawned in
+    this generation — so every entry still in the registry at this point was
+    necessarily spawned by a PRIOR ``run_tunnel`` invocation (this one
+    hasn't spawned anything yet). Verifies PID + create_time before killing
+    (same PID-reuse guard as :func:`_is_slot_claimed_by_live_client`) so a
+    long-dead PID that the OS has since reassigned to an unrelated process
+    is never mistakenly killed. The registry is cleared unconditionally
+    afterward (whether or not psutil was available to verify) so it never
+    grows unbounded across restarts — this generation's spawns repopulate it
+    from empty via :func:`_record_spawned_pid`.
+
+    Best-effort and silent on any failure — this must never block tunnel
+    startup, mirroring :func:`_kill_stale_port_occupant`'s own contract.
+    """
+    path = _all_spawned_registry_path()
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(entries, list):
+            entries = []
+    except Exception:  # noqa: BLE001 — missing/corrupt file; nothing to do
+        entries = []
+    if entries:
+        try:
+            import psutil  # type: ignore
+        except Exception:  # noqa: BLE001 — psutil unavailable; can't verify, skip killing
+            psutil = None  # type: ignore
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            pid = entry.get("pid")
+            if not isinstance(pid, int):
+                continue
+            if psutil is not None:
+                try:
+                    proc = psutil.Process(pid)
+                    recorded_ct = entry.get("create_time")
+                    if recorded_ct is not None and abs(proc.create_time() - float(recorded_ct)) >= 1.0:
+                        continue  # PID was reused by an unrelated process -- not our orphan
+                except Exception:  # noqa: BLE001 — process already gone
+                    continue
+                # Owner-tunnel liveness guard (mirrors
+                # _is_slot_claimed_by_live_client): if the tunnel that
+                # spawned this child is STILL alive, it's a legitimately
+                # owned child of a different, currently-running tunnel
+                # invocation -- not an orphan. Only kill when the owner is
+                # confirmed gone (or the entry predates this field, in which
+                # case there's nothing to check against and it degrades to
+                # the original unconditional-kill behaviour).
+                owner_pid = entry.get("owner_tunnel_pid")
+                owner_ct = entry.get("owner_tunnel_create_time")
+                if isinstance(owner_pid, int) and owner_ct is not None:
+                    try:
+                        owner_proc = psutil.Process(owner_pid)
+                        if abs(owner_proc.create_time() - float(owner_ct)) < 1.0:
+                            continue  # owning tunnel still alive -- not our orphan to kill
+                    except Exception:  # noqa: BLE001 — owner process gone -- genuine orphan
+                        pass
+            print(
+                f"tunnel:{label}: killing previously-spawned orphan "
+                f"(pid {pid}, {entry.get('label', '?')}) from a prior generation",
+                flush=True,
+            )
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, check=False,
+                )
+            else:
+                try:
+                    stale = psutil.Process(pid)  # type: ignore[union-attr]
+                    stale.terminate()
+                    stale.wait(timeout=5)
+                except Exception:  # noqa: BLE001
+                    try:
+                        psutil.Process(pid).kill()  # type: ignore[union-attr]
+                    except Exception:  # noqa: BLE001
+                        pass
+    # Clear unconditionally -- this generation starts recording from empty.
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]", encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
 
@@ -3881,9 +4047,19 @@ async def _proc_watchdog(
             )
             backoff = min(max(backoff, poll_interval) * 2, _MAX_BACKOFF)
         try:
-            holder["proc"] = subprocess.Popen(
+            relaunched = subprocess.Popen(
                 holder["cmd"], env=holder.get("env"), **_spawn_kwargs()
             )
+            holder["proc"] = relaunched
+            # 6884a668 — this relaunch path is a DIRECT Popen, not
+            # _spawn_with_cache_retry, so it needs its own recording. The
+            # confirmed "duplicate same-second outputs processes" symptom
+            # smells exactly like a watchdog relaunch racing another spawn
+            # attempt for the same slot -- both survivors need to be
+            # trackable so a future tunnel startup can find and kill
+            # whichever one loses the port-binding race and is left running
+            # unbound to anything _kill_stale_port_occupant would ever check.
+            _record_spawned_pid(relaunched, label)
         except Exception as exc:  # noqa: BLE001 — count it, back off, may still recover
             print(f"tunnel:{label}: relaunch failed: {exc}", file=sys.stderr, flush=True)
 
@@ -4614,6 +4790,18 @@ async def run_tunnel(
         slot_proxies.append(op)
         if _persistent:
             persistent_slots.add(slot)
+
+    # 6884a668 — kill EVERY process this tunnel has ever spawned across all
+    # prior generations, not just whoever currently occupies an expected
+    # port. Runs first, before the per-port sweep below: _kill_stale_port_
+    # occupant only ever finds a process that is CURRENTLY LISTENING on a
+    # slot's port, so a process that lost a startup race (two instances
+    # spawned close together, one wins the bind) or one that was orphaned
+    # from a still-earlier generation without ever rebinding is invisible to
+    # it forever — confirmed live: one meridian-docs-mcp.exe survived 8+
+    # hours predating same-session fixes, plus duplicate same-second
+    # meridian-outputs-mcp.exe processes from a watchdog-relaunch race.
+    _kill_all_previously_spawned_pids()
 
     # 44892730 — before anything spawns, clear any stale prior-generation
     # process still bound to each registered slot's port (see
