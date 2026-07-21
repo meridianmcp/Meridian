@@ -2206,7 +2206,6 @@ def test_spawn_with_cache_retry_records_pid_on_success(tmp_path, monkeypatch):
     """Integration: a successful _spawn_with_cache_retry call records the
     child in the all-spawned registry (6884a668)."""
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
-    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
     monkeypatch.setattr(tc.time, "sleep", lambda n: None)
 
     class _FakeProc4:
