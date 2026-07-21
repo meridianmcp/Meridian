@@ -3467,6 +3467,24 @@ async def _migrate_pg_claim_verification_mode(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_handoff_tokens_consumed_at(conn: PostgresConnection) -> None:
+    """b763d2ba — handoff_tokens.consumed_at (mirrors SQLite).
+
+    Nullable ISO-8601 UTC timestamp of when a token was actually consumed,
+    decoupling a consumed row's retention window (how long
+    verify_handoff_token can still honestly report "already_consumed" instead
+    of a purged-away "not_found") from the token's own short mint-time TTL.
+    See db.migrations._migrate_handoff_tokens_consumed_at for the full
+    2026-07-21 false-positive-spoofing-alarm writeup.
+
+    ADD COLUMN IF NOT EXISTS is idempotent; existing rows default to NULL.
+    Mirrors db._migrate_handoff_tokens_consumed_at.
+    """
+    await conn.executescript(
+        "ALTER TABLE handoff_tokens ADD COLUMN IF NOT EXISTS consumed_at TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3558,4 +3576,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tool_priority_map,
     _migrate_pg_sprint_item_github_channel,
     _migrate_pg_claim_verification_mode,
+    _migrate_pg_handoff_tokens_consumed_at,
 )
