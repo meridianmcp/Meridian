@@ -1177,12 +1177,6 @@ async def _handle_mcp_request(
                     # WHOLE tunnel-tools fetch to 5s regardless of slot count/health
                     # staleness; a timeout here degrades to native-only (same signal
                     # shape as the existing generic-exception branch below).
-                    # 6941fd0f — this wait_for's cancellation is not the only thing
-                    # bounding per-slot latency any more: live connection-event
-                    # timing showed this still not reliably cutting off at 5s (see
-                    # tunnel.py's _SLOT_TOOLS_FETCH_BUDGET), so _fetch_slot_tools now
-                    # also self-bounds via plain wall-clock time, independent of
-                    # whether this wait_for's cancellation actually reaches it.
                     import asyncio as _asyncio  # noqa: PLC0415
                     try:
                         tunnel_tools = await _asyncio.wait_for(

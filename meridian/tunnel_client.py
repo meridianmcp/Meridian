@@ -55,6 +55,35 @@ _MAX_BACKOFF = 30.0
 # slow-but-alive relay never trips it, while still bounding genuine dead-peer
 # detection to a reasonable ping_interval + ping_timeout = ~65s worst case.
 _WS_PING_TIMEOUT = 45.0
+# 0b3ea61a — every websockets.connect() below sets ping_interval/ping_timeout
+# explicitly (676e53a3, above) but never set open_timeout — the CONNECT itself
+# (TCP+TLS+HTTP Upgrade handshake) silently inherited the websockets library's
+# own default (10s in websockets 16.x). That default governs the earliest leg
+# of the tunnel's connection sequence, BEFORE any ping/pong or relayed request
+# even begins, and is completely independent of MCP_TIMEOUT — MCP_TIMEOUT is a
+# `claude` CLI environment variable read by that separate process entirely; it
+# has no wiring anywhere in this repo (confirmed: no reference outside a
+# sprint-tracking note) and cannot reach this client's own websockets.connect()
+# call. A cold Fly.io machine wake (auto_start_machines, fly.toml) or a slow
+# network path can plausibly exceed 10s without being anywhere near unhealthy,
+# so an unconfigured, silently-inherited 10s ceiling here is a real gap: it can
+# flatly fail a connect attempt that would have succeeded a few seconds later
+# (matching the observed "2 of 3 consecutive attempts time out, the 3rd
+# succeeds" pattern as the machine finishes booting). Configurable via
+# MERIDIAN_TUNNEL_CONNECT_TIMEOUT for power users, mirroring the exact
+# env-var-with-fallback convention _run_cmd_timeout() already uses below.
+def _tunnel_connect_timeout() -> float:
+    raw = os.environ.get("MERIDIAN_TUNNEL_CONNECT_TIMEOUT", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    return 30.0
+
+
 # 13161001 — close code 1012 ("Service Restart", RFC 6455 IANA registry) means
 # the server is cycling on purpose (deploy/restart), not that the connection
 # failed. websockets only treats codes 1000/1001 as a clean close that exits
@@ -980,6 +1009,7 @@ async def _run_connection_lazy(
     try:
         async with websockets.connect(
             ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
+            open_timeout=_tunnel_connect_timeout(),
         ) as ws:
             print(f"tunnel:{label}: connected (lazy mode)", flush=True)
             local_base = f"http://127.0.0.1:{proxy.port}"
@@ -1229,6 +1259,7 @@ async def _run_extract_pool_connection(
     try:
         async with websockets.connect(
             ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
+            open_timeout=_tunnel_connect_timeout(),
         ) as ws:
             print(f"tunnel:{label}: connected (Serena daemon pool)", flush=True)
             async with httpx.AsyncClient() as http_client:
@@ -3728,6 +3759,7 @@ async def _run_connection(
     local_base = f"http://127.0.0.1:{port}"
     async with websockets.connect(
         ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
+        open_timeout=_tunnel_connect_timeout(),
     ) as ws:
         print(f"tunnel:{label}: connected", flush=True)
         async with httpx.AsyncClient() as http_client:
