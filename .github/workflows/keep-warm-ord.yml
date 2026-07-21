@@ -1,0 +1,48 @@
+name: Keep ord region warm
+
+# 4da86be7 — Fly.io's min_machines_running guarantee only covers an app's
+# PRIMARY region (iad here); confirmed against Fly's own docs/community
+# ("the min_machines_running setting currently only applies to your
+# designated primary region, not to other regions your app may be deployed
+# in") — there is no per-region min-warm config. The secondary region (ord,
+# placed by ensure-regions in deploy.yml) therefore fully auto-stops when
+# idle, and the next real request Cloudflare/Fly edge-routes there pays a
+# genuine cold start — confirmed live: a fly-force-region: ord request timed
+# out after 15s+ while the same request to iad answered instantly (HTTP 200)
+# in the same test. This is the exact "2 of 3 connection attempts hang, 3rd
+# succeeds once warm" symptom this item was filed to fix.
+#
+# Honest limitation (see scripts/keep_warm_region.py's own docstring): GitHub
+# Actions scheduled-workflow cron is not a real-time guarantee and can be
+# delayed under platform load. This narrows the cold-start window to an
+# occasional, load-dependent gap instead of eliminating it outright — a hard
+# guarantee would need Fly to ship real per-region min_machines_running, or
+# an always-on process outside GitHub Actions. Out of scope here; this is the
+# best available mechanism given the platform's current constraints.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes -- GitHub Actions' minimum supported interval
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Health URL to ping (default: prod)'
+        required: false
+        default: 'https://usemeridian.us/health'
+        type: string
+      region:
+        description: 'Fly region to force-route to and keep warm'
+        required: false
+        default: 'ord'
+        type: string
+
+jobs:
+  keep-warm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ping secondary region to keep it warm
+        run: |
+          python3 scripts/keep_warm_region.py \
+            --url "${{ github.event.inputs.url || 'https://usemeridian.us/health' }}" \
+            --region "${{ github.event.inputs.region || 'ord' }}"

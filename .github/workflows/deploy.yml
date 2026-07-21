@@ -351,9 +351,23 @@ jobs:
   # region outage can't take prod down. Idempotent — `scale count` just sets
   # desired state. Non-fatal: a scaling hiccup must not fail the deploy, and
   # idle machines auto-stop so the second region adds little steady-state cost.
+  #
+  # 4da86be7 — this job's `if` previously required `github.event_name == 'push'`,
+  # but the REAL prod-deploy trigger under normal operation is `workflow_dispatch`
+  # (fired automatically by the dev->main auto-promote path; see the workflow_run
+  # trigger + auto-promote job above). A direct `push` to main only happens on
+  # rare manual/incident occasions. Confirmed live: `flyctl regions list -a
+  # meridian-hosted` showed ONLY `iad` (zero `ord` machines) despite this job
+  # existing, and `gh run list` history showed ensure-regions skipped (0s) on
+  # every recent workflow_dispatch-triggered deploy. So under real, everyday
+  # operation this job never actually ran, and the intended iad+ord spread was
+  # never applied — the second region only ever existed after one of the rare
+  # direct-push incidents, and was never re-asserted since. Widening the
+  # condition to also cover workflow_dispatch makes it actually fire on every
+  # real prod deploy, matching the `deploy` job's own effective trigger scope.
   ensure-regions:
     needs: deploy
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
