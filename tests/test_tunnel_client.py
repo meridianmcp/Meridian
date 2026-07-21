@@ -2022,6 +2022,209 @@ def test_is_slot_claimed_by_live_client_no_claim_file(tmp_path, monkeypatch):
     assert tc._is_slot_claimed_by_live_client(9005, "my-client") is False
 
 
+def test_record_spawned_pid_writes_registry_entry(tmp_path, monkeypatch):
+    """_record_spawned_pid writes a JSON list entry with pid/label/owner fields."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+
+    class _FakeProc3:
+        pid = 4242
+
+    tc._record_spawned_pid(_FakeProc3(), "docs")
+
+    entries = json.loads(tc._all_spawned_registry_path().read_text())
+    assert len(entries) == 1
+    assert entries[0]["pid"] == 4242
+    assert entries[0]["label"] == "docs"
+    assert entries[0]["owner_tunnel_pid"] == os.getpid()
+
+
+def test_record_spawned_pid_appends_to_existing_registry(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+
+    class _FakeProc3:
+        def __init__(self, pid):
+            self.pid = pid
+
+    tc._record_spawned_pid(_FakeProc3(1), "docs")
+    tc._record_spawned_pid(_FakeProc3(2), "outputs")
+
+    entries = json.loads(tc._all_spawned_registry_path().read_text())
+    assert [e["pid"] for e in entries] == [1, 2]
+
+
+def test_record_spawned_pid_survives_object_with_no_pid_attribute(tmp_path, monkeypatch):
+    """6884a668: a Popen-like object missing .pid must not crash the spawn path."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+
+    class _NoPid:
+        pass
+
+    tc._record_spawned_pid(_NoPid(), "docs")  # must not raise
+    assert not tc._all_spawned_registry_path().exists()
+
+
+def test_kill_all_previously_spawned_pids_kills_genuine_orphan(tmp_path, monkeypatch):
+    """A recorded child whose OWNER tunnel is dead is a genuine orphan -- killed."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    registry = tc._all_spawned_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps([
+        {"pid": 555, "label": "docs", "create_time": 1000.0,
+         "owner_tunnel_pid": 111, "owner_tunnel_create_time": 2000.0},
+    ]))
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    killed = {}
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            if self.pid == 555:
+                return 1000.0  # matches -- genuine child, not PID-reused
+            raise Exception("owner tunnel pid no longer exists")  # 111 is dead
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+        def wait(self, timeout=None):
+            pass
+
+    fake_psutil.Process = _FakeProc
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_all_previously_spawned_pids()
+
+    assert killed.get("terminate") == [555]
+    # Registry cleared after the sweep.
+    assert json.loads(registry.read_text()) == []
+
+
+def test_kill_all_previously_spawned_pids_spares_live_owner_tunnel(tmp_path, monkeypatch):
+    """A recorded child whose OWNER tunnel is STILL alive is left alone --
+    it belongs to a different, currently-running tunnel invocation."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    registry = tc._all_spawned_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps([
+        {"pid": 555, "label": "docs", "create_time": 1000.0,
+         "owner_tunnel_pid": 111, "owner_tunnel_create_time": 2000.0},
+    ]))
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    killed = {}
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            # Both the child and its owner tunnel are still alive and match.
+            return 1000.0 if self.pid == 555 else 2000.0
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+    fake_psutil.Process = _FakeProc
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_all_previously_spawned_pids()
+
+    assert killed == {}, "child owned by a still-live different tunnel must not be killed"
+    # Registry still cleared -- this generation starts recording from empty.
+    assert json.loads(registry.read_text()) == []
+
+
+def test_kill_all_previously_spawned_pids_skips_pid_reused_entry(tmp_path, monkeypatch):
+    """If the recorded create_time no longer matches, the PID was reused by an
+    unrelated process -- must not be killed."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    registry = tc._all_spawned_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps([
+        {"pid": 555, "label": "docs", "create_time": 1000.0,
+         "owner_tunnel_pid": 111, "owner_tunnel_create_time": 2000.0},
+    ]))
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    killed = {}
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            return 9999.0  # mismatch for every pid -- reused
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+    fake_psutil.Process = _FakeProc
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_all_previously_spawned_pids()
+
+    assert killed == {}
+
+
+def test_kill_all_previously_spawned_pids_survives_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    tc._kill_all_previously_spawned_pids()  # must not raise
+
+
+def test_kill_all_previously_spawned_pids_clears_registry_even_without_psutil(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    registry = tc._all_spawned_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps([{"pid": 1, "label": "x"}]))
+
+    import builtins
+    real_import = builtins.__import__
+
+    def _fail_psutil_import(name, *a, **kw):
+        if name == "psutil":
+            raise ImportError("no psutil")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _fail_psutil_import)
+
+    tc._kill_all_previously_spawned_pids()  # must not raise
+    assert json.loads(registry.read_text()) == []
+
+
+def test_spawn_with_cache_retry_records_pid_on_success(tmp_path, monkeypatch):
+    """Integration: a successful _spawn_with_cache_retry call records the
+    child in the all-spawned registry (6884a668)."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.time, "sleep", lambda n: None)
+
+    class _FakeProc4:
+        pid = 7777
+        returncode = None
+
+        def poll(self):
+            return None  # still running -- no TAR-error path
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _FakeProc4())
+
+    result = tc._spawn_with_cache_retry(["npx", "-y", "some-tool"], None, "docs")
+
+    assert result.pid == 7777
+    entries = json.loads(tc._all_spawned_registry_path().read_text())
+    assert any(e["pid"] == 7777 and e["label"] == "docs" for e in entries)
+
+
 def test_kill_stale_port_occupant_spares_live_client_process(tmp_path, monkeypatch):
     """aaddb273 scenario 1: a live second client's process is NOT killed.
 
