@@ -4244,6 +4244,108 @@ async def _handle_plugin_tools(
             }
         return result
 
+    if name == "reset_plugin_override":
+        # c889a1cc — stale_override/_is_stale_local_from_override (tunnel_plugins.py)
+        # correctly DETECTS a stale per-tenant plugin override, but there was no MCP
+        # tool to actually CLEAR one -- only dashboard editing (routes/tunnel.py's
+        # put_tunnel_plugins) could write tunnel_plugins/tunnel_plugins_by_host.
+        from ..tunnel_plugins import (  # noqa: PLC0415
+            BUILTIN_PLUGINS, normalize_plugins_config, parse_plugins_by_host, resolve_plugins,
+        )
+
+        slot_or_name = str(args.get("slot") or "").strip()
+        if not slot_or_name:
+            return {"error": "slot is required"}
+
+        # aiosqlite.Connection type annotation aside, `db` here is resolved per
+        # request by meridian._deps._db(): "Otherwise -> app.state.db" (self-host)
+        # but "Hosted mode + session/Bearer -> tenant's own Neon DB" -- a DIFFERENT
+        # connection than the control-plane one tunnel_plugins/tenants actually
+        # lives on. Writing via this handle would either fail (no tenants table in
+        # the tenant DB) or silently touch the wrong database. The shared
+        # (name, args, db, data_dir, tenant, _mcp_tenant_id) signature every
+        # dispatch group in this file uses makes threading a second,
+        # control-plane-specific db handle through just for this one tool a much
+        # larger change than this fix warrants -- refuse honestly in hosted mode
+        # rather than risk a silent wrong-db write.
+        if _hosted_mode() and tenant is not None:
+            return {
+                "error": (
+                    "reset_plugin_override cannot run over MCP in hosted mode yet -- "
+                    "tunnel_plugins lives on the control-plane tenants table, which "
+                    "this tool call's db handle (the tenant's own data-plane database) "
+                    "cannot reach. Use the dashboard's Tunnel Plugins settings page "
+                    "instead for hosted tenants."
+                )
+            }
+
+        target = next(
+            (p for p in BUILTIN_PLUGINS if p["slot"] == slot_or_name or p["name"] == slot_or_name),
+            None,
+        )
+        if target is None:
+            return {
+                "error": f"unknown plugin slot/name: {slot_or_name!r}. "
+                         "Call list_plugins to see available plugins."
+            }
+        plugin_name = target["name"]
+        hostname = (args.get("hostname") or "").strip() or None
+        tenant_id = tenant.get("id") if tenant else None
+        if tenant_id is None:
+            return {"error": "no tenant context available for this call"}
+
+        if hostname:
+            by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+            host_cfg = normalize_plugins_config(by_host.get(hostname))
+            if plugin_name not in host_cfg:
+                return {
+                    "ok": True, "changed": False, "slot": slot_or_name,
+                    "plugin_name": plugin_name, "hostname": hostname,
+                    "message": "no override was set for this slot on this host",
+                }
+            host_cfg.pop(plugin_name, None)
+            if host_cfg:
+                by_host[hostname] = host_cfg
+            else:
+                by_host.pop(hostname, None)  # host's config now empty -- drop it
+            stored_by_host = json.dumps(by_host) if by_host else None
+            await db_module.update_tenant(db, tenant_id, tunnel_plugins_by_host=stored_by_host)
+            effective_cfg = host_cfg
+        else:
+            # normalize_plugins_config (via _iter_plugin_items) only accepts an
+            # already-parsed dict/list -- a raw JSON string (the actual stored
+            # form of tenants.tunnel_plugins) falls through both isinstance
+            # checks and silently yields {} every time. parse_plugins_by_host
+            # (used in the hostname branch above) already does this parsing
+            # internally; the default-config path needs the same step here,
+            # mirroring server.py's own _parsed_tunnel_plugins helper.
+            _raw_tunnel_plugins = tenant.get("tunnel_plugins")
+            if isinstance(_raw_tunnel_plugins, str) and _raw_tunnel_plugins.strip():
+                try:
+                    _raw_tunnel_plugins = json.loads(_raw_tunnel_plugins)
+                except Exception:  # noqa: BLE001
+                    _raw_tunnel_plugins = None
+            cfg = normalize_plugins_config(_raw_tunnel_plugins)
+            if plugin_name not in cfg:
+                return {
+                    "ok": True, "changed": False, "slot": slot_or_name,
+                    "plugin_name": plugin_name, "hostname": None,
+                    "message": "no override was set for this slot",
+                }
+            cfg.pop(plugin_name, None)
+            stored = json.dumps(cfg) if cfg else None  # empty -> NULL (built-in default)
+            await db_module.update_tenant(db, tenant_id, tunnel_plugins=stored)
+            effective_cfg = cfg
+
+        return {
+            "ok": True,
+            "changed": True,
+            "slot": slot_or_name,
+            "plugin_name": plugin_name,
+            "hostname": hostname,
+            "plugins": resolve_plugins(effective_cfg),
+        }
+
     return _MISS
 
 
