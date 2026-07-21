@@ -1177,6 +1177,12 @@ async def _handle_mcp_request(
                     # WHOLE tunnel-tools fetch to 5s regardless of slot count/health
                     # staleness; a timeout here degrades to native-only (same signal
                     # shape as the existing generic-exception branch below).
+                    # 6941fd0f — this wait_for's cancellation is not the only thing
+                    # bounding per-slot latency any more: live connection-event
+                    # timing showed this still not reliably cutting off at 5s (see
+                    # tunnel.py's _SLOT_TOOLS_FETCH_BUDGET), so _fetch_slot_tools now
+                    # also self-bounds via plain wall-clock time, independent of
+                    # whether this wait_for's cancellation actually reaches it.
                     import asyncio as _asyncio  # noqa: PLC0415
                     try:
                         tunnel_tools = await _asyncio.wait_for(
@@ -3162,7 +3168,7 @@ async def _handle_session_tools(
     """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log,
     get_session_activity, get_agent_instructions, set_agent_instructions,
     set_executor_config, idle_until_session_done, search_all, search_synthesis,
-    paper_search, social_search, get_session_brief.
+    paper_search, social_search, github_search, get_session_brief.
 
     81abd31f — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -3191,6 +3197,7 @@ async def _handle_session_tools(
         handle_social_search,
         handle_get_session_brief,
     )
+    from .handlers.research_tools import handle_github_search  # noqa: PLC0415
 
     # Tools that need no extra context beyond the standard five parameters.
     _standard_dispatch: dict[str, Any] = {
@@ -3210,6 +3217,7 @@ async def _handle_session_tools(
         "search_synthesis": handle_search_synthesis,
         "paper_search": handle_paper_search,
         "social_search": handle_social_search,
+        "github_search": handle_github_search,
         "get_session_brief": handle_get_session_brief,
     }
 
