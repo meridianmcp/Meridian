@@ -651,6 +651,7 @@ async def handle_search_all(
     return await db_module.search_all(
         db, args["project_id"], args["query"],
         limit=args.get("limit", 10),
+        expand=bool(args.get("expand", False)),
     )
 
 

@@ -1789,7 +1789,9 @@ def build_mcp_server():
                     "List sprint items for a project. Optional status filter "
                     "(todo|pending|in_progress|done|failed|skipped|pushed). "
                     "Pass human=false to exclude human-assigned tasks (default: true). "
-                    "Cold sessions read this to know what's still owed."
+                    "Cold sessions read this to know what's still owed. By default, items "
+                    "sharing a parent_id or item_group collapse into one summary row per "
+                    "cluster — pass expand=true for the full ungrouped list."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1806,6 +1808,10 @@ def build_mcp_server():
                         "human": {
                             "type": "boolean",
                             "description": "Include items with milestone_type='human'. Default: true. Pass false to hide human tasks (used by executor sessions).",
+                        },
+                        "expand": {
+                            "type": "boolean",
+                            "description": "Default false: collapse parent_id/item_group clusters (2+ items) into one summary row each. Pass true for the full ungrouped item list.",
                         },
                     },
                     "required": [],
@@ -2467,10 +2473,13 @@ def build_mcp_server():
                 except ValueError as exc:
                     result = {"error": str(exc)}
             elif name == "get_sprint_items":
-                result = await db_module.get_sprint_items(
+                _sh_items = await db_module.get_sprint_items(
                     db,
                     arguments["project_id"],
                     status=arguments.get("status"),
+                )
+                result = db_module.collapse_sprint_item_clusters(
+                    _sh_items, expand=bool(arguments.get("expand", False))
                 )
             elif name == "complete_task":
                 task = await db_module.get_task(db, arguments["task_id"])

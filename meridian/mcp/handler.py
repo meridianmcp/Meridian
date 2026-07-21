@@ -192,6 +192,16 @@ async def _build_executor_goal_messages(
         _goal_settings = await db_module.get_project_settings(db, pid)
     except Exception:  # noqa: BLE001
         _goal_settings = None
+    # d5849a67 — same durable pointer-evidence resolution as generate_handoff,
+    # so this template's excluded_unprospected list also agrees with what
+    # claim_sprint_item will actually enforce. Guarded, fail-open.
+    _tpl_pointer_evidence_ids = None
+    try:
+        _tpl_pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+            db, [it.get("id") for it in pending]
+        )
+    except Exception:  # noqa: BLE001
+        _tpl_pointer_evidence_ids = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         version=scoped_version,
@@ -200,6 +210,7 @@ async def _build_executor_goal_messages(
             project.get("execution_mode")
         ),
         max_turns=_max_turns_from_settings(_goal_settings),
+        pointer_evidence_ids=_tpl_pointer_evidence_ids,
     )
     if pending:
         item_lines = "\n".join(
@@ -3896,6 +3907,30 @@ async def _handle_planning_tools(
                     f"get_session_brief(project_id, session_id="
                     f"'{latest_h.get('session_id')}')."
                 )
+        # 9d8e858c — default-collapse parent_id/item_group clusters (2+ items)
+        # into one summary row each so the brief isn't flooded by fanned-out
+        # subtasks; expand=true restores the pre-9d8e858c full list. Applied
+        # to the raw items (which still carry parent_id/item_group) BEFORE
+        # the brief's compact per-item projection below, since a collapsed
+        # summary row has a different shape than a plain sprint item.
+        _pb_expand = bool(args.get("expand", False))
+        _collapsed_pending = db_module.collapse_sprint_item_clusters(
+            pending_items, expand=_pb_expand
+        )
+        _collapsed_in_progress = db_module.collapse_sprint_item_clusters(
+            in_progress, expand=_pb_expand
+        )
+
+        def _brief_item_row(
+            it: dict[str, Any], title_cap: int, include_version: bool
+        ) -> dict[str, Any]:
+            if it.get("collapsed"):
+                return it
+            row = {"id": it["id"], "title": (it.get("title") or "")[:title_cap]}
+            if include_version:
+                row["version"] = it.get("version")
+            return row
+
         return {
             "project_id": project_id,
             "project_name": project.get("name"),
@@ -3903,12 +3938,10 @@ async def _handle_planning_tools(
             "north_star": (goal.get("north_star") or "") if goal else "",
             "pending_count": len(pending_items),
             "pending_items": [
-                {"id": it["id"], "title": (it.get("title") or "")[:120], "version": it.get("version")}
-                for it in pending_items[:10]
+                _brief_item_row(it, 120, True) for it in _collapsed_pending[:10]
             ],
             "in_progress": [
-                {"id": it["id"], "title": (it.get("title") or "")[:80]}
-                for it in in_progress
+                _brief_item_row(it, 80, False) for it in _collapsed_in_progress
             ],
             "recent_tasks": [
                 {"description": (t.get("description") or "")[:80], "status": t.get("status")}
@@ -4668,9 +4701,20 @@ async def _handle_code_index_tools(
     _mcp_tenant_id: Any,
 ) -> Any:
     """Dispatch group: search_code_semantic (93fce816 — Cursor-style local code
-    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS)
-    and prospect_symbol (2ce5bc76 — three-rung fallback chain for robust
-    symbol prospecting)."""
+    index: tree-sitter chunks + Merkle-incremental reindex + hybrid BM25/VSS),
+    prospect_symbol (2ce5bc76 — three-rung fallback chain for robust
+    symbol prospecting), and get_flag_registry (45802b67 — AST scan of
+    os.environ.get()/os.getenv() call sites into a flat flag inventory)."""
+    if name == "get_flag_registry":
+        from .. import flag_registry as _flag_registry  # noqa: PLC0415
+        root_dir = str(args.get("root_dir") or "").strip()
+        if not root_dir:
+            root_dir = os.getcwd()
+        # Tolerate an accidentally-quoted path, same normalization as the
+        # search_code_semantic root_dir handling below.
+        if len(root_dir) >= 2 and root_dir[0] == root_dir[-1] and root_dir[0] in ("'", '"'):
+            root_dir = root_dir[1:-1]
+        return await asyncio.to_thread(_flag_registry.get_flag_registry, root_dir)
     if name == "prospect_symbol":
         symbol = str(args.get("symbol") or "").strip()
         if not symbol:

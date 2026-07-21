@@ -51,6 +51,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
     "annotate_outputs": 'annotate_outputs(outputs_dir="/repo/outputs", path="/repo/outputs/run_42", note="PCA on, BFS off — final params", run_params={"lr": 0.001, "epochs": 100})',
     "search_code_semantic": 'search_code_semantic(root_dir="/repo/src", query="parse the auth token and refresh it")',
+    "get_flag_registry": 'get_flag_registry(root_dir="/repo/src")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -854,6 +855,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "kind": {"type": "string", "description": "Optional chunk-kind filter: one of 'function', 'class', 'method', 'interface', 'enum', 'module'."},
          "reindex": {"type": "boolean", "description": "Default true — run an incremental Merkle-diff reindex before searching so results reflect the current tree. Set false to search the last-built index as-is."}},
          "required": ["root_dir", "query"]}},
+    {"name": "get_flag_registry", "description":
+        "45802b67 — scan a source tree for `os.environ.get(...)` / `os.getenv(...)` "
+        "call sites (AST-based, not regex) and return a flat inventory of every "
+        "config flag the codebase reads: {flag_name, file, line, default}. "
+        "Only call sites where the flag name is a STRING LITERAL first argument "
+        "are included — dynamic names (a variable, f-string, etc.) are skipped "
+        "gracefully rather than erroring. The default is best-effort literal-eval'd "
+        "from the second positional arg (or a `default=` keyword); a non-literal "
+        "default evaluates to null. Useful for auditing config drift — 'what env "
+        "flags exist, where are they read, what do they default to' — without "
+        "grepping by hand. Returns {repo_root, flags:[...], count, "
+        "unique_flag_names:[...], unique_count}. A missing/empty tree returns an "
+        "empty flags list, never an error.",
+     "inputSchema": {"type": "object", "properties": {
+         "root_dir": {"type": "string", "description": "Absolute path to the source-tree root to scan recursively (vendored/build/cache dirs like node_modules/.git/dist/__pycache__ are pruned). Defaults to the server's current working directory (the current project's repo root) when omitted."}},
+         "required": []}},
     {"name": "prospect_symbol", "description":
         "2ce5bc76 — ROBUST symbol prospecting with a three-rung fallback chain: "
         "tries codebase__search_graph FIRST (fast, graph-indexed); when it returns "
@@ -901,23 +918,33 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "{\"type\":\"range\", \"start_line\":3, \"end_line\":4}} = 'these lines, within "
         "this function'. A subSelector is itself a FULL selector and MUST carry its OWN "
         "explicit \"type\" (it does not inherit the parent's). source_type names the "
-        "domain (code | docs | citation | …). Malformed pointers are rejected with a "
+        "domain (code | docs | citation | …). Each target may also carry "
+        "target_kind: \"existing\" | \"planned_new\" (300a063d) — set \"existing\" ONLY "
+        "when the file/symbol already exists (this is checked against the real "
+        "filesystem and REJECTED if the path isn't there); set \"planned_new\" for a "
+        "file this sprint item will CREATE, which is explicitly exempt from that check. "
+        "Omitting target_kind keeps the pre-existing, unchecked behavior (defaults to "
+        "\"existing\" in the stored shape but is never filesystem-verified) — set it "
+        "explicitly to get real verification. Malformed pointers are rejected with a "
         "clear error: a bad/missing selector.type, a missing required selector field "
-        "(e.g. node_id without \"id\", or a subSelector with no \"type\"). Returns the "
-        "stored pointer.",
+        "(e.g. node_id without \"id\", a subSelector with no \"type\", an invalid "
+        "target_kind, or target_kind=\"existing\" at a path that doesn't exist). "
+        "Returns the stored pointer.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
          "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | … (free text)."},
          "targets": {"type": "array", "description":
-             "Non-empty array of {uri, selector, subSelector?} targets. Each selector is "
-             "an object carrying an explicit \"type\" plus that type's field: range "
-             "{\"type\":\"range\", start_line, end_line, start_char?, end_char?}; symbol "
-             "{\"type\":\"symbol\", qualified_name}; node_id {\"type\":\"node_id\", id} "
-             "(field is \"id\", NOT \"value\"); zotero_key {\"type\":\"zotero_key\", key}. "
-             "An optional subSelector is itself a full selector and MUST carry its own "
-             "\"type\".",
+             "Non-empty array of {uri, selector, subSelector?, target_kind?} targets. "
+             "Each selector is an object carrying an explicit \"type\" plus that type's "
+             "field: range {\"type\":\"range\", start_line, end_line, start_char?, "
+             "end_char?}; symbol {\"type\":\"symbol\", qualified_name}; node_id "
+             "{\"type\":\"node_id\", id} (field is \"id\", NOT \"value\"); zotero_key "
+             "{\"type\":\"zotero_key\", key}. An optional subSelector is itself a full "
+             "selector and MUST carry its own \"type\". target_kind is \"existing\" "
+             "(default; explicit \"existing\" is verified against the real filesystem) "
+             "or \"planned_new\" (a file not created yet — exempt from that check).",
              "items": {"type": "object"}},
          "label": {"type": "string", "description": "Optional human-readable label for the pointer."}},
          "required": ["sprint_item_id", "source_type", "targets"]}},
@@ -1464,10 +1491,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "assumptions, the last session's output (last_session), and a new-handoff signal. "
         "No session registration needed. Designed for planning chat sessions that need to see "
         "project state without side effects. Pass `since` (a prior call's generated_at) to flag "
-        "only handoffs filed since you last checked.",
+        "only handoffs filed since you last checked. pending_items/in_progress default-collapse "
+        "any parent_id/item_group cluster (2+ items) into one summary row — pass expand=true "
+        "for the full ungrouped list.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "since": {"type": "string", "description": "Optional ISO timestamp (a prior brief's generated_at). When given, new_handoff_available flags only handoffs filed after it."}},
+         "since": {"type": "string", "description": "Optional ISO timestamp (a prior brief's generated_at). When given, new_handoff_available flags only handoffs filed after it."},
+         "expand": {"type": "boolean", "description": "Default false: collapse parent_id/item_group clusters in pending_items/in_progress into one summary row each. Pass true for the full ungrouped list."}},
          "required": []}},
     {"name": "refresh_context", "description":
         "Single-call post-compaction recovery for planning chats. Returns a "
@@ -1482,13 +1512,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "get_sprint_items", "description":
         "Read-only: List sprint items for a project. Optional status filter "
         "(todo|pending|in_progress|provisional_complete|done|failed|skipped|pushed|indeterminate). "
-        "Cold sessions read this to know what's still owed.",
+        "Cold sessions read this to know what's still owed. By default, items sharing a "
+        "``parent_id`` (subtasks) or ``item_group`` collapse into one summary row per "
+        "cluster ({collapsed, cluster_kind, item_group_or_parent, count, done, description, ids}) "
+        "instead of listing every item — pass expand=true for the full ungrouped list.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "status": {"type": "string",
                     "enum": ["pending", "todo", "in_progress", "provisional_complete",
                              "done", "failed", "skipped", "pushed", "indeterminate"],
-                    "description": "Filter by status."}},
+                    "description": "Filter by status."},
+         "expand": {"type": "boolean",
+                    "description": "Default false: collapse parent_id/item_group clusters "
+                    "(2+ items) into one summary row each. Pass true for the full "
+                    "ungrouped item list (pre-9d8e858c behavior)."}},
          "required": []}},
     {"name": "get_parallelizable_groups", "description":
         "Read-only: Return clusters of pending sprint items that are safe to run "
@@ -1667,11 +1704,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "search_all", "description":
         "Read-only: Universal search across all project content: tasks, notes, pinned decisions, "
         "and sprint items. Uses LIKE matching (SQLite) or ILIKE (Postgres). "
-        "Returns grouped results: {tasks, notes, decisions, sprint_items, total}.",
+        "Returns grouped results: {tasks, notes, decisions, sprint_items, total}. "
+        "sprint_items default-collapse any parent_id/item_group cluster (2+ items) into one "
+        "summary row — pass expand=true for the full ungrouped list.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "query": {"type": "string"},
-         "limit": {"type": "integer", "description": "Max results per type (default 10)."}},
+         "limit": {"type": "integer", "description": "Max results per type (default 10)."},
+         "expand": {"type": "boolean", "description": "Default false: collapse parent_id/item_group clusters in sprint_items into one summary row each. Pass true for the full ungrouped list."}},
          "required": ["query"]}},
     {"name": "search_synthesis", "description":
         "Read-only: Natural-language search that returns a short, CITED answer "
@@ -2136,6 +2176,7 @@ _READ_ONLY_TOOLS = {
     "search_outputs",
     "search_code_semantic",
     "prospect_symbol",
+    "get_flag_registry",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
     "get_custom_hooks",
@@ -2284,6 +2325,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     # code-intel
     "search_code_semantic": "code-intel",
     "prospect_symbol":      "code-intel",
+    "get_flag_registry":    "code-intel",
     "search_outputs":       "code-intel",
     "annotate_outputs":     "code-intel",
     "snapshot_graph_metrics": "code-intel",
@@ -2461,6 +2503,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "dismiss_hitl":              "both",
     "search_code_semantic":      "both",
     "prospect_symbol":           "both",
+    "get_flag_registry":         "both",
     "search_outputs":            "both",
     "get_document_structure":    "both",
     "get_latex_structure":       "both",
@@ -2588,6 +2631,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # code-intel (used when searching codebase)
     "search_code_semantic":       "common-support",
     "prospect_symbol":            "common-support",
+    "get_flag_registry":          "common-support",
     "search_outputs":             "common-support",
     "annotate_outputs":           "common-support",
     # sprint decomposition / pointers
@@ -2775,6 +2819,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "search_code_semantic": "Search Code Semantic",
     "run_verification": "Run Verification",
     "prospect_symbol": "Prospect Symbol",
+    "get_flag_registry": "Get Flag Registry",
     "search_server_logs": "Search Server Logs",
     "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }

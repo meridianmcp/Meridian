@@ -3934,6 +3934,7 @@ async def search_all(
     project_id: str,
     query: str,
     limit: int = 10,
+    expand: bool = False,
 ) -> dict[str, Any]:
     """Universal search across task_log, project_notes, sprint_items, and decisions_pinned.
 
@@ -3960,6 +3961,12 @@ async def search_all(
     ``snippet`` key — a short window of the matching body text centered on the
     query term (empty string when no body field matched, e.g. a title-only
     match).
+
+    9d8e858c — ``sprint_items`` default-collapse (``expand=False``, the
+    default) any cluster sharing a ``parent_id`` or ``item_group`` (2+ items)
+    into one summary row via :func:`collapse_sprint_item_clusters`, mirroring
+    ``get_sprint_items``/``get_planning_brief``. Pass ``expand=True`` for the
+    full ungrouped match list (pre-9d8e858c behavior).
     """
     is_pg = hasattr(db, "_pool")
     op = "ILIKE" if is_pg else "LIKE"
@@ -4016,7 +4023,8 @@ async def search_all(
             "created_at DESC LIMIT ?"
         )
         sprint_sql = (
-            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "SELECT id, title, notes, version, status, parent_id, item_group, "
+            "added_at AS created_at, 'sprint_item' AS match_type "
             "FROM sprint_items "
             f"WHERE project_id = ? AND {tv_sprint} @@ websearch_to_tsquery('english', ?) "
             f"ORDER BY ts_rank({tv_sprint}, websearch_to_tsquery('english', ?)) DESC, "
@@ -4088,7 +4096,8 @@ async def search_all(
             "ORDER BY _match_score DESC, created_at DESC LIMIT ?"
         )
         sprint_sql = (
-            f"SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type, {sc_sprint} AS _match_score "
+            f"SELECT id, title, notes, version, status, parent_id, item_group, "
+            f"added_at AS created_at, 'sprint_item' AS match_type, {sc_sprint} AS _match_score "
             "FROM sprint_items "
             f"WHERE project_id = ? AND {w_sprint} "
             "ORDER BY _match_score DESC, added_at DESC LIMIT ?"
@@ -4116,6 +4125,12 @@ async def search_all(
         d["snippet"] = _search_snippet(d.get("body"), query)
     for s in sprint_items:
         s["snippet"] = _search_snippet(s.get("notes"), query)
+
+    # 9d8e858c — default-collapse sprint_items sharing a parent_id/item_group
+    # (2+ items) into one summary row each; expand=True keeps every match.
+    # Applied last (after snippet attachment) so a pass-through item still
+    # carries its snippet.
+    sprint_items = collapse_sprint_item_clusters(sprint_items, expand=expand)
 
     return {
         "query": query,
@@ -10303,6 +10318,7 @@ from .sprint_items import (  # noqa: F401
     build_github_completion_comment,
     build_sprint_items_xml,
     claim_sprint_item,
+    collapse_sprint_item_clusters,
     complete_sprint_item,
     complete_wave_gate,
     configure_wave_gate,
@@ -10316,6 +10332,7 @@ from .sprint_items import (  # noqa: F401
     get_parallelizable_groups,
     get_sprint_item,
     get_sprint_item_pointers,
+    get_pointer_evidence_item_ids,
     get_sprint_items,
     get_sprint_items_cached,
     get_sprint_items_for_resource,
@@ -10365,6 +10382,8 @@ from .sprint_items import (  # noqa: F401
     _advance_task_chain,
     _invalidate_sprint_items_cache,
     _is_manual_sprint_item,
+    _item_declares_resources,
+    is_item_claim_prospected,
     _maybe_rollup_parent,
     _parse_deferral_ts,
     _split_wave_label,

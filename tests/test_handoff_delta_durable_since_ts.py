@@ -67,9 +67,13 @@ async def test_delta_scopes_by_durable_prior_handoff_not_memory_cache(db, tmp_pa
 @pytest.mark.asyncio
 async def test_delta_with_no_prior_handoff_at_all_still_shows_everything(db, tmp_path, monkeypatch):
     """A session's genuinely FIRST delta call (no prior handoff anywhere) has no
-    well-defined lower bound — showing everything is the correct, unchanged
-    behavior for that case. Only a session with a real durable prior handoff
-    should get scoped."""
+    "last handoff" boundary to read from the handoffs table. 7732e096: it is
+    NOT unbounded, though -- since_ts falls back to this session's own
+    ``created_at`` (session start), so items completed at/after the session
+    started still show. This test's single item is added+completed AFTER the
+    session is registered, so it lands inside that window either way; see
+    tests/test_7732e096_delta_session_scope.py for the case that proves items
+    completed BEFORE the session started are correctly excluded."""
     monkeypatch.setattr(handoff_module, "_SESSION_HANDOFF_STATE", {})
 
     p = await db_module.create_project(db, "delta-first-ever")

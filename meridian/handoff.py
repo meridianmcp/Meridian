@@ -32,7 +32,7 @@ import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from . import db as db_module
-from .db.sprint_items import _is_deferred, _item_is_unprospected, _split_wave_label
+from .db.sprint_items import _is_deferred, is_item_claim_prospected, _split_wave_label
 from .executor_config import build_executor_config_block, has_executor_config
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -758,6 +758,7 @@ def _build_quick_start_goal(
     wave_gate_pending: list[dict[str, Any]] | None = None,
     tool_priority_map: dict[str, str] | None = None,
     force_included_ids: "frozenset[str] | set[str] | None" = None,
+    pointer_evidence_ids: "frozenset[str] | set[str] | None" = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -806,6 +807,16 @@ def _build_quick_start_goal(
     does NOT already carry its own item-level ``required_tool`` pin — gets
     the same hard, unconditional ``<workspace_tool_priority>`` directive that
     an explicit pin gets. ``None``/empty means no workspace default is set.
+
+    ``pointer_evidence_ids`` (d5849a67) — the caller-precomputed set of pending
+    item ids that have >=1 durable row in ``sprint_item_pointers`` (see
+    ``db.get_pointer_evidence_item_ids``). This is the SAME evidence signal
+    ``claim_sprint_item`` checks at claim time, so the ``excluded_unprospected``
+    tag built below is guaranteed to agree with what claim will actually
+    enforce — see ``is_item_claim_prospected``. ``None`` means "unknown /
+    query failed" and is treated as fail-open (nothing is excluded on that
+    basis) rather than "confirmed no evidence" (which would risk mass-excluding
+    every resource-declaring item on a transient DB hiccup).
     """
     try:
         _turns = int(max_turns)
@@ -850,25 +861,38 @@ def _build_quick_start_goal(
         if it.get("id") in _force_included or not _is_backburner_sprint_item(it)
     ]
     _backburner_note = _build_backburner_todo_note(_backburner_items)
-    # 94c26322 — STRUCTURAL PROSPECTING GATE: an item with no real prospecting
-    # evidence (no code_pointers / pointers, no confirmed prospect_status) MUST
-    # NOT be silently included in the auto-run claimable batch. The ONLY exception
-    # is an explicit human-set bypass flag (prospect_bypass=True on the item).
-    # Without evidence AND without bypass: the item is excluded here AND surfaced
-    # as a visible, structured warning in the /goal output — NOT buried prose.
-    # This is the same class of fix as dec69708 (deferred_until enforcement):
-    # a mechanism already existed (prospecting_status / code_pointers), it just
-    # wasn't wired into the one place that makes it protective (goal generation).
+    # 94c26322/d5849a67 — STRUCTURAL PROSPECTING GATE: an item that DECLARED
+    # real code-touching resources (touches_resources) but has no durable
+    # pointer evidence (sprint_item_pointers) MUST NOT be silently included in
+    # the auto-run claimable batch. The ONLY exception is an explicit human-set
+    # bypass flag (prospect_bypass=True on the item). Without evidence AND
+    # without bypass: the item is excluded here AND surfaced as a visible,
+    # structured warning in the /goal output — NOT buried prose. This is the
+    # same class of fix as dec69708 (deferred_until enforcement): a mechanism
+    # already existed (sprint_item_pointers / prospect_bypass), it just wasn't
+    # wired into the one place that makes it protective (goal generation).
+    #
+    # d5849a67 — this loop now calls is_item_claim_prospected(), the SAME
+    # shared helper claim_sprint_item's own gate uses, with the SAME durable
+    # evidence signal (pointer_evidence_ids, batch-resolved from
+    # sprint_item_pointers — NOT the transient enrichment-time code_pointers/
+    # pointers/prospect_status fields the old check here used). Previously the
+    # two checks disagreed in both directions: this loop could exclude items
+    # claim_sprint_item never even gates (no declared touches_resources), and
+    # could pass through items with a "prospected" in-memory annotation that
+    # were never actually persisted to sprint_item_pointers — so claim refused
+    # them anyway despite them not appearing in <excluded_unprospected>.
     _excluded_unprospected: list[dict[str, Any]] = []
     _included_sprint_items: list[dict[str, Any]] = []
     for _it in pending_sprint_items:
-        _has_bypass = bool(_it.get("prospect_bypass"))
-        # 94c26322 — enrichment_failure_only=True: only exclude items that went
-        # through enrichment and got an explicit failure status. Items that have
-        # never been enriched (no prospect_status) are left in the batch — they
-        # are "not yet tried", not "confirmed failures". This prevents the gate
-        # from blocking plain DB items or items added before enrichment runs.
-        if _has_bypass or not _item_is_unprospected(_it, enrichment_failure_only=True):
+        # Fail-open when pointer_evidence_ids is None (query failed / not
+        # supplied): treat as "has evidence" so a transient DB hiccup never
+        # mass-excludes the batch.
+        _has_evidence = (
+            True if pointer_evidence_ids is None
+            else _it.get("id") in pointer_evidence_ids
+        )
+        if is_item_claim_prospected(_it, has_pointer_evidence=_has_evidence):
             _included_sprint_items.append(_it)
         else:
             _excluded_unprospected.append(_it)
@@ -2739,6 +2763,26 @@ def _render_delta_handoff(
     ``diagnostic_tasks`` (77a29c8b), when non-empty, surfaces recent blocked/found
     entries so repeated gate failures are not silently dropped from delta mode.
     """
+    # bc834237 — cap the pending list so a large backlog never bloats the delta
+    # payload. Delta is richer than starter (session-continuity context), so the
+    # cap is 20 items (vs starter's 3) with titles truncated to 150 chars
+    # (vs starter's 80 but consistent with the 200-char diagnostic precedent).
+    # Selection is priority-ranked (urgent > high > normal > low), NOT raw
+    # incoming order: _prepare_pending_sprint_items only sorts by dependency
+    # topology, which has no relationship to priority, so a genuinely urgent
+    # item could otherwise land past position 20 purely by chance and be
+    # silently hidden. A stable sort preserves the caller's relative ordering
+    # within each priority tier.
+    _DELTA_PENDING_CAP = 20
+    # 7732e096 — completed_items had ZERO cap, unlike pending (bc834237): a
+    # session's first delta call on a project with a long completed-item
+    # history (even after the since_ts scoping fix above) could still iterate
+    # every historical done/skipped/failed/pushed item with full untruncated
+    # titles. Mirror the exact same cap/truncation pattern used for pending
+    # (same 20-item cap, same 150-char title truncation, same "+N more"
+    # summary line) so this section is bounded the same way.
+    _DELTA_COMPLETED_CAP = 20
+    _DELTA_TITLE_MAX = 150
     # 04f03ee4 — one-liner start instruction at very top of delta output
     lines = [
         f"To start fresh: start_session(project_name=\"{project['name']}\", session_name=\"describe-what-youre-doing\"{_human_id_clause(identity)})  # project_id={project['id']}",
@@ -2758,22 +2802,15 @@ def _render_delta_handoff(
         lines.append("")
     lines.append("Completed since last handoff:")
     if completed_items:
-        for item in completed_items:
-            lines.append(f"- {item['id']} — {item['title']}")
+        shown_completed = completed_items[:_DELTA_COMPLETED_CAP]
+        hidden_completed = completed_items[_DELTA_COMPLETED_CAP:]
+        for item in shown_completed:
+            short_title = (item.get("title") or "").strip()[:_DELTA_TITLE_MAX]
+            lines.append(f"- {item['id']} — {short_title}")
+        if hidden_completed:
+            lines.append(f"  +{len(hidden_completed)} more completed")
     else:
         lines.append("- none")
-    # bc834237 — cap the pending list so a large backlog never bloats the delta
-    # payload. Delta is richer than starter (session-continuity context), so the
-    # cap is 20 items (vs starter's 3) with titles truncated to 150 chars
-    # (vs starter's 80 but consistent with the 200-char diagnostic precedent).
-    # Selection is priority-ranked (urgent > high > normal > low), NOT raw
-    # incoming order: _prepare_pending_sprint_items only sorts by dependency
-    # topology, which has no relationship to priority, so a genuinely urgent
-    # item could otherwise land past position 20 purely by chance and be
-    # silently hidden. A stable sort preserves the caller's relative ordering
-    # within each priority tier.
-    _DELTA_PENDING_CAP = 20
-    _DELTA_TITLE_MAX = 150
     _PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
     lines += ["", "Pending:"]
     if pending_sprint_items:
@@ -3943,6 +3980,14 @@ async def generate_handoff(
             session_names.setdefault(t["session_id"], "(unknown-session)")
     except Exception:  # noqa: BLE001 — cross-check is best-effort
         pass
+    # d5849a67 — batch-resolve durable pointer evidence for the pending batch so
+    # the excluded_unprospected list below uses the SAME evidence signal
+    # claim_sprint_item checks per-item (sprint_item_pointers rows), not the
+    # transient enrichment-time code_pointers/pointers annotations. None on
+    # failure (fail-open — see _build_quick_start_goal's docstring).
+    _pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+        db, [it.get("id") for it in pending_sprint_items]
+    )
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=db_module.normalize_execution_mode(
@@ -3963,6 +4008,9 @@ async def generate_handoff(
         # deferred exclusion below; that override exists specifically to bring
         # a deferred item back into scope for this one call.
         force_included_ids=frozenset(force_include_ids) if force_include_ids else None,
+        # d5849a67 — durable pointer evidence, batch-resolved above, so the
+        # excluded_unprospected tag agrees with claim_sprint_item's own gate.
+        pointer_evidence_ids=_pointer_evidence_ids,
     )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
@@ -4023,6 +4071,24 @@ async def generate_handoff(
                     since_ts = _prior[0].get("created_at") or since_ts
             except Exception:  # noqa: BLE001 — durable lookup is best-effort
                 pass
+        # 7732e096 — a session's genuinely FIRST delta call (no in-memory value,
+        # no durable prior-handoff row for this session_id) previously left
+        # since_ts as None, which _completed_after treats as "no lower bound":
+        # the "Completed since last handoff" list then dumped the ENTIRE
+        # project's historical done/skipped/failed/pushed items (confirmed live:
+        # 496KB+, reproduced worse at 577KB). There genuinely is no "last
+        # handoff" boundary on a first call, but there IS a natural scope for
+        # a per-SESSION delta: this session's own start time. Fall back to the
+        # session row's created_at so a fresh session's first delta reports
+        # "what's happened since I started", not "everything that ever
+        # happened on this project" — scoped and bounded either way, and the
+        # completed_items cap below (mirroring bc834237's pending cap) is a
+        # second, independent bound for pathological cases (e.g. a long-lived
+        # session that has been open for weeks).
+        if since_ts is None and session_id:
+            _sess_row = next((s for s in sessions if s.get("id") == session_id), None)
+            if _sess_row:
+                since_ts = _sess_row.get("created_at")
         completed_items = [
             item for item in sprint_items_all
             if item.get("status") in {"done", "skipped", "failed", "pushed"}
@@ -4097,11 +4163,30 @@ async def generate_handoff(
     # 302db181 — computed session span: first + last activity, distinct calendar
     # days touched, total elapsed wall-clock. Built server-side from the real
     # task_log + session timestamps (handles both datetime (PG) and str (SQLite)).
-    session_span = compute_session_span(
-        [t.get("created_at") for t in tasks]
-        + [s.get("created_at") for s in sessions]
-        + [s.get("last_seen") for s in sessions]
-    )
+    # 7732e096 — for mode='delta' this footer previously pulled from `tasks` /
+    # `sessions`, which are PROJECT-WIDE (get_tasks/get_sessions have no
+    # session_id filter) — so a session open for an hour would report a span
+    # covering the project's entire multi-week history. 'full' intentionally
+    # keeps the project-wide span (it IS a whole-project state dump), but delta
+    # is a per-session update, so scope its footer to just this session: only
+    # this session's own task_log rows plus its own created_at/last_seen.
+    if mode == "delta" and session_id:
+        _span_sess_row = next((s for s in sessions if s.get("id") == session_id), None)
+        _span_timestamps = [
+            t.get("created_at") for t in tasks if t.get("session_id") == session_id
+        ]
+        if _span_sess_row:
+            _span_timestamps += [
+                _span_sess_row.get("created_at"),
+                _span_sess_row.get("last_seen"),
+            ]
+        session_span = compute_session_span(_span_timestamps)
+    else:
+        session_span = compute_session_span(
+            [t.get("created_at") for t in tasks]
+            + [s.get("created_at") for s in sessions]
+            + [s.get("last_seen") for s in sessions]
+        )
     span_block = _render_session_span_block(session_span)
     if span_block:
         content = f"{content}\n\n{span_block}"
@@ -4478,6 +4563,16 @@ async def _generate_starter_handoff(
         _s_wave_gate_pending = await db_module.get_wave_gate_configs(db, project["id"])
     except Exception:  # noqa: BLE001
         _s_wave_gate_pending = None
+    # d5849a67 — see the twin comment in generate_handoff: batch-resolve durable
+    # pointer evidence so the starter handoff's excluded_unprospected list also
+    # agrees with claim_sprint_item's own gate. Guarded, fail-open.
+    _s_pointer_evidence_ids = None
+    try:
+        _s_pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+            db, [it.get("id") for it in pending]
+        )
+    except Exception:  # noqa: BLE001
+        _s_pointer_evidence_ids = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=db_module.normalize_execution_mode(
@@ -4492,6 +4587,7 @@ async def _generate_starter_handoff(
         wave_gate_pending=_s_wave_gate_pending,
         # 490e100d — workspace-level default tool priority per task category.
         tool_priority_map=(_s_ws_settings or {}).get("tool_priority_map"),
+        pointer_evidence_ids=_s_pointer_evidence_ids,
     )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
