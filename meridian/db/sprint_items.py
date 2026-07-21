@@ -3278,6 +3278,82 @@ def build_sprint_items_xml(items: list[dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
+def collapse_sprint_item_clusters(
+    items: list[dict[str, Any]],
+    expand: bool = False,
+) -> list[dict[str, Any]]:
+    """9d8e858c — collapse item_group/parent_id clusters into summary rows.
+
+    Shared by get_sprint_items, get_planning_brief, and search_all so a
+    caller browsing the board sees one line per logical cluster of work
+    instead of every fanned-out subtask/grouped item individually. Reuses
+    the existing ``parent_id`` (set by :func:`add_subtask`/:func:`split_sprint_item`)
+    and ``item_group`` (set by :func:`add_sprint_item`'s ``group`` arg) columns —
+    no new schema.
+
+    ``expand=True`` returns ``items`` unchanged (today's full-detail shape) —
+    this is the backward-compatible default callers relied on before this
+    item, so any pre-existing caller that explicitly wants the raw list can
+    still get it.
+
+    ``expand=False`` (the new default) groups items by ``parent_id`` if set,
+    else by ``item_group`` if set. Items with neither field, and clusters
+    that only contain a single item, pass through unchanged. Clusters with
+    2+ items collapse into ONE summary row:
+    ``{"collapsed": True, "cluster_kind": "parent_id"|"item_group",
+    "item_group_or_parent": <the shared id/name>, "count": N, "done": X,
+    "description": "<first item's title, truncated>", "ids": [...]}``
+    where ``X`` is how many of the N items have ``status == "done"``.
+
+    Relative ordering is preserved: a standalone item or the first-seen
+    cluster keeps its original position among the returned rows.
+    """
+    if expand:
+        return items
+
+    from collections import OrderedDict  # noqa: PLC0415
+
+    def _cluster_key(it: dict[str, Any]) -> tuple[str, Any] | None:
+        pid = it.get("parent_id")
+        if pid:
+            return ("parent_id", pid)
+        grp = it.get("item_group")
+        if grp:
+            return ("item_group", grp)
+        return None
+
+    # OrderedDict keyed by the cluster key (or a unique per-item sentinel for
+    # standalone items) so first-seen order is preserved across the mix of
+    # collapsed summaries and pass-through items.
+    buckets: OrderedDict[Any, list[dict[str, Any]]] = OrderedDict()
+    for idx, it in enumerate(items):
+        key = _cluster_key(it)
+        if key is None:
+            key = ("__standalone__", idx)
+        buckets.setdefault(key, []).append(it)
+
+    result: list[dict[str, Any]] = []
+    for key, group_items in buckets.items():
+        if key[0] == "__standalone__" or len(group_items) < 2:
+            result.extend(group_items)
+            continue
+        cluster_kind, cluster_id = key
+        done_count = sum(1 for it in group_items if it.get("status") == "done")
+        description = (group_items[0].get("title") or "").strip()
+        if len(description) > 80:
+            description = description[:77] + "..."
+        result.append({
+            "collapsed": True,
+            "cluster_kind": cluster_kind,
+            "item_group_or_parent": cluster_id,
+            "count": len(group_items),
+            "done": done_count,
+            "description": description,
+            "ids": [it.get("id") for it in group_items],
+        })
+    return result
+
+
 # ---------------------------------------------------------------------------
 # SECTION 4: Lines 7070-7151 — sprint item pointers
 # ---------------------------------------------------------------------------

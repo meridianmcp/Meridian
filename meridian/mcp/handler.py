@@ -3896,6 +3896,30 @@ async def _handle_planning_tools(
                     f"get_session_brief(project_id, session_id="
                     f"'{latest_h.get('session_id')}')."
                 )
+        # 9d8e858c — default-collapse parent_id/item_group clusters (2+ items)
+        # into one summary row each so the brief isn't flooded by fanned-out
+        # subtasks; expand=true restores the pre-9d8e858c full list. Applied
+        # to the raw items (which still carry parent_id/item_group) BEFORE
+        # the brief's compact per-item projection below, since a collapsed
+        # summary row has a different shape than a plain sprint item.
+        _pb_expand = bool(args.get("expand", False))
+        _collapsed_pending = db_module.collapse_sprint_item_clusters(
+            pending_items, expand=_pb_expand
+        )
+        _collapsed_in_progress = db_module.collapse_sprint_item_clusters(
+            in_progress, expand=_pb_expand
+        )
+
+        def _brief_item_row(
+            it: dict[str, Any], title_cap: int, include_version: bool
+        ) -> dict[str, Any]:
+            if it.get("collapsed"):
+                return it
+            row = {"id": it["id"], "title": (it.get("title") or "")[:title_cap]}
+            if include_version:
+                row["version"] = it.get("version")
+            return row
+
         return {
             "project_id": project_id,
             "project_name": project.get("name"),
@@ -3903,12 +3927,10 @@ async def _handle_planning_tools(
             "north_star": (goal.get("north_star") or "") if goal else "",
             "pending_count": len(pending_items),
             "pending_items": [
-                {"id": it["id"], "title": (it.get("title") or "")[:120], "version": it.get("version")}
-                for it in pending_items[:10]
+                _brief_item_row(it, 120, True) for it in _collapsed_pending[:10]
             ],
             "in_progress": [
-                {"id": it["id"], "title": (it.get("title") or "")[:80]}
-                for it in in_progress
+                _brief_item_row(it, 80, False) for it in _collapsed_in_progress
             ],
             "recent_tasks": [
                 {"description": (t.get("description") or "")[:80], "status": t.get("status")}

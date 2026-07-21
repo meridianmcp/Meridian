@@ -597,7 +597,13 @@ async def handle_get_sprint_items(
                     _items[_i] = {**_it, "stale_warning": True, "stale_age_hours": round(_age_h, 1)}
             except Exception:  # noqa: BLE001
                 pass
-    return _items
+    # 9d8e858c — default-collapse item_group/parent_id clusters into one
+    # summary row each so a caller browsing the board isn't flooded by every
+    # fanned-out subtask; expand=true (default false) restores the full list.
+    _expand = args.get("expand", False)
+    if isinstance(_expand, str):
+        _expand = _expand.lower() not in ("false", "0", "no", "")
+    return db_module.collapse_sprint_item_clusters(_items, expand=bool(_expand))
 
 
 async def handle_get_parallelizable_groups(
