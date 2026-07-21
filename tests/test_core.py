@@ -5096,6 +5096,28 @@ async def test_workspace_settings_refresh_config_defaults(db):
     assert ws["auto_refresh_enabled"] is False
     assert ws["refresh_interval_turns"] == 10
     assert ws["refresh_triggers"] is None
+    # db0361bb — separate, smaller floor for the trigger branch defaults to 3.
+    assert ws["refresh_trigger_min_interval"] == 3
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_refresh_trigger_min_interval_roundtrip(db):
+    """refresh_trigger_min_interval (db0361bb) is a stored, configurable
+    setting distinct from refresh_interval_turns, and is clamped to >= 1."""
+    ws = await db_module.update_workspace_settings(
+        db, refresh_trigger_min_interval=5,
+    )
+    assert ws["refresh_trigger_min_interval"] == 5
+    # Persists on re-read.
+    ws2 = await db_module.get_workspace_settings(db)
+    assert ws2["refresh_trigger_min_interval"] == 5
+    # Clamped to a minimum of 1.
+    ws3 = await db_module.update_workspace_settings(db, refresh_trigger_min_interval=0)
+    assert ws3["refresh_trigger_min_interval"] == 1
+    # Untouched by a refresh_interval_turns-only update.
+    ws4 = await db_module.update_workspace_settings(db, refresh_interval_turns=20)
+    assert ws4["refresh_trigger_min_interval"] == 1
+    assert ws4["refresh_interval_turns"] == 20
 
 
 @pytest.mark.asyncio
@@ -13366,6 +13388,72 @@ async def test_dispatch_context_refresh_skips_executor_session(db):
         db, "/tmp",
     )
     assert "_context_refresh" not in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_trigger_branch_has_own_floor(db):
+    """db0361bb — the trigger branch (add_insight/pin_decision/etc.) previously
+    fired on EVERY matching call with no rate limit at all; refresh_interval_turns
+    only gated the periodic fallback. Back-to-back trigger calls must now respect
+    a separate, smaller floor (refresh_trigger_min_interval, default 3 calls)
+    instead of compounding a fresh refresh on every single call."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-trigger-floor")
+    # A large periodic interval isolates the trigger-branch floor being tested
+    # (the periodic fallback branch would otherwise never fire in this test).
+    await db_module.update_workspace_settings(
+        db, auto_refresh_enabled=True, refresh_interval_turns=100,
+    )
+
+    async def _pin(n):
+        return await srv._dispatch_mcp_tool(
+            "pin_decision",
+            {
+                "project_id": pid, "session_id": sid,
+                "title": f"D{n}", "body": "body", "category": "TECHNICAL",
+            },
+            db, "/tmp",
+        )
+
+    r1 = await _pin(1)
+    assert "_context_refresh" in r1, "first trigger call in a session still fires immediately"
+    r2 = await _pin(2)
+    assert "_context_refresh" not in r2, "back-to-back trigger call within the floor must not re-fire"
+    r3 = await _pin(3)
+    assert "_context_refresh" not in r3, "still within the default 3-call floor"
+    r4 = await _pin(4)
+    assert "_context_refresh" in r4, "floor elapsed (3 calls since the last fire) — fires again"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_trigger_floor_is_configurable(db):
+    """refresh_trigger_min_interval is a stored, workspace-configurable
+    setting, not a hardcoded constant — lowering it changes trigger-branch
+    rate limiting behavior."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-trigger-configurable")
+    await db_module.update_workspace_settings(
+        db, auto_refresh_enabled=True, refresh_interval_turns=100,
+        refresh_trigger_min_interval=1,
+    )
+
+    async def _insight(n):
+        return await srv._dispatch_mcp_tool(
+            "add_insight",
+            {"project_id": pid, "session_id": sid, "title": f"T{n}", "body": "B"},
+            db, "/tmp",
+        )
+
+    r1 = await _insight(1)
+    r2 = await _insight(2)
+    assert "_context_refresh" in r1
+    assert "_context_refresh" in r2, "floor of 1 allows firing on every consecutive trigger call"
 
 
 @pytest.mark.asyncio

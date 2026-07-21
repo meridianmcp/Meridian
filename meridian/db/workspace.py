@@ -857,7 +857,7 @@ async def get_workspace_settings(
         "log_task_sprint_nudge_threshold, handoff_template, "
         "execution_mode_default, code_intel_enabled_default, "
         "loop_enabled_default, auto_refresh_enabled, refresh_interval_turns, "
-        "refresh_triggers, handoff_inline_pointers, "
+        "refresh_triggers, refresh_trigger_min_interval, handoff_inline_pointers, "
         "active_session_warning_minutes, manual_issue_screening_enabled, "
         "tool_priority_map, claim_verification_mode, updated_at "
         "FROM workspace_settings"
@@ -895,6 +895,10 @@ async def get_workspace_settings(
         except Exception:  # noqa: BLE001 — malformed row ⇒ fall back to default
             _refresh_triggers = None
     _interval = data.get("refresh_interval_turns")
+    # db0361bb — separate, smaller floor (in calls) that gates the
+    # TRIGGER-branch nudge specifically (distinct from refresh_interval_turns,
+    # which only gates the periodic fallback branch). NULL/missing ⇒ 3.
+    _trigger_min_interval_raw = data.get("refresh_trigger_min_interval")
     # 36fea6ca — inline-resolved-pointers toggle. Missing column/row ⇒ True
     # (default on); a stored 0 keeps pointers DB-only in the handoff.
     _inline_ptrs = data.get("handoff_inline_pointers")
@@ -942,6 +946,9 @@ async def get_workspace_settings(
         "auto_refresh_enabled": bool(data.get("auto_refresh_enabled")),
         "refresh_interval_turns": (int(_interval) if _interval is not None else 10) or 10,
         "refresh_triggers": _refresh_triggers,
+        "refresh_trigger_min_interval": max(
+            1, int(_trigger_min_interval_raw) if _trigger_min_interval_raw is not None else 3
+        ),
         "handoff_inline_pointers": (True if _inline_ptrs is None else bool(_inline_ptrs)),
         "active_session_warning_minutes": _active_session_warning_minutes,
         # 5dfe34b2 / cd495afa — OFF-by-default opt-in toggle. Deliberately NOT a
@@ -972,6 +979,7 @@ async def update_workspace_settings(
     auto_refresh_enabled: "bool | int | str | None" = None,
     refresh_interval_turns: int | None = None,
     refresh_triggers: "list[str] | str | None" = None,
+    refresh_trigger_min_interval: int | None = None,
     handoff_inline_pointers: "bool | int | str | None" = None,
     active_session_warning_minutes: int | None = None,
     tool_priority_map: "dict[str, str] | str | None" = None,
@@ -979,6 +987,14 @@ async def update_workspace_settings(
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
+
+    ``refresh_trigger_min_interval`` (db0361bb) — minimum number of dispatch
+    calls that must elapse since the last context-refresh fire before a
+    trigger tool (add_insight, pin_decision, etc.) is allowed to fire another
+    one. Distinct from ``refresh_interval_turns``, which only gates the
+    periodic fallback branch — before this setting existed, the trigger
+    branch had no rate limit at all, so back-to-back trigger calls each
+    injected a fresh refresh with zero spacing. Minimum 1 call; default 3.
 
     Only the fields passed (non-None) are changed. ``sprint_name_default=""``
     or ``display_name=""`` explicitly clears that label. ``execution_mode_default=""``
@@ -1066,6 +1082,10 @@ async def update_workspace_settings(
             params.append(refresh_triggers.strip() or None)
         else:
             params.append(None)
+    if refresh_trigger_min_interval is not None:
+        # db0361bb — at least 1 call between trigger-branch refreshes.
+        updates.append("refresh_trigger_min_interval = ?")
+        params.append(max(1, int(refresh_trigger_min_interval)))
     if handoff_inline_pointers is not None:
         # 36fea6ca — inline resolved pointers in the handoff. Truthy/1 → 1,
         # falsey/0 (incl. the strings "0"/"false") → 0.

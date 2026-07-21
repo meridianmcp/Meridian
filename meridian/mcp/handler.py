@@ -4886,6 +4886,18 @@ async def _dispatch_mcp_tool(
                                     else _PLANNER_REFRESH_TRIGGERS
                                 )
                                 _interval = settings.get("refresh_interval_turns") or 10
+                                # db0361bb — separate, smaller floor for the
+                                # trigger branch, distinct from the periodic
+                                # fallback's refresh_interval_turns. Without
+                                # this, back-to-back trigger-tool calls (e.g.
+                                # pin_decision, pin_decision, pin_decision)
+                                # each injected a fresh refresh with zero
+                                # spacing, compounding context bloat over a
+                                # long chat. Configurable (not hardcoded) —
+                                # see workspace_settings.refresh_trigger_min_interval.
+                                _trigger_min_interval = (
+                                    settings.get("refresh_trigger_min_interval") or 3
+                                )
                                 _calls = _state["calls"]
                                 _last = _state["last_refresh"]
                                 # edd9c54b — amend path: suppress the
@@ -4897,8 +4909,18 @@ async def _dispatch_mcp_tool(
                                     and isinstance(_result, dict)
                                     and _result.get("amended") is True
                                 )
+                                # _last == 0 ⇒ no refresh has ever fired for
+                                # this session yet, so a trigger tool still
+                                # fires immediately (unchanged first-fire
+                                # behavior); once a refresh has fired at least
+                                # once, subsequent trigger fires must wait at
+                                # least _trigger_min_interval calls, same as
+                                # the periodic branch waits _interval calls.
+                                _trigger_ready = (
+                                    _last == 0 or (_calls - _last) >= _trigger_min_interval
+                                )
                                 _fire = (
-                                    (name in enabled_triggers and not _amended_handoff)
+                                    (name in enabled_triggers and not _amended_handoff and _trigger_ready)
                                     or (_calls - _last) >= _interval
                                 )
                                 # One-per-call: only fire if we haven't already

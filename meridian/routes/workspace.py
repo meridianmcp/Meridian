@@ -155,6 +155,7 @@ async def update_workspace_settings_endpoint(
     """Patch workspace-global defaults. Only the fields passed are changed."""
     nudge_thresh = body.get("log_task_sprint_nudge_threshold")
     interval = body.get("refresh_interval_turns")
+    trigger_min_interval = body.get("refresh_trigger_min_interval")
     asw_mins = body.get("active_session_warning_minutes")
     return await db_module.update_workspace_settings(
         await _db(request),
@@ -172,6 +173,10 @@ async def update_workspace_settings_endpoint(
         auto_refresh_enabled=body.get("auto_refresh_enabled"),
         refresh_interval_turns=int(interval) if interval is not None else None,
         refresh_triggers=body.get("refresh_triggers"),
+        # db0361bb — separate, smaller floor gating the trigger branch only.
+        refresh_trigger_min_interval=(
+            int(trigger_min_interval) if trigger_min_interval is not None else None
+        ),
         # 6e0e5cea — configurable active-session warning window.
         active_session_warning_minutes=int(asw_mins) if asw_mins is not None else None,
         tenant_id=await _tenant_id(request),
