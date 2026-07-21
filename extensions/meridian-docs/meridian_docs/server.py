@@ -1047,6 +1047,7 @@ def move_section(
     destination_anchor_para_id: str,
     destination_position: str = "after",
     index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
 ) -> dict[str, Any]:
     """6ff24136 — Move an existing section (heading + its content) to a new
     location in the document.
@@ -1055,10 +1056,19 @@ def move_section(
     next same-or-shallower heading, then re-inserts that exact range
     relative to destination_anchor_para_id. Existing paraIds/bookmarks are
     preserved (not regenerated), so cross-references INTO the moved section
-    stay valid. After the move, automatically calls renumber_sequences (the
-    move may have reordered Figure/Table captions) and find_references_to
-    for section_id itself (in case something references the section's own
-    heading).
+    stay valid. Before anything is cut/spliced/saved, this runs two safety
+    checks and ABORTS cleanly (file untouched) if either fails:
+      1. find_references_to for section_id itself, against the still-intact
+         file.
+      2. A check for any bookmark whose w:bookmarkStart/w:bookmarkEnd pair
+         would end up split across the move boundary (start inside the
+         moved section, end outside, or vice versa) — this would tear the
+         bookmark apart. Pass allow_bookmark_split=True to force the move
+         anyway.
+    After a successful write, automatically calls renumber_sequences (the
+    move may have reordered Figure/Table captions — cached SEQ numbers AND
+    any REF field elsewhere that displays a stale "<Kind> <N>" for a
+    corrected caption are fixed in the same call).
 
     Args:
       docx_path:                    Absolute path to the .docx file (mutated
@@ -1069,14 +1079,29 @@ def move_section(
                                      table to move the section next to. Must
                                      be OUTSIDE the section being moved.
       destination_position:         "before" or "after" (default).
+
+                                     When destination_anchor_para_id is
+                                     itself a HEADING and destination_position
+                                     is "after", the moved section lands
+                                     after that heading's ENTIRE section (its
+                                     own body + subsections), not immediately
+                                     after the heading paragraph — anchor on
+                                     a section's LAST body paragraph instead
+                                     if you need a literal splice right after
+                                     the heading.
       index_db_path:                If supplied, sidecar is invalidated
                                      (and threaded into renumber_sequences).
+      allow_bookmark_split:         Explicit override (default False) to
+                                     proceed even when the move would split a
+                                     bookmark's start/end across the move
+                                     boundary (see safety check 2 above).
 
     Returns:
       {status, section_id, heading_text, moved_block_count,
       destination_anchor_para_id, destination_position, renumber_sequences,
       find_references_to, docx_path} or {error: <message>} (file NOT
-      mutated on error).
+      mutated on error; a blocked bookmark-split also returns
+      {split_bookmarks: [...]}).
     """
     return docs_intel.move_section(
         docx_path=docx_path,
@@ -1084,6 +1109,7 @@ def move_section(
         destination_anchor_para_id=destination_anchor_para_id,
         destination_position=destination_position,
         index_db_path=index_db_path,
+        allow_bookmark_split=allow_bookmark_split,
     )
 
 
@@ -1094,9 +1120,11 @@ def copy_section(
     destination_anchor_para_id: str,
     destination_position: str = "after",
     index_db_path: str | None = None,
+    trim_original_to: str | None = None,
 ) -> dict[str, Any]:
     """8213050a — Duplicate an existing section (heading + its content) to a
-    new location, leaving the original untouched.
+    new location, leaving the original untouched (unless trim_original_to is
+    given).
 
     Same section-boundary rule as move_section, but deep-COPIES the range:
     every copied paragraph gets a FRESH w14:paraId, and every bookmark name
@@ -1108,6 +1136,12 @@ def copy_section(
     the copy is left pointing at the (shared) original. Calls
     renumber_sequences as the final step, same as move_section.
 
+    48daaf66 — destination_position="after" onto a HEADING anchor resolves to
+    after that heading's ENTIRE section (own body + subsections), the same
+    fix move_section got in 027b7ada. A pre-write find_references_to check
+    (plus a bookmark-split check when trim_original_to is set) runs BEFORE
+    any mutation, the same fix move_section got in e87b8338.
+
     Args:
       docx_path:                    Absolute path to the .docx file (mutated
                                      in place).
@@ -1115,16 +1149,23 @@ def copy_section(
                                      heading paragraph (the ORIGINAL, not the
                                      copy).
       destination_anchor_para_id:   w14:paraId (or p{N}) to copy the section
-                                     next to.
+                                     next to. Must be OUTSIDE the section
+                                     being copied when trim_original_to is set.
       destination_position:         "before" or "after" (default).
       index_db_path:                If supplied, sidecar is invalidated
                                      (and threaded into renumber_sequences).
+      trim_original_to:             Optional replacement text for the
+                                     original section's body (heading kept,
+                                     e.g. a "moved to <destination>" pointer).
+                                     None (default) leaves the original fully
+                                     untouched.
 
     Returns:
       {status, section_id, heading_text, new_heading_para_id,
       copied_block_count, para_id_map, bookmark_map,
       destination_anchor_para_id, destination_position, renumber_sequences,
-      docx_path} or {error: <message>} (file NOT mutated on error).
+      find_references_to, trimmed_original, docx_path} or
+      {error: <message>} (file NOT mutated on error).
     """
     return docs_intel.copy_section(
         docx_path=docx_path,
@@ -1132,6 +1173,7 @@ def copy_section(
         destination_anchor_para_id=destination_anchor_para_id,
         destination_position=destination_position,
         index_db_path=index_db_path,
+        trim_original_to=trim_original_to,
     )
 
 
