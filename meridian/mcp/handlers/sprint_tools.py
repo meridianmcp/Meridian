@@ -219,6 +219,8 @@ async def handle_fan_out_sprint_items(
         _active_executor_session_warnings,
         _check_file_only_resources_warning,
         _wave_assignment_hint,
+        _prospecting_result,
+        _persist_prospected_pointer,
     )
     items = args.get("items")
     if not isinstance(items, list) or not items:
@@ -238,6 +240,34 @@ async def handle_fan_out_sprint_items(
         db, args["project_id"], _enriched
     )
     _result: dict[str, Any] = {"item_ids": ids, "count": len(ids)}
+    # 02a52bf6 — mirror add_sprint_item's inline prospecting/pointer-persist for
+    # each bulk-filed item. Without this, an item fanned out with real (declared
+    # or inferred) touches_resources ends up with zero rows in
+    # sprint_item_pointers and unconditionally hits the claim-time UNPROSPECTED
+    # gate (meridian/db/sprint_items.py claim_sprint_item) regardless of whether
+    # its target symbol genuinely exists — add_sprint_item never has this problem
+    # because it already calls _prospecting_result + _persist_prospected_pointer
+    # inline; fan_out_sprint_items only ever returned bare ids and skipped both.
+    # Best-effort per item: a prospecting/persist failure for one item must never
+    # break the rest of the batch or the fan-out call itself.
+    _fo_prospecting_status: dict[str, str] = {}
+    _fo_prospected_pointers: dict[str, Any] = {}
+    for _fo_id in ids:
+        try:
+            _fo_item = await db_module.get_sprint_item(db, _fo_id)
+        except Exception:  # noqa: BLE001 — best-effort; never break fan-out
+            _fo_item = None
+        _fo_ctx, _fo_status = _prospecting_result(_fo_item)
+        _fo_prospecting_status[_fo_id] = _fo_status
+        _fo_ptr = await _persist_prospected_pointer(
+            db, args["project_id"], _fo_item, _fo_status
+        )
+        if _fo_ptr:
+            _fo_prospected_pointers[_fo_id] = _fo_ptr
+    if _fo_prospecting_status:
+        _result["prospecting_status"] = _fo_prospecting_status
+    if _fo_prospected_pointers:
+        _result["prospected_pointers"] = _fo_prospected_pointers
     # 586eeda9 — same active-session warning as add_sprint_item: a fanned-out
     # batch injected mid-run is a board change executors should know about.
     _fo_warnings = await _active_executor_session_warnings(db, args["project_id"])

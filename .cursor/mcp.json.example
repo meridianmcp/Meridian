@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "pixi",
+      "args": ["run", "python", "-m", "meridian", "--mcp"],
+      "cwd": "${workspaceFolder}"
+    },
+    "meridian-meridian": {
+      "type": "http",
+      "url": "https://usemeridian.us/mcp",
+      "headers": {
+        "Authorization": "Bearer sk_meridian_your_api_token_here"
+      }
+    },
+    "filesystem": {
+      "type": "http",
+      "url": "https://usemeridian.us/fs/mcp/<your-workspace-id>/mcp"
+    },
+    "codebase-memory": {
+      "type": "http",
+      "url": "https://usemeridian.us/code/mcp/<your-workspace-id>/mcp"
+    },
+    "serena": {
+      "type": "http",
+      "url": "https://usemeridian.us/extract/mcp/<your-workspace-id>/mcp"
+    }
+  }
+}
