@@ -121,6 +121,154 @@ def test_validate_pointer_range_rejects_bool_as_int():
 
 
 # ---------------------------------------------------------------------------
+# 300a063d — target_kind: existing | planned_new
+# ---------------------------------------------------------------------------
+
+def test_target_kind_omitted_defaults_to_existing_unchecked():
+    """Backward compat: a target with no target_kind key at all normalizes to
+    'existing' in the returned shape but is NEVER filesystem-checked — a fake
+    placeholder path like 'a.py' (the shape every pre-300a063d pointer/test
+    uses) must keep validating exactly as before."""
+    ptr = validate_pointer({
+        "source_type": "code",
+        "targets": [{"uri": "a.py", "selector": {"type": "range",
+                     "start_line": 1, "end_line": 2}}],
+    })
+    assert ptr["targets"][0]["target_kind"] == "existing"
+
+
+def test_target_kind_existing_real_path_passes(tmp_path):
+    """target_kind='existing' explicitly declared on a REAL path validates fine,
+    and the checker actually ran (proven by the missing-path counterpart below)."""
+    real_file = tmp_path / "real_module.py"
+    real_file.write_text("# real file\n")
+    ptr = validate_pointer({
+        "source_type": "code",
+        "targets": [{"uri": str(real_file), "target_kind": "existing",
+                     "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    })
+    assert ptr["targets"][0]["target_kind"] == "existing"
+    assert ptr["targets"][0]["uri"] == str(real_file)
+
+
+def test_target_kind_existing_missing_path_rejected(tmp_path):
+    """target_kind='existing' explicitly declared on a path that does NOT exist
+    is rejected — this is the core gap 300a063d closes: a planned-new-file item
+    can no longer masquerade as verified, existing-code prospecting."""
+    missing = tmp_path / "does_not_exist.py"
+    with pytest.raises(PointerValidationError, match="target_kind='existing'"):
+        validate_pointer({
+            "source_type": "code",
+            "targets": [{"uri": str(missing), "target_kind": "existing",
+                         "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        })
+
+
+def test_target_kind_planned_new_missing_path_allowed(tmp_path):
+    """target_kind='planned_new' explicitly allows a nonexistent path — the file
+    hasn't been created yet, and that's the whole point of declaring it planned."""
+    missing = tmp_path / "not_created_yet.py"
+    ptr = validate_pointer({
+        "source_type": "code",
+        "targets": [{"uri": str(missing), "target_kind": "planned_new",
+                     "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    })
+    assert ptr["targets"][0]["target_kind"] == "planned_new"
+    assert ptr["targets"][0]["uri"] == str(missing)
+
+
+def test_target_kind_invalid_value_rejected():
+    with pytest.raises(PointerValidationError, match="target_kind"):
+        validate_pointer({
+            "source_type": "code",
+            "targets": [{"uri": "a.py", "target_kind": "bogus",
+                         "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        })
+
+
+def test_target_kind_existing_skips_check_for_non_local_uri_schemes():
+    """target_kind='existing' on a non-local-path uri (zotero:/doc:/finding:/a URL)
+    is NOT filesystem-checked — those schemes have their own existence semantics,
+    resolved elsewhere (resolve_pointer), not a local disk check."""
+    for uri, selector in [
+        ("zotero:", {"type": "zotero_key", "key": "ABCD1234"}),
+        ("doc:1", {"type": "node_id", "id": "el-1"}),
+        ("finding:xyz", {"type": "finding_id", "id": "note-1"}),
+        ("https://example.com/a", {"type": "text_quote", "exact": "x"}),
+    ]:
+        ptr = validate_pointer({
+            "source_type": "x",
+            "targets": [{"uri": uri, "target_kind": "existing", "selector": selector}],
+        })
+        assert ptr["targets"][0]["target_kind"] == "existing"
+
+
+def test_target_kind_existing_uses_injectable_path_exists_checker():
+    """path_exists is an injectable seam (same pattern as symbol_resolver /
+    node_resolver / citation_resolver): tests can stub it instead of touching
+    the real filesystem."""
+    ptr = {
+        "source_type": "code",
+        "targets": [{"uri": "some/fake/path.py", "target_kind": "existing",
+                     "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    }
+    ok = validate_pointer(ptr, path_exists=lambda _uri: True)
+    assert ok["targets"][0]["target_kind"] == "existing"
+    with pytest.raises(PointerValidationError):
+        validate_pointer(ptr, path_exists=lambda _uri: False)
+
+
+@pytest.mark.asyncio
+async def test_db_pointer_target_kind_existing_missing_path_rejected(db, tmp_path):
+    """DB layer: add_sprint_item_pointer rejects an explicit target_kind='existing'
+    pointer at a nonexistent path BEFORE any write (mirrors
+    test_db_pointer_rejects_malformed_before_write's convention)."""
+    p = await db_module.create_project(db, "ptr-kind-bad")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    missing = tmp_path / "ghost.py"
+    with pytest.raises(ValueError):
+        await db_module.add_sprint_item_pointer(
+            db, p["id"], item["id"], "code",
+            [{"uri": str(missing), "target_kind": "existing",
+              "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        )
+    assert await db_module.get_sprint_item_pointers(db, item["id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_db_pointer_target_kind_planned_new_missing_path_allowed(db, tmp_path):
+    """DB layer: a target_kind='planned_new' pointer at a nonexistent path IS
+    persisted — a planned-new-file item is real prospecting evidence too, just
+    distinguishable from verified existing-code evidence."""
+    p = await db_module.create_project(db, "ptr-kind-planned")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    missing = tmp_path / "new_module.py"
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": str(missing), "target_kind": "planned_new",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    assert stored["targets"][0]["target_kind"] == "planned_new"
+    got = await db_module.get_sprint_item_pointers(db, item["id"])
+    assert got[0]["targets"][0]["target_kind"] == "planned_new"
+
+
+@pytest.mark.asyncio
+async def test_db_pointer_target_kind_existing_real_path_allowed(db, tmp_path):
+    """DB layer: a target_kind='existing' pointer at a REAL path is persisted."""
+    p = await db_module.create_project(db, "ptr-kind-real")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    real_file = tmp_path / "present.py"
+    real_file.write_text("# present\n")
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": str(real_file), "target_kind": "existing",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    assert stored["targets"][0]["target_kind"] == "existing"
+
+
+# ---------------------------------------------------------------------------
 # Serialize / deserialize the JSON targets column
 # ---------------------------------------------------------------------------
 

@@ -21,11 +21,42 @@ columns, the core requirement)::
         "source_type": "code" | "docs" | "citation" | ...,
         "targets": [
             {"uri": "...", "selector": {"type": ..., ...},
-             "subSelector": {"type": ..., ...}?},
+             "subSelector": {"type": ..., ...}?,
+             "target_kind": "existing" | "planned_new"?},
             ...
         ],
         "label": "..."?,
     }
+
+``target_kind`` (300a063d) — distinguishes a pointer at REAL, already-present code/
+docs from a pointer at a file a sprint item plans to CREATE. Without this, a
+new-file item could point at a path that doesn't exist yet and pass the claim
+gate's "has a pointer" check exactly like real, verified prospecting — the two
+were indistinguishable. Per TARGET (not per-pointer): a single multi-file pointer
+may modify an existing file AND introduce a new one in the same targets array.
+
+* ``"existing"`` (the default when omitted, for backward compatibility with
+  pointers written before this field existed) — the target is asserted to
+  already be real. Verification is OPT-IN, not retroactive: the filesystem
+  check below only runs when the caller EXPLICITLY writes
+  ``"target_kind": "existing"`` on the target. A target that omits
+  ``target_kind`` entirely is normalized to ``"existing"`` in the returned
+  shape (so downstream readers always see a concrete value) but is NOT
+  filesystem-checked — this keeps every pointer written before 300a063d
+  (bare ``uri`` strings, no ``target_kind`` key, often placeholder paths in
+  tests) validating exactly as before.
+* ``"planned_new"`` — the caller is explicitly asserting the path does not
+  exist YET (a planned new file). No filesystem check is performed; the
+  target is exempt, not "verified" — the distinction is preserved through to
+  the stored shape.
+
+When ``target_kind`` is explicitly ``"existing"`` and the ``uri`` looks like a
+local filesystem path (not a URL / ``zotero:`` / ``doc:`` / ``finding:``
+reference — those have their own existence semantics, checked at RESOLVE time
+by :func:`resolve_pointer`, not here), :func:`validate_pointer` verifies the
+path is actually present on disk (via an injectable ``path_exists`` checker,
+defaulting to :func:`os.path.exists`) and raises :class:`PointerValidationError`
+if it is not.
 
 Selector variants — every selector carries an explicit ``"type"``; the field
 below is the type-specific key it also needs (443d9453):
@@ -66,6 +97,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Awaitable, Callable
 
 _log = logging.getLogger(__name__)
@@ -85,6 +117,34 @@ _log = logging.getLogger(__name__)
 _SELECTOR_TYPES = frozenset(
     {"range", "symbol", "node_id", "zotero_key", "text_quote", "finding_id"}
 )
+
+# 300a063d — target_kind distinguishes a pointer at real, already-present code
+# from a pointer at a planned-but-not-yet-created file. See the module
+# docstring for the full rationale and the backward-compat/opt-in rules.
+_TARGET_KINDS = frozenset({"existing", "planned_new"})
+_DEFAULT_TARGET_KIND = "existing"
+
+# uri prefixes that are NOT local filesystem paths — the target_kind='existing'
+# filesystem check is skipped for these (they have their own existence
+# semantics, checked elsewhere: zotero_key/finding_id/node_id at resolve time,
+# text_quote via a live fetch). A local .docx path used by text_quote (06df6ab3)
+# still looks like a plain path and IS checked, which is correct.
+_NON_LOCAL_URI_PREFIXES = ("zotero:", "finding:", "doc:", "mailto:")
+
+
+def _looks_like_local_path(uri: str) -> bool:
+    """True when ``uri`` looks like a filesystem path rather than a URL or a
+    scheme reference (``zotero:``, ``doc:``, ``finding:``, ``http(s)://``, …).
+
+    The ``target_kind='existing'`` filesystem check only makes sense for local
+    paths; other uri schemes address things that don't live on this machine's
+    disk, or that are already verified by their own resolver.
+    """
+    if not uri:
+        return False
+    if "://" in uri:
+        return False
+    return not uri.startswith(_NON_LOCAL_URI_PREFIXES)
 
 # Integer fields an LSP Range carries. start_line/end_line are required; the char
 # offsets are optional (a whole-line span is valid) but must be ints when present.
@@ -224,18 +284,29 @@ def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]
     return out
 
 
-def _validate_target(target: Any) -> dict[str, Any]:
-    """Validate one ``{uri, selector, subSelector?}`` target; return a normalized copy.
+def _validate_target(
+    target: Any, *, path_exists: Callable[[str], bool] | None = None
+) -> dict[str, Any]:
+    """Validate one ``{uri, selector, subSelector?, target_kind?}`` target; return
+    a normalized copy.
 
     A ``subSelector`` at the TARGET level (a peer of ``selector``) is accepted as
     an alias for nesting it under the selector — some callers put it there per the
     W3C shape. Either placement is normalized into ``selector.subSelector``.
+
+    ``target_kind`` (300a063d) is ``"existing"`` | ``"planned_new"``, defaulting
+    to ``"existing"`` when omitted (backward compat — see module docstring).
+    Verification is opt-in: the on-disk existence check only runs when the
+    caller EXPLICITLY wrote ``target_kind: "existing"`` on this target, so
+    pointers written before this field existed (no key at all) are never
+    retroactively checked. ``planned_new`` never triggers a check.
     """
     if not isinstance(target, dict):
         raise PointerValidationError("each target must be an object")
     uri = target.get("uri")
     if not isinstance(uri, str) or not uri.strip():
         raise PointerValidationError("each target requires a non-empty uri")
+    uri = uri.strip()
     if "selector" not in target:
         raise PointerValidationError("each target requires a selector")
     selector_src = dict(target["selector"]) if isinstance(target["selector"], dict) else target["selector"]
@@ -244,16 +315,49 @@ def _validate_target(target: Any) -> dict[str, Any]:
     if isinstance(selector_src, dict) and target.get("subSelector") is not None:
         selector_src.setdefault("subSelector", target["subSelector"])
     selector = _validate_selector(selector_src)
-    return {"uri": uri.strip(), "selector": selector}
+
+    # 300a063d — target_kind: existing (default, backward-compat) | planned_new.
+    kind_explicit = "target_kind" in target
+    raw_kind = target.get("target_kind")
+    if kind_explicit:
+        if raw_kind not in _TARGET_KINDS:
+            raise PointerValidationError(
+                f"target_kind must be one of {sorted(_TARGET_KINDS)}, got {raw_kind!r}"
+            )
+        kind = raw_kind
+    else:
+        kind = _DEFAULT_TARGET_KIND
+
+    if kind_explicit and kind == "existing" and _looks_like_local_path(uri):
+        checker = path_exists or os.path.exists
+        try:
+            exists = bool(checker(uri))
+        except OSError:
+            exists = False
+        if not exists:
+            raise PointerValidationError(
+                f"target_kind='existing' but no file exists at uri {uri!r} "
+                "(use target_kind='planned_new' for a file that does not exist yet)"
+            )
+
+    return {"uri": uri, "selector": selector, "target_kind": kind}
 
 
-def validate_pointer(pointer: Any) -> dict[str, Any]:
+def validate_pointer(
+    pointer: Any, *, path_exists: Callable[[str], bool] | None = None
+) -> dict[str, Any]:
     """Validate a full pointer and return a normalized copy.
 
     Enforces ``{source_type: non-empty str, targets: non-empty list of
-    {uri, selector, subSelector?}, label?: str}``. Raises
+    {uri, selector, subSelector?, target_kind?}, label?: str}``. Raises
     :class:`PointerValidationError` on any malformed field. The returned dict is a
     fresh, normalized structure safe to serialize.
+
+    ``path_exists`` (300a063d) is an injectable ``uri -> bool`` filesystem
+    checker (defaults to :func:`os.path.exists`), used ONLY for targets that
+    explicitly declare ``target_kind: "existing"`` on a local-path-looking uri
+    — see :func:`_validate_target` and the module docstring. Tests inject a
+    stub so the check never touches the real filesystem.
     """
     if not isinstance(pointer, dict):
         raise PointerValidationError("pointer must be an object")
@@ -265,7 +369,9 @@ def validate_pointer(pointer: Any) -> dict[str, Any]:
         raise PointerValidationError(
             "pointer requires a non-empty targets array"
         )
-    normalized_targets = [_validate_target(t) for t in targets]
+    normalized_targets = [
+        _validate_target(t, path_exists=path_exists) for t in targets
+    ]
     out: dict[str, Any] = {
         "source_type": source_type.strip(),
         "targets": normalized_targets,

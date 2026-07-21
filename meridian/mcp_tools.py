@@ -918,23 +918,33 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "{\"type\":\"range\", \"start_line\":3, \"end_line\":4}} = 'these lines, within "
         "this function'. A subSelector is itself a FULL selector and MUST carry its OWN "
         "explicit \"type\" (it does not inherit the parent's). source_type names the "
-        "domain (code | docs | citation | …). Malformed pointers are rejected with a "
+        "domain (code | docs | citation | …). Each target may also carry "
+        "target_kind: \"existing\" | \"planned_new\" (300a063d) — set \"existing\" ONLY "
+        "when the file/symbol already exists (this is checked against the real "
+        "filesystem and REJECTED if the path isn't there); set \"planned_new\" for a "
+        "file this sprint item will CREATE, which is explicitly exempt from that check. "
+        "Omitting target_kind keeps the pre-existing, unchecked behavior (defaults to "
+        "\"existing\" in the stored shape but is never filesystem-verified) — set it "
+        "explicitly to get real verification. Malformed pointers are rejected with a "
         "clear error: a bad/missing selector.type, a missing required selector field "
-        "(e.g. node_id without \"id\", or a subSelector with no \"type\"). Returns the "
-        "stored pointer.",
+        "(e.g. node_id without \"id\", a subSelector with no \"type\", an invalid "
+        "target_kind, or target_kind=\"existing\" at a path that doesn't exist). "
+        "Returns the stored pointer.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
          "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | … (free text)."},
          "targets": {"type": "array", "description":
-             "Non-empty array of {uri, selector, subSelector?} targets. Each selector is "
-             "an object carrying an explicit \"type\" plus that type's field: range "
-             "{\"type\":\"range\", start_line, end_line, start_char?, end_char?}; symbol "
-             "{\"type\":\"symbol\", qualified_name}; node_id {\"type\":\"node_id\", id} "
-             "(field is \"id\", NOT \"value\"); zotero_key {\"type\":\"zotero_key\", key}. "
-             "An optional subSelector is itself a full selector and MUST carry its own "
-             "\"type\".",
+             "Non-empty array of {uri, selector, subSelector?, target_kind?} targets. "
+             "Each selector is an object carrying an explicit \"type\" plus that type's "
+             "field: range {\"type\":\"range\", start_line, end_line, start_char?, "
+             "end_char?}; symbol {\"type\":\"symbol\", qualified_name}; node_id "
+             "{\"type\":\"node_id\", id} (field is \"id\", NOT \"value\"); zotero_key "
+             "{\"type\":\"zotero_key\", key}. An optional subSelector is itself a full "
+             "selector and MUST carry its own \"type\". target_kind is \"existing\" "
+             "(default; explicit \"existing\" is verified against the real filesystem) "
+             "or \"planned_new\" (a file not created yet — exempt from that check).",
              "items": {"type": "object"}},
          "label": {"type": "string", "description": "Optional human-readable label for the pointer."}},
          "required": ["sprint_item_id", "source_type", "targets"]}},
