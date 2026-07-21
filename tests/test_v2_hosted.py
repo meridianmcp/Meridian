@@ -690,6 +690,34 @@ def test_remote_mcp_invalid_token_returns_401(client):
     assert r.status_code == 401
 
 
+def test_remote_mcp_unauth_warning_logs_ip_and_headers(client, caplog):
+    """1b4dc353 — the '[mcp_auth] unrecognised token' warning must carry the
+    source IP and a non-sensitive header dump so a recurring unidentified
+    caller (no Authorization header at all) can be fingerprinted from logs
+    alone next time it fires. Authorization/Cookie must never appear in the
+    header dump (they're either redacted or already covered by raw=)."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="meridian.mcp_auth"):
+        r = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={
+                "User-Agent": "python-httpx/0.28.1",
+                "X-Diagnostic-Marker": "probe-1b4dc353",
+                "Cookie": "session=should-not-appear",
+            },
+        )
+    assert r.status_code == 401
+    assert "[mcp_auth] unrecognised token" in caplog.text
+    assert "raw=" in caplog.text and "(none)" in caplog.text
+    assert "ip=" in caplog.text
+    # The redacted extra header must show up (proves "full headers" made it
+    # into the log), but Cookie's value must never leak.
+    assert "probe-1b4dc353" in caplog.text
+    assert "should-not-appear" not in caplog.text
+
+
 def test_hooks_invalid_bearer_returns_401_in_hosted_mode(monkeypatch, tmp_path):
     """Hook endpoints must reject invalid Bearer tokens instead of falling back."""
     from meridian import db as db_module
