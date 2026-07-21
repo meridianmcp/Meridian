@@ -297,3 +297,9 @@ node_modules/
 .serena/
 coverage/
 extensions/claude-mcp/
+ 
+# Codex CLI local config - contains a live bearer token, never commit 
+.codex/config.toml 
+ 
+# Ephemeral scheduled-task lock file - runtime state, not source 
+.claude/scheduled_tasks.lock
