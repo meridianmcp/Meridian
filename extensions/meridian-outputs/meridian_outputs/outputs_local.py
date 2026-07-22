@@ -1147,6 +1147,58 @@ def _resolve_max_workers(explicit: int | None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# c73c0dd7 -- configurable Tantivy writer heap_size
+# ---------------------------------------------------------------------------
+# Measured live against a real 16k-file batch: Tantivy's own default
+# (undocumented in the Python binding, but effectively ~128MB against real
+# content of ~240MB) produced 678 fragmented segments + a 4.8s reload().
+# Raising heap_size to 512MB drops segments to 48 and cuts
+# add+commit+reload from 8.8s to 2.8s (~3x) -- the writer flushes far less
+# often against the same content volume.
+_DEFAULT_TANTIVY_HEAP_BYTES = 512 * 1024 * 1024
+_TANTIVY_HEAP_ENV_VAR = "MERIDIAN_OUTPUTS_TANTIVY_HEAP_MB"
+
+
+def _default_tantivy_heap_bytes() -> int:
+    """Resolve the default Tantivy writer heap_size (in bytes) from the
+    environment, expressed in MB for readability (mirrors the max_workers
+    resolution pattern above). Checked fresh on every call rather than
+    cached at import time."""
+    raw = os.environ.get(_TANTIVY_HEAP_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _DEFAULT_TANTIVY_HEAP_BYTES
+    try:
+        value_mb = int(raw.strip())
+    except ValueError:
+        _log.warning(
+            "%s=%r is not a valid integer (MB) -- falling back to default (%d MB)",
+            _TANTIVY_HEAP_ENV_VAR, raw, _DEFAULT_TANTIVY_HEAP_BYTES // (1024 * 1024),
+        )
+        return _DEFAULT_TANTIVY_HEAP_BYTES
+    if value_mb < 15:  # tantivy's own hard minimum is ~15MB per indexing thread
+        _log.warning(
+            "%s=%r must be >= 15 (MB) -- falling back to default (%d MB)",
+            _TANTIVY_HEAP_ENV_VAR, raw, _DEFAULT_TANTIVY_HEAP_BYTES // (1024 * 1024),
+        )
+        return _DEFAULT_TANTIVY_HEAP_BYTES
+    return value_mb * 1024 * 1024
+
+
+def _resolve_tantivy_heap_bytes(explicit: int | None) -> int:
+    """Precedence: explicit constructor arg (bytes) > env var (MB) > default."""
+    if explicit is not None:
+        if explicit >= 15 * 1024 * 1024:
+            return explicit
+        _log.warning(
+            "OutputsFtsIndex: tantivy_heap_bytes=%r must be >= 15MB -- "
+            "falling back to default (%d MB)", explicit,
+            _DEFAULT_TANTIVY_HEAP_BYTES // (1024 * 1024),
+        )
+        return _DEFAULT_TANTIVY_HEAP_BYTES
+    return _default_tantivy_heap_bytes()
+
+
+# ---------------------------------------------------------------------------
 # 9a18a2b2 -- Tantivy single-writer lock conflict handling
 # ---------------------------------------------------------------------------
 
@@ -1212,6 +1264,7 @@ class OutputsFtsIndex:
         hasher: Callable[[str], str | None] = _xxh3_file,
         max_workers: int | None = None,
         exclude_patterns: tuple[str, ...] | None = None,
+        tantivy_heap_bytes: int | None = None,
     ) -> None:
         self.outputs_dir = outputs_dir
         self._db_path = db_path
@@ -1220,6 +1273,10 @@ class OutputsFtsIndex:
         # MERIDIAN_OUTPUTS_MAX_WORKERS env var > hardcoded default (8, the
         # previous unconfigurable behaviour).
         self._max_workers = _resolve_max_workers(max_workers)
+        # c73c0dd7 -- Tantivy writer heap_size: explicit param (bytes) >
+        # MERIDIAN_OUTPUTS_TANTIVY_HEAP_MB env var > 512MB default (up from
+        # tantivy's own undersized default, measured ~3x faster commits).
+        self._tantivy_heap_bytes = _resolve_tantivy_heap_bytes(tantivy_heap_bytes)
         # fd4dd661 -- user-configurable gitignore-style exclude patterns:
         # explicit param > MERIDIAN_OUTPUTS_EXCLUDE_PATTERNS env var > empty
         # (unchanged default behaviour -- only secret-file exclusion applies).
@@ -1574,7 +1631,11 @@ class OutputsFtsIndex:
                 else tantivy.Index(schema)
             )
             try:
-                writer = index.writer()
+                # c73c0dd7 -- explicit heap_size (default 512MB, up from
+                # tantivy's own undersized default): measured live on a real
+                # 16k-file batch, this alone drops segment fragmentation from
+                # 678 to 48 and cuts add+commit+reload from 8.8s to 2.8s (~3x).
+                writer = index.writer(heap_size=self._tantivy_heap_bytes)
             except Exception as exc:  # noqa: BLE001
                 if not _is_tantivy_lock_conflict(exc):
                     raise

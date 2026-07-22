@@ -1994,6 +1994,71 @@ class TestTantivySearchIndex:
             idx.close()
 
 
+class TestTantivyHeapSize:
+    """c73c0dd7 -- Tantivy writer's undersized default heap_size caused
+    678 fragmented segments + a 4.8s reload() on a real 16k-file batch;
+    512MB drops segments to 48 and cuts add+commit+reload to 2.8s (~3x)."""
+
+    def test_default_heap_bytes_is_512mb(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._TANTIVY_HEAP_ENV_VAR, raising=False)
+        assert OL._default_tantivy_heap_bytes() == 512 * 1024 * 1024
+
+    def test_env_var_overrides_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._TANTIVY_HEAP_ENV_VAR, "256")
+        assert OL._default_tantivy_heap_bytes() == 256 * 1024 * 1024
+
+    def test_invalid_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._TANTIVY_HEAP_ENV_VAR, "not-a-number")
+        assert OL._default_tantivy_heap_bytes() == 512 * 1024 * 1024
+
+    def test_env_var_below_minimum_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._TANTIVY_HEAP_ENV_VAR, "1")
+        assert OL._default_tantivy_heap_bytes() == 512 * 1024 * 1024
+
+    def test_explicit_constructor_arg_takes_precedence_over_env_var(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(OL._TANTIVY_HEAP_ENV_VAR, "256")
+        assert OL._resolve_tantivy_heap_bytes(64 * 1024 * 1024) == 64 * 1024 * 1024
+
+    def test_explicit_arg_below_minimum_falls_back_to_default(self) -> None:
+        assert OL._resolve_tantivy_heap_bytes(1024) == 512 * 1024 * 1024
+
+    def test_index_resolves_heap_bytes_from_constructor(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), tantivy_heap_bytes=64 * 1024 * 1024)
+        assert idx._tantivy_heap_bytes == 64 * 1024 * 1024
+
+    def test_index_defaults_to_512mb_heap(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv(OL._TANTIVY_HEAP_ENV_VAR, raising=False)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        assert idx._tantivy_heap_bytes == 512 * 1024 * 1024
+
+    def test_connect_tantivy_passes_resolved_heap_size_to_writer(
+        self, tmp_path: Path,
+    ) -> None:
+        """The resolved heap_bytes must actually reach tantivy.Index.writer(),
+        not just be stored on the instance and never used."""
+        f = tmp_path / "a.csv"
+        f.write_text("term,1\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), tantivy_heap_bytes=33 * 1024 * 1024)
+
+        import tantivy  # noqa: PLC0415
+
+        captured: dict[str, Any] = {}
+        real_writer_method = tantivy.Index.writer
+
+        def _spy_writer(self, *args, **kwargs):  # noqa: ANN001
+            captured["heap_size"] = kwargs.get("heap_size")
+            return real_writer_method(self, *args, **kwargs)
+
+        try:
+            with patch.object(tantivy.Index, "writer", _spy_writer):
+                idx._connect_tantivy()
+            assert captured.get("heap_size") == 33 * 1024 * 1024
+        finally:
+            idx.close()
+
+
 class TestTantivyMigration:
     """8163816e -- a pre-Tantivy (pure-DuckDB-FTS) install's outputs_index
     table can already hold rows that predate this migration. Those rows
