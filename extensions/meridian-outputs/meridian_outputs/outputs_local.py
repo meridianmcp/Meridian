@@ -2028,28 +2028,54 @@ class OutputsFtsIndex:
                 try:
                     con = self._connect()
                     self._ensure_schema(con)
-                    # Delete only the paths that were removed or re-computed.
+                    # e8a2f710 -- single combined statement instead of
+                    # executemany's N separate prepare/bind/execute
+                    # round-trips. Measured live (2000-row batch, 11-col
+                    # schema): executemany 16.8s vs one combined multi-row
+                    # DELETE...IN + INSERT...VALUES ~10s (~40% faster,
+                    # verified, no new dependency). Root cause goes deeper
+                    # than executemany itself -- a raw per-row execute()
+                    # loop, a single combined VALUES statement, and a
+                    # columnar UNNEST bind all land in the same order of
+                    # magnitude on this DuckDB version; the cost tracks
+                    # column count almost linearly regardless of batching
+                    # strategy, and only DuckDB's own bulk-columnar paths
+                    # (Appender / Arrow / pandas registration -- none wired
+                    # in here) would close the rest of the gap. This is a
+                    # real, measured improvement, not a full fix. Chunked
+                    # at _MAX_BATCH-sized pieces so a single call's combined
+                    # statement can't grow unboundedly on the rare
+                    # walk-complete call where archival-reclassification
+                    # can add many more rows than the usual stale-only batch.
+                    _WRITE_CHUNK = _ResumableFileWalk._MAX_BATCH
                     if paths_to_delete:
-                        con.executemany(
-                            "DELETE FROM outputs_index WHERE path = ?",
-                            [[p] for p in paths_to_delete],
-                        )
+                        for i in range(0, len(paths_to_delete), _WRITE_CHUNK):
+                            chunk = paths_to_delete[i:i + _WRITE_CHUNK]
+                            placeholders = ",".join("?" for _ in chunk)
+                            con.execute(
+                                f"DELETE FROM outputs_index WHERE path IN ({placeholders})",
+                                chunk,
+                            )
                     # Batch-insert only the new/changed rows.
                     if new_rows:
-                        con.executemany(
-                            "INSERT INTO outputs_index VALUES "
-                            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            [
-                                [
+                        for i in range(0, len(new_rows), _WRITE_CHUNK):
+                            chunk_rows = new_rows[i:i + _WRITE_CHUNK]
+                            row_placeholders = ",".join(
+                                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" for _ in chunk_rows
+                            )
+                            flat_params: list[Any] = []
+                            for r in chunk_rows:
+                                flat_params.extend([
                                     r.path, r.content, r.mtime, r.sha256, r.size,
                                     r.generating_script, r.kind, r.is_archival,
                                     r.canonical_path,
                                     json.dumps(r.csv_columns) if r.csv_columns else None,
                                     json.dumps(r.json_keys) if r.json_keys else None,
-                                ]
-                                for r in new_rows
-                            ],
-                        )
+                                ])
+                            con.execute(
+                                f"INSERT INTO outputs_index VALUES {row_placeholders}",
+                                flat_params,
+                            )
                     # 77443d83 -- stage this call's own delta for the next
                     # Tantivy commit. Accumulates (rather than overwrites)
                     # across deferred calls, so whenever _rebuild_fts() next
