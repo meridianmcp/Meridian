@@ -272,7 +272,28 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # package name "meridian-docs") to prevent uvx from treating the trailing
         # command argument as a PyPI package lookup. See extensions/meridian-docs/
         # pyproject.toml for the full rationale.
-        "command": ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp"],
+        # f886d37a — root cause of a "code edits to meridian-docs don't take effect
+        # until well after a tunnel restart" bug seen live 2026-07-22: `uvx --from
+        # <local-path> ...` caches the built venv keyed on the resolved package, and
+        # its normal cache-freshness check does not reliably catch every local-source
+        # edit — so a newly-added @mcp.tool() function stayed invisible even across
+        # tunnel restarts. Confirmed live against this repo's pinned `uv 0.11.11`:
+        # `--reinstall`/`--reinstall-package` are silently NO-OPS for `uvx` (uv itself
+        # warns "Tools cannot be reinstalled via `uvx`" and the stale build still
+        # runs), and `--refresh`/`--refresh-package` also do NOT force a rebuild of a
+        # `--from <local-path>` venv whose source changed. Only `--no-cache` (`-n`)
+        # actually forces a from-scratch rebuild every invocation — verified with a
+        # throwaway local package: editing its source and re-running with each
+        # candidate flag reproduced the stale output for every flag except
+        # `--no-cache`. The cost (bypassing uv's resolution/build cache on every
+        # spawn, ~1-2s + re-touches dependency resolution) is accepted here because
+        # this is a local-path entry that IS edited during development; it is
+        # deliberately NOT applied to the PyPI-installed plugins below (docx-mcp,
+        # powerpoint-mcp, zotero-mcp, mcp-debugger), which aren't locally edited and
+        # would only pay the cost for no correctness benefit.
+        "command": [
+            "uvx", "--no-cache", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp",
+        ],
         # 4b5b1a74 — root cause of a "meridian-docs was not found in the package
         # registry" crash seen live on 2026-07-19 even though the default above is
         # already correct: unlike the `code-extractor`/`word` slots, this entry
@@ -291,8 +312,13 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # warn-don't-silently-swap contract cc904bfe already guarantees elsewhere
         # (see test_resolve_plugins_flags_stale_extract_override /
         # test_resolve_plugins_flags_stale_word_docx_mcp_server_override).
+        # f886d37a — also backfill the pre-cache-fix form of the CURRENT entry-point
+        # (no "--no-cache" flag): a tenant override saved before this fix was applied
+        # would otherwise merge in unconditionally with zero staleness signal, exactly
+        # the same silent-reproduction failure mode 4b5b1a74 already documents above.
         "previous_defaults": [
             ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs"],
+            ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp"],
         ],
         "env": {},
         # meridian-docs exposes bare tool names (document_outline, parse_document,
@@ -344,7 +370,27 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": ["uvx", "--from", _MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp"],
+        # f886d37a — "--no-cache" forces uvx to rebuild this local-path venv from
+        # scratch on every spawn instead of silently reusing a stale cached build
+        # from before the last code edit — see the matching comment on the
+        # meridian-docs entry above for the full investigation (uv 0.11.11
+        # confirmed: --reinstall/--reinstall-package are no-ops for uvx;
+        # --refresh/--refresh-package don't invalidate a stale --from build either;
+        # only --no-cache/-n actually does). Deliberately NOT applied to the
+        # PyPI-installed plugins in this file (docx-mcp, powerpoint-mcp, zotero-mcp,
+        # mcp-debugger) — those aren't edited locally, so forcing a rebuild would
+        # only add spawn latency for no correctness benefit.
+        "command": [
+            "uvx", "--no-cache", "--from", _MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp",
+        ],
+        # f886d37a — backfill previous_defaults with the pre-cache-fix form of the
+        # current entry-point (no "--no-cache" flag) so a tenant override saved
+        # before this fix was applied is flagged `stale_override` via the ordinary
+        # exact-match path below, rather than silently continuing to run without
+        # the cache-busting flag with zero dashboard signal.
+        "previous_defaults": [
+            ["uvx", "--from", _MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp"],
+        ],
         # ff8d1b2f — root cause of a live "search_outputs unreachable,
         # tunnel_tried=true" failure (2026-07-20): the default `--from` path above
         # was already correct (computed the same way as _MERIDIAN_DOCS_LOCAL_PATH,
@@ -358,11 +404,12 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # a stray "file:///C:/app/extensions/meridian-outputs" from a differently
         # rooted checkout). No fixed previous_defaults list can enumerate every
         # possible stale path. resolve_plugins() below therefore also flags any
-        # override that is structurally `["uvx", "--from", <some-other-path>,
-        # "meridian-outputs-mcp"]` — same runtime + entry-point as the current
-        # default, different local path — as `stale_override`, so the dashboard
-        # badge fires instead of the tunnel client silently retrying an unreachable
-        # path on every call (see _is_stale_local_from_override).
+        # override that is structurally `["uvx", "--no-cache", "--from",
+        # <some-other-path>, "meridian-outputs-mcp"]` — same runtime + entry-point
+        # (and, f886d37a, same "--no-cache" flag) as the current default, different
+        # local path — as `stale_override`, so the dashboard badge fires instead of
+        # the tunnel client silently retrying an unreachable path on every call (see
+        # _is_stale_local_from_override).
         "env": {},
         # meridian-outputs exposes bare tool names (search_outputs, annotate_outputs,
         # …) — no self-prefix, so the server bridge namespaces them via
@@ -1050,11 +1097,13 @@ def resolve_custom_plugins(raw_config: Any) -> list[dict]:
 
 
 def _is_stale_local_from_override(ov_cmd: Any, base_cmd: Any) -> bool:
-    """ff8d1b2f — detect a stale ``uvx --from <local-path> <entry-point>`` override.
+    """ff8d1b2f — detect a stale ``uvx --no-cache --from <local-path> <entry-point>``
+    override.
 
     Complements the exact-match ``previous_defaults`` list: that list only catches
-    a *fixed* historical default (e.g. a one-time entry-point rename). A local
-    ``--from`` command embeds an absolute filesystem path computed from
+    a *fixed* historical default (e.g. a one-time entry-point rename, or — f886d37a —
+    the pre-cache-fix command missing the ``--no-cache`` flag). A local ``--from``
+    command embeds an absolute filesystem path computed from
     ``Path(__file__).parent.parent`` at the time it was saved — if a tenant's
     stored override was captured on a different checkout/container (a different
     root than this machine currently computes), the path segment is permanently
@@ -1062,22 +1111,29 @@ def _is_stale_local_from_override(ov_cmd: Any, base_cmd: Any) -> bool:
     possible stale value.
 
     Returns True when both commands share the same shape
-    ``["uvx", "--from", <path>, <entry-point>]`` with the same runtime and
-    entry-point but a *different* path — i.e. "this looks like our own default,
-    just pointed at a different local checkout" — without asserting anything
-    about paths that aren't ours to begin with (a genuinely custom command, e.g.
-    a different runtime or entry-point, is left untouched).
+    ``["uvx", "--no-cache", "--from", <path>, <entry-point>]`` (f886d37a bumped this
+    from a 4-token to a 5-token shape when the cache-busting flag was inserted) with
+    the same runtime, cache flag, and entry-point but a *different* path — i.e.
+    "this looks like our own default, just pointed at a different local checkout" —
+    without asserting anything about paths that aren't ours to begin with (a
+    genuinely custom command, e.g. a different runtime, entry-point, or missing the
+    ``--no-cache`` flag entirely, is left untouched here; the missing-flag case is
+    instead caught by the exact-match ``previous_defaults`` entry above).
     """
     if (
         not isinstance(ov_cmd, list) or not isinstance(base_cmd, list)
-        or len(ov_cmd) != 4 or len(base_cmd) != 4
+        or len(ov_cmd) != 5 or len(base_cmd) != 5
     ):
         return False
-    if ov_cmd[0] != base_cmd[0] or ov_cmd[1] != "--from" or base_cmd[1] != "--from":
+    if (
+        ov_cmd[0] != base_cmd[0]
+        or ov_cmd[1] != "--no-cache" or base_cmd[1] != "--no-cache"
+        or ov_cmd[2] != "--from" or base_cmd[2] != "--from"
+    ):
         return False
-    if ov_cmd[3] != base_cmd[3]:
+    if ov_cmd[4] != base_cmd[4]:
         return False
-    return ov_cmd[2] != base_cmd[2]
+    return ov_cmd[3] != base_cmd[3]
 
 
 def resolve_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[dict]:

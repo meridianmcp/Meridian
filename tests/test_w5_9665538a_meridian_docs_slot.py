@@ -44,12 +44,16 @@ def test_docs_slot_registered_in_builtin_plugins():
     # meridian-docs source dir must be supplied via --from).
     # 58a044c7 — entry-point is "meridian-docs-mcp" (not "meridian-docs") to prevent
     # uvx from treating the trailing command as a PyPI registry lookup.
+    # f886d37a — "--no-cache" was inserted right after "uvx" to force a from-scratch
+    # rebuild of this --from venv on every spawn, so --from/the entry-point are
+    # located positionally rather than at a hardcoded index.
     cmd = docs["command"]
     assert cmd[0] == "uvx"
-    assert cmd[1] == "--from"
-    assert cmd[3] == "meridian-docs-mcp"
+    assert "--from" in cmd
+    from_idx = cmd.index("--from")
+    assert cmd[-1] == "meridian-docs-mcp"
     # The --from path points at the local extensions/meridian-docs directory.
-    assert "extensions" in cmd[2] and "meridian-docs" in cmd[2]
+    assert "extensions" in cmd[from_idx + 1] and "meridian-docs" in cmd[from_idx + 1]
     # Opt-in like the Office slots: off by default, not a core tool.
     assert docs["enabled"] is False
     assert docs["core"] is False
@@ -85,7 +89,7 @@ def test_docs_slot_resolves_via_resolve_plugins_and_by_slot():
     # 1b3a2c23/58a044c7 — resolved command uses --from local-path with meridian-docs-mcp
     # (not bare uvx package, not "meridian-docs" which collides with the package name).
     cmd = by_slot["docs"]["command"]
-    assert cmd[0] == "uvx" and cmd[1] == "--from" and cmd[3] == "meridian-docs-mcp"
+    assert cmd[0] == "uvx" and "--from" in cmd and cmd[-1] == "meridian-docs-mcp"
 
     got = tp.plugin_by_slot(None, "docs")
     assert got is not None and got["name"] == "meridian-docs"

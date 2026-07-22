@@ -50,15 +50,18 @@ def test_docs_command_uses_meridian_docs_mcp_entry_point():
     assert isinstance(cmd, list) and len(cmd) >= 4, (
         f"docs command must be a list with at least 4 elements, got {cmd!r}"
     )
-    # The entry-point (index 3) must be "meridian-docs-mcp", not "meridian-docs".
-    assert cmd[3] == "meridian-docs-mcp", (
-        f"entry-point (cmd[3]) must be 'meridian-docs-mcp', got {cmd[3]!r}. "
+    # The entry-point (the trailing token) must be "meridian-docs-mcp", not
+    # "meridian-docs". f886d37a inserted a "--no-cache" cache-busting flag after
+    # "uvx", so the entry-point is checked positionally (last token) rather than at
+    # a hardcoded index.
+    assert cmd[-1] == "meridian-docs-mcp", (
+        f"entry-point (last token) must be 'meridian-docs-mcp', got {cmd[-1]!r}. "
         "Using 'meridian-docs' triggers a uvx PyPI registry lookup that fails with "
         "'meridian-docs was not found in the package registry' (58a044c7)."
     )
-    # The overall form must still be ["uvx", "--from", <local-path>, "meridian-docs-mcp"].
-    assert cmd[0] == "uvx" and cmd[1] == "--from", (
-        f"command must start with ['uvx', '--from', ...], got {cmd[:2]!r}"
+    # The overall form must still be ["uvx", ..., "--from", <local-path>, "meridian-docs-mcp"].
+    assert cmd[0] == "uvx" and "--from" in cmd, (
+        f"command must start with 'uvx' and contain '--from', got {cmd!r}"
     )
 
 
@@ -69,7 +72,7 @@ def test_docs_command_does_not_use_bare_meridian_docs():
     explicitly on BOTH the positive AND the negative check."""
     by_slot = {p["slot"]: p for p in tp.BUILTIN_PLUGINS}
     cmd = by_slot["docs"]["command"]
-    assert cmd[3] != "meridian-docs", (
+    assert cmd[-1] != "meridian-docs", (
         "entry-point is 'meridian-docs' — this triggers the uvx PyPI registry "
         "lookup bug (58a044c7). Rename to 'meridian-docs-mcp' (or any name that "
         "does not match the package name) to fix it."
@@ -142,8 +145,8 @@ def test_resolve_plugins_uses_meridian_docs_mcp():
     assert "docs" in by_slot
     cmd = by_slot["docs"]["command"]
     assert isinstance(cmd, list) and len(cmd) >= 4
-    assert cmd[3] == "meridian-docs-mcp", (
-        f"resolve_plugins docs command has entry-point {cmd[3]!r}, expected "
+    assert cmd[-1] == "meridian-docs-mcp", (
+        f"resolve_plugins docs command has entry-point {cmd[-1]!r}, expected "
         "'meridian-docs-mcp' (58a044c7)"
     )
 
@@ -153,22 +156,24 @@ def test_resolve_plugins_uses_meridian_docs_mcp():
 # ---------------------------------------------------------------------------
 
 def test_docs_full_command_form():
-    """The full docs slot command must be ['uvx', '--from', <local-path>, 'meridian-docs-mcp']
-    (58a044c7). All four positional constraints must hold simultaneously."""
+    """The full docs slot command must be
+    ['uvx', '--no-cache', '--from', <local-path>, 'meridian-docs-mcp'] (58a044c7 +
+    f886d37a). All positional constraints must hold simultaneously."""
     by_slot = {p["slot"]: p for p in tp.BUILTIN_PLUGINS}
     cmd = by_slot["docs"]["command"]
     assert cmd[0] == "uvx", f"cmd[0] must be 'uvx', got {cmd[0]!r}"
-    assert cmd[1] == "--from", f"cmd[1] must be '--from', got {cmd[1]!r}"
-    local_path = cmd[2]
+    assert "--from" in cmd, f"'--from' must be present, got {cmd!r}"
+    from_idx = cmd.index("--from")
+    local_path = cmd[from_idx + 1]
     # Local path must point at the extensions/ directory (not a bare package name).
     assert "extensions" in local_path and "meridian-docs" in local_path, (
-        f"cmd[2] must be the local extensions/meridian-docs path, got {local_path!r}"
+        f"the --from value must be the local extensions/meridian-docs path, got {local_path!r}"
     )
     assert "/" in local_path or "\\" in local_path, (
-        f"cmd[2] must be a filesystem path (with separators), got {local_path!r}"
+        f"the --from value must be a filesystem path (with separators), got {local_path!r}"
     )
-    assert cmd[3] == "meridian-docs-mcp", (
-        f"cmd[3] (entry-point) must be 'meridian-docs-mcp', got {cmd[3]!r}"
+    assert cmd[-1] == "meridian-docs-mcp", (
+        f"cmd[-1] (entry-point) must be 'meridian-docs-mcp', got {cmd[-1]!r}"
     )
 
 
