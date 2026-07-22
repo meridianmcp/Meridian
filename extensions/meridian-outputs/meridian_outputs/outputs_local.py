@@ -2028,25 +2028,24 @@ class OutputsFtsIndex:
                 try:
                     con = self._connect()
                     self._ensure_schema(con)
-                    # e8a2f710 -- single combined statement instead of
-                    # executemany's N separate prepare/bind/execute
-                    # round-trips. Measured live (2000-row batch, 11-col
-                    # schema): executemany 16.8s vs one combined multi-row
-                    # DELETE...IN + INSERT...VALUES ~10s (~40% faster,
-                    # verified, no new dependency). Root cause goes deeper
-                    # than executemany itself -- a raw per-row execute()
-                    # loop, a single combined VALUES statement, and a
-                    # columnar UNNEST bind all land in the same order of
-                    # magnitude on this DuckDB version; the cost tracks
-                    # column count almost linearly regardless of batching
-                    # strategy, and only DuckDB's own bulk-columnar paths
-                    # (Appender / Arrow / pandas registration -- none wired
-                    # in here) would close the rest of the gap. This is a
-                    # real, measured improvement, not a full fix. Chunked
-                    # at _MAX_BATCH-sized pieces so a single call's combined
-                    # statement can't grow unboundedly on the rare
-                    # walk-complete call where archival-reclassification
-                    # can add many more rows than the usual stale-only batch.
+                    # e8a2f710 -- prefer DuckDB's native Arrow zero-copy bulk
+                    # path over any parameter-bound VALUES insert. Measured
+                    # live: executemany (16.8s), a raw per-row execute()
+                    # loop (15.6s), a single combined multi-row VALUES
+                    # statement (10.0s), and a columnar UNNEST bind (15.7s)
+                    # all land in the same order of magnitude for a 2000-row
+                    # batch -- the cost tracks total (row x column) cells
+                    # bound through DuckDB's SQL parameter layer almost
+                    # linearly, regardless of batching strategy or storage
+                    # backend (in-memory vs on-disk measured identical too).
+                    # Registering a pyarrow Table and running INSERT ...
+                    # SELECT * FROM it bypasses that layer entirely: same
+                    # 2000-row batch measured at 0.110s (~150x faster than
+                    # the original executemany), 0.047s for a 5138-row batch.
+                    # Falls back to the combined-VALUES path (still ~40%
+                    # faster than plain executemany) when pyarrow isn't
+                    # installed, so this degrades gracefully rather than
+                    # hard-requiring the new dependency.
                     _WRITE_CHUNK = _ResumableFileWalk._MAX_BATCH
                     if paths_to_delete:
                         for i in range(0, len(paths_to_delete), _WRITE_CHUNK):
@@ -2058,24 +2057,63 @@ class OutputsFtsIndex:
                             )
                     # Batch-insert only the new/changed rows.
                     if new_rows:
-                        for i in range(0, len(new_rows), _WRITE_CHUNK):
-                            chunk_rows = new_rows[i:i + _WRITE_CHUNK]
-                            row_placeholders = ",".join(
-                                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" for _ in chunk_rows
-                            )
-                            flat_params: list[Any] = []
-                            for r in chunk_rows:
-                                flat_params.extend([
-                                    r.path, r.content, r.mtime, r.sha256, r.size,
-                                    r.generating_script, r.kind, r.is_archival,
-                                    r.canonical_path,
-                                    json.dumps(r.csv_columns) if r.csv_columns else None,
-                                    json.dumps(r.json_keys) if r.json_keys else None,
-                                ])
-                            con.execute(
-                                f"INSERT INTO outputs_index VALUES {row_placeholders}",
-                                flat_params,
-                            )
+                        try:
+                            import pyarrow as _pa  # noqa: PLC0415 -- optional, lazy
+                        except ImportError:
+                            _pa = None
+                        if _pa is not None:
+                            _arrow_table = _pa.table({
+                                "path": [r.path for r in new_rows],
+                                "content": [r.content for r in new_rows],
+                                "mtime": [r.mtime for r in new_rows],
+                                "sha256": [r.sha256 for r in new_rows],
+                                "size": [r.size for r in new_rows],
+                                "generating_script": [r.generating_script for r in new_rows],
+                                "kind": [r.kind for r in new_rows],
+                                "is_archival": [r.is_archival for r in new_rows],
+                                "canonical_path": [r.canonical_path for r in new_rows],
+                                "csv_columns": [
+                                    json.dumps(r.csv_columns) if r.csv_columns else None
+                                    for r in new_rows
+                                ],
+                                "json_keys": [
+                                    json.dumps(r.json_keys) if r.json_keys else None
+                                    for r in new_rows
+                                ],
+                            })
+                            con.register("_outputs_index_bulk_insert", _arrow_table)
+                            try:
+                                con.execute(
+                                    "INSERT INTO outputs_index "
+                                    "(path, content, mtime, sha256, size, "
+                                    "generating_script, kind, is_archival, "
+                                    "canonical_path, csv_columns, json_keys) "
+                                    "SELECT path, content, mtime, sha256, size, "
+                                    "generating_script, kind, is_archival, "
+                                    "canonical_path, csv_columns, json_keys "
+                                    "FROM _outputs_index_bulk_insert"
+                                )
+                            finally:
+                                con.unregister("_outputs_index_bulk_insert")
+                        else:
+                            for i in range(0, len(new_rows), _WRITE_CHUNK):
+                                chunk_rows = new_rows[i:i + _WRITE_CHUNK]
+                                row_placeholders = ",".join(
+                                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" for _ in chunk_rows
+                                )
+                                flat_params: list[Any] = []
+                                for r in chunk_rows:
+                                    flat_params.extend([
+                                        r.path, r.content, r.mtime, r.sha256, r.size,
+                                        r.generating_script, r.kind, r.is_archival,
+                                        r.canonical_path,
+                                        json.dumps(r.csv_columns) if r.csv_columns else None,
+                                        json.dumps(r.json_keys) if r.json_keys else None,
+                                    ])
+                                con.execute(
+                                    f"INSERT INTO outputs_index VALUES {row_placeholders}",
+                                    flat_params,
+                                )
                     # 77443d83 -- stage this call's own delta for the next
                     # Tantivy commit. Accumulates (rather than overwrites)
                     # across deferred calls, so whenever _rebuild_fts() next
