@@ -356,7 +356,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # 469d89b4 — meridian-outputs: local BM25 outputs index (CSV/JSON/NPY),
         # launched via `uvx --from <local-path> meridian-outputs-mcp`. Provides
         # search_outputs, annotate_outputs, classify_outputs, resolve_figure_output,
-        # npy_metadata, and file_fingerprint — all purely local, no hosted call.
+        # find_outputs_by_source, npy_metadata, and file_fingerprint — all
+        # purely local, no hosted call.
         # 469d89b4 — NOT published to PyPI; spawn from the local extensions/
         # meridian-outputs directory via `uvx --from` so this works out-of-the-box
         # without a separate PyPI publish step.
@@ -621,7 +622,8 @@ KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Local BM25 outputs index (CSV/JSON/NPY) — search_outputs, "
             "annotate_outputs, classify_outputs, resolve_figure_output, "
-            "npy_metadata, file_fingerprint. All purely local, no hosted call."
+            "find_outputs_by_source, npy_metadata, file_fingerprint. All "
+            "purely local, no hosted call."
         ),
     },
     {

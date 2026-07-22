@@ -342,6 +342,7 @@ def test_scanner_ignores_github_api_path_tools():
         "get_latex_structure",
         "search_code_semantic",
         "search_outputs",
+        "find_outputs_by_source",
     ],
 )
 def test_known_local_fs_tools_are_recognized_and_guarded(tool):

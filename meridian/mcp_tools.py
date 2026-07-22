@@ -50,6 +50,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "find_similar_table": 'find_similar_table(project_id="abc-123", doc="thesis/chapter1.docx", description="summary of experimental results")',
     "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
     "annotate_outputs": 'annotate_outputs(outputs_dir="/repo/outputs", path="/repo/outputs/run_42", note="PCA on, BFS off — final params", run_params={"lr": 0.001, "epochs": 100})',
+    "find_outputs_by_source": 'find_outputs_by_source(outputs_dir="/repo/outputs", source_path="analysis/run.py")',
     "search_code_semantic": 'search_code_semantic(root_dir="/repo/src", query="parse the auth token and refresh it")',
     "get_flag_registry": 'get_flag_registry(root_dir="/repo/src")',
     "link_flag_to_section": 'link_flag_to_section(project_id="abc-123", doc="thesis/chapter4.docx", element_id="el-uuid-here", flag_name="DT_ONLY_WIDTH", value=1, default=0, source_file="pipeline/gt.py", source_line=142)',
@@ -830,6 +831,30 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "note": {"type": "string", "description": "The annotation text (e.g. 'PCA on, BFS off — results from run on 2026-07-12 with lr=0.001')."},
          "run_params": {"type": "object", "description": "Optional free-form key-value dict of run parameters to log alongside the note (e.g. {\"lr\": 0.001, \"epochs\": 100})."}},
          "required": ["outputs_dir", "path", "note"]}},
+    {"name": "find_outputs_by_source", "description":
+        "2ae25966 — READ-ONLY reverse provenance lookup over a run's OUTPUTS "
+        "tree: the mirror image of resolve_figure_output's forward direction "
+        "(figure -> source). Given a script or data file's source_path, scans "
+        "the same local DuckDB outputs index search_outputs/annotate_outputs "
+        "use for every indexed output whose recorded generating_script traces "
+        "back to it — an exact (case/slash-insensitive) string match OR a "
+        "basename match, so 'analysis/run.py' also matches an output recorded "
+        "with generating_script='run.py'. This is the direction plain "
+        "exact-path resolution can never answer, because that always starts "
+        "from the output side: 'what did this script/data file produce?' — "
+        "useful for auditing a stale Outputs_*_BACKUP folder mess by walking "
+        "a source file's outputs forward, newest first, and comparing against "
+        "what a document actually cites. Returns {outputs_dir, source_path, "
+        "outputs:[{path, generating_script, is_archival, canonical_path, "
+        "sha256, kind, size, mtime, csv_columns, json_keys}], total} sorted "
+        "newest-first by mtime; total is the full match count before limit "
+        "truncation. outputs is empty (not an error) when nothing in the "
+        "tree cites this source, or when outputs_dir doesn't exist.",
+     "inputSchema": {"type": "object", "properties": {
+         "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (same value you pass to search_outputs)."},
+         "source_path": {"type": "string", "description": "The generating script or data file to trace forward from (e.g. 'analysis/run.py') — matched against each indexed output's recorded generating_script."},
+         "limit": {"type": "integer", "description": "Max matched outputs to return, newest-first by mtime (default 25)."}},
+         "required": ["outputs_dir", "source_path"]}},
     {"name": "search_code_semantic", "description":
         "93fce816 — Cursor-style LOCAL semantic code search over a source tree, "
         "entirely in a DuckDB sidecar (no cloud round-trip). Parses Python "
@@ -2240,6 +2265,7 @@ _READ_ONLY_TOOLS = {
     "find_similar_figure",
     "find_similar_table",
     "search_outputs",
+    "find_outputs_by_source",
     "search_code_semantic",
     "prospect_symbol",
     "get_flag_registry",
@@ -2395,6 +2421,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_flag_registry":    "code-intel",
     "search_outputs":       "code-intel",
     "annotate_outputs":     "code-intel",
+    "find_outputs_by_source": "code-intel",
     "snapshot_graph_metrics": "code-intel",
     "get_graph_diff":       "code-intel",
     "get_symbol_hotspots":  "code-intel",
@@ -2576,6 +2603,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_flag_registry":         "both",
     "get_flag_drift":            "both",
     "search_outputs":            "both",
+    "find_outputs_by_source":    "both",
     "get_document_structure":    "both",
     "get_latex_structure":       "both",
     "get_citation_edges":        "both",
@@ -2705,6 +2733,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_flag_registry":          "common-support",
     "search_outputs":             "common-support",
     "annotate_outputs":           "common-support",
+    "find_outputs_by_source":     "common-support",
     # sprint decomposition / pointers
     "fan_out_sprint_items":       "common-support",
     "add_subtask":                "common-support",
@@ -2889,6 +2918,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "find_similar_table": "Find Similar Table",
     "search_outputs": "Search Outputs",
     "annotate_outputs": "Annotate Outputs",
+    "find_outputs_by_source": "Find Outputs By Source",
     "search_code_semantic": "Search Code Semantic",
     "run_verification": "Run Verification",
     "prospect_symbol": "Prospect Symbol",

@@ -4737,6 +4737,65 @@ async def _handle_outputs_tools(
                 "timed_out": True,
                 "error": str(exc),
             }
+    if name == "find_outputs_by_source":
+        from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+        from .. import hardening as _hardening  # noqa: PLC0415
+        outputs_dir = str(args.get("outputs_dir") or "").strip()
+        source_path = str(args.get("source_path") or "").strip()
+        if not outputs_dir:
+            raise ValueError("outputs_dir is required")
+        if not source_path:
+            raise ValueError("source_path is required")
+        # 2ae25966 — reverse of search_outputs/resolve_figure_output: same
+        # 0dedff91 / 1365e01a hosted-mode guard (this walks `outputs_dir` off
+        # THIS process's own filesystem) with the same tunnel-proxy fallback.
+        if _hosted_mode():
+            tenant_id = (tenant or {}).get("id", "")
+            if tenant_id:
+                _proxied = await _tunnel_proxy_outputs_tool(
+                    tenant_id, "find_outputs_by_source", dict(args),
+                )
+                if _proxied is not None:
+                    return _proxied
+            return {
+                "outputs_dir": outputs_dir,
+                "source_path": source_path,
+                "outputs": [],
+                "total": 0,
+                "error": (
+                    "find_outputs_by_source walks a directory on YOUR local "
+                    "filesystem and cannot run on hosted Meridian -- the server "
+                    "has no access to your machine. Start `meridian --tunnel` "
+                    "with the meridian-outputs package to enable tunnel-routed "
+                    "local outputs indexing, or run Meridian self-hosted."
+                ),
+                "hosted": True,
+                "tunnel_tried": bool(tenant_id),
+            }
+        limit = args.get("limit", 25)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 25
+        # Same CPU-bound walk + hash + DuckDB rebuild as search_outputs, so the
+        # same bulkhead-pool + hard-deadline backstop applies (e5f96adf/1d021501).
+        try:
+            return await _hardening.run_in_bulkhead(
+                _outputs_indexer.find_outputs_by_source,
+                outputs_dir,
+                source_path,
+                limit=limit,
+                label="find_outputs_by_source",
+            )
+        except _hardening.HeavyToolTimeout as exc:
+            return {
+                "outputs_dir": outputs_dir,
+                "source_path": source_path,
+                "outputs": [],
+                "total": 0,
+                "timed_out": True,
+                "error": str(exc),
+            }
     return _MISS
 
 

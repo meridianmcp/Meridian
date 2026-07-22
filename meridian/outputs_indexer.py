@@ -184,6 +184,35 @@ def _normalize_output_path(path: Any) -> str:
     return os.path.normcase(os.path.normpath(s)).replace("\\", "/")
 
 
+def _basename_key(path: Any) -> str:
+    """Case/slash-insensitive basename key, for relocation-tolerant matching
+    (mirrors the same helper in the meridian-outputs tunnel plugin's
+    ``provenance.py``, kept dependency-free/duplicated rather than importing
+    across the core/extension boundary)."""
+    if not path:
+        return ""
+    s = str(path).replace("\\", "/").rstrip("/")
+    return os.path.normcase(os.path.basename(s))
+
+
+def _path_key(path: Any) -> str:
+    """Case/slash-insensitive key for a path-like STRING (no ``abspath``).
+
+    Deliberately does NOT resolve against the current working directory (unlike
+    :func:`_normalize_output_path`, used for figure/output-path equality):
+    ``generating_script`` values are inferred from free text (a CSV header
+    comment, a JSON key) and are frequently a bare filename or a short relative
+    fragment rather than a path meant to be resolved on this machine. Running
+    them through ``os.path.abspath`` would silently rebase them onto an
+    unrelated CWD and produce false negatives/positives. This key only
+    normalizes case and slash direction so two textually-equivalent references
+    compare equal.
+    """
+    if not path:
+        return ""
+    return os.path.normcase(str(path).strip().replace("\\", "/"))
+
+
 def _rows_from_relation(relation: Any) -> list[dict[str, Any]]:
     """Materialize a DuckDB relation (or an injected stand-in) into row dicts."""
     columns = None
@@ -1138,6 +1167,78 @@ class OutputsFtsIndex:
                 }
         return None
 
+    def find_by_source(self, source_path: str) -> list[dict[str, Any]]:
+        """Reverse resolver: a script/data ``source_path`` -> the outputs it produced.
+
+        The mirror image of :meth:`resolve_output` (2ae25966): that answers "is
+        THIS EXACT file already an indexed output" starting from the output
+        side; this answers "what did THIS script/data file produce" starting
+        from the SOURCE side — the direction plain exact/basename resolution
+        can never answer. Scans the index for rows whose recorded
+        ``generating_script`` traces back to ``source_path``, by either an
+        exact (case/slash-insensitive) string match or a basename match (so
+        ``analysis/run.py`` matches a ``generating_script`` recorded as just
+        ``run.py``). This is what catches a docx figure quietly citing STALE
+        data: walk the source's outputs forward, newest first, and compare
+        against what the docx actually shows.
+
+        Matching deliberately does NOT go through :func:`_normalize_output_path`
+        (unlike :meth:`resolve_output`) — see :func:`_path_key` for why an
+        ``abspath`` would silently rebase a free-text-inferred script name onto
+        an unrelated CWD.
+
+        Returns every matching row (same shape as :meth:`resolve_output`:
+        path, generating_script, is_archival, canonical_path, sha256, kind,
+        size, mtime, csv_columns, json_keys), sorted newest-first by ``mtime``,
+        UNSLICED (the caller applies its own limit + reports the pre-truncation
+        total). Never raises: an empty/unindexed tree or no matches yields
+        ``[]``; a blank ``source_path`` also yields ``[]``.
+        """
+        target_path = _path_key(source_path)
+        if not target_path:
+            return []
+        target_base = _basename_key(source_path)
+        with self._lock:
+            try:
+                con = self._connect()
+                self._ensure_schema(con)
+                relation = con.execute(
+                    "SELECT path, content, mtime, sha256, size, generating_script, "
+                    "kind, is_archival, canonical_path, csv_columns, json_keys "
+                    "FROM outputs_index"
+                )
+                columns = [c[0] for c in relation.description]
+                fetched = relation.fetchall()
+            except Exception:  # noqa: BLE001 — a bad/empty index resolves to []
+                _log.debug("OutputsFtsIndex.find_by_source failed", exc_info=True)
+                return []
+        matches: list[dict[str, Any]] = []
+        for row in fetched:
+            rec = dict(zip(columns, row))
+            gs = rec.get("generating_script")
+            if not gs:
+                continue
+            if _path_key(gs) != target_path and _basename_key(gs) != target_base:
+                continue
+            matches.append({
+                "path": rec["path"],
+                "generating_script": gs,
+                "is_archival": bool(rec.get("is_archival")),
+                "canonical_path": rec.get("canonical_path"),
+                "sha256": rec.get("sha256"),
+                "kind": rec.get("kind"),
+                "size": rec.get("size"),
+                "mtime": rec.get("mtime"),
+                "csv_columns": (
+                    json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+                ),
+                "json_keys": (
+                    json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+                ),
+            })
+        matches.sort(key=lambda h: (h.get("mtime") or 0), reverse=True)
+        return matches
+
     def close(self) -> None:
         """Close the owned DuckDB connection (no-op for an injected one)."""
         with self._lock:
@@ -1276,6 +1377,59 @@ def resolve_figure_output(
     index = _get_cached_index(outputs_dir)
     index.rebuild()
     return index.resolve_output(file_path)
+
+
+def find_outputs_by_source(
+    outputs_dir: str,
+    source_path: str,
+    *,
+    limit: int = 25,
+    max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
+) -> dict[str, Any]:
+    """Stateless reverse resolve-through (2ae25966): script/data ``source_path``
+    -> the outputs it produced.
+
+    Reuses the same cached, incremental index as :func:`search_outputs` /
+    :func:`resolve_figure_output` (5116078b) — the module-level counterpart of
+    :meth:`OutputsFtsIndex.find_by_source` for callers that don't hold a live
+    index. This is the direction :func:`resolve_figure_output` can never
+    answer, because that always starts from the OUTPUT side: given the
+    generating script or data file, this scans the outputs index for rows
+    whose recorded ``generating_script`` traces back to it (exact-string or
+    basename match) — i.e. "what did this thing produce?". That is the
+    direction needed to catch a docx figure quietly citing STALE data: walk
+    the source's outputs forward, newest first, and compare against what the
+    docx actually shows.
+
+    Returns ``{outputs_dir, source_path, outputs: [...], total}`` where each
+    output row carries the same fields as
+    :meth:`OutputsFtsIndex.resolve_output` (path, generating_script,
+    is_archival, canonical_path, sha256, kind, size, mtime, csv_columns,
+    json_keys), sorted newest-first by ``mtime``. ``total`` is the full match
+    count before ``limit`` truncation. ``outputs`` is empty (not an error)
+    when nothing in the tree cites this source, ``source_path`` is blank, or
+    ``outputs_dir`` doesn't exist. Never raises.
+    """
+    empty: dict[str, Any] = {
+        "outputs_dir": outputs_dir,
+        "source_path": source_path,
+        "outputs": [],
+        "total": 0,
+    }
+    if not source_path or not str(source_path).strip():
+        return empty
+    if not os.path.isdir(outputs_dir):
+        return empty
+    index = _get_cached_index(outputs_dir)
+    index.rebuild(max_seconds=max_seconds)
+    matches = index.find_by_source(source_path)
+    lim = max(int(limit), 1) if limit else 25
+    return {
+        "outputs_dir": outputs_dir,
+        "source_path": source_path,
+        "outputs": matches[:lim],
+        "total": len(matches),
+    }
 
 
 class OutputsIndexer:
