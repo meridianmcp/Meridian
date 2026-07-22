@@ -336,7 +336,7 @@ async def _db(request: Request) -> Any:
 _TENANT_UNSET = object()
 
 
-async def _get_tenant_from_request(request: Request) -> "dict | None":
+async def _get_tenant_from_request(request: Request, *, force_refresh: bool = False) -> "dict | None":
     """Return the tenant record from the auth DB for this request, or None.
 
     Returns None in self-hosted (non-hosted) mode, demo mode, or when the
@@ -349,10 +349,16 @@ async def _get_tenant_from_request(request: Request) -> "dict | None":
     ``_scoped_project_ids_for_request``, and per-route ``_tenant_id`` helpers)
     each call this independently, so without memoization a single request can
     pay the session/token DB round-trip repeatedly.
+
+    Pass ``force_refresh=True`` to bypass the memoized value and re-fetch from
+    the DB -- needed by call sites that write to this tenant's row mid-request
+    (e.g. tunnel plugin add/remove) and then need the just-persisted state
+    rather than the pre-write cached snapshot.
     """
-    cached = getattr(request.state, "_tenant", _TENANT_UNSET)
-    if cached is not _TENANT_UNSET:
-        return cached
+    if not force_refresh:
+        cached = getattr(request.state, "_tenant", _TENANT_UNSET)
+        if cached is not _TENANT_UNSET:
+            return cached
 
     import hashlib as _hashlib
 

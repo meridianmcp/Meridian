@@ -472,3 +472,54 @@ def test_get_tenant_from_request_memoizes_none_result(monkeypatch):
     assert first is None
     assert second is None
     assert len(calls) == 1, f"expected exactly 1 DB lookup across 2 calls, got {len(calls)}"
+
+
+def test_get_tenant_from_request_force_refresh_bypasses_cache(monkeypatch):
+    """20889f40 regression: a caller that writes to the tenant's row mid-request
+    (e.g. routes/tunnel.py's add/remove custom plugin) must be able to read back
+    the just-persisted state rather than the pre-write memoized snapshot.
+    force_refresh=True must re-hit the DB and overwrite the cached value."""
+    import asyncio
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from meridian import _deps
+    from meridian import db as db_module
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    rows = [{"id": "tenant-1", "tunnel_plugins": "old"}, {"id": "tenant-1", "tunnel_plugins": "new"}]
+    calls: list[str] = []
+
+    async def _fake_lookup(auth_db, token_hash):
+        calls.append(token_hash)
+        return rows[len(calls) - 1] if len(calls) <= len(rows) else rows[-1]
+
+    monkeypatch.setattr(db_module, "get_tenant_from_token_hash", _fake_lookup)
+
+    fake_app = SimpleNamespace(state=SimpleNamespace(db=object()))
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/tunnel/plugins/custom",
+        "headers": [(b"authorization", b"Bearer sometesttoken")],
+        "app": fake_app,
+    }
+    request = Request(scope)
+
+    async def _read_write_reread():
+        before = await _deps._get_tenant_from_request(request)
+        cached_again = await _deps._get_tenant_from_request(request)
+        after = await _deps._get_tenant_from_request(request, force_refresh=True)
+        return before, cached_again, after
+
+    before, cached_again, after = asyncio.run(_read_write_reread())
+
+    assert before["tunnel_plugins"] == "old"
+    assert cached_again["tunnel_plugins"] == "old", "plain call must still serve the memoized value"
+    assert after["tunnel_plugins"] == "new", "force_refresh must bypass the cache and fetch fresh state"
+    assert len(calls) == 2, f"expected exactly 2 DB lookups (initial + forced refresh), got {len(calls)}"
+
+    # The forced refresh must also update the cache for any subsequent plain call.
+    final = asyncio.run(_deps._get_tenant_from_request(request))
+    assert final["tunnel_plugins"] == "new"
+    assert len(calls) == 2, "a plain call after force_refresh must reuse the newly-cached value, not re-fetch"
