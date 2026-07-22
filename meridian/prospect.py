@@ -7,7 +7,118 @@ from this module; handler.py imports and calls prospect_symbol_impl.
 from __future__ import annotations
 
 import os
-from typing import Any
+import re
+import subprocess
+from typing import Any, Awaitable, Callable
+
+# 4b8f083f — a stored fingerprint only counts as a git-commit-drift baseline
+# when it actually looks like a git commit (short or full hex SHA). The same
+# fingerprint slot can also hold an ISO "indexed_at" timestamp (see
+# routes/tunnel.py's _extract_graph_fingerprint preference order) which is not
+# a git ref and must never be handed to `git rev-list`.
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def _looks_like_git_commit(value: "str | None") -> bool:
+    return bool(value) and isinstance(value, str) and bool(_GIT_COMMIT_RE.match(value.strip()))
+
+
+def _git_commit_drift_sync(root_dir: str, stored_commit: str) -> "dict[str, Any] | None":
+    """Synchronous, best-effort local git check for index/repo drift.
+
+    Runs entirely on-disk (`git rev-parse` + `git rev-list --count`) — no
+    tunnel round-trip, no dependency on the external codebase-memory-mcp
+    binary self-reporting freshness. Must be called from a worker thread
+    (via ``hardening.run_in_bulkhead``), never awaited directly: asyncio
+    subprocess creation (``create_subprocess_exec``) is unsupported on the
+    SelectorEventLoop this project forces on Windows (see __main__.py), so a
+    plain blocking ``subprocess.run`` inside a thread is the only safe way to
+    shell out to git from here.
+
+    Returns None (fail-open) whenever the signal can't be computed cleanly:
+    not a git repo, `stored_commit` unresolvable in this checkout (e.g. a
+    fingerprint from a different clone/fork), git missing, or any timeout —
+    never raises.
+    """
+    if not root_dir or not os.path.isdir(root_dir):
+        return None
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root_dir, capture_output=True, text=True, timeout=3,
+        )
+        if head.returncode != 0:
+            return None
+        head_commit = head.stdout.strip()
+        if not head_commit or head_commit == stored_commit:
+            return None
+        count = subprocess.run(
+            ["git", "rev-list", "--count", f"{stored_commit}..{head_commit}"],
+            cwd=root_dir, capture_output=True, text=True, timeout=3,
+        )
+        if count.returncode != 0:
+            # Most commonly: stored_commit isn't reachable in this checkout's
+            # history at all (unrelated clone, rewritten history, shallow
+            # clone). Nothing safe to report — fail open rather than guess.
+            return None
+        commits_since_index = int((count.stdout or "0").strip() or "0")
+        if commits_since_index <= 0:
+            return None
+        return {
+            "stored_commit": stored_commit,
+            "head_commit": head_commit,
+            "commits_since_index": commits_since_index,
+        }
+    except Exception:  # noqa: BLE001 — drift probe must never raise
+        return None
+
+
+async def _detect_graph_commit_drift(
+    tenant_id: str, project_id: str, root_dir: str,
+) -> "dict[str, Any] | None":
+    """4b8f083f — cheap local staleness signal that closes a real gap in the
+    2ce5bc76 fingerprint mechanism.
+
+    ``_annotate_graph_result_staleness`` (routes/tunnel.py) only flags
+    staleness when a DIFFERENT process re-indexes and ``codebase__index_status``
+    echoes back a fingerprint newer than the one this process cached — it
+    compares two readings of the INDEX's own self-report. It does nothing for
+    the far more common real-world case (confirmed live): real commits land in
+    the repo and nobody re-runs ``index_repository``. ``index_status`` just
+    keeps echoing the same last-indexed fingerprint forever in that case, so
+    ``search_graph`` never gets flagged even after the queried file has moved
+    hundreds of lines.
+
+    This closes that gap using nothing but a local ``git rev-list --count``
+    against the stored ``index_repository`` fingerprint — no tunnel round
+    trip, no dependency on the external binary self-reporting anything. Only
+    runs when there is an actual baseline to compare against (mirrors the
+    "no baseline, no probe" discipline in ``_annotate_graph_result_staleness``):
+    no stored fingerprint, or a fingerprint that isn't a git commit (e.g. an
+    ``indexed_at`` timestamp), means there is nothing safe to check, so this
+    returns None immediately without shelling out to git at all.
+
+    Never raises — any failure (no git repo, no git binary, unresolvable
+    commit, timeout) degrades silently to None, same as every other rung in
+    this fallback chain.
+    """
+    if not tenant_id or not root_dir:
+        return None
+    try:
+        from .routes import tunnel as _tunnel_mod  # noqa: PLC0415
+        stored = _tunnel_mod.get_cached_graph_fingerprint(tenant_id, project_id or None)
+    except Exception:  # noqa: BLE001
+        return None
+    if not _looks_like_git_commit(stored):
+        return None
+    try:
+        from . import hardening as _hardening  # noqa: PLC0415
+        return await _hardening.run_in_bulkhead(
+            _git_commit_drift_sync, root_dir, stored,
+            timeout=5.0, label="prospect_symbol_commit_drift",
+        )
+    except Exception:  # noqa: BLE001 — drift probe must never break prospecting
+        return None
 
 
 def _extract_hits(payload: Any) -> list:
@@ -71,7 +182,10 @@ async def prospect_symbol_impl(
     """Three-rung fallback chain for robust symbol prospecting.
 
     Rung 1 (graph): codebase__search_graph — fast, indexed. Skipped when
-      stale_graph=True or when no code tunnel is active.
+      stale_graph=True, when no code tunnel is active, or (4b8f083f) when a
+      local git-commit-drift probe finds real commits since the last
+      index_repository run for this (tenant, project) — see
+      ``_detect_graph_commit_drift``.
     Rung 2 (serena): extractor__find_symbol / extractor__find_declaration —
       AST-accurate, never stale. Tried when graph returns zero results or is
       skipped.
@@ -89,6 +203,19 @@ async def prospect_symbol_impl(
         "hits": [],
         "fallback_reason": None,
     }
+
+    # ------------- 4b8f083f: local commit-drift staleness probe -----------
+    # Only runs when the caller hasn't already told us the graph is stale,
+    # and only when there's a tenant + root_dir to check against — see
+    # _detect_graph_commit_drift for why this is a real gap the 2ce5bc76
+    # fingerprint mechanism leaves open (it can't see "nobody re-indexed
+    # after N real commits", only "a sibling process re-indexed").
+    commit_drift: "dict[str, Any] | None" = None
+    if not stale_graph and tenant_id and root_dir:
+        commit_drift = await _detect_graph_commit_drift(tenant_id, project_id, root_dir)
+        if commit_drift:
+            stale_graph = True
+            result["_graph_commit_drift"] = commit_drift
 
     # ------------- Rung 1: codebase__search_graph -------------------------
     if not stale_graph and tenant_id:
@@ -182,7 +309,14 @@ async def prospect_symbol_impl(
             result["fallback_reason"] = f"graph_error: {_e}"
 
     elif stale_graph:
-        result["fallback_reason"] = "graph_skipped_stale_graph=true"
+        if commit_drift:
+            result["fallback_reason"] = (
+                "graph_skipped_commit_drift_detected: "
+                f"{commit_drift['commits_since_index']} commit(s) since last index "
+                f"({commit_drift['stored_commit'][:12]} -> {commit_drift['head_commit'][:12]})"
+            )
+        else:
+            result["fallback_reason"] = "graph_skipped_stale_graph=true"
 
     # ------------- Rung 2: extractor__find_symbol / find_declaration ------
     if tenant_id:
@@ -251,3 +385,93 @@ async def prospect_symbol_impl(
 
     # All rungs exhausted — return the (empty) result with diagnostic info.
     return result
+
+
+def _normalize_prospect_hit(hit: Any, qualified_name: str) -> dict[str, Any]:
+    """Normalise ONE prospect_symbol_impl hit into the ``{qualified_name, file,
+    ...}`` shape :func:`pointers._resolve_symbol` expects.
+
+    Hit shape varies by which rung produced it: ``graph``/``serena`` hits
+    typically carry ``qualified_name``/``file`` (or ``name``), while
+    ``semantic`` (search_code_semantic) hits carry ``name``/``path`` instead.
+    Preserves every original key (callers that want the raw hit still get it)
+    and only backfills ``qualified_name``/``file`` when missing/falsy so
+    :func:`pointers._resolve_symbol`'s exact-match + ``file`` read never KeyErrors
+    or silently mismatches across rungs.
+    """
+    if not isinstance(hit, dict):
+        return {"qualified_name": qualified_name}
+    out = dict(hit)
+    if not out.get("qualified_name"):
+        out["qualified_name"] = (
+            hit.get("name_path") or hit.get("name") or qualified_name
+        )
+    if not out.get("file"):
+        out["file"] = hit.get("relative_path") or hit.get("path") or hit.get("uri")
+    return out
+
+
+def build_symbol_resolver(
+    *,
+    tenant: "dict[str, Any] | None" = None,
+    root_dir: str = "",
+    data_dir: str = "",
+) -> "Callable[..., Awaitable[list[dict[str, Any]]]]":
+    """653579c5 — a ``pointers.resolve_pointer``-compatible ``symbol_resolver``
+    that tries the LIVE three-rung :func:`prospect_symbol_impl` chain first,
+    falling back to the local cached-snapshot search
+    (``db.search_graph_entities``) that was previously the ONLY thing
+    ``resolve_pointer``'s default resolver ever consulted.
+
+    Root cause this fixes: ``resolve_sprint_item_pointers`` (mcp/handlers/
+    sprint_tools.py) already has ``tenant`` in scope (it's a parameter of the
+    handler) but never threaded it anywhere — ``pointers.resolve_pointer`` was
+    always called with its DEFAULT ``symbol_resolver``, which only queries the
+    ``codebase_graph_entities`` snapshot table. That table has exactly zero
+    production writers (``db.upsert_graph_entities`` is only ever called from
+    tests / the c00b1ccf opt-in snapshot feature that was never wired to a
+    refresh path — see graph_snapshot.py's own "refreshed from the tunnel when
+    available (deferred)" docstring), so a symbol pointer could NEVER resolve
+    through the default path even when the SAME tenant's live tunnel-connected
+    code graph (the one ``prospect_symbol`` itself reaches, and that a direct
+    ``codebase__search_graph`` call resolves instantly) had the answer.
+
+    Threading ``tenant`` (and an optional ``root_dir``, for the semantic
+    fallback rung) into a resolver built from :func:`prospect_symbol_impl`
+    gives ``resolve_sprint_item_pointers`` the exact same reach as
+    ``prospect_symbol`` — graph → Serena → semantic — while still degrading
+    gracefully to the old cached-snapshot behaviour (never regressing existing
+    callers) when no tenant/tunnel/root_dir is available, e.g. self-hosted
+    sessions with no active code tunnel.
+
+    Never raises: both the prospect attempt and the snapshot fallback are
+    fully guarded, matching every other resolver seam in this module.
+    """
+    async def _resolver(
+        db: Any, project_id: "str | None", qualified_name: "str | None", limit: int,
+    ) -> list[dict[str, Any]]:
+        qn = qualified_name or ""
+        if qn:
+            try:
+                result = await prospect_symbol_impl(
+                    symbol=qn,
+                    project_id=project_id or "",
+                    root_dir=root_dir,
+                    limit=limit,
+                    kind=None,
+                    stale_graph=False,
+                    tenant=tenant,
+                    data_dir=data_dir,
+                )
+                hits = result.get("hits") or []
+                if hits:
+                    return [_normalize_prospect_hit(h, qn) for h in hits]
+            except Exception:  # noqa: BLE001 — fall through to the snapshot search
+                pass
+        try:
+            from .db import search_graph_entities as _sg  # noqa: PLC0415
+            return await _sg(db, project_id or "", qn, limit)
+        except Exception:  # noqa: BLE001 — resolver seam must never raise
+            return []
+
+    return _resolver

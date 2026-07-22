@@ -565,6 +565,63 @@ async def test_mcp_pointer_tools_add_get_resolve(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mcp_resolve_pointers_reaches_live_graph_via_tenant(db, monkeypatch):
+    """653579c5 regression — resolve_sprint_item_pointers must resolve a symbol
+    target via the SAME live tunnel-connected graph prospect_symbol reaches,
+    not just the (production-empty) codebase_graph_entities snapshot.
+
+    Before the fix, ``tenant`` was accepted by the handler but never threaded
+    into symbol resolution at all, so this scenario (empty snapshot, live
+    graph has the answer) always returned {resolved: False} even with an
+    active code tunnel for this exact tenant/project.
+    """
+    import meridian.routes.tunnel as _tunnel_mod
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "ptr-live-graph")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "wire the primitive")
+
+    # The local cached snapshot has NOTHING for this project (matches
+    # production reality: nothing ever populates codebase_graph_entities).
+    async def _empty_snapshot(_db, _pid, query, limit=10):
+        return []
+    monkeypatch.setattr(db_module, "search_graph_entities", _empty_snapshot)
+
+    # But a live code tunnel for this tenant resolves the symbol instantly.
+    async def _fake_call_tunnel(tid, name, args, **kw):
+        if name == "codebase__search_graph":
+            return {"content": [{"type": "text", "text":
+                '{"results": [{"qualified_name": "meridian.server.mcp_tools_doc", '
+                '"file": "meridian/server.py"}]}'}]}
+        raise AssertionError(f"unexpected tunnel tool: {name}")
+    monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+    monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+    added = await srv._dispatch_mcp_tool(
+        "add_sprint_item_pointer",
+        {"project_id": p["id"], "sprint_item_id": item["id"], "source_type": "code",
+         "targets": [{"uri": "meridian/server.py",
+                      "selector": {"type": "symbol",
+                                   "qualified_name": "meridian.server.mcp_tools_doc"}}],
+         "label": "doc generator"},
+        db, "/tmp",
+    )
+    assert added["label"] == "doc generator"
+
+    fake_tenant = {"id": "tenant-live-graph"}
+    resolved = await srv._dispatch_mcp_tool(
+        "resolve_sprint_item_pointers",
+        {"project_id": p["id"], "sprint_item_id": item["id"]},
+        db, "/tmp",
+        tenant=fake_tenant,
+    )
+    assert len(resolved["pointers"]) == 1
+    target = resolved["pointers"][0]["targets"][0]
+    assert target["resolved"] is True
+    assert target["file"] == "meridian/server.py"
+
+
+@pytest.mark.asyncio
 async def test_mcp_add_pointer_malformed_returns_error(db):
     from meridian import server as srv
     p = await db_module.create_project(db, "ptr-mcp-bad")

@@ -525,6 +525,66 @@ async def test_search_outputs_dispatches_through_dispatch_mcp_tool(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_search_outputs_threads_max_seconds_through(tmp_path, monkeypatch):
+    """3535b9ad -- max_seconds already existed on outputs_indexer.search_outputs
+    (the "indexing slider" Adam asked for) but was never read from args or
+    threaded through the search_outputs dispatch branch. Must now reach the
+    underlying call."""
+    from meridian import server as srv
+    from meridian import outputs_indexer as _outputs_indexer
+
+    captured = {}
+    real_search_outputs = _outputs_indexer.search_outputs
+
+    def _spy(outputs_dir, query, **kwargs):
+        captured.update(kwargs)
+        return real_search_outputs(outputs_dir, query, **kwargs)
+
+    monkeypatch.setattr(_outputs_indexer, "search_outputs", _spy)
+    _write(tmp_path / "budget.csv", "budget_term,other\n1,2\n")
+
+    result = await srv._dispatch_mcp_tool(
+        "search_outputs",
+        {"outputs_dir": str(tmp_path), "query": "budget_term", "max_seconds": 7.5},
+        None, "/tmp",
+    )
+    assert captured.get("max_seconds") == 7.5
+    assert isinstance(result, dict)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_search_outputs_omitted_max_seconds_uses_library_default(
+    tmp_path, monkeypatch,
+):
+    """Omitting max_seconds must NOT pass max_seconds=None through (that would
+    mean "no deadline" to the underlying function) -- it must preserve the
+    library's own DEFAULT_REBUILD_BUDGET_SECONDS default, unchanged from
+    before this item."""
+    from meridian import server as srv
+    from meridian import outputs_indexer as _outputs_indexer
+
+    captured = {}
+    real_search_outputs = _outputs_indexer.search_outputs
+
+    def _spy(outputs_dir, query, **kwargs):
+        captured.update(kwargs)
+        return real_search_outputs(outputs_dir, query, **kwargs)
+
+    monkeypatch.setattr(_outputs_indexer, "search_outputs", _spy)
+    _write(tmp_path / "nodeadline.csv", "nodeadline_term,other\n1,2\n")
+
+    await srv._dispatch_mcp_tool(
+        "search_outputs",
+        {"outputs_dir": str(tmp_path), "query": "nodeadline_term"},
+        None, "/tmp",
+    )
+    assert "max_seconds" not in captured, (
+        "omitting max_seconds must not override the underlying function's own "
+        "default by explicitly passing max_seconds=None"
+    )
+
+
+@pytest.mark.asyncio
 async def test_dispatch_search_outputs_requires_outputs_dir():
     from meridian import server as srv
 

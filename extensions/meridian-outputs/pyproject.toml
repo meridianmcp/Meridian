@@ -30,6 +30,19 @@ dependencies = [
     # but it's declared as a real, non-optional dependency here so a normal
     # install always gets the fast path.
     "xxhash>=3.4",
+    # e8a2f710 -- pyarrow backs OutputsFtsIndex.rebuild()'s Phase-2 bulk
+    # insert: registering a pyarrow Table and running INSERT ... SELECT
+    # bypasses DuckDB's parameter-bound VALUES insert path entirely.
+    # Measured live: a 2000-row/11-col batch that cost ~17s through any
+    # parameter-bound insert (executemany, a raw loop, a single combined
+    # multi-row VALUES statement, or a columnar UNNEST bind -- all land in
+    # the same order of magnitude) drops to ~0.11s via Arrow registration
+    # (~150x faster). outputs_local.py lazily imports this and degrades to
+    # the combined-VALUES path (still ~40% faster than plain executemany)
+    # if it's ever missing at runtime, but it's declared as a real,
+    # non-optional dependency here so a normal install always gets the
+    # fast path -- same policy as xxhash above.
+    "pyarrow>=14.0",
 ]
 
 [project.optional-dependencies]

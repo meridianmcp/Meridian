@@ -1318,12 +1318,24 @@ async def handle_resolve_sprint_item_pointers(
     2976e168 — resolve EVERY pointer on an item, dispatching by selector.type.
     Best-effort + guarded: unresolvable targets become {resolved:false}; the
     pass NEVER raises. node_id targets need the doc-structure store, resolved
-    via the same tier-aware helper the citation tools use; symbol/zotero use
-    the pointers module's default seams (db.search_graph_entities /
-    zotero_client). project_id scopes the code-graph search.
+    via the same tier-aware helper the citation tools use; zotero uses the
+    pointers module's default seam (zotero_client). project_id scopes the
+    code-graph search.
+
+    653579c5 — symbol targets now resolve through :func:`prospect.build_symbol_resolver`,
+    which tries the LIVE three-rung ``prospect_symbol`` chain (graph → Serena →
+    semantic) using THIS handler's own ``tenant`` first, falling back to the
+    cached ``codebase_graph_entities`` snapshot (``db.search_graph_entities``)
+    that used to be the ONLY thing consulted. Previously ``tenant`` was a
+    handler parameter that was never threaded anywhere, so a symbol pointer
+    could never resolve against the live/tunnel-connected graph even when the
+    exact same tenant's ``prospect_symbol`` / direct ``codebase__search_graph``
+    calls resolved instantly — see build_symbol_resolver's docstring for the
+    full root-cause writeup.
     """
     from ..handler import _resolve_ingest_doc_store  # noqa: PLC0415
     from ...pointers import resolve_pointer  # noqa: PLC0415
+    from ...prospect import build_symbol_resolver  # noqa: PLC0415
 
     if not args.get("project_id"):
         return {"error": "project_id is required (or pass project_name)"}
@@ -1342,6 +1354,14 @@ async def handle_resolve_sprint_item_pointers(
         except Exception:  # noqa: BLE001 — resolver seam must never raise
             return None
 
+    # 653579c5 — root_dir is optional: it only extends reach to the semantic
+    # (search_code_semantic) rung when no tunnel/tenant is available; omitting
+    # it just means that rung is skipped, same as prospect_symbol itself.
+    _root_dir = str(args.get("root_dir") or "").strip()
+    _symbol_resolver = build_symbol_resolver(
+        tenant=tenant, root_dir=_root_dir, data_dir=data_dir,
+    )
+
     pointers = await db_module.get_sprint_item_pointers(
         db, args["sprint_item_id"]
     )
@@ -1352,6 +1372,7 @@ async def handle_resolve_sprint_item_pointers(
                 db, ptr,
                 project_id=args["project_id"],
                 node_resolver=_node_resolver,
+                symbol_resolver=_symbol_resolver,
             )
         )
     return {"sprint_item_id": args["sprint_item_id"], "pointers": resolved}

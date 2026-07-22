@@ -50,6 +50,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "find_similar_table": 'find_similar_table(project_id="abc-123", doc="thesis/chapter1.docx", description="summary of experimental results")',
     "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
     "annotate_outputs": 'annotate_outputs(outputs_dir="/repo/outputs", path="/repo/outputs/run_42", note="PCA on, BFS off — final params", run_params={"lr": 0.001, "epochs": 100})',
+    "find_outputs_by_source": 'find_outputs_by_source(outputs_dir="/repo/outputs", source_path="analysis/run.py")',
     "search_code_semantic": 'search_code_semantic(root_dir="/repo/src", query="parse the auth token and refresh it")',
     "get_flag_registry": 'get_flag_registry(root_dir="/repo/src")',
     "link_flag_to_section": 'link_flag_to_section(project_id="abc-123", doc="thesis/chapter4.docx", element_id="el-uuid-here", flag_name="DT_ONLY_WIDTH", value=1, default=0, source_file="pipeline/gt.py", source_line=142)',
@@ -801,12 +802,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "created_at, updated_at, source}]}]}. annotations is auto-included "
         "for each hit (any annotation keyed to the hit path OR a nearest "
         "ancestor directory) — no second tool call needed. A missing dir / "
-        "empty tree returns an empty hits list, never an error.",
+        "empty tree returns an empty hits list, never an error. "
+        "3535b9ad — pass max_seconds to raise/lower the indexing budget "
+        "(the \"indexing slider\"): a large or cold tree may not fully "
+        "converge within the default budget on the first call — the result's "
+        "partial=true field signals more indexing remains; call again to "
+        "continue (each call resumes where the last left off, never restarts).",
      "inputSchema": {"type": "object", "properties": {
          "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (walked recursively)."},
          "query": {"type": "string", "description": "The BM25 query — one or more search terms (column names, keys, script names, or any text in a csv/json)."},
          "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
-         "include_archival": {"type": "boolean", "description": "Default true — archival copies are deprioritized but still returned. Set false to exclude confirmed-archival files entirely."}},
+         "include_archival": {"type": "boolean", "description": "Default true — archival copies are deprioritized but still returned. Set false to exclude confirmed-archival files entirely."},
+         "max_seconds": {"type": "number", "description": "Wall-clock budget (seconds) for this call's incremental indexing before returning. Omit for the library default. Lower it for a faster first response on a huge tree (check partial=true and call again); raise it to converge in fewer calls on a tree too large for the default budget."}},
          "required": ["outputs_dir", "query"]}},
     {"name": "annotate_outputs", "description":
         "9e02e448 — capture a human annotation for a path inside an outputs "
@@ -830,6 +837,30 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "note": {"type": "string", "description": "The annotation text (e.g. 'PCA on, BFS off — results from run on 2026-07-12 with lr=0.001')."},
          "run_params": {"type": "object", "description": "Optional free-form key-value dict of run parameters to log alongside the note (e.g. {\"lr\": 0.001, \"epochs\": 100})."}},
          "required": ["outputs_dir", "path", "note"]}},
+    {"name": "find_outputs_by_source", "description":
+        "2ae25966 — READ-ONLY reverse provenance lookup over a run's OUTPUTS "
+        "tree: the mirror image of resolve_figure_output's forward direction "
+        "(figure -> source). Given a script or data file's source_path, scans "
+        "the same local DuckDB outputs index search_outputs/annotate_outputs "
+        "use for every indexed output whose recorded generating_script traces "
+        "back to it — an exact (case/slash-insensitive) string match OR a "
+        "basename match, so 'analysis/run.py' also matches an output recorded "
+        "with generating_script='run.py'. This is the direction plain "
+        "exact-path resolution can never answer, because that always starts "
+        "from the output side: 'what did this script/data file produce?' — "
+        "useful for auditing a stale Outputs_*_BACKUP folder mess by walking "
+        "a source file's outputs forward, newest first, and comparing against "
+        "what a document actually cites. Returns {outputs_dir, source_path, "
+        "outputs:[{path, generating_script, is_archival, canonical_path, "
+        "sha256, kind, size, mtime, csv_columns, json_keys}], total} sorted "
+        "newest-first by mtime; total is the full match count before limit "
+        "truncation. outputs is empty (not an error) when nothing in the "
+        "tree cites this source, or when outputs_dir doesn't exist.",
+     "inputSchema": {"type": "object", "properties": {
+         "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (same value you pass to search_outputs)."},
+         "source_path": {"type": "string", "description": "The generating script or data file to trace forward from (e.g. 'analysis/run.py') — matched against each indexed output's recorded generating_script."},
+         "limit": {"type": "integer", "description": "Max matched outputs to return, newest-first by mtime (default 25)."}},
+         "required": ["outputs_dir", "source_path"]}},
     {"name": "search_code_semantic", "description":
         "93fce816 — Cursor-style LOCAL semantic code search over a source tree, "
         "entirely in a DuckDB sidecar (no cloud round-trip). Parses Python "
@@ -937,6 +968,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "fallback_reason: str?}) so the caller knows which level succeeded. "
         "All three legs are best-effort: a missing tunnel, inactive slot, or "
         "missing root_dir degrades to the next rung, never an error. "
+        "4b8f083f — when root_dir is a git checkout, the graph rung is ALSO "
+        "auto-skipped (same as an explicit stale_graph=true, with fallback_reason "
+        "'graph_skipped_commit_drift_detected') whenever a cheap local "
+        "`git rev-list --count` finds real commits since the last "
+        "index_repository run for this project — no waiting for a "
+        "_graph_staleness warning from the server, which only fires when a "
+        "SIBLING process re-indexes, never when nobody re-indexes at all. "
+        "Pass root_dir to get this protection. "
         "Use this instead of calling codebase__search_graph directly whenever "
         "you are prospecting for a symbol, function, or class location — it "
         "is structurally immune to the class of silent graph-index miss that "
@@ -1015,18 +1054,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "resolve_sprint_item_pointers", "description":
         "2976e168 — resolve EVERY generic pointer on a sprint item to its concrete "
         "location, dispatching by selector.type. A range target returns its location "
-        "as-is; symbol resolves the qualified_name in the cached code graph to a "
-        "file+line; node_id looks the element up in the doc-structure store; zotero_key "
-        "resolves via Zotero's local API. A subSelector narrows the outer resolution "
-        "('these lines, within this function'). Every dispatch is best-effort: an "
-        "unresolvable target yields {resolved:false, reason} instead of an error, and "
-        "the pass NEVER fails. Returns {pointers:[{id, source_type, label, "
-        "targets:[<resolved-target>]}]}. Requires no network for range/symbol/node_id; "
-        "zotero_key needs Zotero running locally (else that target is just unresolved).",
+        "as-is; symbol resolves the qualified_name against the SAME live three-rung "
+        "chain prospect_symbol uses (graph → Serena → semantic, 653579c5) when this "
+        "session has an active code tunnel, falling back to the cached code-graph "
+        "snapshot when it doesn't; node_id looks the element up in the doc-structure "
+        "store; zotero_key resolves via Zotero's local API. A subSelector narrows the "
+        "outer resolution ('these lines, within this function'). Every dispatch is "
+        "best-effort: an unresolvable target yields {resolved:false, reason} instead "
+        "of an error, and the pass NEVER fails. Returns {pointers:[{id, source_type, "
+        "label, targets:[<resolved-target>]}]}. Requires no network for range/symbol/"
+        "node_id; zotero_key needs Zotero running locally (else that target is just "
+        "unresolved).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to resolve."}},
+         "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to resolve."},
+         "root_dir": {"type": "string", "description": "Optional absolute path to the source tree root, passed through to the symbol resolver's search_code_semantic fallback rung (same as prospect_symbol's root_dir) when no code tunnel is active. If omitted, that rung is skipped."}},
          "required": ["sprint_item_id"]}},
     {"name": "delete_sprint_item_pointer", "description":
         "2976e168 — delete ONE generic pointer from a sprint item by its pointer id "
@@ -2228,6 +2271,7 @@ _READ_ONLY_TOOLS = {
     "find_similar_figure",
     "find_similar_table",
     "search_outputs",
+    "find_outputs_by_source",
     "search_code_semantic",
     "prospect_symbol",
     "get_flag_registry",
@@ -2383,6 +2427,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_flag_registry":    "code-intel",
     "search_outputs":       "code-intel",
     "annotate_outputs":     "code-intel",
+    "find_outputs_by_source": "code-intel",
     "snapshot_graph_metrics": "code-intel",
     "get_graph_diff":       "code-intel",
     "get_symbol_hotspots":  "code-intel",
@@ -2564,6 +2609,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_flag_registry":         "both",
     "get_flag_drift":            "both",
     "search_outputs":            "both",
+    "find_outputs_by_source":    "both",
     "get_document_structure":    "both",
     "get_latex_structure":       "both",
     "get_citation_edges":        "both",
@@ -2693,6 +2739,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_flag_registry":          "common-support",
     "search_outputs":             "common-support",
     "annotate_outputs":           "common-support",
+    "find_outputs_by_source":     "common-support",
     # sprint decomposition / pointers
     "fan_out_sprint_items":       "common-support",
     "add_subtask":                "common-support",
@@ -2877,6 +2924,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "find_similar_table": "Find Similar Table",
     "search_outputs": "Search Outputs",
     "annotate_outputs": "Annotate Outputs",
+    "find_outputs_by_source": "Find Outputs By Source",
     "search_code_semantic": "Search Code Semantic",
     "run_verification": "Run Verification",
     "prospect_symbol": "Prospect Symbol",

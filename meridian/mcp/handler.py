@@ -4123,6 +4123,49 @@ async def _handle_plugin_tools(
             except Exception:  # noqa: BLE001
                 pass
 
+        # 8047802f — a live probe returning 0 tools does NOT prove a slot is dead.
+        # `_fetch_slot_tools`'s own tools/list request shares the exact same
+        # per-(slot, tenant) in-flight bulkhead (`_slot_semaphore` in
+        # routes/tunnel.py, capped at MERIDIAN_MAX_SLOT_INFLIGHT — default 8) as
+        # every real tools/call against that slot, and gives up fast
+        # (`_SLOT_ACQUIRE_TIMEOUT` = 1s). A slot under genuinely heavy, successful
+        # real traffic — e.g. dozens of live dc:*/meridian-outputs:* calls in the
+        # same session — can transiently saturate that bulkhead and fail-fast
+        # (503 "slot saturated") THIS diagnostic probe within its own budget, even
+        # though the slot is demonstrably invocable right now. The busier (and
+        # healthier) the slot, the MORE likely this probe collapses to 0 — so the
+        # naive "0 tools this fetch => inactive" rule misreports a busy-but-alive
+        # slot as dead (same status-doesn't-reflect-ground-truth bug class as
+        # 1a799e52, different subsystem).
+        #
+        # Cross-check any slot the live probe came back empty for against
+        # ``_tunnel_tool_routes`` — the SAME routing cache real ``call_tunnel_tool``
+        # dispatch reads from to send actual tool invocations, so it IS ground
+        # truth for "is this slot really being invoked right now". If the socket
+        # is still connected AND the cache already maps >=1 live tool name to this
+        # slot (proof a discovery succeeded earlier this session and nothing has
+        # invalidated it since — reconnects/recoveries clear this cache), trust
+        # that over a single saturated probe instead of falsely reporting 0/dead.
+        if tenant_id:
+            _routes = (getattr(_tunnel_mod, "_tunnel_tool_routes", None) or {}).get(tenant_id) or {}
+            if _routes:
+                _routed_by_slot: dict[str, list[str]] = {}
+                for _prefixed_name, _lbl in _routes.items():
+                    _routed_by_slot.setdefault(_lbl, []).append(_prefixed_name)
+                for _lbl, _prefixed_names in _routed_by_slot.items():
+                    if _lbl in slot_tool_counts:
+                        continue  # this fetch already confirmed the slot live
+                    _lbl_sockets, _ = _tunnel_mod._label_maps(_lbl)  # type: ignore[attr-defined]
+                    if tenant_id not in _lbl_sockets:
+                        continue  # socket genuinely gone — never resurrect from a stale cache
+                    _lbl_display = _slot_display.get(_lbl, _lbl)
+                    _prefix = f"{_lbl_display}__"
+                    slot_tool_counts[_lbl] = len(_prefixed_names)
+                    slot_tool_names[_lbl] = [
+                        n[len(_prefix):] if n.startswith(_prefix) else n
+                        for n in _prefixed_names
+                    ]
+
         # Fetch stored skill notes (tagged 'plugin-skill') from workspace notes
         skill_notes: dict[str, dict] = {}
         try:
@@ -4671,19 +4714,35 @@ async def _handle_outputs_tools(
         except (TypeError, ValueError):
             limit = 10
         include_archival = args.get("include_archival", True)
+        # 3535b9ad — "indexing slider": max_seconds already existed on the
+        # underlying outputs_indexer.search_outputs() (DEFAULT_REBUILD_BUDGET_
+        # SECONDS) but was never read from args/threaded through here, so a
+        # caller had no way to raise/lower the rebuild budget for a cold or
+        # oversized tree. omit -> library default (unchanged behaviour).
+        max_seconds = args.get("max_seconds")
+        if max_seconds is not None:
+            try:
+                max_seconds = float(max_seconds)
+            except (TypeError, ValueError):
+                max_seconds = None
         # The walk + hash + DuckDB FTS build is synchronous/CPU-bound. Run it in
         # the bulkhead pool under a hard deadline (e5f96adf / 1d021501): it now
         # also has an internal incremental budget (5116078b), so this backstop
         # only fires on a genuinely pathological cold tree — and fails fast with
         # a clear error instead of the ~4-minute silent hang that motivated this.
+        _search_outputs_kwargs: dict[str, Any] = {
+            "limit": limit,
+            "include_archival": bool(include_archival),
+            "label": "search_outputs",
+        }
+        if max_seconds is not None:
+            _search_outputs_kwargs["max_seconds"] = max_seconds
         try:
             return await _hardening.run_in_bulkhead(
                 _outputs_indexer.search_outputs,
                 outputs_dir,
                 query,
-                limit=limit,
-                include_archival=bool(include_archival),
-                label="search_outputs",
+                **_search_outputs_kwargs,
             )
         except _hardening.HeavyToolTimeout as exc:
             return {
@@ -4691,6 +4750,65 @@ async def _handle_outputs_tools(
                 "query": query,
                 "hits": [],
                 "total_indexed": 0,
+                "timed_out": True,
+                "error": str(exc),
+            }
+    if name == "find_outputs_by_source":
+        from .. import outputs_indexer as _outputs_indexer  # noqa: PLC0415
+        from .. import hardening as _hardening  # noqa: PLC0415
+        outputs_dir = str(args.get("outputs_dir") or "").strip()
+        source_path = str(args.get("source_path") or "").strip()
+        if not outputs_dir:
+            raise ValueError("outputs_dir is required")
+        if not source_path:
+            raise ValueError("source_path is required")
+        # 2ae25966 — reverse of search_outputs/resolve_figure_output: same
+        # 0dedff91 / 1365e01a hosted-mode guard (this walks `outputs_dir` off
+        # THIS process's own filesystem) with the same tunnel-proxy fallback.
+        if _hosted_mode():
+            tenant_id = (tenant or {}).get("id", "")
+            if tenant_id:
+                _proxied = await _tunnel_proxy_outputs_tool(
+                    tenant_id, "find_outputs_by_source", dict(args),
+                )
+                if _proxied is not None:
+                    return _proxied
+            return {
+                "outputs_dir": outputs_dir,
+                "source_path": source_path,
+                "outputs": [],
+                "total": 0,
+                "error": (
+                    "find_outputs_by_source walks a directory on YOUR local "
+                    "filesystem and cannot run on hosted Meridian -- the server "
+                    "has no access to your machine. Start `meridian --tunnel` "
+                    "with the meridian-outputs package to enable tunnel-routed "
+                    "local outputs indexing, or run Meridian self-hosted."
+                ),
+                "hosted": True,
+                "tunnel_tried": bool(tenant_id),
+            }
+        limit = args.get("limit", 25)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 25
+        # Same CPU-bound walk + hash + DuckDB rebuild as search_outputs, so the
+        # same bulkhead-pool + hard-deadline backstop applies (e5f96adf/1d021501).
+        try:
+            return await _hardening.run_in_bulkhead(
+                _outputs_indexer.find_outputs_by_source,
+                outputs_dir,
+                source_path,
+                limit=limit,
+                label="find_outputs_by_source",
+            )
+        except _hardening.HeavyToolTimeout as exc:
+            return {
+                "outputs_dir": outputs_dir,
+                "source_path": source_path,
+                "outputs": [],
+                "total": 0,
                 "timed_out": True,
                 "error": str(exc),
             }

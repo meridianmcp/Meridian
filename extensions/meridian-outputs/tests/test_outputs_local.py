@@ -1832,6 +1832,63 @@ class TestColdTreeFtsDeferral:
         result = OL.search_outputs(str(tmp_path), "normalterm")
         assert result["total_indexed"] >= 1
         assert len(result["hits"]) >= 1
+        assert "db_write_error" not in result, (
+            "1a799e52: a healthy write must not carry a db_write_error field"
+        )
+
+    def test_rebuild_surfaces_db_write_error_instead_of_silent_debug_log(
+        self, tmp_path: Path,
+    ) -> None:
+        """1a799e52: before this fix, Phase 2's DB-write except-block swallowed
+        ANY failure at DEBUG level only, while total_indexed/total_in_index (both
+        derived from the in-memory row_cache, populated BEFORE the write is
+        attempted) kept reporting growing "success" -- a real persistence
+        failure looked identical to a healthy index. last_db_write_error /
+        the search_outputs() result's db_write_error field must now surface it."""
+        (tmp_path / "a.csv").write_text("term_one,1\n", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        assert idx.last_db_write_error is None
+
+        def _boom(self, con):  # noqa: ANN001 -- matches _ensure_schema's real signature
+            raise RuntimeError("simulated disk-full / connection failure")
+
+        with patch.object(OL.OutputsFtsIndex, "_ensure_schema", _boom):
+            total_indexed = idx.rebuild()
+
+        # The misleading part of the original bug: the in-memory count still
+        # looks like a healthy, progressing index...
+        assert total_indexed >= 1
+        assert len(idx._row_cache) >= 1
+        # ...but the write genuinely failed, and that must now be visible.
+        assert idx.last_db_write_error is not None
+        assert "simulated disk-full" in idx.last_db_write_error
+
+        # A subsequent successful rebuild() call must clear the error (per-call
+        # semantics -- last_db_write_error reflects only the MOST RECENT call).
+        idx.last_db_write_error = None  # reset attribute directly (isolate this assertion)
+        idx.rebuild()
+        assert idx.last_db_write_error is None
+
+    def test_search_outputs_surfaces_db_write_error_in_result_dict(
+        self, tmp_path: Path,
+    ) -> None:
+        """The module-level search_outputs() API (the real MCP-tool-facing
+        entry point) must surface the same signal, not just the class attribute."""
+        (tmp_path / "b.csv").write_text("term_two,1\n", encoding="utf-8")
+
+        def _boom(self, con):  # noqa: ANN001
+            raise RuntimeError("simulated write failure")
+
+        with patch.object(OL.OutputsFtsIndex, "_ensure_schema", _boom):
+            result = OL.search_outputs(str(tmp_path), "term_two")
+
+        assert result["total_indexed"] >= 1, (
+            "the in-memory count still looks like a healthy index -- this is "
+            "exactly the deceptive state the fix must make visible via db_write_error"
+        )
+        assert result.get("db_write_error") is not None
+        assert "simulated write failure" in result["db_write_error"]
         assert result.get("partial") is not True, (
             "a small/warm tree must not set partial=True: "
             f"got {result}"
@@ -1933,6 +1990,71 @@ class TestTantivySearchIndex:
             f.unlink()
             idx.rebuild()
             assert not any(h["path"] == str(f) for h in idx.search("vanishingterm"))
+        finally:
+            idx.close()
+
+
+class TestTantivyHeapSize:
+    """c73c0dd7 -- Tantivy writer's undersized default heap_size caused
+    678 fragmented segments + a 4.8s reload() on a real 16k-file batch;
+    512MB drops segments to 48 and cuts add+commit+reload to 2.8s (~3x)."""
+
+    def test_default_heap_bytes_is_512mb(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._TANTIVY_HEAP_ENV_VAR, raising=False)
+        assert OL._default_tantivy_heap_bytes() == 512 * 1024 * 1024
+
+    def test_env_var_overrides_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._TANTIVY_HEAP_ENV_VAR, "256")
+        assert OL._default_tantivy_heap_bytes() == 256 * 1024 * 1024
+
+    def test_invalid_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._TANTIVY_HEAP_ENV_VAR, "not-a-number")
+        assert OL._default_tantivy_heap_bytes() == 512 * 1024 * 1024
+
+    def test_env_var_below_minimum_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._TANTIVY_HEAP_ENV_VAR, "1")
+        assert OL._default_tantivy_heap_bytes() == 512 * 1024 * 1024
+
+    def test_explicit_constructor_arg_takes_precedence_over_env_var(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(OL._TANTIVY_HEAP_ENV_VAR, "256")
+        assert OL._resolve_tantivy_heap_bytes(64 * 1024 * 1024) == 64 * 1024 * 1024
+
+    def test_explicit_arg_below_minimum_falls_back_to_default(self) -> None:
+        assert OL._resolve_tantivy_heap_bytes(1024) == 512 * 1024 * 1024
+
+    def test_index_resolves_heap_bytes_from_constructor(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), tantivy_heap_bytes=64 * 1024 * 1024)
+        assert idx._tantivy_heap_bytes == 64 * 1024 * 1024
+
+    def test_index_defaults_to_512mb_heap(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv(OL._TANTIVY_HEAP_ENV_VAR, raising=False)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        assert idx._tantivy_heap_bytes == 512 * 1024 * 1024
+
+    def test_connect_tantivy_passes_resolved_heap_size_to_writer(
+        self, tmp_path: Path,
+    ) -> None:
+        """The resolved heap_bytes must actually reach tantivy.Index.writer(),
+        not just be stored on the instance and never used."""
+        f = tmp_path / "a.csv"
+        f.write_text("term,1\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), tantivy_heap_bytes=33 * 1024 * 1024)
+
+        import tantivy  # noqa: PLC0415
+
+        captured: dict[str, Any] = {}
+        real_writer_method = tantivy.Index.writer
+
+        def _spy_writer(self, *args, **kwargs):  # noqa: ANN001
+            captured["heap_size"] = kwargs.get("heap_size")
+            return real_writer_method(self, *args, **kwargs)
+
+        try:
+            with patch.object(tantivy.Index, "writer", _spy_writer):
+                idx._connect_tantivy()
+            assert captured.get("heap_size") == 33 * 1024 * 1024
         finally:
             idx.close()
 
@@ -2453,10 +2575,15 @@ class TestHashAlgoVersionUpgrade:
 # ---------------------------------------------------------------------------
 
 class TestConfigurableMaxWorkers:
-    def test_default_is_eight(self, tmp_path: Path) -> None:
+    def test_default_is_cpu_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """a849e3d5 -- default changed from a flat hardcoded 8 to
+        os.cpu_count(), empirically confirmed faster on real hardware."""
+        monkeypatch.delenv(OL._MAX_WORKERS_ENV_VAR, raising=False)
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
-            assert idx._max_workers == 8
+            assert idx._max_workers == (os.cpu_count() or 8)
         finally:
             idx.close()
 
@@ -2493,7 +2620,7 @@ class TestConfigurableMaxWorkers:
         monkeypatch.setenv(OL._MAX_WORKERS_ENV_VAR, "not-an-int")
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
-            assert idx._max_workers == 8
+            assert idx._max_workers == (os.cpu_count() or 8)
         finally:
             idx.close()
 
@@ -2502,7 +2629,7 @@ class TestConfigurableMaxWorkers:
     ) -> None:
         idx = OL.OutputsFtsIndex(str(tmp_path), max_workers=0)
         try:
-            assert idx._max_workers == 8
+            assert idx._max_workers == (os.cpu_count() or 8)
         finally:
             idx.close()
 

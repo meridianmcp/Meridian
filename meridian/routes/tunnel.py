@@ -3467,6 +3467,34 @@ def _graph_fingerprint_key(tenant_id: str, arguments: "dict | None") -> "str | N
     return f"{tenant_id}:{project_id or '*'}"
 
 
+def get_cached_graph_fingerprint(
+    tenant_id: str, project_id: "str | None" = None,
+) -> "str | None":
+    """Public accessor for the fingerprint captured by the last successful
+    ``index_repository`` call for ``(tenant_id, project_id)``.
+
+    Same lookup ``_annotate_graph_result_staleness`` performs internally:
+    project-specific key first, falling back to the ``{tenant_id}:*``
+    wildcard key that ``index_repository`` always writes to (it takes
+    ``repo_path`` rather than ``project_id``, so it never populates a
+    project-specific key itself).
+
+    4b8f083f — exposed so callers outside this module (``prospect.py``'s
+    local git-commit-drift probe) can compare the stored index baseline
+    against a freshness signal that needs no extra tunnel round-trip.
+    Returns None when no baseline has been captured for this tenant/project.
+    """
+    fkey = _graph_fingerprint_key(
+        tenant_id, {"project_id": project_id} if project_id else None,
+    )
+    stored = _code_graph_fingerprints.get(fkey)
+    if not stored:
+        wildcard_key = f"{tenant_id}:*"
+        if wildcard_key != fkey:
+            stored = _code_graph_fingerprints.get(wildcard_key)
+    return stored
+
+
 async def _fetch_graph_current_fingerprint(tenant_id: str, arguments: "dict | None") -> "str | None":
     """Best-effort: ask the code-intel server for the current index fingerprint.
 
