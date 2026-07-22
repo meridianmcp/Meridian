@@ -1242,6 +1242,15 @@ class OutputsFtsIndex:
         self._manifest: dict[str, tuple[float | None, int | None]] = {}
         self._row_cache: dict[str, OutputRow] = {}
         self.last_rebuild_partial = False
+        # 1a799e52 -- set when Phase 2's DB write raises inside rebuild()'s
+        # `except Exception: _log.debug(...)` block. Previously that failure
+        # was swallowed at DEBUG level only, while total_indexed/total_in_index
+        # (both derived from the in-memory _row_cache, populated BEFORE the
+        # write is attempted) kept reporting growing "success" -- a real
+        # persistence failure looked identical to a healthy index until a
+        # fresh process found nothing on disk. None means the most recent
+        # rebuild() call's write (if attempted) succeeded or nothing changed.
+        self.last_db_write_error: str | None = None
         # 6ba77ada -- resumable file-walk state (see _ResumableFileWalk). None
         # when no walk pass is currently in progress; set at the start of a
         # pass and cleared once that pass's walk finishes. _walk_accumulated
@@ -1805,6 +1814,8 @@ class OutputsFtsIndex:
         use ``_add_annotation_locked`` (not ``add_annotation``).  That
         invariant is preserved here.
         """
+        # 1a799e52 -- reset per-call; set below if Phase 2's DB write fails.
+        self.last_db_write_error = None
         deadline = (None if max_seconds is None
                     else time.monotonic() + max_seconds)
         # 5845cc6d — Phase 1 gets its own, earlier sub-deadline so it can never
@@ -2225,8 +2236,17 @@ class OutputsFtsIndex:
                     else:
                         self._fts_pending = False
                         self._rebuild_fts(con)
-                except Exception:  # noqa: BLE001
+                except Exception as _db_write_exc:  # noqa: BLE001
                     _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
+                    # 1a799e52 -- this used to be swallowed at DEBUG level only,
+                    # with total_indexed/total_in_index (both derived from the
+                    # in-memory _row_cache populated BEFORE this write) still
+                    # reporting growing "success". Surface it so callers can
+                    # distinguish "indexed in memory, not yet confirmed on
+                    # disk" from "confirmed persisted".
+                    self.last_db_write_error = (
+                        f"{type(_db_write_exc).__name__}: {_db_write_exc}"
+                    )
             # b1789c0d: also set _fts_pending when the deadline expired before
             # any rows were written (changed=False because _apply_precomputed
             # exited immediately on a deeply-negative deadline). In that case
@@ -2684,6 +2704,11 @@ def search_outputs(
     # "empty tree, nothing to find". total_in_index == len(index._row_cache)
     # because _row_cache always mirrors what is (or will be) in the DB.
     result["total_in_index"] = len(index._row_cache)
+    if index.last_db_write_error:
+        # 1a799e52 -- a real Phase 2 persistence failure this call. Rows may
+        # still be visible in total_indexed/total_in_index (in-memory
+        # row_cache), but they were NOT confirmed written to disk.
+        result["db_write_error"] = index.last_db_write_error
     hits = index.search(query, limit=limit, include_archival=include_archival)
     for hit in hits:
         hit["annotations"] = index.get_annotations_for_path(hit["path"])

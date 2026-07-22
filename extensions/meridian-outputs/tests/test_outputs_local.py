@@ -1832,6 +1832,63 @@ class TestColdTreeFtsDeferral:
         result = OL.search_outputs(str(tmp_path), "normalterm")
         assert result["total_indexed"] >= 1
         assert len(result["hits"]) >= 1
+        assert "db_write_error" not in result, (
+            "1a799e52: a healthy write must not carry a db_write_error field"
+        )
+
+    def test_rebuild_surfaces_db_write_error_instead_of_silent_debug_log(
+        self, tmp_path: Path,
+    ) -> None:
+        """1a799e52: before this fix, Phase 2's DB-write except-block swallowed
+        ANY failure at DEBUG level only, while total_indexed/total_in_index (both
+        derived from the in-memory row_cache, populated BEFORE the write is
+        attempted) kept reporting growing "success" -- a real persistence
+        failure looked identical to a healthy index. last_db_write_error /
+        the search_outputs() result's db_write_error field must now surface it."""
+        (tmp_path / "a.csv").write_text("term_one,1\n", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        assert idx.last_db_write_error is None
+
+        def _boom(self, con):  # noqa: ANN001 -- matches _ensure_schema's real signature
+            raise RuntimeError("simulated disk-full / connection failure")
+
+        with patch.object(OL.OutputsFtsIndex, "_ensure_schema", _boom):
+            total_indexed = idx.rebuild()
+
+        # The misleading part of the original bug: the in-memory count still
+        # looks like a healthy, progressing index...
+        assert total_indexed >= 1
+        assert len(idx._row_cache) >= 1
+        # ...but the write genuinely failed, and that must now be visible.
+        assert idx.last_db_write_error is not None
+        assert "simulated disk-full" in idx.last_db_write_error
+
+        # A subsequent successful rebuild() call must clear the error (per-call
+        # semantics -- last_db_write_error reflects only the MOST RECENT call).
+        idx.last_db_write_error = None  # reset attribute directly (isolate this assertion)
+        idx.rebuild()
+        assert idx.last_db_write_error is None
+
+    def test_search_outputs_surfaces_db_write_error_in_result_dict(
+        self, tmp_path: Path,
+    ) -> None:
+        """The module-level search_outputs() API (the real MCP-tool-facing
+        entry point) must surface the same signal, not just the class attribute."""
+        (tmp_path / "b.csv").write_text("term_two,1\n", encoding="utf-8")
+
+        def _boom(self, con):  # noqa: ANN001
+            raise RuntimeError("simulated write failure")
+
+        with patch.object(OL.OutputsFtsIndex, "_ensure_schema", _boom):
+            result = OL.search_outputs(str(tmp_path), "term_two")
+
+        assert result["total_indexed"] >= 1, (
+            "the in-memory count still looks like a healthy index -- this is "
+            "exactly the deceptive state the fix must make visible via db_write_error"
+        )
+        assert result.get("db_write_error") is not None
+        assert "simulated write failure" in result["db_write_error"]
         assert result.get("partial") is not True, (
             "a small/warm tree must not set partial=True: "
             f"got {result}"
