@@ -5690,8 +5690,13 @@ async def _start_session_composite(
 
     project = await db_module.get_project(db, project_id)
     project_name = project["name"] if project else project_id
-    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", project_name).strip("-") or "project"
-    handoff_path_str = str(Path(data_dir) / f"{slug}_handoff.md")
+    # 44fc189d — keyed on project_id (globally unique), NOT the display-name
+    # slug: two tenants with same-named projects would otherwise collide on
+    # one path in this process-global data_dir. Must stay in lock-step with
+    # handoff.handoff_file_stem(), which computes the SAME stem on write.
+    handoff_path_str = str(
+        Path(data_dir) / f"{handoff_module.handoff_file_stem(project_id)}_handoff.md"
+    )
     handoff_exists = Path(handoff_path_str).exists()
 
     # v0.6.1 — stamp the XML envelope onto the goal so MCP consumers

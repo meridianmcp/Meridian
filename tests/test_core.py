@@ -307,7 +307,7 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     # 0d5453bc — empty-board goal must also state the single-run constraint.
     assert "run once at the end, not per item" in content
     assert "## Resume Instructions" in content
-    on_disk = tmp_path / "alpha_handoff.md"
+    on_disk = tmp_path / f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md"
     assert on_disk.exists()
     assert on_disk.read_text(encoding="utf-8") == content
     assert str(on_disk.resolve()) == path
@@ -838,7 +838,9 @@ def test_handoff_endpoint(client):
     assert "MERIDIAN_CONTEXT" in body["content"]
     assert "ship it" in body["content"]
     assert "step 1" in body["content"]
-    assert body["path"].endswith("alpha_handoff.md")
+    assert body["path"].endswith(
+        f"{handoff_module.handoff_file_stem(project['id'])}_handoff.md"
+    )
 
 
 def test_handoff_endpoint_auto_switches_repeat_session_to_delta(client):
@@ -2710,7 +2712,9 @@ async def test_expire_and_generate_handoffs_creates_file(db, tmp_path):
     result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
     assert result["count"] >= 1
     assert result["auto_handoff_generated"] is True
-    assert (tmp_path / "myproj_handoff.md").exists()
+    assert (
+        tmp_path / f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md"
+    ).exists()
 
 
 @pytest.mark.asyncio
@@ -2724,7 +2728,9 @@ async def test_expire_and_generate_handoffs_skips_when_nothing_expires(db, tmp_p
     result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
     assert result["count"] == 0
     assert result["auto_handoff_generated"] is False
-    assert not (tmp_path / "myproj_handoff.md").exists()
+    assert not (
+        tmp_path / f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md"
+    ).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2973,8 +2979,11 @@ def test_start_session_handoff_exists_reflects_disk_reality(client, tmp_path):
     assert r.status_code == 200
     assert r.json()["handoff_exists"] is False
 
-    # Write the handoff file that the slug logic would produce.
-    (tmp_path / "myproj_handoff.md").write_text("# handoff", encoding="utf-8")
+    # Write the handoff file at the project_id-keyed path the write side
+    # would produce (44fc189d — no longer name-slug-based).
+    (
+        tmp_path / f"{handoff_module.handoff_file_stem(project['id'])}_handoff.md"
+    ).write_text("# handoff", encoding="utf-8")
 
     r2 = client.post(
         f"/projects/{project['id']}/start-session",
@@ -2982,6 +2991,70 @@ def test_start_session_handoff_exists_reflects_disk_reality(client, tmp_path):
     )
     assert r2.status_code == 200
     assert r2.json()["handoff_exists"] is True
+
+
+def test_start_session_handoff_path_keyed_on_project_id_not_name(monkeypatch, tmp_path):
+    """44fc189d regression: two DIFFERENT tenants, each with their own isolated
+    DB (as in real hosted Meridian — every tenant gets its own Neon Postgres
+    database), that each happen to have a project named "same-name" must NOT
+    collide on the same ambient handoff path in the shared process-global
+    data_dir. ``start_session``'s handoff_exists/handoff_path fields must stay
+    correct against the new project_id-keyed path shape.
+
+    ``projects.name`` is UNIQUE within a single db, so same-name-across-tenants
+    can only be modeled with two separate db connections/apps — hence two
+    sequential ``TestClient`` lifespans (each gets a fresh in-memory SQLite db
+    on lifespan startup, mirroring per-tenant DB isolation) sharing one
+    MERIDIAN_DATA_DIR.
+    """
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+
+    from fastapi.testclient import TestClient
+
+    server_module._CONNECTED_SESSIONS.clear()
+
+    # Tenant A: create the project, start a session, and actually generate a
+    # handoff so a real file lands on disk under the shared data_dir.
+    with TestClient(server_module.app) as client_a:
+        proj_a = client_a.post("/projects", json={"name": "same-name"}).json()
+        body_a = client_a.post(
+            f"/projects/{proj_a['id']}/start-session",
+            json={"session_name": "w-a"},
+        ).json()
+        assert body_a["handoff_path"].endswith(
+            f"{handoff_module.handoff_file_stem(proj_a['id'])}_handoff.md"
+        )
+        gen_a = client_a.post(f"/projects/{proj_a['id']}/handoff").json()
+        assert gen_a["path"] == body_a["handoff_path"]
+        assert Path(body_a["handoff_path"]).exists()
+
+    server_module._CONNECTED_SESSIONS.clear()
+
+    # Tenant B: a wholly separate db (fresh TestClient lifespan), but the SAME
+    # data_dir on disk, with a project sharing tenant A's exact display name.
+    with TestClient(server_module.app) as client_b:
+        proj_b = client_b.post("/projects", json={"name": "same-name"}).json()
+        assert proj_a["id"] != proj_b["id"]
+        body_b = client_b.post(
+            f"/projects/{proj_b['id']}/start-session",
+            json={"session_name": "w-b"},
+        ).json()
+
+        # Different tenants -> different on-disk handoff paths, even though
+        # the display name is byte-for-byte identical (the actual collision
+        # this item exists to prevent).
+        assert body_b["handoff_path"] != body_a["handoff_path"]
+        assert body_b["handoff_path"].endswith(
+            f"{handoff_module.handoff_file_stem(proj_b['id'])}_handoff.md"
+        )
+        # Tenant B must NOT see tenant A's already-written handoff as its own.
+        assert body_b["handoff_exists"] is False
 
 
 # ---------------------------------------------------------------------------
