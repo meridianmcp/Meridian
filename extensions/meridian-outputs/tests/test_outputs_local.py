@@ -2575,10 +2575,15 @@ class TestHashAlgoVersionUpgrade:
 # ---------------------------------------------------------------------------
 
 class TestConfigurableMaxWorkers:
-    def test_default_is_eight(self, tmp_path: Path) -> None:
+    def test_default_is_cpu_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """a849e3d5 -- default changed from a flat hardcoded 8 to
+        os.cpu_count(), empirically confirmed faster on real hardware."""
+        monkeypatch.delenv(OL._MAX_WORKERS_ENV_VAR, raising=False)
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
-            assert idx._max_workers == 8
+            assert idx._max_workers == (os.cpu_count() or 8)
         finally:
             idx.close()
 
@@ -2615,7 +2620,7 @@ class TestConfigurableMaxWorkers:
         monkeypatch.setenv(OL._MAX_WORKERS_ENV_VAR, "not-an-int")
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
-            assert idx._max_workers == 8
+            assert idx._max_workers == (os.cpu_count() or 8)
         finally:
             idx.close()
 
@@ -2624,7 +2629,7 @@ class TestConfigurableMaxWorkers:
     ) -> None:
         idx = OL.OutputsFtsIndex(str(tmp_path), max_workers=0)
         try:
-            assert idx._max_workers == 8
+            assert idx._max_workers == (os.cpu_count() or 8)
         finally:
             idx.close()
 

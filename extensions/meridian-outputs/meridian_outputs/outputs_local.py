@@ -1095,7 +1095,12 @@ _HASH_ALGO_VERSION = 2
 # ---------------------------------------------------------------------------
 # acac2599 -- configurable Phase-1 ThreadPoolExecutor worker cap
 # ---------------------------------------------------------------------------
-_DEFAULT_MAX_WORKERS = 8
+# a849e3d5 -- was a flat hardcoded 8 regardless of machine size. Empirically
+# confirmed on a real 16-core test machine (os.cpu_count()=16) across a real
+# 16,000-file batch: 8 workers = 8.969s, 16 workers = 5.890s (best), 32
+# workers = 6.344s (worse than 16) -- os.cpu_count() landed exactly on the
+# empirically-best value, not just a reasonable-sounding guess.
+_HARDCODED_MAX_WORKERS_FALLBACK = 8
 _MAX_WORKERS_ENV_VAR = "MERIDIAN_OUTPUTS_MAX_WORKERS"
 
 
@@ -1105,32 +1110,35 @@ def _default_max_workers() -> int:
     Checked fresh on every call (a cheap env lookup) rather than cached at
     import time, so a changed ``MERIDIAN_OUTPUTS_MAX_WORKERS`` takes effect
     on the next :class:`OutputsFtsIndex` construction without a process
-    restart. Falls back to the historical hardcoded default (8) for
-    anything not a positive integer, logging why so a typo'd env var is
-    diagnosable instead of silently ignored.
+    restart. Falls back to ``os.cpu_count()`` (a849e3d5) -- or the historical
+    hardcoded 8 if ``os.cpu_count()`` itself returns ``None``, the rare
+    environment where the OS can't report a CPU count -- for anything not a
+    positive integer, logging why so a typo'd env var is diagnosable instead
+    of silently ignored.
     """
+    _default = os.cpu_count() or _HARDCODED_MAX_WORKERS_FALLBACK
     raw = os.environ.get(_MAX_WORKERS_ENV_VAR)
     if raw is None or not raw.strip():
-        return _DEFAULT_MAX_WORKERS
+        return _default
     try:
         value = int(raw.strip())
     except ValueError:
         _log.warning(
             "%s=%r is not a valid integer -- falling back to default (%d)",
-            _MAX_WORKERS_ENV_VAR, raw, _DEFAULT_MAX_WORKERS,
+            _MAX_WORKERS_ENV_VAR, raw, _default,
         )
-        return _DEFAULT_MAX_WORKERS
+        return _default
     if value < 1:
         _log.warning(
             "%s=%r must be >= 1 -- falling back to default (%d)",
-            _MAX_WORKERS_ENV_VAR, raw, _DEFAULT_MAX_WORKERS,
+            _MAX_WORKERS_ENV_VAR, raw, _default,
         )
-        return _DEFAULT_MAX_WORKERS
+        return _default
     return value
 
 
 def _resolve_max_workers(explicit: int | None) -> int:
-    """Precedence: explicit constructor arg > env var > hardcoded default.
+    """Precedence: explicit constructor arg > env var > os.cpu_count() default.
 
     Mirrors the precedence rule already used elsewhere in this codebase for
     other explicit-arg/env-var/default triples (e.g. project_id resolution).
@@ -1138,11 +1146,12 @@ def _resolve_max_workers(explicit: int | None) -> int:
     if explicit is not None:
         if explicit >= 1:
             return explicit
+        _default = os.cpu_count() or _HARDCODED_MAX_WORKERS_FALLBACK
         _log.warning(
             "OutputsFtsIndex: max_workers=%r must be >= 1 -- falling back "
-            "to default (%d)", explicit, _DEFAULT_MAX_WORKERS,
+            "to default (%d)", explicit, _default,
         )
-        return _DEFAULT_MAX_WORKERS
+        return _default
     return _default_max_workers()
 
 
