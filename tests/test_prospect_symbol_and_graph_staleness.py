@@ -1008,3 +1008,343 @@ class TestBuildSymbolResolver:
         matches = await resolver(object(), "p1", "some_fn", 5)
         assert len(matches) == 1
         assert matches[0]["qualified_name"] == "snapshot.hit"
+# Part 4 — 4b8f083f: local git-commit-drift staleness probe
+#
+# The 2ce5bc76 fingerprint mechanism above only detects drift when a
+# DIFFERENT process re-indexes and index_status echoes back a newer
+# fingerprint than the one this process cached — it never fires for the far
+# more common case where real commits land in the repo and nobody re-runs
+# index_repository at all (index_status just keeps echoing the same stale
+# fingerprint forever). These tests cover the local git-based probe that
+# closes that gap.
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+import subprocess  # noqa: E402
+
+from meridian.prospect import (  # noqa: E402
+    _looks_like_git_commit,
+    _git_commit_drift_sync,
+    _detect_graph_commit_drift,
+)
+import meridian.routes.tunnel as _tunnel_mod  # noqa: E402
+import meridian.hardening as _hardening_mod  # noqa: E402
+import meridian.prospect as _prospect_mod  # noqa: E402
+
+
+class TestLooksLikeGitCommit:
+    def test_accepts_full_sha(self):
+        assert _looks_like_git_commit("a" * 40) is True
+
+    def test_accepts_short_sha(self):
+        assert _looks_like_git_commit("abc1234") is True
+
+    def test_rejects_iso_timestamp(self):
+        assert _looks_like_git_commit("2026-07-13T00:00:00Z") is False
+
+    def test_rejects_too_short(self):
+        assert _looks_like_git_commit("abc12") is False
+
+    def test_rejects_none_and_empty(self):
+        assert _looks_like_git_commit(None) is False
+        assert _looks_like_git_commit("") is False
+
+
+def _run_git(args: list, cwd: str) -> None:
+    subprocess.run(
+        ["git"] + args, cwd=cwd, capture_output=True, text=True, check=True,
+        env={**os.environ,
+             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"},
+    )
+
+
+def _make_commit(repo_dir: str, filename: str, content: str) -> str:
+    with open(os.path.join(repo_dir, filename), "w") as f:
+        f.write(content)
+    _run_git(["add", "-A"], repo_dir)
+    _run_git(["commit", "-m", f"add {filename}"], repo_dir)
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir,
+        capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip()
+
+
+class TestGitCommitDriftSync:
+    """Real (temp, on-disk) git repos — no mocking of git itself."""
+
+    def test_not_a_directory_returns_none(self):
+        assert _git_commit_drift_sync("", "abc1234") is None
+        assert _git_commit_drift_sync("/definitely/not/a/real/path/xyz", "abc1234") is None
+
+    def test_not_a_git_repo_returns_none(self, tmp_path):
+        d = tmp_path / "not_a_repo"
+        d.mkdir()
+        assert _git_commit_drift_sync(str(d), "abc1234") is None
+
+    def test_no_drift_when_stored_equals_head(self, tmp_path):
+        repo = tmp_path / "repo1"
+        repo.mkdir()
+        _run_git(["init"], str(repo))
+        commit1 = _make_commit(str(repo), "a.txt", "one")
+        assert _git_commit_drift_sync(str(repo), commit1) is None
+
+    def test_drift_detected_after_new_commits(self, tmp_path):
+        repo = tmp_path / "repo2"
+        repo.mkdir()
+        _run_git(["init"], str(repo))
+        commit1 = _make_commit(str(repo), "a.txt", "one")
+        _make_commit(str(repo), "b.txt", "two")
+        commit3 = _make_commit(str(repo), "c.txt", "three")
+
+        drift = _git_commit_drift_sync(str(repo), commit1)
+        assert drift is not None
+        assert drift["stored_commit"] == commit1
+        assert drift["head_commit"] == commit3
+        assert drift["commits_since_index"] == 2
+
+    def test_unresolvable_stored_commit_returns_none(self, tmp_path):
+        """A fingerprint from an unrelated repo/history — fail open, don't guess."""
+        repo = tmp_path / "repo3"
+        repo.mkdir()
+        _run_git(["init"], str(repo))
+        _make_commit(str(repo), "a.txt", "one")
+        bogus_commit = "f" * 40
+        assert _git_commit_drift_sync(str(repo), bogus_commit) is None
+
+
+class TestDetectGraphCommitDrift:
+    """The async wrapper: no-baseline / non-git-fingerprint short-circuits,
+    and the real drift path goes through hardening.run_in_bulkhead."""
+
+    @pytest.mark.asyncio
+    async def test_no_tenant_or_root_dir_returns_none(self):
+        assert await _detect_graph_commit_drift("", "proj", "/some/dir") is None
+        assert await _detect_graph_commit_drift("tenant", "proj", "") is None
+
+    @pytest.mark.asyncio
+    async def test_no_stored_fingerprint_skips_probe_entirely(self, monkeypatch):
+        """No baseline → no git subprocess at all (mirrors the fingerprint
+        mechanism's own 'no baseline, no fetch' discipline)."""
+        called = {"bulkhead": False}
+
+        monkeypatch.setattr(
+            _tunnel_mod, "get_cached_graph_fingerprint", lambda tid, pid=None: None,
+        )
+
+        async def _fake_bulkhead(fn, *a, **kw):
+            called["bulkhead"] = True
+            return {"drift": True}
+
+        monkeypatch.setattr(_hardening_mod, "run_in_bulkhead", _fake_bulkhead)
+
+        out = await _detect_graph_commit_drift("tenant-x", "proj", "/some/dir")
+        assert out is None
+        assert called["bulkhead"] is False
+
+    @pytest.mark.asyncio
+    async def test_non_git_fingerprint_skips_probe(self, monkeypatch):
+        """An indexed_at ISO timestamp fingerprint must never reach git."""
+        called = {"bulkhead": False}
+
+        monkeypatch.setattr(
+            _tunnel_mod, "get_cached_graph_fingerprint",
+            lambda tid, pid=None: "2026-07-13T00:00:00Z",
+        )
+
+        async def _fake_bulkhead(fn, *a, **kw):
+            called["bulkhead"] = True
+            return {"drift": True}
+
+        monkeypatch.setattr(_hardening_mod, "run_in_bulkhead", _fake_bulkhead)
+
+        out = await _detect_graph_commit_drift("tenant-x", "proj", "/some/dir")
+        assert out is None
+        assert called["bulkhead"] is False
+
+    @pytest.mark.asyncio
+    async def test_git_fingerprint_runs_through_bulkhead(self, monkeypatch):
+        """A plausible commit-hash fingerprint dispatches the sync probe via
+        run_in_bulkhead (thread pool — never asyncio subprocess, which is
+        unsupported on the SelectorEventLoop this project forces on Windows)."""
+        seen_args = []
+
+        monkeypatch.setattr(
+            _tunnel_mod, "get_cached_graph_fingerprint",
+            lambda tid, pid=None: "abc1234",
+        )
+
+        async def _fake_bulkhead(fn, *a, **kw):
+            seen_args.append((fn, a, kw))
+            return {
+                "stored_commit": "abc1234", "head_commit": "def5678",
+                "commits_since_index": 4,
+            }
+
+        monkeypatch.setattr(_hardening_mod, "run_in_bulkhead", _fake_bulkhead)
+
+        out = await _detect_graph_commit_drift("tenant-x", "proj", "/some/dir")
+        assert out == {
+            "stored_commit": "abc1234", "head_commit": "def5678",
+            "commits_since_index": 4,
+        }
+        assert len(seen_args) == 1
+        fn, a, kw = seen_args[0]
+        assert fn is _prospect_mod._git_commit_drift_sync
+        assert a == ("/some/dir", "abc1234")
+        assert kw.get("label") == "prospect_symbol_commit_drift"
+
+
+class TestGetCachedGraphFingerprint:
+    """tunnel.get_cached_graph_fingerprint — public accessor used by the
+    commit-drift probe."""
+
+    def test_returns_project_specific_when_present(self):
+        tunnel._code_graph_fingerprints["tenant-acc:myrepo"] = "PROJECT-FP"
+        try:
+            assert tunnel.get_cached_graph_fingerprint("tenant-acc", "myrepo") == "PROJECT-FP"
+        finally:
+            tunnel._code_graph_fingerprints.pop("tenant-acc:myrepo", None)
+
+    def test_falls_back_to_wildcard(self):
+        tunnel._code_graph_fingerprints["tenant-acc2:*"] = "WILDCARD-FP"
+        try:
+            assert tunnel.get_cached_graph_fingerprint("tenant-acc2", "myrepo") == "WILDCARD-FP"
+        finally:
+            tunnel._code_graph_fingerprints.pop("tenant-acc2:*", None)
+
+    def test_returns_none_when_absent(self):
+        tunnel._code_graph_fingerprints.pop("tenant-acc3:myrepo", None)
+        tunnel._code_graph_fingerprints.pop("tenant-acc3:*", None)
+        assert tunnel.get_cached_graph_fingerprint("tenant-acc3", "myrepo") is None
+
+    def test_no_project_id_uses_wildcard_key_directly(self):
+        tunnel._code_graph_fingerprints["tenant-acc4:*"] = "WILDCARD-ONLY"
+        try:
+            assert tunnel.get_cached_graph_fingerprint("tenant-acc4") == "WILDCARD-ONLY"
+        finally:
+            tunnel._code_graph_fingerprints.pop("tenant-acc4:*", None)
+
+
+class TestProspectSymbolCommitDriftIntegration:
+    """End-to-end through prospect_symbol_impl: a detected commit drift skips
+    the graph rung exactly like an explicit stale_graph=True, but with a
+    distinguishing fallback_reason and a _graph_commit_drift diagnostic."""
+
+    @pytest.mark.asyncio
+    async def test_drift_detected_skips_graph_goes_to_serena(self, monkeypatch):
+        import meridian.routes.tunnel as _tm
+
+        drift_info = {
+            "stored_commit": "abc1234", "head_commit": "def5678",
+            "commits_since_index": 4,
+        }
+
+        async def _fake_detect(tenant_id, project_id, root_dir):
+            return drift_info
+
+        monkeypatch.setattr(_prospect_mod, "_detect_graph_commit_drift", _fake_detect)
+
+        serena_result = _text_result([
+            {"file": "meridian/server.py", "line_start": 900, "name": "some_fn"},
+        ])
+        call_log: list[str] = []
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            call_log.append(name)
+            if name == "extractor__find_symbol":
+                return serena_result
+            raise AssertionError(f"should not call {name}")
+
+        monkeypatch.setattr(_tm, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tm, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="some_fn",
+            project_id="myrepo",
+            root_dir="/repo",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant={"id": "tenant-drift"},
+            data_dir="",
+        )
+        # Graph rung was skipped entirely — never called.
+        assert "codebase__search_graph" not in call_log
+        assert result["rung"] == "serena"
+        assert result["hits"][0]["name"] == "some_fn"
+        assert result["_graph_commit_drift"] == drift_info
+        assert "graph_skipped_commit_drift_detected" in result["fallback_reason"]
+        assert "4 commit(s)" in result["fallback_reason"]
+
+    @pytest.mark.asyncio
+    async def test_no_drift_proceeds_to_graph_normally(self, monkeypatch):
+        """When the probe finds nothing (no baseline, unchanged, whatever),
+        the graph rung runs exactly as before — no regression."""
+        import meridian.routes.tunnel as _tm
+
+        async def _fake_detect(tenant_id, project_id, root_dir):
+            return None
+
+        monkeypatch.setattr(_prospect_mod, "_detect_graph_commit_drift", _fake_detect)
+
+        graph_result = _text_result({"results": [
+            {"file": "meridian/server.py", "line": 42, "name": "some_fn"},
+        ]})
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                return graph_result
+            raise AssertionError(f"should not call {name}")
+
+        monkeypatch.setattr(_tm, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tm, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="some_fn",
+            project_id="myrepo",
+            root_dir="/repo",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant={"id": "tenant-nodrift"},
+            data_dir="",
+        )
+        assert result["rung"] == "graph"
+        assert "_graph_commit_drift" not in result
+
+    @pytest.mark.asyncio
+    async def test_explicit_stale_graph_skips_drift_probe(self, monkeypatch):
+        """When the caller already passed stale_graph=True, the drift probe
+        must not even run (redundant — avoid an unnecessary git subprocess)."""
+        import meridian.routes.tunnel as _tm
+
+        probe_called = {"yes": False}
+
+        async def _fake_detect(tenant_id, project_id, root_dir):
+            probe_called["yes"] = True
+            return None
+
+        monkeypatch.setattr(_prospect_mod, "_detect_graph_commit_drift", _fake_detect)
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "extractor__find_symbol":
+                return _text_result([{"file": "x.py", "name": "fn"}])
+            raise AssertionError(f"should not call {name}")
+
+        monkeypatch.setattr(_tm, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tm, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="fn",
+            project_id="",
+            root_dir="/repo",
+            limit=5,
+            kind=None,
+            stale_graph=True,
+            tenant={"id": "tenant-explicit-stale"},
+            data_dir="",
+        )
+        assert probe_called["yes"] is False
+        assert result["fallback_reason"] == "graph_skipped_stale_graph=true"
