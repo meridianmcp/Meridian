@@ -39,6 +39,17 @@ watchdog = ">=4.0"
 # Editable path install so `import docparse` resolves for the app + test suite while
 # the code lives standalone in packages/docparse/ (pip install -e ./packages/docparse).
 meridian-docparse = { path = "packages/docparse", editable = true }
+# 52cbe5d8 -- extensions/meridian-outputs declares tantivy/xxhash as real,
+# non-optional runtime deps (see its own pyproject.toml), but its tests import
+# the module straight off sys.path (no pip install of that package), so
+# nothing previously pulled these into THIS pixi env. A fresh clone/worktree
+# was silently missing both, making every Tantivy-backed test fail with a
+# swallowed ModuleNotFoundError (caught by outputs_local.py's broad
+# best-effort excepts) instead of exercising the real code path -- this is
+# what produced a totally different failure signature than the one actually
+# under investigation for 52cbe5d8 until this was caught and fixed.
+tantivy = ">=0.22"
+xxhash = ">=3.4"
 mcp = ">=1.0"
 anthropic = ">=0.40"
 python-dotenv = ">=1.0"
