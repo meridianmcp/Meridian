@@ -328,8 +328,9 @@ async def handle_update_sprint_item(
                 "error": "IN_PROGRESS",
                 "message": (
                     f"Item is in_progress and owned by an active session{_owner} — "
-                    "cannot mutate while claimed. Wait for completion, call "
-                    "fail_sprint_item first, or pass force=true to override."
+                    "cannot mutate while claimed. Wait for completion, pass "
+                    "status='pending' together with force=true to release a "
+                    "stale claim, or pass force=true to override for other fields."
                 ),
                 "item_id": args["item_id"],
                 "claimed_at": _ca,
@@ -341,6 +342,21 @@ async def handle_update_sprint_item(
         human_id=args.get("human_id"),
         item_group=args.get("group"),
     )
+    # dcbd55a0 — expose a NARROW status-recovery path. update_sprint_item's own
+    # STALE_CLAIM/IN_PROGRESS guard messages have long told callers to
+    # force-reclaim a stuck in_progress claim via
+    # update_sprint_item(status='pending'), but this handler never actually
+    # forwarded a status key to patch_sprint_item, so that documented recovery
+    # path silently did nothing -- the item just stayed in_progress forever
+    # (the "crashed session leaves items stuck" bug). Fixed here, but
+    # deliberately NOT a general status setter: patch_sprint_item's own status
+    # kwarg already hard-rejects every terminal/guarded status (done, skipped,
+    # failed, pushed, in_progress, provisional_complete) with a ValueError
+    # naming the correct dedicated function (fix 6a17e735, closing the earlier
+    # d71cfaaf backdoor), so we simply forward the value and let that existing,
+    # tested gate do the validation -- no new allowlist duplicated here.
+    if "status" in args:
+        _patch_kwargs["status"] = args.get("status")
     # 501ec93f — only forward touches_resources when the caller supplied it,
     # so omitting the key leaves the stored value untouched (_UNSET sentinel).
     if "touches_resources" in args:
@@ -771,7 +787,7 @@ async def handle_claim_sprint_item(
                         "message": (
                             f"Item is in_progress but claimed {round(_age_h, 1)}h ago with no recent "
                             "activity — the claiming session may have ended. Safe to force-reclaim "
-                            "by updating status to 'pending' first via update_sprint_item."
+                            "by calling update_sprint_item(status='pending', force=true)."
                         ),
                         "stale_age_hours": round(_age_h, 1),
                         "claimed_at": _stale_item["claimed_at"],
