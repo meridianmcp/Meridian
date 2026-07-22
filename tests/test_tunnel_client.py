@@ -2925,11 +2925,68 @@ def test_slot_proxy_kill_on_owned_proc_still_terminates_normally(monkeypatch):
 def test_code_intel_cache_dir_is_dedicated_meridian_managed_path(monkeypatch, tmp_path):
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
     cache_dir = tc._code_intel_cache_dir()
-    assert cache_dir == tmp_path / ".meridian" / "code-intel-cache"
+    base = tmp_path / ".meridian" / "code-intel-cache"
+    # dee49d99 — no longer a single fixed path: it's a per-process-unique
+    # subdirectory of the base managed path (see the pid/create_time tests
+    # below for the actual uniqueness guarantee).
+    assert cache_dir.parent == base
+    assert str(os.getpid()) in cache_dir.name
     # Distinct from _managed_bin_dir (the binary install dir) and from
     # codebase-memory-mcp's own unset-env default (~/.cache/codebase-memory-mcp).
     assert cache_dir != tc._managed_bin_dir()
     assert "code-intel-cache" in str(cache_dir)
+
+
+def test_code_intel_cache_dir_stable_within_one_process(monkeypatch, tmp_path):
+    """dee49d99 — repeated calls within the SAME process must return the
+    identical path: this process's pid/create_time identity does not change
+    over its own lifetime, so within-generation warm-index reuse (e.g. across
+    an idle-kill + lazy-respawn of the SAME long-running tunnel process) still
+    works exactly as before this fix."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    assert tc._code_intel_cache_dir() == tc._code_intel_cache_dir()
+
+
+def test_code_intel_cache_dir_differs_across_tunnel_generations(monkeypatch, tmp_path):
+    """dee49d99 — the actual fix: two different tunnel PROCESS invocations
+    (simulated here via different os.getpid() return values, standing in for
+    two different `meridian --tunnel` generations across a fast restart) must
+    resolve to two DIFFERENT cache dirs. This is what stops a fast restart's
+    freshly-spawned codebase-memory-mcp from ever opening the same on-disk
+    index .db the dying generation's copy may still have a handle on —
+    closing the race unconditionally rather than depending on the dying
+    process's OS-level handle being released before the new one opens it."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.os, "getpid", lambda: 111111)
+    first = tc._code_intel_cache_dir()
+    monkeypatch.setattr(tc.os, "getpid", lambda: 222222)
+    second = tc._code_intel_cache_dir()
+    assert first != second
+    assert first.parent == second.parent == tmp_path / ".meridian" / "code-intel-cache"
+
+
+def test_code_intel_cache_dir_falls_back_to_pid_only_without_psutil(monkeypatch, tmp_path):
+    """When psutil can't resolve this process's create_time (unavailable, or
+    the lookup itself raises), the dir must still be unique by pid alone
+    rather than raising or silently reverting to the pre-fix fixed path.
+
+    ``_code_intel_cache_dir`` does ``import psutil`` locally inside its own
+    try/except, so the fake module must be injected into ``sys.modules``
+    (what the ``import`` statement actually consults) rather than patched
+    onto ``tc`` itself."""
+    import sys
+
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+
+    class _BoomProcess:
+        def __init__(self, pid):
+            raise RuntimeError("psutil unavailable in this test")
+
+    fake_psutil = type("_FakePsutil", (), {"Process": _BoomProcess})
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    cache_dir = tc._code_intel_cache_dir()
+    assert cache_dir == tmp_path / ".meridian" / "code-intel-cache" / str(os.getpid())
 
 
 def test_code_intel_spawn_env_sets_cbm_cache_dir_and_preserves_parent_env(monkeypatch, tmp_path):
@@ -2968,6 +3025,79 @@ def test_code_intel_spawn_env_honours_explicit_cbm_cache_dir_override(monkeypatc
     assert env["CBM_CACHE_DIR"] == custom
     # And it must not have been silently created under our managed path.
     assert not (tmp_path / ".meridian" / "code-intel-cache").exists()
+
+
+# ---------------------------------------------------------------------------
+# dee49d99 — sweep OLD per-generation code-intel cache dirs left behind by
+# the pid/create_time-suffixed _code_intel_cache_dir.
+# ---------------------------------------------------------------------------
+
+def test_cleanup_stale_code_intel_cache_dirs_noop_when_base_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    # Base dir doesn't exist at all yet -- must not raise.
+    tc._cleanup_stale_code_intel_cache_dirs()
+    assert not (tmp_path / ".meridian" / "code-intel-cache").exists()
+
+
+def test_cleanup_stale_code_intel_cache_dirs_reclaims_dead_generations(monkeypatch, tmp_path):
+    """A dead generation's dir (its pid is no longer alive) is reclaimed; the
+    CURRENT process's own dir and any non-pid-suffixed directory are left
+    untouched. psutil is faked (rather than using a real-but-nonexistent pid)
+    so the test can never flake against a real live process coincidentally
+    reusing an arbitrary pid number on the CI machine."""
+    import sys
+
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    base = tmp_path / ".meridian" / "code-intel-cache"
+    base.mkdir(parents=True)
+    own_pid = os.getpid()
+
+    class _FakeProc:
+        def __init__(self, pid):
+            if pid != own_pid:
+                raise RuntimeError("no such process")
+            self._pid = pid
+
+        def create_time(self):
+            return 1000.0
+
+    fake_psutil = type("_FakePsutil", (), {"Process": _FakeProc})
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    own_dir = base / f"{own_pid}-1000000"
+    own_dir.mkdir()
+    dead_dir = base / "999999-123456789"
+    dead_dir.mkdir()
+    (dead_dir / "index.db").write_text("stale")
+    not_pid_dir = base / "not-a-pid-dir"
+    not_pid_dir.mkdir()
+
+    tc._cleanup_stale_code_intel_cache_dirs()
+
+    assert own_dir.exists()          # never touch our own generation's dir
+    assert not dead_dir.exists()     # dead pid -- reclaimed
+    assert not_pid_dir.exists()      # not one of our pid-suffixed dirs -- left alone
+
+
+def test_cleanup_stale_code_intel_cache_dirs_skips_without_psutil(monkeypatch, tmp_path):
+    """No psutil means no safe way to tell a live generation from a dead one
+    -- skip cleanup entirely rather than guessing (and possibly deleting a
+    still-in-use index). Setting ``sys.modules["psutil"] = None`` is the
+    standard idiom for simulating a missing module: the import machinery
+    raises ImportError immediately rather than re-resolving the real one."""
+    import sys
+
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    base = tmp_path / ".meridian" / "code-intel-cache"
+    base.mkdir(parents=True)
+    some_dir = base / "999999-123456789"
+    some_dir.mkdir()
+
+    monkeypatch.setitem(sys.modules, "psutil", None)
+
+    tc._cleanup_stale_code_intel_cache_dirs()
+
+    assert some_dir.exists()  # left untouched -- cleanup skipped entirely
 
 
 # ---------------------------------------------------------------------------

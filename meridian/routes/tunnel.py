@@ -1719,9 +1719,11 @@ async def add_custom_plugin(request: Request) -> Response:
     entries.append(entry)
     await _store_tunnel_config(request, tenant, hostname, entries)
     # Re-read the stored config so the returned custom list reflects exactly what
-    # persisted (and would resolve at tunnel spawn).
+    # persisted (and would resolve at tunnel spawn). force_refresh=True bypasses
+    # the 20889f40 request.state memoization, which would otherwise still hold
+    # the pre-write tenant snapshot from the call above.
     stored = _current_tunnel_config(
-        await _get_tenant_from_request(request) or tenant, hostname)
+        await _get_tenant_from_request(request, force_refresh=True) or tenant, hostname)
     return _json_response({
         "ok": True,
         "hostname": hostname,
@@ -1779,8 +1781,10 @@ async def remove_custom_plugin(request: Request) -> Response:
             {"error": f"no custom plugin named '{name}'"}, status_code=404)
 
     await _store_tunnel_config(request, tenant, hostname, kept)
+    # force_refresh=True -- see add_custom_plugin above for why this can't use
+    # the memoized 20889f40 tenant snapshot.
     stored = _current_tunnel_config(
-        await _get_tenant_from_request(request) or tenant, hostname)
+        await _get_tenant_from_request(request, force_refresh=True) or tenant, hostname)
     return _json_response({
         "ok": True,
         "hostname": hostname,

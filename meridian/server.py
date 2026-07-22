@@ -5690,8 +5690,13 @@ async def _start_session_composite(
 
     project = await db_module.get_project(db, project_id)
     project_name = project["name"] if project else project_id
-    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", project_name).strip("-") or "project"
-    handoff_path_str = str(Path(data_dir) / f"{slug}_handoff.md")
+    # 44fc189d — keyed on project_id (globally unique), NOT the display-name
+    # slug: two tenants with same-named projects would otherwise collide on
+    # one path in this process-global data_dir. Must stay in lock-step with
+    # handoff.handoff_file_stem(), which computes the SAME stem on write.
+    handoff_path_str = str(
+        Path(data_dir) / f"{handoff_module.handoff_file_stem(project_id)}_handoff.md"
+    )
     handoff_exists = Path(handoff_path_str).exists()
 
     # v0.6.1 — stamp the XML envelope onto the goal so MCP consumers
@@ -7659,10 +7664,31 @@ async def _remote_mcp_inner(request: Request) -> Any:
     if tenant is None:
         import logging as _logging
         _raw_auth = request.headers.get("authorization", "")
+        # 1b4dc353 — diagnostic enrichment. This warning previously logged only
+        # a truncated raw Authorization header + UA, which wasn't enough to
+        # fingerprint a recurring external caller (e.g. a scheduled bot hitting
+        # /mcp with NO Authorization header at all — raw=(none) — on a
+        # cadence). Add the source IP (same `request.client.host` pattern
+        # already used for signup rate-limiting and session tracking in
+        # hosted.py) plus the full non-sensitive header set, so the next
+        # occurrence carries enough to identify the caller. Authorization and
+        # Cookie are excluded from the header dump (Authorization is already
+        # covered, truncated, by raw= above) and the dump is capped to bound
+        # log size against a hostile oversized-header request.
+        _client_ip = (request.client.host if request.client else None) or "unknown"
+        _diag_headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in ("authorization", "cookie")
+        }
+        _diag_headers_repr = repr(_diag_headers)
+        if len(_diag_headers_repr) > 1000:
+            _diag_headers_repr = _diag_headers_repr[:1000] + "...(truncated)"
         _logging.getLogger("meridian.mcp_auth").warning(
-            "[mcp_auth] unrecognised token raw=%r ua=%r",
+            "[mcp_auth] unrecognised token raw=%r ua=%r ip=%s headers=%s",
             (_raw_auth[:60] if _raw_auth else "(none)"),
             request.headers.get("user-agent", "")[:60],
+            _client_ip,
+            _diag_headers_repr,
         )
         # b12cc29f — log auth failure (no token or invalid token).
         _auth_fail_result = "no_token" if not _bearer_hash else "invalid_token"

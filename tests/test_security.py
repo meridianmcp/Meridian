@@ -379,3 +379,147 @@ def test_magic_verify_missing_token_returns_html(client):
     assert r.status_code == 400
     assert "text/html" in r.headers.get("content-type", "")
     assert "Request a new link" in r.text
+
+
+# ---------------------------------------------------------------------------
+# 20889f40 — _get_tenant_from_request memoized on request.state
+# ---------------------------------------------------------------------------
+
+def test_get_tenant_from_request_memoized_per_request(monkeypatch):
+    """_get_tenant_from_request must hit the DB at most once per request, even
+    when called repeatedly by different helpers (_require_workspace_perm,
+    _enforcement_context, per-route _tenant_id, ...) — mirrors the
+    request.state._db_conn memoization pattern already used by _db()."""
+    import asyncio
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from meridian import _deps
+    from meridian import db as db_module
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    calls: list[str] = []
+    tenant_row = {"id": "tenant-1", "email": "a@b.com"}
+
+    async def _fake_lookup(auth_db, token_hash):
+        calls.append(token_hash)
+        return tenant_row
+
+    monkeypatch.setattr(db_module, "get_tenant_from_token_hash", _fake_lookup)
+
+    fake_app = SimpleNamespace(state=SimpleNamespace(db=object()))
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/workspace/settings",
+        "headers": [(b"authorization", b"Bearer sometesttoken")],
+        "app": fake_app,
+    }
+    request = Request(scope)
+
+    async def _call_thrice():
+        first = await _deps._get_tenant_from_request(request)
+        second = await _deps._get_tenant_from_request(request)
+        third = await _deps._get_tenant_from_request(request)
+        return first, second, third
+
+    first, second, third = asyncio.run(_call_thrice())
+
+    assert first == tenant_row
+    assert second == tenant_row
+    assert third == tenant_row
+    assert len(calls) == 1, f"expected exactly 1 DB lookup across 3 calls, got {len(calls)}"
+
+
+def test_get_tenant_from_request_memoizes_none_result(monkeypatch):
+    """A legitimately-resolved None (no valid credential) must also be cached —
+    not re-attempted as if it were 'unset' — so an unauthenticated request
+    doesn't retry the (cheap but still real) resolution path on every call."""
+    import asyncio
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from meridian import _deps
+    from meridian import db as db_module
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    calls: list[str] = []
+
+    async def _fake_lookup(auth_db, token_hash):
+        calls.append(token_hash)
+        return None
+
+    monkeypatch.setattr(db_module, "get_tenant_from_token_hash", _fake_lookup)
+
+    fake_app = SimpleNamespace(state=SimpleNamespace(db=object()))
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/workspace/settings",
+        "headers": [(b"authorization", b"Bearer badtoken")],
+        "app": fake_app,
+    }
+    request = Request(scope)
+
+    async def _call_twice():
+        return (
+            await _deps._get_tenant_from_request(request),
+            await _deps._get_tenant_from_request(request),
+        )
+
+    first, second = asyncio.run(_call_twice())
+
+    assert first is None
+    assert second is None
+    assert len(calls) == 1, f"expected exactly 1 DB lookup across 2 calls, got {len(calls)}"
+
+
+def test_get_tenant_from_request_force_refresh_bypasses_cache(monkeypatch):
+    """20889f40 regression: a caller that writes to the tenant's row mid-request
+    (e.g. routes/tunnel.py's add/remove custom plugin) must be able to read back
+    the just-persisted state rather than the pre-write memoized snapshot.
+    force_refresh=True must re-hit the DB and overwrite the cached value."""
+    import asyncio
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from meridian import _deps
+    from meridian import db as db_module
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    rows = [{"id": "tenant-1", "tunnel_plugins": "old"}, {"id": "tenant-1", "tunnel_plugins": "new"}]
+    calls: list[str] = []
+
+    async def _fake_lookup(auth_db, token_hash):
+        calls.append(token_hash)
+        return rows[len(calls) - 1] if len(calls) <= len(rows) else rows[-1]
+
+    monkeypatch.setattr(db_module, "get_tenant_from_token_hash", _fake_lookup)
+
+    fake_app = SimpleNamespace(state=SimpleNamespace(db=object()))
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/tunnel/plugins/custom",
+        "headers": [(b"authorization", b"Bearer sometesttoken")],
+        "app": fake_app,
+    }
+    request = Request(scope)
+
+    async def _read_write_reread():
+        before = await _deps._get_tenant_from_request(request)
+        cached_again = await _deps._get_tenant_from_request(request)
+        after = await _deps._get_tenant_from_request(request, force_refresh=True)
+        return before, cached_again, after
+
+    before, cached_again, after = asyncio.run(_read_write_reread())
+
+    assert before["tunnel_plugins"] == "old"
+    assert cached_again["tunnel_plugins"] == "old", "plain call must still serve the memoized value"
+    assert after["tunnel_plugins"] == "new", "force_refresh must bypass the cache and fetch fresh state"
+    assert len(calls) == 2, f"expected exactly 2 DB lookups (initial + forced refresh), got {len(calls)}"
+
+    # The forced refresh must also update the cache for any subsequent plain call.
+    final = asyncio.run(_deps._get_tenant_from_request(request))
+    assert final["tunnel_plugins"] == "new"
+    assert len(calls) == 2, "a plain call after force_refresh must reuse the newly-cached value, not re-fetch"

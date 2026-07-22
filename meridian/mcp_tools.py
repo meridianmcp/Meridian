@@ -52,6 +52,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "annotate_outputs": 'annotate_outputs(outputs_dir="/repo/outputs", path="/repo/outputs/run_42", note="PCA on, BFS off — final params", run_params={"lr": 0.001, "epochs": 100})',
     "search_code_semantic": 'search_code_semantic(root_dir="/repo/src", query="parse the auth token and refresh it")',
     "get_flag_registry": 'get_flag_registry(root_dir="/repo/src")',
+    "link_flag_to_section": 'link_flag_to_section(project_id="abc-123", doc="thesis/chapter4.docx", element_id="el-uuid-here", flag_name="DT_ONLY_WIDTH", value=1, default=0, source_file="pipeline/gt.py", source_line=142)',
+    "get_flag_drift": 'get_flag_drift(project_id="abc-123", root_dir="/repo/src", doc="thesis/chapter4.docx")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -870,6 +872,58 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "empty flags list, never an error.",
      "inputSchema": {"type": "object", "properties": {
          "root_dir": {"type": "string", "description": "Absolute path to the source-tree root to scan recursively (vendored/build/cache dirs like node_modules/.git/dist/__pycache__ are pruned). Defaults to the server's current working directory (the current project's repo root) when omitted."}},
+         "required": []}},
+    {"name": "link_flag_to_section", "description":
+        "8ca89e8f — DURABLY link a docx section/paragraph/figure/table (any "
+        "doc_elements id — the same id space index_figure/index_table/"
+        "link_figure_caption already anchor to) to the config-flag state that "
+        "produced its underlying numbers. This is the check that catches "
+        "'results computed with the wrong flag state, then cited as current' — "
+        "e.g. a flag that silently skipped a whole code path regardless of "
+        "another flag, or a stale count cited after a fix superseded it. "
+        "Typical flow: call get_flag_registry to find the flag's current "
+        "file/line/default, compute the section, then call this tool with "
+        "value=the value actually used and default=the default get_flag_registry "
+        "reported (so get_flag_drift has something to compare the codebase's "
+        "CURRENT default against later). Insert-only: re-linking the same "
+        "(element_id, flag_name) pair after a re-verification adds a new "
+        "history row rather than overwriting the old one. Returns "
+        "{project_id, document_id, link}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you ingested it under via ingest_document)."},
+         "element_id": {"type": "string", "description": "The doc_elements.id of the section/paragraph/figure/table this flag state applies to."},
+         "flag_name": {"type": "string", "description": "The config flag's name (as scanned by get_flag_registry, e.g. 'DT_ONLY_WIDTH')."},
+         "value": {"description": "The value the flag actually had when this section's numbers were produced (any JSON scalar — string/number/boolean/null)."},
+         "default": {"description": "The flag's default AS RECORDED by get_flag_registry at link time — what a later get_flag_drift compares the current codebase default against. Optional but recommended."},
+         "source_file": {"type": "string", "description": "Optional: the file the flag was read from (from get_flag_registry's 'file'), pinning drift detection to this exact call site."},
+         "source_line": {"type": "integer", "description": "Optional: the line the flag was read at (from get_flag_registry's 'line'), paired with source_file."}},
+         "required": ["doc", "element_id", "flag_name", "value"]}},
+    {"name": "get_flag_drift", "description":
+        "8ca89e8f — read side of link_flag_to_section: for every recorded "
+        "flag link (optionally scoped to one doc / element_id / flag_name — "
+        "pass flag_name alone with no doc for the REVERSE query 'flag X "
+        "changed, which sections does it touch'), re-scan the CURRENT "
+        "codebase (same AST scan as get_flag_registry) and diff each link's "
+        "recorded default against what the flag defaults to NOW. Only the "
+        "most recently recorded link per (element, flag) pair is diffed — a "
+        "re-verified section's older links are history, not live claims. "
+        "Each result carries status: 'removed' (the flag, or this exact call "
+        "site, no longer exists — the strongest staleness signal), 'drifted' "
+        "(the flag still exists but its default changed since this section "
+        "was computed — the section is possibly stale, needs re-verification), "
+        "or 'ok' (no evidence of drift found). Returns {project_id, root_dir, "
+        "links:[{...link fields, current_default, current_call_sites, "
+        "status}], summary:{ok, drifted, removed}}. No recorded links returns "
+        "an empty list, never an error — this is advisory, not a hard gate.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "root_dir": {"type": "string", "description": "Absolute path to the source-tree root to re-scan for current flag defaults (same as get_flag_registry's root_dir). Defaults to the server's current working directory when omitted."},
+         "doc": {"type": "string", "description": "Optional: scope to links recorded against one stored document (the doc source you ingested it under)."},
+         "element_id": {"type": "string", "description": "Optional: scope to links recorded against one specific doc_elements id."},
+         "flag_name": {"type": "string", "description": "Optional: scope to links recorded for one flag name — the reverse query, omit 'doc' to search project-wide."}},
          "required": []}},
     {"name": "prospect_symbol", "description":
         "2ce5bc76 — ROBUST symbol prospecting with a three-rung fallback chain: "
@@ -2177,6 +2231,7 @@ _READ_ONLY_TOOLS = {
     "search_code_semantic",
     "prospect_symbol",
     "get_flag_registry",
+    "get_flag_drift",
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
     "get_custom_hooks",
@@ -2347,6 +2402,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "index_table":                    "docx",
     "find_similar_table":             "docx",
     "ingest_document_structure":      "docx",
+    "link_flag_to_section":           "docx",
+    "get_flag_drift":                 "docx",
     # file locking
     "claim_file":               "file-locking",
     "release_file":             "file-locking",
@@ -2406,6 +2463,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "link_figure_caption":       "executor",
     "index_table":               "executor",
     "ingest_document_structure": "executor",
+    "link_flag_to_section":      "executor",
     "annotate_outputs":          "executor",
     "log_task":                  "executor",
     "generate_handoff":          "executor",
@@ -2504,6 +2562,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "search_code_semantic":      "both",
     "prospect_symbol":           "both",
     "get_flag_registry":         "both",
+    "get_flag_drift":            "both",
     "search_outputs":            "both",
     "get_document_structure":    "both",
     "get_latex_structure":       "both",
@@ -2725,6 +2784,8 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "release_docx_region_claims": "maintenance-only",
     "get_citation_edges":         "maintenance-only",
     "resolve_citations":          "maintenance-only",
+    "link_flag_to_section":       "maintenance-only",
+    "get_flag_drift":             "maintenance-only",
     # workspace management (cross-project admin)
     "add_workspace_note":              "maintenance-only",
     "get_workspace_notes":             "maintenance-only",
@@ -2820,6 +2881,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "run_verification": "Run Verification",
     "prospect_symbol": "Prospect Symbol",
     "get_flag_registry": "Get Flag Registry",
+    "link_flag_to_section": "Link Flag to Section",
+    "get_flag_drift": "Get Flag Drift",
     "search_server_logs": "Search Server Logs",
     "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }

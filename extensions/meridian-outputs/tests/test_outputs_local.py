@@ -1387,7 +1387,35 @@ class TestRebuildWalkDeadlineAwareness:
         CI-fast scale: repeated rebuild() calls against a walk that alone
         exceeds a single call's budget must still converge -- every file
         indexed, FTS built, search returning real hits -- within a bounded
-        number of calls, not plateau (at 0 or any other count) forever."""
+        number of calls, not plateau (at 0 or any other count) forever.
+
+        52cbe5d8 -- this test previously only called ``idx.search(...)`` as
+        the LAST, short-circuited operand of the loop's ``and`` chain, so it
+        was skipped entirely whenever ``_fts_built`` was still False.  That
+        starved the test of the exact recovery path
+        ``OutputsFtsIndex.rebuild()``'s own design relies on for convergence
+        (b1789c0d): ``search()`` performs a lazy FTS build whenever
+        ``_fts_built`` is False, regardless of ``_fts_pending`` -- but only if
+        it is actually CALLED.  The reference script this test claims to
+        mirror, ``scripts/test_outputs_indexing.py::run_rebuild_cycles``,
+        calls ``idx.search(...)`` unconditionally on every cycle for exactly
+        this reason (real production usage via ``search_outputs()`` also
+        always calls ``rebuild()`` immediately followed by ``search()``, so
+        the lazy build is *always* attempted on the very next call). Without
+        that unconditional call, a run where every early rebuild() call
+        happened to exceed its own deadline just before reaching the Tantivy
+        commit step (deferring the build via ``_fts_pending``) could leave
+        ``_fts_built`` permanently False for the rest of the loop -- nothing
+        else in a bare ``rebuild()``-only loop ever retries the build once
+        the walk finishes and there is nothing left to write (``changed``
+        goes False forever, and that is the ONLY call site of
+        ``_rebuild_fts()`` inside ``rebuild()``). Confirmed via 20 repeated
+        isolated runs: the old short-circuited condition failed ~40% of the
+        time (a real, repeatable test bug, not a load-flake) while calling
+        ``search()`` unconditionally every cycle -- matching the reference
+        script and real production usage -- converged in 19/20 runs (the one
+        remaining failure was an unrelated Tantivy searcher-reuse bug, fixed
+        separately in ``OutputsFtsIndex.search()``)."""
         n = 50
         for i in range(n):
             (tmp_path / f"k{i:03d}.csv").write_text(
@@ -1400,14 +1428,17 @@ class TestRebuildWalkDeadlineAwareness:
             converged = False
             for _ in range(30):
                 count = idx.rebuild(max_seconds=0.15)
-                if (count >= n and idx._fts_built and not idx._fts_pending
-                        and idx.search("value=1")):
+                # Unconditional, mirroring run_rebuild_cycles() -- see the
+                # docstring above for why this must never be short-circuited.
+                hits = idx.search("value=1")
+                if count >= n and idx._fts_built and not idx._fts_pending and hits:
                     converged = True
                     break
             assert converged, (
-                "rebuild() never converged across repeated tight-budget "
-                "calls -- the walk fix must let every call make forward, "
-                "resumable progress instead of stalling indefinitely"
+                "rebuild()/search() never converged across repeated "
+                "tight-budget calls -- the walk fix must let every call "
+                "make forward, resumable progress instead of stalling "
+                "indefinitely"
             )
         finally:
             idx.close()
@@ -1811,6 +1842,59 @@ class TestColdTreeFtsDeferral:
 class TestTantivySearchIndex:
     """77443d83/a6056886 -- OutputsFtsIndex._rebuild_fts/.search now go
     through Tantivy instead of DuckDB's FTS extension."""
+
+    def test_search_reuses_single_searcher_snapshot(self, tmp_path: Path) -> None:
+        """52cbe5d8 -- search() must resolve every hit's DocAddress against
+        the SAME Searcher snapshot that produced the query results, not a
+        freshly-obtained one.
+
+        DocAddress values are only meaningful relative to the segment layout
+        of the Searcher that returned them. Calling ``index.searcher()`` a
+        second time (as the code previously did, once to run the query and
+        again to resolve each hit's path) can return a *different* live view
+        if Tantivy's background segment-merge thread swaps in a new layout in
+        between -- observed live as a Rust-level panic
+        (``pyo3_runtime.PanicException: index out of bounds``) from
+        ``searcher.doc(addr)`` that bypasses ``search()``'s own
+        ``except Exception`` and crashes the caller instead of yielding the
+        documented best-effort ``[]``. Reproducing the race itself is
+        inherently timing-dependent (it needs a real background merge to
+        land in a few-line window), so this test instead pins down the fix
+        directly: wrap the real Tantivy index so every ``.searcher()`` call
+        is counted, and assert ``search()`` only ever asks for one per call.
+        """
+        f = tmp_path / "run.csv"
+        f.write_text("findme,value\n1,2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            real_index, real_writer = idx._connect_tantivy()
+
+            class _SearcherCountingIndex:
+                def __init__(self, real: Any) -> None:
+                    self._real = real
+                    self.searcher_calls = 0
+
+                def searcher(self) -> Any:
+                    self.searcher_calls += 1
+                    return self._real.searcher()
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._real, name)
+
+            counting = _SearcherCountingIndex(real_index)
+            idx._tantivy_index = counting  # type: ignore[assignment]
+
+            hits = idx.search("findme")
+            assert hits, "sanity check: the query must still find the row"
+            assert counting.searcher_calls == 1, (
+                "search() called index.searcher() "
+                f"{counting.searcher_calls} times in one invocation -- it "
+                "must call it exactly once and reuse that same Searcher for "
+                "both the query and every doc() lookup"
+            )
+        finally:
+            idx.close()
 
     def test_content_update_reflected_in_search(self, tmp_path: Path) -> None:
         """A changed file's OLD content must stop matching and its NEW

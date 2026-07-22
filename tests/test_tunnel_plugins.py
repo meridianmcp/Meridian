@@ -45,6 +45,68 @@ def test_resolve_defaults_returns_builtins_in_order():
     assert by_name["word"]["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
 
 
+def test_local_path_plugins_force_uvx_cache_bust():
+    """f886d37a — local-path tunnel plugins (meridian-docs, meridian-outputs) spawn
+    via `uvx --from <local-path> ...`; uvx caches the built venv and reuses it, so a
+    newly-added @mcp.tool() function stayed invisible across tunnel restarts until
+    the cache was manually invalidated.
+
+    Confirmed live against this repo's pinned `uv 0.11.11`: `--reinstall` /
+    `--reinstall-package` are no-ops for `uvx` (uv itself warns "Tools cannot be
+    reinstalled via `uvx`" and the stale build still runs), and `--refresh` /
+    `--refresh-package` do NOT force a rebuild of a `--from <local-path>` venv whose
+    source changed either — only `--no-cache` (`-n`) actually forces a from-scratch
+    rebuild on every invocation.
+
+    The fix is a static change to the two local-path command lists only: both must
+    carry "--no-cache" immediately after "uvx" (uv only honors cache-busting flags
+    when they appear before the spawned command, not after it — a flag placed after
+    the entry-point is passed through to the spawned tool's own CLI instead of being
+    consumed by uvx). Every other (PyPI-installed) plugin — including the other
+    opt-in ones (powerpoint, word, zotero-mcp, mcp-debugger) — must NOT carry the
+    flag, since those aren't edited locally and a forced rebuild would only add
+    spawn latency for no correctness benefit."""
+    by_name = {p["name"]: p for p in tp.BUILTIN_PLUGINS}
+
+    docs_cmd = by_name["meridian-docs"]["command"]
+    assert docs_cmd == [
+        "uvx", "--no-cache", "--from", tp._MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp",
+    ]
+    assert docs_cmd[0] == "uvx" and docs_cmd[1] == "--no-cache" and docs_cmd[2] == "--from"
+
+    outputs_cmd = by_name["meridian-outputs"]["command"]
+    assert outputs_cmd == [
+        "uvx", "--no-cache", "--from", tp._MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp",
+    ]
+    assert outputs_cmd[0] == "uvx" and outputs_cmd[1] == "--no-cache" and outputs_cmd[2] == "--from"
+
+    # Every other builtin's command must NOT gain "--no-cache" — this fix is scoped
+    # to ONLY the two local-path `--from` entries.
+    for plugin in tp.BUILTIN_PLUGINS:
+        if plugin["name"] in ("meridian-docs", "meridian-outputs"):
+            continue
+        cmd = plugin["command"]
+        if cmd is None:
+            continue
+        assert "--no-cache" not in cmd, (
+            f"{plugin['name']!r} command unexpectedly carries --no-cache: {cmd!r} "
+            "(the cache-busting fix is scoped to the two local-path plugins only)"
+        )
+
+    # Same invariant must hold after resolve_plugins() merges in an empty/absent
+    # config (the common no-override case), not just on the raw BUILTIN_PLUGINS list.
+    resolved_by_name = {p["name"]: p for p in tp.resolve_plugins(None)}
+    assert resolved_by_name["meridian-docs"]["command"] == docs_cmd
+    assert resolved_by_name["meridian-outputs"]["command"] == outputs_cmd
+    for name, plugin in resolved_by_name.items():
+        if name in ("meridian-docs", "meridian-outputs"):
+            continue
+        cmd = plugin["command"]
+        if cmd is None:
+            continue
+        assert "--no-cache" not in cmd
+
+
 def test_core_vs_plugin_tagging():
     # b2a60de7 — fs/code/extract are always-on core tools; office + desktop-commander
     # are opt-in plugins. The dashboard renders Core Tools (locked) vs Plugins.
@@ -320,8 +382,10 @@ def test_resolve_plugins_flags_stale_docs_pre_rename_override():
     cfg = {"meridian-docs": {"command": old_cmd}}
     docs = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["docs"]
     assert docs.get("stale_override") is True
+    # f886d37a — the current default now also carries the "--no-cache" cache-busting
+    # flag (inserted between "uvx" and "--from").
     assert docs["newer_default_command"] == [
-        "uvx", "--from", tp._MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp",
+        "uvx", "--no-cache", "--from", tp._MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp",
     ]
     assert docs.get("newer_default_label")
     # The old, broken command must NOT be the one this test expects to reach uvx
@@ -347,28 +411,33 @@ def test_resolve_plugins_no_stale_flag_for_docs_current_default():
 def test_resolve_plugins_flags_stale_outputs_foreign_local_path_override():
     """ff8d1b2f — root cause of a live "search_outputs unreachable, tunnel_tried=true"
     failure: the outputs slot's shipped default `--from` path was already correct
-    (computed the same way as the docs slot), but the slot never got a
-    `previous_defaults` list, so a tenant `tunnel_plugins` config storing a
-    command captured on a DIFFERENT checkout/container (e.g. an absolute path
-    like "file:///C:/app/extensions/meridian-outputs" that doesn't exist on this
-    machine) merged in unconditionally with zero staleness signal — the tunnel
-    client kept trying to spawn an unreachable path on every call, forever.
+    (computed the same way as the docs slot), but the slot's ONLY previous_defaults
+    entry (f886d37a added one, for the pre-cache-fix exact command) can never
+    enumerate a tenant `tunnel_plugins` config storing a command captured on a
+    DIFFERENT checkout/container (e.g. an absolute path like
+    "file:///C:/app/extensions/meridian-outputs" that doesn't exist on this
+    machine) — that merges in unconditionally with zero staleness signal via the
+    exact-match path, so the tunnel client would keep trying to spawn an
+    unreachable path on every call, forever.
 
     Unlike the docs/word/extract slots (whose stale value is one fixed historical
     string), a stale local `--from` path is inherently environment-specific and
     can't be enumerated in a fixed previous_defaults list — so resolve_plugins()
-    must structurally detect "same runtime + entry-point, different local path"
-    (see _is_stale_local_from_override). This regression guard fails without that
-    detection and passes with it."""
+    must structurally detect "same runtime + cache flag + entry-point, different
+    local path" (see _is_stale_local_from_override). This regression guard fails
+    without that detection and passes with it."""
+    # f886d37a — the current default is now 5-token (with "--no-cache"), so the
+    # foreign-path positive control must match that shape to exercise the
+    # structural detector rather than falling through the len-mismatch guard.
     foreign_cmd = [
-        "uvx", "--from", "file:///C:/app/extensions/meridian-outputs",
+        "uvx", "--no-cache", "--from", "file:///C:/app/extensions/meridian-outputs",
         "meridian-outputs-mcp",
     ]
     cfg = {"meridian-outputs": {"command": foreign_cmd}}
     outputs = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["outputs"]
     assert outputs.get("stale_override") is True
     assert outputs["newer_default_command"] == [
-        "uvx", "--from", tp._MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp",
+        "uvx", "--no-cache", "--from", tp._MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp",
     ]
     assert outputs.get("newer_default_label")
     # Positive control: the foreign path must actually differ from what this
@@ -389,21 +458,39 @@ def test_resolve_plugins_no_stale_flag_for_outputs_current_default_or_custom():
 
 
 def test_is_stale_local_from_override_helper():
-    """Unit coverage for the structural detector itself: same runtime + entry-point
-    but a different --from path is stale; anything else (different entry-point,
-    different runtime, non --from-shaped, or the identical command) is not."""
-    base = ["uvx", "--from", "/repo/extensions/meridian-outputs", "meridian-outputs-mcp"]
+    """Unit coverage for the structural detector itself: same runtime + cache flag +
+    entry-point but a different --from path is stale; anything else (different
+    entry-point, different runtime, missing the "--no-cache" flag, non --from-shaped,
+    or the identical command) is not.
+
+    f886d37a bumped the detector's expected shape from 4 to 5 tokens (``["uvx",
+    "--no-cache", "--from", <path>, <entry-point>]``) when the cache-busting flag was
+    inserted into the docs/outputs default commands."""
+    base = [
+        "uvx", "--no-cache", "--from", "/repo/extensions/meridian-outputs",
+        "meridian-outputs-mcp",
+    ]
     same_shape_other_path = [
-        "uvx", "--from", "/other/checkout/meridian-outputs", "meridian-outputs-mcp",
+        "uvx", "--no-cache", "--from", "/other/checkout/meridian-outputs",
+        "meridian-outputs-mcp",
     ]
     assert tp._is_stale_local_from_override(same_shape_other_path, base) is True
     assert tp._is_stale_local_from_override(base, base) is False  # identical -> not stale
     different_entry = [
-        "uvx", "--from", "/other/checkout/meridian-outputs", "meridian-outputs",
+        "uvx", "--no-cache", "--from", "/other/checkout/meridian-outputs",
+        "meridian-outputs",
     ]
     assert tp._is_stale_local_from_override(different_entry, base) is False
     assert tp._is_stale_local_from_override(["uvx", "my-own-outputs-mcp"], base) is False
     assert tp._is_stale_local_from_override(None, base) is False
+    # f886d37a — the pre-cache-fix 4-token shape (no "--no-cache") no longer matches
+    # the current 5-token base structurally; that case is instead caught by the
+    # exact-match previous_defaults entry (see test_resolve_plugins_flags_stale_*
+    # above), not this structural detector.
+    pre_cache_fix_shape = [
+        "uvx", "--from", "/repo/extensions/meridian-outputs", "meridian-outputs-mcp",
+    ]
+    assert tp._is_stale_local_from_override(pre_cache_fix_shape, base) is False
 
 
 def test_office_binaries_word_launcher_is_docx_mcp():

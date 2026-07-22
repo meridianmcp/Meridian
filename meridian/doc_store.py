@@ -58,11 +58,28 @@ synchronous and unit-testable without opening a database.
 * :meth:`DocStructureStore.reindex_document` — the one orchestrator entry point
   tying the outline+figures/tables (`put_document`) and equations
   (`put_equations`) passes together for a single .docx.
+
+8ca89e8f additionally adds:
+
+* A SEVENTH self-contained table, ``doc_flag_links`` (same outside-migrations
+  pattern as the six above) — a durable, append-only record that a given
+  ``doc_elements`` id's underlying numbers were produced with a config flag
+  set to a particular value (:meth:`DocStructureStore.link_flag_state`), plus
+  the reverse/forward lookups needed for a staleness check
+  (:meth:`DocStructureStore.get_flag_links`). The flag SCAN itself (which
+  flags exist, where, with what default) stays in :mod:`meridian.flag_registry`
+  — that module's :func:`~meridian.flag_registry.diff_flag_links` is the
+  stateless comparison between a recorded link and a fresh scan. This is the
+  anchor side of that check, reusing the SAME durable ``doc_elements`` id every
+  other linkage in this module anchors to (figures/tables/captions) rather than
+  inventing a parallel id space.
 """
 from __future__ import annotations
 
 import difflib
 import io
+import itertools
+import json
 import os
 import re
 import shutil
@@ -230,6 +247,53 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_doc_tables_document_ordinal "
     "ON doc_tables (document_id, ordinal)",
+    # Seventh self-contained table (8ca89e8f): durable flag-state provenance --
+    # one row per "this doc_elements id's underlying numbers were produced with
+    # flag_name=recorded_value" claim, anchored to the SAME doc_elements id every
+    # other linkage in this module anchors to (figures/tables/captions), so a
+    # section, paragraph, figure, OR table is covered by one mechanism (they are
+    # all doc_elements rows -- see elements_from_docx_content_tree). Insert-only /
+    # append-only (mirrors the repo's provenance convention elsewhere -- task_log,
+    # DECISIONS.md): a section can be re-verified multiple times as flags change,
+    # and each recording is a fact about a point in time, not a mutable "current
+    # state" -- callers collapse to the latest link per (element_id, flag_name)
+    # via flag_registry.dedupe_flag_links before a drift check.
+    # ``recorded_value``/``recorded_default`` are JSON-encoded TEXT so any
+    # JSON-scalar flag value/default (str/int/float/bool/None) round-trips
+    # exactly -- see _encode_flag_json/_decode_flag_link. ``source_file`` +
+    # ``source_line`` optionally pin the EXACT call site recorded (from
+    # flag_registry's scan) so a later drift check can distinguish "this flag's
+    # default changed" from "a different, same-named flag elsewhere changed".
+    # ``seq`` is a process-local monotonic counter (see _next_flag_link_seq) --
+    # NOT a wall-clock value. Two links for the same (element, flag) recorded
+    # back-to-back can legitimately land on the SAME ``created_at`` (ISO
+    # timestamp resolution/OS clock granularity is coarser than "two awaited
+    # DB inserts in a row" on some platforms), and ``id`` is a random UUID with
+    # zero relationship to insertion order -- neither is a safe tiebreaker for
+    # "which link is latest". ``seq`` is assigned synchronously (before the
+    # awaited INSERT), so sequential ``await link_flag_state(...)`` calls from
+    # the same caller are ordered correctly regardless of timestamp collisions.
+    # Same self-contained pattern as the six tables above -- created here by
+    # ``ensure_schema``, OUTSIDE the main migration machinery.
+    """
+    CREATE TABLE IF NOT EXISTS doc_flag_links (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        document_id TEXT NOT NULL,
+        element_id TEXT NOT NULL,
+        flag_name TEXT NOT NULL,
+        recorded_value TEXT,
+        recorded_default TEXT,
+        source_file TEXT,
+        source_line INTEGER,
+        created_at TEXT NOT NULL,
+        seq INTEGER NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_doc_flag_links_project_flag "
+    "ON doc_flag_links (project_id, flag_name)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_flag_links_element "
+    "ON doc_flag_links (element_id)",
 )
 
 
@@ -316,6 +380,56 @@ _TABLE_COLUMNS = (
     "id", "document_id", "element_id", "ordinal", "table_index", "caption",
     "normalized_caption", "semantic_label", "paired_figure_id", "created_at",
 )
+_FLAG_LINK_COLUMNS = (
+    "id", "project_id", "document_id", "element_id", "flag_name",
+    "recorded_value", "recorded_default", "source_file", "source_line",
+    "created_at", "seq",
+)
+
+# Process-local monotonic counter for doc_flag_links.seq (8ca89e8f). A plain
+# itertools.count() rather than a wall-clock read: it is assigned SYNCHRONOUSLY
+# (before the awaited INSERT), so it is immune to the timestamp-collision +
+# random-UUID-tiebreak trap that made ordering by (created_at, id) unreliable
+# for "which link is latest" -- see the schema comment above doc_flag_links.
+_flag_link_seq_counter = itertools.count()
+
+
+def _next_flag_link_seq() -> int:
+    """Next monotonically increasing ``doc_flag_links.seq`` value."""
+    return next(_flag_link_seq_counter)
+
+
+def _encode_flag_json(value: Any) -> str:
+    """JSON-encode a flag value/default for ``doc_flag_links`` storage.
+
+    Always produces TEXT (never SQL NULL) so ``recorded_default=None`` — a
+    legitimate "this flag has no default" claim, exactly what
+    :func:`meridian.flag_registry._literal_or_none` already reports for an
+    unparseable default — round-trips as JSON ``null`` rather than being
+    conflated with "no row"/"column absent". Falls back to ``repr()`` wrapped
+    as a JSON string for the (should-never-happen) case of a non-JSON-safe
+    value, so a link write can never raise on an odd value.
+    """
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return json.dumps(repr(value))
+
+
+def _decode_flag_link(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Decode a ``doc_flag_links`` row's JSON-encoded value/default columns."""
+    if row is None:
+        return None
+    out = dict(row)
+    for key in ("recorded_value", "recorded_default"):
+        raw = out.get(key)
+        if isinstance(raw, str):
+            try:
+                out[key] = json.loads(raw)
+            except (ValueError, TypeError):
+                pass  # leave the raw string -- defensive, should not happen
+    return out
+
 
 # Fuzzy-match ratio (difflib) at/above which two equations' latex_normalized
 # values count as a "near-duplicate" for put_equations' advisory dedup surface.
@@ -2898,6 +3012,129 @@ class DocStructureStore:
         scored.sort(key=lambda t: t["score"], reverse=True)
         lim = limit if isinstance(limit, int) and limit > 0 else 5
         return scored[:lim]
+
+    # -- flag-state links (8ca89e8f) -----------------------------------------
+
+    async def link_flag_state(
+        self,
+        project_id: str,
+        document_id: str,
+        element_id: str,
+        flag_name: str,
+        *,
+        value: Any = None,
+        default: Any = None,
+        source_file: str | None = None,
+        source_line: int | None = None,
+    ) -> dict[str, Any]:
+        """Durably record that ``element_id``'s underlying numbers were
+        produced with ``flag_name`` set to ``value`` -- the ``link_flag_to_section``
+        MCP tool's write primitive (8ca89e8f, the unbuilt half of workspace
+        proposal 8d8bbe63).
+
+        ``element_id`` is a ``doc_elements.id`` -- a section heading,
+        paragraph, or (since figures/tables are ALSO doc_elements rows, see
+        :func:`elements_from_docx_content_tree`) a figure or table. One
+        mechanism covers all four anchor kinds the item asks for, exactly
+        like the existing figure-caption linkage anchors to the same id space
+        rather than inventing a parallel one.
+
+        ``default`` should be the flag's default AS RECORDED by
+        :func:`meridian.flag_registry.get_flag_registry` at link time (the
+        caller typically just ran that scan to find ``flag_name`` in the
+        first place). It is what a later drift check compares the CURRENT
+        scanned default against -- ``diff_flag_links`` in
+        :mod:`meridian.flag_registry`. ``source_file``/``source_line``
+        optionally pin the exact call site scanned, so a same-named flag read
+        elsewhere in the codebase can never falsely trigger/suppress drift for
+        this link (see that function's docstring).
+
+        Insert-only (NOT an upsert): re-linking the same (element_id,
+        flag_name) pair after a re-verification adds a new row rather than
+        overwriting the old one -- an append-only provenance trail, mirroring
+        the repo's convention elsewhere (task_log, DECISIONS.md). Callers
+        collapse to the latest link per pair via
+        :func:`meridian.flag_registry.dedupe_flag_links` before diffing.
+
+        Returns the inserted row as a dict (JSON-decoded ``recorded_value``/
+        ``recorded_default``). Never raises on a bad ``default``/``value``
+        (any non-JSON-safe value is stringified rather than failing the
+        write -- see :func:`_encode_flag_json`).
+        """
+        row_id = uuid.uuid4().hex
+        now = _now_iso()
+        # Grabbed synchronously, before the awaited INSERT below, so sequential
+        # ``await link_flag_state(...)`` calls get seq values in true call order
+        # even when their ``created_at`` collides (see the seq schema comment).
+        seq = _next_flag_link_seq()
+        line = (
+            int(source_line)
+            if isinstance(source_line, (int, float)) and not isinstance(source_line, bool)
+            else None
+        )
+        await self._db.execute(
+            "INSERT INTO doc_flag_links "
+            "(id, project_id, document_id, element_id, flag_name, "
+            "recorded_value, recorded_default, source_file, source_line, "
+            "created_at, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row_id, project_id, document_id, element_id, flag_name,
+                _encode_flag_json(value), _encode_flag_json(default),
+                source_file, line, now, seq,
+            ),
+        )
+        await self._db.commit()
+        async with self._db.execute(
+            "SELECT * FROM doc_flag_links WHERE id = ?", (row_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return _decode_flag_link(_row_to_dict(row, _FLAG_LINK_COLUMNS))
+
+    async def get_flag_links(
+        self,
+        project_id: str,
+        *,
+        element_id: str | None = None,
+        document_id: str | None = None,
+        flag_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recorded flag-state links for a project, newest first.
+
+        Filters (all optional, ANDed): ``element_id`` (one specific anchor),
+        ``document_id`` (every link in one document), ``flag_name`` (the
+        REVERSE query the item asks for -- "flag X changed, which sections
+        does it touch"). With no filters, returns the project's full link
+        history. Mirrors :meth:`get_edges`'s filter shape. Never raises; an
+        unknown project / no links yields ``[]``.
+
+        Ordered by ``created_at DESC, seq DESC`` -- ``seq`` (not ``id``) is the
+        tiebreaker because two links recorded back-to-back can share an
+        identical ``created_at`` (timestamp resolution/OS clock granularity),
+        and ``id`` is a random UUID with no relationship to insertion order;
+        ``seq`` is assigned synchronously in call order (see
+        :meth:`link_flag_state`), so it resolves the tie correctly.
+        """
+        clauses = ["project_id = ?"]
+        params: list[Any] = [project_id]
+        if element_id is not None:
+            clauses.append("element_id = ?")
+            params.append(element_id)
+        if document_id is not None:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        if flag_name is not None:
+            clauses.append("flag_name = ?")
+            params.append(flag_name)
+        sql = (
+            "SELECT * FROM doc_flag_links WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at DESC, seq DESC"
+        )
+        async with self._db.execute(sql, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        return [
+            _decode_flag_link(_row_to_dict(r, _FLAG_LINK_COLUMNS)) for r in rows
+        ]
 
     async def _find_paired_figure_suggestion(
         self, document_id: str, element_id: str | None

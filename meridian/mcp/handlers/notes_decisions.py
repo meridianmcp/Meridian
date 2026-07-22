@@ -1446,6 +1446,178 @@ async def handle_check_embedded_staleness(
 
 
 # ---------------------------------------------------------------------------
+# Section 9c: Flag-to-section drift check (8ca89e8f)
+# ---------------------------------------------------------------------------
+
+async def handle_link_flag_to_section(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: link_flag_to_section.
+
+    8ca89e8f — durably record that a docx section/paragraph/figure/table
+    (identified by its stable ``doc_elements`` id — the SAME id space
+    index_figure/index_table/link_figure_caption already anchor to) was
+    computed with a config flag set to a particular value. The write
+    primitive behind :meth:`DocStructureStore.link_flag_state`; the read/
+    drift side is ``get_flag_drift``.
+
+    Typical flow: run ``get_flag_registry`` to find the flag's current
+    file/line/default, compute the section, then call this tool with
+    ``value`` = the value actually used and ``default`` = the default
+    ``get_flag_registry`` reported (so a later drift check has something to
+    compare the codebase's CURRENT default against).
+    """
+    validate_input_size(args.get("doc"), "doc", 2_000)
+    validate_input_size(args.get("element_id"), "element_id", 200)
+    validate_input_size(args.get("flag_name"), "flag_name", 500)
+    validate_input_size(args.get("source_file"), "source_file", 4_000)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    element_id = (args.get("element_id") or "").strip()
+    flag_name = (args.get("flag_name") or "").strip()
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not element_id:
+        return {"error": "element_id is required"}
+    if not flag_name:
+        return {"error": "flag_name is required"}
+    if "value" not in args:
+        return {"error": "value is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {
+            "error": (
+                f"no stored document for doc={doc_source!r} — ingest_document "
+                "it first (that MCP tool populates the doc-structure store; "
+                "there is no separate reindex_document tool)"
+            ),
+        }
+    try:
+        link = await store.link_flag_state(
+            args["project_id"], doc_row["id"], element_id, flag_name,
+            value=args.get("value"),
+            default=args.get("default"),
+            source_file=(args.get("source_file") or None),
+            source_line=args.get("source_line"),
+        )
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort
+        return {"error": f"could not record flag link: {exc}"}
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        "link": link,
+    }
+
+
+async def handle_get_flag_drift(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_flag_drift.
+
+    8ca89e8f — read side of the flag-to-section link: for every recorded
+    flag link (optionally scoped to one doc / element_id / flag_name — the
+    reverse query "flag X changed, which sections does it touch" is just
+    ``flag_name`` with no ``doc``), re-scan the CURRENT codebase via
+    :func:`meridian.flag_registry.get_flag_registry` and diff
+    (:func:`~meridian.flag_registry.diff_flag_links`) against each link's
+    recorded default. Only the LATEST link per (element, flag) is diffed
+    (:func:`~meridian.flag_registry.dedupe_flag_links`) — a re-verified
+    section's older links are history, not live claims.
+
+    Returns ``{project_id, root_dir, links:[{...link, current_default,
+    current_call_sites, status}], summary:{ok, drifted, removed}}``. An empty
+    link history (nothing recorded yet) returns an empty list, never an
+    error — this tool is advisory, not a hard gate.
+    """
+    validate_input_size(args.get("doc"), "doc", 2_000)
+    validate_input_size(args.get("element_id"), "element_id", 200)
+    validate_input_size(args.get("flag_name"), "flag_name", 500)
+    validate_input_size(args.get("root_dir"), "root_dir", 4_000)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {
+            "project_id": args["project_id"], "links": [],
+            "summary": {"ok": 0, "drifted": 0, "removed": 0},
+        }
+
+    document_id = None
+    doc_source = args.get("doc")
+    if doc_source:
+        try:
+            doc_row = await store.get_document(args["project_id"], doc_source)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not resolve doc: {exc}"}
+        if doc_row is None:
+            return {
+                "error": (
+                    f"no stored document for doc={doc_source!r} — "
+                    "ingest_document it first"
+                ),
+            }
+        document_id = doc_row["id"]
+
+    try:
+        links = await store.get_flag_links(
+            args["project_id"],
+            element_id=(args.get("element_id") or None),
+            document_id=document_id,
+            flag_name=(args.get("flag_name") or None),
+        )
+    except Exception as exc:  # noqa: BLE001 — read must not crash the tool call
+        return {"error": f"could not read flag links: {exc}"}
+
+    from meridian import flag_registry as _flag_registry  # noqa: PLC0415
+    latest = _flag_registry.dedupe_flag_links(links)
+
+    root_dir = str(args.get("root_dir") or "").strip()
+    if not root_dir:
+        root_dir = os.getcwd()
+    # Tolerate an accidentally-quoted path, same normalization get_flag_registry
+    # already applies.
+    if len(root_dir) >= 2 and root_dir[0] == root_dir[-1] and root_dir[0] in ("'", '"'):
+        root_dir = root_dir[1:-1]
+
+    try:
+        results = await asyncio.to_thread(
+            _flag_registry.check_flag_drift, latest, root_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 — the scan itself is best-effort
+        return {"error": f"could not scan flag registry: {exc}"}
+
+    summary = {"ok": 0, "drifted": 0, "removed": 0}
+    for r in results:
+        status = r.get("status")
+        if status in summary:
+            summary[status] += 1
+
+    return {
+        "project_id": args["project_id"],
+        "root_dir": root_dir,
+        "links": results,
+        "summary": summary,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Section 10: Insights and findings
 # ---------------------------------------------------------------------------
 

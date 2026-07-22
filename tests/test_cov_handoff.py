@@ -887,7 +887,55 @@ async def test_generate_handoff_no_goal_uses_placeholder(db, tmp_path):
     assert "No sprint name set" in content
     assert "No pending sprint items" in content
     assert "No pinned decisions" in content
-    assert path.endswith("alpha-nogoal_handoff.md")
+    assert path.endswith(f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md")
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_same_name_projects_no_path_collision(db, tmp_path):
+    """44fc189d regression: the ambient handoff file is keyed on project_id, not
+    the display-name slug, so two DIFFERENT projects sharing the SAME name write
+    to two DIFFERENT files instead of silently colliding/overwriting each other
+    in the shared process-global data_dir.
+
+    ``projects.name`` is UNIQUE *within one database*, but each real tenant
+    gets its own isolated (Neon) Postgres database — the collision this item
+    guards against is across TWO DIFFERENT tenant databases sharing ONE
+    process-global data_dir (see ``_deps._data_dir``), so this test models
+    that with two independent db connections rather than one shared db.
+    """
+    from pathlib import Path as _Path
+
+    db2 = await db_module.init_db(":memory:")
+    try:
+        p1 = await db_module.create_project(db, "duplicate-name")
+        p2 = await db_module.create_project(db2, "duplicate-name")
+        assert p1["id"] != p2["id"]
+        await db_module.set_goal(db, p1["id"], "project one goal")
+        await db_module.set_goal(db2, p2["id"], "project two goal")
+
+        path1, content1, _ = await handoff_module.generate_handoff(
+            db, p1["id"], str(tmp_path), skip_ai_summary=True
+        )
+        path2, content2, _ = await handoff_module.generate_handoff(
+            db2, p2["id"], str(tmp_path), skip_ai_summary=True
+        )
+
+        assert path1 != path2
+        assert path1.endswith(
+            f"{handoff_module.handoff_file_stem(p1['id'])}_handoff.md"
+        )
+        assert path2.endswith(
+            f"{handoff_module.handoff_file_stem(p2['id'])}_handoff.md"
+        )
+        assert "project one goal" in content1
+        assert "project two goal" in content2
+        # Both files landed on disk independently — neither overwrote the other.
+        assert _Path(path1).exists()
+        assert _Path(path2).exists()
+        assert _Path(path1).read_text(encoding="utf-8") == content1
+        assert _Path(path2).read_text(encoding="utf-8") == content2
+    finally:
+        await db2.close()
 
 
 @pytest.mark.asyncio
@@ -1274,7 +1322,9 @@ async def test_generate_handoff_planner_mode_full_content(db, tmp_path):
     assert "### Priorities" in content
     assert "### Proposed next sprint items" in content
     assert "### Open questions" in content
-    assert path.endswith("alpha-planner_planner_handoff.md")
+    assert path.endswith(
+        f"{handoff_module.handoff_file_stem(p['id'])}_planner_handoff.md"
+    )
 
 
 @pytest.mark.asyncio
@@ -1312,7 +1362,7 @@ async def test_generate_handoff_starter_and_compact(db, tmp_path):
         assert f'project_id (fallback): {p["id"]}' in content
         assert it2["id"][:8] in content
         assert "Done:" in content
-        assert path.endswith("alpha-starter-cov_starter.md")
+        assert path.endswith(f"{handoff_module.handoff_file_stem(p['id'])}_starter.md")
 
 
 @pytest.mark.asyncio
@@ -1359,7 +1409,7 @@ async def test_generate_handoff_l0_fallback(db, tmp_path):
     assert "L0 star" in content
     assert "l0-sprint" in content
     assert "L0 dec" in content
-    assert path.endswith("alpha-l0_handoff.md")
+    assert path.endswith(f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md")
 
 
 @pytest.mark.asyncio
@@ -1417,7 +1467,9 @@ def test_post_handoff_endpoint_full(client):
     body = r.json()
     assert body["mode"] == "full"
     assert "ship http" in body["content"]
-    assert body["path"].endswith("http-full_handoff.md")
+    assert body["path"].endswith(
+        f"{handoff_module.handoff_file_stem(project['id'])}_handoff.md"
+    )
 
 
 def test_post_handoff_endpoint_404(client):

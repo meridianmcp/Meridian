@@ -2316,11 +2316,26 @@ class OutputsFtsIndex:
                     self._fts_pending = False
                     self._rebuild_fts(con)
                 index, _writer = self._connect_tantivy()
+                # 52cbe5d8 -- a single Searcher snapshot must be used for BOTH
+                # the query (which returns DocAddress values that are only
+                # valid relative to the segment layout of the searcher that
+                # produced them) and the doc() lookups below. The previous
+                # code called index.searcher() a SECOND time after the query
+                # to resolve each hit's path -- if Tantivy's background
+                # segment-merge thread swapped in a new segment layout between
+                # the two calls (a real race, observed live), the first
+                # searcher's DocAddress values become invalid against the
+                # second searcher and searcher.doc(addr) raises a Rust-level
+                # panic (pyo3_runtime.PanicException: "index out of bounds")
+                # that is NOT caught by the `except Exception` below --
+                # crashing the whole call instead of the documented
+                # best-effort "errors yield []" contract. Confirmed via
+                # TestTantivySearchIndex::test_search_reuses_single_searcher_snapshot.
+                searcher = index.searcher()
                 parsed_query = index.parse_query(q, ["content"])
-                tantivy_hits = index.searcher().search(parsed_query, safe_limit).hits
+                tantivy_hits = searcher.search(parsed_query, safe_limit).hits
                 if not tantivy_hits:
                     return []
-                searcher = index.searcher()
                 bm25_by_path: dict[str, float] = {}
                 for score, addr in tantivy_hits:
                     path = searcher.doc(addr).get_first("path")

@@ -307,7 +307,7 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     # 0d5453bc — empty-board goal must also state the single-run constraint.
     assert "run once at the end, not per item" in content
     assert "## Resume Instructions" in content
-    on_disk = tmp_path / "alpha_handoff.md"
+    on_disk = tmp_path / f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md"
     assert on_disk.exists()
     assert on_disk.read_text(encoding="utf-8") == content
     assert str(on_disk.resolve()) == path
@@ -838,7 +838,9 @@ def test_handoff_endpoint(client):
     assert "MERIDIAN_CONTEXT" in body["content"]
     assert "ship it" in body["content"]
     assert "step 1" in body["content"]
-    assert body["path"].endswith("alpha_handoff.md")
+    assert body["path"].endswith(
+        f"{handoff_module.handoff_file_stem(project['id'])}_handoff.md"
+    )
 
 
 def test_handoff_endpoint_auto_switches_repeat_session_to_delta(client):
@@ -2710,7 +2712,9 @@ async def test_expire_and_generate_handoffs_creates_file(db, tmp_path):
     result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
     assert result["count"] >= 1
     assert result["auto_handoff_generated"] is True
-    assert (tmp_path / "myproj_handoff.md").exists()
+    assert (
+        tmp_path / f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md"
+    ).exists()
 
 
 @pytest.mark.asyncio
@@ -2724,7 +2728,9 @@ async def test_expire_and_generate_handoffs_skips_when_nothing_expires(db, tmp_p
     result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
     assert result["count"] == 0
     assert result["auto_handoff_generated"] is False
-    assert not (tmp_path / "myproj_handoff.md").exists()
+    assert not (
+        tmp_path / f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md"
+    ).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2973,8 +2979,11 @@ def test_start_session_handoff_exists_reflects_disk_reality(client, tmp_path):
     assert r.status_code == 200
     assert r.json()["handoff_exists"] is False
 
-    # Write the handoff file that the slug logic would produce.
-    (tmp_path / "myproj_handoff.md").write_text("# handoff", encoding="utf-8")
+    # Write the handoff file at the project_id-keyed path the write side
+    # would produce (44fc189d — no longer name-slug-based).
+    (
+        tmp_path / f"{handoff_module.handoff_file_stem(project['id'])}_handoff.md"
+    ).write_text("# handoff", encoding="utf-8")
 
     r2 = client.post(
         f"/projects/{project['id']}/start-session",
@@ -2982,6 +2991,70 @@ def test_start_session_handoff_exists_reflects_disk_reality(client, tmp_path):
     )
     assert r2.status_code == 200
     assert r2.json()["handoff_exists"] is True
+
+
+def test_start_session_handoff_path_keyed_on_project_id_not_name(monkeypatch, tmp_path):
+    """44fc189d regression: two DIFFERENT tenants, each with their own isolated
+    DB (as in real hosted Meridian — every tenant gets its own Neon Postgres
+    database), that each happen to have a project named "same-name" must NOT
+    collide on the same ambient handoff path in the shared process-global
+    data_dir. ``start_session``'s handoff_exists/handoff_path fields must stay
+    correct against the new project_id-keyed path shape.
+
+    ``projects.name`` is UNIQUE within a single db, so same-name-across-tenants
+    can only be modeled with two separate db connections/apps — hence two
+    sequential ``TestClient`` lifespans (each gets a fresh in-memory SQLite db
+    on lifespan startup, mirroring per-tenant DB isolation) sharing one
+    MERIDIAN_DATA_DIR.
+    """
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+
+    from fastapi.testclient import TestClient
+
+    server_module._CONNECTED_SESSIONS.clear()
+
+    # Tenant A: create the project, start a session, and actually generate a
+    # handoff so a real file lands on disk under the shared data_dir.
+    with TestClient(server_module.app) as client_a:
+        proj_a = client_a.post("/projects", json={"name": "same-name"}).json()
+        body_a = client_a.post(
+            f"/projects/{proj_a['id']}/start-session",
+            json={"session_name": "w-a"},
+        ).json()
+        assert body_a["handoff_path"].endswith(
+            f"{handoff_module.handoff_file_stem(proj_a['id'])}_handoff.md"
+        )
+        gen_a = client_a.post(f"/projects/{proj_a['id']}/handoff").json()
+        assert gen_a["path"] == body_a["handoff_path"]
+        assert Path(body_a["handoff_path"]).exists()
+
+    server_module._CONNECTED_SESSIONS.clear()
+
+    # Tenant B: a wholly separate db (fresh TestClient lifespan), but the SAME
+    # data_dir on disk, with a project sharing tenant A's exact display name.
+    with TestClient(server_module.app) as client_b:
+        proj_b = client_b.post("/projects", json={"name": "same-name"}).json()
+        assert proj_a["id"] != proj_b["id"]
+        body_b = client_b.post(
+            f"/projects/{proj_b['id']}/start-session",
+            json={"session_name": "w-b"},
+        ).json()
+
+        # Different tenants -> different on-disk handoff paths, even though
+        # the display name is byte-for-byte identical (the actual collision
+        # this item exists to prevent).
+        assert body_b["handoff_path"] != body_a["handoff_path"]
+        assert body_b["handoff_path"].endswith(
+            f"{handoff_module.handoff_file_stem(proj_b['id'])}_handoff.md"
+        )
+        # Tenant B must NOT see tenant A's already-written handoff as its own.
+        assert body_b["handoff_exists"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -5096,6 +5169,28 @@ async def test_workspace_settings_refresh_config_defaults(db):
     assert ws["auto_refresh_enabled"] is False
     assert ws["refresh_interval_turns"] == 10
     assert ws["refresh_triggers"] is None
+    # db0361bb — separate, smaller floor for the trigger branch defaults to 3.
+    assert ws["refresh_trigger_min_interval"] == 3
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_refresh_trigger_min_interval_roundtrip(db):
+    """refresh_trigger_min_interval (db0361bb) is a stored, configurable
+    setting distinct from refresh_interval_turns, and is clamped to >= 1."""
+    ws = await db_module.update_workspace_settings(
+        db, refresh_trigger_min_interval=5,
+    )
+    assert ws["refresh_trigger_min_interval"] == 5
+    # Persists on re-read.
+    ws2 = await db_module.get_workspace_settings(db)
+    assert ws2["refresh_trigger_min_interval"] == 5
+    # Clamped to a minimum of 1.
+    ws3 = await db_module.update_workspace_settings(db, refresh_trigger_min_interval=0)
+    assert ws3["refresh_trigger_min_interval"] == 1
+    # Untouched by a refresh_interval_turns-only update.
+    ws4 = await db_module.update_workspace_settings(db, refresh_interval_turns=20)
+    assert ws4["refresh_trigger_min_interval"] == 1
+    assert ws4["refresh_interval_turns"] == 20
 
 
 @pytest.mark.asyncio
@@ -13366,6 +13461,72 @@ async def test_dispatch_context_refresh_skips_executor_session(db):
         db, "/tmp",
     )
     assert "_context_refresh" not in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_trigger_branch_has_own_floor(db):
+    """db0361bb — the trigger branch (add_insight/pin_decision/etc.) previously
+    fired on EVERY matching call with no rate limit at all; refresh_interval_turns
+    only gated the periodic fallback. Back-to-back trigger calls must now respect
+    a separate, smaller floor (refresh_trigger_min_interval, default 3 calls)
+    instead of compounding a fresh refresh on every single call."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-trigger-floor")
+    # A large periodic interval isolates the trigger-branch floor being tested
+    # (the periodic fallback branch would otherwise never fire in this test).
+    await db_module.update_workspace_settings(
+        db, auto_refresh_enabled=True, refresh_interval_turns=100,
+    )
+
+    async def _pin(n):
+        return await srv._dispatch_mcp_tool(
+            "pin_decision",
+            {
+                "project_id": pid, "session_id": sid,
+                "title": f"D{n}", "body": "body", "category": "TECHNICAL",
+            },
+            db, "/tmp",
+        )
+
+    r1 = await _pin(1)
+    assert "_context_refresh" in r1, "first trigger call in a session still fires immediately"
+    r2 = await _pin(2)
+    assert "_context_refresh" not in r2, "back-to-back trigger call within the floor must not re-fire"
+    r3 = await _pin(3)
+    assert "_context_refresh" not in r3, "still within the default 3-call floor"
+    r4 = await _pin(4)
+    assert "_context_refresh" in r4, "floor elapsed (3 calls since the last fire) — fires again"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_context_refresh_trigger_floor_is_configurable(db):
+    """refresh_trigger_min_interval is a stored, workspace-configurable
+    setting, not a hardcoded constant — lowering it changes trigger-branch
+    rate limiting behavior."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+    mh._SESSION_REFRESH_STATE.clear()
+    mh._EXECUTOR_SESSIONS.clear()
+    pid, sid = await _new_project_and_session(db, "refresh-trigger-configurable")
+    await db_module.update_workspace_settings(
+        db, auto_refresh_enabled=True, refresh_interval_turns=100,
+        refresh_trigger_min_interval=1,
+    )
+
+    async def _insight(n):
+        return await srv._dispatch_mcp_tool(
+            "add_insight",
+            {"project_id": pid, "session_id": sid, "title": f"T{n}", "body": "B"},
+            db, "/tmp",
+        )
+
+    r1 = await _insight(1)
+    r2 = await _insight(2)
+    assert "_context_refresh" in r1
+    assert "_context_refresh" in r2, "floor of 1 allows firing on every consecutive trigger call"
 
 
 @pytest.mark.asyncio

@@ -93,11 +93,13 @@ def test_docs_plugin_has_command_in_builtin_plugins():
     assert docs.get("command"), (
         "meridian-docs plugin must have a non-empty command in BUILTIN_PLUGINS"
     )
-    # The command must be a local-path uvx invocation (not bare `uvx meridian-docs`)
+    # The command must be a local-path uvx invocation (not bare `uvx meridian-docs`).
+    # f886d37a — "--no-cache" was inserted right after "uvx" (before "--from"), so
+    # check for "--from" positionally rather than at a hardcoded index.
     cmd = docs["command"]
     assert isinstance(cmd, list)
-    assert cmd[0] == "uvx" and cmd[1] == "--from", (
-        "docs slot command must be ['uvx', '--from', <path>, 'meridian-docs'] -- "
+    assert cmd[0] == "uvx" and "--from" in cmd, (
+        "docs slot command must be ['uvx', ..., '--from', <path>, 'meridian-docs-mcp'] -- "
         "bare uvx meridian-docs fails because the package is NOT on PyPI"
     )
 
@@ -273,8 +275,9 @@ def test_resolve_plugins_includes_docs_slot_by_default():
     docs = by_slot["docs"]
     # Default: disabled (opt-in like office slots)
     assert docs["enabled"] is False
-    # Command must still be the local-path uvx form.
-    assert docs["command"][0] == "uvx" and docs["command"][1] == "--from"
+    # Command must still be the local-path uvx form. f886d37a inserted "--no-cache"
+    # right after "uvx", so check for "--from" positionally.
+    assert docs["command"][0] == "uvx" and "--from" in docs["command"]
 
 
 def test_resolve_plugins_includes_zotero_slot_by_default():

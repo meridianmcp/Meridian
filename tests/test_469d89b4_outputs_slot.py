@@ -43,12 +43,17 @@ def test_outputs_builtin_plugin_entry_shape():
     # meridian-outputs source dir must be supplied via --from).
     # The entry-point is "meridian-outputs-mcp" (not "meridian-outputs") to prevent
     # uvx from treating the trailing command as a PyPI registry lookup (same as 58a044c7).
+    # f886d37a — "--no-cache" was inserted right after "uvx" to force uvx to rebuild
+    # the --from venv every spawn (uv only honors cache-busting flags positioned
+    # before the spawned command), so --from/the entry-point are located
+    # positionally rather than at a hardcoded index.
     cmd = o["command"]
     assert cmd[0] == "uvx"
-    assert cmd[1] == "--from"
-    assert cmd[3] == "meridian-outputs-mcp"
+    assert "--from" in cmd
+    from_idx = cmd.index("--from")
+    assert cmd[-1] == "meridian-outputs-mcp"
     # The --from path points at the local extensions/meridian-outputs directory.
-    assert "extensions" in cmd[2] and "meridian-outputs" in cmd[2]
+    assert "extensions" in cmd[from_idx + 1] and "meridian-outputs" in cmd[from_idx + 1]
     # Opt-in like the other non-core slots: off by default, not a core tool.
     assert o["enabled"] is False
     assert o["core"] is False

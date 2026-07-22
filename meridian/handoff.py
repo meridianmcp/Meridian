@@ -442,6 +442,32 @@ def _slugify(name: str) -> str:
     return slug or "project"
 
 
+def handoff_file_stem(project_id: str) -> str:
+    """Filename-safe stem for a project's ambient handoff files.
+
+    44fc189d — SECURITY/MULTI-TENANT: this used to be derived from the
+    project's *display name* via ``_slugify(project["name"])``. Every ambient
+    handoff file (full/delta, L0 fallback, planner, starter) lives in one
+    process-global ``data_dir`` shared by every tenant that process serves
+    (see ``_deps._data_dir``), so two different tenants naming a project the
+    same thing (e.g. "backend") collided on one on-disk path and could
+    overwrite / leak each other's handoff content.
+
+    ``project_id`` is a globally-unique uuid4 (see ``db._new_id``), so keying
+    the filename on it instead eliminates the cross-tenant collision. Still
+    run through the same character-whitelist as the old name-based scheme —
+    defensively, since ids are already filename-safe in practice, but this
+    keeps the guarantee explicit rather than assumed.
+
+    The handoffs DB table (keyed on project_id) remains the real source of
+    truth for handoff content; this ambient file is a redundant, best-effort
+    convenience copy on disk, and the read site (``server.py``'s
+    ``_start_session_composite``) must compute this SAME stem so the
+    ``handoff_exists`` / ``handoff_path`` fields stay accurate.
+    """
+    return _slugify(project_id)
+
+
 def _format_content(content) -> str:
     """Pretty-print goal content for the handoff body."""
     if isinstance(content, str):
@@ -3611,8 +3637,7 @@ async def _generate_handoff_l0(
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    slug = _slugify(name)
-    out_path = out_dir / f"{slug}_handoff.md"
+    out_path = out_dir / f"{handoff_file_stem(project_id)}_handoff.md"
     out_path.write_text(content, encoding="utf-8")
     return str(out_path.resolve()), content
 
@@ -4323,7 +4348,7 @@ async def generate_handoff(
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{_slugify(project['name'])}_handoff.md"
+    out_path = out_dir / f"{handoff_file_stem(project_id)}_handoff.md"
     out_path.write_text(content, encoding="utf-8")
     if session_id:
         _SESSION_HANDOFF_STATE[session_id] = state_ts
@@ -4593,7 +4618,7 @@ async def _generate_planner_handoff(
     content = "\n".join(lines)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{_slugify(project['name'])}_planner_handoff.md"
+    out_path = out_dir / f"{handoff_file_stem(project_id)}_planner_handoff.md"
     out_path.write_text(content, encoding="utf-8")
     return str(out_path.resolve()), content
 
@@ -4704,6 +4729,6 @@ async def _generate_starter_handoff(
         content = f"{build_executor_config_block(executor_config)}\n\n{content}"
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{_slugify(project['name'])}_starter.md"
+    out_path = out_dir / f"{handoff_file_stem(project_id)}_starter.md"
     out_path.write_text(content, encoding="utf-8")
     return str(out_path.resolve()), content

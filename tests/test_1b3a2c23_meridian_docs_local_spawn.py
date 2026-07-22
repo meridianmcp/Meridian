@@ -53,24 +53,30 @@ def test_meridian_docs_command_is_local_path_uvx():
     # Must be a list of strings (not a bare string).
     assert isinstance(cmd, list) and all(isinstance(t, str) for t in cmd)
 
-    # Form: ["uvx", "--from", "<path>", "meridian-docs-mcp"]
+    # Form: ["uvx", "--no-cache", "--from", "<path>", "meridian-docs-mcp"]
+    # f886d37a — "--no-cache" was inserted right after "uvx" (uv only honors
+    # cache-busting flags positioned before the spawned command; a flag after the
+    # entry-point is passed through to the spawned tool's own CLI instead). Find
+    # "--from" positionally rather than hardcoding its index so this test doesn't
+    # need to change again if another uvx-level flag is ever inserted.
     assert cmd[0] == "uvx", f"launcher must be uvx, got {cmd[0]!r}"
-    assert cmd[1] == "--from", (
+    assert "--from" in cmd, (
         "bare `uvx meridian-docs` fails (package not on PyPI); "
-        f"expected '--from' at index 1, got {cmd[1]!r}"
+        f"expected '--from' somewhere in the command, got {cmd!r}"
     )
+    from_idx = cmd.index("--from")
     # 58a044c7 — entry-point must be "meridian-docs-mcp", NOT "meridian-docs":
     # the name-collision between package and command causes uvx to attempt a
     # PyPI lookup for the command, which fails since the package is not on PyPI.
-    assert cmd[3] == "meridian-docs-mcp", (
+    assert cmd[-1] == "meridian-docs-mcp", (
         f"entry-point must be 'meridian-docs-mcp' (not 'meridian-docs'); "
-        f"got {cmd[3]!r}. A name matching the package triggers a uvx PyPI lookup "
+        f"got {cmd[-1]!r}. A name matching the package triggers a uvx PyPI lookup "
         "that fails with 'meridian-docs was not found in the package registry'."
     )
 
-    # The --from value (cmd[2]) must reference the local extensions directory,
-    # NOT a bare PyPI package name.
-    local_path = cmd[2]
+    # The --from value (immediately after "--from") must reference the local
+    # extensions directory, NOT a bare PyPI package name.
+    local_path = cmd[from_idx + 1]
     assert "extensions" in local_path, (
         f"--from path should point into extensions/, got {local_path!r}"
     )
@@ -183,4 +189,4 @@ def test_meridian_docs_enabled_true_resolves_to_installed_inactive():
     # Assert the command still uses the local --from form (override preserved shape).
     cmd = docs["command"]
     assert isinstance(cmd, list)
-    assert cmd[0] == "uvx" and cmd[1] == "--from" and cmd[3] == "meridian-docs-mcp"
+    assert cmd[0] == "uvx" and "--from" in cmd and cmd[-1] == "meridian-docs-mcp"

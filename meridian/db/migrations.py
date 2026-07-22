@@ -381,6 +381,14 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
         db, "workspace_settings", "refresh_interval_turns", "INTEGER NOT NULL DEFAULT 10"
     )
     await _migrate_add_column_if_missing(db, "workspace_settings", "refresh_triggers", "TEXT")
+    # db0361bb — separate, smaller floor (in calls) gating the TRIGGER branch
+    # specifically, distinct from refresh_interval_turns (which only gates the
+    # periodic fallback branch). Without this, back-to-back trigger tool calls
+    # (e.g. consecutive pin_decision calls) each fired a fresh refresh with no
+    # spacing at all.
+    await _migrate_add_column_if_missing(
+        db, "workspace_settings", "refresh_trigger_min_interval", "INTEGER NOT NULL DEFAULT 3"
+    )
     # 36fea6ca — inline each pending item's RESOLVED pointers directly in the
     # handoff markdown (default 1 = on) so a resuming session sees them without a
     # separate resolve_sprint_item_pointers call. A stored 0 keeps them DB-only.
