@@ -1015,18 +1015,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "resolve_sprint_item_pointers", "description":
         "2976e168 — resolve EVERY generic pointer on a sprint item to its concrete "
         "location, dispatching by selector.type. A range target returns its location "
-        "as-is; symbol resolves the qualified_name in the cached code graph to a "
-        "file+line; node_id looks the element up in the doc-structure store; zotero_key "
-        "resolves via Zotero's local API. A subSelector narrows the outer resolution "
-        "('these lines, within this function'). Every dispatch is best-effort: an "
-        "unresolvable target yields {resolved:false, reason} instead of an error, and "
-        "the pass NEVER fails. Returns {pointers:[{id, source_type, label, "
-        "targets:[<resolved-target>]}]}. Requires no network for range/symbol/node_id; "
-        "zotero_key needs Zotero running locally (else that target is just unresolved).",
+        "as-is; symbol resolves the qualified_name against the SAME live three-rung "
+        "chain prospect_symbol uses (graph → Serena → semantic, 653579c5) when this "
+        "session has an active code tunnel, falling back to the cached code-graph "
+        "snapshot when it doesn't; node_id looks the element up in the doc-structure "
+        "store; zotero_key resolves via Zotero's local API. A subSelector narrows the "
+        "outer resolution ('these lines, within this function'). Every dispatch is "
+        "best-effort: an unresolvable target yields {resolved:false, reason} instead "
+        "of an error, and the pass NEVER fails. Returns {pointers:[{id, source_type, "
+        "label, targets:[<resolved-target>]}]}. Requires no network for range/symbol/"
+        "node_id; zotero_key needs Zotero running locally (else that target is just "
+        "unresolved).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to resolve."}},
+         "sprint_item_id": {"type": "string", "description": "The sprint item whose pointers to resolve."},
+         "root_dir": {"type": "string", "description": "Optional absolute path to the source tree root, passed through to the symbol resolver's search_code_semantic fallback rung (same as prospect_symbol's root_dir) when no code tunnel is active. If omitted, that rung is skipped."}},
          "required": ["sprint_item_id"]}},
     {"name": "delete_sprint_item_pointer", "description":
         "2976e168 — delete ONE generic pointer from a sprint item by its pointer id "

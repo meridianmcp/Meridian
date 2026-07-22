@@ -863,3 +863,148 @@ class TestFingerprintWildcardFallback:
         )
         assert "_graph_staleness" not in out
         assert not fetch_called[0], "fetch should not be called when no baseline exists"
+
+
+# ---------------------------------------------------------------------------
+# 653579c5 — resolve_sprint_item_pointers's symbol resolver now reaches the
+# same live three-rung prospect_symbol chain, not just the (production-empty)
+# cached codebase_graph_entities snapshot.
+# ---------------------------------------------------------------------------
+
+from meridian.prospect import build_symbol_resolver, _normalize_prospect_hit  # noqa: E402
+
+
+class TestNormalizeProspectHit:
+    def test_passes_through_existing_qualified_name_and_file(self):
+        hit = {"qualified_name": "pkg.mod.fn", "file": "pkg/mod.py", "line": 10}
+        out = _normalize_prospect_hit(hit, "fn")
+        assert out["qualified_name"] == "pkg.mod.fn"
+        assert out["file"] == "pkg/mod.py"
+        assert out["line"] == 10
+
+    def test_backfills_qualified_name_from_name(self):
+        # Serena-style hit: has "name", not "qualified_name".
+        hit = {"name": "add_figure", "file": "meridian/doc_store.py"}
+        out = _normalize_prospect_hit(hit, "add_figure")
+        assert out["qualified_name"] == "add_figure"
+        assert out["file"] == "meridian/doc_store.py"
+
+    def test_backfills_file_from_path(self):
+        # search_code_semantic-style hit: has "path", not "file".
+        hit = {"name": "my_fn", "path": "foo.py"}
+        out = _normalize_prospect_hit(hit, "my_fn")
+        assert out["file"] == "foo.py"
+        assert out["qualified_name"] == "my_fn"
+
+    def test_non_dict_hit_degrades_to_qualified_name_only(self):
+        out = _normalize_prospect_hit("not-a-dict", "my_fn")
+        assert out == {"qualified_name": "my_fn"}
+
+
+class TestBuildSymbolResolver:
+    """build_symbol_resolver: prospect_symbol_impl first, snapshot fallback."""
+
+    @pytest.mark.asyncio
+    async def test_uses_live_graph_hit_when_tunnel_active(self, monkeypatch):
+        """653579c5 regression: a tenant with an active code tunnel resolves
+        via the LIVE graph, even though the local snapshot has nothing for it
+        (search_graph_entities is never even called — the prospect hit wins)."""
+        import meridian.routes.tunnel as _tunnel_mod
+        from meridian import db as db_module
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                return _text_result({
+                    "results": [{"qualified_name": "meridian.prospect.prospect_symbol_impl",
+                                 "file": "meridian/prospect.py"}],
+                })
+            raise AssertionError(f"unexpected: {name}")
+
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        async def _snapshot_should_not_be_called(*a, **kw):
+            raise AssertionError("snapshot fallback must not run when graph hit")
+
+        monkeypatch.setattr(db_module, "search_graph_entities", _snapshot_should_not_be_called)
+
+        resolver = build_symbol_resolver(tenant={"id": "tenant-live"}, root_dir="", data_dir="")
+        matches = await resolver(object(), "myrepo", "prospect_symbol_impl", 5)
+        assert len(matches) == 1
+        assert matches[0]["qualified_name"] == "meridian.prospect.prospect_symbol_impl"
+        assert matches[0]["file"] == "meridian/prospect.py"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_snapshot_when_no_tenant(self, monkeypatch):
+        """No tenant/tunnel (e.g. self-hosted, no --tunnel running): degrades
+        to the old cached-snapshot behaviour instead of returning nothing."""
+        from meridian import db as db_module
+
+        async def _fake_snapshot(_db, _pid, query, limit=10):
+            return [{"qualified_name": "meridian.server.mcp_tools_doc",
+                      "file": "meridian/server.py"}]
+
+        monkeypatch.setattr(db_module, "search_graph_entities", _fake_snapshot)
+
+        resolver = build_symbol_resolver(tenant=None, root_dir="", data_dir="")
+        matches = await resolver(object(), "p1", "mcp_tools_doc", 5)
+        assert len(matches) == 1
+        assert matches[0]["file"] == "meridian/server.py"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_snapshot_when_tunnel_active_but_zero_hits(self, monkeypatch):
+        """Tunnel active but the graph genuinely has zero hits: still falls
+        through to the snapshot rather than dead-ending."""
+        import meridian.routes.tunnel as _tunnel_mod
+        from meridian import db as db_module
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            return _text_result({"results": []})
+
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        async def _fake_snapshot(_db, _pid, query, limit=10):
+            return [{"qualified_name": "snapshot.hit", "file": "snap.py"}]
+
+        monkeypatch.setattr(db_module, "search_graph_entities", _fake_snapshot)
+
+        resolver = build_symbol_resolver(tenant={"id": "tenant-empty"}, root_dir="", data_dir="")
+        matches = await resolver(object(), "p1", "nonexistent_fn", 5)
+        assert len(matches) == 1
+        assert matches[0]["qualified_name"] == "snapshot.hit"
+
+    @pytest.mark.asyncio
+    async def test_no_qualified_name_skips_straight_to_snapshot(self, monkeypatch):
+        from meridian import db as db_module
+
+        async def _fake_snapshot(_db, _pid, query, limit=10):
+            return []
+
+        monkeypatch.setattr(db_module, "search_graph_entities", _fake_snapshot)
+
+        resolver = build_symbol_resolver(tenant={"id": "t"}, root_dir="", data_dir="")
+        matches = await resolver(object(), "p1", None, 5)
+        assert matches == []
+
+    @pytest.mark.asyncio
+    async def test_prospect_exception_falls_back_to_snapshot(self, monkeypatch):
+        """A prospect_symbol_impl-side exception must never break resolution —
+        degrade to the snapshot fallback instead of raising."""
+        import meridian.prospect as _prospect_mod
+        from meridian import db as db_module
+
+        async def _boom(*a, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(_prospect_mod, "prospect_symbol_impl", _boom)
+
+        async def _fake_snapshot(_db, _pid, query, limit=10):
+            return [{"qualified_name": "snapshot.hit", "file": "snap.py"}]
+
+        monkeypatch.setattr(db_module, "search_graph_entities", _fake_snapshot)
+
+        resolver = build_symbol_resolver(tenant={"id": "t"}, root_dir="", data_dir="")
+        matches = await resolver(object(), "p1", "some_fn", 5)
+        assert len(matches) == 1
+        assert matches[0]["qualified_name"] == "snapshot.hit"

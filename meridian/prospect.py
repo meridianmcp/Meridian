@@ -7,7 +7,7 @@ from this module; handler.py imports and calls prospect_symbol_impl.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 
 def _extract_hits(payload: Any) -> list:
@@ -251,3 +251,93 @@ async def prospect_symbol_impl(
 
     # All rungs exhausted — return the (empty) result with diagnostic info.
     return result
+
+
+def _normalize_prospect_hit(hit: Any, qualified_name: str) -> dict[str, Any]:
+    """Normalise ONE prospect_symbol_impl hit into the ``{qualified_name, file,
+    ...}`` shape :func:`pointers._resolve_symbol` expects.
+
+    Hit shape varies by which rung produced it: ``graph``/``serena`` hits
+    typically carry ``qualified_name``/``file`` (or ``name``), while
+    ``semantic`` (search_code_semantic) hits carry ``name``/``path`` instead.
+    Preserves every original key (callers that want the raw hit still get it)
+    and only backfills ``qualified_name``/``file`` when missing/falsy so
+    :func:`pointers._resolve_symbol`'s exact-match + ``file`` read never KeyErrors
+    or silently mismatches across rungs.
+    """
+    if not isinstance(hit, dict):
+        return {"qualified_name": qualified_name}
+    out = dict(hit)
+    if not out.get("qualified_name"):
+        out["qualified_name"] = (
+            hit.get("name_path") or hit.get("name") or qualified_name
+        )
+    if not out.get("file"):
+        out["file"] = hit.get("relative_path") or hit.get("path") or hit.get("uri")
+    return out
+
+
+def build_symbol_resolver(
+    *,
+    tenant: "dict[str, Any] | None" = None,
+    root_dir: str = "",
+    data_dir: str = "",
+) -> "Callable[..., Awaitable[list[dict[str, Any]]]]":
+    """653579c5 — a ``pointers.resolve_pointer``-compatible ``symbol_resolver``
+    that tries the LIVE three-rung :func:`prospect_symbol_impl` chain first,
+    falling back to the local cached-snapshot search
+    (``db.search_graph_entities``) that was previously the ONLY thing
+    ``resolve_pointer``'s default resolver ever consulted.
+
+    Root cause this fixes: ``resolve_sprint_item_pointers`` (mcp/handlers/
+    sprint_tools.py) already has ``tenant`` in scope (it's a parameter of the
+    handler) but never threaded it anywhere — ``pointers.resolve_pointer`` was
+    always called with its DEFAULT ``symbol_resolver``, which only queries the
+    ``codebase_graph_entities`` snapshot table. That table has exactly zero
+    production writers (``db.upsert_graph_entities`` is only ever called from
+    tests / the c00b1ccf opt-in snapshot feature that was never wired to a
+    refresh path — see graph_snapshot.py's own "refreshed from the tunnel when
+    available (deferred)" docstring), so a symbol pointer could NEVER resolve
+    through the default path even when the SAME tenant's live tunnel-connected
+    code graph (the one ``prospect_symbol`` itself reaches, and that a direct
+    ``codebase__search_graph`` call resolves instantly) had the answer.
+
+    Threading ``tenant`` (and an optional ``root_dir``, for the semantic
+    fallback rung) into a resolver built from :func:`prospect_symbol_impl`
+    gives ``resolve_sprint_item_pointers`` the exact same reach as
+    ``prospect_symbol`` — graph → Serena → semantic — while still degrading
+    gracefully to the old cached-snapshot behaviour (never regressing existing
+    callers) when no tenant/tunnel/root_dir is available, e.g. self-hosted
+    sessions with no active code tunnel.
+
+    Never raises: both the prospect attempt and the snapshot fallback are
+    fully guarded, matching every other resolver seam in this module.
+    """
+    async def _resolver(
+        db: Any, project_id: "str | None", qualified_name: "str | None", limit: int,
+    ) -> list[dict[str, Any]]:
+        qn = qualified_name or ""
+        if qn:
+            try:
+                result = await prospect_symbol_impl(
+                    symbol=qn,
+                    project_id=project_id or "",
+                    root_dir=root_dir,
+                    limit=limit,
+                    kind=None,
+                    stale_graph=False,
+                    tenant=tenant,
+                    data_dir=data_dir,
+                )
+                hits = result.get("hits") or []
+                if hits:
+                    return [_normalize_prospect_hit(h, qn) for h in hits]
+            except Exception:  # noqa: BLE001 — fall through to the snapshot search
+                pass
+        try:
+            from .db import search_graph_entities as _sg  # noqa: PLC0415
+            return await _sg(db, project_id or "", qn, limit)
+        except Exception:  # noqa: BLE001 — resolver seam must never raise
+            return []
+
+    return _resolver
