@@ -30,6 +30,19 @@ Design notes:
   argument's AST node. A non-literal default (e.g. a function call or a
   variable reference) evaluates to ``None`` — same graceful-skip philosophy,
   just for the default rather than the name.
+
+8ca89e8f — flag-to-section drift check (the unbuilt half of workspace proposal
+8d8bbe63). This module stays the pure, dependency-free scanning half; the
+DURABLE storage of a "this docx section's numbers were produced with flag=value"
+link lives in :class:`meridian.doc_store.DocStructureStore` (a
+``doc_flag_links`` table, alongside the store's other self-contained
+doc_documents/doc_elements/doc_figures/... tables — see that module for why),
+keyed by stable ``doc_elements`` id exactly like the existing figure-caption
+linkage. This module adds only the STATELESS comparison: given a recorded link
+(carrying the flag's default AT RECORD TIME) and a fresh scan of the CURRENT
+codebase, decide whether that link has drifted. :func:`diff_flag_links` is the
+pure comparison (no DB, no filesystem — unit-testable with two plain lists);
+:func:`check_flag_drift` is the convenience wrapper that also runs the scan.
 """
 from __future__ import annotations
 
@@ -183,3 +196,164 @@ def get_flag_registry(repo_root: str | None = None) -> dict[str, Any]:
         "unique_flag_names": unique_names,
         "unique_count": len(unique_names),
     }
+
+
+# ---------------------------------------------------------------------------
+# 8ca89e8f — flag-to-section drift check
+# ---------------------------------------------------------------------------
+#
+# A "link" here is the durable record produced by
+# ``DocStructureStore.link_flag_state`` (a ``doc_flag_links`` row, materialised
+# as a plain dict): the claim "this doc_elements id's underlying numbers were
+# produced with flag_name=recorded_value, and at record time the codebase's
+# default for that flag was recorded_default". The two functions below never
+# touch a DB or a store — they operate purely on the dict shape that store
+# produces, so they are unit-testable (and independently useful) without any
+# of that machinery running.
+#
+# Expected link shape (extra keys are ignored, so a full doc_flag_links row —
+# id/project_id/document_id/created_at/etc — can be passed through untouched):
+#   {"flag_name": str, "recorded_default": Any,
+#    "element_id": str?, "source_file": str?, "source_line": int?, ...}
+
+
+def dedupe_flag_links(links: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse a link history down to the MOST RECENT link per (element_id,
+    flag_name) pair.
+
+    ``link_flag_state`` is insert-only (mirrors the repo's append-only
+    provenance convention — see DECISIONS.md/task_log): a section can be
+    re-verified multiple times as flags change, and each recording is a fact
+    about a point in time, not a single mutable "current state". Drift
+    checking only cares about the LATEST claim for a given (element, flag)
+    pair, so callers run their link history through this before
+    :func:`diff_flag_links`.
+
+    Recency is compared on ``(created_at, seq)``: ``created_at`` (ISO-8601
+    strings sort correctly as plain strings) first, then ``seq`` — the
+    process-local monotonic counter ``DocStructureStore.link_flag_state``
+    stamps on every row — as a tiebreaker. The tiebreaker matters in practice:
+    two links recorded back-to-back for the same (element, flag) pair can
+    legitimately land on the IDENTICAL ``created_at`` (timestamp
+    resolution/OS clock granularity is coarser than "two sequential DB
+    inserts" on some platforms), and without ``seq`` there would be nothing
+    left to break the tie correctly (a link's ``id`` is a random UUID with no
+    relationship to insertion order). A link missing ``created_at``/``seq``
+    (e.g. a hand-built test dict) sorts as the oldest possible value on that
+    field so it never masks a properly-dated/sequenced sibling. Never raises.
+    """
+    latest: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for link in links or []:
+        key = (link.get("element_id"), link.get("flag_name"))
+        existing = latest.get(key)
+        if existing is None:
+            latest[key] = link
+            continue
+        link_rank = (link.get("created_at") or "", link.get("seq") or 0)
+        existing_rank = (existing.get("created_at") or "", existing.get("seq") or 0)
+        if link_rank > existing_rank:
+            latest[key] = link
+    return list(latest.values())
+
+
+def diff_flag_links(
+    links: list[dict[str, Any]],
+    current_flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Pure drift comparison: recorded flag links vs. a fresh registry scan.
+
+    ``current_flags`` is the ``flags`` list from :func:`get_flag_registry` /
+    :func:`scan_env_flags` (``{flag_name, file, line, default}`` dicts).
+    Returns one result dict per input link — every key from the input link is
+    preserved (spread first) plus:
+
+        {"current_default": Any, "current_call_sites": int,
+         "status": "ok" | "drifted" | "removed"}
+
+    Matching a link to call sites: by ``flag_name`` first; when the link also
+    carries ``source_file``/``source_line`` (the call site recorded at link
+    time), candidates are further narrowed to that EXACT call site — a flag
+    name can legitimately be read at more than one call site with different
+    defaults, and pinning to the recorded site avoids a false "drifted" from
+    an unrelated read of a same-named flag elsewhere. If the pinned call site
+    itself is gone (the line moved / file changed) the match falls back to
+    every same-named call site, so a mere line-shift doesn't masquerade as
+    ``removed``.
+
+    Status:
+
+    * ``"removed"`` — no current call site matches at all (name, or the
+      pinned file/line) — the strongest staleness signal: the flag (or this
+      specific read of it) isn't even in the codebase anymore.
+    * ``"drifted"`` — at least one matching call site exists, but none of
+      their current defaults equal ``recorded_default`` — the flag's default
+      behaviour changed since this section's numbers were produced.
+    * ``"ok"`` — a matching call site's current default equals
+      ``recorded_default``. Does NOT prove the section is still correct —
+      only that this specific check found no evidence of drift.
+
+    Never raises; a link with no (or non-string) ``flag_name`` is silently
+    skipped (not surfaced in the result — there is nothing to diff).
+    """
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for f in current_flags or []:
+        name = f.get("flag_name")
+        if isinstance(name, str):
+            by_name.setdefault(name, []).append(f)
+
+    results: list[dict[str, Any]] = []
+    for link in links or []:
+        flag_name = link.get("flag_name")
+        if not isinstance(flag_name, str) or not flag_name:
+            continue
+        candidates = by_name.get(flag_name, [])
+        source_file = link.get("source_file")
+        source_line = link.get("source_line")
+        if source_file is not None and source_line is not None:
+            pinned = [
+                c for c in candidates
+                if c.get("file") == source_file and c.get("line") == source_line
+            ]
+            matches = pinned if pinned else candidates
+        else:
+            matches = candidates
+
+        if not matches:
+            results.append({
+                **link,
+                "current_default": None,
+                "current_call_sites": 0,
+                "status": "removed",
+            })
+            continue
+
+        current_defaults = [m.get("default") for m in matches]
+        drifted = link.get("recorded_default") not in current_defaults
+        results.append({
+            **link,
+            "current_default": (
+                current_defaults[0] if len(current_defaults) == 1
+                else current_defaults
+            ),
+            "current_call_sites": len(matches),
+            "status": "drifted" if drifted else "ok",
+        })
+    return results
+
+
+def check_flag_drift(
+    links: list[dict[str, Any]],
+    repo_root: str | None = None,
+) -> list[dict[str, Any]]:
+    """Convenience wrapper: scan *repo_root* fresh, then :func:`diff_flag_links`.
+
+    This is the implementation behind the ``get_flag_drift`` MCP tool (it is
+    also a plain importable entry point, same contract as
+    :func:`get_flag_registry`, whose ``repo_root`` normalisation — default to
+    ``os.getcwd()``, tolerate an accidentally-quoted path — it reuses
+    unchanged). Callers that already have a fresh registry scan (e.g. to avoid
+    re-walking a large tree for multiple checks) should call
+    :func:`diff_flag_links` directly instead.
+    """
+    registry = get_flag_registry(repo_root)
+    return diff_flag_links(links, registry["flags"])
