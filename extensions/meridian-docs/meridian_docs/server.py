@@ -1177,6 +1177,75 @@ def copy_section(
     )
 
 
+@mcp.tool()
+def relocate_table(
+    docx_path: str,
+    table_index: int,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
+) -> dict[str, Any]:
+    """c031622b — Move an existing bare <w:tbl> (no owning heading) to a new
+    location in the document, atomically.
+
+    Unlike move_section (which locates its source via a heading's para_id),
+    a bare table has no heading to anchor on: table_index identifies it by
+    its own 0-based body-child position — the same "index" value
+    index_document_structure stores in the docx_tables sidecar table and
+    get_structure_elements returns for each entry in its "tables" list.
+
+    Cuts the table from its current position and re-inserts it, as ONE
+    atomic operation, relative to destination_anchor_para_id (same
+    anchor/position convention as move_section / copy_section). Operates on
+    the same live <w:tbl> element object, so w:tblPr, w:tblGrid, and any
+    relationship reference inside a cell (image r:embed, hyperlink r:id) are
+    carried verbatim — nothing is renamed, since nothing is duplicated.
+
+    destination_position="after" onto a HEADING anchor lands the table after
+    that heading's ENTIRE section (own body + subsections), the same fix
+    move_section / copy_section rely on. Before anything is
+    cut/spliced/saved, checks whether the move would split a bookmark across
+    the table's own boundary and aborts (file untouched) unless
+    allow_bookmark_split=True.
+
+    Does NOT move an adjacent caption paragraph and does NOT call
+    renumber_sequences — no caption travels with a bare table, so SEQ Table
+    numbering is unaffected. If the table is actually owned by a heading, use
+    move_section instead so the caption/heading move with it.
+
+    Args:
+      docx_path:                    Absolute path to the .docx file (mutated
+                                     in place).
+      table_index:                  0-based body-child position of the
+                                     <w:tbl> to relocate.
+      destination_anchor_para_id:   w14:paraId (or p{N}) of the paragraph/
+                                     table to move the table next to. Must be
+                                     OUTSIDE the table being moved.
+      destination_position:         "before" or "after" (default).
+      index_db_path:                If supplied, sidecar is invalidated
+                                     after the write.
+      allow_bookmark_split:         Explicit override (default False) to
+                                     proceed even when the move would split a
+                                     bookmark's start/end across the move
+                                     boundary.
+
+    Returns:
+      {status, table_index, new_table_index, row_count, col_count,
+      destination_anchor_para_id, destination_position, docx_path} or
+      {error: <message>} (file NOT mutated on error; a blocked bookmark-split
+      also returns {split_bookmarks: [...]}).
+    """
+    return docs_intel.relocate_table(
+        docx_path=docx_path,
+        table_index=table_index,
+        destination_anchor_para_id=destination_anchor_para_id,
+        destination_position=destination_position,
+        index_db_path=index_db_path,
+        allow_bookmark_split=allow_bookmark_split,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx meridian-docs``)."""
     mcp.run()

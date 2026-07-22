@@ -6255,3 +6255,234 @@ def copy_section(
         "trimmed_original": trimmed,
         "docx_path": docx_path,
     }
+
+
+# ---------------------------------------------------------------------------
+# relocate_table (c031622b) -- move a bare <w:tbl> with no owning heading
+#
+# Scoped narrower than the original "OOXML-Graph" proposal (81899c27):
+# move_section (027b7ada) already relocates a HEADING-delimited section, and
+# a table that lives inside one is carried along for free as part of that
+# range (see test_move_section_relocates_table_and_caption_and_fixes_seq_and_
+# ref_atomically in test_docs_intel_new_primitives.py). This primitive covers
+# the other case: a bare <w:tbl> with no owning heading at all -- there is no
+# section boundary to reuse move_section's heading-based SOURCE addressing
+# for, so this locates the source purely by its own body-child position.
+# ---------------------------------------------------------------------------
+
+def relocate_table(
+    docx_path: str,
+    table_index: int,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
+) -> dict[str, Any]:
+    """c031622b -- move an existing bare ``<w:tbl>`` (no owning heading) to a
+    new location in the document, atomically.
+
+    Unlike :func:`move_section` (which locates its source via a HEADING's
+    para_id and cuts the whole heading-delimited range), a bare table has no
+    heading of its own to anchor on. ``table_index`` instead identifies the
+    table by its own 0-based body-child position -- the exact same ``index``
+    value :func:`index_docx_structure` stores in the ``docx_tables`` sidecar
+    table and :func:`get_local_structure_elements` returns for each entry in
+    its ``tables`` list (``{"index": ..., ...}``), so a caller already holding
+    that lookup's output can pass it straight through without any new
+    addressing scheme.
+
+    The table is cut from its current body-child slot and re-inserted, as ONE
+    atomic operation (single load -> mutate -> save), at a new position
+    relative to ``destination_anchor_para_id`` -- the same anchor/position
+    convention :func:`move_section` / :func:`copy_section` use
+    (:func:`_find_para_by_id`'s three id schemes: native ``w14:paraId``,
+    synthesized ``sp<hash>``, legacy ``p{N}``). Because this operates on the
+    SAME live ``<w:tbl>`` element object (never re-serialized or rebuilt),
+    every descendant is carried verbatim: ``w:tblPr`` (style/borders/
+    shading), ``w:tblGrid`` (column widths), and any relationship reference
+    inside a cell (e.g. an image's ``r:embed``/``r:id`` attribute, or a
+    hyperlink's ``r:id``) -- nothing is renamed or reparented, since a
+    relocate (unlike :func:`copy_section`) never duplicates the element, so
+    there is no id collision to resolve in the first place.
+
+    027b7ada-style destination fix: when ``destination_anchor_para_id``
+    resolves to a HEADING and ``destination_position`` is ``"after"``, the
+    table lands after that heading's ENTIRE section (its own body +
+    subsections), not immediately after the heading paragraph -- same fix
+    :func:`move_section` / :func:`copy_section` rely on, reusing
+    :func:`_locate_section_bounds` rather than reimplementing it. "before"
+    and "after" a non-heading anchor are an unchanged literal splice.
+
+    e87b8338-style safety check: before anything is cut/spliced/saved, this
+    checks whether the move would split a bookmark's ``w:bookmarkStart``/
+    ``w:bookmarkEnd`` pair across the ``[table_index, table_index + 1)``
+    boundary (rare for a table -- OOXML bookmarks almost never straddle a
+    table boundary -- but the check is cheap and the helper already exists,
+    see :func:`_bookmarks_split_by_range`). Aborts with the file untouched
+    unless ``allow_bookmark_split=True``.
+
+    This primitive intentionally does NOT move a caption paragraph that may
+    sit next to the table, and does NOT call :func:`renumber_sequences` --
+    since no caption moves with it, SEQ Table numbering is unaffected by this
+    call. If the table has a caption that should travel with it, relocate
+    that paragraph separately, or use :func:`move_section` when the table is
+    actually owned by a heading.
+
+    Args:
+        docx_path:                   Absolute path to the .docx file
+                                      (mutated in place).
+        table_index:                 0-based body-child position of the
+                                      ``<w:tbl>`` to relocate (see above).
+        destination_anchor_para_id:  w14:paraId (or synthesized/legacy id,
+                                      same schemes :func:`_find_para_by_id`
+                                      accepts) of the paragraph/table to move
+                                      the table next to. Must be OUTSIDE the
+                                      table being moved.
+        destination_position:        "before" or "after" (default) the
+                                      destination anchor.
+        index_db_path:                If supplied, sidecar is invalidated
+                                      after the write.
+        allow_bookmark_split:         Explicit override (default ``False``)
+                                      to proceed even when the move would
+                                      split a bookmark's start/end across the
+                                      move boundary (see e87b8338 above).
+
+    Returns:
+        ``{status, table_index, new_table_index, row_count, col_count,
+        destination_anchor_para_id, destination_position, docx_path}``.
+
+        ``{"error": <message>}`` when ``table_index`` is out of range or does
+        not identify a ``<w:tbl>``, ``destination_anchor_para_id`` can't be
+        resolved, the destination falls on/inside the table being moved, or
+        the move would split a bookmark (and ``allow_bookmark_split`` is not
+        set) -- the file is NOT mutated in any of these cases.
+    """
+    if destination_position not in ("before", "after"):
+        return {
+            "error": f"destination_position must be 'before' or 'after', got {destination_position!r}"
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    body_list = list(body)
+    w_tbl = _q(_W, "tbl")
+
+    if not isinstance(table_index, int) or isinstance(table_index, bool) or table_index < 0:
+        return {"error": f"table_index must be a non-negative int, got {table_index!r}"}
+    if table_index >= len(body_list):
+        return {
+            "error": (
+                f"table_index {table_index} out of range -- document body has "
+                f"{len(body_list)} top-level children"
+            )
+        }
+    target_el = body_list[table_index]
+    if target_el.tag != w_tbl:
+        found_tag = target_el.tag.rsplit("}", 1)[-1]
+        return {
+            "error": (
+                f"body child at index {table_index} is not a <w:tbl> "
+                f"(found <{found_tag}>)"
+            )
+        }
+
+    dest_result = _find_para_by_id(root, destination_anchor_para_id)
+    if dest_result is None:
+        return {"error": f"para_id {destination_anchor_para_id!r} not found in {docx_path}"}
+    _dbody, _delem, dest_idx = dest_result
+
+    if dest_idx == table_index:
+        return {
+            "error": (
+                "destination_anchor_para_id resolves to the table being "
+                "relocated (or a paragraph inside it); choose an anchor "
+                "outside it"
+            )
+        }
+
+    # 027b7ada-style fix (see move_section / copy_section): a heading anchor +
+    # destination_position="after" lands after that heading's WHOLE section,
+    # not a literal next-body-child splice. _locate_section_bounds only
+    # matches when destination_anchor_para_id resolves to a heading (None
+    # otherwise), so this is a no-op for every other destination anchor kind.
+    dest_section_bounds = (
+        _locate_section_bounds(body, destination_anchor_para_id)
+        if destination_position == "after"
+        else None
+    )
+
+    # e87b8338-style safety check, applied to the single-element
+    # [table_index, table_index + 1) range this move cuts. Runs and GATES
+    # here, BEFORE anything is cut/spliced/saved.
+    split_bookmarks = _bookmarks_split_by_range(body_list, table_index, table_index + 1)
+    if split_bookmarks and not allow_bookmark_split:
+        return {
+            "error": (
+                f"aborting relocate_table: moving table at index {table_index} "
+                f"would split bookmark(s) {split_bookmarks!r} across the move "
+                "boundary (their w:bookmarkStart and w:bookmarkEnd would end "
+                "up in two disconnected parts of the document) -- pass "
+                "allow_bookmark_split=True to force the move anyway"
+            ),
+            "split_bookmarks": split_bookmarks,
+        }
+
+    from ._vendored_content_tree import _table_node  # noqa: PLC0415
+
+    table_meta = _table_node(target_el, table_index)
+
+    start_idx = table_index
+    end_idx = table_index + 1
+    removed_count = 1
+
+    body.remove(target_el)
+
+    # Adjust the destination index ARITHMETICALLY rather than re-resolving
+    # destination_anchor_para_id by string after the removal -- same reasoning
+    # as move_section's own _shift: if it's a synthesised id, removing the
+    # table earlier in the document shifts every later paragraph's synthetic
+    # id, so re-searching for the OLD literal string post-removal could
+    # silently match the wrong paragraph (or none).
+    def _shift(idx: int) -> int:
+        if idx >= end_idx:
+            return idx - removed_count
+        if idx >= start_idx:
+            return start_idx
+        return idx
+
+    dest_idx_after = _shift(dest_idx)
+
+    if dest_section_bounds is not None:
+        _dest_start_idx, dest_end_idx, _dest_heading_text, _dest_level = dest_section_bounds
+        insert_at = _shift(dest_end_idx)
+    else:
+        insert_at = dest_idx_after if destination_position == "before" else dest_idx_after + 1
+
+    body.insert(insert_at, target_el)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "moved",
+        "table_index": table_index,
+        "new_table_index": insert_at,
+        "row_count": table_meta["row_count"],
+        "col_count": table_meta["col_count"],
+        "destination_anchor_para_id": destination_anchor_para_id,
+        "destination_position": destination_position,
+        "docx_path": docx_path,
+    }

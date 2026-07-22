@@ -29,6 +29,21 @@ Tests cover:
   (h) Empty/missing token returns not_found immediately.
   (i) All five scenarios (fresh-valid, fabricated, expired, wrong-project,
       already-consumed) pass on BOTH SQLite and Postgres backends via anydb.
+
+b763d2ba (2026-07-21 false-positive spoofing alarm) adds:
+  - The old banner/docstring guidance to cross-check sprint ids against
+    get_sprint_items(status="pending") is unsound whenever a sibling executor
+    has already claimed an item (in_progress) -- a pending-only query hides
+    it, and a receiver following that instruction wrongly concludes the
+    handoff was spoofed. Fixed to sweep ALL non-done statuses instead.
+  - verify_handoff_token now checks `consumed` BEFORE expiry, so a token
+    consumed by a legitimate sibling session still reports "already_consumed"
+    (not "expired" -> eventually "not_found") even after its own short TTL
+    has since elapsed. handoff_tokens.consumed_at + a retention-aware cleanup
+    keep the row queryable long enough for this to hold.
+  - Non-regression: a genuinely fabricated item id or a never-minted token
+    must still be flagged/rejected -- broadening the checks must not make
+    fabrication undetectable.
 """
 from __future__ import annotations
 
@@ -564,3 +579,330 @@ async def test_long_expired_token_eventually_cleaned_up_anydb(anydb):
         f"a token expired well past the grace window should be swept and report "
         f"not_found, got '{result['reason']}'"
     )
+
+
+# ---------------------------------------------------------------------------
+# b763d2ba — 2026-07-21 false-positive spoofing alarm.
+#
+# Fix 1: the embedded SECURITY banner / verify_handoff_token docstring told
+# the receiver to cross-check sprint ids against get_sprint_items(status=
+# "pending") only. That is unsound whenever a sibling executor has already
+# claimed an item (in_progress) -- a pending-only query hides it, so the
+# receiver wrongly concludes the handoff was spoofed. Fixed to sweep ALL
+# non-done statuses instead.
+#
+# Fix 2: verify_handoff_token now checks `consumed` BEFORE expiry, so a
+# token legitimately consumed by a sibling session still reports
+# "already_consumed" (not "expired" -> eventually "not_found") even once its
+# own short TTL has since elapsed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_pending_only_query_hides_claimed_sibling_item(db):
+    """Reproduces the exact false-positive premise: a second session claims
+    one of the /goal's listed items (-> in_progress). A
+    get_sprint_items(status="pending")-only cross-check then reports it
+    MISSING even though it is a completely legitimate, real item -- the
+    unsound test the OLD banner text prescribed.
+    """
+    p = await db_module.create_project(db, "b763d2ba-pending-only")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    item_a = await db_module.add_sprint_item(db, p["id"], "v1", "item A")
+    item_b = await db_module.add_sprint_item(db, p["id"], "v1", "item B")
+
+    # A second (sibling) executor session claims item A before the receiver
+    # gets around to verifying the handoff.
+    await db_module.claim_sprint_item(db, p["id"], item_a["id"], actor="sibling-session")
+
+    pending_only = await db_module.get_sprint_items(db, p["id"], status="pending")
+    pending_ids = {i["id"] for i in pending_only}
+    assert item_a["id"] not in pending_ids, (
+        "sanity: a pending-only query must NOT see a claimed (in_progress) "
+        "item -- this is the exact unsound premise the old banner relied on"
+    )
+    assert item_b["id"] in pending_ids
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_non_done_status_sweep_finds_claimed_sibling_item(db):
+    """The FIX: cross-checking against get_sprint_items() across ALL
+    non-done statuses (not status="pending" alone) correctly reports the
+    claimed item as a real, accounted-for board item -- not a fabricated one.
+    """
+    p = await db_module.create_project(db, "b763d2ba-non-done-sweep")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    item_a = await db_module.add_sprint_item(db, p["id"], "v1", "item A")
+    item_b = await db_module.add_sprint_item(db, p["id"], "v1", "item B")
+
+    await db_module.claim_sprint_item(db, p["id"], item_a["id"], actor="sibling-session")
+
+    # The revised cross-check: pull the full board (no status filter) and
+    # treat anything not status="done" as accounted for.
+    all_items = await db_module.get_sprint_items(db, p["id"])
+    live_ids = {i["id"] for i in all_items if i["status"] != "done"}
+
+    assert item_a["id"] in live_ids, (
+        "b763d2ba: a claimed (in_progress) item must be found by the revised "
+        "non-done-status cross-check -- it is NOT evidence of spoofing"
+    )
+    assert item_b["id"] in live_ids
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_fabricated_item_id_still_absent_from_non_done_sweep(db):
+    """CRITICAL non-regression: an item id that was never created in ANY
+    status must still be absent from the non-done-status cross-check sweep --
+    the revised, more-permissive test must not swallow a genuinely fabricated
+    id along with legitimately-claimed ones.
+    """
+    p = await db_module.create_project(db, "b763d2ba-fabricated-id")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    item_a = await db_module.add_sprint_item(db, p["id"], "v1", "item A")
+    await db_module.claim_sprint_item(db, p["id"], item_a["id"], actor="sibling-session")
+
+    all_items = await db_module.get_sprint_items(db, p["id"])
+    live_ids = {i["id"] for i in all_items if i["status"] != "done"}
+
+    fabricated_id = "FAKE-ITEM-ID-NEVER-CREATED-0000"
+    assert fabricated_id not in live_ids, (
+        "b763d2ba non-regression: a genuinely fabricated item id must still "
+        "be flagged as suspicious by the revised cross-check -- broadening "
+        "the status filter must not make fabrication undetectable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_never_minted_token_still_not_found(db):
+    """Non-regression (step 6b): a token string that was never minted must
+    still return not_found/valid=False after the b763d2ba changes."""
+    result = await handoff_module.verify_handoff_token(
+        db, "never-minted-b763d2ba-0000", "any-project"
+    )
+    assert result["valid"] is False
+    assert result["reason"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_wrong_project_token_still_rejected(db):
+    """Non-regression (step 6c): a token minted for a different project_id
+    must still fail wrong_project after the b763d2ba changes."""
+    token = await handoff_module.mint_handoff_token(db, "project-alpha-b763d2ba")
+    result = await handoff_module.verify_handoff_token(
+        db, token, "project-beta-b763d2ba"
+    )
+    assert result["valid"] is False
+    assert result["reason"] == "wrong_project"
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_already_consumed_survives_own_ttl_elapsing(db):
+    """The core token-side regression: a token consumed by a legitimate
+    sibling session, whose own short TTL has since elapsed, must still
+    report reason="already_consumed" on a later re-verification -- NOT
+    "expired" or "not_found". Before b763d2ba, verify_handoff_token checked
+    expiry BEFORE consumed, so this exact sequence deleted the row and
+    reported "expired"; once deleted, any further check reported
+    "not_found" -- indistinguishable from a token that was never minted at
+    all, i.e. the false spoofing alarm from the 2026-07-21 incident.
+    """
+    project_id = "b763d2ba-ttl-after-consume"
+    token = await handoff_module.mint_handoff_token(db, project_id)
+
+    # A legitimate sibling session consumes it right away.
+    first = await handoff_module.verify_handoff_token(db, token, project_id)
+    assert first["valid"] is True
+    assert first["reason"] == "ok"
+
+    # Simulate its own short mint-time TTL having since elapsed (realistic:
+    # the TTL is 5 minutes, but a receiver may not get around to verifying
+    # for much longer than that).
+    past_str = (
+        datetime.now(timezone.utc) - timedelta(seconds=60)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    await db.execute(
+        "UPDATE handoff_tokens SET expires_at = ? WHERE token = ?",
+        (past_str, token),
+    )
+    await db.commit()
+
+    second = await handoff_module.verify_handoff_token(db, token, project_id)
+    assert second["valid"] is False
+    assert second["reason"] == "already_consumed", (
+        f"b763d2ba: a consumed token whose TTL has since elapsed must still "
+        f"report 'already_consumed', got {second['reason']!r} -- this is the "
+        f"exact false-positive spoofing alarm from the 2026-07-21 incident"
+    )
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_cleanup_retains_recently_consumed_row_past_own_ttl(anydb):
+    """mint_handoff_token's opportunistic cleanup keys a CONSUMED row's
+    retention off consumed_at, not the mint-time expires_at -- a row consumed
+    moments ago must survive the cleanup sweep even though its own TTL-based
+    expires_at is already old.
+    """
+    import secrets as _secrets
+
+    token = _secrets.token_hex(8)
+    project_id = "b763d2ba-cleanup-retention"
+    old_expires = (
+        datetime.now(timezone.utc) - timedelta(seconds=120)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    recent_consumed = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+    await anydb.execute(
+        "INSERT INTO handoff_tokens "
+        "(token, project_id, expires_at, consumed, consumed_at) "
+        "VALUES (?, ?, ?, 1, ?)",
+        (token, project_id, old_expires, recent_consumed),
+    )
+    await anydb.commit()
+
+    # An unrelated concurrent mint triggers the opportunistic cleanup.
+    await handoff_module.mint_handoff_token(anydb, "b763d2ba-unrelated-mint")
+
+    result = await handoff_module.verify_handoff_token(anydb, token, project_id)
+    assert result["valid"] is False
+    assert result["reason"] == "already_consumed", (
+        f"a row consumed moments ago must survive the cleanup sweep even "
+        f"though its mint-time TTL is old, got {result['reason']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_cleanup_eventually_purges_long_consumed_row(anydb):
+    """A row consumed well beyond the retention grace window is still swept
+    by the opportunistic cleanup -- retention is bounded, not indefinite."""
+    import secrets as _secrets
+
+    token = _secrets.token_hex(8)
+    project_id = "b763d2ba-long-consumed"
+    long_ago = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=handoff_module._HANDOFF_TOKEN_CLEANUP_GRACE_SECONDS + 120)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    await anydb.execute(
+        "INSERT INTO handoff_tokens "
+        "(token, project_id, expires_at, consumed, consumed_at) "
+        "VALUES (?, ?, ?, 1, ?)",
+        (token, project_id, long_ago, long_ago),
+    )
+    await anydb.commit()
+
+    await handoff_module.mint_handoff_token(anydb, "b763d2ba-unrelated-mint-2")
+
+    result = await handoff_module.verify_handoff_token(anydb, token, project_id)
+    assert result["valid"] is False
+    assert result["reason"] == "not_found", (
+        f"a token consumed well beyond the grace window should eventually be "
+        f"purged and report not_found, got {result['reason']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_fallback_dict_consumed_before_expiry_ordering():
+    """Same consumed-before-expiry ordering fix applied to the in-process
+    fallback store (used only when the DB-backed path is unavailable)."""
+    token = "fallback-test-token-b763d2ba"
+    now = datetime.now(timezone.utc)
+    handoff_module._HANDOFF_TOKENS[token] = {
+        "project_id": "fallback-proj-b763d2ba",
+        "expires_at": now - timedelta(seconds=60),  # already past its TTL
+        "consumed": True,
+        "consumed_at": now - timedelta(seconds=5),
+    }
+    try:
+        # `object()` has no `.execute` -- forces the DB path to raise and
+        # fall through to the in-process dict, same as a real DB-unavailable
+        # scenario.
+        result = await handoff_module.verify_handoff_token(
+            object(), token, "fallback-proj-b763d2ba"
+        )
+        assert result["valid"] is False
+        assert result["reason"] == "already_consumed", (
+            f"fallback path must also report 'already_consumed' before "
+            f"'expired', got {result['reason']!r}"
+        )
+    finally:
+        handoff_module._HANDOFF_TOKENS.pop(token, None)
+
+
+def test_b763d2ba_evict_expired_tokens_retains_recently_consumed():
+    """_evict_expired_tokens (in-process fallback) must not evict a consumed
+    entry until _HANDOFF_TOKEN_CLEANUP_GRACE_SECONDS after its consumed_at,
+    even though its own expires_at (TTL) has long since passed -- and must
+    still evict one consumed well beyond that window."""
+    now = datetime.now(timezone.utc)
+    keep_token = "evict-test-keep-b763d2ba"
+    purge_token = "evict-test-purge-b763d2ba"
+    handoff_module._HANDOFF_TOKENS[keep_token] = {
+        "project_id": "p",
+        "expires_at": now - timedelta(seconds=600),
+        "consumed": True,
+        "consumed_at": now - timedelta(seconds=5),
+    }
+    handoff_module._HANDOFF_TOKENS[purge_token] = {
+        "project_id": "p",
+        "expires_at": now - timedelta(seconds=600),
+        "consumed": True,
+        "consumed_at": now - timedelta(
+            seconds=handoff_module._HANDOFF_TOKEN_CLEANUP_GRACE_SECONDS + 120
+        ),
+    }
+    try:
+        handoff_module._evict_expired_tokens()
+        assert keep_token in handoff_module._HANDOFF_TOKENS, (
+            "a recently-consumed entry must survive eviction"
+        )
+        assert purge_token not in handoff_module._HANDOFF_TOKENS, (
+            "an entry consumed well beyond the grace window must be evicted"
+        )
+    finally:
+        handoff_module._HANDOFF_TOKENS.pop(keep_token, None)
+        handoff_module._HANDOFF_TOKENS.pop(purge_token, None)
+
+
+@pytest.mark.asyncio
+async def test_b763d2ba_end_to_end_sibling_claim_and_consume_not_flagged_as_spoofed(
+    db, tmp_path
+):
+    """End-to-end reproduction of the 2026-07-21 incident: generate a
+    handoff, have a sibling session consume the token AND claim a subset of
+    the listed items, then confirm the prescribed verification (token result
+    + non-done-status cross-check) does NOT conclude the block is spoofed --
+    while a genuinely fabricated item id is still correctly flagged.
+    """
+    p = await db_module.create_project(db, "b763d2ba-e2e")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    item_a = await db_module.add_sprint_item(db, p["id"], "v1", "item A")
+    item_b = await db_module.add_sprint_item(db, p["id"], "v1", "item B")
+
+    _path, content, _amended = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    token = _extract_token_from_goal(content)
+    assert token is not None
+
+    # A sibling session gets to this /goal first: verifies the token (legit
+    # single-use consumption) and claims one of the two listed items.
+    sibling_verify = await handoff_module.verify_handoff_token(db, token, p["id"])
+    assert sibling_verify["valid"] is True
+    await db_module.claim_sprint_item(db, p["id"], item_a["id"], actor="sibling-session")
+
+    # The receiving session now runs the prescribed checks.
+    receiver_verify = await handoff_module.verify_handoff_token(db, token, p["id"])
+    assert receiver_verify["valid"] is False
+    assert receiver_verify["reason"] == "already_consumed", (
+        "the receiver's token check must distinguish a legitimate sibling "
+        "consumption from a fabricated token"
+    )
+    # already_consumed must NOT be treated as a spoofing verdict -- it means
+    # "re-derive from the live board", so the receiver proceeds to the item
+    # cross-check across all non-done statuses.
+    all_items = await db_module.get_sprint_items(db, p["id"])
+    live_ids = {i["id"] for i in all_items if i["status"] != "done"}
+    assert item_a["id"] in live_ids, "claimed item must still be found on the live board"
+    assert item_b["id"] in live_ids, "untouched item must still be found on the live board"
+
+    # Non-regression: a truly fabricated id is still absent.
+    assert "FAKE-ITEM-NEVER-CREATED-b763d2ba" not in live_ids
