@@ -4123,6 +4123,49 @@ async def _handle_plugin_tools(
             except Exception:  # noqa: BLE001
                 pass
 
+        # 8047802f — a live probe returning 0 tools does NOT prove a slot is dead.
+        # `_fetch_slot_tools`'s own tools/list request shares the exact same
+        # per-(slot, tenant) in-flight bulkhead (`_slot_semaphore` in
+        # routes/tunnel.py, capped at MERIDIAN_MAX_SLOT_INFLIGHT — default 8) as
+        # every real tools/call against that slot, and gives up fast
+        # (`_SLOT_ACQUIRE_TIMEOUT` = 1s). A slot under genuinely heavy, successful
+        # real traffic — e.g. dozens of live dc:*/meridian-outputs:* calls in the
+        # same session — can transiently saturate that bulkhead and fail-fast
+        # (503 "slot saturated") THIS diagnostic probe within its own budget, even
+        # though the slot is demonstrably invocable right now. The busier (and
+        # healthier) the slot, the MORE likely this probe collapses to 0 — so the
+        # naive "0 tools this fetch => inactive" rule misreports a busy-but-alive
+        # slot as dead (same status-doesn't-reflect-ground-truth bug class as
+        # 1a799e52, different subsystem).
+        #
+        # Cross-check any slot the live probe came back empty for against
+        # ``_tunnel_tool_routes`` — the SAME routing cache real ``call_tunnel_tool``
+        # dispatch reads from to send actual tool invocations, so it IS ground
+        # truth for "is this slot really being invoked right now". If the socket
+        # is still connected AND the cache already maps >=1 live tool name to this
+        # slot (proof a discovery succeeded earlier this session and nothing has
+        # invalidated it since — reconnects/recoveries clear this cache), trust
+        # that over a single saturated probe instead of falsely reporting 0/dead.
+        if tenant_id:
+            _routes = (getattr(_tunnel_mod, "_tunnel_tool_routes", None) or {}).get(tenant_id) or {}
+            if _routes:
+                _routed_by_slot: dict[str, list[str]] = {}
+                for _prefixed_name, _lbl in _routes.items():
+                    _routed_by_slot.setdefault(_lbl, []).append(_prefixed_name)
+                for _lbl, _prefixed_names in _routed_by_slot.items():
+                    if _lbl in slot_tool_counts:
+                        continue  # this fetch already confirmed the slot live
+                    _lbl_sockets, _ = _tunnel_mod._label_maps(_lbl)  # type: ignore[attr-defined]
+                    if tenant_id not in _lbl_sockets:
+                        continue  # socket genuinely gone — never resurrect from a stale cache
+                    _lbl_display = _slot_display.get(_lbl, _lbl)
+                    _prefix = f"{_lbl_display}__"
+                    slot_tool_counts[_lbl] = len(_prefixed_names)
+                    slot_tool_names[_lbl] = [
+                        n[len(_prefix):] if n.startswith(_prefix) else n
+                        for n in _prefixed_names
+                    ]
+
         # Fetch stored skill notes (tagged 'plugin-skill') from workspace notes
         skill_notes: dict[str, dict] = {}
         try:
