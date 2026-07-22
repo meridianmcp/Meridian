@@ -346,6 +346,50 @@ def remove_caption(
 
 
 @mcp.tool()
+def retrofit_plaintext_captions(
+    docx_path: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """82b0b1a6 — Bulk-convert existing plain-text Figure/Table captions
+    (hardcoded numbers, no SEQ field) into real Word SEQ fields.
+
+    insert_caption above only ever creates NEW captions with real SEQ
+    fields — nothing converted EXISTING plain-text captions (a paragraph
+    whose visible text literally reads "Figure 41" with no SEQ field behind
+    it at all). renumber_sequences only walks SEQ fields, so a plain-text
+    caption is invisible to it and silently survives a renumbering pass —
+    duplicate numbers and all.
+
+    Scans every paragraph (including inside table cells) for one with no
+    SEQ field already, whose text starts with "Figure <N>" or "Table <N>"
+    (case-insensitive). Each match is rebuilt using the exact same SEQ
+    fldSimple shape insert_caption constructs, preserving the paragraph's
+    own identity and its existing descriptive label text. renumber_sequences
+    is then called automatically so the (possibly still-duplicate) numbers
+    just converted are corrected from actual document order — closing the
+    gap where duplicate hardcoded captions survived a renumbering pass.
+
+    A candidate paragraph that already carries a bookmark is skipped rather
+    than converted, to avoid destroying it.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place —
+                       only if at least one plain-text caption is found).
+      index_db_path:   If supplied, sidecar is invalidated after write (and
+                       threaded into the renumber_sequences call).
+
+    Returns:
+      {status, candidates_found, conversions, skipped, renumber_sequences,
+      docx_path} or {error: <message>} on failure (file NOT mutated on
+      error).
+    """
+    return docs_intel.retrofit_plaintext_captions(
+        docx_path=docx_path,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
 def insert_cross_reference(
     docx_path: str,
     anchor_para_id: str,

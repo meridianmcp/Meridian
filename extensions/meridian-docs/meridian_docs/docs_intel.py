@@ -1870,6 +1870,211 @@ def remove_caption(
 
 
 # ---------------------------------------------------------------------------
+# retrofit_plaintext_captions (82b0b1a6) -- bulk-migrate hardcoded caption
+# text to real SEQ fields
+#
+# insert_caption (9d749639, above) only ever creates NEW captions with real,
+# auto-numbering SEQ fields. Nothing converted EXISTING plain-text captions
+# -- a paragraph whose visible text literally reads "Figure 41" or "Table 3"
+# with no SEQ field backing it at all (carried over from a document authored
+# before insert_caption existed, or pasted in from another source) -- into
+# that mechanism. renumber_sequences (595ccea1) walks <w:fldSimple> SEQ
+# fields ONLY (see its seq_fields scan above); a plain-text caption has no
+# such field, so it is invisible to a renumbering pass and silently survives
+# untouched, duplicate number and all. That is exactly the failure mode that
+# let a real 4-way "Figure 42" duplicate (plus three more 2x duplicates)
+# survive a full renumber_sequences pass on a real document: nothing could
+# migrate the old hardcoded numbers onto a mechanically-unique system in the
+# first place.
+# ---------------------------------------------------------------------------
+
+_PLAINTEXT_FIGURE_RE = re.compile(
+    r"^\s*Figure\s+(\d+)\b\s*[.:]?\s*(.*)$", re.IGNORECASE | re.DOTALL
+)
+_PLAINTEXT_TABLE_RE = re.compile(
+    r"^\s*Table\s+(\d+)\b\s*[.:]?\s*(.*)$", re.IGNORECASE | re.DOTALL
+)
+
+
+def retrofit_plaintext_captions(
+    docx_path: str, index_db_path: str | None = None
+) -> dict[str, Any]:
+    """82b0b1a6 -- bulk-convert existing plain-text Figure/Table captions into
+    real Word SEQ fields, then re-derive correct numbering across the WHOLE
+    document in the same call.
+
+    Scans every paragraph in the document (including ones nested in table
+    cells -- same walk order as :func:`renumber_sequences`) for one that:
+
+      1. Has NO SEQ field already -- checked the same way :func:`edit_caption`
+         / :func:`remove_caption` validate an EXISTING caption (a ``SEQ``
+         ``<w:fldSimple w:instr=...>`` or complex-field ``<w:instrText>``
+         anywhere in the paragraph); and
+      2. Has visible text that starts with ``"Figure <N>"`` or ``"Table
+         <N>"`` (case-insensitive, optional trailing ``.``/``:`` before the
+         descriptive label) -- the plain-text caption pattern this primitive
+         exists to migrate.
+
+    Note this is a text-pattern match, not a semantic one: a normal body
+    paragraph that happens to OPEN with "Figure 3 ..." (referring to a figure
+    in prose, not captioning one) would also match. In practice this is rare
+    -- real captions are short, standalone paragraphs -- but callers dealing
+    with an unusual document should spot-check ``conversions`` before
+    trusting the result.
+
+    Each match is rebuilt via :func:`_build_caption_paragraph` -- the EXACT
+    same ``SEQ Figure \\* ARABIC`` / ``SEQ Table \\* ARABIC`` ``fldSimple``
+    shape :func:`insert_caption` already constructs, with its own
+    ``_Ref<digits>`` cross-reference bookmark (:func:`_next_ref_bookmark_name`)
+    -- while preserving the paragraph's own identity (``w14:paraId`` and any
+    other attributes are untouched; only its children are replaced) and its
+    existing descriptive label text (everything after the old ``"<Kind>
+    <N>"`` prefix). The OLD hardcoded number is kept as the field's cached
+    value for now; it does not need to already be correct, because:
+
+    :func:`renumber_sequences` is called automatically as the final step
+    (same "call it as a first-class primitive rather than duplicate the
+    logic" pattern :func:`move_section` / :func:`copy_section` already use)
+    -- it re-reads the just-saved document from disk and re-derives every
+    SEQ number (Figure and Table counted independently) from actual body
+    order, INCLUDING the fields this call just created. That is what
+    actually closes the duplicate-number gap: once a plain-text caption is a
+    real SEQ field, a renumbering pass can finally see it and fix it, instead
+    of walking straight past it.
+
+    Fails safe on any single candidate rather than risk corrupting an
+    unusual paragraph shape: a candidate paragraph that already carries ANY
+    ``<w:bookmarkStart>`` (e.g. a hand-made cross-reference bookmark
+    pointing at this exact paragraph, predating this migration) is SKIPPED
+    -- not converted -- since rebuilding its children would silently destroy
+    that bookmark. Skipped paragraphs are reported in ``skipped`` so a
+    caller can migrate them by hand.
+
+    Args:
+        docx_path:     Absolute path to the .docx file (mutated in place --
+                       only if at least one plain-text caption is found).
+        index_db_path: If supplied, the sidecar is invalidated after the
+                       write (and threaded into the :func:`renumber_sequences`
+                       call so its own sidecar invalidation happens too).
+
+    Returns:
+        ``{status, candidates_found, conversions, skipped, renumber_sequences,
+        docx_path}``. ``status`` is ``"unchanged"`` when no plain-text
+        caption was found (no write performed) or ``"converted"`` otherwise.
+        ``conversions`` lists ``{para_id, kind, old_cached_number, label_text,
+        ref_bookmark}`` for every paragraph actually migrated, in document
+        order. ``skipped`` lists ``{para_id, kind, reason}`` for candidates
+        that matched the text pattern but were left untouched for safety.
+        ``{"error": <message>}`` on failure (file NOT mutated on error).
+    """
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+    w_bookmarkStart = _q(_W, "bookmarkStart")
+
+    conversions: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    for global_p_idx, p in enumerate(body.iter(w_p)):
+        has_seq = any(
+            "SEQ" in (fld.get(_q(_W, "instr")) or "")
+            for fld in p.iter(_q(_W, "fldSimple"))
+        ) or any("SEQ" in (it.text or "") for it in p.iter(_q(_W, "instrText")))
+        if has_seq:
+            continue
+
+        text = "".join(t.text or "" for t in p.iter(_q(_W, "t")))
+
+        kind = "Figure"
+        m = _PLAINTEXT_FIGURE_RE.match(text)
+        if m is None:
+            kind = "Table"
+            m = _PLAINTEXT_TABLE_RE.match(text)
+        if m is None:
+            continue
+
+        real_id = p.get(w14_para_id)
+        para_id = real_id if real_id else f"p{global_p_idx}"
+        old_number = m.group(1)
+        label_text = m.group(2).strip()
+
+        if next(iter(p.iter(w_bookmarkStart)), None) is not None:
+            skipped.append({
+                "para_id": para_id,
+                "kind": kind,
+                "reason": "paragraph already has a bookmark; conversion would destroy it",
+            })
+            continue
+
+        ref_bookmark = _next_ref_bookmark_name(root)
+        new_p = _build_caption_paragraph(
+            kind=kind,
+            label_text=label_text,
+            seq_cached=old_number,
+            ref_bookmark=ref_bookmark,
+        )
+        if not label_text:
+            # _build_caption_paragraph always appends a trailing
+            # "<kind> <N>. <label>" run -- drop it when there was no
+            # descriptive text at all rather than leave a dangling bare
+            # "Figure 41. " period behind.
+            trailing = list(new_p)[-1]
+            if trailing.tag == _q(_W, "r"):
+                new_p.remove(trailing)
+
+        for child in list(p):
+            p.remove(child)
+        for child in list(new_p):
+            p.append(child)
+
+        conversions.append({
+            "para_id": para_id,
+            "kind": kind,
+            "old_cached_number": old_number,
+            "label_text": label_text,
+            "ref_bookmark": ref_bookmark,
+        })
+
+    if not conversions:
+        return {
+            "status": "unchanged",
+            "candidates_found": 0,
+            "conversions": [],
+            "skipped": skipped,
+            "renumber_sequences": None,
+            "docx_path": docx_path,
+        }
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    renumber_result = renumber_sequences(docx_path, index_db_path=index_db_path)
+
+    return {
+        "status": "converted",
+        "candidates_found": len(conversions),
+        "conversions": conversions,
+        "skipped": skipped,
+        "renumber_sequences": renumber_result,
+        "docx_path": docx_path,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public cross-reference API: Word REF-field mechanism (1c59cb90)
 #
 # REFILED (original 7b5bfb00) — captions previously only got Word's SEQ-field
