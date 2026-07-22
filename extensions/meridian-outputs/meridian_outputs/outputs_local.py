@@ -364,19 +364,66 @@ class _ResumableFileWalk:
     # was allowed to run so far ahead of the analysis/write stages. Capping
     # the batch keeps each throttle cycle's backlog proportionate to what
     # Phase 1/2 can plausibly clear in a comparable amount of time.
+    #
+    # 3535b9ad -- this was hardcoded with no override, unlike sibling knobs
+    # (MERIDIAN_OUTPUTS_MAX_WORKERS, MERIDIAN_OUTPUTS_EXCLUDE_PATTERNS). It was
+    # sized conservatively because Phase 2's DB write used to cost ~8ms/row --
+    # a big batch meant a proportionally huge, budget-eating write. That
+    # constraint is now gone (pyarrow bulk insert, 4f78e70: 2000 rows write in
+    # ~0.11s), and Phase 1/the walk are both also now dramatically faster
+    # (c73c0dd7, 7fee82e, 4972a6d), so the ORIGINAL reason for capping at
+    # exactly 2000 no longer applies at the same weight. The class default is
+    # deliberately left UNCHANGED here -- the item's own suggested approach is
+    # to benchmark candidate values (5000/10000/20000) against a real full-tree
+    # run (db4bb64b) once this configurability lands, rather than guess a new
+    # number without that data. This just makes the cap override-able so that
+    # benchmark (and any future retuning) doesn't require a code change.
     _MAX_BATCH = 2000
+    _MAX_BATCH_ENV_VAR = "MERIDIAN_OUTPUTS_MAX_BATCH"
+
+    @classmethod
+    def _resolve_max_batch(cls, explicit: int | None) -> int:
+        """Precedence: explicit constructor arg > env var > class default."""
+        if explicit is not None:
+            if explicit >= 1:
+                return explicit
+            _log.warning(
+                "_ResumableFileWalk: max_batch=%r must be >= 1 -- falling "
+                "back to default (%d)", explicit, cls._MAX_BATCH,
+            )
+            return cls._MAX_BATCH
+        raw = os.environ.get(cls._MAX_BATCH_ENV_VAR)
+        if raw is None or not raw.strip():
+            return cls._MAX_BATCH
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            _log.warning(
+                "%s=%r is not a valid integer -- falling back to default (%d)",
+                cls._MAX_BATCH_ENV_VAR, raw, cls._MAX_BATCH,
+            )
+            return cls._MAX_BATCH
+        if value < 1:
+            _log.warning(
+                "%s=%r must be >= 1 -- falling back to default (%d)",
+                cls._MAX_BATCH_ENV_VAR, raw, cls._MAX_BATCH,
+            )
+            return cls._MAX_BATCH
+        return value
 
     def __init__(
         self, outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
+        max_batch: int | None = None,
     ) -> None:
         self._iterator = _walk_safe_output_files(
             outputs_dir, exclude_patterns=exclude_patterns,
         )
         self.exhausted = False
+        self.max_batch = self._resolve_max_batch(max_batch)
 
     def drain(self, deadline: float | None) -> list[str]:
         """Pull paths until the walk is exhausted, ``deadline`` passes, or
-        ``_MAX_BATCH`` paths have been collected -- whichever comes first.
+        ``self.max_batch`` paths have been collected -- whichever comes first.
 
         Always pulls at least one path per call (if any remain) before
         checking the deadline, so a single ``drain()`` call can never spin
@@ -388,7 +435,7 @@ class _ResumableFileWalk:
             return found
         for path in self._iterator:
             found.append(path)
-            if len(found) >= self._MAX_BATCH:
+            if len(found) >= self.max_batch:
                 return found
             if deadline is not None and time.monotonic() > deadline:
                 return found
@@ -1274,6 +1321,7 @@ class OutputsFtsIndex:
         max_workers: int | None = None,
         exclude_patterns: tuple[str, ...] | None = None,
         tantivy_heap_bytes: int | None = None,
+        max_batch: int | None = None,
     ) -> None:
         self.outputs_dir = outputs_dir
         self._db_path = db_path
@@ -1286,6 +1334,11 @@ class OutputsFtsIndex:
         # MERIDIAN_OUTPUTS_TANTIVY_HEAP_MB env var > 512MB default (up from
         # tantivy's own undersized default, measured ~3x faster commits).
         self._tantivy_heap_bytes = _resolve_tantivy_heap_bytes(tantivy_heap_bytes)
+        # 3535b9ad -- walk batch cap: explicit param > MERIDIAN_OUTPUTS_MAX_BATCH
+        # env var > 2000 class default (the previous unconfigurable behaviour).
+        # Also used for the DB write chunk size (_WRITE_CHUNK), which shared
+        # the same constant before this change.
+        self._max_batch = _ResumableFileWalk._resolve_max_batch(max_batch)
         # fd4dd661 -- user-configurable gitignore-style exclude patterns:
         # explicit param > MERIDIAN_OUTPUTS_EXCLUDE_PATTERNS env var > empty
         # (unchanged default behaviour -- only secret-file exclusion applies).
@@ -1935,9 +1988,10 @@ class OutputsFtsIndex:
             if self._walk_state is None:
                 self._walk_state = _ResumableFileWalk(
                     self.outputs_dir, exclude_patterns=self._exclude_patterns,
+                    max_batch=self._max_batch,
                 )
                 self._walk_accumulated = []
-            if len(self._pending_stale) < _ResumableFileWalk._MAX_BATCH:
+            if len(self._pending_stale) < self._max_batch:
                 newly_seen = self._walk_state.drain(phase1_deadline)
                 self._walk_accumulated.extend(newly_seen)
             walk_complete = self._walk_state.exhausted
@@ -2185,7 +2239,7 @@ class OutputsFtsIndex:
                     # faster than plain executemany) when pyarrow isn't
                     # installed, so this degrades gracefully rather than
                     # hard-requiring the new dependency.
-                    _WRITE_CHUNK = _ResumableFileWalk._MAX_BATCH
+                    _WRITE_CHUNK = self._max_batch
                     if paths_to_delete:
                         for i in range(0, len(paths_to_delete), _WRITE_CHUNK):
                             chunk = paths_to_delete[i:i + _WRITE_CHUNK]

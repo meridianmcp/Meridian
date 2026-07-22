@@ -43,6 +43,7 @@ def search_outputs(
     query: str,
     limit: int = 10,
     include_archival: bool = True,
+    max_seconds: float | None = outputs_local.DEFAULT_REBUILD_BUDGET_SECONDS,
 ) -> dict[str, Any]:
     """BM25 full-text search over a local outputs directory tree, with a
     literal-filename-match boost (item c6236ef4).
@@ -70,6 +71,14 @@ def search_outputs(
       include_archival: Include archival-flagged (e.g. ``*_old.csv``) files in
                         results.  They are deprioritised (score halved) but
                         not excluded unless this is False (default True).
+      max_seconds:      3535b9ad -- the "indexing slider": how long a single
+                        call may spend on rebuild()'s incremental indexing
+                        before returning, on a cold or large tree. Omit for
+                        the library default (DEFAULT_REBUILD_BUDGET_SECONDS,
+                        130s). Lower it for a faster first response on a huge
+                        tree (partial=True signals more indexing remains --
+                        call again to continue); raise it to converge in
+                        fewer calls on a tree too large for the default budget.
 
     Returns:
       {outputs_dir, query, hits, total_indexed} plus optional {partial, error}.
@@ -82,6 +91,7 @@ def search_outputs(
         query,
         limit=limit,
         include_archival=include_archival,
+        max_seconds=max_seconds,
     )
 
 

@@ -4714,19 +4714,35 @@ async def _handle_outputs_tools(
         except (TypeError, ValueError):
             limit = 10
         include_archival = args.get("include_archival", True)
+        # 3535b9ad — "indexing slider": max_seconds already existed on the
+        # underlying outputs_indexer.search_outputs() (DEFAULT_REBUILD_BUDGET_
+        # SECONDS) but was never read from args/threaded through here, so a
+        # caller had no way to raise/lower the rebuild budget for a cold or
+        # oversized tree. omit -> library default (unchanged behaviour).
+        max_seconds = args.get("max_seconds")
+        if max_seconds is not None:
+            try:
+                max_seconds = float(max_seconds)
+            except (TypeError, ValueError):
+                max_seconds = None
         # The walk + hash + DuckDB FTS build is synchronous/CPU-bound. Run it in
         # the bulkhead pool under a hard deadline (e5f96adf / 1d021501): it now
         # also has an internal incremental budget (5116078b), so this backstop
         # only fires on a genuinely pathological cold tree — and fails fast with
         # a clear error instead of the ~4-minute silent hang that motivated this.
+        _search_outputs_kwargs: dict[str, Any] = {
+            "limit": limit,
+            "include_archival": bool(include_archival),
+            "label": "search_outputs",
+        }
+        if max_seconds is not None:
+            _search_outputs_kwargs["max_seconds"] = max_seconds
         try:
             return await _hardening.run_in_bulkhead(
                 _outputs_indexer.search_outputs,
                 outputs_dir,
                 query,
-                limit=limit,
-                include_archival=bool(include_archival),
-                label="search_outputs",
+                **_search_outputs_kwargs,
             )
         except _hardening.HeavyToolTimeout as exc:
             return {

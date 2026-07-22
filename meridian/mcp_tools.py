@@ -802,12 +802,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "created_at, updated_at, source}]}]}. annotations is auto-included "
         "for each hit (any annotation keyed to the hit path OR a nearest "
         "ancestor directory) — no second tool call needed. A missing dir / "
-        "empty tree returns an empty hits list, never an error.",
+        "empty tree returns an empty hits list, never an error. "
+        "3535b9ad — pass max_seconds to raise/lower the indexing budget "
+        "(the \"indexing slider\"): a large or cold tree may not fully "
+        "converge within the default budget on the first call — the result's "
+        "partial=true field signals more indexing remains; call again to "
+        "continue (each call resumes where the last left off, never restarts).",
      "inputSchema": {"type": "object", "properties": {
          "outputs_dir": {"type": "string", "description": "Absolute path to the outputs directory tree to index and search (walked recursively)."},
          "query": {"type": "string", "description": "The BM25 query — one or more search terms (column names, keys, script names, or any text in a csv/json)."},
          "limit": {"type": "integer", "description": "Max ranked hits to return (default 10)."},
-         "include_archival": {"type": "boolean", "description": "Default true — archival copies are deprioritized but still returned. Set false to exclude confirmed-archival files entirely."}},
+         "include_archival": {"type": "boolean", "description": "Default true — archival copies are deprioritized but still returned. Set false to exclude confirmed-archival files entirely."},
+         "max_seconds": {"type": "number", "description": "Wall-clock budget (seconds) for this call's incremental indexing before returning. Omit for the library default. Lower it for a faster first response on a huge tree (check partial=true and call again); raise it to converge in fewer calls on a tree too large for the default budget."}},
          "required": ["outputs_dir", "query"]}},
     {"name": "annotate_outputs", "description":
         "9e02e448 — capture a human annotation for a path inside an outputs "
