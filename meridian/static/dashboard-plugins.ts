@@ -111,11 +111,15 @@ window._renderSlotHealthWarning = _renderSlotHealthWarning;
 // cc904bfe — render an informational badge when the tenant's saved command for a
 // slot is a *stale* copy of an old built-in default (resolve_plugins set
 // p.stale_override + p.newer_default_*). Distinct blue styling from the yellow
-// health warning. The "Use new default" button *populates* the slot's command
-// input with the new built-in default (e.g. `uvx docx-mcp`) so the user sees and
-// saves the current default — it must NOT clear the field (78114fa6). The new
-// default is carried on a data-newer attribute so the click handler is a clean,
-// testable helper (_applyStaleOverrideDefault) instead of a fragile inline string.
+// health warning. The "Use new default" button CLEARS the slot's command
+// override (97dc51ab) rather than writing the literal new-default string: that
+// string is a DISPLAY value computed server-side (Path(__file__) resolved on
+// the Fly.io container, e.g. /app/extensions/...) and would pin every tunnel
+// CLIENT to a path that only exists in the container. Clearing lets
+// collectConfig() omit `command` for this slot, so the tunnel client recomputes
+// its own correct local default at spawn time. The new default's label is still
+// carried on a data-newer attribute so the click handler is a clean, testable
+// helper (_applyStaleOverrideDefault) instead of a fragile inline string.
 // Returns '' when the override is current or genuinely custom.
 function _renderStaleOverrideWarning(p: any) {
   if (!p || !p.stale_override) return '';
@@ -130,11 +134,14 @@ function _renderStaleOverrideWarning(p: any) {
 }
 window._renderStaleOverrideWarning = _renderStaleOverrideWarning;
 
-// 78114fa6 — click handler for the "Use new default" button on the stale-override
-// warning. Populates the slot's command input with the new built-in default (read
-// from the button's data-newer attribute) and fires an 'input' event so collectConfig
-// picks up the change. Populates, never clears: an empty field previously left the
-// command blank instead of showing the current default (e.g. `uvx docx-mcp`).
+// 97dc51ab — click handler for the "Use new default" button on the stale-override
+// warning. CLEARS the slot's command input (reverses 78114fa6's populate-not-clear
+// design) and fires an 'input' event so collectConfig picks up the change: the
+// server-rendered `newer` string bakes in a container-local absolute path
+// (Path(__file__) resolved on Fly.io), so writing it verbatim as this tenant's
+// override would break every tunnel CLIENT's own spawn-time resolution. Clearing
+// the field leaves the placeholder showing the default's description (still
+// visible to the user) while collectConfig() sends no override for this slot.
 // Attached to window (not ESM-exported: this file is a global script consumed by
 // dashboard.ts via ambient globals) + null-safe so the UI test can exercise it.
 function _applyStaleOverrideDefault(btn: any) {
@@ -143,11 +150,12 @@ function _applyStaleOverrideDefault(btn: any) {
   if (!row) return;
   const cmd = row.querySelector('.tp-command');
   if (!cmd) return;
-  // data-newer holds the joined new default command (may be '' if the server sent
-  // no newer_default_command — in which case there is nothing to populate).
+  // data-newer holds the joined new default command; only used here to confirm a
+  // legitimate newer default exists (may be '' if the server sent none, in which
+  // case there is nothing to reset and we no-op rather than clear blindly).
   const newer = btn.getAttribute ? (btn.getAttribute('data-newer') || '') : '';
   if (!newer) return;
-  cmd.value = newer;
+  cmd.value = '';
   cmd.dispatchEvent(new Event('input', { bubbles: true }));
 }
 window._applyStaleOverrideDefault = _applyStaleOverrideDefault;
