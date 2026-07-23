@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -1145,6 +1146,86 @@ def test_run_connection_lazy_reprobe_recovers(monkeypatch):
     statuses = [m for m in sent if m.get("type") == "plugin_status"]
     assert {"type": "plugin_status", "slot": "fs", "healthy": False} in statuses
     assert {"type": "plugin_status", "slot": "fs", "healthy": True} in statuses
+
+
+def test_reprobe_backs_off_after_max_retries(monkeypatch):
+    """c325b8eb: a slot that NEVER recovers (e.g. "dc" under ongoing AV/Defender
+    file-lock interference on every single npx extraction attempt — a genuinely
+    persistent failure, not a one-off) must not get re-kicked at the flat
+    _SLOT_REPROBE_INTERVAL forever. After _WATCHDOG_MAX_RETRIES straight failed
+    reprobes the background _reprobe() task must back off to the much longer
+    _WATCHDOG_COOLDOWN_SECONDS cadence, mirroring _proc_watchdog's already-proven
+    fast-retry-then-cooldown shape."""
+    monkeypatch.setattr(tc, "_SLOT_REPROBE_INTERVAL", 0.03)
+    monkeypatch.setattr(tc, "_WATCHDOG_MAX_RETRIES", 2)
+    monkeypatch.setattr(tc, "_WATCHDOG_COOLDOWN_SECONDS", 0.2)
+
+    n_requests = tc._WATCHDOG_MAX_RETRIES + 1  # enough failing requests to escalate
+    call_times: list[float] = []
+
+    async def fake_reprobe_once(proxy, probe):
+        call_times.append(time.monotonic())
+        return False  # never recovers — simulates persistent AV lock interference
+
+    monkeypatch.setattr(tc, "_reprobe_once", fake_reprobe_once)
+
+    sent = []
+
+    class FakeWS:
+        def __init__(self):
+            self._n = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self._n += 1
+            if self._n <= n_requests:
+                return json.dumps({"type": "request", "id": str(self._n)})
+            # Escalation already happened — idle-ping the connection long enough
+            # for several background reprobe cycles (including at least one past
+            # the fast-retry cap) to fire, then end the stream.
+            if len(call_times) < tc._WATCHDOG_MAX_RETRIES + 3:
+                await asyncio.sleep(0.03)
+                return json.dumps({"type": "ping"})
+            raise StopAsyncIteration
+
+        async def send(self, data):
+            sent.append(json.loads(data))
+
+    class FakeHttpClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+
+    async def fake_ensure(self):  # proxy never comes up
+        return None
+    monkeypatch.setattr(tc.SlotProxy, "ensure_running", fake_ensure)
+
+    proxy = tc.SlotProxy(["x"], 8808, "dc")
+    asyncio.run(tc._run_connection_lazy("wss://x", proxy, "dc"))
+
+    assert len(call_times) >= tc._WATCHDOG_MAX_RETRIES + 2
+    gaps = [b - a for a, b in zip(call_times, call_times[1:])]
+    fast_gaps = gaps[: tc._WATCHDOG_MAX_RETRIES]
+    cooled_gap = gaps[tc._WATCHDOG_MAX_RETRIES]
+    # Fast-retry gaps stay near _SLOT_REPROBE_INTERVAL; once the cap is
+    # exceeded the gap jumps to the much larger cooldown.
+    assert all(g < tc._WATCHDOG_COOLDOWN_SECONDS * 0.6 for g in fast_gaps)
+    assert cooled_gap >= tc._WATCHDOG_COOLDOWN_SECONDS * 0.6
 
 
 # ---------------------------------------------------------------------------
