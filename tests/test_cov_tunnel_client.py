@@ -504,7 +504,14 @@ def test_reconnect_loop_resets_backoff_on_clean_1012_but_climbs_on_real_failure(
 # ---------------------------------------------------------------------------
 
 class _FakeProc:
-    """Minimal subprocess.Popen stand-in: alive until .terminate()/.kill()."""
+    """Minimal subprocess.Popen stand-in: alive until .terminate()/.kill().
+
+    Implements the context-manager protocol (__enter__/__exit__) because real
+    Popen does and subprocess.run()'s stdlib implementation always spawns via
+    `with Popen(...) as process:` -- any code path that reaches subprocess.run
+    while tc.subprocess.Popen is patched to this class needs it to behave like
+    a real Popen would (e.g. _kill_all_previously_spawned_pids' Windows taskkill).
+    """
     def __init__(self, cmd=None, *a, **k):
         self.cmd = cmd
         self.pid = 4242
@@ -520,6 +527,10 @@ class _FakeProc:
     def kill(self):
         self._alive = False
         self.returncode = -9
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc_info):
+        return False
 
 
 def test_slotproxy_ensure_running_spawns_once_then_kill(monkeypatch):
@@ -1484,6 +1495,11 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
         def terminate(self): pass
         def wait(self, timeout=None): return 0
         def kill(self): pass
+        # subprocess.run()'s stdlib impl always does `with Popen(...) as process:`
+        # -- _kill_all_previously_spawned_pids' Windows taskkill call goes through
+        # subprocess.run, so this stand-in needs the context-manager protocol too.
+        def __enter__(self): return self
+        def __exit__(self, *exc_info): return False
 
     monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, *a, **k: FakeProc(cmd))
 
@@ -1498,6 +1514,13 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
     # dedicated, thorough coverage in test_tunnel_client.py) — no-op it here so
     # these tests are hermetic regardless of what happens to be running locally.
     monkeypatch.setattr(tc, "_kill_stale_port_occupant", lambda *a, **k: None)
+    # _kill_all_previously_spawned_pids reads/writes a REAL file at
+    # Path.home()/".meridian"/"spawned_pids.json" -- not test-scoped. Left live,
+    # a successful run would overwrite that real file (used by actual local
+    # `meridian --tunnel` sessions) with "[]". Its own behavior has dedicated,
+    # properly-isolated coverage in test_tunnel_client.py; no-op it here too,
+    # for the same hermeticity reason as _kill_stale_port_occupant above.
+    monkeypatch.setattr(tc, "_kill_all_previously_spawned_pids", lambda *a, **k: None)
 
     # Lazy spawn (3649a61a): built-in slots are SlotProxy objects whose proxy is
     # NOT Popen'd at startup — it spawns on the first request via ensure_running().
@@ -2028,6 +2051,9 @@ def test_run_tunnel_fs_lazy_spawn_enoent_keeps_tunnel_up(monkeypatch, tmp_path):
                         lambda: ["uvx", "mcp-server-code-extractor"])
     # Skip ensure_running's 1s port-bind sleep on a successful spawn.
     monkeypatch.setattr(tc.asyncio, "sleep", AsyncMock(return_value=None))
+    # No-op: reads/writes a REAL Path.home()/".meridian"/spawned_pids.json, not
+    # test-scoped -- see the matching no-op + comment in _stub_run_tunnel_spawn.
+    monkeypatch.setattr(tc, "_kill_all_previously_spawned_pids", lambda *a, **k: None)
 
     # Lazy reconnect drives the REAL ensure_running once then returns; idle-killer
     # + legacy watchdog are no-ops.
@@ -2154,6 +2180,9 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
     monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
     # Skip the 1s port-bind sleep ensure_running does after a successful spawn.
     monkeypatch.setattr(tc.asyncio, "sleep", AsyncMock(return_value=None))
+    # No-op: reads/writes a REAL Path.home()/".meridian"/spawned_pids.json, not
+    # test-scoped -- see the matching no-op + comment in _stub_run_tunnel_spawn.
+    monkeypatch.setattr(tc, "_kill_all_previously_spawned_pids", lambda *a, **k: None)
 
     # Lazy reconnect loops drive the real ensure_running (to hit its spawn-failure
     # branch) then return; idle-killer + legacy watchdog are no-ops.
@@ -2186,6 +2215,10 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
         def terminate(self): pass
         def wait(self, timeout=None): return 0
         def kill(self): pass
+        # subprocess.run() spawns via `with Popen(...) as process:` -- needed for
+        # _kill_all_previously_spawned_pids' Windows taskkill call.
+        def __enter__(self): return self
+        def __exit__(self, *exc_info): return False
 
     def popen(cmd, *a, **k):
         # fs proxy (server-filesystem) starts; code-intel + extractor blow up.
@@ -2321,6 +2354,10 @@ def test_run_tunnel_finally_kills_proc_on_wait_timeout(monkeypatch, tmp_path):
         def terminate(self): pass
         def wait(self, timeout=None): raise RuntimeError("wait timed out")
         def kill(self): killed["n"] += 1
+        # subprocess.run() spawns via `with Popen(...) as process:` -- needed for
+        # _kill_all_previously_spawned_pids' Windows taskkill call.
+        def __enter__(self): return self
+        def __exit__(self, *exc_info): return False
 
     monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, *a, **k: TimeoutProc())
 
