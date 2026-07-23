@@ -607,6 +607,189 @@ class TestOutputsFtsIndex:
 
 
 # ---------------------------------------------------------------------------
+# _row_cache content eviction (sprint item edc84500)
+# ---------------------------------------------------------------------------
+
+class TestRowCacheContentEviction:
+    """edc84500 -- _row_cache must never hold one full extracted-content
+    body (the CSV/JSON/text body used for FTS) per discovered file for the
+    OutputsFtsIndex instance's entire lifetime. That unbounded growth caused
+    a real OS-level allocator failure ("memory allocation of N bytes
+    failed") at ~96,000/244,191 files against a real SUT_Compressed tree.
+
+    Content is evicted back to None once a row has been committed (see
+    _apply_precomputed/_light_row); every lightweight field a caller
+    actually needs off a cached row (sha256, size, mtime, kind,
+    csv_columns, json_keys, generating_script, is_archival, canonical_path)
+    must keep working exactly as before. get_content() -- backed directly
+    by the persistent DuckDB outputs_index table -- is the supported way
+    to read a file's real content back on demand.
+    """
+
+    @duckdb_required
+    def test_row_cache_content_evicted_after_commit(self, tmp_path: Path) -> None:
+        f = tmp_path / "metrics.csv"
+        # A same-size sibling forces the size-prefilter (e1fd4182) to
+        # actually compute a real sha256 for both files, rather than
+        # skipping hashing entirely for a lone, uniquely-sized file --
+        # exercising the lightweight sha256 field this fix must preserve.
+        f.write_text("epoch,loss\n1,0.9\n2,0.4\n3,0.1", encoding="utf-8")
+        (tmp_path / "sibling.csv").write_text(
+            "epoch,loss\n1,0.9\n2,0.4\n3,0.2", encoding="utf-8",
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            count = idx.rebuild()
+            assert count == 2
+            cache_key = next(p for p in idx._row_cache if p.endswith("metrics.csv"))
+            cached = idx._row_cache[cache_key]
+            assert cached.content is None, (
+                "row_cache must not hold the full content once a row has "
+                "been committed to the DB + FTS index"
+            )
+            # Lightweight fields must survive eviction -- staleness
+            # detection and metadata lookups depend on these.
+            assert cached.sha256 is not None
+            assert cached.size is not None
+            assert cached.kind == "text_content"
+
+            # A real lookup must still return the ACTUAL persisted content,
+            # read straight from DuckDB -- never stale/empty.
+            content = idx.get_content(cache_key)
+            assert content is not None
+            assert "epoch,loss" in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_get_content_missing_path_returns_none(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.get_content(str(tmp_path / "nope.csv")) is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_staleness_detection_unaffected_by_eviction(self, tmp_path: Path) -> None:
+        """The staleness check (`p not in self._row_cache`) and the sha256
+        read (`self._row_cache[path].sha256`) must both keep working once
+        content has been evicted -- an unchanged file must NOT be
+        re-analysed on a subsequent rebuild() call."""
+        f = tmp_path / "data.json"
+        f.write_text('{"a": 1}', encoding="utf-8")
+        # A same-size sibling forces a real sha256 to be computed (see
+        # test_row_cache_content_evicted_after_commit) so this test actually
+        # exercises the cached-hash read, not a legitimately-skipped one.
+        (tmp_path / "sibling.json").write_text('{"a": 2}', encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            cache_key = next(p for p in idx._row_cache if p.endswith("data.json"))
+            assert idx._row_cache[cache_key].content is None
+            sha_before = idx._row_cache[cache_key].sha256
+            assert sha_before is not None
+
+            analysed: list[str] = []
+            real_analyse = OL._analyse_file
+
+            def _spy_analyse(p, hasher, **kwargs):
+                analysed.append(p)
+                return real_analyse(p, hasher, **kwargs)
+
+            with patch.object(OL, "_analyse_file", side_effect=_spy_analyse):
+                count = idx.rebuild()
+            assert count == 2
+            assert not analysed, (
+                "an unchanged file was re-analysed -- staleness detection "
+                "broke after content eviction"
+            )
+            assert idx._row_cache[cache_key].sha256 == sha_before
+            assert idx._row_cache[cache_key].content is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_archival_metadata_refresh_preserves_content(self, tmp_path: Path) -> None:
+        """A row whose ONLY change is its archival classification (a twin
+        file appears later) is re-inserted via the "update non-stale cached
+        rows" path in _apply_precomputed, which reuses the CACHED (already
+        content-evicted) row. The fix must re-read the real content from
+        DuckDB before re-inserting -- never silently overwrite already-
+        persisted content with NULL."""
+        archival = tmp_path / "run_old.csv"
+        archival.write_bytes(b"a,b\n1,2\n")
+        # A same-size (but different-content) sibling present from the
+        # start forces a REAL sha256 to be computed for run_old.csv during
+        # its OWN initial indexing (the size-prefilter, e1fd4182, skips
+        # hashing a uniquely-sized file entirely) -- needed so the archival
+        # comparison below has a real hash to compare once the canonical
+        # twin appears; run_old.csv itself is never re-hashed once cached.
+        (tmp_path / "helper.csv").write_bytes(b"x,y\n9,9\n")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            cache_key = next(p for p in idx._row_cache if p.endswith("run_old.csv"))
+            assert idx._row_cache[cache_key].content is None
+            assert idx._row_cache[cache_key].is_archival is False  # no twin yet
+            content_before = idx.get_content(cache_key)
+            assert content_before is not None and "a,b" in content_before
+
+            # Add the canonical twin (identical content) -- flips
+            # run_old.csv's archival classification via the metadata-refresh
+            # path, WITHOUT run_old.csv itself being touched/re-stat'd as
+            # stale this call.
+            canonical = tmp_path / "run.csv"
+            canonical.write_bytes(b"a,b\n1,2\n")
+            idx.rebuild()
+
+            assert idx._row_cache[cache_key].is_archival is True, (
+                "twin addition should have flipped is_archival via the "
+                "non-stale metadata-refresh path"
+            )
+            content_after = idx.get_content(cache_key)
+            assert content_after == content_before, (
+                "a metadata-only archival refresh must never null out "
+                "already-persisted content"
+            )
+            assert idx._row_cache[cache_key].content is None, (
+                "the metadata refresh must not re-inflate row_cache with "
+                "full content"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_rehydrate_from_disk_does_not_load_content(self, tmp_path: Path) -> None:
+        """A fresh OutputsFtsIndex pointed at an existing on-disk DB (process
+        restart / cache-eviction scenario) must not re-materialise every
+        row's full content into _row_cache on connect() -- only cheap
+        metadata should be rehydrated."""
+        (tmp_path / "big.csv").write_text(
+            "col\n" + ("x" * 5000), encoding="utf-8",
+        )
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild()
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx2._connect()  # triggers _rehydrate_cache_from_disk
+            cache_key = next(p for p in idx2._row_cache if p.endswith("big.csv"))
+            assert idx2._row_cache[cache_key].content is None, (
+                "_rehydrate_cache_from_disk must not load content into "
+                "row_cache on a fresh connect()"
+            )
+            content = idx2.get_content(cache_key)
+            assert content is not None
+            assert "x" * 100 in content
+        finally:
+            idx2.close()
+
+
+# ---------------------------------------------------------------------------
 # Module-level API: search_outputs, annotate_outputs, classify_outputs,
 # resolve_figure_output
 # ---------------------------------------------------------------------------
