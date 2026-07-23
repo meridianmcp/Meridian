@@ -607,6 +607,189 @@ class TestOutputsFtsIndex:
 
 
 # ---------------------------------------------------------------------------
+# _row_cache content eviction (sprint item edc84500)
+# ---------------------------------------------------------------------------
+
+class TestRowCacheContentEviction:
+    """edc84500 -- _row_cache must never hold one full extracted-content
+    body (the CSV/JSON/text body used for FTS) per discovered file for the
+    OutputsFtsIndex instance's entire lifetime. That unbounded growth caused
+    a real OS-level allocator failure ("memory allocation of N bytes
+    failed") at ~96,000/244,191 files against a real SUT_Compressed tree.
+
+    Content is evicted back to None once a row has been committed (see
+    _apply_precomputed/_light_row); every lightweight field a caller
+    actually needs off a cached row (sha256, size, mtime, kind,
+    csv_columns, json_keys, generating_script, is_archival, canonical_path)
+    must keep working exactly as before. get_content() -- backed directly
+    by the persistent DuckDB outputs_index table -- is the supported way
+    to read a file's real content back on demand.
+    """
+
+    @duckdb_required
+    def test_row_cache_content_evicted_after_commit(self, tmp_path: Path) -> None:
+        f = tmp_path / "metrics.csv"
+        # A same-size sibling forces the size-prefilter (e1fd4182) to
+        # actually compute a real sha256 for both files, rather than
+        # skipping hashing entirely for a lone, uniquely-sized file --
+        # exercising the lightweight sha256 field this fix must preserve.
+        f.write_text("epoch,loss\n1,0.9\n2,0.4\n3,0.1", encoding="utf-8")
+        (tmp_path / "sibling.csv").write_text(
+            "epoch,loss\n1,0.9\n2,0.4\n3,0.2", encoding="utf-8",
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            count = idx.rebuild()
+            assert count == 2
+            cache_key = next(p for p in idx._row_cache if p.endswith("metrics.csv"))
+            cached = idx._row_cache[cache_key]
+            assert cached.content is None, (
+                "row_cache must not hold the full content once a row has "
+                "been committed to the DB + FTS index"
+            )
+            # Lightweight fields must survive eviction -- staleness
+            # detection and metadata lookups depend on these.
+            assert cached.sha256 is not None
+            assert cached.size is not None
+            assert cached.kind == "text_content"
+
+            # A real lookup must still return the ACTUAL persisted content,
+            # read straight from DuckDB -- never stale/empty.
+            content = idx.get_content(cache_key)
+            assert content is not None
+            assert "epoch,loss" in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_get_content_missing_path_returns_none(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.get_content(str(tmp_path / "nope.csv")) is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_staleness_detection_unaffected_by_eviction(self, tmp_path: Path) -> None:
+        """The staleness check (`p not in self._row_cache`) and the sha256
+        read (`self._row_cache[path].sha256`) must both keep working once
+        content has been evicted -- an unchanged file must NOT be
+        re-analysed on a subsequent rebuild() call."""
+        f = tmp_path / "data.json"
+        f.write_text('{"a": 1}', encoding="utf-8")
+        # A same-size sibling forces a real sha256 to be computed (see
+        # test_row_cache_content_evicted_after_commit) so this test actually
+        # exercises the cached-hash read, not a legitimately-skipped one.
+        (tmp_path / "sibling.json").write_text('{"a": 2}', encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            cache_key = next(p for p in idx._row_cache if p.endswith("data.json"))
+            assert idx._row_cache[cache_key].content is None
+            sha_before = idx._row_cache[cache_key].sha256
+            assert sha_before is not None
+
+            analysed: list[str] = []
+            real_analyse = OL._analyse_file
+
+            def _spy_analyse(p, hasher, **kwargs):
+                analysed.append(p)
+                return real_analyse(p, hasher, **kwargs)
+
+            with patch.object(OL, "_analyse_file", side_effect=_spy_analyse):
+                count = idx.rebuild()
+            assert count == 2
+            assert not analysed, (
+                "an unchanged file was re-analysed -- staleness detection "
+                "broke after content eviction"
+            )
+            assert idx._row_cache[cache_key].sha256 == sha_before
+            assert idx._row_cache[cache_key].content is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_archival_metadata_refresh_preserves_content(self, tmp_path: Path) -> None:
+        """A row whose ONLY change is its archival classification (a twin
+        file appears later) is re-inserted via the "update non-stale cached
+        rows" path in _apply_precomputed, which reuses the CACHED (already
+        content-evicted) row. The fix must re-read the real content from
+        DuckDB before re-inserting -- never silently overwrite already-
+        persisted content with NULL."""
+        archival = tmp_path / "run_old.csv"
+        archival.write_bytes(b"a,b\n1,2\n")
+        # A same-size (but different-content) sibling present from the
+        # start forces a REAL sha256 to be computed for run_old.csv during
+        # its OWN initial indexing (the size-prefilter, e1fd4182, skips
+        # hashing a uniquely-sized file entirely) -- needed so the archival
+        # comparison below has a real hash to compare once the canonical
+        # twin appears; run_old.csv itself is never re-hashed once cached.
+        (tmp_path / "helper.csv").write_bytes(b"x,y\n9,9\n")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            cache_key = next(p for p in idx._row_cache if p.endswith("run_old.csv"))
+            assert idx._row_cache[cache_key].content is None
+            assert idx._row_cache[cache_key].is_archival is False  # no twin yet
+            content_before = idx.get_content(cache_key)
+            assert content_before is not None and "a,b" in content_before
+
+            # Add the canonical twin (identical content) -- flips
+            # run_old.csv's archival classification via the metadata-refresh
+            # path, WITHOUT run_old.csv itself being touched/re-stat'd as
+            # stale this call.
+            canonical = tmp_path / "run.csv"
+            canonical.write_bytes(b"a,b\n1,2\n")
+            idx.rebuild()
+
+            assert idx._row_cache[cache_key].is_archival is True, (
+                "twin addition should have flipped is_archival via the "
+                "non-stale metadata-refresh path"
+            )
+            content_after = idx.get_content(cache_key)
+            assert content_after == content_before, (
+                "a metadata-only archival refresh must never null out "
+                "already-persisted content"
+            )
+            assert idx._row_cache[cache_key].content is None, (
+                "the metadata refresh must not re-inflate row_cache with "
+                "full content"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_rehydrate_from_disk_does_not_load_content(self, tmp_path: Path) -> None:
+        """A fresh OutputsFtsIndex pointed at an existing on-disk DB (process
+        restart / cache-eviction scenario) must not re-materialise every
+        row's full content into _row_cache on connect() -- only cheap
+        metadata should be rehydrated."""
+        (tmp_path / "big.csv").write_text(
+            "col\n" + ("x" * 5000), encoding="utf-8",
+        )
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild()
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx2._connect()  # triggers _rehydrate_cache_from_disk
+            cache_key = next(p for p in idx2._row_cache if p.endswith("big.csv"))
+            assert idx2._row_cache[cache_key].content is None, (
+                "_rehydrate_cache_from_disk must not load content into "
+                "row_cache on a fresh connect()"
+            )
+            content = idx2.get_content(cache_key)
+            assert content is not None
+            assert "x" * 100 in content
+        finally:
+            idx2.close()
+
+
+# ---------------------------------------------------------------------------
 # Module-level API: search_outputs, annotate_outputs, classify_outputs,
 # resolve_figure_output
 # ---------------------------------------------------------------------------
@@ -2656,6 +2839,195 @@ class TestConfigurableMaxWorkers:
             idx.close()
         assert seen, "ThreadPoolExecutor was never constructed"
         assert seen[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# 1bce8c41 -- walk-batch cap vs. DB write-chunk size decoupling
+# ---------------------------------------------------------------------------
+
+class TestWalkBatchDefaultUnbounded:
+    """FOLLOW-UP to 3535b9ad: _ResumableFileWalk's own default must no
+    longer cap the walk at an arbitrary file count (2000) -- the walk should
+    be time-primary by default, stopping only on `deadline` (or true
+    exhaustion), while an explicit override still works for anyone who
+    deliberately wants a count cap."""
+
+    def test_class_default_is_effectively_unbounded(self) -> None:
+        assert OL._ResumableFileWalk._MAX_BATCH >= 1_000_000
+
+    def test_default_walk_not_capped_at_old_2000_default(
+        self, tmp_path: Path,
+    ) -> None:
+        n = 2500  # exceeds the OLD hardcoded default of 2000
+        for i in range(n):
+            (tmp_path / f"f{i:05d}.csv").write_text("col\n1", encoding="utf-8")
+        walk = OL._ResumableFileWalk(str(tmp_path))
+        chunk = walk.drain(time.monotonic() + 60.0)
+        assert len(chunk) == n, (
+            f"drain() returned {len(chunk)}/{n} paths with a generous "
+            "deadline -- the walk appears to still be capped at an "
+            "arbitrary file count instead of being time-primary"
+        )
+        assert walk.exhausted is True
+
+    def test_explicit_constructor_arg_still_caps_the_walk(
+        self, tmp_path: Path,
+    ) -> None:
+        """An explicit override must still work for anyone who deliberately
+        wants a real count cap -- the decoupling only changes the DEFAULT."""
+        for i in range(50):
+            (tmp_path / f"g{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        walk = OL._ResumableFileWalk(str(tmp_path), max_batch=10)
+        chunk = walk.drain(time.monotonic() + 60.0)
+        assert len(chunk) == 10
+        assert walk.exhausted is False
+
+    def test_env_var_still_caps_the_walk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL._ResumableFileWalk._MAX_BATCH_ENV_VAR, "10")
+        for i in range(50):
+            (tmp_path / f"h{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        walk = OL._ResumableFileWalk(str(tmp_path))
+        chunk = walk.drain(time.monotonic() + 60.0)
+        assert len(chunk) == 10
+        assert walk.exhausted is False
+
+
+class TestWriteChunkDecoupling:
+    """1bce8c41 -- the DB write-chunk size (_WRITE_CHUNK, used to batch
+    INSERT/DELETE statements against DuckDB) must stay at a small, tuned
+    default independent of _ResumableFileWalk._MAX_BATCH's new effectively-
+    unbounded default. Naively sharing one knob for both concerns would
+    have turned every DB write into one giant, unchunked SQL statement by
+    default -- a new resource-exhaustion risk replacing the one just fixed."""
+
+    def test_default_write_chunk_is_2000_while_walk_cap_is_unbounded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, raising=False)
+        monkeypatch.delenv(OL._ResumableFileWalk._MAX_BATCH_ENV_VAR, raising=False)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._write_chunk == 2000
+            assert idx._max_batch == OL._ResumableFileWalk._MAX_BATCH
+            assert idx._max_batch > idx._write_chunk
+        finally:
+            idx.close()
+
+    def test_write_chunk_constructor_override(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), write_chunk=250)
+        try:
+            assert idx._write_chunk == 250
+            # The walk's own cap is untouched by this override.
+            assert idx._max_batch == OL._ResumableFileWalk._MAX_BATCH
+        finally:
+            idx.close()
+
+    def test_write_chunk_env_var_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, "500")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._write_chunk == 500
+        finally:
+            idx.close()
+
+    def test_constructor_overrides_write_chunk_env_var(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, "500")
+        idx = OL.OutputsFtsIndex(str(tmp_path), write_chunk=42)
+        try:
+            assert idx._write_chunk == 42
+        finally:
+            idx.close()
+
+    def test_invalid_write_chunk_env_var_falls_back_to_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, "not-an-int")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._write_chunk == 2000
+        finally:
+            idx.close()
+
+    def test_non_positive_write_chunk_falls_back_to_default(
+        self, tmp_path: Path,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), write_chunk=0)
+        try:
+            assert idx._write_chunk == 2000
+        finally:
+            idx.close()
+
+    def test_max_batch_env_var_does_not_affect_write_chunk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The two knobs are fully independent in BOTH directions: setting
+        the WALK's env var must not perturb the write-chunk default either."""
+        monkeypatch.setenv(OL._ResumableFileWalk._MAX_BATCH_ENV_VAR, "999")
+        monkeypatch.delenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, raising=False)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._max_batch == 999
+            assert idx._write_chunk == 2000
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_delete_writes_are_chunked_at_configured_write_chunk_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Integration proof that _WRITE_CHUNK actually bounds the real
+        DELETE statement batching -- not just the resolved attribute --
+        even though the walk's own default max_batch is effectively
+        unbounded and would otherwise let a single call re-stage every row
+        for delete+reinsert in one shot."""
+        n = 120
+        for i in range(n):
+            (tmp_path / f"w{i:04d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), write_chunk=10)
+        try:
+            assert idx._write_chunk == 10
+            assert idx._max_batch == OL._ResumableFileWalk._MAX_BATCH
+            assert idx._max_batch > n
+
+            count = idx.rebuild(max_seconds=60)
+            assert count == n
+
+            # Mark every file stale so the next rebuild() issues a real
+            # DELETE-then-reinsert for all n paths.
+            for p in list(idx._row_cache):
+                os.utime(p, None)
+
+            con = idx._connect()
+            conn_cls = type(con)
+            real_execute = conn_cls.execute
+            delete_chunk_sizes: list[int] = []
+
+            def spy_execute(self, sql, parameters=None):
+                if isinstance(sql, str) and sql.startswith(
+                    "DELETE FROM outputs_index WHERE path IN"
+                ):
+                    delete_chunk_sizes.append(len(parameters) if parameters else 0)
+                if parameters is not None:
+                    return real_execute(self, sql, parameters)
+                return real_execute(self, sql)
+
+            monkeypatch.setattr(conn_cls, "execute", spy_execute)
+            idx.rebuild(max_seconds=60)
+
+            assert delete_chunk_sizes, "expected at least one chunked DELETE statement"
+            assert all(size <= 10 for size in delete_chunk_sizes), (
+                f"DELETE chunk exceeded the configured write_chunk=10: "
+                f"{delete_chunk_sizes}"
+            )
+            assert sum(delete_chunk_sizes) == n
+        finally:
+            idx.close()
 
 
 # ---------------------------------------------------------------------------

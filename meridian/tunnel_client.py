@@ -3264,11 +3264,25 @@ def _build_proxy_for_inner(
     On Windows ``--shell`` is added only when the inner launcher is a ``.cmd``/
     ``.bat`` shim (Node 24 CVE-2024-27980 mitigation), matching the other builders.
 
+    0675d588 — a *built-in* inner command (e.g. the ``debug`` slot's static
+    ``["npx", "-y", "@debugmcp/mcp-debugger"]``) carries the literal, unresolved
+    string ``"npx"`` as its first token: on Windows that's the extension-less
+    shell shim, and since it doesn't end in ``.cmd``/``.bat`` the ``--shell``
+    mitigation above never triggers, so mcp-proxy's direct (no-shell) spawn of
+    it raises ``ENOENT`` (the same failure class :func:`_find_npx` exists to
+    avoid for the *outer* npx — that resolution was never applied to *inner*
+    commands). Resolve a literal ``"npx"`` inner token through :func:`_find_npx`
+    here, once, at the single choke point every inner command passes through —
+    this then also makes the ``--shell`` check above trigger correctly, since
+    the resolved path ends in ``.cmd`` on Windows.
+
     *stateless* (4ea1b9d5) — when False, ``--stateless`` is omitted so the inner
     server keeps state across requests. Used for ``session_mode: "persistent"``
     slots like Desktop Commander, whose terminal sessions must survive between
     calls; ``--stateless`` would reset them on every POST.
     """
+    if inner_cmd and inner_cmd[0] == "npx":
+        inner_cmd = [_find_npx(), *inner_cmd[1:]]
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port), "--server", "stream"]
     if stateless:
         cmd.append("--stateless")

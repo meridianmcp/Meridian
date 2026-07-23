@@ -1500,6 +1500,27 @@ def test_build_proxy_for_inner_structure():
     assert cmd[cmd.index("--") + 1:] == ["codegraph", "--stdio"]
 
 
+def test_build_proxy_for_inner_resolves_bare_npx_inner_command(monkeypatch):
+    """0675d588 — a literal ``"npx"`` inner token (e.g. the debug slot's static
+    default) must be resolved via _find_npx, not passed through bare: on
+    Windows a bare npx is the extension-less shim, and since it doesn't end in
+    .cmd/.bat the --shell mitigation never triggers, so mcp-proxy's no-shell
+    spawn of it raises ENOENT."""
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.setattr(tc, "_find_npx", lambda: r"C:\npm\npx.cmd")
+    cmd = tc._build_proxy_for_inner("npx.cmd", ["npx", "-y", "@debugmcp/mcp-debugger"], 8821)
+    inner = cmd[cmd.index("--") + 1:]
+    assert inner == [r"C:\npm\npx.cmd", "-y", "@debugmcp/mcp-debugger"]
+    # Resolved to a .cmd shim -> the existing Windows shell mitigation fires.
+    assert "--shell" in cmd
+
+
+def test_build_proxy_for_inner_leaves_non_npx_inner_command_untouched(monkeypatch):
+    monkeypatch.setattr(tc, "_find_npx", lambda: r"C:\npm\npx.cmd")
+    cmd = tc._build_proxy_for_inner("npx", ["codegraph", "--stdio"], 8809)
+    assert cmd[cmd.index("--") + 1:] == ["codegraph", "--stdio"]
+
+
 def test_build_proxy_for_inner_no_shell_for_exe_on_windows(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "win32")
     cmd = tc._build_proxy_for_inner("npx.cmd", ["codegraph.exe"], 8809)

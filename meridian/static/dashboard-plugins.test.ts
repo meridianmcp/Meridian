@@ -3,9 +3,11 @@
 // f5e1ed49 — the reference-manager (Zotero) status row: _renderZoteroStatusRow
 // maps GET /tunnel/status (zotero_active + optional slot_status.zotero) to the
 // same three-state status badge the other slot rows use.
-// 78114fa6 — the stale-override "Use new default" handler: _applyStaleOverrideDefault
-// must POPULATE the slot command input with the new built-in default (e.g.
-// `uvx docx-mcp` for the word slot), not CLEAR it.
+// 97dc51ab — the stale-override "Use new default" handler: _applyStaleOverrideDefault
+// must CLEAR the slot command input (not write the server-rendered new-default
+// string) so collectConfig() sends no override and the tunnel client recomputes
+// its own correct local default at spawn time. Reverses 78114fa6's populate design,
+// which pinned every client to a Fly.io-container-local absolute path.
 //
 // dashboard-plugins.ts is a legacy *script* module (symbols land on `window`,
 // not ES exports), so we import it for side effects and read the functions off
@@ -109,17 +111,16 @@ describe("_renderZoteroStatusRow", () => {
 });
 
 describe("_applyStaleOverrideDefault", () => {
-  it("POPULATES the command input with the new default (does not clear it)", () => {
+  it("CLEARS the command input rather than writing the server-resolved default", () => {
     const { input, btn } = buildRow({ command: "uvx docx-mcp-server", newer: "uvx docx-mcp" });
     _applyStaleOverrideDefault(btn);
-    expect(input.value).toBe("uvx docx-mcp");
-    expect(input.value).not.toBe("");
+    expect(input.value).toBe("");
   });
 
-  it("overwrites a stale command value with the new default", () => {
+  it("clears a stale command value back to empty (so the client recomputes the default)", () => {
     const { input, btn } = buildRow({ command: "uvx word-mcp-live", newer: "uvx docx-mcp" });
     _applyStaleOverrideDefault(btn);
-    expect(input.value).toBe("uvx docx-mcp");
+    expect(input.value).toBe("");
   });
 
   it("fires an 'input' event so collectConfig picks up the change", () => {
@@ -150,7 +151,7 @@ describe("_applyStaleOverrideDefault", () => {
   });
 });
 
-describe("_renderStaleOverrideWarning wires the populate handler", () => {
+describe("_renderStaleOverrideWarning wires the clear handler", () => {
   it("renders a button carrying the joined new default on data-newer (word slot)", () => {
     const render = (window as any)._renderStaleOverrideWarning as (p: any) => string;
     const html = render({
@@ -165,7 +166,7 @@ describe("_renderStaleOverrideWarning wires the populate handler", () => {
     expect(html).toContain("Use new default");
   });
 
-  it("wires render -> click end-to-end: clicking populates the command field", () => {
+  it("wires render -> click end-to-end: clicking clears the command field", () => {
     const render = (window as any)._renderStaleOverrideWarning as (p: any) => string;
     const host = document.createElement("div");
     host.setAttribute("data-lifecycle", "installed_inactive");
@@ -183,7 +184,7 @@ describe("_renderStaleOverrideWarning wires the populate handler", () => {
     );
     const btn = host.querySelector(".tp-reset-default") as HTMLElement;
     _applyStaleOverrideDefault(btn);
-    expect(input.value).toBe("uvx docx-mcp");
+    expect(input.value).toBe("");
   });
 });
 

@@ -38,7 +38,7 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -372,13 +372,31 @@ class _ResumableFileWalk:
     # constraint is now gone (pyarrow bulk insert, 4f78e70: 2000 rows write in
     # ~0.11s), and Phase 1/the walk are both also now dramatically faster
     # (c73c0dd7, 7fee82e, 4972a6d), so the ORIGINAL reason for capping at
-    # exactly 2000 no longer applies at the same weight. The class default is
-    # deliberately left UNCHANGED here -- the item's own suggested approach is
-    # to benchmark candidate values (5000/10000/20000) against a real full-tree
-    # run (db4bb64b) once this configurability lands, rather than guess a new
-    # number without that data. This just makes the cap override-able so that
-    # benchmark (and any future retuning) doesn't require a code change.
-    _MAX_BATCH = 2000
+    # exactly 2000 no longer applies at the same weight.
+    #
+    # 1bce8c41 -- FOLLOW-UP: 3535b9ad shipped configurability but left the
+    # DEFAULT at 2000, so even a caller supplying a generous `max_seconds`
+    # budget still stopped every drain() at 2000 files, wasting the rest of
+    # its own time budget instead of walking closer to the full tree per
+    # call (confirmed live against db4bb64b's real 244k-file convergence
+    # run). The walk should be TIME-primary by default, not count-primary --
+    # every drain() call already checks `deadline` on every single path
+    # pulled (see drain() below), so raising this default doesn't weaken that
+    # bound at all; it just stops an arbitrary, far-too-small count cap from
+    # firing first. Bumped to an "effectively unbounded" default so the walk
+    # only ever stops on `deadline` (or true exhaustion) by default, while an
+    # explicit constructor arg or MERIDIAN_OUTPUTS_MAX_BATCH env var (see
+    # _resolve_max_batch) still lets anyone who deliberately wants a real
+    # count cap set one.
+    #
+    # IMPORTANT: this constant is a WALK-only concern (this class's own
+    # per-drain() cap, and OutputsFtsIndex's related walk-vs-analysis
+    # throttle in rebuild()'s Phase 0). It must NOT also become the DB
+    # write-chunk size (_WRITE_CHUNK) -- OutputsFtsIndex.__init__ resolves
+    # that SEPARATELY via its own `_WRITE_CHUNK_DEFAULT`/`_resolve_write_
+    # chunk`, specifically so bumping this default doesn't silently turn
+    # every DB write into one giant, unchunked SQL statement.
+    _MAX_BATCH = 1_000_000_000
     _MAX_BATCH_ENV_VAR = "MERIDIAN_OUTPUTS_MAX_BATCH"
 
     @classmethod
@@ -947,10 +965,24 @@ def classify_canonical_archival(
 
 @dataclass
 class OutputRow:
-    """One row of the persistent outputs_index table."""
+    """One row of the persistent outputs_index table.
+
+    edc84500 -- ``content`` (the full extracted CSV/JSON/text body used for
+    FTS) is the one HEAVY field here; every other field is a small scalar.
+    Once a row has been committed to DuckDB and staged for its Tantivy
+    commit, :class:`OutputsFtsIndex` evicts ``content`` back to ``None`` in
+    its long-lived ``_row_cache`` (see ``_apply_precomputed``/``_light_row``)
+    so the cache never holds one full file body per discovered file for the
+    lifetime of the process -- that unbounded growth is what caused a real
+    OS-level allocator failure at ~96,000/244,191 files on a real tree. A
+    ``None`` content means "not resident in memory, re-read it from the
+    persistent ``outputs_index`` table by path if you actually need it"
+    (see :meth:`OutputsFtsIndex.get_content`) -- it does NOT mean the row is
+    stale, incomplete, or unindexed.
+    """
 
     path: str
-    content: str
+    content: str | None
     mtime: float | None
     sha256: str | None
     size: int | None
@@ -963,6 +995,22 @@ class OutputRow:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _light_row(row: OutputRow) -> OutputRow:
+    """Return a copy of ``row`` with the heavy ``content`` field evicted.
+
+    edc84500 -- this is what :class:`OutputsFtsIndex` stores in its
+    long-lived ``_row_cache`` once a row has been (or is about to be)
+    persisted: every lightweight field callers actually read off a cached
+    row (sha256 for archival dedup, size for the size-prefilter, mtime/kind/
+    csv_columns/json_keys/generating_script/is_archival/canonical_path for
+    staleness + metadata bookkeeping) survives unchanged; only ``content``
+    -- never read from ``_row_cache`` anywhere in this module, see
+    ``search``/``resolve_output``/``get_content``, which all query DuckDB
+    directly -- is dropped.
+    """
+    return replace(row, content=None)
 
 
 def build_output_rows(
@@ -1311,6 +1359,56 @@ class OutputsFtsIndex:
         "kind", "is_archival", "canonical_path", "csv_columns", "json_keys",
     )
 
+    # 1bce8c41 -- DB write-chunk size (INSERT/DELETE batching against
+    # DuckDB, see `_WRITE_CHUNK` in rebuild()), decoupled from
+    # `_ResumableFileWalk._MAX_BATCH` (the walk's own per-drain() count cap).
+    # Before this, both concerns shared one constant/knob: bumping the
+    # walk's default towards "effectively unbounded" (so a generous
+    # `max_seconds` budget isn't wasted stopping at an arbitrary file count)
+    # would ALSO have made every DB write one giant, unchunked SQL statement
+    # by default -- a new unbounded-parameter-count/memory-spike risk
+    # replacing the one just fixed. This keeps the write-chunk default at
+    # the same tuned value (2000) the shared knob used before 1bce8c41,
+    # independent of whatever the walk's own default becomes.
+    _WRITE_CHUNK_DEFAULT = 2000
+    _WRITE_CHUNK_ENV_VAR = "MERIDIAN_OUTPUTS_WRITE_CHUNK"
+
+    @classmethod
+    def _resolve_write_chunk(cls, explicit: int | None) -> int:
+        """Precedence: explicit constructor arg > env var > class default.
+
+        Mirrors :meth:`_ResumableFileWalk._resolve_max_batch`'s precedence
+        pattern exactly, but resolves an entirely independent value/env var
+        (see the ``_WRITE_CHUNK_DEFAULT`` comment above for why the two must
+        not share a knob).
+        """
+        if explicit is not None:
+            if explicit >= 1:
+                return explicit
+            _log.warning(
+                "OutputsFtsIndex: write_chunk=%r must be >= 1 -- falling "
+                "back to default (%d)", explicit, cls._WRITE_CHUNK_DEFAULT,
+            )
+            return cls._WRITE_CHUNK_DEFAULT
+        raw = os.environ.get(cls._WRITE_CHUNK_ENV_VAR)
+        if raw is None or not raw.strip():
+            return cls._WRITE_CHUNK_DEFAULT
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            _log.warning(
+                "%s=%r is not a valid integer -- falling back to default (%d)",
+                cls._WRITE_CHUNK_ENV_VAR, raw, cls._WRITE_CHUNK_DEFAULT,
+            )
+            return cls._WRITE_CHUNK_DEFAULT
+        if value < 1:
+            _log.warning(
+                "%s=%r must be >= 1 -- falling back to default (%d)",
+                cls._WRITE_CHUNK_ENV_VAR, raw, cls._WRITE_CHUNK_DEFAULT,
+            )
+            return cls._WRITE_CHUNK_DEFAULT
+        return value
+
     def __init__(
         self,
         outputs_dir: str,
@@ -1322,6 +1420,7 @@ class OutputsFtsIndex:
         exclude_patterns: tuple[str, ...] | None = None,
         tantivy_heap_bytes: int | None = None,
         max_batch: int | None = None,
+        write_chunk: int | None = None,
     ) -> None:
         self.outputs_dir = outputs_dir
         self._db_path = db_path
@@ -1335,10 +1434,15 @@ class OutputsFtsIndex:
         # tantivy's own undersized default, measured ~3x faster commits).
         self._tantivy_heap_bytes = _resolve_tantivy_heap_bytes(tantivy_heap_bytes)
         # 3535b9ad -- walk batch cap: explicit param > MERIDIAN_OUTPUTS_MAX_BATCH
-        # env var > 2000 class default (the previous unconfigurable behaviour).
-        # Also used for the DB write chunk size (_WRITE_CHUNK), which shared
-        # the same constant before this change.
+        # env var > class default (1bce8c41: an effectively-unbounded default,
+        # time-primary -- see _ResumableFileWalk._MAX_BATCH). This value feeds
+        # ONLY the walk's own per-drain() cap and the walk-vs-analysis
+        # throttle below; it no longer feeds the DB write-chunk size.
         self._max_batch = _ResumableFileWalk._resolve_max_batch(max_batch)
+        # 1bce8c41 -- DB write-chunk size: explicit param > MERIDIAN_OUTPUTS_
+        # WRITE_CHUNK env var > 2000 default. Deliberately resolved
+        # independently of `self._max_batch` above -- see `_WRITE_CHUNK_DEFAULT`.
+        self._write_chunk = self._resolve_write_chunk(write_chunk)
         # fd4dd661 -- user-configurable gitignore-style exclude patterns:
         # explicit param > MERIDIAN_OUTPUTS_EXCLUDE_PATTERNS env var > empty
         # (unchanged default behaviour -- only secret-file exclusion applies).
@@ -1480,7 +1584,20 @@ class OutputsFtsIndex:
         """Populate ``_manifest``/``_row_cache`` from any pre-existing rows in
         the on-disk ``outputs_index`` table, so a fresh process resumes prior
         progress instead of treating every file as stale again. No-op (and
-        cheap) when the table doesn't exist yet or is empty."""
+        cheap) when the table doesn't exist yet or is empty.
+
+        edc84500 -- deliberately does NOT select the ``content`` column: the
+        rows rehydrated here are, by definition, already fully persisted (we
+        just read them back from disk), so there is nothing to re-commit and
+        no reason to ever materialise their (potentially huge, per-file)
+        text bodies into memory just to immediately evict them again. On a
+        tree with hundreds of thousands of already-indexed rows this is the
+        difference between a cheap metadata-only rehydration and briefly
+        holding the entire tree's extracted content in memory on every
+        process restart -- the same class of unbounded growth this item
+        fixes for the walk/write path, just at connect() time instead of
+        during rebuild().
+        """
         con = self._con
         if con is None:
             return
@@ -1495,7 +1612,7 @@ class OutputsFtsIndex:
             return
         try:
             relation = con.execute(
-                "SELECT path, content, mtime, sha256, size, "
+                "SELECT path, mtime, sha256, size, "
                 "generating_script, kind, is_archival, canonical_path, "
                 "csv_columns, json_keys FROM outputs_index"
             )
@@ -1514,7 +1631,7 @@ class OutputsFtsIndex:
                 continue
             row = OutputRow(
                 path=path,
-                content=rec.get("content"),
+                content=None,  # edc84500 -- never resident; re-read on demand.
                 mtime=rec.get("mtime"),
                 sha256=rec.get("sha256"),
                 size=rec.get("size"),
@@ -2239,7 +2356,13 @@ class OutputsFtsIndex:
                     # faster than plain executemany) when pyarrow isn't
                     # installed, so this degrades gracefully rather than
                     # hard-requiring the new dependency.
-                    _WRITE_CHUNK = self._max_batch
+                    # 1bce8c41 -- self._write_chunk, NOT self._max_batch: the
+                    # walk's own count cap and the DB write-chunk size are
+                    # deliberately decoupled (see _WRITE_CHUNK_DEFAULT) so
+                    # that self._max_batch's new effectively-unbounded
+                    # default (time-primary walk convergence) can never
+                    # silently turn this into one giant, unchunked write.
+                    _WRITE_CHUNK = self._write_chunk
                     if paths_to_delete:
                         for i in range(0, len(paths_to_delete), _WRITE_CHUNK):
                             chunk = paths_to_delete[i:i + _WRITE_CHUNK]
@@ -2429,6 +2552,14 @@ class OutputsFtsIndex:
         The split between ``paths_to_delete`` and ``new_rows`` enables the
         targeted delete + batched insert that replaces the old DELETE-all /
         reinsert-all pattern.
+
+        edc84500 -- ``new_rows`` (and therefore ``all_rows``'s inputs before
+        caching) always carry REAL content: either freshly extracted this
+        call, or re-read from DuckDB on demand (see the archival-metadata
+        refresh loop below). ``self._row_cache`` itself only ever stores the
+        light (content-evicted) copy -- see :func:`_light_row` -- so it never
+        re-accumulates the unbounded, per-file text bodies that caused a real
+        OS-level allocator failure at ~96,000/244,191 files on a real tree.
         """
         self.last_rebuild_partial = False
         changed = False
@@ -2476,7 +2607,13 @@ class OutputsFtsIndex:
                 csv_columns=fp.csv_columns,
                 json_keys=fp.json_keys,
             )
-            self._row_cache[p] = row
+            # edc84500 -- `new_rows` keeps the FULL row (real content, just
+            # extracted) so the imminent DB write + Tantivy commit below get
+            # the real text. `_row_cache` only ever stores the light
+            # (content-evicted) copy -- this is the actual eviction point:
+            # content is never resident in `_row_cache` for longer than the
+            # tail end of the SAME rebuild() call that produced it.
+            self._row_cache[p] = _light_row(row)
             self._manifest[p] = stale_sigs.get(p, (mtime, size))
             paths_to_delete.append(p)  # delete old row (if any) before reinserting
             new_rows.append(row)
@@ -2496,11 +2633,29 @@ class OutputsFtsIndex:
                 new_canonical = cls.canonical_path if cls else None
                 if (row.is_archival != new_is_archival
                         or row.canonical_path != new_canonical):
+                    # edc84500 -- `row` here is a CACHED (light) row, so
+                    # `row.content` is normally already None (evicted after a
+                    # prior commit). Re-insertion below must never write that
+                    # None over the real, already-persisted content -- read
+                    # it back from DuckDB first whenever it isn't resident.
+                    # (A non-evicted `row.content` -- e.g. this same path was
+                    # ALSO stale this call, though `p in stale_set` already
+                    # excludes that -- is reused as-is, no extra read.)
+                    content = (
+                        row.content if row.content is not None
+                        else self._fetch_content_from_db(p)
+                    )
+                    full_row = replace(
+                        row, content=content, is_archival=new_is_archival,
+                        canonical_path=new_canonical,
+                    )
+                    # Keep the cached entry itself light -- only the two
+                    # metadata fields change; content stays evicted.
                     row.is_archival = new_is_archival
                     row.canonical_path = new_canonical
                     # This row changed -- include it in the targeted update.
                     paths_to_delete.append(p)
-                    new_rows.append(row)
+                    new_rows.append(full_row)
                     changed = True
 
         all_rows = [self._row_cache[p] for p in all_paths if p in self._row_cache]
@@ -2712,6 +2867,69 @@ class OutputsFtsIndex:
                 json.loads(rec["json_keys"]) if rec.get("json_keys") else None
             ),
         }
+
+    def _fetch_content_from_db(self, path: str) -> str | None:
+        """Read the persisted FTS ``content`` body for the EXACT (already
+        stored-form) ``path`` directly from the ``outputs_index`` table.
+
+        edc84500 -- the one and only place ``content`` should ever be read
+        back once it has been evicted from ``_row_cache``. ``path`` must
+        already match the DB's stored form exactly (no
+        :func:`_normalize_output_path` case/slash normalisation) -- callers
+        with a raw filesystem path from ``all_paths``/``_row_cache`` keys
+        satisfy this directly; :meth:`get_content` (the public, user-facing
+        lookup) normalises first via the platform-aware SQL that
+        :meth:`resolve_output` also uses.
+        """
+        try:
+            con = self._connect()
+            self._ensure_schema(con)
+            row = con.execute(
+                "SELECT content FROM outputs_index WHERE path = ?", [path],
+            ).fetchone()
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "OutputsFtsIndex._fetch_content_from_db failed for %r",
+                path, exc_info=True,
+            )
+            return None
+        return row[0] if row is not None else None
+
+    def get_content(self, file_path: str) -> str | None:
+        """Return the indexed FTS content body for ``file_path``, or
+        ``None`` if the path isn't indexed.
+
+        edc84500 -- ``_row_cache`` evicts a row's ``content`` back to
+        ``None`` once it has been committed (see ``_apply_precomputed``);
+        this is the supported way for a caller to get the real text back
+        on demand, by reading it straight from the persistent
+        ``outputs_index`` table -- never read
+        ``self._row_cache[path].content`` directly, it may be stale/``None``
+        even for a fully-indexed, up-to-date row. Mirrors
+        :meth:`resolve_output`'s platform-aware path matching (Windows:
+        case/slash-insensitive; POSIX: exact).
+        """
+        target = _normalize_output_path(file_path)
+        if not target:
+            return None
+        import sys as _sys
+        with self._read_lock:
+            try:
+                con = self._connect()
+                self._ensure_schema(con)
+                if _sys.platform == "win32":
+                    sql = (
+                        "SELECT content FROM outputs_index "
+                        "WHERE lower(replace(path, '\\', '/')) = ?"
+                    )
+                else:
+                    sql = "SELECT content FROM outputs_index WHERE path = ?"
+                row = con.execute(sql, [target]).fetchone()
+            except Exception:  # noqa: BLE001
+                _log.debug("OutputsFtsIndex.get_content failed for %r",
+                            file_path, exc_info=True)
+                return None
+        return row[0] if row is not None else None
 
     def close(self) -> None:
         with self._write_lock:
