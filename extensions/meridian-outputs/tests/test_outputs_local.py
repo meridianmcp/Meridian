@@ -2842,6 +2842,195 @@ class TestConfigurableMaxWorkers:
 
 
 # ---------------------------------------------------------------------------
+# 1bce8c41 -- walk-batch cap vs. DB write-chunk size decoupling
+# ---------------------------------------------------------------------------
+
+class TestWalkBatchDefaultUnbounded:
+    """FOLLOW-UP to 3535b9ad: _ResumableFileWalk's own default must no
+    longer cap the walk at an arbitrary file count (2000) -- the walk should
+    be time-primary by default, stopping only on `deadline` (or true
+    exhaustion), while an explicit override still works for anyone who
+    deliberately wants a count cap."""
+
+    def test_class_default_is_effectively_unbounded(self) -> None:
+        assert OL._ResumableFileWalk._MAX_BATCH >= 1_000_000
+
+    def test_default_walk_not_capped_at_old_2000_default(
+        self, tmp_path: Path,
+    ) -> None:
+        n = 2500  # exceeds the OLD hardcoded default of 2000
+        for i in range(n):
+            (tmp_path / f"f{i:05d}.csv").write_text("col\n1", encoding="utf-8")
+        walk = OL._ResumableFileWalk(str(tmp_path))
+        chunk = walk.drain(time.monotonic() + 60.0)
+        assert len(chunk) == n, (
+            f"drain() returned {len(chunk)}/{n} paths with a generous "
+            "deadline -- the walk appears to still be capped at an "
+            "arbitrary file count instead of being time-primary"
+        )
+        assert walk.exhausted is True
+
+    def test_explicit_constructor_arg_still_caps_the_walk(
+        self, tmp_path: Path,
+    ) -> None:
+        """An explicit override must still work for anyone who deliberately
+        wants a real count cap -- the decoupling only changes the DEFAULT."""
+        for i in range(50):
+            (tmp_path / f"g{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        walk = OL._ResumableFileWalk(str(tmp_path), max_batch=10)
+        chunk = walk.drain(time.monotonic() + 60.0)
+        assert len(chunk) == 10
+        assert walk.exhausted is False
+
+    def test_env_var_still_caps_the_walk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL._ResumableFileWalk._MAX_BATCH_ENV_VAR, "10")
+        for i in range(50):
+            (tmp_path / f"h{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        walk = OL._ResumableFileWalk(str(tmp_path))
+        chunk = walk.drain(time.monotonic() + 60.0)
+        assert len(chunk) == 10
+        assert walk.exhausted is False
+
+
+class TestWriteChunkDecoupling:
+    """1bce8c41 -- the DB write-chunk size (_WRITE_CHUNK, used to batch
+    INSERT/DELETE statements against DuckDB) must stay at a small, tuned
+    default independent of _ResumableFileWalk._MAX_BATCH's new effectively-
+    unbounded default. Naively sharing one knob for both concerns would
+    have turned every DB write into one giant, unchunked SQL statement by
+    default -- a new resource-exhaustion risk replacing the one just fixed."""
+
+    def test_default_write_chunk_is_2000_while_walk_cap_is_unbounded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, raising=False)
+        monkeypatch.delenv(OL._ResumableFileWalk._MAX_BATCH_ENV_VAR, raising=False)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._write_chunk == 2000
+            assert idx._max_batch == OL._ResumableFileWalk._MAX_BATCH
+            assert idx._max_batch > idx._write_chunk
+        finally:
+            idx.close()
+
+    def test_write_chunk_constructor_override(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), write_chunk=250)
+        try:
+            assert idx._write_chunk == 250
+            # The walk's own cap is untouched by this override.
+            assert idx._max_batch == OL._ResumableFileWalk._MAX_BATCH
+        finally:
+            idx.close()
+
+    def test_write_chunk_env_var_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, "500")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._write_chunk == 500
+        finally:
+            idx.close()
+
+    def test_constructor_overrides_write_chunk_env_var(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, "500")
+        idx = OL.OutputsFtsIndex(str(tmp_path), write_chunk=42)
+        try:
+            assert idx._write_chunk == 42
+        finally:
+            idx.close()
+
+    def test_invalid_write_chunk_env_var_falls_back_to_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, "not-an-int")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._write_chunk == 2000
+        finally:
+            idx.close()
+
+    def test_non_positive_write_chunk_falls_back_to_default(
+        self, tmp_path: Path,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), write_chunk=0)
+        try:
+            assert idx._write_chunk == 2000
+        finally:
+            idx.close()
+
+    def test_max_batch_env_var_does_not_affect_write_chunk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The two knobs are fully independent in BOTH directions: setting
+        the WALK's env var must not perturb the write-chunk default either."""
+        monkeypatch.setenv(OL._ResumableFileWalk._MAX_BATCH_ENV_VAR, "999")
+        monkeypatch.delenv(OL.OutputsFtsIndex._WRITE_CHUNK_ENV_VAR, raising=False)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._max_batch == 999
+            assert idx._write_chunk == 2000
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_delete_writes_are_chunked_at_configured_write_chunk_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Integration proof that _WRITE_CHUNK actually bounds the real
+        DELETE statement batching -- not just the resolved attribute --
+        even though the walk's own default max_batch is effectively
+        unbounded and would otherwise let a single call re-stage every row
+        for delete+reinsert in one shot."""
+        n = 120
+        for i in range(n):
+            (tmp_path / f"w{i:04d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), write_chunk=10)
+        try:
+            assert idx._write_chunk == 10
+            assert idx._max_batch == OL._ResumableFileWalk._MAX_BATCH
+            assert idx._max_batch > n
+
+            count = idx.rebuild(max_seconds=60)
+            assert count == n
+
+            # Mark every file stale so the next rebuild() issues a real
+            # DELETE-then-reinsert for all n paths.
+            for p in list(idx._row_cache):
+                os.utime(p, None)
+
+            con = idx._connect()
+            conn_cls = type(con)
+            real_execute = conn_cls.execute
+            delete_chunk_sizes: list[int] = []
+
+            def spy_execute(self, sql, parameters=None):
+                if isinstance(sql, str) and sql.startswith(
+                    "DELETE FROM outputs_index WHERE path IN"
+                ):
+                    delete_chunk_sizes.append(len(parameters) if parameters else 0)
+                if parameters is not None:
+                    return real_execute(self, sql, parameters)
+                return real_execute(self, sql)
+
+            monkeypatch.setattr(conn_cls, "execute", spy_execute)
+            idx.rebuild(max_seconds=60)
+
+            assert delete_chunk_sizes, "expected at least one chunked DELETE statement"
+            assert all(size <= 10 for size in delete_chunk_sizes), (
+                f"DELETE chunk exceeded the configured write_chunk=10: "
+                f"{delete_chunk_sizes}"
+            )
+            assert sum(delete_chunk_sizes) == n
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
 # fd4dd661 -- user-configurable exclude patterns (gitignore-style, v1)
 # ---------------------------------------------------------------------------
 
