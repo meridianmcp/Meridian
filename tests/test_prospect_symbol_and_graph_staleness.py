@@ -759,6 +759,180 @@ class TestGraphEmptyAfterFreshIndex:
         assert call_count[0] == 1, f"expected 1 call, got {call_count[0]}"
         assert result.get("fallback_reason") == "graph_empty"
 
+    @pytest.mark.asyncio
+    async def test_app_level_project_not_found_error_retries_broad_and_succeeds(
+        self, monkeypatch,
+    ):
+        """1579bc1e — confirmed report: search_graph returns an app-level
+        "project not found"/"not indexed" error (not just zero hits) for a
+        project_id that doesn't match the repo-path slug index_repository
+        auto-assigned. The graph rung must retry WITHOUT project_id and,
+        when that succeeds, report hits instead of giving up with
+        graph_error — the exact same slug-mismatch fix as the zero-hits
+        case, just triggered by an explicit error payload."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        error_result = _text_result(
+            {"error": "project not found or not indexed", "code": 404}
+        )
+        hits_payload = _text_result({"results": [
+            {"file": "analysis.py", "line": 42, "name": "dominant_segments_from_group"},
+        ]})
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                if args.get("project_id"):
+                    return error_result
+                return hits_payload
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-app-err-mismatch"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="dominant_segments_from_group",
+            project_id="meridian-build",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        assert result["rung"] == "graph"
+        assert len(result["hits"]) == 1
+        assert result["hits"][0]["name"] == "dominant_segments_from_group"
+        fr = str(result.get("fallback_reason") or "")
+        assert "mismatch" in fr.lower()
+        assert "meridian-build" in fr
+
+    @pytest.mark.asyncio
+    async def test_app_level_unrelated_error_does_not_trigger_broad_retry(
+        self, monkeypatch,
+    ):
+        """An app-level error that is NOT project-related (e.g. a query
+        syntax error) must not trigger the broad no-project_id retry — only
+        genuine project-not-found-shaped errors should."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        error_result = _text_result({"error": "query syntax error near '('"})
+        call_count = [0]
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                call_count[0] += 1
+                return error_result
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-unrelated-err"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="dominant_segments_from_group",
+            project_id="meridian-build",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        assert result["rung"] == "none"
+        assert call_count[0] == 1, "unrelated error must not trigger a broad retry"
+        fr = str(result.get("fallback_reason") or "")
+        assert "graph_error" in fr
+        assert "query syntax error" in fr
+
+    @pytest.mark.asyncio
+    async def test_raised_project_not_found_exception_retries_broad_and_succeeds(
+        self, monkeypatch,
+    ):
+        """1579bc1e — the same slug mismatch can surface as a raised
+        exception from call_tunnel_tool (e.g. a JSON-RPC-level error,
+        possibly hint-enriched by _enrich_code_intel_project_error) rather
+        than a result payload at all. The graph rung must still retry
+        without project_id and succeed instead of falling straight to
+        Serena/semantic with a bare graph_error."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        hits_payload = _text_result({"results": [
+            {"file": "analysis.py", "line": 7, "name": "dominant_segments_from_group"},
+        ]})
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                if args.get("project_id"):
+                    raise RuntimeError(
+                        "project 'meridian-build' not found\n\n"
+                        "Note: code-intel graph tools identify a project by "
+                        "its LOCAL REPO-PATH slug..."
+                    )
+                return hits_payload
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-raised-mismatch"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="dominant_segments_from_group",
+            project_id="meridian-build",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        assert result["rung"] == "graph"
+        assert len(result["hits"]) == 1
+        assert result["hits"][0]["name"] == "dominant_segments_from_group"
+        fr = str(result.get("fallback_reason") or "")
+        assert "mismatch" in fr.lower()
+
+    @pytest.mark.asyncio
+    async def test_raised_unrelated_exception_does_not_trigger_broad_retry(
+        self, monkeypatch,
+    ):
+        """A raised exception unrelated to project lookup (e.g. a transport
+        failure) must not trigger the broad retry and must fall through to
+        Serena exactly as before."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        serena_result = _text_result([
+            {"file": "analysis.py", "line": 10, "name": "dominant_segments_from_group"},
+        ])
+        call_count = [0]
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                call_count[0] += 1
+                raise RuntimeError("tunnel transport error: connection reset")
+            if name == "extractor__find_symbol":
+                return serena_result
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-raised-unrelated"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="dominant_segments_from_group",
+            project_id="meridian-build",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        # Only one search_graph call — unrelated errors don't trigger retry.
+        assert call_count[0] == 1
+        assert result["rung"] == "serena"
+        assert result["hits"][0]["name"] == "dominant_segments_from_group"
+
 
 class TestFingerprintWildcardFallback:
     """9033914e — staleness fingerprint wildcard fallback for project-specific

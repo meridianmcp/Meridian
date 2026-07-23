@@ -1033,26 +1033,59 @@ async def _run_connection_lazy(
 
     async def _reprobe() -> None:
         """Background recovery: retry spawn + tools/list every
-        _SLOT_REPROBE_INTERVAL; on the first healthy probe, re-advertise."""
+        _SLOT_REPROBE_INTERVAL; on the first healthy probe, re-advertise.
+
+        c325b8eb — back off to _WATCHDOG_COOLDOWN_SECONDS after
+        _WATCHDOG_MAX_RETRIES straight failures, mirroring _proc_watchdog's
+        fast-retry-then-cooldown shape exactly. Without this the loop retried
+        at the flat _SLOT_REPROBE_INTERVAL (60s) forever with no escalation —
+        fine for a transient hiccup, but for a persistently-failing cold-fetch
+        slot (e.g. "dc": AV/Defender locking files on every single npx
+        extraction attempt, not just the first — see 3db4f8d8/4f680060) that
+        re-kicks a full cold-spawn sequence (Popen + cache-clear-retry + up to
+        the ~55s _PREFLIGHT_BUDGET_COLD_FETCH readiness probe) every ~60-115s
+        indefinitely: expensive, and it re-triggers the very same AV write-lock
+        race on every cycle instead of giving it room to clear. Never gives up
+        for good — same rationale as b9e4967d: the underlying cause (AV rule
+        change, network hiccup) may still clear on its own.
+        """
         nonlocal _unhealthy, _reprobe_task
+        failures = 0
+        interval = _SLOT_REPROBE_INTERVAL
+        gave_up_fast_retry = False
         while True:
-            await asyncio.sleep(_SLOT_REPROBE_INTERVAL)
+            await asyncio.sleep(interval)
+            recovered = False
             try:
                 # a898710a — _reprobe_once force-restarts a persistent slot that's
                 # alive-but-unhealthy (parent process up, inner MCP server dead).
-                if await _reprobe_once(
+                recovered = await _reprobe_once(
                     proxy, lambda port: _probe_slot_health(port, attempts=1)
-                ):
-                    _unhealthy = False
-                    _reprobe_task = None
-                    await _report_slot_health(ws, label, True)
-                    print(
-                        f"tunnel:{label}: slot recovered — re-advertising tools",
-                        flush=True,
-                    )
-                    return
+                )
             except Exception:  # noqa: BLE001 — keep retrying until cancelled
-                pass
+                recovered = False
+            if recovered:
+                _unhealthy = False
+                _reprobe_task = None
+                print(
+                    f"tunnel:{label}: slot recovered — re-advertising tools",
+                    flush=True,
+                )
+                await _report_slot_health(ws, label, True)
+                return
+            failures += 1
+            if failures > _WATCHDOG_MAX_RETRIES:
+                if not gave_up_fast_retry:
+                    print(
+                        f"tunnel:{label}: reprobe keeps failing (attempt "
+                        f"{failures}); giving up fast retries after "
+                        f"{_WATCHDOG_MAX_RETRIES} attempts — will keep retrying "
+                        f"every {_WATCHDOG_COOLDOWN_SECONDS:.0f}s in case the "
+                        "issue clears",
+                        file=sys.stderr, flush=True,
+                    )
+                    gave_up_fast_retry = True
+                interval = _WATCHDOG_COOLDOWN_SECONDS
 
     async def _mark_unhealthy(*, already_reported: bool = False) -> None:
         """Suppress this slot's tools and begin background recovery. Idempotent."""

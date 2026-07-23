@@ -4221,6 +4221,16 @@ async def _handle_plugin_tools(
                     for tn in slot_tool_names.get(slot, [])
                 ],
             }
+            # 4c61ae81 — surface stale_override (and its companion fields) here so
+            # reset_plugin_override's docstring claim ("surfaced by
+            # list_plugins/get_plugin_details") is actually true. resolve_plugins
+            # already computes this per-tenant; previously only `enabled` was read
+            # out of the resolved entry and the flag itself was dropped on the floor.
+            _resolved_entry = _resolved_by_slot.get(slot)
+            if _resolved_entry and _resolved_entry.get("stale_override"):
+                entry["stale_override"] = True
+                entry["newer_default_command"] = _resolved_entry.get("newer_default_command")
+                entry["newer_default_label"] = _resolved_entry.get("newer_default_label")
             if skill:
                 entry["skill_note"] = {
                     "title": skill.get("title", ""),
@@ -4246,7 +4256,7 @@ async def _handle_plugin_tools(
         }
 
     if name == "get_plugin_details":
-        from ..tunnel_plugins import BUILTIN_PLUGINS  # noqa: PLC0415
+        from ..tunnel_plugins import BUILTIN_PLUGINS, resolve_plugins  # noqa: PLC0415
         from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
         _slot_display = _tunnel_mod.SLOT_DISPLAY_NAMES
 
@@ -4264,6 +4274,26 @@ async def _handle_plugin_tools(
 
         slot = target["slot"]
         tenant_id = tenant.get("id") if tenant else None
+
+        # 4c61ae81 — resolve the SAME per-tenant config list_plugins reads, so
+        # `enabled` (and stale_override) agree between the two tools for the same
+        # slot at the same moment. Previously this branch read `enabled` straight
+        # off the static BUILTIN_PLUGINS default, while list_plugins read it off
+        # resolve_plugins()'s per-tenant merged config — an opt-in slot (word,
+        # powerpoint) the tenant had explicitly enabled showed enabled=True via
+        # list_plugins but enabled=False via get_plugin_details for the identical
+        # config, at the identical moment.
+        _raw_tp_gpd = tenant.get("tunnel_plugins") if tenant else None
+        if isinstance(_raw_tp_gpd, str) and _raw_tp_gpd.strip():
+            import json as _json_tp_gpd  # noqa: PLC0415
+            try:
+                _raw_tp_gpd = _json_tp_gpd.loads(_raw_tp_gpd)
+            except Exception:  # noqa: BLE001
+                _raw_tp_gpd = None
+        _resolved_target = next(
+            (p for p in resolve_plugins(_raw_tp_gpd) if p["slot"] == slot),
+            target,
+        )
 
         # Cross-instance-aware gate (ea2c7aed) — mirrors the fix in list_plugins.
         # See the detailed comment there for the full rationale.  _fetch_slot_tools
@@ -4310,13 +4340,21 @@ async def _handle_plugin_tools(
         result: dict[str, Any] = {
             "name": target["name"],
             "slot": slot,
-            "enabled": target.get("enabled", False),
+            # 4c61ae81 — read from the resolved per-tenant config, matching
+            # list_plugins (see comment above where _resolved_target is built).
+            "enabled": _resolved_target.get("enabled", False),
             "description": target.get("description", ""),
             "tools": tools,
             "tool_count": len(tools),
             # ea2c7aed — cross-instance-aware tunnel status; mirrors list_plugins fix.
             "tunnel_active": _local_active_gpd or _cross_instance_active_gpd,
         }
+        # 4c61ae81 — surface stale_override here too, matching list_plugins, so
+        # reset_plugin_override's docstring claim is actually true for both tools.
+        if _resolved_target.get("stale_override"):
+            result["stale_override"] = True
+            result["newer_default_command"] = _resolved_target.get("newer_default_command")
+            result["newer_default_label"] = _resolved_target.get("newer_default_label")
         if skill_note:
             result["skill_guide"] = {
                 "title": skill_note.get("title", ""),

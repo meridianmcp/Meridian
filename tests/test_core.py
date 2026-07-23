@@ -17374,6 +17374,98 @@ async def test_list_plugins_enabled_consistent_with_active_invocable(db, tmp_pat
 
 
 # ---------------------------------------------------------------------------
+# 4c61ae81 — list_plugins / get_plugin_details must agree on 'enabled', and
+# both must surface stale_override (matching reset_plugin_override's docstring)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_enabled_reflects_tenant_config(db, tmp_path):
+    """4c61ae81 — get_plugin_details.enabled must match the tenant's resolved
+    plugin config, not the static BUILTIN_PLUGINS default (the same bug
+    3751af82 fixed for list_plugins only)."""
+    import json
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    tenant_with_word_enabled = {
+        "id": "test-tenant-4c61ae81-gpd",
+        "tunnel_plugins": json.dumps({"word": {"enabled": True}}),
+        "tunnel_active": 0,
+    }
+    result = await _dispatch_mcp_tool(
+        "get_plugin_details", {"name": "word"}, db, str(tmp_path),
+        tenant=tenant_with_word_enabled,
+    )
+    assert result["enabled"] is True, (
+        "word plugin enabled should be True (tenant override) but got "
+        f"{result['enabled']!r} — static BUILTIN_PLUGINS default was used instead"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_and_get_plugin_details_agree_on_enabled(db, tmp_path):
+    """4c61ae81 — list_plugins and get_plugin_details must report the SAME
+    'enabled' value for the same slot at the same moment, for both an opt-in
+    slot a tenant has enabled and one they haven't."""
+    import json
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    tenant = {
+        "id": "test-tenant-4c61ae81-agree",
+        "tunnel_plugins": json.dumps({"word": {"enabled": True}}),
+        "tunnel_active": 0,
+    }
+    list_result = await _dispatch_mcp_tool("list_plugins", {}, db, str(tmp_path), tenant=tenant)
+    list_by_name = {p["name"]: p for p in list_result["plugins"]}
+
+    for plugin_name in ("word", "powerpoint", "filesystem"):
+        details = await _dispatch_mcp_tool(
+            "get_plugin_details", {"name": plugin_name}, db, str(tmp_path), tenant=tenant
+        )
+        assert details["enabled"] == list_by_name[plugin_name]["enabled"], (
+            f"{plugin_name}: list_plugins enabled={list_by_name[plugin_name]['enabled']!r} "
+            f"but get_plugin_details enabled={details['enabled']!r} for the same tenant config"
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_and_get_plugin_details_surface_stale_override(db, tmp_path):
+    """4c61ae81 — reset_plugin_override's docstring claims stale_override is
+    'surfaced by list_plugins/get_plugin_details'; verify both actually include
+    it (previously neither did — resolve_plugins computed it but it was
+    dropped before reaching the MCP response)."""
+    import json
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    tenant = {
+        "id": "test-tenant-4c61ae81-stale",
+        "tunnel_plugins": json.dumps(
+            {"code-extractor": {"command": ["uvx", "mcp-server-code-extractor"]}}
+        ),
+        "tunnel_active": 0,
+    }
+
+    list_result = await _dispatch_mcp_tool("list_plugins", {}, db, str(tmp_path), tenant=tenant)
+    ext_entry = next(p for p in list_result["plugins"] if p["name"] == "code-extractor")
+    assert ext_entry.get("stale_override") is True, "list_plugins did not surface stale_override"
+    assert ext_entry.get("newer_default_command")
+
+    details = await _dispatch_mcp_tool(
+        "get_plugin_details", {"name": "code-extractor"}, db, str(tmp_path), tenant=tenant
+    )
+    assert details.get("stale_override") is True, "get_plugin_details did not surface stale_override"
+    assert details.get("newer_default_command") == ext_entry["newer_default_command"]
+
+    # A plugin with no override must not carry a stray stale_override flag.
+    fs_entry = next(p for p in list_result["plugins"] if p["name"] == "filesystem")
+    assert "stale_override" not in fs_entry
+    fs_details = await _dispatch_mcp_tool(
+        "get_plugin_details", {"name": "filesystem"}, db, str(tmp_path), tenant=tenant
+    )
+    assert "stale_override" not in fs_details
+
+
+# ---------------------------------------------------------------------------
 # 4f02340e — mixed-ownership task chains
 # ---------------------------------------------------------------------------
 

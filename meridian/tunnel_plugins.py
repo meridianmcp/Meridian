@@ -211,6 +211,32 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # recorded in a pinned decision). A tenant who saved either OLD default as an
         # override is flagged stale via previous_defaults below (cc904bfe badge).
         "command": ["uvx", "docx-mcp"],
+        # 92b6d977 (2026-07-23) — investigated a report that
+        # replace_block_between_manual_anchors on the old docx-mcp-server
+        # default returns "Start anchor ... not found" for verbatim, exact-match
+        # anchor text (both Heading-1 and Normal-style paragraphs; not
+        # style-specific). Confirmed and reproduced upstream in
+        # office-word-mcp-server (GongRzhe/Office-Word-MCP-Server, the PyPI
+        # package backing this old default; module `word_document_server`,
+        # matching this repo's "docx-mcp-server" previous_defaults entry): in
+        # word_document_server/utils/document_utils.py,
+        # replace_block_between_manual_anchors() (and the sibling
+        # replace_paragraph_block_below_header()/delete_block_under_header())
+        # identify paragraph/table XML elements via `el.tag == CT_P.tag` /
+        # `el.tag == CT_Tbl.tag`. Accessed on the *class* (not an instance),
+        # `CT_P.tag` resolves to lxml's unbound `getset_descriptor` for
+        # `_Element.tag`, not the paragraph's qualified tag string — so the
+        # comparison is unconditionally False, start_idx never gets set, and
+        # every anchor lookup fails regardless of paragraph style or exact-text
+        # match. Not a run-split/whitespace/smart-quote issue (the run-text
+        # concatenation a few lines above it is actually correct). This lives
+        # entirely in the third-party PyPI package, not in this repo (fetched
+        # fresh via `uvx` — nothing vendored under extensions/), so it isn't
+        # patchable here; it's one more data point for why 5b065c2e already
+        # moved the default off this package to docx-mcp. If
+        # office-word-mcp-server is ever reconsidered, this must be fixed
+        # upstream (compare against `qn("w:p")`/`qn("w:tbl")` instead) before
+        # any anchor-based replace tool on it can be trusted.
         "previous_defaults": [["uvx", "docx-mcp-server"], ["uvx", "word-mcp-live"]],
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
         # docx-mcp exposes bare tool names (create_document, ...) — no self-prefix.

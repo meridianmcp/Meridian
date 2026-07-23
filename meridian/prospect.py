@@ -185,7 +185,11 @@ async def prospect_symbol_impl(
       stale_graph=True, when no code tunnel is active, or (4b8f083f) when a
       local git-commit-drift probe finds real commits since the last
       index_repository run for this (tenant, project) — see
-      ``_detect_graph_commit_drift``.
+      ``_detect_graph_commit_drift``. (1579bc1e) When the graph rung misses
+      because of a project_id/slug mismatch — whether that surfaces as a
+      quietly-empty result, an app-level error payload, or a raised
+      exception from ``call_tunnel_tool`` — a broad retry without
+      project_id is attempted before giving up on this rung.
     Rung 2 (serena): extractor__find_symbol / extractor__find_declaration —
       AST-accurate, never stale. Tried when graph returns zero results or is
       skipped.
@@ -225,9 +229,82 @@ async def prospect_symbol_impl(
                 graph_args: dict[str, Any] = {"query": symbol, "limit": limit}
                 if project_id:
                     graph_args["project_id"] = project_id
-                graph_result = await _tunnel_mod.call_tunnel_tool(
-                    tenant_id, "codebase__search_graph", graph_args,
-                )
+
+                async def _broad_retry_without_project_id(
+                    original_msg: str,
+                ) -> bool:
+                    """1579bc1e — retry search_graph WITHOUT project_id and,
+                    if it turns up hits, populate *result* and return True.
+
+                    The 9033914e fix already does this when search_graph
+                    comes back with a project_id but *zero hits* — the
+                    codebase-memory-mcp slug derived from repo_path may not
+                    match the caller's project_id. But the SAME slug
+                    mismatch can just as easily surface as an explicit
+                    "project not found"/"not indexed" error — either an
+                    app-level error payload inside the content envelope, or
+                    an exception raised by ``call_tunnel_tool`` (e.g. a
+                    JSON-RPC-level error, possibly already hint-enriched by
+                    ``_enrich_code_intel_project_error``) — instead of a
+                    quietly-empty result. Confirmed report (1579bc1e):
+                    prospect_symbol's graph rung fails outright with that
+                    error immediately after a fresh, successful
+                    index_repository run on the exact same project slug,
+                    while a direct call without project_id (or with the
+                    auto-assigned slug) succeeds instantly. Only worth
+                    trying when the error actually looks project-related —
+                    never fires for unrelated errors (syntax errors, rate
+                    limits, etc.) via ``_is_project_not_found_error``.
+
+                    Never raises: any failure here just means the retry
+                    didn't help, and the caller keeps its original error.
+                    """
+                    if not (
+                        project_id
+                        and graph_args.get("project_id")
+                        and _tunnel_mod._is_project_not_found_error(original_msg)
+                    ):
+                        return False
+                    try:
+                        broad_args: dict[str, Any] = {"query": symbol, "limit": limit}
+                        broad_result = await _tunnel_mod.call_tunnel_tool(
+                            tenant_id, "codebase__search_graph", broad_args,
+                        )
+                    except Exception:  # noqa: BLE001 — retry itself may fail
+                        return False
+                    if broad_result is None:
+                        return False
+                    broad_payload = _tunnel_mod._extract_graph_matches(broad_result)
+                    broad_hits = _extract_hits(broad_payload)
+                    if not (broad_hits and isinstance(broad_hits, list) and len(broad_hits) > 0):
+                        return False
+                    result["rung"] = "graph"
+                    result["hits"] = broad_hits
+                    result["graph_raw"] = broad_payload
+                    result["fallback_reason"] = (
+                        f"graph_project_id_mismatch_error: search_graph with "
+                        f"project_id={project_id!r} failed ({original_msg!r}); "
+                        f"broad search (no project_id) succeeded — the "
+                        f"caller's project_id may not match the repo-path "
+                        f"slug auto-assigned by index_repository"
+                    )
+                    return True
+
+                try:
+                    graph_result = await _tunnel_mod.call_tunnel_tool(
+                        tenant_id, "codebase__search_graph", graph_args,
+                    )
+                except Exception as _rung1_exc:  # noqa: BLE001
+                    # 1579bc1e — an explicit "project not found"/"not indexed"
+                    # error raised by call_tunnel_tool is the same
+                    # slug-mismatch root cause as the zero-hits case below —
+                    # just surfaced as an exception. Try the broad retry
+                    # before giving up on the graph rung.
+                    if await _broad_retry_without_project_id(str(_rung1_exc)):
+                        return result
+                    result["fallback_reason"] = f"graph_error: {_rung1_exc}"
+                    graph_result = None
+
                 if graph_result is not None:
                     # Check for injected staleness warning from Part 1.
                     staleness_info = None
@@ -268,6 +345,14 @@ async def prospect_symbol_impl(
                     # the planning project_id doesn't match the repo-path
                     # slug that index_repository auto-assigned).
                     if app_err is not None:
+                        # 1579bc1e — an app-level error can be the very same
+                        # slug mismatch (e.g. "project not found") rather
+                        # than a genuinely-unindexed repo; try the broad
+                        # retry before reporting it as a bare graph_error.
+                        if await _broad_retry_without_project_id(app_err):
+                            if staleness_info:
+                                result["_graph_staleness"] = staleness_info
+                            return result
                         result["fallback_reason"] = f"graph_error: {app_err}"
                     elif project_id and graph_args.get("project_id"):
                         # Retry without project_id — broader search.
