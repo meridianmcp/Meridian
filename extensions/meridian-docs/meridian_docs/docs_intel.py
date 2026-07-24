@@ -6691,3 +6691,387 @@ def relocate_table(
         "destination_position": destination_position,
         "docx_path": docx_path,
     }
+
+
+# ---------------------------------------------------------------------------
+# f1185012 -- page header / footer support.
+#
+# python-docx, the Google Docs API + UI, and Apryse (a commercial DOCX SDK)
+# all treat header/footer as first-class, table-stakes DOCX functionality;
+# this module had none at all.
+#
+# Design notes -- a genuinely SEPARATE write path from everything above:
+#   - Every write-back function above this line (captions, citations,
+#     equations, notes, move_section/copy_section/write_section/
+#     relocate_table, ...) only ever rewrites the ONE existing
+#     word/document.xml member via _load_docx_xml_stdlib / _save_docx_xml_stdlib,
+#     preserving every other ZIP member byte-for-byte. A header/footer needs
+#     THREE additional moving pieces docs_intel has never had to manage: a new
+#     OOXML part (word/header<N>.xml or word/footer<N>.xml), a new
+#     relationship in word/_rels/document.xml.rels, and a new content-type
+#     override in [Content_Types].xml.
+#   - Rather than spread that new multi-part-write risk into the existing,
+#     currently-clean single-part call sites, it lives entirely in its own
+#     functions (_save_docx_with_new_parts_stdlib, _set_page_header_or_footer,
+#     set_page_header, set_page_footer) with their own dedicated tests. None
+#     of the code above this line calls into any of it, and none of it calls
+#     into _save_docx_xml_stdlib.
+#   - "Set" semantics: calling set_page_header/set_page_footer a second time
+#     with the same ``type`` (default/even/first) overwrites the SAME part in
+#     place (found via the sectPr's existing headerReference/footerReference
+#     -> rels lookup) rather than allocating a new part + orphaning the old
+#     one on every call.
+#   - Scope: wires the reference into the document's FINAL, body-level
+#     <w:sectPr> only (the section properties governing a single-section
+#     document -- the overwhelming common case -- and the last section of a
+#     multi-section one). Per-section overrides for EARLIER sections of a
+#     multi-section document, and the settings.xml <w:titlePg>/
+#     <w:evenAndOddHeaders> switches that make "first"/"even" page types
+#     actually render differently in Word, are real but narrower follow-ups,
+#     not attempted here.
+# ---------------------------------------------------------------------------
+
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+_HDR_FTR_CONTENT_TYPES = {
+    "header": "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
+    "footer": "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml",
+}
+_HDR_FTR_VALID_TYPES = frozenset({"default", "even", "first"})
+
+# Minimal-but-valid fallback parts for the (rare, mostly test-fixture) case of
+# a .docx that has no [Content_Types].xml / word/_rels/document.xml.rels at
+# all yet. Real Word output always has both; this just means "add a header to
+# a hand-built minimal docx" doesn't hard-fail for lack of scaffolding.
+_MINIMAL_CONTENT_TYPES_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/word/document.xml" '
+    'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+    "</Types>"
+).encode("utf-8")
+
+_MINIMAL_DOCUMENT_RELS_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    "</Relationships>"
+).encode("utf-8")
+
+
+def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes], dest: str) -> None:
+    """Write MULTIPLE ZIP parts back into ``dest`` in one repackage.
+
+    Unlike :func:`_save_docx_xml_stdlib` (which can only ever overwrite the
+    single, already-existing ``word/document.xml`` member), this adds parts
+    that are not already present in the original archive AND overwrites parts
+    that are. Every other original ZIP member is preserved byte-for-byte.
+
+    Backs up the existing file to ``dest + ".bak"`` when it already exists
+    (best-effort, non-fatal on failure -- same pattern as
+    :func:`_save_docx_xml_stdlib`).
+    """
+    out = io.BytesIO()
+    written: set[str] = set()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src:
+        infos = src.infolist()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for info in infos:
+                data = src.read(info.filename)
+                if info.filename in updated_parts:
+                    data = updated_parts[info.filename]
+                dst.writestr(info, data)
+                written.add(info.filename)
+            # Anything in updated_parts that wasn't already a ZIP member is a
+            # genuinely new part -- append it.
+            for part_name, data in updated_parts.items():
+                if part_name not in written:
+                    dst.writestr(part_name, data)
+
+    if os.path.exists(dest):
+        backup = dest + ".bak"
+        try:
+            shutil.copy2(dest, backup)
+        except OSError:
+            pass  # backup failure is non-fatal
+
+    with open(dest, "wb") as fh:
+        fh.write(out.getvalue())
+
+
+def _insert_before_closing_tag(xml_bytes: bytes, root_tag_name: str, new_element_xml: str) -> bytes:
+    """Insert ``new_element_xml`` as the last child of ``<root_tag_name>``.
+
+    Text-splice rather than an ET parse/re-serialize round-trip: OPC
+    infrastructure parts ([Content_Types].xml, .rels files) are always
+    unprefixed-default-namespace XML in real Word output, and ET's
+    ``register_namespace`` registry is a single global default-prefix slot --
+    registering it for a SECOND unrelated namespace (this one, alongside the
+    package content-types namespace) would silently evict whichever one was
+    registered first (both want the empty '' prefix), corrupting unrelated
+    serialization elsewhere in this module. Splicing the raw text instead
+    sidesteps that global-state hazard entirely and guarantees byte-for-byte
+    preservation of everything except the one new child.
+
+    Handles both an existing ``<root_tag_name>...</root_tag_name>`` (appends
+    before the closing tag) and a childless self-closing
+    ``<root_tag_name .../>`` (expands it to hold the new child).
+    """
+    text = xml_bytes.decode("utf-8")
+    closing = f"</{root_tag_name}>"
+    idx = text.rfind(closing)
+    if idx != -1:
+        return (text[:idx] + new_element_xml + text[idx:]).encode("utf-8")
+
+    self_close_pattern = re.compile(rf"<{root_tag_name}\b([^>]*?)/>")
+    match = self_close_pattern.search(text)
+    if not match:
+        raise ValueError(f"could not locate <{root_tag_name}> element to extend")
+    expanded = f"<{root_tag_name}{match.group(1)}>{new_element_xml}</{root_tag_name}>"
+    return (text[: match.start()] + expanded + text[match.end() :]).encode("utf-8")
+
+
+def _next_relationship_id(rels_root: ET.Element) -> str:
+    """Return the next unused ``rId<N>`` relationship id (Word's own convention)."""
+    max_seen = 0
+    for rel in rels_root:
+        rid = rel.get("Id") or ""
+        m = re.match(r"^rId(\d+)$", rid)
+        if m:
+            max_seen = max(max_seen, int(m.group(1)))
+    return f"rId{max_seen + 1}"
+
+
+def _next_header_footer_part_name(namelist: list[str], kind: str) -> str:
+    """Return the next unused ``word/header<N>.xml`` / ``word/footer<N>.xml`` name."""
+    pattern = re.compile(rf"^word/{kind}(\d+)\.xml$")
+    max_seen = 0
+    for name in namelist:
+        m = pattern.match(name)
+        if m:
+            max_seen = max(max_seen, int(m.group(1)))
+    return f"word/{kind}{max_seen + 1}.xml"
+
+
+def _build_header_footer_part_xml(kind: str, text: str) -> bytes:
+    """Build a minimal but valid ``<w:hdr>``/``<w:ftr>`` OOXML part: one
+    paragraph containing ``text`` as a single run."""
+    root_tag = "hdr" if kind == "header" else "ftr"
+    root = ET.Element(_q(_W, root_tag))
+    p = ET.SubElement(root, _q(_W, "p"))
+    r = ET.SubElement(p, _q(_W, "r"))
+    t = ET.SubElement(r, _q(_W, "t"))
+    t.set(_q(_XML_NS, "space"), "preserve")
+    t.text = text
+    xml_body = ET.tostring(root, encoding="unicode")
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + xml_body).encode("utf-8")
+
+
+def _sectpr_insert_ref_index(sectpr: ET.Element, kind: str) -> int:
+    """Return the correct child index to insert a new headerReference/
+    footerReference at, per CT_SectPr's schema order: all ``headerReference``
+    elements come first (as a group), then all ``footerReference`` elements,
+    then everything else (``type``, ``pgSz``, ``pgMar``, ...)."""
+    header_tag = _q(_W, "headerReference")
+    footer_tag = _q(_W, "footerReference")
+    children = list(sectpr)
+    idx = 0
+    if kind == "header":
+        while idx < len(children) and children[idx].tag == header_tag:
+            idx += 1
+    else:
+        while idx < len(children) and children[idx].tag in (header_tag, footer_tag):
+            idx += 1
+    return idx
+
+
+def _set_page_header_or_footer(
+    docx_path: str,
+    text: str,
+    kind: str,
+    header_footer_type: str,
+    index_db_path: str | None,
+) -> dict[str, Any]:
+    """Shared implementation for :func:`set_page_header` / :func:`set_page_footer`."""
+    if not text or not str(text).strip():
+        return {"error": "text must be a non-empty string"}
+    if header_footer_type not in _HDR_FTR_VALID_TYPES:
+        return {
+            "error": (
+                f"type must be one of {sorted(_HDR_FTR_VALID_TYPES)}, "
+                f"got {header_footer_type!r}"
+            )
+        }
+    if not os.path.exists(docx_path):
+        return {"error": f"no such file: {docx_path}"}
+
+    with open(docx_path, "rb") as fh:
+        raw = fh.read()
+
+    try:
+        src = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        return {"error": f"not a valid .docx (not a ZIP): {docx_path}"}
+
+    try:
+        namelist = src.namelist()
+        if "word/document.xml" not in namelist:
+            return {"error": f"not a valid .docx: missing word/document.xml: {docx_path}"}
+        document_xml = src.read("word/document.xml")
+        try:
+            doc_root = ET.fromstring(document_xml)
+        except ET.ParseError as exc:
+            return {"error": f"malformed word/document.xml in {docx_path}: {exc}"}
+
+        body = doc_root.find(_q(_W, "body"))
+        if body is None:
+            return {"error": "document has no <w:body>"}
+
+        final_sectpr = None
+        for child in body:
+            if child.tag == _q(_W, "sectPr"):
+                final_sectpr = child
+        if final_sectpr is None:
+            final_sectpr = ET.SubElement(body, _q(_W, "sectPr"))
+
+        ref_tag = _q(_W, f"{kind}Reference")
+        w_type_attr = _q(_W, "type")
+        r_id_attr = _q(_R_NS, "id")
+
+        existing_ref = None
+        for child in final_sectpr:
+            if child.tag == ref_tag and child.get(w_type_attr) == header_footer_type:
+                existing_ref = child
+                break
+
+        rels_path = "word/_rels/document.xml.rels"
+        rels_bytes = src.read(rels_path) if rels_path in namelist else _MINIMAL_DOCUMENT_RELS_XML
+        rels_root = ET.fromstring(rels_bytes)
+        rel_tag = _q(_PKG_REL_NS, "Relationship")
+
+        part_xml = _build_header_footer_part_xml(kind, text.strip())
+        updated_parts: dict[str, bytes] = {}
+
+        if existing_ref is not None:
+            # "Set" -- an active reference of this exact type already exists.
+            # Overwrite the part it already points to, in place. No new
+            # relationship, content-type override, or sectPr change needed.
+            existing_rid = existing_ref.get(r_id_attr)
+            target = None
+            for rel in rels_root:
+                if rel.tag == rel_tag and rel.get("Id") == existing_rid:
+                    target = rel.get("Target")
+                    break
+            if not target:
+                return {
+                    "error": (
+                        f"sectPr has a {kind}Reference r:id={existing_rid!r} with no "
+                        "matching relationship in word/_rels/document.xml.rels -- "
+                        "docx is internally inconsistent"
+                    )
+                }
+            part_name = target if target.startswith("word/") else f"word/{target}"
+            updated_parts[part_name] = part_xml
+            rel_id = existing_rid
+        else:
+            part_name = _next_header_footer_part_name(namelist, kind)
+            rel_id = _next_relationship_id(rels_root)
+            rel_type = f"{_R_NS}/{kind}"
+            target_rel = part_name.split("/", 1)[1]  # relative to word/_rels/
+
+            new_rel_xml = f'<Relationship Id="{rel_id}" Type="{rel_type}" Target="{target_rel}"/>'
+            new_rels_bytes = _insert_before_closing_tag(rels_bytes, "Relationships", new_rel_xml)
+
+            ct_path = "[Content_Types].xml"
+            ct_bytes = src.read(ct_path) if ct_path in namelist else _MINIMAL_CONTENT_TYPES_XML
+            new_override_xml = (
+                f'<Override PartName="/{part_name}" '
+                f'ContentType="{_HDR_FTR_CONTENT_TYPES[kind]}"/>'
+            )
+            new_ct_bytes = _insert_before_closing_tag(ct_bytes, "Types", new_override_xml)
+
+            ref_el = ET.Element(ref_tag)
+            ref_el.set(w_type_attr, header_footer_type)
+            ref_el.set(r_id_attr, rel_id)
+            insert_at = _sectpr_insert_ref_index(final_sectpr, kind)
+            final_sectpr.insert(insert_at, ref_el)
+
+            new_document_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                + ET.tostring(doc_root, encoding="unicode")
+            ).encode("utf-8")
+
+            updated_parts[rels_path] = new_rels_bytes
+            updated_parts[ct_path] = new_ct_bytes
+            updated_parts["word/document.xml"] = new_document_xml
+            updated_parts[part_name] = part_xml
+    finally:
+        src.close()
+
+    try:
+        _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "set",
+        "kind": kind,
+        "type": header_footer_type,
+        "part_name": part_name,
+        "relationship_id": rel_id,
+        "text": text.strip(),
+        "docx_path": docx_path,
+    }
+
+
+def set_page_header(
+    docx_path: str,
+    text: str,
+    header_type: str = "default",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """f1185012 -- Add or replace a page header on ``docx_path``.
+
+    Allocates a new ``word/header<N>.xml`` part, a new relationship in
+    ``word/_rels/document.xml.rels``, a new content-type override in
+    ``[Content_Types].xml``, and a ``<w:headerReference>`` on the document's
+    final ``<w:sectPr>`` -- OR, if a header of this exact ``header_type``
+    already exists, overwrites that SAME part's content in place (no new
+    part/relationship/override, no sectPr change).
+
+    Args:
+        docx_path:    Absolute path to the .docx file (mutated in place).
+        text:         Header text (a single paragraph, single run).
+        header_type:  One of ``"default"``, ``"even"``, ``"first"``
+                      (``w:type`` on ``<w:headerReference>``). Note: making
+                      "even"/"first" actually render distinctly in Word ALSO
+                      requires ``settings.xml``'s ``<w:evenAndOddHeaders>`` /
+                      a section's ``<w:titlePg>`` -- not set by this function.
+        index_db_path: If supplied, invalidates that sidecar's cached mtime
+                      so the next read re-parses the document.
+
+    Returns:
+        ``{status, kind, type, part_name, relationship_id, text, docx_path}``
+        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+    """
+    return _set_page_header_or_footer(docx_path, text, "header", header_type, index_db_path)
+
+
+def set_page_footer(
+    docx_path: str,
+    text: str,
+    footer_type: str = "default",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """f1185012 -- Add or replace a page footer on ``docx_path``.
+
+    Mirrors :func:`set_page_header` exactly (same allocation-vs-overwrite
+    "set" semantics, same part/relationship/content-type plumbing) for
+    ``<w:footerReference>`` / ``word/footer<N>.xml`` instead. See its
+    docstring for the full parameter/return contract.
+    """
+    return _set_page_header_or_footer(docx_path, text, "footer", footer_type, index_db_path)
