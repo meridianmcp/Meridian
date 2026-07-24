@@ -56,7 +56,7 @@ async def test_saturated_probe_does_not_mask_a_live_routed_slot(monkeypatch, db,
 
     monkeypatch.setattr(tunnel_mod, "has_active_tunnel", lambda _tid: True)
 
-    async def _fake_fetch_slot_tools(_tenant_id, label):
+    async def _fake_fetch_slot_tools(_tenant_id, label, *, budget=None):
         # Every slot's live probe comes back empty this call -- simulating every
         # slot momentarily failing to win the per-slot in-flight semaphore.
         return label, []
@@ -117,7 +117,7 @@ async def test_live_probe_result_wins_over_cache_when_both_present(monkeypatch, 
 
     monkeypatch.setattr(tunnel_mod, "has_active_tunnel", lambda _tid: True)
 
-    async def _fake_fetch_slot_tools(_tenant_id, label):
+    async def _fake_fetch_slot_tools(_tenant_id, label, *, budget=None):
         if label == "dc":
             return label, [{"name": "read_file"}]  # live probe succeeds for dc
         return label, []
@@ -151,7 +151,7 @@ async def test_stale_routes_for_a_disconnected_socket_are_not_resurrected(monkey
 
     monkeypatch.setattr(tunnel_mod, "has_active_tunnel", lambda _tid: True)
 
-    async def _fake_fetch_slot_tools(_tenant_id, label):
+    async def _fake_fetch_slot_tools(_tenant_id, label, *, budget=None):
         return label, []
 
     monkeypatch.setattr(tunnel_mod, "_fetch_slot_tools", _fake_fetch_slot_tools)

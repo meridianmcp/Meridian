@@ -2835,7 +2835,7 @@ async def _handle_notes_decisions(
     get_document_structure, get_latex_structure, get_citation_edges,
     resolve_citations, index_equation, find_similar_equation, insert_equation,
     update_paragraph, find_symbol_usages, index_figure, find_similar_figure,
-    link_figure_caption, index_table, find_similar_table,
+    link_figure_caption, index_table, find_similar_table, link_table_caption,
     link_flag_to_section, get_flag_drift,
     ingest_document_structure, add_insight, get_insights, save_finding,
     capture_research_finding, get_notes, read_note, delete_note,
@@ -2879,6 +2879,7 @@ async def _handle_notes_decisions(
         handle_link_figure_caption,
         handle_index_table,
         handle_find_similar_table,
+        handle_link_table_caption,
         handle_link_flag_to_section,
         handle_get_flag_drift,
         handle_check_embedded_staleness,
@@ -2904,7 +2905,7 @@ async def _handle_notes_decisions(
         handle_promote_proposal,
     )
 
-    # All 45 tools map directly to handler functions with the standard five
+    # All 46 tools map directly to handler functions with the standard five
     # parameters — no extra context needed beyond (args, db, data_dir, tenant,
     # _mcp_tenant_id).
     _standard_dispatch: dict[str, Any] = {
@@ -2933,6 +2934,7 @@ async def _handle_notes_decisions(
         "link_figure_caption": handle_link_figure_caption,
         "index_table": handle_index_table,
         "find_similar_table": handle_find_similar_table,
+        "link_table_caption": handle_link_table_caption,
         "link_flag_to_section": handle_link_flag_to_section,
         "get_flag_drift": handle_get_flag_drift,
         "check_embedded_staleness": handle_check_embedded_staleness,
@@ -4103,9 +4105,18 @@ async def _handle_plugin_tools(
             # socket — _fetch_slot_tools returns [] immediately when the socket
             # isn't local, so there is no point calling it on a cross-instance miss.
             try:
+                # 5a8a2d2e — use the cold-fetch-aware budget so a cold-fetch-family
+                # slot (ppt/word/docs/dc/...) that's legitimately still spawning
+                # after an idle-kill gets a realistic chance to answer instead of
+                # being falsely reported as unreachable/0 tools. fs/code/extract are
+                # never cold, so _slot_tools_fetch_budget leaves their (fast) flat
+                # budget unchanged.
                 slot_results = await asyncio.gather(
                     *[
-                        _tunnel_mod._fetch_slot_tools(tenant_id, label)  # type: ignore[attr-defined]
+                        _tunnel_mod._fetch_slot_tools(  # type: ignore[attr-defined]
+                            tenant_id, label,
+                            budget=_tunnel_mod._slot_tools_fetch_budget(label),  # type: ignore[attr-defined]
+                        )
                         for label in _tunnel_mod._TUNNEL_LABELS  # type: ignore[attr-defined]
                     ]
                 )
@@ -4309,10 +4320,14 @@ async def _handle_plugin_tools(
         )
 
         # Fetch full tools list for this slot
+        # 5a8a2d2e — cold-fetch-aware budget, same rationale as list_plugins above.
         tools: list[dict] = []
         if tenant_id and _local_active_gpd:
             try:
-                _, tools = await _tunnel_mod._fetch_slot_tools(tenant_id, slot)  # type: ignore[attr-defined]
+                _, tools = await _tunnel_mod._fetch_slot_tools(  # type: ignore[attr-defined]
+                    tenant_id, slot,
+                    budget=_tunnel_mod._slot_tools_fetch_budget(slot),  # type: ignore[attr-defined]
+                )
             except Exception:  # noqa: BLE001
                 pass
 

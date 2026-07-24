@@ -40,7 +40,7 @@ def _install_live_tunnel(monkeypatch, slot_tools):
 
     monkeypatch.setattr(tunnel_mod, "has_active_tunnel", lambda _tid: True)
 
-    async def _fake_fetch_slot_tools(tenant_id, label):
+    async def _fake_fetch_slot_tools(tenant_id, label, *, budget=None):
         return label, list(slot_tools.get(label, []))
 
     monkeypatch.setattr(tunnel_mod, "_fetch_slot_tools", _fake_fetch_slot_tools)

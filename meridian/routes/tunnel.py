@@ -103,6 +103,42 @@ _TOOL_DISCOVERY_TIMEOUT = 5.0
 # slot from consuming its full ~14s per-slot retry budget.
 _SLOT_TOOLS_FETCH_BUDGET = 4.0
 
+# 5a8a2d2e — cold-fetch-family slots (``tunnel_client._COLD_FETCH_SLOTS`` — dc/
+# ppt/word/docs/zotero/outputs/debug) legitimately need up to ~55s to answer
+# their FIRST tools/list after an idle-kill respawn: the client's
+# ``ensure_running()`` runs its own cold-spawn readiness probe
+# (``_PREFLIGHT_BUDGET_COLD_FETCH`` = 4 attempts x 5s delay x 10s per-attempt
+# timeout == ~55s worst case) BEFORE it even relays the request this function
+# is waiting on. The flat 4s ``_SLOT_TOOLS_FETCH_BUDGET`` above is correctly
+# sized for the always-warm fs/code/extract slots (never idle-killed in
+# practice, so never cold) but is ~10x too short for a genuinely-cold ppt/
+# word/docs-family respawn — which made ``list_plugins``/``get_plugin_details``
+# (mcp/handler.py) falsely report a slot that was simply still starting up as
+# unreachable/0 tools (5a8a2d2e). Those two health-reporting call sites pass
+# this larger budget in explicitly via ``_fetch_slot_tools``'s ``budget=``
+# override (see ``_slot_tools_fetch_budget``); every other caller (notably
+# ``list_tunnel_tools``'s real-time discovery fan-out, which feeds the
+# interactive tools/list MCP handshake behind an outer 5s bound that 6941fd0f
+# already found unreliable at actually cancelling a slow inner task) keeps the
+# flat default so this fix cannot reopen that separate, already-hardened
+# outage class.
+_SLOT_TOOLS_FETCH_BUDGET_COLD = 60.0
+
+
+def _slot_tools_fetch_budget(label: str) -> float:
+    """Return the ``_fetch_slot_tools`` wall-clock budget appropriate for *label*.
+
+    Cold-fetch-family slots get ``_SLOT_TOOLS_FETCH_BUDGET_COLD``; every other
+    slot gets the flat ``_SLOT_TOOLS_FETCH_BUDGET``. Callers opt in explicitly
+    by passing the result as ``_fetch_slot_tools(..., budget=...)`` — the
+    function's own default is unchanged, so callers that don't ask for this
+    stay on the flat budget (5a8a2d2e).
+    """
+    from ..tunnel_client import _COLD_FETCH_SLOTS  # noqa: PLC0415 — avoid a module-load import cycle
+
+    return _SLOT_TOOLS_FETCH_BUDGET_COLD if label in _COLD_FETCH_SLOTS else _SLOT_TOOLS_FETCH_BUDGET
+
+
 _slot_inflight: dict[str, asyncio.Semaphore] = {}
 
 
@@ -2914,23 +2950,38 @@ async def _tunnel_jsonrpc(
     return _parse_mcp_payload(resp.body)
 
 
-async def _fetch_slot_tools(tenant_id: str, label: str) -> "tuple[str, list[dict]]":
+async def _fetch_slot_tools(
+    tenant_id: str, label: str, *, budget: "float | None" = None,
+) -> "tuple[str, list[dict]]":
     """Fetch tools/list for one tunnel slot with retries. Returns (label, tools).
 
-    6941fd0f — bounded to ``_SLOT_TOOLS_FETCH_BUDGET`` wall-clock seconds total,
-    independent of the caller's own asyncio-cancellation-based timeout (see the
-    comment on ``_SLOT_TOOLS_FETCH_BUDGET`` for why that alone is not reliable).
-    Each attempt's own timeout is shrunk to whatever's left of the budget so a
-    slot that's merely slow (not hung) still gets its full remaining allowance,
+    6941fd0f — bounded to ``_SLOT_TOOLS_FETCH_BUDGET`` wall-clock seconds total
+    (or the caller-supplied *budget*, e.g. ``_slot_tools_fetch_budget(label)``
+    for cold-fetch-aware callers — 5a8a2d2e), independent of the caller's own
+    asyncio-cancellation-based timeout (see the comment on
+    ``_SLOT_TOOLS_FETCH_BUDGET`` for why that alone is not reliable). Each
+    attempt's own timeout is shrunk to whatever's left of the budget so a slot
+    that's merely slow (not hung) still gets its full remaining allowance,
     while the loop can never spend more than the budget in aggregate.
+
+    5a8a2d2e — the retry count is no longer hardcoded to 4: it used to be
+    ``for _attempt in range(4)`` with each attempt capped at ``min(3.0,
+    remaining)``, so the loop could never actually spend more than ~13.5s
+    total regardless of *budget* — silently defeating a larger cold-fetch
+    budget before this fix. The loop now keeps retrying (0.5s apart) until
+    *budget* itself is exhausted, so a caller-supplied larger budget is
+    actually usable. Behavior for the default flat budget is unchanged: it
+    was already budget-exhaustion-bound in practice (4.0s isn't enough for a
+    4th attempt), not attempt-count-bound.
     """
     sockets, _ = _label_maps(label)
     if tenant_id not in sockets:
         return label, []
+    budget_s = _SLOT_TOOLS_FETCH_BUDGET if budget is None else budget
     tools: list[dict] = []
     started = time.monotonic()
-    for _attempt in range(4):  # initial try + up to 3 retries
-        remaining = _SLOT_TOOLS_FETCH_BUDGET - (time.monotonic() - started)
+    while True:
+        remaining = budget_s - (time.monotonic() - started)
         if remaining <= 0:
             break
         try:
@@ -2944,10 +2995,10 @@ async def _fetch_slot_tools(tenant_id: str, label: str) -> "tuple[str, list[dict
             tools = []
         if tools:
             break
-        remaining = _SLOT_TOOLS_FETCH_BUDGET - (time.monotonic() - started)
-        if _attempt < 3 and remaining > 0.5:
+        remaining = budget_s - (time.monotonic() - started)
+        if remaining > 0.5:
             await asyncio.sleep(0.5)
-        elif _attempt < 3:
+        else:
             break
     return label, tools
 

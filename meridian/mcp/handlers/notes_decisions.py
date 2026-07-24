@@ -1280,6 +1280,69 @@ async def handle_find_similar_table(
     }
 
 
+async def handle_link_table_caption(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: link_table_caption.
+
+    42d398a5 — durably link an already-indexed doc_tables row to its
+    caption paragraph by stable doc_elements id (not proximity). The table
+    analogue of link_figure_caption: confirmation primitive for the advisory
+    suggestion from index_table, and the backfill mechanism for tables
+    indexed before caption linkage was added.
+    """
+    validate_input_size(args.get("doc"), "table doc", 2_000)
+    validate_input_size(args.get("table_id"), "table_id", 200)
+    validate_input_size(args.get("caption_element_id"), "caption_element_id", 200)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = args.get("doc")
+    table_id = (args.get("table_id") or "").strip()
+    caption_element_id = (args.get("caption_element_id") or "").strip()
+    if not doc_source:
+        return {"error": "doc is required"}
+    if not table_id:
+        return {"error": "table_id is required"}
+    if not caption_element_id:
+        return {"error": "caption_element_id is required"}
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {
+            "error": (
+                f"no stored document for doc={doc_source!r} — ingest_document "
+                "it first (that MCP tool populates the doc-structure store; "
+                "there is no separate reindex_document tool)"
+            ),
+        }
+    try:
+        updated = await store.set_table_caption_link(table_id, caption_element_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not set caption link: {exc}"}
+    if updated is None:
+        return {
+            "error": (
+                f"no doc_tables row found for table_id={table_id!r} "
+                "— use find_similar_table to locate the correct table_id"
+            ),
+        }
+    return {
+        "project_id": args["project_id"],
+        "document_id": doc_row["id"],
+        "table": updated,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Section 9b: Embedded-copy-vs-source drift detection (432fcfcb)
 # ---------------------------------------------------------------------------

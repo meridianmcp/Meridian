@@ -139,7 +139,7 @@ def test_notify_helper_is_idempotent():
 
 def _stub_fetch(monkeypatch, tools_by_label):
     """Stub _fetch_slot_tools so no real WebSocket/proxy is touched."""
-    async def fake_fetch(tenant_id, label):
+    async def fake_fetch(tenant_id, label, *, budget=None):
         return label, list(tools_by_label.get(label, []))
     monkeypatch.setattr(tn, "_fetch_slot_tools", fake_fetch)
 
