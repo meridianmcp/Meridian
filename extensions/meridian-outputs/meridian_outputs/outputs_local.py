@@ -2321,19 +2321,20 @@ class OutputsFtsIndex:
                     precomputed, classifications, deadline,
                 )
             )
-            # 6ba77ada -- a path only leaves the pending-stale backlog once
-            # it's actually been analysed and staged for write (`new_rows`);
-            # anything in `stale` that _apply_precomputed didn't get to this
-            # call (its own deadline check breaks early) simply stays queued
-            # for the next call instead of being silently dropped.
-            for r in new_rows:
-                self._pending_stale.pop(r.path, None)
             if not walk_complete:
                 # 6ba77ada -- the walk itself hasn't finished a full pass yet
                 # (it's being resumed across future rebuild() calls), so the
                 # index is known-incomplete regardless of whether Phase 1/2
                 # themselves hit their own deadlines this call.
                 self.last_rebuild_partial = True
+            # <false-convergence fix, see root-cause note at the pop below> --
+            # write_confirmed tracks whether Phase 2's DB write (+ FTS commit)
+            # actually succeeds. Starts True (nothing to persist, or the
+            # write below succeeds) and is flipped False ONLY inside the
+            # `except` block. The pending-stale pop used to run
+            # unconditionally right here -- see the note at its new location
+            # for why that was a real bug, not just a comment inaccuracy.
+            write_confirmed = True
             if changed:
                 try:
                     con = self._connect()
@@ -2494,6 +2495,42 @@ class OutputsFtsIndex:
                     self.last_db_write_error = (
                         f"{type(_db_write_exc).__name__}: {_db_write_exc}"
                     )
+                    write_confirmed = False
+            # <false-convergence ROOT-CAUSE FIX> -- a path is only dropped from
+            # the pending-stale backlog once its row is CONFIRMED persisted
+            # (write_confirmed True). Before this fix, the pop ran
+            # unconditionally right after _apply_precomputed -- BEFORE Phase
+            # 2's DB write (the code directly above) even ran, let alone
+            # succeeded. _apply_precomputed() had already updated
+            # self._row_cache / self._manifest optimistically for every path
+            # in new_rows (edc84500's "content evicted, everything else kept"
+            # cache), so once a path was popped from _pending_stale here, a
+            # DB write failure for that SAME path left it looking exactly as
+            # "current" as a genuinely persisted row: Phase 1's own staleness
+            # check (`self._manifest.get(p) != sig or p not in
+            # self._row_cache`) would find both fields already up to date and
+            # never re-flag it as stale. The file would then be silently and
+            # PERMANENTLY dropped from the searchable index for the lifetime
+            # of the process -- never retried, never surfaced again once this
+            # call's own last_db_write_error is reset to None at the top of
+            # the NEXT rebuild() call. That is exactly the false-convergence
+            # failure mode flagged in this sprint item: the tree can look
+            # fully converged (partial=False, pending_stale_count omitted/0)
+            # while a real file is missing from search results.
+            #
+            # The fix: leave failed paths IN _pending_stale (they were never
+            # removed to begin with -- this is a pure reordering, not a
+            # re-add) so the next rebuild() call resubmits them to Phase 1/2
+            # for a genuine retry. last_rebuild_partial / fts_pending are
+            # deliberately NOT touched here on a write failure -- db_write_
+            # error already carries this call's own signal (1a799e52,
+            # unchanged contract, see TestSearchOutputsAPI::
+            # test_search_outputs_surfaces_db_write_error_in_result_dict) and
+            # this fix's job is only to make the NEXT call actually retry
+            # instead of silently losing the file forever.
+            if write_confirmed:
+                for r in new_rows:
+                    self._pending_stale.pop(r.path, None)
             # b1789c0d: also set _fts_pending when the deadline expired before
             # any rows were written (changed=False because _apply_precomputed
             # exited immediately on a deeply-negative deadline). In that case
@@ -3012,6 +3049,16 @@ def search_outputs(
 ) -> dict[str, Any]:
     """BM25 search over a local outputs tree.
 
+    *** A ZERO-HIT RESULT IS NOT PROOF THE FILE/TERM DOESN'T EXIST. ***
+    Always check ``partial``, ``fts_pending``, ``pending_stale_count``, and
+    ``db_write_error`` on the response before concluding "not found" -- any of
+    them being set means indexing is still in progress (or a write failed and
+    is queued for retry), not that the search genuinely came up empty. When
+    ``hits`` is empty AND the index is not fully converged, this function also
+    sets ``zero_hits_warning`` (see below) as a single, hard-to-miss signal --
+    but the underlying fields are the authoritative contract; do not rely on
+    ``zero_hits_warning`` alone if you are inspecting fields programmatically.
+
     Fully local -- no hosted call.  Reuses a cached incremental
     :class:`OutputsFtsIndex` per ``outputs_dir``.  Secret files are never
     indexed (filtered by :func:`is_secret_path` before any file is walked).
@@ -3037,6 +3084,17 @@ def search_outputs(
     (``OutputsFtsIndex._pending_stale``) so a caller can tell a zero-hit
     result on a mid-pass index (backlog non-empty, or the walk itself hasn't
     finished a pass) apart from a genuine miss on a fully-converged index.
+
+    <surface-it-loudly>: when ``hits`` is empty AND at least one of
+    ``partial``/``fts_pending``/``db_write_error`` is set, the response ALSO
+    carries ``zero_hits_warning`` -- a human-readable string explaining that
+    this specific zero-hit result must not be read as "not found" (a
+    same-shaped WARNING is also logged server-side). This exists because the
+    ``partial``/``fts_pending``/``pending_stale_count`` contract documented
+    above, while already tracked and returned, was repeatedly missed by
+    callers (frequently other AI agents) skimming only ``hits: []`` --
+    exactly the misdiagnosis this docstring update and field were added to
+    close.
     """
     result: dict[str, Any] = {
         "outputs_dir": outputs_dir,
@@ -3092,6 +3150,45 @@ def search_outputs(
         # hits with no indication why isn't actionable -- surface the same
         # clear message OutputsFtsIndex already logged at WARNING.
         result["tantivy_lock_warning"] = index._last_tantivy_error
+    if not hits and (
+        result.get("partial") or result.get("fts_pending")
+        or result.get("db_write_error")
+    ):
+        # <surface-it-loudly> -- b1789c0d/81a0b23d already tracked
+        # partial/fts_pending/pending_stale_count/db_write_error internally,
+        # and the module + tool docstrings already document the contract
+        # ("an empty hits list with partial=True means... still pending").
+        # In practice that was not loud enough: a caller (frequently another
+        # AI agent, not a human reading this docstring) that only glances at
+        # `hits: []` has repeatedly misread it as "file does not exist" even
+        # though partial=True/fts_pending=True/db_write_error was sitting
+        # right there in the SAME response -- the exact failure mode this
+        # sprint item was opened to close. Rather than rely on a caller
+        # cross-referencing three separate optional fields, add ONE
+        # impossible-to-miss field on the exact response shape that triggers
+        # the misread: zero hits + an incomplete/unpersisted index. Modeled
+        # on the tantivy_lock_warning precedent (9a18a2b2) -- a plain string
+        # that is simultaneously truthy-as-a-flag and a ready-to-relay
+        # explanation for an LLM caller, needing no separate boolean.
+        result["zero_hits_warning"] = (
+            "search_outputs returned 0 hits, but indexing of outputs_dir has "
+            "NOT finished (partial=True and/or fts_pending=True and/or "
+            "db_write_error is set on this same response) -- this is NOT a "
+            "reliable 'file does not exist' signal. Re-invoke search_outputs "
+            "on the same outputs_dir and query to let indexing continue "
+            "(see pending_stale_count for how much work remains queued), and "
+            "only treat a miss as confirmed once a response comes back with "
+            "no partial/fts_pending/db_write_error fields at all."
+        )
+        _log.warning(
+            "search_outputs: zero hits for query=%r under outputs_dir=%r "
+            "while the index is incomplete (partial=%s, fts_pending=%s, "
+            "pending_stale_count=%s, db_write_error=%s) -- this is NOT a "
+            "confirmed miss; caller should re-invoke rather than conclude "
+            "the file/term doesn't exist",
+            query, outputs_dir, result.get("partial"), result.get("fts_pending"),
+            result.get("pending_stale_count"), result.get("db_write_error"),
+        )
     return result
 
 

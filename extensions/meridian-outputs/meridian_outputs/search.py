@@ -124,12 +124,17 @@ def search_outputs(
       Identical shape to ``outputs_local.search_outputs``'s return value
       (``{outputs_dir, query, hits, total_indexed, total_in_index, ...}``
       plus optional ``partial``/``pending_stale_count``/``fts_pending``/
-      ``tantivy_lock_warning``/``error``), except every hit dict gains a
+      ``tantivy_lock_warning``/``db_write_error``/``zero_hits_warning``/
+      ``error``), except every hit dict gains a
       ``literal_match: bool``
       field, and ``hits`` is stably re-sorted so all ``literal_match=True``
       hits precede all ``literal_match=False`` hits (BM25 order is
       preserved within each group). On error (missing dir, empty query,
-      etc.) the result is returned unchanged -- no re-ranking is attempted.
+      etc.) OR a zero-hit result the result is returned unchanged -- no
+      re-ranking is attempted, and (per ``outputs_local.search_outputs``'s
+      contract) a zero-hit response carries ``zero_hits_warning`` whenever
+      the index isn't fully converged, so this passthrough must never be
+      mistaken for a confirmed "not found".
     """
     result = outputs_local.search_outputs(
         outputs_dir,

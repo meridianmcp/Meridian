@@ -18,6 +18,19 @@ v14 fixes this by:
 3. Adding an explicit table mapping connection mode to available tools.
 4. Documenting that local STDIO tools are genuinely absent (not deferred) in
    that context — so a discovery search failure means absence, not a loading lag.
+
+v16 follow-up (c0169ae9): v14's own STDIO-unreachable prose named the local
+tools `meridian-code` and `meridian-extractor` — names that were never
+registered in tunnel_plugins.BUILTIN_PLUGINS and are explicitly LEGACY
+.mcp.json connector keys (superseded per tunnel_client.py's ef162c28 rename).
+The real, currently-registered identifiers are the code-intel plugin's
+`codebase__*` tools (slot "code") and the code-extractor plugin's
+`extractor__*` tools (slot "extract", Serena), per routes/tunnel.py's
+SLOT_DISPLAY_NAMES. This was a genuine in-repo documentation bug: it sent
+sessions looking for a tool/process name that never existed under that name
+-- exactly the "phantom meridian-extract: tool namespace" symptom c0169ae9
+investigated. Fixed by swapping the stale names for the real ones; assertions
+below updated to match.
 """
 
 from meridian.agent_defaults import (
@@ -67,14 +80,25 @@ def test_search_code_named_as_primary_in_browser_no_tunnel_case():
 
 
 def test_stdio_tools_named_as_genuinely_unreachable():
-    """The instructions must explain that desktop-commander/meridian-code/
-    meridian-extractor are STDIO processes that require a running tunnel and
-    are genuinely absent (not just deferred) in browser sessions."""
+    """The instructions must explain that desktop-commander / the code-intel
+    slot's codebase__* tools / the code-extractor slot's extractor__* tools
+    (Serena) are STDIO processes that require a running tunnel and are
+    genuinely absent (not just deferred) in browser sessions.
+
+    c0169ae9: previously asserted the phantom names `meridian-code` /
+    `meridian-extractor`, which were never registered in
+    tunnel_plugins.BUILTIN_PLUGINS. Updated to the real, currently-registered
+    tool prefixes (`codebase__` / `extractor__`, per SLOT_DISPLAY_NAMES).
+    """
     text = DEFAULT_AGENT_INSTRUCTIONS
     assert "STDIO" in text or "stdio" in text.lower()
     assert "desktop-commander" in text
-    assert "meridian-code" in text
-    assert "meridian-extractor" in text
+    assert "codebase__" in text
+    assert "extractor__" in text
+    # The phantom pre-fix names must NOT reappear.
+    assert "meridian-code" not in text
+    assert "meridian-extractor" not in text
+    assert "meridian-extract" not in text
     # Must convey the tunnel dependency
     assert "--tunnel" in text
 

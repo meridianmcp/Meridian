@@ -48,6 +48,17 @@ def search_outputs(
     """BM25 full-text search over a local outputs directory tree, with a
     literal-filename-match boost (item c6236ef4).
 
+    IMPORTANT -- a 0-hit result does NOT mean the file/term doesn't exist.
+    On a cold or large ``outputs_dir``, indexing this tool depends on can
+    take longer than one call's budget: check ``partial``, ``fts_pending``,
+    ``pending_stale_count``, and ``db_write_error`` on the response before
+    concluding "not found" -- any of them present means the index is still
+    catching up (or a write failed and will retry), and you should
+    re-invoke this same tool with the same ``outputs_dir``/``query`` to get
+    a progressively more complete answer. A ``zero_hits_warning`` string is
+    also included on exactly this "0 hits + still indexing" response shape
+    as an unmissable flag -- if you see it, re-run rather than report a miss.
+
     Indexes CSV, JSON, and NPY files under ``outputs_dir`` (recursive) and
     returns ranked hits.  The index is built and cached locally -- no network
     call is made.  Secret files matching patterns like .env*, *.key, *secret*,
@@ -83,10 +94,14 @@ def search_outputs(
     Returns:
       {outputs_dir, query, hits, total_indexed} plus optional {partial,
       pending_stale_count, fts_pending, tantivy_lock_warning, db_write_error,
-      error}. ``pending_stale_count`` (only present when ``partial`` is True)
-      is the number of confirmed-stale files still queued for analysis+write
-      -- distinguishes a zero-hit result on a mid-pass index (more indexing
-      queued) from a genuine miss on a fully-converged index (81a0b23d).
+      zero_hits_warning, error}. ``pending_stale_count`` (only present when
+      ``partial`` is True) is the number of confirmed-stale files still
+      queued for analysis+write -- distinguishes a zero-hit result on a
+      mid-pass index (more indexing queued) from a genuine miss on a
+      fully-converged index (81a0b23d). ``zero_hits_warning`` is present
+      whenever ``hits`` is empty AND the index isn't fully converged
+      (partial/fts_pending/db_write_error set) -- treat its presence as "do
+      not conclude not-found yet, re-invoke this tool instead."
       Each hit has: path, score, bm25, is_archival, canonical_path, kind,
       generating_script, csv_columns, json_keys, size, mtime, annotations,
       literal_match.

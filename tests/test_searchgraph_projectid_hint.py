@@ -25,6 +25,18 @@ from meridian.routes import tunnel
     "unknown project: meridian-build",
     "project does not exist",
     "that project is not indexed yet",
+    # 1579bc1e — broadened phrasing/subject-noun coverage: confirmed live
+    # failures showed the retry not firing because the actual text used a
+    # different noun ("repository"/"repo" instead of "project") or a
+    # phrasing variant (a contraction, or an extra word breaking what used
+    # to be a required contiguous substring).
+    "repository not found or not indexed",
+    "repo is not indexed",
+    "the repository hasn't been indexed yet",
+    "could not find that project",
+    "couldn't find repo 'meridian-build'",
+    "no matching project for that repo-path slug",
+    "unknown repository: meridian-build",
 ])
 def test_is_project_not_found_matches_known_phrasings(msg):
     assert tunnel._is_project_not_found_error(msg) is True
@@ -33,9 +45,12 @@ def test_is_project_not_found_matches_known_phrasings(msg):
 @pytest.mark.parametrize("msg", [
     "",
     "syntax error in query",
-    "file not found",  # 'file', not 'project'
+    "file not found",  # 'file', not 'project'/'repo'/'repository'
     "rate limited",
     "the graph is empty",
+    # Noun present, but no not-found-shaped phrase attached to it.
+    "the repository returned 200 results",
+    "project search completed successfully",
 ])
 def test_is_project_not_found_ignores_unrelated_errors(msg):
     assert tunnel._is_project_not_found_error(msg) is False
@@ -232,3 +247,84 @@ async def test_call_tunnel_tool_leaves_non_project_error_untouched(monkeypatch):
     msg = str(exc.value)
     assert "query syntax error" in msg
     assert "repo-path" not in msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_call_tunnel_tool_error_dict_without_message_key_still_surfaces_text(
+    monkeypatch,
+):
+    """1579bc1e — regression for a real gap: call_tunnel_tool used to build
+    the raised error's text via ``err.get("message")`` alone. A JSON-RPC
+    error object that carries its human-readable text under a different key
+    (``"error"``/``"detail"``/a string ``"data"`` field — not every server
+    strictly follows the JSON-RPC "message" convention) made ``.get("message")``
+    return None, and ``str(None)`` produced the literal text "None" instead of
+    the real diagnostic. That silently destroyed the "project not found"
+    signal before it ever reached ``_is_project_not_found_error``, so the
+    downstream retry-without-project_id fallback in prospect.py could never
+    fire — regardless of how good the phrase-matching itself is. The fix
+    probes "message", "error", "detail", then a string "data" field before
+    falling back to stringifying the whole dict."""
+    tenant = "tenant-e2e-nomsgkey"
+    tool = "codebase__search_graph"
+    tunnel._tunnel_tool_routes[tenant] = {tool: "code"}
+    tunnel._tunnel_code_sockets[tenant] = object()
+
+    async def _fake_jsonrpc(tenant_id, label, method, params, repo_path=None):
+        # No "message" key at all — text lives in "data" instead.
+        return {"error": {"code": 404, "data": "project not found or not indexed"}}
+
+    async def _fake_list(tenant_id):
+        return []
+
+    monkeypatch.setattr(tunnel, "_tunnel_jsonrpc", _fake_jsonrpc)
+    monkeypatch.setattr(tunnel, "_list_indexed_project_ids", _fake_list)
+
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            await tunnel.call_tunnel_tool(
+                tenant, tool, {"project_id": "meridian-build", "query": "foo"}
+            )
+    finally:
+        tunnel._tunnel_tool_routes.pop(tenant, None)
+        tunnel._tunnel_code_sockets.pop(tenant, None)
+
+    msg = str(exc.value)
+    # The real diagnostic text must survive — never collapse to "None".
+    assert "project not found or not indexed" in msg
+    assert msg.strip() != "None"
+    # It must also still be recognisable as a project-not-found error, since
+    # that's what the whole retry mechanism depends on.
+    assert tunnel._is_project_not_found_error(msg) is True
+
+
+@pytest.mark.asyncio
+async def test_call_tunnel_tool_error_string_data_falls_back_when_no_error_key(
+    monkeypatch,
+):
+    """Same gap, minimal shape: only "data" is present (no "message", no
+    "error" string). Must still surface the real text, not "None"."""
+    tenant = "tenant-e2e-dataonly"
+    tool = "codebase__search_graph"
+    tunnel._tunnel_tool_routes[tenant] = {tool: "code"}
+    tunnel._tunnel_code_sockets[tenant] = object()
+
+    async def _fake_jsonrpc(tenant_id, label, method, params, repo_path=None):
+        return {"error": {"code": 404, "data": "repository is not indexed"}}
+
+    async def _fake_list(tenant_id):
+        return []
+
+    monkeypatch.setattr(tunnel, "_tunnel_jsonrpc", _fake_jsonrpc)
+    monkeypatch.setattr(tunnel, "_list_indexed_project_ids", _fake_list)
+
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            await tunnel.call_tunnel_tool(tenant, tool, {"query": "foo"})
+    finally:
+        tunnel._tunnel_tool_routes.pop(tenant, None)
+        tunnel._tunnel_code_sockets.pop(tenant, None)
+
+    msg = str(exc.value)
+    assert "repository is not indexed" in msg
+    assert msg.strip() != "None"

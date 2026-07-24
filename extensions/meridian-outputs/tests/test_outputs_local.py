@@ -2149,6 +2149,129 @@ class TestColdTreeFtsDeferral:
         )
         assert result.get("fts_pending") is not True
 
+    def test_db_write_failure_does_not_permanently_drop_file_from_index(
+        self, tmp_path: Path,
+    ) -> None:
+        """<false-convergence root-cause fix> (sprint item f66656f9): before
+        this fix, rebuild() popped a just-analysed path from
+        ``_pending_stale`` UNCONDITIONALLY right after ``_apply_precomputed``
+        -- which had ALREADY optimistically updated ``_row_cache``/
+        ``_manifest`` for that path -- regardless of whether Phase 2's actual
+        DB write (below that pop, in the original code) went on to succeed.
+        If the write then raised, the path was gone from the backlog forever:
+        Phase 1's own staleness check (``manifest mismatch OR not in
+        row_cache``) found both already "current" and would never re-flag it
+        stale, so the file could never be retried. Worse, ``last_db_write_
+        error`` resets to ``None`` at the top of every ``rebuild()`` call, so
+        even that signal vanishes on the very next call once nothing is
+        `changed` anymore -- the tree then looks fully converged
+        (``partial`` False, ``pending_stale_count`` omitted) forever, while
+        the real file silently never made it into the searchable index. This
+        confirms the fix: the file stays queued in ``_pending_stale`` after a
+        failed write, and a later successful ``rebuild()`` call actually
+        persists and finds it.
+        """
+        (tmp_path / "real_file.csv").write_text(
+            "distinctive_term_xyz,1\n", encoding="utf-8"
+        )
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            def _boom(self, con):  # noqa: ANN001 -- matches _ensure_schema's signature
+                raise RuntimeError("simulated transient disk-full")
+
+            with patch.object(OL.OutputsFtsIndex, "_ensure_schema", _boom):
+                idx.rebuild()
+
+            # The pre-existing, documented optimistic in-memory state...
+            assert idx.last_db_write_error is not None
+            assert len(idx._row_cache) == 1, (
+                f"expected the optimistic row_cache entry -- got {idx._row_cache!r}"
+            )
+            # ...but the fix under test: the file must STILL be queued for
+            # retry, not silently and permanently dropped.
+            assert len(idx._pending_stale) == 1, (
+                "a DB write failure must leave the file queued in "
+                f"_pending_stale for a future retry -- got {idx._pending_stale!r}"
+            )
+            # And it must genuinely not be searchable yet -- the write really
+            # did fail, nothing was persisted.
+            assert idx.search("distinctive_term_xyz") == [], (
+                "the row was never actually persisted, so it must not be "
+                "searchable until a retry succeeds"
+            )
+
+            # A later, unpatched rebuild() call (the transient failure is
+            # gone) must actually retry and persist the file this time.
+            idx.last_db_write_error = None
+            idx.rebuild()
+            assert idx.last_db_write_error is None
+            assert idx._pending_stale == {}, (
+                "a successful retry must clear the backlog -- "
+                f"got {idx._pending_stale!r}"
+            )
+
+            hits = idx.search("distinctive_term_xyz")
+            assert any("real_file.csv" in h["path"] for h in hits), (
+                f"the file must be searchable once the write actually "
+                f"succeeds -- got {hits}"
+            )
+        finally:
+            idx.close()
+
+    def test_search_outputs_sets_zero_hits_warning_when_index_incomplete(
+        self, tmp_path: Path,
+    ) -> None:
+        """<surface-it-loudly> (sprint item f66656f9): a zero-hit result
+        returned while the index is NOT fully converged must carry
+        ``zero_hits_warning`` -- an unmissable, self-contained signal added
+        because the pre-existing ``partial``/``fts_pending``/
+        ``pending_stale_count`` contract, while already tracked and returned,
+        was repeatedly misread by callers looking only at ``hits: []`` as
+        "file does not exist"."""
+        n_files = 5
+        for i in range(n_files):
+            (tmp_path / f"cold_zhw_{i}.csv").write_text(
+                f"cold_zhw_unique_term_{i}\n{i}", encoding="utf-8"
+            )
+
+        result = OL.search_outputs(
+            str(tmp_path), "cold_zhw_unique_term_2", max_seconds=-1.0,
+        )
+
+        assert result["hits"] == []
+        assert result.get("partial") is True
+        assert result.get("zero_hits_warning"), (
+            f"expected zero_hits_warning on a 0-hit, partial=True result -- got {result}"
+        )
+        assert "re-invoke" in result["zero_hits_warning"].lower()
+
+    def test_search_outputs_no_zero_hits_warning_when_hits_present(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression check: a healthy, non-empty result must never carry
+        zero_hits_warning -- the new field must not leak into the common case."""
+        (tmp_path / "warm_zhw.csv").write_text(
+            "warmzhwuniqueterm,1\n1,2", encoding="utf-8"
+        )
+        result = OL.search_outputs(str(tmp_path), "warmzhwuniqueterm")
+        assert len(result["hits"]) >= 1
+        assert "zero_hits_warning" not in result
+
+    def test_search_outputs_no_zero_hits_warning_on_fully_converged_miss(
+        self, tmp_path: Path,
+    ) -> None:
+        """A genuine zero-hit miss on a FULLY converged (non-partial) index
+        must NOT carry zero_hits_warning -- it would defeat the purpose of a
+        loud signal if it fired on every miss regardless of index state."""
+        (tmp_path / "unrelated_zhw.csv").write_text(
+            "somecolumn,1\n1,2", encoding="utf-8"
+        )
+        result = OL.search_outputs(str(tmp_path), "totally_absent_term_zzz_zhw")
+        assert result["hits"] == []
+        assert result.get("partial") is not True
+        assert "zero_hits_warning" not in result
+
 
 class TestTantivySearchIndex:
     """77443d83/a6056886 -- OutputsFtsIndex._rebuild_fts/.search now go
