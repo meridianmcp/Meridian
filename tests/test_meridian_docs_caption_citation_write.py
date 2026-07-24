@@ -972,7 +972,8 @@ class TestRoundTrip:
         )
         assert cap_para is not None, "Caption paragraph not found after insert"
 
-        # Edit via synthesized para_id (p{N} counting).
+        # Edit via the id parse_docx just resolved (native w14:paraId when
+        # present, else the content-derived synth id -- see 71db285b).
         edit = docs_intel.edit_caption(
             docx_path=docx,
             caption_para_id=cap_para["para_id"],
@@ -982,10 +983,23 @@ class TestRoundTrip:
         xml_after_edit = _read_doc_xml(docx)
         assert "Edited label" in xml_after_edit
 
+        # 71db285b -- this paragraph has no native w14:paraId, so its id is
+        # the content-derived synth id (heading breadcrumb + normalized TEXT
+        # + occurrence). edit_caption just changed that very text, which
+        # changes the paragraph's OWN synth id (by design -- the id is a hash
+        # of current content, not a positional counter). Re-resolve the
+        # caption's CURRENT id post-edit rather than reusing the pre-edit one,
+        # exactly as a real caller must after any content-changing write.
+        paras_after_edit = docs_intel.parse_docx(docx)
+        cap_para_after_edit = next(
+            (p for p in paras_after_edit if p.get("style") == "Caption"), None
+        )
+        assert cap_para_after_edit is not None, "Caption paragraph not found after edit"
+
         # Remove.
         rem = docs_intel.remove_caption(
             docx_path=docx,
-            caption_para_id=cap_para["para_id"],
+            caption_para_id=cap_para_after_edit["para_id"],
         )
         assert "error" not in rem
         xml_final = _read_doc_xml(docx)
