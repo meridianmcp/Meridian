@@ -2297,6 +2297,32 @@ def _record_spawned_pid(proc: object, label: str) -> None:
         pass
 
 
+def _serena_pool_spawn(cmd: "list[str]") -> "subprocess.Popen":
+    """Spawn one Serena daemon for :class:`SerenaDaemonPool` (the extract
+    slot's default backend, 64650cb4) and record it in the all-spawned PID
+    registry (6884a668).
+
+    6c29d144 — confirmed gap: ``SerenaDaemonPool.get_or_spawn`` calls its
+    injected ``spawn`` callable directly with a bare ``subprocess.Popen(cmd,
+    **_spawn_kwargs())`` lambda, which never went through
+    :func:`_spawn_with_cache_retry` (every other lazy-spawn slot's spawn
+    path) NOR through the watchdog-relaunch path (custom plugins) — both of
+    which already call :func:`_record_spawned_pid`. That made every Serena
+    daemon this tunnel ever spawns invisible to
+    :func:`_kill_all_previously_spawned_pids` on the NEXT tunnel startup:
+    an orphaned Serena daemon from a crashed/killed prior generation (the
+    pool's ``shutdown()`` never runs) would sit forever untracked, and the
+    per-slot ``_kill_stale_port_occupant`` sweep in ``run_tunnel`` cannot
+    cover it either — the pool isn't added to ``slot_proxies`` and its ports
+    are allocated dynamically per repo_path, not a single fixed port checked
+    at startup. Recording here closes that gap the same way every other spawn
+    path already does.
+    """
+    proc = subprocess.Popen(cmd, **_spawn_kwargs())
+    _record_spawned_pid(proc, "extract")
+    return proc
+
+
 def _kill_all_previously_spawned_pids(label: str = "startup") -> None:
     """Kill every process recorded in the all-spawned registry, then clear it.
 
@@ -5176,7 +5202,11 @@ async def run_tunnel(
                 # b970fe07 — dashboard serena_repo_path fills this in when --repo
                 # was not passed; otherwise it's the CLI repo_path (== cwd default).
                 default_repo_path=serena_repo_path,
-                spawn=lambda cmd: subprocess.Popen(cmd, **_spawn_kwargs()),
+                # 6c29d144 — _serena_pool_spawn wraps the Popen with
+                # _record_spawned_pid so orphaned Serena daemons are covered
+                # by _kill_all_previously_spawned_pids on the next startup
+                # (see _serena_pool_spawn's docstring for the full gap).
+                spawn=_serena_pool_spawn,
             )
             print(
                 f"  code-extractor:    Serena daemon pool (lazy, per repo_path) "

@@ -2391,6 +2391,39 @@ def test_spawn_with_cache_retry_records_pid_on_success(tmp_path, monkeypatch):
     assert any(e["pid"] == 7777 and e["label"] == "docs" for e in entries)
 
 
+def test_serena_pool_spawn_records_pid(tmp_path, monkeypatch):
+    """6c29d144: SerenaDaemonPool's spawn path is a direct Popen that never
+    went through _spawn_with_cache_retry, so it never called
+    _record_spawned_pid -- an orphaned Serena daemon from a prior generation
+    was invisible to _kill_all_previously_spawned_pids on the next startup.
+    _serena_pool_spawn (the callable wired into SerenaDaemonPool(spawn=...) in
+    run_tunnel) must record the child exactly like every other spawn path."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+
+    class _FakeSerenaProc:
+        pid = 8888
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, **kw: _FakeSerenaProc())
+
+    result = tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+
+    assert result.pid == 8888
+    entries = json.loads(tc._all_spawned_registry_path().read_text())
+    assert any(e["pid"] == 8888 and e["label"] == "extract" for e in entries)
+
+
+def test_serena_daemon_pool_wired_via_serena_pool_spawn_in_run_tunnel():
+    """6c29d144: run_tunnel must wire SerenaDaemonPool's spawn callable to
+    _serena_pool_spawn (not a bare subprocess.Popen lambda) so every Serena
+    daemon it spawns is recorded in the all-spawned PID registry. Guards
+    against a future regression silently reverting to the unrecorded lambda."""
+    import inspect
+
+    source = inspect.getsource(tc.run_tunnel)
+    assert "spawn=_serena_pool_spawn" in source
+    assert "spawn=lambda cmd: subprocess.Popen(cmd" not in source
+
+
 def test_kill_stale_port_occupant_spares_live_client_process(tmp_path, monkeypatch):
     """aaddb273 scenario 1: a live second client's process is NOT killed.
 
