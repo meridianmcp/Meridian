@@ -46,6 +46,7 @@ import sqlite3
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import Any
 
 # OOXML namespaces.
@@ -4853,6 +4854,69 @@ def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.El
     return p
 
 
+# 7205c8e0 -- tracked-changes insertion support: a w:ins-wrapped paragraph
+# insert. Scope is deliberately narrow -- insertion only, NOT deletion
+# tracking (w:del) or review/accept-reject (a separate, deprioritized
+# concern, proposal 9b7ecceb). w:ins/w:del are inline within document.xml
+# itself (confirmed via the OOXML spec), no new part/relationship needed --
+# fits the existing single-part write invariant every function above already
+# relies on, unlike set_page_header/set_page_footer's multi-part write below.
+
+
+def _next_revision_id(root: ET.Element) -> int:
+    """Mint the next unused numeric ``w:id`` for a new ``w:ins``/``w:del``
+    element, by scanning every existing ``w:ins``/``w:del`` element's ``w:id``
+    anywhere in the document and returning one past the max seen. Mirrors
+    :func:`_next_note_bookmark_name`'s max-seen-plus-one pattern, but over
+    revision ids (shared by both w:ins and w:del, per OOXML's own ``w:id``
+    revision-numbering scheme) rather than bookmark names.
+    """
+    w_id_attr = _q(_W, "id")
+    ins_tag = _q(_W, "ins")
+    del_tag = _q(_W, "del")
+    max_seen = 0
+    for el in root.iter():
+        if el.tag not in (ins_tag, del_tag):
+            continue
+        raw_id = el.get(w_id_attr)
+        if raw_id is None:
+            continue
+        try:
+            max_seen = max(max_seen, int(raw_id))
+        except ValueError:
+            continue
+    return max_seen + 1
+
+
+def _build_tracked_insertion_paragraph(
+    text: str, para_id: str, revision_id: int, author: str
+) -> ET.Element:
+    """Build a ``<w:p>`` whose entire content is one ``<w:ins>``-wrapped
+    ``<w:r>`` -- a genuine tracked-changes paragraph INSERT, not a plain
+    untracked paragraph. Carries a real ``w14:paraId`` (this is a brand-new
+    paragraph, so a real id is minted for it up front -- never a synth id,
+    which only ever describes paragraphs already present at parse time).
+
+    ``w:date`` is stamped as UTC ISO-8601 with a literal ``"Z"`` suffix --
+    Word's own convention. ``datetime.isoformat()`` on an aware UTC
+    ``datetime`` instead produces a ``"+00:00"`` offset suffix, which real
+    Word output never emits and which some strict OOXML consumers reject.
+    """
+    p = ET.Element(_q(_W, "p"))
+    p.set(_q(_W14, "paraId"), para_id)
+
+    ins = ET.SubElement(p, _q(_W, "ins"))
+    ins.set(_q(_W, "id"), str(revision_id))
+    ins.set(_q(_W, "author"), author)
+    ins.set(_q(_W, "date"), datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    r = ET.SubElement(ins, _q(_W, "r"))
+    t = ET.SubElement(r, _q(_W, "t"))
+    t.set(_q(_XML_NS, "space"), "preserve")
+    t.text = text
+    return p
+
+
 def _upsert_sidecar_note(index_db_path: str, note_id: str, text: str, anchor_para_id: str) -> None:
     """Best-effort record of a newly-inserted internal note into the sidecar.
 
@@ -5601,6 +5665,109 @@ def insert_highlighted_note(
         "anchor_para_id": anchor_para_id,
         "position": position,
         "style": _INTERNAL_NOTE_STYLE_DEFAULT,
+        "docx_path": docx_path,
+    }
+
+
+def insert_tracked_paragraph(
+    docx_path: str,
+    text: str,
+    anchor_para_id: str,
+    position: str = "after",
+    author: str = "Meridian Agent",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """7205c8e0 -- insert a genuinely tracked-changes ("w:ins"-wrapped)
+    paragraph, mirroring :func:`insert_highlighted_note`'s structure exactly.
+
+    Addresses a real, table-stakes DOCX gap: every major word processor
+    (Word, Google Docs) supports inserting new content under Track Changes so
+    a reviewer can see exactly what an editing pass added. This module had no
+    tracked-changes support at all. The new paragraph's entire content is one
+    ``<w:ins>``-wrapped ``<w:r>`` (see :func:`_build_tracked_insertion_paragraph`),
+    carrying a real, freshly-minted ``w14:paraId`` (this is brand-new content,
+    not something :func:`_build_synth_id_map` could ever have derived an id
+    for) and a fresh, never-before-used ``w:id`` revision number (see
+    :func:`_next_revision_id`) distinct from any ``w:ins``/``w:del`` already
+    in the document.
+
+    Scope (confirmed): INSERTION only -- NOT deletion tracking (``w:del``) or
+    review/accept-reject workflows (a separate, deprioritized concern,
+    proposal 9b7ecceb). ``w:ins``/``w:del`` live inline within
+    ``word/document.xml`` itself (no new OOXML part or relationship needed,
+    unlike :func:`set_page_header`/:func:`set_page_footer`'s multi-part write
+    path) -- so this fits the existing single-part write invariant every
+    write-back function above (up to the header/footer section) already
+    relies on. Does NOT touch :func:`write_section`.
+
+    Args:
+        docx_path:      Absolute path to the .docx file (mutated in place).
+        text:            The inserted paragraph's text content.
+        anchor_para_id:  w14:paraId (synth id, or legacy p{N}) of the
+                         paragraph to anchor on -- resolved via
+                         :func:`_find_para_by_id`'s usual three-tier scheme.
+        position:        "before" or "after" (default) the anchor.
+        author:          Recorded as the ``w:ins`` element's ``w:author``
+                         attribute (what Word displays as the reviewer name
+                         for this tracked insertion). Defaults to
+                         ``"Meridian Agent"``.
+        index_db_path:   If supplied, invalidates that sidecar's cached mtime
+                         so the next read re-parses the document (mirrors
+                         every other write-back function's sidecar handling;
+                         there is no dedicated tracked-insertion sidecar table
+                         the way :func:`insert_highlighted_note` has
+                         ``docx_internal_notes`` -- the new paragraph is
+                         immediately findable via its real ``w14:paraId`` by
+                         any other function in this module, no reindex
+                         needed).
+
+    Returns:
+        ``{status, para_id, revision_id, text, anchor_para_id, position,
+        author, docx_path}`` on success, or ``{"error": <message>}`` on
+        failure (file NOT mutated on error).
+    """
+    if not text or not str(text).strip():
+        return {"error": "text must be a non-empty string"}
+    if position not in ("before", "after"):
+        return {"error": f"position must be 'before' or 'after', got {position!r}"}
+    if not author or not str(author).strip():
+        return {"error": "author must be a non-empty string"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, anchor_para_id)
+    if result is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    body, _anchor_elem, child_idx = result
+
+    taken = _existing_para_ids(root)
+    new_para_id = _new_para_id(taken)
+    revision_id = _next_revision_id(root)
+    tracked_p = _build_tracked_insertion_paragraph(text.strip(), new_para_id, revision_id, author.strip())
+
+    insert_at = child_idx if position == "before" else child_idx + 1
+    body.insert(insert_at, tracked_p)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "inserted",
+        "para_id": new_para_id,
+        "revision_id": revision_id,
+        "text": text.strip(),
+        "anchor_para_id": anchor_para_id,
+        "position": position,
+        "author": author.strip(),
         "docx_path": docx_path,
     }
 
