@@ -1194,10 +1194,46 @@ def _build_quick_start_goal(
             if _gids:
                 _batches.append(f"batch {len(_batches) + 1}: {', '.join(_gids)}")
         _leftover = [iid for iid in item_ids if iid not in _batched]
-        _left_txt = (
-            f"; then, once their dependencies clear: {', '.join(_leftover)}"
-            if _leftover else ""
-        )
+        # a1996fbf — a leftover id can be held back for two structurally
+        # different reasons, and the goal text must not conflate them:
+        #   1. genuinely just waiting on in-goal batch order (its own
+        #      dependency is another item ALSO listed in this same goal) —
+        #      the generic "once their dependencies clear" phrasing is
+        #      accurate and harmless here.
+        #   2. blocked on an item that never appears anywhere in this goal's
+        #      item list at all — the generic phrasing is actively
+        #      misleading: it reads as "just wait for batch order," which
+        #      implies the blocker is accounted for in-goal, when the real
+        #      blocker is a separate, unlisted prerequisite the executor has
+        #      never heard of and may attempt to work around.
+        # get_parallelizable_groups already resolves this distinction in the
+        # SAME call — its "blocked" list carries the real depends_on id +
+        # blocked_by_status for exactly case 2 — so cross-reference it here
+        # instead of rendering every leftover id identically.
+        _blocked_by_id = {
+            _b["id"]: _b
+            for _b in (parallel_groups or {}).get("blocked") or []
+            if _b.get("id")
+        }
+        _leftover_external = [iid for iid in _leftover if iid in _blocked_by_id]
+        _leftover_batch_order = [iid for iid in _leftover if iid not in _blocked_by_id]
+        _left_parts: list[str] = []
+        if _leftover_batch_order:
+            _left_parts.append(
+                "; then, once their dependencies clear: "
+                f"{', '.join(_leftover_batch_order)}"
+            )
+        if _leftover_external:
+            _ext_txt = "; ".join(
+                f"{iid} blocked on {_blocked_by_id[iid].get('depends_on') or '?'} "
+                "(status: "
+                f"{_blocked_by_id[iid].get('blocked_by_status') or 'unknown'})"
+                for iid in _leftover_external
+            )
+            _left_parts.append(
+                f"; blocked on an item outside this goal (not listed above): {_ext_txt}"
+            )
+        _left_txt = "".join(_left_parts)
         items_clause = (
             "Complete sprint items in resource-conflict-free batches — the items "
             "within a batch touch disjoint resources and are parallel-safe (fan "

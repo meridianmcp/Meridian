@@ -5975,6 +5975,70 @@ def test_build_quick_start_goal_parallel_batches():
     assert "c3" in goal2       # leftover pending id preserved
 
 
+def test_build_quick_start_goal_leftover_shows_real_external_blocker():
+    """a1996fbf — a leftover item whose real depends_on is a DIFFERENT item
+    that never appears in this goal's item list must render the real
+    depends_on id + blocked_by_status explicitly, instead of the generic
+    "once their dependencies clear" phrase. That generic phrasing implies the
+    blocker is just in-goal batch order, which is misleading (and unsafe: an
+    executor could be misled into attempting a change that's genuinely not
+    safe yet) when the true blocker is a completely separate, unlisted item.
+    get_parallelizable_groups already resolves this via its "blocked" list —
+    this test pins that the goal text actually surfaces it."""
+    from meridian import handoff as h
+    items = [
+        {"id": "cd9c2bf7", "version": None},
+        {"id": "a1", "version": None},
+        {"id": "b2", "version": None},
+    ]
+    groups = {
+        "group_count": 2,
+        "groups": [
+            [{"id": "a1", "title": "x"}, {"id": "b2", "title": "y"}],
+        ],
+        # cd9c2bf7's real blocker (b75c4160) is NOT in this goal's item list at all.
+        "blocked": [
+            {
+                "id": "cd9c2bf7",
+                "title": "some item",
+                "depends_on": "b75c4160",
+                "blocked_by_status": "pending",
+            }
+        ],
+    }
+    goal = h._build_quick_start_goal(items, parallel_groups=groups)
+    assert "cd9c2bf7" in goal
+    assert "blocked on b75c4160" in goal
+    assert "status: pending" in goal
+    # Must NOT present this as merely waiting on in-goal batch order.
+    assert "once their dependencies clear: cd9c2bf7" not in goal
+
+
+def test_build_quick_start_goal_leftover_batch_order_phrasing_preserved():
+    """Companion/regression case: a leftover id with NO matching entry in
+    parallel_groups['blocked'] is genuinely just waiting on in-goal batch
+    order (or parallel_groups carries no blocked-list evidence at all) — the
+    existing generic "once their dependencies clear" phrasing must be
+    preserved unchanged, and the new external-blocker phrasing must NOT
+    appear."""
+    from meridian import handoff as h
+    items = [
+        {"id": "a1", "version": None},
+        {"id": "b2", "version": None},
+        {"id": "c3", "version": None},
+    ]
+    groups = {
+        "group_count": 2,
+        "groups": [
+            [{"id": "a1", "title": "x"}, {"id": "b2", "title": "y"}],
+        ],
+        "blocked": [],
+    }
+    goal = h._build_quick_start_goal(items, parallel_groups=groups)
+    assert "once their dependencies clear: c3" in goal
+    assert "blocked on an item outside this goal" not in goal
+
+
 # ---------------------------------------------------------------------------
 # 0b711a9d — strategic insights (table + tools + planning brief)
 # ---------------------------------------------------------------------------
