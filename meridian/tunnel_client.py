@@ -3900,7 +3900,8 @@ async def _index_code_dir(port: int, code_dir: str) -> None:
         try:
             async with httpx.AsyncClient(timeout=2.0) as c:
                 r = await c.post(local, json=probe,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json, text/event-stream"})
                 if r.status_code < 500:
                     break
         except Exception:
@@ -3922,7 +3923,8 @@ async def _index_code_dir(port: int, code_dir: str) -> None:
     try:
         async with httpx.AsyncClient(timeout=300.0) as c:
             r = await c.post(local, json=payload,
-                             headers={"Content-Type": "application/json"})
+                             headers={"Content-Type": "application/json",
+                                      "Accept": "application/json, text/event-stream"})
         if r.status_code < 400:
             # codebase-memory-mcp returns HTTP 200 even on an internal index
             # failure. Parse the JSON-RPC body so a silent partial/failed index
