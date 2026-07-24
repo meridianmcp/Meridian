@@ -858,6 +858,46 @@ def _build_backburner_todo_note(backburner_items: list[dict[str, Any]]) -> str:
     return f"\n<exclusions>{_xml_escape(body)}</exclusions>"
 
 
+def _build_goal_pointer_lines(pending_sprint_items: list[dict[str, Any]]) -> str:
+    """682005f4 — render each pending item's DURABLE resolved pointer(s) (see
+    ``_annotate_resolved_pointers``) as a short line INSIDE the /goal block's
+    own ``<sprint_items>`` tag, rather than only in the separate L1 markdown
+    "Pending Sprint Items" section full/delta render outside the goal block.
+
+    A goal-only handoff mode strips everything except the /goal block itself,
+    so an executor working from ONLY that block previously had no way to see
+    exact file/symbol locations even when they had been resolved — the
+    location info existed, it just lived in a part of the handoff the
+    goal-only mode discards. Threading it into the goal block's own rendering
+    (rather than reusing the L1 section as-is) is what actually fixes that.
+
+    Items with no ``resolved_pointers`` are skipped silently (same as the L1
+    section). Returns ``""`` when no item has any resolved pointer.
+    """
+    lines: list[str] = []
+    for it in pending_sprint_items:
+        iid = it.get("id")
+        resolved = it.get("resolved_pointers")
+        if not iid or not resolved:
+            continue
+        targets: list[str] = []
+        for ptr in resolved:
+            if not isinstance(ptr, dict):
+                continue
+            label = ptr.get("label")
+            prefix = f"{label}: " if label else ""
+            for loc in ptr.get("targets") or []:
+                targets.append(f"{prefix}{loc}")
+        if not targets:
+            continue
+        title = (it.get("title") or "").strip().split(".")[0][:60]
+        head = f"{iid} ({title})" if title else str(iid)
+        lines.append(f"{head}: {'; '.join(targets)}")
+    if not lines:
+        return ""
+    return "\n" + "\n".join(f"- {_xml_escape(line)}" for line in lines)
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -875,6 +915,7 @@ def _build_quick_start_goal(
     tool_priority_map: dict[str, str] | None = None,
     force_included_ids: "frozenset[str] | set[str] | None" = None,
     pointer_evidence_ids: "frozenset[str] | set[str] | None" = None,
+    include_pointer_lines: bool = False,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -933,6 +974,14 @@ def _build_quick_start_goal(
     query failed" and is treated as fail-open (nothing is excluded on that
     basis) rather than "confirmed no evidence" (which would risk mass-excluding
     every resource-declaring item on a transient DB hiccup).
+
+    ``include_pointer_lines`` (682005f4) — when True, append each remaining
+    item's resolved pointer(s) (``item["resolved_pointers"]``, set by
+    ``_annotate_resolved_pointers``) as short lines inside ``<sprint_items>``
+    via :func:`_build_goal_pointer_lines`. Off by default so existing full/
+    delta/starter output is byte-for-byte unchanged; the goal-only handoff
+    mode turns it on since that mode strips the separate L1 section that
+    would otherwise carry this same information.
     """
     try:
         _turns = int(max_turns)
@@ -1083,6 +1132,12 @@ def _build_quick_start_goal(
             "just this prose note. -->"
         )
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
+    # 682005f4 — computed against the FINAL filtered pending_sprint_items (after
+    # manual/backburner/unprospected/wave-gate exclusion above), so a pointer
+    # line never appears for an item that was itself excluded from the batch.
+    _pointer_lines_block = (
+        _build_goal_pointer_lines(pending_sprint_items) if include_pointer_lines else ""
+    )
     if not item_ids:
         # 5abf3e12 — empty-board branch: same constraints as before (verify,
         # test floor, generate_handoff, turn/HITL stop) re-expressed as XML tags.
@@ -1203,7 +1258,7 @@ def _build_quick_start_goal(
         '<first_step>First call get_sprint_items(status="pending") to load the '
         "live board (the ids below are a snapshot and may have shifted)."
         "</first_step>\n"
-        f"<sprint_items>{_xml_escape(items_clause.strip())}</sprint_items>\n"
+        f"<sprint_items>{_xml_escape(items_clause.strip())}{_pointer_lines_block}</sprint_items>\n"
         # 0d5453bc — explicit per-item vs end-of-megasprint split: targeted tests
         # only per item; the full suite is a single gate at the very end. This
         # prevents the anti-pattern of running the full suite 6x for one item.
@@ -2545,8 +2600,13 @@ def resolve_handoff_mode(
     requested_mode: str | None,
     session_id: str | None = None,
 ) -> str:
-    """Resolve the public handoff mode, auto-switching repeat sessions to delta."""
-    if requested_mode in {"full", "delta", "planner", "starter", "compact"}:
+    """Resolve the public handoff mode, auto-switching repeat sessions to delta.
+
+    ``"goal"`` (682005f4) is the 6th mode: it returns ONLY the bare /goal
+    block itself — no readiness header, no workspace decisions/notes, no
+    L0/L1/L2 context. See ``_generate_goal_only_handoff``.
+    """
+    if requested_mode in {"full", "delta", "planner", "starter", "compact", "goal"}:
         return requested_mode
     if session_id and session_id in _SESSION_HANDOFF_STATE:
         return "delta"
@@ -2598,8 +2658,15 @@ def _render_starter_handoff(
         lines += [f"Done: {', '.join(titles)}{extra}", ""]
     else:
         lines += ["Done: (none)", ""]
-    # Top 3 pending items with IDs
-    lines.append("# Pending")
+    # Top 3 pending items with IDs — 682005f4(c): the header must not imply
+    # only 3 items exist when there are more; the actual claimable batch in
+    # quick_start_goal below always receives the FULL pending list regardless
+    # of how many are previewed here.
+    _pending_total = len(pending_items)
+    if _pending_total > 3:
+        lines.append(f"# Pending (top 3 of {_pending_total} — full batch in /goal below)")
+    else:
+        lines.append("# Pending")
     for i, it in enumerate(pending_items[:3], 1):
         short_title = it["title"].strip()[:80]
         lines.append(f"{i}. [{it['id'][:8]}] {short_title}")
@@ -3850,8 +3917,23 @@ async def generate_handoff(
     if mode in {"starter", "compact"}:
         _st_path, _st_content = await _generate_starter_handoff(db, project, output_dir, identity=identity)
         return _st_path, _st_content, False
+    if mode == "goal":
+        # 682005f4 — bare-/goal-only mode: no readiness header, no workspace
+        # decisions/notes, no L0/L1/L2 context. Returns immediately, before any
+        # of the readiness/workspace-block/decisions rendering further below
+        # (that logic only ever runs for the full/delta branch).
+        _g_path, _g_content = await _generate_goal_only_handoff(
+            db,
+            project_id,
+            output_dir,
+            graph_searcher=graph_searcher,
+            force_include_ids=force_include_ids,
+        )
+        return _g_path, _g_content, False
     if mode not in {"full", "delta"}:
-        raise ValueError("mode must be 'full', 'delta', 'planner', 'starter', or 'compact'")
+        raise ValueError(
+            "mode must be 'full', 'delta', 'planner', 'starter', 'compact', or 'goal'"
+        )
 
     # 4c7cd788 — generate_handoff has THREE network Haiku seams (session-summary
     # fan-out, the ai_summary blurb, the sprint retrospective). The delta template
@@ -4632,7 +4714,9 @@ async def _generate_starter_handoff(
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
     Contains only the essentials: project_id, start_session command,
-    last 5 completed sprint items (titles), top 3 pending items with IDs,
+    last 5 completed sprint items (titles), a top-3 pending-items PREVIEW with
+    IDs (682005f4(c): honestly labeled "top 3 of N" when N > 3 — the actual
+    claimable batch in quick_start_goal below always carries the full list),
     and a ready-to-paste /goal string.  No decisions, no north star, no
     file paths — just enough to orient and execute.
     """
@@ -4732,3 +4816,146 @@ async def _generate_starter_handoff(
     out_path = out_dir / f"{handoff_file_stem(project_id)}_starter.md"
     out_path.write_text(content, encoding="utf-8")
     return str(out_path.resolve()), content
+
+
+async def _generate_goal_only_handoff(
+    db: object,
+    project_id: str,
+    output_dir: str,
+    *,
+    graph_searcher: Callable[[str], Any] | None = None,
+    force_include_ids: list[str] | None = None,
+) -> tuple[str, str]:
+    """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
+
+    No readiness header, no workspace decisions/notes, no L0/L1/L2 context —
+    unlike every other mode (including ``starter``/``compact``, which still
+    carries a "Done:"/"# Pending" preview frame around the /goal string).
+    This is for a caller that wants nothing but the executor-facing directive
+    itself, e.g. to hand straight to a fresh sub-agent with zero framing.
+
+    Unlike ``_generate_starter_handoff`` (which never resolves code pointers
+    at all — it goes straight from ``_prepare_pending_sprint_items`` to
+    ``_build_quick_start_goal``), this mode reuses the SAME
+    ``_annotate_code_pointers`` / ``_annotate_resolved_pointers`` enrichment
+    pipeline ``generate_handoff``'s full/delta branch uses, gated by the same
+    project/workspace settings. It then threads each item's resolved
+    pointer(s) INLINE into the goal block's own ``<sprint_items>`` tag (via
+    ``_build_quick_start_goal(..., include_pointer_lines=True)``) rather than
+    relying on the separate L1 markdown "Pending Sprint Items" section full/
+    delta render — that section lives outside the /goal block and would be
+    stripped away entirely by a goal-only mode, so reusing full's enrichment
+    pipeline alone would not have been sufficient.
+
+    Fully guarded like the full/delta path: any enrichment failure (no live
+    tunnel/graph searcher, settings fetch failure, resolve blowup) degrades to
+    no pointers rather than breaking this mandatory handoff.
+    """
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise ValueError(f"project not found: {project_id}")
+    # 45f519a0 — include_deferred=False; force_include_ids re-adds specific ids
+    # below, mirroring generate_handoff's own full/delta handling.
+    sprint_items_all = await db_module.get_sprint_items(
+        db, project_id, include_human=False, include_deferred=False
+    )
+    pending_sprint_items = [
+        it for it in sprint_items_all
+        if it.get("status") in ("todo", "pending")
+    ]
+    if force_include_ids:
+        _pending_id_set = {it["id"] for it in pending_sprint_items}
+        for _fid in force_include_ids:
+            if _fid in _pending_id_set:
+                continue
+            _forced = await db_module.get_sprint_item(db, _fid)
+            if (
+                _forced is not None
+                and _forced.get("project_id") == project_id
+                and _forced.get("status") in ("todo", "pending")
+            ):
+                pending_sprint_items.append(_forced)
+                _pending_id_set.add(_fid)
+    pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
+
+    # 91ac0199 — same code-pointer enrichment gate generate_handoff's full/
+    # delta branch uses. Fully guarded: never break the mandatory handoff.
+    try:
+        proj_settings = await db_module.get_project_settings(db, project_id)
+    except Exception:  # noqa: BLE001 — settings fetch must never break handoff
+        proj_settings = None
+    _ws_settings = None
+    try:
+        _ws_settings = await db_module.get_workspace_settings(db)
+    except Exception:  # noqa: BLE001 — column/row may be absent on older DBs
+        _ws_settings = None
+    if _code_pointers_enabled(proj_settings):
+        searcher = graph_searcher or _resolve_graph_searcher(project_id)
+        if searcher is not None:
+            try:
+                pending_sprint_items = await _annotate_code_pointers(
+                    pending_sprint_items, searcher
+                )
+            except Exception:  # noqa: BLE001 — enrichment is best-effort
+                pass
+    # 36fea6ca — same durable-pointer resolution generate_handoff's full/delta
+    # branch uses (gated by workspace_settings.handoff_inline_pointers, default
+    # on). Unlike full/delta, this mode's ONLY rendering surface for the
+    # result is the /goal block itself (see include_pointer_lines below).
+    if (_ws_settings or {}).get("handoff_inline_pointers", True):
+        try:
+            pending_sprint_items = await _annotate_resolved_pointers(
+                db, project_id, pending_sprint_items
+            )
+        except Exception:  # noqa: BLE001 — inline pointers are best-effort
+            pass
+
+    _hitl_mode = 0
+    try:
+        _hitl_mode = int(await db_module._project_hitl_auto_answer_mode(db, project_id))
+    except Exception:  # noqa: BLE001
+        pass
+    _parallel_groups = None
+    try:
+        _parallel_groups = await db_module.get_parallelizable_groups(db, project_id)
+    except Exception:  # noqa: BLE001
+        _parallel_groups = None
+    _wave_gate_pending = None
+    try:
+        _wave_gate_pending = await db_module.get_wave_gate_configs(db, project_id)
+    except Exception:  # noqa: BLE001
+        _wave_gate_pending = None
+    _pointer_evidence_ids = None
+    try:
+        _pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
+            db, [it.get("id") for it in pending_sprint_items]
+        )
+    except Exception:  # noqa: BLE001
+        _pointer_evidence_ids = None
+
+    quick_start_goal = _build_quick_start_goal(
+        pending_sprint_items,
+        execution_mode=db_module.normalize_execution_mode(project.get("execution_mode")),
+        max_turns=_max_turns_from_settings(proj_settings),
+        hitl_auto_answer_mode=_hitl_mode,
+        completion_mode=_completion_mode_from_settings(proj_settings),
+        goal_group_style=_goal_group_style_from_settings(proj_settings),
+        loop_enabled=_loop_enabled_from_settings(proj_settings, _ws_settings),
+        parallel_groups=_parallel_groups,
+        wave_gate_pending=_wave_gate_pending,
+        # 490e100d — workspace-level default tool priority per task category.
+        tool_priority_map=(_ws_settings or {}).get("tool_priority_map"),
+        force_included_ids=frozenset(force_include_ids) if force_include_ids else None,
+        pointer_evidence_ids=_pointer_evidence_ids,
+        # 682005f4(b) — thread resolved pointers into the goal block itself.
+        include_pointer_lines=True,
+    )
+    # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
+    # banner every /goal-producing path carries.
+    quick_start_goal = await _mint_and_embed_goal_token(db, project_id, quick_start_goal)
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{handoff_file_stem(project_id)}_goal.md"
+    out_path.write_text(quick_start_goal, encoding="utf-8")
+    return str(out_path.resolve()), quick_start_goal

@@ -564,6 +564,115 @@ def test_extract_jsonrpc_error_empty_body_returns_none():
     assert tc._extract_jsonrpc_error(None) is None  # type: ignore[arg-type]
 
 
+# ---------------------------------------------------------------------------
+# _extract_jsonrpc_error — application-level status/worker failure (cd28b329)
+#
+# codebase-memory-mcp's index_repository can report a server-side failure
+# (status=error, per-worker worker_failed/exit_code=1) WITHOUT setting the
+# MCP isError convention anywhere in the envelope. Before this fix that shape
+# passed straight through _extract_jsonrpc_error as a clean response, so
+# _index_code_dir printed "code-intel: indexed" despite the failure.
+# ---------------------------------------------------------------------------
+
+def test_extract_jsonrpc_error_status_error_on_result():
+    """A bare result.status == "error" (no isError anywhere) is detected."""
+    body = b'{"jsonrpc":"2.0","id":"idx","result":{"status":"error"}}'
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "status=error" in result
+
+
+def test_extract_jsonrpc_error_worker_failed_exit_code_1_twice():
+    """The exact reported shape: status=error + 2x worker_failed, exit_code=1."""
+    body = (
+        b'{"jsonrpc":"2.0","id":"idx","result":{"status":"error","workers":['
+        b'{"status":"worker_failed","exit_code":1},'
+        b'{"status":"worker_failed","exit_code":1}'
+        b']}}'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "status=error" in result
+    assert "2 worker(s) failed" in result
+    assert "exit_code=1" in result
+
+
+def test_extract_jsonrpc_error_worker_failed_without_top_level_status():
+    """Worker failures alone (no top-level status field) are still detected."""
+    body = (
+        b'{"jsonrpc":"2.0","id":"idx","result":{"workers":['
+        b'{"status":"worker_failed","exit_code":1}]}}'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "1 worker(s) failed" in result
+
+
+def test_extract_jsonrpc_error_nonzero_exit_code_without_status_string():
+    """A worker with a nonzero exit_code but no recognized status string still counts."""
+    body = b'{"jsonrpc":"2.0","id":"idx","result":{"workers":[{"exit_code":1}]}}'
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "1 worker(s) failed" in result
+
+
+def test_extract_jsonrpc_error_status_nested_in_content_text():
+    """The status/worker blob nested inside result.content[*].text JSON is detected."""
+    inner = '{"status":"error","workers":[{"status":"worker_failed","exit_code":1}]}'
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "idx",
+        "result": {"content": [{"type": "text", "text": inner}]},
+    }).encode()
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "status=error" in result
+    assert "1 worker(s) failed" in result
+
+
+def test_extract_jsonrpc_error_healthy_status_not_flagged():
+    """A clean status value (e.g. "ok") must not be misreported as a failure."""
+    body = b'{"jsonrpc":"2.0","id":"idx","result":{"status":"ok","workers":[{"status":"ok","exit_code":0}]}}'
+    assert tc._extract_jsonrpc_error(body) is None
+
+
+def test_index_code_dir_reports_worker_failed_status_error_as_failure(monkeypatch, capsys):
+    """End-to-end: index_repository's HTTP-200 status=error/worker_failed body must
+    surface as a warning, not a silent 'code-intel: indexed' success (cd28b329).
+    """
+    import httpx as _httpx
+
+    _call_count = [0]
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self.status_code = 200
+            self.content = body
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            _call_count[0] += 1
+            if _call_count[0] == 1:
+                return FakeResp(b'{"jsonrpc":"2.0","id":"probe","result":{"tools":[]}}')
+            return FakeResp(
+                b'{"jsonrpc":"2.0","id":"idx","result":{"status":"error","workers":['
+                b'{"status":"worker_failed","exit_code":1},'
+                b'{"status":"worker_failed","exit_code":1}'
+                b']}}'
+            )
+
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+    asyncio.run(tc._index_code_dir(8809, "/repo"))
+
+    captured = capsys.readouterr()
+    assert "status=error" in captured.err
+    assert "worker(s) failed" in captured.err
+    assert "code-intel: indexed" not in captured.out
+
+
 def test_index_code_dir_logs_jsonrpc_error_body(monkeypatch, capsys):
     """_index_code_dir warns when index_repository returns HTTP 200 with a JSON-RPC error body.
 
@@ -3761,3 +3870,204 @@ def test_spawn_with_cache_retry_fast_exit_non_tar_uses_scoped_clear(monkeypatch)
     assert spawn_count[0] == 2
     assert len(scoped_called) == 1, "scoped clear used for non-TAR fast-exit"
     assert len(thorough_called) == 0
+
+
+# ---------------------------------------------------------------------------
+# Staleness alert v1 (986117fc) — cheap local git-commit-drift warning.
+#
+# "manual Ctrl-C + restart every time a client-side fix lands" friction: at
+# startup, capture the commit this process is actually running; periodically
+# re-check the on-disk commit; warn (never restart) on divergence. Purely
+# local (git rev-parse), no server round-trip, no live-reset/self-restart
+# (explicitly out of scope for this item).
+# ---------------------------------------------------------------------------
+
+def _run_git(args: list, cwd: str) -> None:
+    import subprocess as _sp
+    _sp.run(
+        ["git"] + args, cwd=cwd, capture_output=True, text=True, check=True,
+        env={**os.environ,
+             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"},
+    )
+
+
+def _make_commit(repo_dir: str, filename: str, content: str) -> str:
+    import subprocess as _sp
+    with open(os.path.join(repo_dir, filename), "w") as f:
+        f.write(content)
+    _run_git(["add", "-A"], repo_dir)
+    _run_git(["commit", "-m", f"add {filename}"], repo_dir)
+    out = _sp.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir,
+        capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip()
+
+
+def test_tunnel_client_git_root_is_this_modules_directory():
+    """_tunnel_client_git_root points at the dir containing tunnel_client.py."""
+    assert tc._tunnel_client_git_root() == str(tc.Path(tc.__file__).resolve().parent)
+
+
+class TestTunnelClientCommitHashSync:
+    """Real (temp, on-disk) git repos — no mocking of git itself, mirrors
+    prospect.py's TestGitCommitDriftSync."""
+
+    def test_not_a_directory_returns_none(self):
+        assert tc._tunnel_client_commit_hash_sync("/definitely/not/a/real/path/xyz") is None
+
+    def test_not_a_git_repo_returns_none(self, tmp_path):
+        d = tmp_path / "not_a_repo"
+        d.mkdir()
+        assert tc._tunnel_client_commit_hash_sync(str(d)) is None
+
+    def test_real_repo_matches_head(self, tmp_path):
+        repo = tmp_path / "repo1"
+        repo.mkdir()
+        _run_git(["init"], str(repo))
+        commit1 = _make_commit(str(repo), "a.txt", "one")
+        assert tc._tunnel_client_commit_hash_sync(str(repo)) == commit1
+
+    def test_updates_after_new_commit(self, tmp_path):
+        repo = tmp_path / "repo2"
+        repo.mkdir()
+        _run_git(["init"], str(repo))
+        _make_commit(str(repo), "a.txt", "one")
+        commit2 = _make_commit(str(repo), "b.txt", "two")
+        assert tc._tunnel_client_commit_hash_sync(str(repo)) == commit2
+
+    def test_git_binary_missing_returns_none(self, monkeypatch, tmp_path):
+        def _raise(*a, **k):
+            raise FileNotFoundError("git not found")
+        monkeypatch.setattr(tc.subprocess, "run", _raise)
+        assert tc._tunnel_client_commit_hash_sync(str(tmp_path)) is None
+
+    def test_defaults_to_module_root_when_no_arg_given(self, monkeypatch):
+        """No root_dir passed → falls back to _tunnel_client_git_root()."""
+        seen = {}
+
+        class FakeResult:
+            returncode = 0
+            stdout = "deadbeef1234\n"
+
+        def fake_run(cmd, cwd=None, **kw):
+            seen["cwd"] = cwd
+            return FakeResult()
+
+        monkeypatch.setattr(tc.subprocess, "run", fake_run)
+        result = tc._tunnel_client_commit_hash_sync()
+        assert result == "deadbeef1234"
+        assert seen["cwd"] == tc._tunnel_client_git_root()
+
+
+def test_staleness_alert_loop_returns_immediately_without_baseline():
+    """No started_commit (e.g. not a git checkout at startup) → no-op, no loop."""
+    async def drive():
+        await asyncio.wait_for(tc._staleness_alert_loop(None), timeout=1.0)
+    asyncio.run(drive())  # would hang/timeout if the loop didn't early-return
+
+
+def test_staleness_alert_loop_warns_once_on_divergence(monkeypatch, capsys):
+    """Disk commit differs from the started commit → one clear stderr warning."""
+    calls = {"n": 0}
+
+    def fake_hash(root_dir=None):
+        calls["n"] += 1
+        return "def456abcdef"  # always diverged from started_commit below
+
+    monkeypatch.setattr(tc, "_tunnel_client_commit_hash_sync", fake_hash)
+
+    _real_sleep = asyncio.sleep
+    async def quick_sleep(_n):
+        await _real_sleep(0)
+    monkeypatch.setattr(tc.asyncio, "sleep", quick_sleep)
+
+    async def drive():
+        task = asyncio.ensure_future(
+            tc._staleness_alert_loop("abc123000000", interval=0.001)
+        )
+        # Each poll hops through a REAL thread-pool executor (asyncio.to_thread),
+        # so give it real wall-clock slices to run rather than instant yields.
+        for _ in range(300):
+            await _real_sleep(0.01)
+            if calls["n"] >= 3:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(drive())
+    assert calls["n"] >= 3, "commit-hash probe never ran enough times for this test to be meaningful"
+    captured = capsys.readouterr()
+    # Warned exactly once despite multiple poll iterations seeing the same
+    # diverged commit (no spam once a divergence has already been reported).
+    assert captured.err.count("has been updated since this process started") == 1
+    assert "abc123000000"[:12] in captured.err
+    assert "def456abcdef"[:12] in captured.err
+    assert "restart the tunnel" in captured.err
+
+
+def test_staleness_alert_loop_no_warning_when_commit_unchanged(monkeypatch, capsys):
+    """Disk commit == started commit → no warning ever printed."""
+    monkeypatch.setattr(tc, "_tunnel_client_commit_hash_sync", lambda root_dir=None: "same000000")
+
+    _real_sleep = asyncio.sleep
+    async def quick_sleep(_n):
+        await _real_sleep(0)
+    monkeypatch.setattr(tc.asyncio, "sleep", quick_sleep)
+
+    async def drive():
+        task = asyncio.ensure_future(
+            tc._staleness_alert_loop("same000000", interval=0.001)
+        )
+        for _ in range(10):
+            await _real_sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(drive())
+    captured = capsys.readouterr()
+    assert "has been updated" not in captured.err
+
+
+def test_staleness_alert_loop_survives_probe_exception(monkeypatch, capsys):
+    """A raising commit-hash probe must never kill the loop (fail-open)."""
+    state = {"n": 0}
+
+    def flaky_hash(root_dir=None):
+        state["n"] += 1
+        raise RuntimeError("git transiently unavailable")
+
+    monkeypatch.setattr(tc, "_tunnel_client_commit_hash_sync", flaky_hash)
+
+    _real_sleep = asyncio.sleep
+    async def quick_sleep(_n):
+        await _real_sleep(0)
+    monkeypatch.setattr(tc.asyncio, "sleep", quick_sleep)
+
+    async def drive():
+        task = asyncio.ensure_future(
+            tc._staleness_alert_loop("abc123000000", interval=0.001)
+        )
+        # Each poll hops through a REAL thread-pool executor (asyncio.to_thread),
+        # so give it real wall-clock slices to run rather than instant yields.
+        for _ in range(300):
+            await _real_sleep(0.01)
+            if state["n"] >= 3:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(drive())  # must not raise out of drive()
+    captured = capsys.readouterr()
+    assert "has been updated" not in captured.err
+    assert state["n"] >= 3

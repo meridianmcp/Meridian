@@ -46,6 +46,7 @@ import sqlite3
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import Any
 
 # OOXML namespaces.
@@ -326,10 +327,21 @@ def _parse_one_sectpr(
 def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     """Parse a .docx (path or raw bytes) into ordered paragraph records.
 
-    Each record is ``{index, para_id, style, text}``. ``para_id`` is the
-    ``w14:paraId`` when Word wrote one (stable across edits), else a synthesized
-    ``p{index}`` so every paragraph is still addressable. Returns an empty list
-    for a document with no body.
+    Each record is ``{index, para_id, style, text}``. ``para_id`` resolves with
+    the same three-tier scheme every mutation primitive in this module already
+    uses (``_find_para_by_id``, ``_locate_section_bounds``,
+    ``_vendored_content_tree._paragraph_node``): the native ``w14:paraId`` when
+    Word wrote one (stable across edits), else the synthesized ``sp<hash>`` id
+    from :func:`_vendored_content_tree._build_synth_id_map` (a content-derived
+    id that is ALSO stable across edits -- unlike a raw position counter), else
+    a positional ``p{index}`` fallback. Returns an empty list for a document
+    with no body.
+
+    71db285b -- previously this used a bare ``p{index}`` position counter,
+    unaware of the synth_id scheme that ``move_section``/``copy_section``/
+    ``_locate_section_bounds`` actually resolve against, so ``document_outline``
+    handed back ids that those functions could not reliably locate on any real
+    (non-synthetic) docx lacking ``w14:paraId`` on every paragraph.
     """
     if isinstance(source, (bytes, bytearray)):
         zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
@@ -345,8 +357,12 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     paragraphs: list[dict[str, Any]] = []
     if body is None:
         return paragraphs
+
+    from ._vendored_content_tree import _build_synth_id_map  # noqa: PLC0415
+
+    synth_map = _build_synth_id_map(body)
     for index, p in enumerate(body.findall(_q(_W, "p"))):
-        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        para_id = p.get(_q(_W14, "paraId")) or synth_map.get(id(p)) or f"p{index}"
         style: str | None = None
         ppr = p.find(_q(_W, "pPr"))
         if ppr is not None:
@@ -400,6 +416,14 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
 
 def _connect(index_db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(index_db_path)
+    # 05256d4a -- WAL mode: journal_mode was never configured anywhere in this
+    # module, so every connection defaulted to SQLite's rollback-journal mode.
+    # WAL lets readers proceed concurrently with a writer (no exclusive lock
+    # for the whole transaction) and generally reduces fsync overhead for the
+    # small, frequent writes index_docx's delta-update path now does. A no-op
+    # (silently ignored by SQLite) for :memory:/temporary databases, which
+    # always report/keep journal_mode 'memory' regardless of this pragma.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS docx_paragraphs (
@@ -600,11 +624,32 @@ def _ensure_fresh(index_db_path: str) -> None:
 def index_docx(
     source: str | bytes | bytearray, index_db_path: str
 ) -> dict[str, Any]:
-    """Build (or rebuild) a sidecar SQLite index of a .docx keyed by paraId.
+    """Build (or incrementally update) a sidecar SQLite index of a .docx keyed
+    by paraId.
 
-    Returns a summary ``{index_db, paragraph_count, heading_count}``. Idempotent:
-    the paragraph table is fully replaced each run so re-indexing an edited doc
-    stays consistent.
+    Returns a summary ``{index_db, paragraph_count, heading_count, delta}``.
+    Idempotent: re-indexing an edited doc always converges to the exact same
+    ``docx_paragraphs`` contents a fresh index would produce.
+
+    05256d4a — DELTA update, not a full rebuild: paragraphs are diffed against
+    what's already stored, by ``para_id`` (the existing ``TEXT PRIMARY KEY``
+    on ``docx_paragraphs``) plus an ``(idx, style, text)`` content comparison,
+    and only the rows that actually differ are INSERTed / UPDATEd / DELETEd.
+    An unchanged document touches zero rows. A one-paragraph text edit touches
+    exactly that paragraph's row (plus any later paragraph whose ``idx``
+    genuinely shifted because paragraphs were added/removed -- not relevant
+    to a same-length in-place edit). This replaces the previous
+    unconditional ``DELETE FROM docx_paragraphs`` + full reinsert + explicit
+    FTS5 ``'rebuild'`` on every single call, which was a full-table rewrite
+    even for a one-paragraph change.
+
+    docx_paragraphs' existing per-row ``docx_paragraphs_ai``/``_au``/``_ad``
+    triggers already keep ``docx_fts`` incrementally consistent on INSERT /
+    UPDATE / DELETE (see :func:`_connect`) -- so a delta write no longer needs
+    the explicit full ``'rebuild'`` command at all; only the FTS postings for
+    rows that actually changed are touched, both for the first-ever index
+    (every row is a fresh INSERT, still trigger-driven, one row at a time)
+    and for every subsequent delta update.
 
     2426dce9 — when ``source`` is a file path (not raw bytes), the path and its
     current mtime are stamped into ``docx_index_meta`` so a later read call can
@@ -616,12 +661,42 @@ def index_docx(
     paragraphs = parse_docx(source)
     conn = _connect(index_db_path)
     try:
-        conn.execute("DELETE FROM docx_paragraphs")
-        conn.executemany(
-            "INSERT OR REPLACE INTO docx_paragraphs (para_id, idx, style, text) "
-            "VALUES (?, ?, ?, ?)",
-            [(p["para_id"], p["index"], p["style"], p["text"]) for p in paragraphs],
-        )
+        existing = {
+            row[0]: (row[1], row[2], row[3])
+            for row in conn.execute("SELECT para_id, idx, style, text FROM docx_paragraphs")
+        }
+        seen_ids: set[str] = set()
+        inserted = updated = unchanged = 0
+        for p in paragraphs:
+            pid = p["para_id"]
+            seen_ids.add(pid)
+            new_sig = (p["index"], p["style"], p["text"])
+            old_sig = existing.get(pid)
+            if old_sig is None:
+                conn.execute(
+                    "INSERT INTO docx_paragraphs (para_id, idx, style, text) "
+                    "VALUES (?, ?, ?, ?)",
+                    (pid, p["index"], p["style"], p["text"]),
+                )
+                inserted += 1
+            elif old_sig != new_sig:
+                conn.execute(
+                    "UPDATE docx_paragraphs SET idx = ?, style = ?, text = ? "
+                    "WHERE para_id = ?",
+                    (p["index"], p["style"], p["text"], pid),
+                )
+                updated += 1
+            else:
+                unchanged += 1
+
+        stale_ids = existing.keys() - seen_ids
+        if stale_ids:
+            conn.executemany(
+                "DELETE FROM docx_paragraphs WHERE para_id = ?",
+                [(pid,) for pid in stale_ids],
+            )
+        deleted = len(stale_ids)
+
         if isinstance(source, str):
             mtime = _stat_mtime(source)
             conn.execute(
@@ -632,12 +707,6 @@ def index_docx(
                 "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
                 ("source_mtime", str(mtime) if mtime is not None else None),
             )
-        # 32d84131 — rebuild the FTS5 index from the current docx_paragraphs
-        # content. This is a full content-sync (not trigger-driven) so the index
-        # is always consistent after index_docx regardless of how the paragraph
-        # table was populated. The 'rebuild' command re-reads the content table
-        # and regenerates all FTS posting lists atomically.
-        conn.execute("INSERT INTO docx_fts(docx_fts) VALUES ('rebuild')")
         conn.commit()
     finally:
         conn.close()
@@ -645,6 +714,12 @@ def index_docx(
         "index_db": index_db_path,
         "paragraph_count": len(paragraphs),
         "heading_count": sum(1 for p in paragraphs if _is_heading(p["style"])),
+        "delta": {
+            "inserted": inserted,
+            "updated": updated,
+            "deleted": deleted,
+            "unchanged": unchanged,
+        },
     }
 
 
@@ -4794,6 +4869,69 @@ def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.El
     return p
 
 
+# 7205c8e0 -- tracked-changes insertion support: a w:ins-wrapped paragraph
+# insert. Scope is deliberately narrow -- insertion only, NOT deletion
+# tracking (w:del) or review/accept-reject (a separate, deprioritized
+# concern, proposal 9b7ecceb). w:ins/w:del are inline within document.xml
+# itself (confirmed via the OOXML spec), no new part/relationship needed --
+# fits the existing single-part write invariant every function above already
+# relies on, unlike set_page_header/set_page_footer's multi-part write below.
+
+
+def _next_revision_id(root: ET.Element) -> int:
+    """Mint the next unused numeric ``w:id`` for a new ``w:ins``/``w:del``
+    element, by scanning every existing ``w:ins``/``w:del`` element's ``w:id``
+    anywhere in the document and returning one past the max seen. Mirrors
+    :func:`_next_note_bookmark_name`'s max-seen-plus-one pattern, but over
+    revision ids (shared by both w:ins and w:del, per OOXML's own ``w:id``
+    revision-numbering scheme) rather than bookmark names.
+    """
+    w_id_attr = _q(_W, "id")
+    ins_tag = _q(_W, "ins")
+    del_tag = _q(_W, "del")
+    max_seen = 0
+    for el in root.iter():
+        if el.tag not in (ins_tag, del_tag):
+            continue
+        raw_id = el.get(w_id_attr)
+        if raw_id is None:
+            continue
+        try:
+            max_seen = max(max_seen, int(raw_id))
+        except ValueError:
+            continue
+    return max_seen + 1
+
+
+def _build_tracked_insertion_paragraph(
+    text: str, para_id: str, revision_id: int, author: str
+) -> ET.Element:
+    """Build a ``<w:p>`` whose entire content is one ``<w:ins>``-wrapped
+    ``<w:r>`` -- a genuine tracked-changes paragraph INSERT, not a plain
+    untracked paragraph. Carries a real ``w14:paraId`` (this is a brand-new
+    paragraph, so a real id is minted for it up front -- never a synth id,
+    which only ever describes paragraphs already present at parse time).
+
+    ``w:date`` is stamped as UTC ISO-8601 with a literal ``"Z"`` suffix --
+    Word's own convention. ``datetime.isoformat()`` on an aware UTC
+    ``datetime`` instead produces a ``"+00:00"`` offset suffix, which real
+    Word output never emits and which some strict OOXML consumers reject.
+    """
+    p = ET.Element(_q(_W, "p"))
+    p.set(_q(_W14, "paraId"), para_id)
+
+    ins = ET.SubElement(p, _q(_W, "ins"))
+    ins.set(_q(_W, "id"), str(revision_id))
+    ins.set(_q(_W, "author"), author)
+    ins.set(_q(_W, "date"), datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    r = ET.SubElement(ins, _q(_W, "r"))
+    t = ET.SubElement(r, _q(_W, "t"))
+    t.set(_q(_XML_NS, "space"), "preserve")
+    t.text = text
+    return p
+
+
 def _upsert_sidecar_note(index_db_path: str, note_id: str, text: str, anchor_para_id: str) -> None:
     """Best-effort record of a newly-inserted internal note into the sidecar.
 
@@ -5542,6 +5680,109 @@ def insert_highlighted_note(
         "anchor_para_id": anchor_para_id,
         "position": position,
         "style": _INTERNAL_NOTE_STYLE_DEFAULT,
+        "docx_path": docx_path,
+    }
+
+
+def insert_tracked_paragraph(
+    docx_path: str,
+    text: str,
+    anchor_para_id: str,
+    position: str = "after",
+    author: str = "Meridian Agent",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """7205c8e0 -- insert a genuinely tracked-changes ("w:ins"-wrapped)
+    paragraph, mirroring :func:`insert_highlighted_note`'s structure exactly.
+
+    Addresses a real, table-stakes DOCX gap: every major word processor
+    (Word, Google Docs) supports inserting new content under Track Changes so
+    a reviewer can see exactly what an editing pass added. This module had no
+    tracked-changes support at all. The new paragraph's entire content is one
+    ``<w:ins>``-wrapped ``<w:r>`` (see :func:`_build_tracked_insertion_paragraph`),
+    carrying a real, freshly-minted ``w14:paraId`` (this is brand-new content,
+    not something :func:`_build_synth_id_map` could ever have derived an id
+    for) and a fresh, never-before-used ``w:id`` revision number (see
+    :func:`_next_revision_id`) distinct from any ``w:ins``/``w:del`` already
+    in the document.
+
+    Scope (confirmed): INSERTION only -- NOT deletion tracking (``w:del``) or
+    review/accept-reject workflows (a separate, deprioritized concern,
+    proposal 9b7ecceb). ``w:ins``/``w:del`` live inline within
+    ``word/document.xml`` itself (no new OOXML part or relationship needed,
+    unlike :func:`set_page_header`/:func:`set_page_footer`'s multi-part write
+    path) -- so this fits the existing single-part write invariant every
+    write-back function above (up to the header/footer section) already
+    relies on. Does NOT touch :func:`write_section`.
+
+    Args:
+        docx_path:      Absolute path to the .docx file (mutated in place).
+        text:            The inserted paragraph's text content.
+        anchor_para_id:  w14:paraId (synth id, or legacy p{N}) of the
+                         paragraph to anchor on -- resolved via
+                         :func:`_find_para_by_id`'s usual three-tier scheme.
+        position:        "before" or "after" (default) the anchor.
+        author:          Recorded as the ``w:ins`` element's ``w:author``
+                         attribute (what Word displays as the reviewer name
+                         for this tracked insertion). Defaults to
+                         ``"Meridian Agent"``.
+        index_db_path:   If supplied, invalidates that sidecar's cached mtime
+                         so the next read re-parses the document (mirrors
+                         every other write-back function's sidecar handling;
+                         there is no dedicated tracked-insertion sidecar table
+                         the way :func:`insert_highlighted_note` has
+                         ``docx_internal_notes`` -- the new paragraph is
+                         immediately findable via its real ``w14:paraId`` by
+                         any other function in this module, no reindex
+                         needed).
+
+    Returns:
+        ``{status, para_id, revision_id, text, anchor_para_id, position,
+        author, docx_path}`` on success, or ``{"error": <message>}`` on
+        failure (file NOT mutated on error).
+    """
+    if not text or not str(text).strip():
+        return {"error": "text must be a non-empty string"}
+    if position not in ("before", "after"):
+        return {"error": f"position must be 'before' or 'after', got {position!r}"}
+    if not author or not str(author).strip():
+        return {"error": "author must be a non-empty string"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, anchor_para_id)
+    if result is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    body, _anchor_elem, child_idx = result
+
+    taken = _existing_para_ids(root)
+    new_para_id = _new_para_id(taken)
+    revision_id = _next_revision_id(root)
+    tracked_p = _build_tracked_insertion_paragraph(text.strip(), new_para_id, revision_id, author.strip())
+
+    insert_at = child_idx if position == "before" else child_idx + 1
+    body.insert(insert_at, tracked_p)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "inserted",
+        "para_id": new_para_id,
+        "revision_id": revision_id,
+        "text": text.strip(),
+        "anchor_para_id": anchor_para_id,
+        "position": position,
+        "author": author.strip(),
         "docx_path": docx_path,
     }
 
@@ -6691,3 +6932,387 @@ def relocate_table(
         "destination_position": destination_position,
         "docx_path": docx_path,
     }
+
+
+# ---------------------------------------------------------------------------
+# f1185012 -- page header / footer support.
+#
+# python-docx, the Google Docs API + UI, and Apryse (a commercial DOCX SDK)
+# all treat header/footer as first-class, table-stakes DOCX functionality;
+# this module had none at all.
+#
+# Design notes -- a genuinely SEPARATE write path from everything above:
+#   - Every write-back function above this line (captions, citations,
+#     equations, notes, move_section/copy_section/write_section/
+#     relocate_table, ...) only ever rewrites the ONE existing
+#     word/document.xml member via _load_docx_xml_stdlib / _save_docx_xml_stdlib,
+#     preserving every other ZIP member byte-for-byte. A header/footer needs
+#     THREE additional moving pieces docs_intel has never had to manage: a new
+#     OOXML part (word/header<N>.xml or word/footer<N>.xml), a new
+#     relationship in word/_rels/document.xml.rels, and a new content-type
+#     override in [Content_Types].xml.
+#   - Rather than spread that new multi-part-write risk into the existing,
+#     currently-clean single-part call sites, it lives entirely in its own
+#     functions (_save_docx_with_new_parts_stdlib, _set_page_header_or_footer,
+#     set_page_header, set_page_footer) with their own dedicated tests. None
+#     of the code above this line calls into any of it, and none of it calls
+#     into _save_docx_xml_stdlib.
+#   - "Set" semantics: calling set_page_header/set_page_footer a second time
+#     with the same ``type`` (default/even/first) overwrites the SAME part in
+#     place (found via the sectPr's existing headerReference/footerReference
+#     -> rels lookup) rather than allocating a new part + orphaning the old
+#     one on every call.
+#   - Scope: wires the reference into the document's FINAL, body-level
+#     <w:sectPr> only (the section properties governing a single-section
+#     document -- the overwhelming common case -- and the last section of a
+#     multi-section one). Per-section overrides for EARLIER sections of a
+#     multi-section document, and the settings.xml <w:titlePg>/
+#     <w:evenAndOddHeaders> switches that make "first"/"even" page types
+#     actually render differently in Word, are real but narrower follow-ups,
+#     not attempted here.
+# ---------------------------------------------------------------------------
+
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+_HDR_FTR_CONTENT_TYPES = {
+    "header": "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
+    "footer": "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml",
+}
+_HDR_FTR_VALID_TYPES = frozenset({"default", "even", "first"})
+
+# Minimal-but-valid fallback parts for the (rare, mostly test-fixture) case of
+# a .docx that has no [Content_Types].xml / word/_rels/document.xml.rels at
+# all yet. Real Word output always has both; this just means "add a header to
+# a hand-built minimal docx" doesn't hard-fail for lack of scaffolding.
+_MINIMAL_CONTENT_TYPES_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/word/document.xml" '
+    'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+    "</Types>"
+).encode("utf-8")
+
+_MINIMAL_DOCUMENT_RELS_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    "</Relationships>"
+).encode("utf-8")
+
+
+def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes], dest: str) -> None:
+    """Write MULTIPLE ZIP parts back into ``dest`` in one repackage.
+
+    Unlike :func:`_save_docx_xml_stdlib` (which can only ever overwrite the
+    single, already-existing ``word/document.xml`` member), this adds parts
+    that are not already present in the original archive AND overwrites parts
+    that are. Every other original ZIP member is preserved byte-for-byte.
+
+    Backs up the existing file to ``dest + ".bak"`` when it already exists
+    (best-effort, non-fatal on failure -- same pattern as
+    :func:`_save_docx_xml_stdlib`).
+    """
+    out = io.BytesIO()
+    written: set[str] = set()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src:
+        infos = src.infolist()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for info in infos:
+                data = src.read(info.filename)
+                if info.filename in updated_parts:
+                    data = updated_parts[info.filename]
+                dst.writestr(info, data)
+                written.add(info.filename)
+            # Anything in updated_parts that wasn't already a ZIP member is a
+            # genuinely new part -- append it.
+            for part_name, data in updated_parts.items():
+                if part_name not in written:
+                    dst.writestr(part_name, data)
+
+    if os.path.exists(dest):
+        backup = dest + ".bak"
+        try:
+            shutil.copy2(dest, backup)
+        except OSError:
+            pass  # backup failure is non-fatal
+
+    with open(dest, "wb") as fh:
+        fh.write(out.getvalue())
+
+
+def _insert_before_closing_tag(xml_bytes: bytes, root_tag_name: str, new_element_xml: str) -> bytes:
+    """Insert ``new_element_xml`` as the last child of ``<root_tag_name>``.
+
+    Text-splice rather than an ET parse/re-serialize round-trip: OPC
+    infrastructure parts ([Content_Types].xml, .rels files) are always
+    unprefixed-default-namespace XML in real Word output, and ET's
+    ``register_namespace`` registry is a single global default-prefix slot --
+    registering it for a SECOND unrelated namespace (this one, alongside the
+    package content-types namespace) would silently evict whichever one was
+    registered first (both want the empty '' prefix), corrupting unrelated
+    serialization elsewhere in this module. Splicing the raw text instead
+    sidesteps that global-state hazard entirely and guarantees byte-for-byte
+    preservation of everything except the one new child.
+
+    Handles both an existing ``<root_tag_name>...</root_tag_name>`` (appends
+    before the closing tag) and a childless self-closing
+    ``<root_tag_name .../>`` (expands it to hold the new child).
+    """
+    text = xml_bytes.decode("utf-8")
+    closing = f"</{root_tag_name}>"
+    idx = text.rfind(closing)
+    if idx != -1:
+        return (text[:idx] + new_element_xml + text[idx:]).encode("utf-8")
+
+    self_close_pattern = re.compile(rf"<{root_tag_name}\b([^>]*?)/>")
+    match = self_close_pattern.search(text)
+    if not match:
+        raise ValueError(f"could not locate <{root_tag_name}> element to extend")
+    expanded = f"<{root_tag_name}{match.group(1)}>{new_element_xml}</{root_tag_name}>"
+    return (text[: match.start()] + expanded + text[match.end() :]).encode("utf-8")
+
+
+def _next_relationship_id(rels_root: ET.Element) -> str:
+    """Return the next unused ``rId<N>`` relationship id (Word's own convention)."""
+    max_seen = 0
+    for rel in rels_root:
+        rid = rel.get("Id") or ""
+        m = re.match(r"^rId(\d+)$", rid)
+        if m:
+            max_seen = max(max_seen, int(m.group(1)))
+    return f"rId{max_seen + 1}"
+
+
+def _next_header_footer_part_name(namelist: list[str], kind: str) -> str:
+    """Return the next unused ``word/header<N>.xml`` / ``word/footer<N>.xml`` name."""
+    pattern = re.compile(rf"^word/{kind}(\d+)\.xml$")
+    max_seen = 0
+    for name in namelist:
+        m = pattern.match(name)
+        if m:
+            max_seen = max(max_seen, int(m.group(1)))
+    return f"word/{kind}{max_seen + 1}.xml"
+
+
+def _build_header_footer_part_xml(kind: str, text: str) -> bytes:
+    """Build a minimal but valid ``<w:hdr>``/``<w:ftr>`` OOXML part: one
+    paragraph containing ``text`` as a single run."""
+    root_tag = "hdr" if kind == "header" else "ftr"
+    root = ET.Element(_q(_W, root_tag))
+    p = ET.SubElement(root, _q(_W, "p"))
+    r = ET.SubElement(p, _q(_W, "r"))
+    t = ET.SubElement(r, _q(_W, "t"))
+    t.set(_q(_XML_NS, "space"), "preserve")
+    t.text = text
+    xml_body = ET.tostring(root, encoding="unicode")
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + xml_body).encode("utf-8")
+
+
+def _sectpr_insert_ref_index(sectpr: ET.Element, kind: str) -> int:
+    """Return the correct child index to insert a new headerReference/
+    footerReference at, per CT_SectPr's schema order: all ``headerReference``
+    elements come first (as a group), then all ``footerReference`` elements,
+    then everything else (``type``, ``pgSz``, ``pgMar``, ...)."""
+    header_tag = _q(_W, "headerReference")
+    footer_tag = _q(_W, "footerReference")
+    children = list(sectpr)
+    idx = 0
+    if kind == "header":
+        while idx < len(children) and children[idx].tag == header_tag:
+            idx += 1
+    else:
+        while idx < len(children) and children[idx].tag in (header_tag, footer_tag):
+            idx += 1
+    return idx
+
+
+def _set_page_header_or_footer(
+    docx_path: str,
+    text: str,
+    kind: str,
+    header_footer_type: str,
+    index_db_path: str | None,
+) -> dict[str, Any]:
+    """Shared implementation for :func:`set_page_header` / :func:`set_page_footer`."""
+    if not text or not str(text).strip():
+        return {"error": "text must be a non-empty string"}
+    if header_footer_type not in _HDR_FTR_VALID_TYPES:
+        return {
+            "error": (
+                f"type must be one of {sorted(_HDR_FTR_VALID_TYPES)}, "
+                f"got {header_footer_type!r}"
+            )
+        }
+    if not os.path.exists(docx_path):
+        return {"error": f"no such file: {docx_path}"}
+
+    with open(docx_path, "rb") as fh:
+        raw = fh.read()
+
+    try:
+        src = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        return {"error": f"not a valid .docx (not a ZIP): {docx_path}"}
+
+    try:
+        namelist = src.namelist()
+        if "word/document.xml" not in namelist:
+            return {"error": f"not a valid .docx: missing word/document.xml: {docx_path}"}
+        document_xml = src.read("word/document.xml")
+        try:
+            doc_root = ET.fromstring(document_xml)
+        except ET.ParseError as exc:
+            return {"error": f"malformed word/document.xml in {docx_path}: {exc}"}
+
+        body = doc_root.find(_q(_W, "body"))
+        if body is None:
+            return {"error": "document has no <w:body>"}
+
+        final_sectpr = None
+        for child in body:
+            if child.tag == _q(_W, "sectPr"):
+                final_sectpr = child
+        if final_sectpr is None:
+            final_sectpr = ET.SubElement(body, _q(_W, "sectPr"))
+
+        ref_tag = _q(_W, f"{kind}Reference")
+        w_type_attr = _q(_W, "type")
+        r_id_attr = _q(_R_NS, "id")
+
+        existing_ref = None
+        for child in final_sectpr:
+            if child.tag == ref_tag and child.get(w_type_attr) == header_footer_type:
+                existing_ref = child
+                break
+
+        rels_path = "word/_rels/document.xml.rels"
+        rels_bytes = src.read(rels_path) if rels_path in namelist else _MINIMAL_DOCUMENT_RELS_XML
+        rels_root = ET.fromstring(rels_bytes)
+        rel_tag = _q(_PKG_REL_NS, "Relationship")
+
+        part_xml = _build_header_footer_part_xml(kind, text.strip())
+        updated_parts: dict[str, bytes] = {}
+
+        if existing_ref is not None:
+            # "Set" -- an active reference of this exact type already exists.
+            # Overwrite the part it already points to, in place. No new
+            # relationship, content-type override, or sectPr change needed.
+            existing_rid = existing_ref.get(r_id_attr)
+            target = None
+            for rel in rels_root:
+                if rel.tag == rel_tag and rel.get("Id") == existing_rid:
+                    target = rel.get("Target")
+                    break
+            if not target:
+                return {
+                    "error": (
+                        f"sectPr has a {kind}Reference r:id={existing_rid!r} with no "
+                        "matching relationship in word/_rels/document.xml.rels -- "
+                        "docx is internally inconsistent"
+                    )
+                }
+            part_name = target if target.startswith("word/") else f"word/{target}"
+            updated_parts[part_name] = part_xml
+            rel_id = existing_rid
+        else:
+            part_name = _next_header_footer_part_name(namelist, kind)
+            rel_id = _next_relationship_id(rels_root)
+            rel_type = f"{_R_NS}/{kind}"
+            target_rel = part_name.split("/", 1)[1]  # relative to word/_rels/
+
+            new_rel_xml = f'<Relationship Id="{rel_id}" Type="{rel_type}" Target="{target_rel}"/>'
+            new_rels_bytes = _insert_before_closing_tag(rels_bytes, "Relationships", new_rel_xml)
+
+            ct_path = "[Content_Types].xml"
+            ct_bytes = src.read(ct_path) if ct_path in namelist else _MINIMAL_CONTENT_TYPES_XML
+            new_override_xml = (
+                f'<Override PartName="/{part_name}" '
+                f'ContentType="{_HDR_FTR_CONTENT_TYPES[kind]}"/>'
+            )
+            new_ct_bytes = _insert_before_closing_tag(ct_bytes, "Types", new_override_xml)
+
+            ref_el = ET.Element(ref_tag)
+            ref_el.set(w_type_attr, header_footer_type)
+            ref_el.set(r_id_attr, rel_id)
+            insert_at = _sectpr_insert_ref_index(final_sectpr, kind)
+            final_sectpr.insert(insert_at, ref_el)
+
+            new_document_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                + ET.tostring(doc_root, encoding="unicode")
+            ).encode("utf-8")
+
+            updated_parts[rels_path] = new_rels_bytes
+            updated_parts[ct_path] = new_ct_bytes
+            updated_parts["word/document.xml"] = new_document_xml
+            updated_parts[part_name] = part_xml
+    finally:
+        src.close()
+
+    try:
+        _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "set",
+        "kind": kind,
+        "type": header_footer_type,
+        "part_name": part_name,
+        "relationship_id": rel_id,
+        "text": text.strip(),
+        "docx_path": docx_path,
+    }
+
+
+def set_page_header(
+    docx_path: str,
+    text: str,
+    header_type: str = "default",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """f1185012 -- Add or replace a page header on ``docx_path``.
+
+    Allocates a new ``word/header<N>.xml`` part, a new relationship in
+    ``word/_rels/document.xml.rels``, a new content-type override in
+    ``[Content_Types].xml``, and a ``<w:headerReference>`` on the document's
+    final ``<w:sectPr>`` -- OR, if a header of this exact ``header_type``
+    already exists, overwrites that SAME part's content in place (no new
+    part/relationship/override, no sectPr change).
+
+    Args:
+        docx_path:    Absolute path to the .docx file (mutated in place).
+        text:         Header text (a single paragraph, single run).
+        header_type:  One of ``"default"``, ``"even"``, ``"first"``
+                      (``w:type`` on ``<w:headerReference>``). Note: making
+                      "even"/"first" actually render distinctly in Word ALSO
+                      requires ``settings.xml``'s ``<w:evenAndOddHeaders>`` /
+                      a section's ``<w:titlePg>`` -- not set by this function.
+        index_db_path: If supplied, invalidates that sidecar's cached mtime
+                      so the next read re-parses the document.
+
+    Returns:
+        ``{status, kind, type, part_name, relationship_id, text, docx_path}``
+        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+    """
+    return _set_page_header_or_footer(docx_path, text, "header", header_type, index_db_path)
+
+
+def set_page_footer(
+    docx_path: str,
+    text: str,
+    footer_type: str = "default",
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """f1185012 -- Add or replace a page footer on ``docx_path``.
+
+    Mirrors :func:`set_page_header` exactly (same allocation-vs-overwrite
+    "set" semantics, same part/relationship/content-type plumbing) for
+    ``<w:footerReference>`` / ``word/footer<N>.xml`` instead. See its
+    docstring for the full parameter/return contract.
+    """
+    return _set_page_header_or_footer(docx_path, text, "footer", footer_type, index_db_path)

@@ -109,6 +109,11 @@ _WATCHDOG_COOLDOWN_SECONDS = 15 * 60.0
 # Lazy spawn: how long (seconds) a slot may stay idle before auto-kill.
 # 3649a61a — don't spawn at startup; kill after 30min of no requests.
 _IDLE_KILL_SECONDS = 30 * 60
+# 986117fc — cheap v1 staleness alert: how often the running tunnel process
+# re-checks tunnel_client.py's on-disk git commit against the commit it
+# started with. Piggybacks on the same "poll every few minutes" cadence as
+# the idle-killer above; purely local, no server round-trip.
+_STALENESS_CHECK_INTERVAL_SECONDS = 5 * 60.0
 # a3410a9c — once a core slot is marked unhealthy, how often (seconds) the
 # background re-probe retries spawning + tools/list to auto-recover the slot
 # (e.g. the missing npx/binary became available). On success the client tells
@@ -731,6 +736,84 @@ async def _idle_killer(proxy: "SlotProxy", idle_seconds: float = _IDLE_KILL_SECO
                 flush=True,
             )
             proxy.kill()
+
+
+def _tunnel_client_git_root() -> str:
+    """Directory git commands should run from to fingerprint this module's source.
+
+    Uses the directory containing this file — the Meridian source checkout the
+    running tunnel process was actually launched from — not the user's
+    ``--repo-path`` target project (a different, unrelated git checkout that
+    ``run_tunnel`` also deals with for code-intel indexing).
+    """
+    return str(Path(__file__).resolve().parent)
+
+
+def _tunnel_client_commit_hash_sync(root_dir: "str | None" = None) -> "str | None":
+    """Best-effort, synchronous ``git rev-parse HEAD`` for this module's source tree.
+
+    986117fc — cheap v1 staleness alert (no new infra, no server round-trip).
+    Mirrors the fail-open discipline of ``prospect.py``'s
+    ``_git_commit_drift_sync``: must be called off the event loop thread (via
+    ``asyncio.to_thread``), and never raises — returns ``None`` whenever the
+    signal can't be computed cleanly (not a git checkout, git missing, timeout,
+    or any other error).
+    """
+    root_dir = root_dir or _tunnel_client_git_root()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root_dir, capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode != 0:
+            return None
+        commit = (result.stdout or "").strip()
+        return commit or None
+    except Exception:  # noqa: BLE001 — staleness probe must never raise
+        return None
+
+
+async def _staleness_alert_loop(
+    started_commit: "str | None",
+    root_dir: "str | None" = None,
+    interval: float = _STALENESS_CHECK_INTERVAL_SECONDS,
+) -> None:
+    """986117fc — warn (don't act) when tunnel_client.py has been updated on disk.
+
+    Manual Ctrl-C + restart every time a client-side fix lands is real,
+    repeated friction. This is the cheap v1 mitigation: purely local
+    file/git comparison, no server round-trip, no new background
+    infrastructure beyond a single sleep-loop (same shape as
+    ``_idle_killer``). It only ever prints a message — it never restarts or
+    reloads anything (the live-reset mechanism is explicitly out of scope
+    for this item; a separate future item).
+
+    Runs forever until cancelled. Degrades silently and permanently exits the
+    check (without raising) when there is no ``started_commit`` baseline to
+    compare against — e.g. the process wasn't started from a git checkout.
+    Warns at most once per distinct on-disk commit so it doesn't spam the
+    log every ``interval`` once a divergence has already been reported.
+    """
+    if not started_commit:
+        return
+    root_dir = root_dir or _tunnel_client_git_root()
+    warned_for: "str | None" = None
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            current = await asyncio.to_thread(_tunnel_client_commit_hash_sync, root_dir)
+        except Exception:  # noqa: BLE001 — never let the staleness probe kill the loop
+            continue
+        if not current or current == started_commit or current == warned_for:
+            continue
+        warned_for = current
+        print(
+            "\n"
+            "*** tunnel_client.py has been updated since this process started "
+            f"(running {started_commit[:12]}, disk has {current[:12]}) — "
+            "restart the tunnel to pick up recent fixes. ***\n",
+            file=sys.stderr, flush=True,
+        )
 
 
 async def _probe_slot_health(
@@ -3817,6 +3900,83 @@ async def _fetch_filesystem_roots(
 # Auto-index helper (calls index_repository on codebase-memory-mcp proxy)
 # ---------------------------------------------------------------------------
 
+_STATUS_FAILURE_VALUES = {"error", "failed", "failure", "worker_failed"}
+
+
+def _describe_worker_failures(workers: Any) -> "str | None":
+    """Summarize failed entries in an index_repository ``workers`` list.
+
+    codebase-memory-mcp's per-worker results report failure via a
+    ``status`` string (e.g. ``"worker_failed"``) and/or a non-zero
+    ``exit_code`` — neither of which is the MCP ``isError`` convention, so
+    this is checked independently of it. Returns e.g.
+    ``"2 worker(s) failed (exit_code=1)"``, or ``None`` if *workers* is not a
+    list or contains no failed entries.
+    """
+    if not isinstance(workers, list):
+        return None
+    failed_codes: list = []
+    for w in workers:
+        if not isinstance(w, dict):
+            continue
+        status = w.get("status")
+        exit_code = w.get("exit_code")
+        is_failed_status = isinstance(status, str) and status.strip().lower() in _STATUS_FAILURE_VALUES
+        is_nonzero_exit = isinstance(exit_code, int) and exit_code != 0
+        if is_failed_status or is_nonzero_exit:
+            failed_codes.append(exit_code)
+    if not failed_codes:
+        return None
+    codes = sorted({c for c in failed_codes if c is not None})
+    codes_str = ",".join(str(c) for c in codes) if codes else "unknown"
+    return f"{len(failed_codes)} worker(s) failed (exit_code={codes_str})"
+
+
+def _extract_status_failure(obj: Any) -> "str | None":
+    """Detect an application-level failure status embedded in a tool result.
+
+    codebase-memory-mcp's ``index_repository`` does not always signal
+    failure via the MCP ``isError`` convention — it can instead return an
+    HTTP-200, non-``isError`` JSON-RPC result whose *own* ``status`` field
+    reads ``"error"`` (or similar), optionally alongside a ``workers`` /
+    ``worker_results`` list where individual entries report
+    ``status: "worker_failed"`` and/or ``exit_code != 0``. Both fields can
+    appear either directly on ``result`` or nested one level down inside a
+    ``result.content[*].text`` JSON-encoded blob (the MCP text-content
+    convention). Detect both shapes so a real server-side failure is never
+    reported to the user as a successful index.
+    """
+    if not isinstance(obj, dict):
+        return None
+    status = obj.get("status")
+    workers = obj.get("workers") if obj.get("workers") is not None else obj.get("worker_results")
+    parts = []
+    if isinstance(status, str) and status.strip().lower() in _STATUS_FAILURE_VALUES:
+        parts.append(f"status={status}")
+    worker_detail = _describe_worker_failures(workers)
+    if worker_detail:
+        parts.append(worker_detail)
+    if parts:
+        return "index_repository " + ", ".join(parts)
+    # Nested shape: result.content[*].text holding a JSON-encoded status blob.
+    content = obj.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            try:
+                nested = json.loads(text)
+            except Exception:  # noqa: BLE001 — text isn't JSON, nothing to inspect
+                continue
+            nested_detail = _extract_status_failure(nested)
+            if nested_detail:
+                return nested_detail
+    return None
+
+
 def _extract_jsonrpc_error(body: bytes) -> "str | None":
     """Extract a JSON-RPC or MCP tool-level error message from a response body.
 
@@ -3828,6 +3988,12 @@ def _extract_jsonrpc_error(body: bytes) -> "str | None":
     * ``result.content[*].isError = true`` — an MCP-convention tool error
       whose text is in ``result.content[0].text``.
     * ``result.isError = true`` — older MCP tool-error convention.
+    * ``result.status`` (or a nested ``content[*].text`` JSON blob) reading
+      an error-like value (e.g. ``"error"``), optionally with a ``workers``
+      list reporting ``status: "worker_failed"`` / non-zero ``exit_code``
+      entries — codebase-memory-mcp's own application-level failure signal,
+      which does *not* set ``isError`` (cd28b329: this shape previously slid
+      through as a false "indexed" success).
 
     Returns a short error string if any of these patterns is detected, or
     ``None`` when the response looks clean. Best-effort: any parse failure
@@ -3869,6 +4035,10 @@ def _extract_jsonrpc_error(body: bytes) -> "str | None":
                 if isinstance(item, dict) and item.get("isError"):
                     text = item.get("text") or ""
                     return f"tool error: {text[:200]}" if text else "tool error (no detail)"
+        # Application-level status/worker failure that never sets isError.
+        status_detail = _extract_status_failure(result)
+        if status_detail:
+            return status_detail
     return None
 
 
@@ -4694,6 +4864,11 @@ async def run_tunnel(
     """
     _force_utf8_io()
     _install_tunnel_log_tee()
+    # 986117fc — capture the commit this process is actually running as early as
+    # possible, before anything else in startup can fail/return. Fail-open: None
+    # (not a git checkout, git missing, etc.) just disables the staleness loop
+    # below, same as prospect.py's drift probe.
+    _started_commit = await asyncio.to_thread(_tunnel_client_commit_hash_sync)
     # Resolve base_url first — it's the cache key for the stored token.
     base_url = _resolve_base_url(base_url)
     # b970fe07 — remember whether the caller explicitly set repo_path / code_dirs
@@ -5301,6 +5476,12 @@ async def run_tunnel(
     if not tasks and not running_custom:
         print("error: no tunnel plugins enabled — nothing to serve.", file=sys.stderr)
         return 1
+
+    # 986117fc — cheap v1 staleness alert: warn (never restart) if this file's
+    # on-disk git commit diverges from the one this process started with. A
+    # single instance is enough (the check is global, not per-slot), added
+    # after the "nothing to serve" guard above so it never masks that error.
+    tasks.append(asyncio.ensure_future(_staleness_alert_loop(_started_commit)))
 
     # Install signal handlers for clean Ctrl+C shutdown.
     loop = asyncio.get_event_loop()
