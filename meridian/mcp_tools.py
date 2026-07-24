@@ -205,7 +205,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "mode='delta' returns a compact session update (completed + pending + /goal); "
         "mode='starter' returns a <=20-line block for paste-after-/compact or cold start - "
         "project_id, start_session command, last 5 completed titles, top 3 pending IDs, /goal; "
-        "mode='planner' returns strategic context for a claude.ai planning chat. "
+        "mode='planner' returns strategic context for a claude.ai planning chat; "
+        "mode='goal' (682005f4) returns ONLY the bare /goal block itself - no readiness "
+        "header, no workspace decisions/notes, no L0/L1/L2 context - with each pending "
+        "item's resolved code pointer(s), if any, rendered inline in <sprint_items>. "
         "DISPLAY THE RETURNED content FIELD VERBATIM to the user (5234877f) - the server "
         "delivers content pre-wrapped in a single 4-backtick code fence so it renders as "
         "one copy-pasteable block in any markdown client. Do NOT add extra headers, "
@@ -213,7 +216,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Do NOT just narrate that the handoff succeeded; paste the actual text.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter"]},
+         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."},
          "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming."},
          "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."}},
