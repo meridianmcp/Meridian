@@ -3817,6 +3817,83 @@ async def _fetch_filesystem_roots(
 # Auto-index helper (calls index_repository on codebase-memory-mcp proxy)
 # ---------------------------------------------------------------------------
 
+_STATUS_FAILURE_VALUES = {"error", "failed", "failure", "worker_failed"}
+
+
+def _describe_worker_failures(workers: Any) -> "str | None":
+    """Summarize failed entries in an index_repository ``workers`` list.
+
+    codebase-memory-mcp's per-worker results report failure via a
+    ``status`` string (e.g. ``"worker_failed"``) and/or a non-zero
+    ``exit_code`` — neither of which is the MCP ``isError`` convention, so
+    this is checked independently of it. Returns e.g.
+    ``"2 worker(s) failed (exit_code=1)"``, or ``None`` if *workers* is not a
+    list or contains no failed entries.
+    """
+    if not isinstance(workers, list):
+        return None
+    failed_codes: list = []
+    for w in workers:
+        if not isinstance(w, dict):
+            continue
+        status = w.get("status")
+        exit_code = w.get("exit_code")
+        is_failed_status = isinstance(status, str) and status.strip().lower() in _STATUS_FAILURE_VALUES
+        is_nonzero_exit = isinstance(exit_code, int) and exit_code != 0
+        if is_failed_status or is_nonzero_exit:
+            failed_codes.append(exit_code)
+    if not failed_codes:
+        return None
+    codes = sorted({c for c in failed_codes if c is not None})
+    codes_str = ",".join(str(c) for c in codes) if codes else "unknown"
+    return f"{len(failed_codes)} worker(s) failed (exit_code={codes_str})"
+
+
+def _extract_status_failure(obj: Any) -> "str | None":
+    """Detect an application-level failure status embedded in a tool result.
+
+    codebase-memory-mcp's ``index_repository`` does not always signal
+    failure via the MCP ``isError`` convention — it can instead return an
+    HTTP-200, non-``isError`` JSON-RPC result whose *own* ``status`` field
+    reads ``"error"`` (or similar), optionally alongside a ``workers`` /
+    ``worker_results`` list where individual entries report
+    ``status: "worker_failed"`` and/or ``exit_code != 0``. Both fields can
+    appear either directly on ``result`` or nested one level down inside a
+    ``result.content[*].text`` JSON-encoded blob (the MCP text-content
+    convention). Detect both shapes so a real server-side failure is never
+    reported to the user as a successful index.
+    """
+    if not isinstance(obj, dict):
+        return None
+    status = obj.get("status")
+    workers = obj.get("workers") if obj.get("workers") is not None else obj.get("worker_results")
+    parts = []
+    if isinstance(status, str) and status.strip().lower() in _STATUS_FAILURE_VALUES:
+        parts.append(f"status={status}")
+    worker_detail = _describe_worker_failures(workers)
+    if worker_detail:
+        parts.append(worker_detail)
+    if parts:
+        return "index_repository " + ", ".join(parts)
+    # Nested shape: result.content[*].text holding a JSON-encoded status blob.
+    content = obj.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            try:
+                nested = json.loads(text)
+            except Exception:  # noqa: BLE001 — text isn't JSON, nothing to inspect
+                continue
+            nested_detail = _extract_status_failure(nested)
+            if nested_detail:
+                return nested_detail
+    return None
+
+
 def _extract_jsonrpc_error(body: bytes) -> "str | None":
     """Extract a JSON-RPC or MCP tool-level error message from a response body.
 
@@ -3828,6 +3905,12 @@ def _extract_jsonrpc_error(body: bytes) -> "str | None":
     * ``result.content[*].isError = true`` — an MCP-convention tool error
       whose text is in ``result.content[0].text``.
     * ``result.isError = true`` — older MCP tool-error convention.
+    * ``result.status`` (or a nested ``content[*].text`` JSON blob) reading
+      an error-like value (e.g. ``"error"``), optionally with a ``workers``
+      list reporting ``status: "worker_failed"`` / non-zero ``exit_code``
+      entries — codebase-memory-mcp's own application-level failure signal,
+      which does *not* set ``isError`` (cd28b329: this shape previously slid
+      through as a false "indexed" success).
 
     Returns a short error string if any of these patterns is detected, or
     ``None`` when the response looks clean. Best-effort: any parse failure
@@ -3869,6 +3952,10 @@ def _extract_jsonrpc_error(body: bytes) -> "str | None":
                 if isinstance(item, dict) and item.get("isError"):
                     text = item.get("text") or ""
                     return f"tool error: {text[:200]}" if text else "tool error (no detail)"
+        # Application-level status/worker failure that never sets isError.
+        status_detail = _extract_status_failure(result)
+        if status_detail:
+            return status_detail
     return None
 
 

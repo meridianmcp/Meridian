@@ -564,6 +564,115 @@ def test_extract_jsonrpc_error_empty_body_returns_none():
     assert tc._extract_jsonrpc_error(None) is None  # type: ignore[arg-type]
 
 
+# ---------------------------------------------------------------------------
+# _extract_jsonrpc_error — application-level status/worker failure (cd28b329)
+#
+# codebase-memory-mcp's index_repository can report a server-side failure
+# (status=error, per-worker worker_failed/exit_code=1) WITHOUT setting the
+# MCP isError convention anywhere in the envelope. Before this fix that shape
+# passed straight through _extract_jsonrpc_error as a clean response, so
+# _index_code_dir printed "code-intel: indexed" despite the failure.
+# ---------------------------------------------------------------------------
+
+def test_extract_jsonrpc_error_status_error_on_result():
+    """A bare result.status == "error" (no isError anywhere) is detected."""
+    body = b'{"jsonrpc":"2.0","id":"idx","result":{"status":"error"}}'
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "status=error" in result
+
+
+def test_extract_jsonrpc_error_worker_failed_exit_code_1_twice():
+    """The exact reported shape: status=error + 2x worker_failed, exit_code=1."""
+    body = (
+        b'{"jsonrpc":"2.0","id":"idx","result":{"status":"error","workers":['
+        b'{"status":"worker_failed","exit_code":1},'
+        b'{"status":"worker_failed","exit_code":1}'
+        b']}}'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "status=error" in result
+    assert "2 worker(s) failed" in result
+    assert "exit_code=1" in result
+
+
+def test_extract_jsonrpc_error_worker_failed_without_top_level_status():
+    """Worker failures alone (no top-level status field) are still detected."""
+    body = (
+        b'{"jsonrpc":"2.0","id":"idx","result":{"workers":['
+        b'{"status":"worker_failed","exit_code":1}]}}'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "1 worker(s) failed" in result
+
+
+def test_extract_jsonrpc_error_nonzero_exit_code_without_status_string():
+    """A worker with a nonzero exit_code but no recognized status string still counts."""
+    body = b'{"jsonrpc":"2.0","id":"idx","result":{"workers":[{"exit_code":1}]}}'
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "1 worker(s) failed" in result
+
+
+def test_extract_jsonrpc_error_status_nested_in_content_text():
+    """The status/worker blob nested inside result.content[*].text JSON is detected."""
+    inner = '{"status":"error","workers":[{"status":"worker_failed","exit_code":1}]}'
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "idx",
+        "result": {"content": [{"type": "text", "text": inner}]},
+    }).encode()
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "status=error" in result
+    assert "1 worker(s) failed" in result
+
+
+def test_extract_jsonrpc_error_healthy_status_not_flagged():
+    """A clean status value (e.g. "ok") must not be misreported as a failure."""
+    body = b'{"jsonrpc":"2.0","id":"idx","result":{"status":"ok","workers":[{"status":"ok","exit_code":0}]}}'
+    assert tc._extract_jsonrpc_error(body) is None
+
+
+def test_index_code_dir_reports_worker_failed_status_error_as_failure(monkeypatch, capsys):
+    """End-to-end: index_repository's HTTP-200 status=error/worker_failed body must
+    surface as a warning, not a silent 'code-intel: indexed' success (cd28b329).
+    """
+    import httpx as _httpx
+
+    _call_count = [0]
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self.status_code = 200
+            self.content = body
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            _call_count[0] += 1
+            if _call_count[0] == 1:
+                return FakeResp(b'{"jsonrpc":"2.0","id":"probe","result":{"tools":[]}}')
+            return FakeResp(
+                b'{"jsonrpc":"2.0","id":"idx","result":{"status":"error","workers":['
+                b'{"status":"worker_failed","exit_code":1},'
+                b'{"status":"worker_failed","exit_code":1}'
+                b']}}'
+            )
+
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+    asyncio.run(tc._index_code_dir(8809, "/repo"))
+
+    captured = capsys.readouterr()
+    assert "status=error" in captured.err
+    assert "worker(s) failed" in captured.err
+    assert "code-intel: indexed" not in captured.out
+
+
 def test_index_code_dir_logs_jsonrpc_error_body(monkeypatch, capsys):
     """_index_code_dir warns when index_repository returns HTTP 200 with a JSON-RPC error body.
 
