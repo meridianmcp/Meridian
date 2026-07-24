@@ -400,6 +400,14 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
 
 def _connect(index_db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(index_db_path)
+    # 05256d4a -- WAL mode: journal_mode was never configured anywhere in this
+    # module, so every connection defaulted to SQLite's rollback-journal mode.
+    # WAL lets readers proceed concurrently with a writer (no exclusive lock
+    # for the whole transaction) and generally reduces fsync overhead for the
+    # small, frequent writes index_docx's delta-update path now does. A no-op
+    # (silently ignored by SQLite) for :memory:/temporary databases, which
+    # always report/keep journal_mode 'memory' regardless of this pragma.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS docx_paragraphs (
@@ -600,11 +608,32 @@ def _ensure_fresh(index_db_path: str) -> None:
 def index_docx(
     source: str | bytes | bytearray, index_db_path: str
 ) -> dict[str, Any]:
-    """Build (or rebuild) a sidecar SQLite index of a .docx keyed by paraId.
+    """Build (or incrementally update) a sidecar SQLite index of a .docx keyed
+    by paraId.
 
-    Returns a summary ``{index_db, paragraph_count, heading_count}``. Idempotent:
-    the paragraph table is fully replaced each run so re-indexing an edited doc
-    stays consistent.
+    Returns a summary ``{index_db, paragraph_count, heading_count, delta}``.
+    Idempotent: re-indexing an edited doc always converges to the exact same
+    ``docx_paragraphs`` contents a fresh index would produce.
+
+    05256d4a — DELTA update, not a full rebuild: paragraphs are diffed against
+    what's already stored, by ``para_id`` (the existing ``TEXT PRIMARY KEY``
+    on ``docx_paragraphs``) plus an ``(idx, style, text)`` content comparison,
+    and only the rows that actually differ are INSERTed / UPDATEd / DELETEd.
+    An unchanged document touches zero rows. A one-paragraph text edit touches
+    exactly that paragraph's row (plus any later paragraph whose ``idx``
+    genuinely shifted because paragraphs were added/removed -- not relevant
+    to a same-length in-place edit). This replaces the previous
+    unconditional ``DELETE FROM docx_paragraphs`` + full reinsert + explicit
+    FTS5 ``'rebuild'`` on every single call, which was a full-table rewrite
+    even for a one-paragraph change.
+
+    docx_paragraphs' existing per-row ``docx_paragraphs_ai``/``_au``/``_ad``
+    triggers already keep ``docx_fts`` incrementally consistent on INSERT /
+    UPDATE / DELETE (see :func:`_connect`) -- so a delta write no longer needs
+    the explicit full ``'rebuild'`` command at all; only the FTS postings for
+    rows that actually changed are touched, both for the first-ever index
+    (every row is a fresh INSERT, still trigger-driven, one row at a time)
+    and for every subsequent delta update.
 
     2426dce9 — when ``source`` is a file path (not raw bytes), the path and its
     current mtime are stamped into ``docx_index_meta`` so a later read call can
@@ -616,12 +645,42 @@ def index_docx(
     paragraphs = parse_docx(source)
     conn = _connect(index_db_path)
     try:
-        conn.execute("DELETE FROM docx_paragraphs")
-        conn.executemany(
-            "INSERT OR REPLACE INTO docx_paragraphs (para_id, idx, style, text) "
-            "VALUES (?, ?, ?, ?)",
-            [(p["para_id"], p["index"], p["style"], p["text"]) for p in paragraphs],
-        )
+        existing = {
+            row[0]: (row[1], row[2], row[3])
+            for row in conn.execute("SELECT para_id, idx, style, text FROM docx_paragraphs")
+        }
+        seen_ids: set[str] = set()
+        inserted = updated = unchanged = 0
+        for p in paragraphs:
+            pid = p["para_id"]
+            seen_ids.add(pid)
+            new_sig = (p["index"], p["style"], p["text"])
+            old_sig = existing.get(pid)
+            if old_sig is None:
+                conn.execute(
+                    "INSERT INTO docx_paragraphs (para_id, idx, style, text) "
+                    "VALUES (?, ?, ?, ?)",
+                    (pid, p["index"], p["style"], p["text"]),
+                )
+                inserted += 1
+            elif old_sig != new_sig:
+                conn.execute(
+                    "UPDATE docx_paragraphs SET idx = ?, style = ?, text = ? "
+                    "WHERE para_id = ?",
+                    (p["index"], p["style"], p["text"], pid),
+                )
+                updated += 1
+            else:
+                unchanged += 1
+
+        stale_ids = existing.keys() - seen_ids
+        if stale_ids:
+            conn.executemany(
+                "DELETE FROM docx_paragraphs WHERE para_id = ?",
+                [(pid,) for pid in stale_ids],
+            )
+        deleted = len(stale_ids)
+
         if isinstance(source, str):
             mtime = _stat_mtime(source)
             conn.execute(
@@ -632,12 +691,6 @@ def index_docx(
                 "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
                 ("source_mtime", str(mtime) if mtime is not None else None),
             )
-        # 32d84131 — rebuild the FTS5 index from the current docx_paragraphs
-        # content. This is a full content-sync (not trigger-driven) so the index
-        # is always consistent after index_docx regardless of how the paragraph
-        # table was populated. The 'rebuild' command re-reads the content table
-        # and regenerates all FTS posting lists atomically.
-        conn.execute("INSERT INTO docx_fts(docx_fts) VALUES ('rebuild')")
         conn.commit()
     finally:
         conn.close()
@@ -645,6 +698,12 @@ def index_docx(
         "index_db": index_db_path,
         "paragraph_count": len(paragraphs),
         "heading_count": sum(1 for p in paragraphs if _is_heading(p["style"])),
+        "delta": {
+            "inserted": inserted,
+            "updated": updated,
+            "deleted": deleted,
+            "unchanged": unchanged,
+        },
     }
 
 
