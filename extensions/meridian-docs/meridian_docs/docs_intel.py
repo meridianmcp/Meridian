@@ -327,10 +327,21 @@ def _parse_one_sectpr(
 def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     """Parse a .docx (path or raw bytes) into ordered paragraph records.
 
-    Each record is ``{index, para_id, style, text}``. ``para_id`` is the
-    ``w14:paraId`` when Word wrote one (stable across edits), else a synthesized
-    ``p{index}`` so every paragraph is still addressable. Returns an empty list
-    for a document with no body.
+    Each record is ``{index, para_id, style, text}``. ``para_id`` resolves with
+    the same three-tier scheme every mutation primitive in this module already
+    uses (``_find_para_by_id``, ``_locate_section_bounds``,
+    ``_vendored_content_tree._paragraph_node``): the native ``w14:paraId`` when
+    Word wrote one (stable across edits), else the synthesized ``sp<hash>`` id
+    from :func:`_vendored_content_tree._build_synth_id_map` (a content-derived
+    id that is ALSO stable across edits -- unlike a raw position counter), else
+    a positional ``p{index}`` fallback. Returns an empty list for a document
+    with no body.
+
+    71db285b -- previously this used a bare ``p{index}`` position counter,
+    unaware of the synth_id scheme that ``move_section``/``copy_section``/
+    ``_locate_section_bounds`` actually resolve against, so ``document_outline``
+    handed back ids that those functions could not reliably locate on any real
+    (non-synthetic) docx lacking ``w14:paraId`` on every paragraph.
     """
     if isinstance(source, (bytes, bytearray)):
         zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
@@ -346,8 +357,12 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     paragraphs: list[dict[str, Any]] = []
     if body is None:
         return paragraphs
+
+    from ._vendored_content_tree import _build_synth_id_map  # noqa: PLC0415
+
+    synth_map = _build_synth_id_map(body)
     for index, p in enumerate(body.findall(_q(_W, "p"))):
-        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        para_id = p.get(_q(_W14, "paraId")) or synth_map.get(id(p)) or f"p{index}"
         style: str | None = None
         ppr = p.find(_q(_W, "pPr"))
         if ppr is not None:
