@@ -74,6 +74,7 @@ EXPECTED_HANDLER_NAMES = [
     "handle_link_figure_caption",
     "handle_index_table",
     "handle_find_similar_table",
+    "handle_link_table_caption",
     "handle_add_insight",
     "handle_get_insights",
     "handle_save_finding",
@@ -96,7 +97,7 @@ EXPECTED_HANDLER_NAMES = [
     "handle_promote_proposal",
 ]
 
-# All 45 tool names that must be covered by the dispatch table.
+# All 46 tool names that must be covered by the dispatch table.
 ALL_TOOL_NAMES = [
     "pin_decision",
     "update_decision",
@@ -123,6 +124,7 @@ ALL_TOOL_NAMES = [
     "link_figure_caption",
     "index_table",
     "find_similar_table",
+    "link_table_caption",
     "add_insight",
     "get_insights",
     "save_finding",
@@ -147,7 +149,7 @@ ALL_TOOL_NAMES = [
 
 
 def test_all_expected_handlers_are_importable():
-    """All 45 per-tool handlers must be importable from the new submodule."""
+    """All 46 per-tool handlers must be importable from the new submodule."""
     for name in EXPECTED_HANDLER_NAMES:
         assert hasattr(nd_mod, name), f"Missing handler: {name}"
 
@@ -1162,13 +1164,23 @@ async def test_find_similar_table_missing_doc(db, project):
     assert "error" in result
 
 
+@pytest.mark.asyncio
+async def test_link_table_caption_missing_doc(db, project):
+    pid = project["id"]
+    result = await nd_mod.handle_link_table_caption(
+        {"project_id": pid, "table_id": "tbl-1", "caption_element_id": "el-1"},
+        db, _DATA_DIR, None, None,
+    )
+    assert "error" in result
+
+
 # ---------------------------------------------------------------------------
-# Dispatch-table completeness: none of the 45 known tool names returns _MISS
+# Dispatch-table completeness: none of the 46 known tool names returns _MISS
 # ---------------------------------------------------------------------------
 
 def test_handler_names_match_all_tools():
     """Sanity: EXPECTED_HANDLER_NAMES and ALL_TOOL_NAMES must be same length."""
-    assert len(EXPECTED_HANDLER_NAMES) == len(ALL_TOOL_NAMES) == 45
+    assert len(EXPECTED_HANDLER_NAMES) == len(ALL_TOOL_NAMES) == 46
 
 
 # ---------------------------------------------------------------------------

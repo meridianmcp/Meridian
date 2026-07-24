@@ -242,6 +242,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         normalized_caption TEXT,
         semantic_label TEXT,
         paired_figure_id TEXT,
+        caption_element_id TEXT,
         created_at TEXT NOT NULL
     )
     """,
@@ -378,7 +379,8 @@ _FIGURE_COLUMNS = (
 )
 _TABLE_COLUMNS = (
     "id", "document_id", "element_id", "ordinal", "table_index", "caption",
-    "normalized_caption", "semantic_label", "paired_figure_id", "created_at",
+    "normalized_caption", "semantic_label", "paired_figure_id",
+    "caption_element_id", "created_at",
 )
 _FLAG_LINK_COLUMNS = (
     "id", "project_id", "document_id", "element_id", "flag_name",
@@ -1490,6 +1492,19 @@ class DocStructureStore:
         if not await self._column_exists("doc_figures", "caption_element_id"):
             await self._db.execute(
                 "ALTER TABLE doc_figures ADD COLUMN caption_element_id TEXT"
+            )
+            await self._db.commit()
+        # 42d398a5 — caption_element_id: the doc_tables analogue of doc_figures'
+        # column above -- durable linkage from a doc_tables row to the
+        # doc_elements element (kind='table' paragraph carrying the SEQ field)
+        # that IS that table's caption, by stable element id rather than
+        # paragraph proximity. DEFAULT NULL so every pre-existing table row
+        # (stored before this column) reads back as unlinked (not yet
+        # confirmed), which is honest -- they can be back-filled via the
+        # link_table_caption MCP tool.
+        if not await self._column_exists("doc_tables", "caption_element_id"):
+            await self._db.execute(
+                "ALTER TABLE doc_tables ADD COLUMN caption_element_id TEXT"
             )
             await self._db.commit()
 
@@ -3255,6 +3270,11 @@ class DocStructureStore:
                 "normalized_caption": normalized_caption,
                 "semantic_label": semantic_label,
                 "paired_figure_id": paired_figure_id,
+                # 42d398a5 — always present (None until confirmed via
+                # set_table_caption_link) so this manually-constructed row
+                # matches the shape of a row re-fetched from the DB (which
+                # always carries every _TABLE_COLUMNS key).
+                "caption_element_id": None,
                 "created_at": now,
             }
             if suggested_figure_id is not None:
@@ -3303,6 +3323,44 @@ class DocStructureStore:
             "table": result["inserted"][0] if result["inserted"] else None,
             "near_duplicates": result["near_duplicates"],
         }
+
+    async def set_table_caption_link(
+        self,
+        table_id: str,
+        caption_element_id: str,
+    ) -> dict[str, Any] | None:
+        """Durably set the ``caption_element_id`` on an existing doc_tables row.
+
+        42d398a5 — the write primitive for the ``link_table_caption`` MCP tool,
+        the table analogue of :meth:`set_figure_caption_link`: confirms (or
+        corrects) the durable linkage from a table to its caption paragraph
+        element, identified by the stable ``doc_elements.id``. This is the
+        backfill mechanism for tables already indexed before the
+        ``caption_element_id`` column existed, and the confirmation primitive
+        when the advisory suggestion from :meth:`put_tables` surfaces multiple
+        candidates.
+
+        Returns the updated table row as a dict, or ``None`` when ``table_id``
+        does not resolve to any stored table.
+        """
+        if not isinstance(table_id, str) or not table_id.strip():
+            return None
+        async with self._db.execute(
+            "SELECT * FROM doc_tables WHERE id = ?", (table_id.strip(),)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        await self._db.execute(
+            "UPDATE doc_tables SET caption_element_id = ? WHERE id = ?",
+            (caption_element_id, table_id.strip()),
+        )
+        await self._db.commit()
+        async with self._db.execute(
+            "SELECT * FROM doc_tables WHERE id = ?", (table_id.strip(),)
+        ) as cur:
+            updated_row = await cur.fetchone()
+        return _row_to_dict(updated_row, _TABLE_COLUMNS)
 
     # -- orchestrator — 06df6ab3 ---------------------------------------------
 

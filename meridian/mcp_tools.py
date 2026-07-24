@@ -48,6 +48,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "link_figure_caption": 'link_figure_caption(project_id="abc-123", doc="thesis/chapter1.docx", figure_id="fig-uuid-here", caption_element_id="el-uuid-here")',
     "index_table": 'index_table(project_id="abc-123", doc="thesis/chapter1.docx", table_index=2, caption="Table 2: Summary of experimental results", semantic_label="results table")',
     "find_similar_table": 'find_similar_table(project_id="abc-123", doc="thesis/chapter1.docx", description="summary of experimental results")',
+    "link_table_caption": 'link_table_caption(project_id="abc-123", doc="thesis/chapter1.docx", table_id="tbl-uuid-here", caption_element_id="el-uuid-here")',
     "search_outputs": 'search_outputs(outputs_dir="/repo/outputs", query="temperature pressure sweep")',
     "annotate_outputs": 'annotate_outputs(outputs_dir="/repo/outputs", path="/repo/outputs/run_42", note="PCA on, BFS off — final params", run_params={"lr": 0.001, "epochs": 100})',
     "find_outputs_by_source": 'find_outputs_by_source(outputs_dir="/repo/outputs", source_path="analysis/run.py")',
@@ -760,6 +761,29 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "description": {"type": "string", "description": "A free-text description to fuzzy-match against this document's indexed tables."},
          "limit": {"type": "integer", "description": "Max matches to return (default 5)."}},
          "required": ["doc", "description"]}},
+    {"name": "link_table_caption", "description":
+        "42d398a5 — DURABLY link an already-indexed table (doc_tables row) to "
+        "its caption paragraph (a doc_elements id), by stable structural id "
+        "rather than paragraph proximity. The table analogue of "
+        "link_figure_caption. Use this to confirm an advisory "
+        "suggested_caption_element_id returned by index_table, or to "
+        "backfill a durable link on a table that was indexed before caption "
+        "linkage was supported. Provide table_id (the doc_tables.id of the "
+        "table to link) and caption_element_id (the doc_elements.id of the "
+        "caption paragraph — a kind='table' SEQ-field element from the "
+        "section-tree store). This is the confirmation primitive for the "
+        "ambiguous-multi-candidate scenario: when index_table surfaces "
+        "multiple caption candidates in the same section, inspect them and "
+        "call this tool with the correct one to confirm the durable link. "
+        "Returns the updated table row on success, or {error} "
+        "when table_id doesn't resolve to a known table.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "doc": {"type": "string", "description": "The stored document's source (the path/URL you ingested it under via ingest_document)."},
+         "table_id": {"type": "string", "description": "The doc_tables.id of the table row to update (from index_table or find_similar_table)."},
+         "caption_element_id": {"type": "string", "description": "The doc_elements.id of the caption paragraph to durably link to this table."}},
+         "required": ["doc", "table_id", "caption_element_id"]}},
     {"name": "ingest_document_structure", "description":
         "db42acce — persist pre-parsed structural data (headings/figures/tables) "
         "into the doc-structure store, keyed on the SAME source as "
@@ -2446,6 +2470,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "link_figure_caption":            "docx",
     "index_table":                    "docx",
     "find_similar_table":             "docx",
+    "link_table_caption":             "docx",
     "ingest_document_structure":      "docx",
     "link_flag_to_section":           "docx",
     "get_flag_drift":                 "docx",
@@ -2507,6 +2532,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "index_figure":              "executor",
     "link_figure_caption":       "executor",
     "index_table":               "executor",
+    "link_table_caption":        "executor",
     "ingest_document_structure": "executor",
     "link_flag_to_section":      "executor",
     "annotate_outputs":          "executor",
@@ -2825,6 +2851,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "link_figure_caption":        "maintenance-only",
     "index_table":                "maintenance-only",
     "find_similar_table":         "maintenance-only",
+    "link_table_caption":         "maintenance-only",
     "ingest_document_structure":  "maintenance-only",
     "claim_docx_region":          "maintenance-only",
     "get_docx_region_claims":     "maintenance-only",
