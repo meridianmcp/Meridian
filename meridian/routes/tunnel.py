@@ -3234,24 +3234,53 @@ _CODE_INTEL_PROJECT_TOOLS = frozenset({
 })
 
 
+# 1579bc1e — the subject noun the codebase-memory server uses for "the thing
+# it couldn't find" is not guaranteed to be literally "project": its own
+# domain concept is a repo-path slug, and confirmed-live failures have shown
+# it phrasing the same miss in terms of the repository rather than the
+# planning-style "project" word. Gating on "project" alone silently drops any
+# error phrased as "repository not found"/"repo is not indexed" — the retry
+# never fires because the message never matches, even though it is the exact
+# same slug-mismatch condition. Match on any of the plausible subject nouns.
+_PROJECT_NOT_FOUND_NOUNS = ("project", "repository", "repo")
+
+# 1579bc1e — broadened phrase list. The original list only matched a narrow
+# set of exact contiguous phrasings ("not found", "not indexed", "isn't
+# indexed", "is not indexed", ...) — phrasing variance as small as a
+# contraction ("hasn't been indexed") or an extra word ("could not find that
+# project") falls through every one of them as a literal substring miss, even
+# though it is unambiguously the same "unknown project" condition. Broadened
+# to cover the realistic phrasing space without dropping the requirement that
+# one of _PROJECT_NOT_FOUND_NOUNS also be present (so unrelated errors, e.g. a
+# query syntax error, still never match).
+_PROJECT_NOT_FOUND_PHRASES = (
+    "not found", "no such", "unknown project", "unknown repository",
+    "unknown repo", "does not exist", "doesn't exist", "no project",
+    "no repository", "no repo", "not indexed", "isn't indexed",
+    "is not indexed", "hasn't been indexed", "has not been indexed",
+    "not been indexed", "never indexed", "no index", "not registered",
+    "not recognized", "not recognised", "could not find", "couldn't find",
+    "cannot find", "can't find", "unable to locate", "no matching",
+)
+
+
 def _is_project_not_found_error(msg: str) -> bool:
     """Heuristic: does an error message look like a code-intel project lookup miss?
 
     The codebase-memory server phrases this a few ways ("project not found",
     "no project ... found", "unknown project", "project '<slug>' does not
-    exist"). Match loosely on the (project + not-found) signal so we enrich the
-    right failures without hijacking unrelated errors (e.g. a query syntax error).
+    exist", "repository is not indexed", "could not find that repo", ...).
+    Match loosely — (subject-noun + not-found-shaped phrase) — so we enrich
+    the right failures without hijacking unrelated errors (e.g. a query
+    syntax error), while staying robust to phrasing variance from a
+    third-party server we don't control the exact wording of (1579bc1e: a
+    confirmed live case where the retry never fired because the matching
+    logic was too narrow for the actual returned text).
     """
     low = (msg or "").lower()
-    if "project" not in low:
+    if not any(noun in low for noun in _PROJECT_NOT_FOUND_NOUNS):
         return False
-    return any(
-        phrase in low
-        for phrase in (
-            "not found", "no such", "unknown project", "does not exist",
-            "no project", "not indexed", "isn't indexed", "is not indexed",
-        )
-    )
+    return any(phrase in low for phrase in _PROJECT_NOT_FOUND_PHRASES)
 
 
 def _closest_project_ids(wanted: str, available: "list[str]") -> "list[str]":
@@ -3769,7 +3798,28 @@ async def call_tunnel_tool(
         return None
     err = resp.get("error")
     if err:
-        _msg = str(err.get("message") if isinstance(err, dict) else err)
+        if isinstance(err, dict):
+            # 1579bc1e — not every server follows the JSON-RPC "message" key
+            # convention strictly; the human-readable text can land in
+            # "error", "detail", or a string "data" field instead. Falling
+            # straight through to str(None) whenever "message" is absent
+            # silently swallows the real diagnostic text (e.g. a genuine
+            # "project not found" error becomes the literal string "None"),
+            # which then can never be recognised by
+            # _is_project_not_found_error downstream — the retry-without-
+            # project_id fallback in prospect.py depends on seeing the real
+            # text and would never fire. Probe every plausible field before
+            # giving up and stringifying the whole dict as a last resort.
+            _data = err.get("data")
+            _msg = str(
+                err.get("message")
+                or err.get("error")
+                or err.get("detail")
+                or (_data if isinstance(_data, str) else None)
+                or err
+            )
+        else:
+            _msg = str(err)
         # 7ef712a8 — a code-intel graph tool that misses on the project id gets a
         # slug-vs-planning-name hint + the list of indexed identifiers so the
         # caller can retry instead of abandoning code-intel. Only the code slot's

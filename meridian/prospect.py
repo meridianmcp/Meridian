@@ -153,18 +153,37 @@ def _payload_is_error(payload: Any) -> "str | None":
     results" and report ``fallback_reason="graph_empty"`` — hiding the real
     cause from the caller.
 
-    Only fires when the dict has an ``"error"`` or ``"message"`` key AND has
-    NONE of the recognised hit-container keys.  This avoids false-positives on
-    a legitimate (but empty) result that happens to carry an ``"error"`` field.
+    Only fires when the dict has an ``"error"``/``"message"``/``"detail"`` key
+    AND has NONE of the recognised hit-container keys.  This avoids
+    false-positives on a legitimate (but empty) result that happens to carry
+    an ``"error"`` field.
+
+    1579bc1e — probes each candidate field for a STRING value instead of
+    short-circuiting an ``or``-chain on the first *truthy* value regardless of
+    type. The original ``payload.get("error") or payload.get("message") or
+    payload.get("detail")`` returns whatever ``payload["error"]`` holds the
+    instant it's truthy — even when that's a nested dict (e.g.
+    ``{"error": {"message": "project not found"}}``, a shape some MCP servers
+    use instead of a bare string). ``isinstance(msg, str)`` then fails and the
+    whole function returns None, silently discarding a real, matchable error
+    message and letting it masquerade as "zero results" (``graph_empty``)
+    instead of triggering the project_id-mismatch retry. Falls through to a
+    one-level-deep probe of the same key names when a candidate is a dict.
     """
     if not isinstance(payload, dict):
         return None
     _hit_keys = frozenset({"results", "matches", "hits", "nodes", "symbols", "entities"})
     if any(k in payload for k in _hit_keys):
         return None
-    msg = payload.get("error") or payload.get("message") or payload.get("detail")
-    if msg and isinstance(msg, str):
-        return msg.strip()
+    for _key in ("error", "message", "detail"):
+        val = payload.get(_key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            for _subkey in ("message", "error", "detail", "reason"):
+                subval = val.get(_subkey)
+                if isinstance(subval, str) and subval.strip():
+                    return subval.strip()
     # A string payload that came back non-JSON from _extract_graph_matches.
     return None
 

@@ -933,6 +933,117 @@ class TestGraphEmptyAfterFreshIndex:
         assert result["rung"] == "serena"
         assert result["hits"][0]["name"] == "dominant_segments_from_group"
 
+    @pytest.mark.asyncio
+    async def test_nested_error_object_in_payload_still_triggers_broad_retry(
+        self, monkeypatch,
+    ):
+        """1579bc1e — regression for a real gap in _payload_is_error: the
+        original implementation built its message via
+        ``payload.get("error") or payload.get("message") or ...`` and
+        returned the FIRST truthy value regardless of type. When
+        codebase-memory-mcp nests the text one level down (e.g.
+        ``{"error": {"message": "project not found or not indexed"}}``
+        instead of a bare string), the old code hit the dict, saw it was
+        truthy, and returned None (since ``isinstance(msg, str)`` failed) —
+        silently discarding the error and reporting graph_empty. The fix
+        probes a nested dict for its own message/error/detail field."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        nested_error_result = _text_result({
+            "error": {"message": "project not found or not indexed", "code": 404},
+        })
+        hits_payload = _text_result({"results": [
+            {"file": "analysis.py", "line": 42, "name": "dominant_segments_from_group"},
+        ]})
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            if name == "codebase__search_graph":
+                if args.get("project_id"):
+                    return nested_error_result
+                return hits_payload
+            raise AssertionError(f"unexpected call: {name}")
+
+        fake_tenant = {"id": "tenant-nested-err"}
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="dominant_segments_from_group",
+            project_id="meridian-build",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=fake_tenant,
+            data_dir="",
+        )
+        assert result["rung"] == "graph", (
+            f"expected the nested error to be recognised and the broad retry "
+            f"to succeed, got rung={result['rung']!r} "
+            f"fallback_reason={result.get('fallback_reason')!r}"
+        )
+        assert len(result["hits"]) == 1
+        assert result["hits"][0]["name"] == "dominant_segments_from_group"
+
+    @pytest.mark.asyncio
+    async def test_full_pipeline_message_less_key_error_still_retries(
+        self, monkeypatch,
+    ):
+        """End-to-end regression combining BOTH fixes through the REAL (not
+        stubbed) call_tunnel_tool: the tunnel's JSON-RPC error object has no
+        "message" key (text lives under "data" instead — a real gap in the
+        old ``err.get("message")``-only extraction), so this exercises the
+        actual production code path: _tunnel_jsonrpc -> call_tunnel_tool's
+        error-message construction -> the raised exception ->
+        prospect_symbol_impl's rung-1 except clause ->
+        _is_project_not_found_error -> _broad_retry_without_project_id. Only
+        _tunnel_jsonrpc (the lowest-level transport seam) is stubbed."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        tenant_id = "tenant-full-pipeline"
+        tool = "codebase__search_graph"
+        _tunnel_mod._tunnel_tool_routes[tenant_id] = {tool: "code"}
+        _tunnel_mod._tunnel_code_sockets[tenant_id] = object()
+
+        async def _fake_jsonrpc(tid, label, method, params, repo_path=None):
+            call_args = params.get("arguments") or {}
+            if call_args.get("project_id"):
+                # No "message" key — only "data" carries the real text, the
+                # exact shape that used to collapse to the string "None".
+                return {"error": {"code": 404, "data": "project not found or not indexed"}}
+            return {"result": _text_result({"results": [
+                {"file": "analysis.py", "line": 7, "name": "dominant_segments_from_group"},
+            ]})}
+
+        async def _fake_list_projects(tid):
+            return []
+
+        monkeypatch.setattr(_tunnel_mod, "_tunnel_jsonrpc", _fake_jsonrpc)
+        monkeypatch.setattr(_tunnel_mod, "_list_indexed_project_ids", _fake_list_projects)
+
+        try:
+            result = await _prospect_symbol_impl(
+                symbol="dominant_segments_from_group",
+                project_id="meridian-build",
+                root_dir="",
+                limit=5,
+                kind=None,
+                stale_graph=False,
+                tenant={"id": tenant_id},
+                data_dir="",
+            )
+        finally:
+            _tunnel_mod._tunnel_tool_routes.pop(tenant_id, None)
+            _tunnel_mod._tunnel_code_sockets.pop(tenant_id, None)
+
+        assert result["rung"] == "graph", (
+            f"expected the broad retry to succeed end-to-end through the "
+            f"real call_tunnel_tool, got rung={result['rung']!r} "
+            f"fallback_reason={result.get('fallback_reason')!r}"
+        )
+        assert len(result["hits"]) == 1
+        assert result["hits"][0]["name"] == "dominant_segments_from_group"
+
 
 class TestFingerprintWildcardFallback:
     """9033914e — staleness fingerprint wildcard fallback for project-specific
