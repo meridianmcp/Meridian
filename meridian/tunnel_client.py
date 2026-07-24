@@ -4082,9 +4082,13 @@ async def _index_code_dir(port: int, code_dir: str) -> None:
     tunnel client.  The in-repo contribution here is that we now surface JSON-RPC-
     level errors from ``index_repository`` that previously looked like success
     (HTTP 200 with an error body); that makes a partial/failed index diagnosable
-    rather than silent.  For reliable code-intelligence use the ``meridian-extract``
-    slot (Serena/mcp-server-code-extractor), which is LSP-based and reads the live
-    filesystem directly.
+    rather than silent.  For reliable code-intelligence use the ``code-extractor``
+    slot (Serena; tools appear under the ``extractor__`` prefix per
+    ``routes/tunnel.py``'s ``SLOT_DISPLAY_NAMES``), which is LSP-based and reads
+    the live filesystem directly.  (c0169ae9 — this docstring and the stderr
+    message below previously said "meridian-extract", a name that has never
+    existed in ``tunnel_plugins.BUILTIN_PLUGINS``; the registered plugin is
+    named "code-extractor" on the "extract" slot.)
     """
     import httpx
 
@@ -4130,7 +4134,8 @@ async def _index_code_dir(port: int, code_dir: str) -> None:
                 print(
                     f"  code-intel: index_repository returned an error for {code_dir}: "
                     f"{body_err} — the graph index may be incomplete. "
-                    "Use meridian-extract (Serena) for reliable code-intel.",
+                    "Use the code-extractor slot (extractor__* tools, Serena) "
+                    "for reliable code-intel.",
                     file=sys.stderr, flush=True,
                 )
             else:
