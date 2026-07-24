@@ -1565,6 +1565,14 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
         lambda: extractor_inner if extractor_inner is not None
         else ["uvx", "mcp-server-code-extractor"],
     )
+    # 986117fc — the staleness-alert git probe shells out via subprocess.run,
+    # which internally spawns through the same tc.subprocess.Popen patched
+    # below (FakeProc) -- left live it would (a) inflate the `procs` count
+    # these tests assert on and (b) since FakeProc has no `communicate`, get
+    # swallowed as a fail-open None anyway. No-op it here so `procs` reflects
+    # only real plugin/slot spawns; the probe itself has dedicated, isolated
+    # coverage in test_tunnel_client.py.
+    monkeypatch.setattr(tc, "_tunnel_client_commit_hash_sync", lambda *a, **k: None)
 
     procs = []
 
@@ -1645,6 +1653,56 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
     monkeypatch.setattr(tc, "_reconnect_loop_extract_pool", fake_reconnect_extract_pool)
     monkeypatch.setattr(tc, "_pool_idle_reaper", fake_pool_reaper)
     return procs
+
+
+def test_run_tunnel_wires_staleness_alert_loop_with_started_commit(monkeypatch, tmp_path):
+    """986117fc — run_tunnel captures the startup commit via
+    _tunnel_client_commit_hash_sync and schedules _staleness_alert_loop with
+    it, end-to-end through the real wiring (not just the loop in isolation).
+    """
+    _stub_run_tunnel_spawn(monkeypatch)
+    # Override the stub's default (None) with a specific fake commit so we can
+    # assert it flows through to the loop.
+    monkeypatch.setattr(tc, "_tunnel_client_commit_hash_sync", lambda *a, **k: "cafef00d1234")
+
+    seen_args = []
+
+    async def fake_staleness_loop(started_commit, root_dir=None, interval=tc._STALENESS_CHECK_INTERVAL_SECONDS):
+        seen_args.append(started_commit)
+        return None
+
+    monkeypatch.setattr(tc, "_staleness_alert_loop", fake_staleness_loop)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "tid-x", "plan": "pro"}),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    assert seen_args == ["cafef00d1234"]
+
+
+def test_run_tunnel_no_staleness_warning_masks_no_plugins_error(monkeypatch, tmp_path):
+    """The staleness task must be appended AFTER the 'nothing to serve' guard —
+    it must never turn a real all-slots-disabled error into a fake success."""
+    monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
+    monkeypatch.setattr(tc, "_tunnel_client_commit_hash_sync", lambda *a, **k: "cafef00d1234")
+    monkeypatch.setattr(tc, "_resolve_token", lambda t: "sk_tok")
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "t", "plan": "pro",
+            "tunnel_plugins_config": [
+                {"name": "filesystem", "enabled": False},
+                {"name": "code-intel", "enabled": False},
+                {"name": "code-extractor", "enabled": False},
+            ],
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 1
 
 
 def test_run_tunnel_extra_fs_roots_union(monkeypatch, tmp_path):
