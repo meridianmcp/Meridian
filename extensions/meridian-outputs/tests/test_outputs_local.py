@@ -2018,6 +2018,77 @@ class TestColdTreeFtsDeferral:
         assert "db_write_error" not in result, (
             "1a799e52: a healthy write must not carry a db_write_error field"
         )
+        # 81a0b23d -- a fully-converged (non-partial) response must keep its
+        # existing shape exactly: no new pending_stale_count key at all, not
+        # even pending_stale_count=0. Regression check for callers that don't
+        # know about the new field.
+        assert "partial" not in result
+        assert "pending_stale_count" not in result, (
+            "81a0b23d: a fully-converged rebuild must not carry "
+            f"pending_stale_count -- got {result}"
+        )
+
+    def test_search_outputs_mid_pass_surfaces_pending_stale_count(
+        self, tmp_path: Path,
+    ) -> None:
+        """81a0b23d: search_outputs()'s response must expose how many
+        confirmed-stale files are still queued for analysis+write whenever
+        partial=True, so a zero-hit result on a mid-pass index (more files
+        queued behind the scenes) is distinguishable from a genuine miss on
+        a fully-converged index -- total_indexed/total_in_index alone can't
+        make that distinction because rebuild() deliberately keeps them from
+        regressing mid-pass (every previously-indexed path is retained in
+        ``all_paths`` until the walk's current pass confirms otherwise)."""
+        n_files = 10
+        for i in range(n_files):
+            (tmp_path / f"pending_{i}.csv").write_text(
+                f"col\n{i}", encoding="utf-8"
+            )
+
+        def slow_hasher(path: str) -> str | None:
+            time.sleep(0.2)
+            return OL._sha256_file(path)
+
+        # Seed the module-level cache with a pre-built index using the slow
+        # hasher (mirrors OL._get_cached_index's own construction, just with
+        # a hasher OL.search_outputs itself has no parameter to inject).
+        # max_workers is pinned explicitly (rather than left at the
+        # os.cpu_count() default, a849e3d5) so this stays deterministic
+        # regardless of how many cores the machine running this test has.
+        key = OL._cache_key(str(tmp_path))
+        idx = OL.OutputsFtsIndex(
+            str(tmp_path),
+            db_path=OL._resolve_index_db_path(str(tmp_path)),
+            hasher=slow_hasher,
+            max_workers=2,
+        )
+        with OL._index_cache_lock:
+            OL._index_cache[key] = idx
+        try:
+            # phase1_deadline is half of max_seconds (0.5s here); with 2
+            # workers at 0.2s/file, only ~2 waves (4 files) fit before the
+            # sub-deadline trips, leaving the rest un-analysed and therefore
+            # still queued in idx._pending_stale.
+            result = OL.search_outputs(str(tmp_path), "col", max_seconds=1.0)
+
+            assert result["partial"] is True, (
+                f"expected a mid-pass (partial) rebuild, got: {result}"
+            )
+            assert "pending_stale_count" in result, (
+                "81a0b23d: partial=True must carry pending_stale_count -- "
+                f"got {result}"
+            )
+            assert result["pending_stale_count"] > 0
+            assert result["pending_stale_count"] < n_files, (
+                "test setup didn't actually leave a partial backlog -- "
+                f"got {result}"
+            )
+            # The surfaced count must be the REAL backlog size, not a stand-in.
+            assert result["pending_stale_count"] == len(idx._pending_stale)
+        finally:
+            with OL._index_cache_lock:
+                OL._index_cache.pop(key, None)
+            idx.close()
 
     def test_rebuild_surfaces_db_write_error_instead_of_silent_debug_log(
         self, tmp_path: Path,

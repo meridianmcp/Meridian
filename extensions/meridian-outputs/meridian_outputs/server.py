@@ -81,7 +81,12 @@ def search_outputs(
                         fewer calls on a tree too large for the default budget.
 
     Returns:
-      {outputs_dir, query, hits, total_indexed} plus optional {partial, error}.
+      {outputs_dir, query, hits, total_indexed} plus optional {partial,
+      pending_stale_count, fts_pending, tantivy_lock_warning, db_write_error,
+      error}. ``pending_stale_count`` (only present when ``partial`` is True)
+      is the number of confirmed-stale files still queued for analysis+write
+      -- distinguishes a zero-hit result on a mid-pass index (more indexing
+      queued) from a genuine miss on a fully-converged index (81a0b23d).
       Each hit has: path, score, bm25, is_archival, canonical_path, kind,
       generating_script, csv_columns, json_keys, size, mtime, annotations,
       literal_match.

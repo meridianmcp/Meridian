@@ -3025,6 +3025,18 @@ def search_outputs(
     results as the index builds across multiple calls.  An empty ``hits``
     list with ``partial=True`` means the FTS index has not yet been built
     (still pending) -- check ``total_in_index`` to see if rows already exist.
+
+    81a0b23d: ``total_indexed``/``total_in_index`` are both deliberately
+    optimistic mid-pass (``rebuild()``'s ``all_paths`` retains every
+    previously-indexed path so counts never regress while a resumable walk
+    is still discovering the rest of the tree -- see
+    ``_ResumableFileWalk``/Phase 0 in ``rebuild()``), so a brand-new file can
+    look like it's covered by a large ``total_indexed`` when it hasn't been
+    discovered yet.  When ``partial=True``, ``pending_stale_count`` gives the
+    size of the confirmed-stale backlog still awaiting analysis+write
+    (``OutputsFtsIndex._pending_stale``) so a caller can tell a zero-hit
+    result on a mid-pass index (backlog non-empty, or the walk itself hasn't
+    finished a pass) apart from a genuine miss on a fully-converged index.
     """
     result: dict[str, Any] = {
         "outputs_dir": outputs_dir,
@@ -3057,6 +3069,17 @@ def search_outputs(
     result["hits"] = hits
     if index.last_rebuild_partial:
         result["partial"] = True
+        # 81a0b23d -- last_rebuild_partial was already tracked internally
+        # (set whenever the resumable walk hasn't finished a pass, Phase 1
+        # hit its deadline mid-backlog, or Phase 2's deadline passed before
+        # the FTS commit) but nothing told the caller HOW MUCH work is left
+        # queued. Mirrors the tantivy_lock_warning/9a18a2b2 precedent: make
+        # real, already-tracked state visible instead of silently partial.
+        # Only meaningful alongside partial=True -- a fully-converged
+        # rebuild always leaves this backlog empty, so it's omitted there to
+        # keep the existing full-coverage response shape unchanged.
+        if index._pending_stale:
+            result["pending_stale_count"] = len(index._pending_stale)
     if index._fts_pending:
         # Rows exist but FTS index hasn't been built yet.  Signal this so the
         # caller knows to re-invoke (the next search() call will build FTS).
