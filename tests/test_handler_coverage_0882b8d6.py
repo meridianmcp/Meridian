@@ -771,7 +771,7 @@ async def test_list_plugins_slot_tools_not_fetched_on_cross_instance_miss(db, mo
 
     fetch_calls: list[str] = []
 
-    async def _fake_fetch(tid: str, label: str):
+    async def _fake_fetch(tid: str, label: str, *, budget=None):
         fetch_calls.append(label)
         return label, []
 

@@ -4105,9 +4105,18 @@ async def _handle_plugin_tools(
             # socket — _fetch_slot_tools returns [] immediately when the socket
             # isn't local, so there is no point calling it on a cross-instance miss.
             try:
+                # 5a8a2d2e — use the cold-fetch-aware budget so a cold-fetch-family
+                # slot (ppt/word/docs/dc/...) that's legitimately still spawning
+                # after an idle-kill gets a realistic chance to answer instead of
+                # being falsely reported as unreachable/0 tools. fs/code/extract are
+                # never cold, so _slot_tools_fetch_budget leaves their (fast) flat
+                # budget unchanged.
                 slot_results = await asyncio.gather(
                     *[
-                        _tunnel_mod._fetch_slot_tools(tenant_id, label)  # type: ignore[attr-defined]
+                        _tunnel_mod._fetch_slot_tools(  # type: ignore[attr-defined]
+                            tenant_id, label,
+                            budget=_tunnel_mod._slot_tools_fetch_budget(label),  # type: ignore[attr-defined]
+                        )
                         for label in _tunnel_mod._TUNNEL_LABELS  # type: ignore[attr-defined]
                     ]
                 )
@@ -4311,10 +4320,14 @@ async def _handle_plugin_tools(
         )
 
         # Fetch full tools list for this slot
+        # 5a8a2d2e — cold-fetch-aware budget, same rationale as list_plugins above.
         tools: list[dict] = []
         if tenant_id and _local_active_gpd:
             try:
-                _, tools = await _tunnel_mod._fetch_slot_tools(tenant_id, slot)  # type: ignore[attr-defined]
+                _, tools = await _tunnel_mod._fetch_slot_tools(  # type: ignore[attr-defined]
+                    tenant_id, slot,
+                    budget=_tunnel_mod._slot_tools_fetch_budget(slot),  # type: ignore[attr-defined]
+                )
             except Exception:  # noqa: BLE001
                 pass
 
