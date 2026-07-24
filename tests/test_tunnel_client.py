@@ -1515,6 +1515,43 @@ def test_build_proxy_for_inner_resolves_bare_npx_inner_command(monkeypatch):
     assert "--shell" in cmd
 
 
+def test_build_proxy_for_inner_makes_resolved_npx_shell_safe(monkeypatch):
+    """9130fc7d -- _find_npx() can resolve to a real, space-containing path
+    (e.g. ``C:\\Program Files\\nodejs\\npx.cmd``). Under mcp-proxy's --shell
+    (cmd.exe) invocation an unescaped space truncates the command ("'C:\\Program'
+    is not recognized"). _build_proxy_for_inner must run the resolved path
+    through _win_shell_safe_path (already used elsewhere for this exact class
+    of bug) before using it, not just _find_npx() alone."""
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.setattr(tc, "_find_npx", lambda: r"C:\Program Files\nodejs\npx.cmd")
+    monkeypatch.setattr(tc, "_win_shell_safe_path", lambda p: r"C:\PROGRA~1\nodejs\npx.cmd")
+    cmd = tc._build_proxy_for_inner("npx.cmd", ["npx", "-y", "@debugmcp/mcp-debugger"], 8821)
+    inner = cmd[cmd.index("--") + 1:]
+    assert inner[0] == r"C:\PROGRA~1\nodejs\npx.cmd"
+    assert " " not in inner[0]
+
+
+def test_debug_default_command_is_bare_npx_not_cmd_wrapped(monkeypatch):
+    """9130fc7d -- unlike the (historical) _dc_default_command cmd/c wrap,
+    _debug_default_command must stay a bare npx invocation on every platform:
+    _build_proxy_for_inner's shared npx.cmd resolution + --shell already
+    handles Windows safely (one process layer), and a second cmd/c wrapper
+    here would reintroduce the extra-nested-cmd.exe readiness-probe failure
+    the dc cmd/c wrap was found to cause live."""
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    assert tc._debug_default_command() == ["npx", "-y", "@debugmcp/mcp-debugger"]
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    assert tc._debug_default_command() == ["npx", "-y", "@debugmcp/mcp-debugger"]
+
+
+def test_office_slot_command_falls_back_to_debug_default(monkeypatch):
+    """9130fc7d -- mirrors dc's existing fallback: when the debug slot's
+    plugin dict has no explicit command, _office_slot_command must fall back
+    to _debug_default_command() rather than returning None."""
+    assert tc._office_slot_command("debug", {}) == ["npx", "-y", "@debugmcp/mcp-debugger"]
+    assert tc._office_slot_command("debug", None) == ["npx", "-y", "@debugmcp/mcp-debugger"]
+
+
 def test_build_proxy_for_inner_leaves_non_npx_inner_command_untouched(monkeypatch):
     monkeypatch.setattr(tc, "_find_npx", lambda: r"C:\npm\npx.cmd")
     cmd = tc._build_proxy_for_inner("npx", ["codegraph", "--stdio"], 8809)
@@ -2344,10 +2381,11 @@ def test_slot_proxy_client_id_defaults_to_empty():
 
 
 def test_dc_default_command_wraps_cmd_on_windows(monkeypatch):
-    # 3db4f8d8 — pinned to _DC_PINNED_VERSION, not @latest.
+    # 83bd7f21 -- no longer cmd/c-wrapped; bare npx lets _build_proxy_for_inner's
+    # shared npx.cmd resolution + --shell handle it (one process layer, not two).
     monkeypatch.setattr(tc.sys, "platform", "win32")
     assert tc._dc_default_command() == [
-        "cmd", "/c", "npx", "-y",
+        "npx", "-y",
         f"@wonderwhy-er/desktop-commander@{tc._DC_PINNED_VERSION}",
     ]
 
@@ -3438,11 +3476,16 @@ def test_dc_default_command_uses_pinned_version():
     )
 
 
-def test_dc_default_command_windows_wrapped(monkeypatch):
+def test_dc_default_command_windows_not_wrapped(monkeypatch):
+    # 83bd7f21 -- no longer cmd/c-wrapped on Windows (see the sibling
+    # test_dc_default_command_wraps_cmd_on_windows for the full rationale):
+    # the extra nested cmd.exe layer was found live to break mcp-proxy's
+    # tools/list readiness probe. _build_proxy_for_inner's shared npx.cmd
+    # resolution + --shell now handles this uniformly for all slots.
     monkeypatch.setattr(tc.sys, "platform", "win32")
     cmd = tc._dc_default_command()
-    assert cmd[0] == "cmd"
-    assert "/c" in cmd
+    assert cmd[0] == "npx"
+    assert "cmd" not in cmd
     assert tc._DC_PINNED_VERSION in " ".join(cmd)
     assert "@latest" not in " ".join(cmd)
 

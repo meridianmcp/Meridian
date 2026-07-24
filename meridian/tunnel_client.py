@@ -2454,14 +2454,21 @@ def _kill_stale_port_occupant(port: int, label: str, current_client_id: str = ""
 
 
 def _dc_default_command() -> list[str]:
-    """Default Desktop Commander launcher, shell-wrapped per OS.
+    """Default Desktop Commander launcher.
 
-    DC ships only as an npm package, so the launcher is
-    ``npx -y @wonderwhy-er/desktop-commander@<pinned>``. On Windows ``npx`` is the
-    extension-less shim: spawned directly by mcp-proxy (no ``--shell``, since the
-    first token isn't a ``.cmd``/``.bat`` path) it raises ``ENOENT`` and the
-    watchdog spin-loops. Wrapping in ``cmd /c`` makes mcp-proxy spawn the real
-    ``cmd.exe``, which resolves ``npx`` via ``PATHEXT``. POSIX needs no wrapper.
+    83bd7f21 -- REVISED: no longer cmd/c-wrapped. The original cmd/c wrapping
+    (below, historical) was added to dodge bare-npx ENOENT on Windows, but was
+    found live to cause a DIFFERENT, worse failure: mcp-proxy's tools/list
+    readiness probe persistently times out even though the inner server starts
+    correctly and fast -- confirmed via the inner process's own log (~12ms
+    startup, full success, on every attempt) while mcp-proxy never sees the
+    response. Root cause: stdio piped through an EXTRA nested cmd.exe layer
+    (mcp-proxy -> cmd.exe -> npx -> node.exe) is unreliable on Windows.
+    _build_proxy_for_inner already resolves a literal "npx" first token
+    directly to the real npx.cmd path (_find_npx()+_win_shell_safe_path()) and
+    adds --shell itself -- ONE process layer, not two. Bare npx here lets that
+    single shared, already-reliable mechanism handle it instead of duplicating
+    (and undermining) it with a second wrapping layer here.
 
     3db4f8d8 — pinned to a known-good version instead of ``@latest`` so that every
     cold spawn resolves the same tarball.  ``@latest`` caused every cold spawn to
@@ -2469,10 +2476,24 @@ def _dc_default_command() -> list[str]:
     AV/Defender-induced TAR_ENTRY_ERROR more likely because each new-version
     extraction hits the same write-lock window.
     """
-    base = ["npx", "-y", f"@wonderwhy-er/desktop-commander@{_DC_PINNED_VERSION}"]
-    if sys.platform == "win32":
-        return ["cmd", "/c", *base]
-    return base
+    return ["npx", "-y", f"@wonderwhy-er/desktop-commander@{_DC_PINNED_VERSION}"]
+
+
+def _debug_default_command() -> list[str]:
+    """Default mcp-debugger launcher.
+
+    Deliberately a bare ["npx", "-y", "@debugmcp/mcp-debugger"] -- NOT cmd/c-
+    wrapped like the (older) _dc_default_command pattern. _build_proxy_for_inner
+    already resolves a literal "npx" first token directly to the real npx.cmd
+    path via _find_npx()+_win_shell_safe_path() and adds --shell itself --
+    ONE process layer (mcp-proxy -> npx.cmd -> node.exe), not two (mcp-proxy ->
+    cmd.exe -> npx -> node.exe). The extra cmd/c layer was found live to cause
+    persistent tools/list readiness failures despite the inner server itself
+    starting correctly and fast (~12ms, confirmed via its own log) -- stdio
+    piping through the extra nested cmd.exe layer is unreliable on Windows.
+    Let the single shared resolution path in _build_proxy_for_inner handle it.
+    """
+    return ["npx", "-y", "@debugmcp/mcp-debugger"]
 
 
 def _office_slot_command(slot: str, plugin: "dict | None") -> "list[str] | None":
@@ -2488,6 +2509,8 @@ def _office_slot_command(slot: str, plugin: "dict | None") -> "list[str] | None"
     cmd = (plugin or {}).get("command")
     if cmd is None and slot == "dc":
         cmd = _dc_default_command()
+    if cmd is None and slot == "debug":
+        cmd = _debug_default_command()
     return cmd or None
 
 
@@ -3315,7 +3338,7 @@ def _build_proxy_for_inner(
     calls; ``--stateless`` would reset them on every POST.
     """
     if inner_cmd and inner_cmd[0] == "npx":
-        inner_cmd = [_find_npx(), *inner_cmd[1:]]
+        inner_cmd = [_win_shell_safe_path(_find_npx()), *inner_cmd[1:]]
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port), "--server", "stream"]
     if stateless:
         cmd.append("--stateless")
