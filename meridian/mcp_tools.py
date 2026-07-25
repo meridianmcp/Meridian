@@ -1475,6 +1475,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string"},
          "title": {"type": "string"},
+         "notes": {"type": "string", "description": "Optional free-form context stored on the item at creation time."},
          "group": {"type": "string", "description": "Optional objective name for grouping."},
          "human_id": {"type": "string", "description": "Optional: person this item is assigned to."},
          "depends_on": {"type": "string", "description": "Sprint item id that must complete first."},

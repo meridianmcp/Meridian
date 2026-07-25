@@ -774,6 +774,7 @@ async def add_sprint_item(
     sprint_name: str | None = None,
     prospect_bypass: bool = False,
     required_tool: str | None = None,
+    notes: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -803,6 +804,7 @@ async def add_sprint_item(
     replace_symbol_body'). NULL means ordinary executor discretion. When set,
     it is rendered as a hard directive (not a hint) in the /goal block built by
     ``handoff._build_quick_start_goal`` / ``build_item_briefing``.
+    ``notes`` is optional free-form context stored on the item at creation time.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
     is compared (word-set overlap, see ``_title_word_overlap``) against every
@@ -817,6 +819,9 @@ async def add_sprint_item(
     anyway. Finished items (done / skipped / failed / pushed) never block,
     so legitimately re-doing past work is unaffected.
     """
+    if notes is not None:
+        from meridian.secret_redaction import check_for_secrets
+        check_for_secrets(notes, context="sprint item notes")
     if failure_mode not in (None, "continue", "stop"):
         raise ValueError("failure_mode must be 'continue' or 'stop'")
     if milestone_type not in ("task", "milestone", "human"):
@@ -875,12 +880,12 @@ async def add_sprint_item(
     )
     await db.execute(
         "INSERT INTO sprint_items "
-        "(id, project_id, version, title, item_group, human_id, depends_on, "
+        "(id, project_id, version, title, notes, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
         "deferred_until, track, priority, blocker_kind, wave, sprint_name, "
         "prospect_bypass, required_tool) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (iid, project_id, version, title, group, human_id,
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (iid, project_id, version, title, notes, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
          priority, blocker_kind or None, wave or None, sprint_name or None,
