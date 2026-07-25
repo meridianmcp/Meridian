@@ -825,6 +825,13 @@ async def _probe_slot_health(
     answers with an HTTP 2xx (it is alive and serving MCP). Retries up to
     *attempts* times with *delay* seconds between tries — a proxy can accept the
     Popen but still be binding its port for a second or two. (d71ba2e7)
+
+    Persistent ``mcp-proxy`` servers require an MCP session before ``tools/list``.
+    Their response to the original sessionless probe is HTTP 400 even when the
+    inner server is healthy, which made persistent slots (notably ``debug``)
+    get suppressed after every successful Windows spawn. On that response,
+    perform the normal initialize/initialized/tools-list handshake and close the
+    diagnostic session afterward. (ab956c80)
     """
     import httpx
 
@@ -836,9 +843,51 @@ async def _probe_slot_health(
     for attempt in range(max(1, attempts)):
         try:
             async with httpx.AsyncClient(timeout=10.0) as c:
-                r = await c.post(
-                    f"http://127.0.0.1:{port}/mcp", json=payload, headers=headers
-                )
+                url = f"http://127.0.0.1:{port}/mcp"
+                r = await c.post(url, json=payload, headers=headers)
+                if r.status_code == 400:
+                    init = await c.post(
+                        url,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": "preflight-init",
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {},
+                                "clientInfo": {
+                                    "name": "meridian-tunnel-health",
+                                    "version": "1",
+                                },
+                            },
+                        },
+                        headers=headers,
+                    )
+                    session_id = init.headers.get("mcp-session-id")
+                    if init.status_code < 400 and session_id:
+                        session_headers = {
+                            **headers,
+                            "Mcp-Session-Id": session_id,
+                        }
+                        try:
+                            notified = await c.post(
+                                url,
+                                json={
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/initialized",
+                                    "params": {},
+                                },
+                                headers=session_headers,
+                            )
+                            if notified.status_code < 400:
+                                r = await c.post(
+                                    url, json=payload, headers=session_headers
+                                )
+                        finally:
+                            try:
+                                await c.delete(url, headers=session_headers)
+                            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                                pass
             if r.status_code < 400:
                 return True
         except Exception:  # noqa: BLE001 — connection refused / not up yet
