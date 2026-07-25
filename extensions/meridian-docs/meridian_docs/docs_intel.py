@@ -37,6 +37,7 @@ synthetic in-memory .docx (see tests/test_docs_intel.py).
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -1246,6 +1247,215 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
 
     with open(dest, "wb") as fh:
         fh.write(out.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# 9907df44 — mandatory post-write verification for move_section /
+# copy_section / relocate_table.
+#
+# All three primitives above cut/copy live elements, splice them into a new
+# body position, then trust their OWN in-memory bookkeeping (moved_block_count
+# / copied_block_count / row_count / col_count) to build the success payload
+# -- nothing re-reads the file that was just written to confirm the mutation
+# actually landed. A real incident: two consecutive live calls both reported
+# `status="moved"` with a `moved_block_count` that didn't even match the
+# expected block count, while the on-disk document was byte-identical before
+# and after (paragraph/heading counts unchanged) -- a stale/buggy write path
+# silently no-op'd and the tool reported false success anyway.
+#
+# The fix mirrors the discipline the existing PRE-write safety checks already
+# use (e87b8338: abort cleanly, file untouched, real error) but for the
+# POST-write side: after `_save_docx_xml_stdlib` returns, re-read the file
+# FRESH FROM DISK (never reuse the in-memory root that was just serialized --
+# that would just re-validate our own intent, not the actual write) and
+# compare structural counts (paragraph/heading/table/image) plus a content
+# hash of the affected range against what the operation should have produced.
+# A mismatch returns a real error instead of the success payload, and
+# best-effort restores the pre-write backup `_save_docx_xml_stdlib` already
+# wrote to `<dest>.bak` so a failed verification doesn't leave the file in an
+# inconsistent reported state.
+# ---------------------------------------------------------------------------
+
+def _structural_counts(elements: list[ET.Element]) -> dict[str, int]:
+    """Paragraph / heading / table counts found within ``elements``.
+
+    Each element is walked with :meth:`ET.Element.iter`, so nested
+    paragraphs/tables (e.g. inside a table cell, or the document body itself)
+    are counted too. Called both with ``[body]`` for a whole-document
+    baseline and with a specific moved/copied element list for the delta a
+    copy should have produced.
+    """
+    w_p = _q(_W, "p")
+    w_tbl = _q(_W, "tbl")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+
+    paragraph_count = 0
+    heading_count = 0
+    table_count = 0
+    for el in elements:
+        for p in el.iter(w_p):
+            paragraph_count += 1
+            ppr = p.find(w_pPr)
+            style = None
+            if ppr is not None:
+                ps = ppr.find(w_pStyle)
+                style = ps.get(w_val) if ps is not None else None
+            if _is_heading(style):
+                heading_count += 1
+        table_count += sum(1 for _ in el.iter(w_tbl))
+    return {
+        "paragraph_count": paragraph_count,
+        "heading_count": heading_count,
+        "table_count": table_count,
+    }
+
+
+def _hash_elements(elements: list[ET.Element]) -> str:
+    """SHA-256 hex digest of ``elements`` serialized in order.
+
+    Used to fingerprint the exact byte content of a moved/copied range so a
+    post-write re-read can confirm those SAME bytes actually landed at the
+    expected destination -- catching a false-success write that left the
+    document's structural counts unchanged (a plain no-op write is invisible
+    to count-based checks alone).
+    """
+    h = hashlib.sha256()
+    for el in elements:
+        h.update(ET.tostring(el, encoding="unicode").encode("utf-8"))
+    return h.hexdigest()
+
+
+def _docx_media_count(raw: bytes) -> int:
+    """Count ``word/media/*`` parts in the (pre- or post-write) ZIP bytes.
+
+    Stdlib stand-in for "image count via package.image_parts" (this module
+    has no python-docx dependency) -- none of move_section/copy_section/
+    relocate_table add or remove media parts (copy_section reuses shared
+    image relationships rather than duplicating the media part), so this is
+    expected to be invariant across all three operations.
+    """
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        return sum(1 for name in zf.namelist() if name.startswith("word/media/"))
+
+
+def _restore_docx_backup(dest: str) -> bool:
+    """Best-effort restore of ``dest`` from the ``.bak`` copy left by
+    :func:`_save_docx_xml_stdlib`, when post-write verification fails.
+
+    Mirrors the "file untouched" guarantee the pre-write safety checks give
+    on abort -- a failed post-write verification should not leave a
+    partially-trusted mutation on disk. Returns whether the restore
+    succeeded; a missing/failed backup is reported (not raised) so the
+    caller can surface it in the error payload rather than mask the
+    original verification failure.
+    """
+    backup = dest + ".bak"
+    if not os.path.exists(backup):
+        return False
+    try:
+        shutil.copy2(backup, dest)
+        return True
+    except OSError:
+        return False
+
+
+def _verify_docx_write(
+    docx_path: str,
+    *,
+    expected_counts: dict[str, int],
+    expected_hash: str | None = None,
+    expected_range: tuple[int, int] | None = None,
+    locate_by_paraid: str | None = None,
+    expected_len: int = 1,
+) -> dict[str, Any] | None:
+    """Mandatory post-write verification (9907df44). Returns ``None`` when the
+    on-disk document matches expectations, or an error dict when it doesn't.
+
+    Re-reads ``docx_path`` FRESH FROM DISK -- a stale/buggy build that
+    fabricates a success payload without actually mutating the file, or a
+    write that silently no-ops, is caught here instead of trusted.
+
+    The destination range to hash-check is located either by fixed body
+    index (``expected_range`` -- used by move_section/relocate_table, whose
+    insertion index is known exactly) or by searching for a native
+    ``w14:paraId`` (``locate_by_paraid`` -- used by copy_section, whose final
+    position can shift again if the caller also trims the original section
+    after inserting the copy).
+    """
+    try:
+        raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    actual_counts = _structural_counts([body2])
+    actual_counts["image_count"] = _docx_media_count(raw2)
+
+    count_mismatches = {
+        key: {"expected": expected, "actual": actual_counts.get(key)}
+        for key, expected in expected_counts.items()
+        if actual_counts.get(key) != expected
+    }
+
+    hash_mismatch: dict[str, str] | None = None
+    position_error: str | None = None
+    if expected_hash is not None:
+        body2_list = list(body2)
+        start_idx: int | None = None
+        end_idx: int | None = None
+        if locate_by_paraid is not None:
+            w14_paraId = _q(_W14, "paraId")
+            start_idx = next(
+                (
+                    i
+                    for i, el in enumerate(body2_list)
+                    if el.get(w14_paraId) == locate_by_paraid
+                ),
+                None,
+            )
+            if start_idx is None:
+                position_error = (
+                    f"expected paraId {locate_by_paraid!r} not found anywhere "
+                    f"in {docx_path} after the write"
+                )
+            else:
+                end_idx = start_idx + expected_len
+        elif expected_range is not None:
+            start_idx, end_idx = expected_range
+
+        if start_idx is not None and end_idx is not None:
+            actual_slice = body2_list[start_idx:end_idx]
+            actual_hash = _hash_elements(actual_slice)
+            if actual_hash != expected_hash:
+                hash_mismatch = {"expected": expected_hash, "actual": actual_hash}
+
+    if count_mismatches or hash_mismatch or position_error:
+        return {
+            "error": (
+                "post-write verification failed: the on-disk document does "
+                "not match the expected result of this write -- returning "
+                "an error instead of a false success payload"
+                + (f" ({position_error})" if position_error else "")
+            ),
+            "count_mismatches": count_mismatches,
+            "content_hash_mismatch": hash_mismatch,
+        }
+    return None
 
 
 def _find_para_by_id(
@@ -6252,6 +6462,14 @@ def move_section(
         falls inside the section being moved, the move would split a
         bookmark (and ``allow_bookmark_split`` is not set), or the write
         fails (file NOT mutated on error in every one of these cases).
+
+        9907df44 -- after a successful write, mandatory post-write
+        verification re-reads the file from disk and compares structural
+        counts + a content hash of the moved range against what the move
+        should have produced. On mismatch, returns ``{"error": <message>,
+        "count_mismatches": {...}, "content_hash_mismatch": {...} | None,
+        "file_restored": <bool>}`` instead of a success payload -- the file
+        is best-effort restored from the pre-write ``.bak`` backup first.
     """
     if destination_position not in ("before", "after"):
         return {
@@ -6268,6 +6486,13 @@ def move_section(
     body = root.find(_q(_W, "body"))
     if body is None:
         return {"error": "document has no body element"}
+
+    # 9907df44 -- baseline structural counts, captured BEFORE any mutation, so
+    # the post-write verification below has something real to compare the
+    # re-read-from-disk result against (a plain relocate should leave every
+    # one of these totals unchanged -- nothing is added or removed).
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
 
     bounds = _locate_section_bounds(body, section_id)
     if bounds is None:
@@ -6335,6 +6560,12 @@ def move_section(
     moved_elements = body_list[start_idx:end_idx]
     removed_count = end_idx - start_idx
 
+    # 9907df44 -- fingerprint the exact range being moved BEFORE it's cut, so
+    # post-write verification can confirm these SAME bytes actually landed at
+    # the destination (see the _verify_docx_write docstring for why a plain
+    # count comparison alone can't catch a silent no-op write here).
+    expected_hash = _hash_elements(moved_elements)
+
     for el in moved_elements:
         body.remove(el)
 
@@ -6370,6 +6601,26 @@ def move_section(
         _save_docx_xml_stdlib(raw, root, docx_path)
     except OSError as exc:
         return {"error": f"could not write {docx_path}: {exc}"}
+
+    # 9907df44 -- mandatory post-write verification: re-read docx_path FRESH
+    # FROM DISK and confirm the on-disk document actually reflects this move
+    # before trusting/reporting the write as a success. A stale/buggy write
+    # path (or one that silently no-ops) is caught here instead of producing
+    # a false "moved" success -- same abort discipline as the pre-write
+    # reference/bookmark-split checks above (real error, no misleading
+    # status), except the file has already been written, so best-effort
+    # restore it to the pre-write backup first.
+    verify_error = _verify_docx_write(
+        docx_path,
+        expected_counts=baseline_counts,
+        expected_hash=expected_hash,
+        expected_range=(insert_at, insert_at + len(moved_elements)),
+    )
+    if verify_error is not None:
+        verify_error["file_restored"] = _restore_docx_backup(docx_path)
+        verify_error["section_id"] = section_id
+        verify_error["moved_block_count"] = len(moved_elements)
+        return verify_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -6501,6 +6752,15 @@ def copy_section(
         ``trim_original_to`` was not given.
 
         ``{"error": <message>}`` on failure (file NOT mutated on error).
+
+        9907df44 -- after a successful write, mandatory post-write
+        verification re-reads the file from disk and compares structural
+        counts + a content hash of the copied range (located by its own
+        fresh ``new_heading_para_id``) against what the copy should have
+        produced. On mismatch, returns ``{"error": <message>,
+        "count_mismatches": {...}, "content_hash_mismatch": {...} | None,
+        "file_restored": <bool>}`` instead of a success payload -- the file
+        is best-effort restored from the pre-write ``.bak`` backup first.
     """
     if destination_position not in ("before", "after"):
         return {
@@ -6517,6 +6777,13 @@ def copy_section(
     body = root.find(_q(_W, "body"))
     if body is None:
         return {"error": "document has no body element"}
+
+    # 9907df44 -- baseline structural counts, captured BEFORE any mutation
+    # (see the matching comment in move_section / _verify_docx_write for why
+    # a post-write re-read needs a real baseline, not just the in-memory
+    # intent, to compare against).
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
 
     bounds = _locate_section_bounds(body, section_id)
     if bounds is None:
@@ -6639,6 +6906,18 @@ def copy_section(
         copied_elements[0].get(w14_paraId) if copied_elements[0].tag == w_p else None
     )
 
+    # 9907df44 -- fingerprint the finalized copy (fresh paraIds/bookmark names
+    # and repointed REF fields already applied by Pass 1/2 above) and derive
+    # the total structural counts the write SHOULD produce, so post-write
+    # verification can compare the on-disk result against real expectations
+    # instead of trusting copied_block_count blindly.
+    expected_hash = _hash_elements(copied_elements)
+    copied_counts = _structural_counts(copied_elements)
+    expected_counts = {
+        key: baseline_counts[key] + copied_counts[key] for key in copied_counts
+    }
+    expected_counts["image_count"] = baseline_counts["image_count"]
+
     # 48daaf66 -- same "after this section" resolution as move_section
     # (027b7ada): a heading anchor + "after" lands after that heading's WHOLE
     # section, not a literal next-body-child splice.
@@ -6665,6 +6944,13 @@ def copy_section(
         trim_end = end_idx + shift
         body_list_now = list(body)
         to_remove = body_list_now[trim_start:trim_end]
+        # 9907df44 -- adjust expected counts for the trim: whatever's removed
+        # here no longer counts toward the post-write total, and a truthy
+        # trim_original_to adds back exactly one (non-heading, non-table)
+        # placeholder paragraph.
+        removed_counts = _structural_counts(to_remove)
+        for key in copied_counts:
+            expected_counts[key] -= removed_counts[key]
         for el in to_remove:
             body.remove(el)
         if trim_original_to:
@@ -6675,12 +6961,35 @@ def copy_section(
             t.text = trim_original_to
             placeholder.set(w14_paraId, _new_para_id(taken_ids))
             body.insert(trim_start, placeholder)
+            expected_counts["paragraph_count"] += 1
         trimmed = True
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
     except OSError as exc:
         return {"error": f"could not write {docx_path}: {exc}"}
+
+    # 9907df44 -- mandatory post-write verification: re-read docx_path FRESH
+    # FROM DISK and confirm the copy actually landed before trusting/
+    # reporting success. The copy is located by its own fresh
+    # new_heading_para_id rather than a fixed body index, since a subsequent
+    # trim of the original section can itself shift indices -- searching by
+    # paraId sidesteps needing to re-derive that arithmetic here too. Same
+    # abort discipline as the pre-write checks above (real error, no
+    # misleading status), except the file has already been written, so
+    # best-effort restore it to the pre-write backup first.
+    verify_error = _verify_docx_write(
+        docx_path,
+        expected_counts=expected_counts,
+        expected_hash=expected_hash if new_heading_para_id is not None else None,
+        locate_by_paraid=new_heading_para_id,
+        expected_len=len(copied_elements),
+    )
+    if verify_error is not None:
+        verify_error["file_restored"] = _restore_docx_backup(docx_path)
+        verify_error["section_id"] = section_id
+        verify_error["copied_block_count"] = len(copied_elements)
+        return verify_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -6802,6 +7111,14 @@ def relocate_table(
         resolved, the destination falls on/inside the table being moved, or
         the move would split a bookmark (and ``allow_bookmark_split`` is not
         set) -- the file is NOT mutated in any of these cases.
+
+        9907df44 -- after a successful write, mandatory post-write
+        verification re-reads the file from disk and compares structural
+        counts + a content hash of the relocated table against what the move
+        should have produced. On mismatch, returns ``{"error": <message>,
+        "count_mismatches": {...}, "content_hash_mismatch": {...} | None,
+        "file_restored": <bool>}`` instead of a success payload -- the file
+        is best-effort restored from the pre-write ``.bak`` backup first.
     """
     if destination_position not in ("before", "after"):
         return {
@@ -6818,6 +7135,13 @@ def relocate_table(
     body = root.find(_q(_W, "body"))
     if body is None:
         return {"error": "document has no body element"}
+
+    # 9907df44 -- baseline structural counts, captured BEFORE any mutation
+    # (see the matching comment in move_section / _verify_docx_write): a bare
+    # table relocate never adds/removes a paragraph, heading, table, or media
+    # part, so these totals must be identical after the write.
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
 
     body_list = list(body)
     w_tbl = _q(_W, "tbl")
@@ -6886,6 +7210,11 @@ def relocate_table(
 
     table_meta = _table_node(target_el, table_index)
 
+    # 9907df44 -- fingerprint the exact <w:tbl> being relocated BEFORE it's
+    # cut, so post-write verification can confirm this SAME table (verbatim
+    # w:tblPr/w:tblGrid/cell content) actually landed at the destination.
+    expected_hash = _hash_elements([target_el])
+
     start_idx = table_index
     end_idx = table_index + 1
     removed_count = 1
@@ -6919,6 +7248,23 @@ def relocate_table(
         _save_docx_xml_stdlib(raw, root, docx_path)
     except OSError as exc:
         return {"error": f"could not write {docx_path}: {exc}"}
+
+    # 9907df44 -- mandatory post-write verification: re-read docx_path FRESH
+    # FROM DISK and confirm the table actually landed at insert_at before
+    # trusting/reporting the move as a success. Same abort discipline as the
+    # pre-write bookmark-split check above (real error, no misleading
+    # status), except the file has already been written, so best-effort
+    # restore it to the pre-write backup first.
+    verify_error = _verify_docx_write(
+        docx_path,
+        expected_counts=baseline_counts,
+        expected_hash=expected_hash,
+        expected_range=(insert_at, insert_at + 1),
+    )
+    if verify_error is not None:
+        verify_error["file_restored"] = _restore_docx_backup(docx_path)
+        verify_error["table_index"] = table_index
+        return verify_error
 
     _invalidate_sidecar_mtime(index_db_path)
 

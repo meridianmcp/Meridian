@@ -1280,3 +1280,76 @@ def test_move_section_after_synth_id_heading_anchor_does_not_swallow_dest_sectio
     conclusion = docs_intel.get_section_content(path, conclusion_synth_id)
     conclusion_texts = [b["text"] for b in conclusion["blocks"] if b["kind"] == "paragraph"]
     assert conclusion_texts == ["Conclusion body paragraph, no native id at all."]
+
+
+# ---------------------------------------------------------------------------
+# 9907df44 -- mandatory post-write verification catches a false "success"
+#
+# Real incident: two consecutive live move_section calls both reported
+# status="moved" with a wrong moved_block_count, while the on-disk .docx was
+# byte-identical before and after (a silently no-op'd write). These tests
+# reproduce that exact shape -- stub _save_docx_xml_stdlib to no-op -- and
+# assert the tool now returns an error instead of trusting its own claimed
+# counts/status.
+# ---------------------------------------------------------------------------
+
+def test_move_section_post_write_verification_catches_silent_noop_write(tmp_path, monkeypatch):
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    with open(path, "rb") as fh:
+        original_bytes = fh.read()
+
+    monkeypatch.setattr(docs_intel, "_save_docx_xml_stdlib", lambda raw, root, dest: None)
+
+    result = docs_intel.move_section(path, "H0000002", "H0000001", destination_position="before")
+
+    assert "error" in result
+    assert result.get("status") != "moved"
+    assert result["content_hash_mismatch"] is not None
+
+    with open(path, "rb") as fh:
+        assert fh.read() == original_bytes, (
+            "a verification-failed move must not leave the file mutated"
+        )
+
+
+def test_copy_section_post_write_verification_catches_silent_noop_write(tmp_path, monkeypatch):
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    with open(path, "rb") as fh:
+        original_bytes = fh.read()
+
+    monkeypatch.setattr(docs_intel, "_save_docx_xml_stdlib", lambda raw, root, dest: None)
+
+    result = docs_intel.copy_section(path, "H0000002", "H0000001", destination_position="before")
+
+    assert "error" in result
+    assert result.get("status") != "copied"
+    # copy_section locates its verification range by the fresh copy's own
+    # paraId, which -- on a genuine no-op write -- was never actually
+    # written to disk at all, so the hash check can't even run; the
+    # structural count check (paragraph/heading counts stayed at their
+    # pre-copy totals instead of growing by the copied section) is what
+    # catches this case.
+    assert result["count_mismatches"], f"expected count mismatches, got: {result}"
+    assert "not found" in result["error"]
+
+    with open(path, "rb") as fh:
+        assert fh.read() == original_bytes, (
+            "a verification-failed copy must not leave the file mutated"
+        )
+
+
+def test_move_section_post_write_verification_passes_on_genuine_move(tmp_path):
+    """Control: a real (non-stubbed) move must NOT trip the new verification
+    -- guards against the fix itself becoming a false positive."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    result = docs_intel.move_section(path, "H0000002", "H0000001", destination_position="before")
+    assert "error" not in result, f"genuine move flagged as false success: {result}"
+    assert result["status"] == "moved"
+
+
+def test_copy_section_post_write_verification_passes_on_genuine_copy(tmp_path):
+    """Control: a real (non-stubbed) copy must NOT trip the new verification."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    result = docs_intel.copy_section(path, "H0000002", "H0000001", destination_position="before")
+    assert "error" not in result, f"genuine copy flagged as false success: {result}"
+    assert result["status"] == "copied"

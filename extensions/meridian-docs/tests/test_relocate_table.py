@@ -427,3 +427,40 @@ def test_relocate_table_allow_bookmark_split_override(tmp_path):
 def test_relocate_table_missing_file_errors():
     result = docs_intel.relocate_table("C:/nonexistent/path/doc.docx", 0, "P1")
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# 9907df44 -- mandatory post-write verification catches a false "success"
+#
+# Same real incident move_section/copy_section were fixed for: a write that
+# silently no-ops must not be reported as status="moved". Stub
+# _save_docx_xml_stdlib to no-op and assert relocate_table now returns an
+# error instead of trusting its own claimed row_count/col_count/status.
+# ---------------------------------------------------------------------------
+
+def test_relocate_table_post_write_verification_catches_silent_noop_write(tmp_path, monkeypatch):
+    path = _write_docx(tmp_path, _SIMPLE_TABLE_DOC_XML)
+    with open(path, "rb") as fh:
+        original_bytes = fh.read()
+
+    monkeypatch.setattr(docs_intel, "_save_docx_xml_stdlib", lambda raw, root, dest: None)
+
+    result = docs_intel.relocate_table(path, 1, "P0000003", destination_position="after")
+
+    assert "error" in result
+    assert result.get("status") != "moved"
+    assert result["content_hash_mismatch"] is not None
+
+    with open(path, "rb") as fh:
+        assert fh.read() == original_bytes, (
+            "a verification-failed relocate must not leave the file mutated"
+        )
+
+
+def test_relocate_table_post_write_verification_passes_on_genuine_move(tmp_path):
+    """Control: a real (non-stubbed) relocate must NOT trip the new
+    verification -- guards against the fix itself becoming a false positive."""
+    path = _write_docx(tmp_path, _SIMPLE_TABLE_DOC_XML)
+    result = docs_intel.relocate_table(path, 1, "P0000003", destination_position="after")
+    assert "error" not in result, f"genuine relocate flagged as false success: {result}"
+    assert result["status"] == "moved"
