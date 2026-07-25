@@ -382,8 +382,10 @@ async def get_workspace_proposals(
     status: str | None = None,
     tag: str | None = None,
     tenant_id: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """Return workspace proposals, newest first.
+    """Return a bounded page of workspace proposals, newest first.
 
     Optional filters: ``status`` (raw/investigating/promoted/rejected) and
     ``tag`` (substring match). Scoped to ``tenant_id`` when provided.
@@ -392,7 +394,12 @@ async def get_workspace_proposals(
     investigating) — terminal proposals (promoted/rejected) are excluded so
     the default view reflects what's actually still open. Pass
     ``status="all"`` to fetch every status, or an explicit status value to
-    filter to just that one (including "promoted"/"rejected")."""
+    filter to just that one (including "promoted"/"rejected").
+
+    ``limit`` defaults to 20 and is clamped to 1..100 so proposal bodies cannot
+    produce an unbounded MCP response. ``offset`` is a zero-based page cursor
+    and is clamped to zero or greater. Both parameters follow ``tenant_id`` to
+    preserve the existing positional calling convention."""
     clauses: list[str] = []
     params: list[Any] = []
     if status and status != "all":
@@ -410,9 +417,13 @@ async def get_workspace_proposals(
         clauses.append(scope)
         params.extend(scope_params)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
+    params.extend((limit, offset))
     async with db.execute(
-        f"SELECT * FROM workspace_proposals{where} ORDER BY created_at DESC",
-        params or None,
+        f"SELECT * FROM workspace_proposals{where} "
+        "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        params,
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
