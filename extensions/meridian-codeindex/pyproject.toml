@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meridian-codeindex"
+description = "Standalone local BM25 code index -- tree-sitter/ast semantic chunking, Merkle-incremental reindex, and DuckDB FTS hybrid search over a source tree. Extracted from Meridian (2b2433ca); runs with zero Meridian involvement -- a real independent tool usable as a library or a CLI, the same relationship Meridian has with codebase-memory-mcp."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Adam Camerer" }]
+keywords = ["bm25", "code-search", "fts", "duckdb", "tree-sitter", "merkle", "cli", "grep"]
+version = "0.1.0"
+dependencies = [
+    # DuckDB backs both the chunk store and the BM25 FTS index (PRAGMA
+    # create_fts_index) -- the one hard runtime dependency. Everything else
+    # below is optional / lazily imported and degrades gracefully when absent.
+    "duckdb>=1.0",
+]
+
+[project.optional-dependencies]
+# TypeScript/JavaScript semantic chunking (Python chunking uses stdlib ast,
+# no third-party dependency at all). Without this extra, .ts/.js/.tsx files
+# still get indexed -- as a single whole-file "module" chunk instead of
+# function/class/method-level chunks.
+treesitter = [
+    "tree-sitter>=0.21",
+    "tree-sitter-javascript>=0.21",
+    "tree-sitter-typescript>=0.21",
+]
+# Optional local embedding leg for hybrid BM25+vector search (Reciprocal Rank
+# Fusion). OFF by default -- set MERIDIAN_CODE_INDEX_VECTORS=1 to enable, and
+# only then does this ever import model2vec/numpy or load a model.
+vectors = [
+    "model2vec>=0.3",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+meridian-codeindex = "meridian_codeindex.cli:main"
+
+[project.urls]
+Homepage = "https://usemeridian.us"
+Source = "https://github.com/meridianmcp/meridian"
+
+[tool.hatch.build.targets.wheel]
+packages = ["meridian_codeindex"]

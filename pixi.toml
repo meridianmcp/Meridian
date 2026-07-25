@@ -39,6 +39,13 @@ watchdog = ">=4.0"
 # Editable path install so `import docparse` resolves for the app + test suite while
 # the code lives standalone in packages/docparse/ (pip install -e ./packages/docparse).
 meridian-docparse = { path = "packages/docparse", editable = true }
+# 2b2433ca -- CodeIndex (BM25 local code search) extracted into its own
+# standalone, zero-Meridian-dependency package. Editable path install so
+# `import meridian_codeindex` resolves for the app + test suite while the code
+# lives standalone in extensions/meridian-codeindex/ (pip install -e
+# ./extensions/meridian-codeindex). meridian/code_index.py is now a thin
+# compatibility shim over this package (same pattern as docs_intel.py above).
+meridian-codeindex = { path = "extensions/meridian-codeindex", editable = true }
 # 52cbe5d8 -- extensions/meridian-outputs declares tantivy/xxhash as real,
 # non-optional runtime deps (see its own pyproject.toml), but its tests import
 # the module straight off sys.path (no pip install of that package), so
