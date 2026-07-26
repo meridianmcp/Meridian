@@ -68,9 +68,9 @@ jobs:
       # consistently land above the pre-change range.
       # test_rate_limit_serial.py excluded here and run separately below — its
       # moving-window rate-limit tests depend on real wall-clock deltas between
-      # their own requests, which -n auto's parallel + --cov load can stretch
+      # their own requests, which -n 3's parallel + --cov load can stretch
       # past the window (see that file's module docstring).
-      - run: pixi run python -m pytest tests/ -n auto --dist=worksteal -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py --timeout=60 --cov=meridian --cov-config=.coveragerc
+      - run: pixi run python -m pytest tests/ -n 3 --dist=worksteal -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py --timeout=60 --cov=meridian --cov-config=.coveragerc
       - run: pixi run python -m pytest tests/test_rate_limit_serial.py -q --tb=short -p no:xdist --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-append --cov-report=term-missing --cov-fail-under=82
 
   test-postgres:
@@ -127,7 +127,7 @@ jobs:
       - run: pixi install
       # Postgres-backed run. No coverage gate here — test-core already enforces
       # the coverage floor on the identical suite; this job's job is backend
-      # correctness. -n auto shards across workers; each xdist worker gets its own
+      # correctness. -n 3 shards across workers; each xdist worker gets its own
       # database (meridian_test_gw0, _gw1, … — created on demand by conftest) and
       # drops/recreates the public schema per test, so workers stay fully isolated
       # even though every test rebuilds the schema.
@@ -140,7 +140,7 @@ jobs:
       # Sample size too small for a confident verdict; keeping --dist=worksteal.
       # test_rate_limit_serial.py excluded here and run separately below (same
       # reason as test-core above — see that file's module docstring).
-      - run: pixi run python -m pytest tests/ -n auto --dist=worksteal -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py --timeout=60
+      - run: pixi run python -m pytest tests/ -n 3 --dist=worksteal -q --tb=short --durations=20 --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py --timeout=60
       - run: pixi run python -m pytest tests/test_rate_limit_serial.py -q --tb=short -p no:xdist --timeout=60
 
   test-ux:
@@ -164,7 +164,7 @@ jobs:
       - name: Install Playwright Chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: pixi run python -m playwright install chromium --with-deps
-      - run: pixi run python -m pytest tests/test_demo_ux.py -n auto -q --tb=short
+      - run: pixi run python -m pytest tests/test_demo_ux.py -n 3 -q --tb=short
 
   lint:
     runs-on: ubuntu-latest

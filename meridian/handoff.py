@@ -1349,7 +1349,7 @@ def _build_quick_start_goal(
             ""
             if _completion_override is not None or _stype == "general"
             else "\n<test_gate_note>" + _xml_escape(
-            "If `pixi run test -n auto` produces an INTERNALERROR "
+            "If `pixi run test -n 3` produces an INTERNALERROR "
             "or worker crash (a line starting with 'INTERNALERROR>' rather than a "
             "normal 'FAILED tests/...' line), this is very likely a parallel-execution "
             "flake, not a regression in your code. Before concluding your change broke "
@@ -1357,7 +1357,7 @@ def _build_quick_start_goal(
             "crashed test in isolation (`pixi run python -m pytest <path>::<test> -q "
             "--timeout=60 -p no:xdist`), (3) if it passes standalone, your change is "
             "very likely fine — restore your changes (`git stash pop`) and re-run the "
-            "full suite WITHOUT -n auto (`pixi run python -m pytest tests/ -q "
+            "full suite WITHOUT -n 3 (`pixi run python -m pytest tests/ -q "
             "--timeout=60`) for a clean, honest count before deciding pass/fail."
             ) + "</test_gate_note>"
         )

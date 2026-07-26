@@ -86,7 +86,7 @@ jobs:
       - name: Run tests (fast for hotfix, full with coverage otherwise)
         run: |
           if [ "${{ inputs.hotfix }}" = "yes" ]; then
-            pixi run python -m pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_security.py -n auto -q --tb=short
+            pixi run python -m pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_security.py -n 3 -q --tb=short
           else
             pixi run test-cov
           fi
