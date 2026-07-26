@@ -399,7 +399,10 @@ async def get_workspace_proposals(
     ``limit`` defaults to 20 and is clamped to 1..100 so proposal bodies cannot
     produce an unbounded MCP response. ``offset`` is a zero-based page cursor
     and is clamped to zero or greater. Both parameters follow ``tenant_id`` to
-    preserve the existing positional calling convention."""
+    preserve the existing positional calling convention.
+
+    Same-second rows use the immutable ``created_seq`` insertion key as a
+    stable secondary sort order on both SQLite and PostgreSQL."""
     clauses: list[str] = []
     params: list[Any] = []
     if status and status != "all":
@@ -422,7 +425,7 @@ async def get_workspace_proposals(
     params.extend((limit, offset))
     async with db.execute(
         f"SELECT * FROM workspace_proposals{where} "
-        "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        "ORDER BY created_at DESC, created_seq DESC LIMIT ? OFFSET ?",
         params,
     ) as cur:
         rows = await cur.fetchall()

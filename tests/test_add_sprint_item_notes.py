@@ -29,7 +29,12 @@ async def test_add_sprint_item_persists_notes_at_creation(db):
 
 
 @pytest.mark.asyncio
-async def test_mcp_add_sprint_item_forwards_notes(db):
+async def test_mcp_add_sprint_item_forwards_notes(db, monkeypatch):
+    import json
+
+    import mcp.types as mcp_types
+    import meridian.server as server_module
+
     project = await db_module.create_project(db, "notes-mcp-regression")
 
     result = await _dispatch_mcp_tool(
@@ -50,6 +55,37 @@ async def test_mcp_add_sprint_item_forwards_notes(db):
     stored = await db_module.get_sprint_item(db, result["id"])
     assert stored is not None
     assert stored["notes"] == "Context passed through the MCP handler."
+
+    async def _return_db(*_args, **_kwargs):
+        return db
+
+    monkeypatch.setattr(db_module, "init_db", _return_db)
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.delenv("MERIDIAN_DB_URL", raising=False)
+    stdio_server, _run_stdio = server_module.build_mcp_server()
+
+    list_handler = stdio_server.request_handlers[mcp_types.ListToolsRequest]
+    listed = await list_handler(mcp_types.ListToolsRequest())
+    add_tool = next(tool for tool in listed.root.tools if tool.name == "add_sprint_item")
+    assert add_tool.inputSchema["properties"]["notes"]["type"] == "string"
+
+    call_handler = stdio_server.request_handlers[mcp_types.CallToolRequest]
+    called = await call_handler(
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="add_sprint_item",
+                arguments={
+                    "project_id": project["id"],
+                    "version": "v1",
+                    "title": "Forward stdio creation notes",
+                    "notes": "Context passed through the stdio transport.",
+                    "force": True,
+                },
+            )
+        )
+    )
+    stdio_result = json.loads(called.root.content[0].text)
+    assert stdio_result["notes"] == "Context passed through the stdio transport."
 
 
 def test_add_sprint_item_schema_exposes_notes():

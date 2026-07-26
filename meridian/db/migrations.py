@@ -2609,6 +2609,32 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_tenant "
         "ON workspace_proposals(tenant_id)"
     )
+    # abde3b36 follow-up — created_at historically has one-second precision,
+    # so multiple proposals can tie. Persist an immutable insertion sequence
+    # instead of using UUID or rowid ordering at read time. Existing rows are
+    # backfilled in SQLite insertion order; the trigger assigns monotonically
+    # increasing values to future rows.
+    await _migrate_add_column_if_missing(
+        db, "workspace_proposals", "created_seq", "INTEGER"
+    )
+    await db.execute(
+        "UPDATE workspace_proposals SET created_seq = rowid "
+        "WHERE created_seq IS NULL"
+    )
+    await db.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_workspace_proposals_created_seq
+        AFTER INSERT ON workspace_proposals
+        WHEN NEW.created_seq IS NULL
+        BEGIN
+            UPDATE workspace_proposals
+            SET created_seq = (
+                SELECT COALESCE(MAX(created_seq), 0) + 1
+                FROM workspace_proposals
+                WHERE id <> NEW.id
+            )
+            WHERE id = NEW.id;
+        END"""
+    )
     await db.commit()
 
 

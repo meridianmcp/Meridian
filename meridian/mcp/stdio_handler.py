@@ -55,8 +55,18 @@ def build_mcp_server():
     # as the HTTP /mcp surface (meridian/mcp/handler.py) so both transports
     # advertise identical prompts and bodies.
     from . import handler as _handler
+    from ..mcp_tools import _MCP_TOOLS_LIST
 
     server: Server = Server("meridian")
+
+    def _shared_tool(name: str) -> Tool:
+        """Build a stdio Tool from the canonical HTTP/MCP schema."""
+        schema = next(item for item in _MCP_TOOLS_LIST if item["name"] == name)
+        return Tool(
+            name=schema["name"],
+            description=schema["description"],
+            inputSchema=schema["inputSchema"],
+        )
 
     # Lazy holder for the DB connection — opened on first use because the
     # stdio entrypoint is sync up to the point we hit asyncio.run().
@@ -1358,6 +1368,7 @@ def build_mcp_server():
                     "required": [],
                 },
             ),
+            _shared_tool("get_workspace_proposals"),
             Tool(
                 name="pin_workspace_decision",
                 description=(
@@ -1610,63 +1621,7 @@ def build_mcp_server():
                     "required": ["project_id", "text"],
                 },
             ),
-            Tool(
-                name="add_sprint_item",
-                description=(
-                    "ALWAYS call get_sprint_items first to check for existing "
-                    "pending items before adding. "
-                    "Append a todo item to the project's machine-trackable "
-                    "sprint checklist (v1.1). Use this when you start work on "
-                    "a new version so the next session sees what's in flight. "
-                    "Optional: group items under a named objective with "
-                    "'group'; attribute the item to a person with 'human_id'. "
-                    "Use 'depends_on' to block this item until another item "
-                    "finishes; 'failure_mode=stop' stops the chain if the "
-                    "parent fails. Blocks near-duplicate titles (>=60% word "
-                    "overlap with an open pending/in_progress item) and returns "
-                    "the conflict instead of creating a duplicate; pass "
-                    "force=true to add anyway. Returns the new item."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string"},
-                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-                        "version": {"type": "string"},
-                        "title": {"type": "string"},
-                        "group": {
-                            "type": "string",
-                            "description": (
-                                "Optional objective name to group this item "
-                                "under on the sprint board."
-                            ),
-                        },
-                        "human_id": {
-                            "type": "string",
-                            "description": "Optional: person this item is assigned to.",
-                        },
-                        "depends_on": {
-                            "type": "string",
-                            "description": "Sprint item id that must complete before this item is claimable.",
-                        },
-                        "failure_mode": {
-                            "type": "string",
-                            "enum": ["continue", "stop"],
-                            "description": "'stop' blocks this item if the parent fails. Default: 'continue'.",
-                        },
-                        "milestone_type": {
-                            "type": "string",
-                            "enum": ["task", "milestone", "human"],
-                            "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions). Default: 'task'.",
-                        },
-                        "force": {
-                            "type": "boolean",
-                            "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default: false.",
-                        },
-                    },
-                    "required": ["version", "title"],
-                },
-            ),
+            _shared_tool("add_sprint_item"),
             Tool(
                 name="update_sprint_item",
                 description=(
@@ -2279,9 +2234,11 @@ def build_mcp_server():
                 "check_embedded_staleness",
                 "search_outputs",
                 "search_code_semantic",
+                "add_sprint_item",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "add_workspace_note", "get_workspace_notes",
+                "get_workspace_proposals",
                 "pin_workspace_decision", "get_workspace_decisions",
             ):
                 # v2.4/v0.9 — share dispatch with HTTP MCP so both surfaces stay in sync.
@@ -2403,19 +2360,6 @@ def build_mcp_server():
                     }
                 except ValueError as exc:
                     result = {"error": str(exc)}
-            elif name == "add_sprint_item":
-                result = await db_module.add_sprint_item(
-                    db,
-                    arguments["project_id"],
-                    arguments["version"],
-                    arguments["title"],
-                    group=arguments.get("group"),
-                    human_id=arguments.get("human_id"),
-                    depends_on=arguments.get("depends_on"),
-                    failure_mode=arguments.get("failure_mode"),
-                    milestone_type=arguments.get("milestone_type", "task"),
-                    force=bool(arguments.get("force", False)),
-                )
             elif name == "update_sprint_item":
                 item = await db_module.patch_sprint_item(
                     db,

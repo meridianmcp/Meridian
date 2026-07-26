@@ -59,6 +59,27 @@ async def test_get_workspace_proposals_is_bounded_and_pages_newest_first(db):
     clamped = await db_module.get_workspace_proposals(db, limit=0, offset=-8)
     assert [row["title"] for row in clamped] == ["proposal-104"]
 
+    for index in range(3):
+        tied = await db_module.add_workspace_proposal(
+            db,
+            f"same-second-{index}",
+            f"same-second-body-{index}",
+        )
+        await db.execute(
+            "UPDATE workspace_proposals SET created_at = ? WHERE id = ?",
+            ("2030-01-01 00:00:00", tied["id"]),
+        )
+
+    tied_first = await db_module.get_workspace_proposals(db, limit=2)
+    tied_second = await db_module.get_workspace_proposals(db, limit=2, offset=2)
+    assert [row["title"] for row in tied_first] == [
+        "same-second-2",
+        "same-second-1",
+    ]
+    assert tied_second[0]["title"] == "same-second-0"
+    tied_ids = [row["id"] for row in tied_first + tied_second[:1]]
+    assert len(tied_ids) == len(set(tied_ids)) == 3
+
 
 @pytest.mark.asyncio
 async def test_get_workspace_proposals_keeps_positional_filters_compatible(db):
@@ -74,7 +95,15 @@ async def test_get_workspace_proposals_keeps_positional_filters_compatible(db):
 
 
 @pytest.mark.asyncio
-async def test_get_workspace_proposals_handler_forwards_limit_and_offset(db):
+async def test_get_workspace_proposals_handler_forwards_limit_and_offset(
+    db,
+    monkeypatch,
+):
+    import json
+
+    import mcp.types as mcp_types
+    import meridian.server as server_module
+
     await _seed_proposals(db, 10, tenant_id="tenant-page")
 
     page = await notes_decisions_handler.handle_get_workspace_proposals(
@@ -91,6 +120,43 @@ async def test_get_workspace_proposals_handler_forwards_limit_and_offset(db):
         "proposal-4",
         "proposal-3",
     ]
+
+    await _seed_proposals(db, 6)
+
+    async def _return_db(*_args, **_kwargs):
+        return db
+
+    monkeypatch.setattr(db_module, "init_db", _return_db)
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.delenv("MERIDIAN_DB_URL", raising=False)
+    stdio_server, _run_stdio = server_module.build_mcp_server()
+
+    list_handler = stdio_server.request_handlers[mcp_types.ListToolsRequest]
+    listed = await list_handler(mcp_types.ListToolsRequest())
+    proposal_tool = next(
+        tool for tool in listed.root.tools
+        if tool.name == "get_workspace_proposals"
+    )
+    assert proposal_tool.inputSchema["properties"]["limit"]["maximum"] == 100
+    assert proposal_tool.inputSchema["properties"]["offset"]["minimum"] == 0
+
+    call_handler = stdio_server.request_handlers[mcp_types.CallToolRequest]
+    called = await call_handler(
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="get_workspace_proposals",
+                arguments={"status": "raw", "limit": 2, "offset": 1},
+            )
+        )
+    )
+    stdio_page = json.loads(called.root.content[0].text)
+    expected = await db_module.get_workspace_proposals(
+        db,
+        status="raw",
+        limit=2,
+        offset=1,
+    )
+    assert [row["id"] for row in stdio_page] == [row["id"] for row in expected]
 
 
 def test_get_workspace_proposals_schema_exposes_bounded_pagination():
