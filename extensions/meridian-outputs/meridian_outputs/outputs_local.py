@@ -396,7 +396,10 @@ class _ResumableFileWalk:
     # that SEPARATELY via its own `_WRITE_CHUNK_DEFAULT`/`_resolve_write_
     # chunk`, specifically so bumping this default doesn't silently turn
     # every DB write into one giant, unchunked SQL statement.
-    _MAX_BATCH = 1_000_000_000
+    # Keep discovery from outrunning analysis/write by hundreds of thousands
+    # of paths on a large root.  This remains an explicit constructor/env
+    # override; the default is a bounded fairness window for resumable scans.
+    _MAX_BATCH = 4_096
     _MAX_BATCH_ENV_VAR = "MERIDIAN_OUTPUTS_MAX_BATCH"
 
     @classmethod
@@ -866,8 +869,14 @@ def file_fingerprint(path: str) -> FileFingerprint:
                            json_keys=keys, generating_script=script)
 
 
-def _content_for_fts(path: str, fingerprint: FileFingerprint) -> str:
-    """The text body for the FTS content column."""
+def _content_for_fts(
+    path: str, fingerprint: FileFingerprint, *, body: str | None = None,
+) -> str:
+    """The text body for the FTS content column.
+
+    ``body`` is supplied by the single-read analysis fast path when available;
+    otherwise this helper preserves the existing on-demand read behavior.
+    """
     terms: list[str] = [os.path.basename(path)]
     if fingerprint.csv_columns:
         terms.extend(fingerprint.csv_columns)
@@ -878,10 +887,11 @@ def _content_for_fts(path: str, fingerprint: FileFingerprint) -> str:
     header = " ".join(terms)
     if fingerprint.kind != "text_content":
         return header
-    try:
-        body = _read_text_capped(path)
-    except OSError:
-        body = ""
+    if body is None:
+        try:
+            body = _read_text_capped(path)
+        except OSError:
+            body = ""
     return f"{header}\n{body}"
 
 
@@ -1065,10 +1075,15 @@ class _FileAnalysis:
     mtime: float | None
     size: int | None
     sha256: str | None
+    # Content extracted from the same read used for hashing/fingerprinting.
+    # Kept only for the current bounded rebuild batch; the long-lived cache
+    # still evicts it after persistence.
+    content: str | None = None
 
 
 def _analyse_file(
     path: str, hasher: Callable[[str], str | None], *, needs_hash: bool = True,
+    stat_signature: tuple[float | None, int | None] | None = None,
 ) -> "_FileAnalysis":
     """Read-only per-file analysis: stat + fingerprint + hash.
 
@@ -1100,23 +1115,32 @@ def _analyse_file(
     size-count map built once per rebuild() call, not from anything in
     this function -- it stays a pure per-path decision here.
     """
+    captured_mtime, captured_size = (
+        stat_signature if stat_signature is not None else (None, None)
+    )
     if not needs_hash:
         fp = file_fingerprint(path)
-        try:
-            st = os.stat(path)
-            size: int | None = st.st_size
-            mtime: float | None = st.st_mtime
-        except OSError:
-            size = mtime = None
+        if stat_signature is not None:
+            size, mtime = captured_size, captured_mtime
+        else:
+            try:
+                st = os.stat(path)
+                size = st.st_size
+                mtime = st.st_mtime
+            except OSError:
+                size = mtime = None
         return _FileAnalysis(path=path, fingerprint=fp, mtime=mtime,
                               size=size, sha256=None)
 
-    try:
-        st = os.stat(path)
-        size: int | None = st.st_size
-        mtime: float | None = st.st_mtime
-    except OSError:
-        size = mtime = None
+    if stat_signature is not None:
+        size, mtime = captured_size, captured_mtime
+    else:
+        try:
+            st = os.stat(path)
+            size = st.st_size
+            mtime = st.st_mtime
+        except OSError:
+            size = mtime = None
 
     if hasher is _sha256_file or hasher is _xxh3_file:
         try:
@@ -1144,6 +1168,7 @@ def _analyse_file(
             kind = _classify_suffix(path)
             if kind != "text_content":
                 fp = FileFingerprint(path=path, kind=kind)
+                fts_content = _content_for_fts(path, fp)
             else:
                 # Match _read_text_capped's exact semantics (up to
                 # _MAX_CONTENT_CHARS characters). Over-read bytes (4/char
@@ -1162,8 +1187,9 @@ def _analyse_file(
                     keys, script = _extract_json(text)
                     fp = FileFingerprint(path=path, kind=kind,
                                          json_keys=keys, generating_script=script)
+                fts_content = _content_for_fts(path, fp, body=text)
             return _FileAnalysis(path=path, fingerprint=fp, mtime=mtime,
-                                  size=size, sha256=sha)
+                                  size=size, sha256=sha, content=fts_content)
 
     # Fallback: OSError on the single read, or a non-default hasher injected
     # (tests, or a future custom hasher) -- original two-read path, unchanged.
@@ -1190,13 +1216,23 @@ _HASH_ALGO_VERSION = 2
 # ---------------------------------------------------------------------------
 # acac2599 -- configurable Phase-1 ThreadPoolExecutor worker cap
 # ---------------------------------------------------------------------------
-# a849e3d5 -- was a flat hardcoded 8 regardless of machine size. Empirically
-# confirmed on a real 16-core test machine (os.cpu_count()=16) across a real
-# 16,000-file batch: 8 workers = 8.969s, 16 workers = 5.890s (best), 32
-# workers = 6.344s (worse than 16) -- os.cpu_count() landed exactly on the
-# empirically-best value, not just a reasonable-sounding guess.
+# a849e3d5 -- was a flat hardcoded 8 regardless of machine size. The default
+# follows physical cores (not logical threads): filesystem-heavy analysis does
+# not benefit from one worker per hyperthread. Explicit/env overrides remain.
 _HARDCODED_MAX_WORKERS_FALLBACK = 8
 _MAX_WORKERS_ENV_VAR = "MERIDIAN_OUTPUTS_MAX_WORKERS"
+
+
+def _physical_core_count() -> int:
+    """Return physical cores when available, falling back safely."""
+    try:
+        import psutil  # noqa: PLC0415
+        physical = psutil.cpu_count(logical=False)
+        if physical and physical >= 1:
+            return physical
+    except (ImportError, OSError, AttributeError):
+        pass
+    return os.cpu_count() or _HARDCODED_MAX_WORKERS_FALLBACK
 
 
 def _default_max_workers() -> int:
@@ -1205,13 +1241,12 @@ def _default_max_workers() -> int:
     Checked fresh on every call (a cheap env lookup) rather than cached at
     import time, so a changed ``MERIDIAN_OUTPUTS_MAX_WORKERS`` takes effect
     on the next :class:`OutputsFtsIndex` construction without a process
-    restart. Falls back to ``os.cpu_count()`` (a849e3d5) -- or the historical
-    hardcoded 8 if ``os.cpu_count()`` itself returns ``None``, the rare
-    environment where the OS can't report a CPU count -- for anything not a
-    positive integer, logging why so a typo'd env var is diagnosable instead
-    of silently ignored.
+    restart. Falls back to physical cores via ``psutil`` (or
+    ``os.cpu_count()`` when unavailable), with the historical hardcoded 8 as
+    the final fallback. Invalid overrides are logged rather than silently
+    ignored.
     """
-    _default = os.cpu_count() or _HARDCODED_MAX_WORKERS_FALLBACK
+    _default = _physical_core_count()
     raw = os.environ.get(_MAX_WORKERS_ENV_VAR)
     if raw is None or not raw.strip():
         return _default
@@ -1241,7 +1276,7 @@ def _resolve_max_workers(explicit: int | None) -> int:
     if explicit is not None:
         if explicit >= 1:
             return explicit
-        _default = os.cpu_count() or _HARDCODED_MAX_WORKERS_FALLBACK
+        _default = _physical_core_count()
         _log.warning(
             "OutputsFtsIndex: max_workers=%r must be >= 1 -- falling back "
             "to default (%d)", explicit, _default,
@@ -1345,6 +1380,16 @@ def _is_tantivy_lock_conflict(exc: BaseException) -> bool:
 
 
 class OutputsFtsIndex:
+    # Adaptive defaults are deliberately bounded: 4k is the safety floor,
+    # while 32k was the fastest tested setting in the real SUT benchmark.
+    # 64k is reserved for machines with ample headroom and is still bounded
+    # to avoid turning a large root into one uninterruptible commit burst.
+    _ADAPTIVE_MIN_BATCH = 4_096
+    _ADAPTIVE_MAX_BATCH = 65_536
+    _ADAPTIVE_HEALTHY_AVAILABLE_BYTES = 4 * 1024**3
+    _ADAPTIVE_LOW_AVAILABLE_BYTES = 2 * 1024**3
+    _ADAPTIVE_MAX_FTS_SECONDS = 8.0
+    _ADAPTIVE_MAX_WRITE_SECONDS = 24.0
     """Persistent DuckDB FTS index over a local outputs directory.
 
     Same logic as the main-repo OutputsFtsIndex, but:
@@ -1439,6 +1484,11 @@ class OutputsFtsIndex:
         # ONLY the walk's own per-drain() cap and the walk-vs-analysis
         # throttle below; it no longer feeds the DB write-chunk size.
         self._max_batch = _ResumableFileWalk._resolve_max_batch(max_batch)
+        self._max_batch_overridden = (
+            max_batch is not None
+            or bool(os.environ.get(_ResumableFileWalk._MAX_BATCH_ENV_VAR, "").strip())
+        )
+        self._adaptive_batch = self._initial_adaptive_batch()
         # 1bce8c41 -- DB write-chunk size: explicit param > MERIDIAN_OUTPUTS_
         # WRITE_CHUNK env var > 2000 default. Deliberately resolved
         # independently of `self._max_batch` above -- see `_WRITE_CHUNK_DEFAULT`.
@@ -1486,6 +1536,11 @@ class OutputsFtsIndex:
         # from scratch, AND doubles as the signal the walk throttle (above)
         # uses to pause further discovery until Phase 1/2 catch up.
         self._pending_stale: dict[str, tuple[float | None, int | None]] = {}
+        # Planner diagnostics: phase timings and discovery coverage from the
+        # most recent rebuild.  These are intentionally lightweight and make
+        # large-root bottlenecks measurable instead of inferred from a single
+        # wall-clock duration.
+        self.last_rebuild_metrics: dict[str, Any] = {}
         # 77443d83 -- Tantivy replaces DuckDB's own FTS extension for the
         # search index; DuckDB (self._con) remains the metadata store (path,
         # content, mtime, sha256, ... -- see _COLUMNS) that resolve_output and
@@ -2019,6 +2074,49 @@ class OutputsFtsIndex:
             ingested += 1
         return ingested
 
+    def _initial_adaptive_batch(self) -> int:
+        """Choose a conservative batch from current process memory.
+
+        Explicit constructor/env values remain authoritative.  The optional
+        psutil dependency is only consulted for the adaptive default; when it
+        is unavailable we use the proven 4k floor rather than guessing.
+        """
+        if self._max_batch_overridden:
+            return self._max_batch
+        try:
+            import psutil  # noqa: PLC0415
+            vm = psutil.virtual_memory()
+            available = int(vm.available) - self._tantivy_heap_bytes
+        except (ImportError, OSError, AttributeError):
+            return self._ADAPTIVE_MIN_BATCH
+        if available < self._ADAPTIVE_LOW_AVAILABLE_BYTES:
+            return self._ADAPTIVE_MIN_BATCH
+        if available < self._ADAPTIVE_HEALTHY_AVAILABLE_BYTES:
+            return self._ADAPTIVE_MIN_BATCH * 2
+        # Even with ample memory, begin at 32k.  A cold 64k commit measured
+        # 63.9s on the real SUT tree, so 64k is only earned after a healthy
+        # 32k commit rather than paid up front on every cold index.
+        return self._ADAPTIVE_MAX_BATCH // 2
+
+    def _adaptive_batch_limit(self) -> int:
+        """Adjust the default batch using memory and prior commit pressure."""
+        if self._max_batch_overridden:
+            return self._max_batch
+        target = self._adaptive_batch
+        metrics = self.last_rebuild_metrics
+        if (
+            float(metrics.get("fts_seconds", 0) or 0) > self._ADAPTIVE_MAX_FTS_SECONDS
+            or float(metrics.get("write_seconds", 0) or 0) > self._ADAPTIVE_MAX_WRITE_SECONDS
+        ):
+            target = max(self._ADAPTIVE_MIN_BATCH, target // 2)
+        elif metrics and (
+            float(metrics.get("fts_seconds", 0) or 0) < 3.0
+            and float(metrics.get("write_seconds", 0) or 0) < 8.0
+        ):
+            target = min(self._ADAPTIVE_MAX_BATCH, target * 2)
+        self._adaptive_batch = target
+        return target
+
     def rebuild(
         self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
     ) -> int:
@@ -2054,6 +2152,8 @@ class OutputsFtsIndex:
         use ``_add_annotation_locked`` (not ``add_annotation``).  That
         invariant is preserved here.
         """
+        rebuild_started = time.monotonic()
+        self.last_rebuild_metrics = {}
         # 1a799e52 -- reset per-call; set below if Phase 2's DB write fails.
         self.last_db_write_error = None
         deadline = (None if max_seconds is None
@@ -2101,14 +2201,20 @@ class OutputsFtsIndex:
         # discovery of the REST of a small tree for an extra call for no
         # benefit, since there was never a risk of overwhelming Phase 1/2.
         newly_seen: list[str] = []
+        walk_started = time.monotonic()
+        batch_limit = self._adaptive_batch_limit()
         if os.path.isdir(self.outputs_dir):
             if self._walk_state is None:
                 self._walk_state = _ResumableFileWalk(
                     self.outputs_dir, exclude_patterns=self._exclude_patterns,
-                    max_batch=self._max_batch,
+                    max_batch=batch_limit,
                 )
                 self._walk_accumulated = []
-            if len(self._pending_stale) < self._max_batch:
+            else:
+                # The walk persists across calls; update its drain cap as the
+                # adaptive controller learns from commit pressure.
+                self._walk_state.max_batch = batch_limit
+            if len(self._pending_stale) < batch_limit:
                 newly_seen = self._walk_state.drain(phase1_deadline)
                 self._walk_accumulated.extend(newly_seen)
             walk_complete = self._walk_state.exhausted
@@ -2140,10 +2246,25 @@ class OutputsFtsIndex:
             # otherwise) so the reported row count and search index never
             # regress mid-pass. Removed-file detection is deferred until the
             # pass completes.
-            all_paths = sorted(set(self._row_cache) | set(self._walk_accumulated))
+            # During an incomplete pass, preserve the cache's insertion order
+            # and append only newly discovered paths. Sorting and rebuilding a
+            # second set here is O(n log n) work on every continuation call,
+            # even though no stale/removal decision can be made until the walk
+            # completes. Deterministic sorting remains on the completed pass.
+            all_paths = list(self._row_cache)
+            known_paths = set(all_paths)
+            all_paths.extend(p for p in self._walk_accumulated if p not in known_paths)
             removed_paths = set()
 
         path_set = set(all_paths)
+        walk_elapsed = time.monotonic() - walk_started
+        self.last_rebuild_metrics.update({
+            "walk_seconds": round(walk_elapsed, 6),
+            "discovered_this_call": len(newly_seen),
+            "discovered_total": len(all_paths),
+            "walk_complete": bool(walk_complete),
+            "pending_stale_count": len(self._pending_stale),
+        })
 
         # ------------------------------------------------------------------
         # Phase 1: read-only pre-analysis (no lock, may run in parallel)
@@ -2177,6 +2298,7 @@ class OutputsFtsIndex:
         # a 5.9 MB file) overlaps across files.  Results are collected into a
         # dict and processed in sorted order to guarantee determinism.
         precomputed: dict[str, _FileAnalysis] = {}
+        analysis_started = time.monotonic()
         if stale:
             # e1fd4182 (size-prefilter follow-up) -- build a size -> count
             # map across ALL known paths (stale files use their freshly-
@@ -2230,6 +2352,7 @@ class OutputsFtsIndex:
                 futures = {
                     pool.submit(
                         _analyse_file, p, self._hasher, needs_hash=_needs_hash(p),
+                        stat_signature=stale_sigs.get(p),
                     ): p
                     for p in stale
                 }
@@ -2254,6 +2377,10 @@ class OutputsFtsIndex:
                 else:
                     pool.shutdown(wait=True)
 
+        self.last_rebuild_metrics["analysis_seconds"] = round(
+            time.monotonic() - analysis_started, 6,
+        )
+
         # classify_canonical_archival needs all paths (not just stale ones) to
         # detect archival twins correctly.  It is read-only, so it runs here
         # before the lock.  Only computed when there are stale or removed paths
@@ -2275,6 +2402,7 @@ class OutputsFtsIndex:
         # in the meantime; the existing "update non-stale cached rows" loop
         # in _apply_precomputed corrects them once this finally runs.
         classifications: dict[str, ArchivalClassification] = {}
+        classify_started = time.monotonic()
         if walk_complete and (stale or removed_paths):
             # Reuse hashes already computed by workers where possible so
             # classify_canonical_archival doesn't read the same file twice.
@@ -2309,10 +2437,14 @@ class OutputsFtsIndex:
             classifications = classify_canonical_archival(
                 all_paths, hasher=_cached_hasher,
             )
+        self.last_rebuild_metrics["classification_seconds"] = round(
+            time.monotonic() - classify_started, 6,
+        )
 
         # ------------------------------------------------------------------
         # Phase 2: targeted write (write_lock held)
         # ------------------------------------------------------------------
+        write_started = time.monotonic()
         with self._write_lock:
             self._ingest_meridian_notes(all_paths)
             rows, changed, paths_to_delete, new_rows = (
@@ -2364,9 +2496,13 @@ class OutputsFtsIndex:
                     # default (time-primary walk convergence) can never
                     # silently turn this into one giant, unchunked write.
                     _WRITE_CHUNK = self._write_chunk
-                    if paths_to_delete:
-                        for i in range(0, len(paths_to_delete), _WRITE_CHUNK):
-                            chunk = paths_to_delete[i:i + _WRITE_CHUNK]
+                    replacement_paths = {r.path for r in new_rows}
+                    db_delete_paths = [
+                        p for p in paths_to_delete if p not in replacement_paths
+                    ]
+                    if db_delete_paths:
+                        for i in range(0, len(db_delete_paths), _WRITE_CHUNK):
+                            chunk = db_delete_paths[i:i + _WRITE_CHUNK]
                             placeholders = ",".join("?" for _ in chunk)
                             con.execute(
                                 f"DELETE FROM outputs_index WHERE path IN ({placeholders})",
@@ -2401,7 +2537,7 @@ class OutputsFtsIndex:
                             con.register("_outputs_index_bulk_insert", _arrow_table)
                             try:
                                 con.execute(
-                                    "INSERT INTO outputs_index "
+                                    "INSERT OR REPLACE INTO outputs_index "
                                     "(path, content, mtime, sha256, size, "
                                     "generating_script, kind, is_archival, "
                                     "canonical_path, csv_columns, json_keys) "
@@ -2428,7 +2564,7 @@ class OutputsFtsIndex:
                                         json.dumps(r.json_keys) if r.json_keys else None,
                                     ])
                                 con.execute(
-                                    f"INSERT INTO outputs_index VALUES {row_placeholders}",
+                                    f"INSERT OR REPLACE INTO outputs_index VALUES {row_placeholders}",
                                     flat_params,
                                 )
                     # 77443d83 -- stage this call's own delta for the next
@@ -2437,7 +2573,9 @@ class OutputsFtsIndex:
                     # actually runs -- here or lazily from search() -- it
                     # commits the full outstanding delta as one small Tantivy
                     # transaction, never a full re-index.
+                    replacement_paths = {r.path for r in new_rows}
                     self._pending_tantivy_deletes.update(paths_to_delete)
+                    self._pending_tantivy_deletes.update(replacement_paths)
                     for r in new_rows:
                         self._pending_tantivy_upserts[r.path] = r
                     # b1789c0d / d9c76caa -- _rebuild_fts() has no deadline
@@ -2483,7 +2621,11 @@ class OutputsFtsIndex:
                         # until the next call with enough remaining budget.)
                     else:
                         self._fts_pending = False
+                        fts_started = time.monotonic()
                         self._rebuild_fts(con)
+                        self.last_rebuild_metrics["fts_seconds"] = round(
+                            time.monotonic() - fts_started, 6,
+                        )
                 except Exception as _db_write_exc:  # noqa: BLE001
                     _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
                     # 1a799e52 -- this used to be swallowed at DEBUG level only,
@@ -2564,6 +2706,17 @@ class OutputsFtsIndex:
                         "OutputsFtsIndex.rebuild: failed to persist "
                         "hash_algo_version", exc_info=True,
                     )
+            self.last_rebuild_metrics["write_seconds"] = round(
+                time.monotonic() - write_started, 6,
+            )
+            self.last_rebuild_metrics.update({
+                "rebuild_seconds": round(time.monotonic() - rebuild_started, 6),
+                "rows_returned": len(rows),
+                "rows_changed": len(new_rows),
+                "rows_deleted": len(paths_to_delete),
+                "partial": bool(self.last_rebuild_partial),
+                "fts_pending": bool(self._fts_pending),
+            })
             return len(rows)
 
     def _apply_precomputed(
@@ -2622,7 +2775,9 @@ class OutputsFtsIndex:
             if analysis is None:
                 # Worker failed for this path; fall back to synchronous analysis.
                 try:
-                    analysis = _analyse_file(p, self._hasher)
+                    analysis = _analyse_file(
+                        p, self._hasher, stat_signature=stale_sigs.get(p),
+                    )
                 except Exception:  # noqa: BLE001
                     _log.debug("_apply_precomputed: fallback _analyse_file failed for %r", p,
                                 exc_info=True)
@@ -2630,10 +2785,18 @@ class OutputsFtsIndex:
             fp = analysis.fingerprint
             mtime = analysis.mtime
             size = analysis.size
+            # During a hash-algorithm upgrade the cache is intentionally left
+            # empty, even though DuckDB still contains legacy rows; those
+            # rows must be replaced rather than treated as brand-new inserts.
+            had_existing = p in self._row_cache or self._pending_hash_upgrade
             cls = classifications.get(p)
             row = OutputRow(
                 path=p,
-                content=_content_for_fts(p, fp),
+                content=(
+                    analysis.content
+                    if analysis.content is not None
+                    else _content_for_fts(p, fp)
+                ),
                 mtime=mtime,
                 sha256=analysis.sha256,
                 size=size,
@@ -2652,7 +2815,8 @@ class OutputsFtsIndex:
             # tail end of the SAME rebuild() call that produced it.
             self._row_cache[p] = _light_row(row)
             self._manifest[p] = stale_sigs.get(p, (mtime, size))
-            paths_to_delete.append(p)  # delete old row (if any) before reinserting
+            if had_existing:
+                paths_to_delete.append(p)  # replace an existing persisted row
             new_rows.append(row)
             changed = True
 
@@ -3116,6 +3280,15 @@ def search_outputs(
     # "empty tree, nothing to find". total_in_index == len(index._row_cache)
     # because _row_cache always mirrors what is (or will be) in the DB.
     result["total_in_index"] = len(index._row_cache)
+    # Planner/diagnostic surface: make discovery coverage and phase costs
+    # explicit.  ``total_in_index`` is a historical row count; these fields
+    # distinguish that from a completed filesystem walk and provide the
+    # measurements needed to tune large-root scans.
+    result["discovery"] = dict(index.last_rebuild_metrics)
+    result["discovery"].setdefault(
+        "walk_complete", index._walk_state is None,
+    )
+    result["discovery"]["row_cache_content_resident"] = False
     if index.last_db_write_error:
         # 1a799e52 -- a real Phase 2 persistence failure this call. Rows may
         # still be visible in total_indexed/total_in_index (in-memory

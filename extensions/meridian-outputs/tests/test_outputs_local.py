@@ -818,6 +818,23 @@ class TestSearchOutputsAPI:
         assert len(result["hits"]) >= 1
 
     @duckdb_required
+    def test_search_exposes_discovery_phase_metrics(self, tmp_path: Path) -> None:
+        (tmp_path / "metrics.json").write_text(
+            '{"marker": "telemetry"}', encoding="utf-8"
+        )
+        result = OL.search_outputs(str(tmp_path), "telemetry", max_seconds=None)
+        discovery = result["discovery"]
+        assert discovery["walk_complete"] is True
+        assert discovery["discovered_total"] >= 1
+        assert discovery["discovered_this_call"] >= 1
+        assert discovery["rebuild_seconds"] >= 0
+        assert discovery["walk_seconds"] >= 0
+        assert discovery["analysis_seconds"] >= 0
+        assert discovery["classification_seconds"] >= 0
+        assert discovery["write_seconds"] >= 0
+        assert discovery["row_cache_content_resident"] is False
+
+    @duckdb_required
     def test_search_no_secret_hits(self, tmp_path: Path) -> None:
         (tmp_path / ".env").write_text("DB_PASS=hunter2", encoding="utf-8")
         (tmp_path / "results.json").write_text('{"DB_PASS": "hunter2"}', encoding="utf-8")
@@ -1121,6 +1138,19 @@ class TestAnalyseFile:
         sentinel = "cafebabe"
         analysis = OL._analyse_file(str(f), lambda _p: sentinel)
         assert analysis.sha256 == sentinel
+
+    def test_captured_stat_signature_avoids_second_stat(self, tmp_path: Path) -> None:
+        f = tmp_path / "captured.csv"
+        f.write_text("col\nvalue", encoding="utf-8")
+        st = f.stat()
+        with patch.object(OL.os, "stat", side_effect=AssertionError("duplicate stat")):
+            analysis = OL._analyse_file(
+                str(f), OL._sha256_file,
+                stat_signature=(st.st_mtime, st.st_size),
+            )
+        assert analysis.mtime == st.st_mtime
+        assert analysis.size == st.st_size
+        assert analysis.sha256 is not None
 
     def test_independent_per_file(self, tmp_path: Path) -> None:
         """Two concurrent _analyse_file calls on different files must not interfere."""
@@ -2952,15 +2982,14 @@ class TestHashAlgoVersionUpgrade:
 # ---------------------------------------------------------------------------
 
 class TestConfigurableMaxWorkers:
-    def test_default_is_cpu_count(
+    def test_default_is_physical_core_count(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """a849e3d5 -- default changed from a flat hardcoded 8 to
-        os.cpu_count(), empirically confirmed faster on real hardware."""
+        """Default follows physical cores, not logical hyperthreads."""
         monkeypatch.delenv(OL._MAX_WORKERS_ENV_VAR, raising=False)
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
-            assert idx._max_workers == (os.cpu_count() or 8)
+            assert idx._max_workers == OL._physical_core_count()
         finally:
             idx.close()
 
@@ -2997,7 +3026,7 @@ class TestConfigurableMaxWorkers:
         monkeypatch.setenv(OL._MAX_WORKERS_ENV_VAR, "not-an-int")
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
-            assert idx._max_workers == (os.cpu_count() or 8)
+            assert idx._max_workers == OL._physical_core_count()
         finally:
             idx.close()
 
@@ -3006,7 +3035,7 @@ class TestConfigurableMaxWorkers:
     ) -> None:
         idx = OL.OutputsFtsIndex(str(tmp_path), max_workers=0)
         try:
-            assert idx._max_workers == (os.cpu_count() or 8)
+            assert idx._max_workers == OL._physical_core_count()
         finally:
             idx.close()
 
@@ -3046,8 +3075,8 @@ class TestWalkBatchDefaultUnbounded:
     exhaustion), while an explicit override still works for anyone who
     deliberately wants a count cap."""
 
-    def test_class_default_is_effectively_unbounded(self) -> None:
-        assert OL._ResumableFileWalk._MAX_BATCH >= 1_000_000
+    def test_class_default_is_bounded_fairness_window(self) -> None:
+        assert OL._ResumableFileWalk._MAX_BATCH == 4_096
 
     def test_default_walk_not_capped_at_old_2000_default(
         self, tmp_path: Path,
@@ -3171,55 +3200,63 @@ class TestWriteChunkDecoupling:
         finally:
             idx.close()
 
+
+class TestAdaptiveBatchPolicy:
+    """The adaptive controller must preserve explicit overrides and back off
+    when a prior Tantivy/DB commit shows pressure."""
+
+    def test_explicit_batch_disables_adaptation(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), max_batch=123)
+        try:
+            assert idx._max_batch_overridden is True
+            assert idx._adaptive_batch_limit() == 123
+        finally:
+            idx.close()
+
+    def test_commit_pressure_halves_adaptive_batch(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._adaptive_batch = 32_768
+            idx.last_rebuild_metrics = {"fts_seconds": 9.0, "write_seconds": 25.0}
+            assert idx._adaptive_batch_limit() == 16_384
+        finally:
+            idx.close()
+
     @duckdb_required
-    def test_delete_writes_are_chunked_at_configured_write_chunk_size(
+    def test_replacement_writes_use_upsert_without_delete(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Integration proof that _WRITE_CHUNK actually bounds the real
-        DELETE statement batching -- not just the resolved attribute --
-        even though the walk's own default max_batch is effectively
-        unbounded and would otherwise let a single call re-stage every row
-        for delete+reinsert in one shot."""
+        """Changed rows use DuckDB upsert semantics; deletes remain reserved
+        for genuinely removed paths."""
         n = 120
         for i in range(n):
             (tmp_path / f"w{i:04d}.csv").write_text(f"col\n{i}", encoding="utf-8")
         idx = OL.OutputsFtsIndex(str(tmp_path), write_chunk=10)
         try:
             assert idx._write_chunk == 10
-            assert idx._max_batch == OL._ResumableFileWalk._MAX_BATCH
-            assert idx._max_batch > n
-
             count = idx.rebuild(max_seconds=60)
             assert count == n
-
-            # Mark every file stale so the next rebuild() issues a real
-            # DELETE-then-reinsert for all n paths.
             for p in list(idx._row_cache):
                 os.utime(p, None)
 
             con = idx._connect()
             conn_cls = type(con)
             real_execute = conn_cls.execute
-            delete_chunk_sizes: list[int] = []
+            delete_sql_seen: list[str] = []
 
             def spy_execute(self, sql, parameters=None):
                 if isinstance(sql, str) and sql.startswith(
                     "DELETE FROM outputs_index WHERE path IN"
                 ):
-                    delete_chunk_sizes.append(len(parameters) if parameters else 0)
+                    delete_sql_seen.append(sql)
                 if parameters is not None:
                     return real_execute(self, sql, parameters)
                 return real_execute(self, sql)
 
             monkeypatch.setattr(conn_cls, "execute", spy_execute)
-            idx.rebuild(max_seconds=60)
-
-            assert delete_chunk_sizes, "expected at least one chunked DELETE statement"
-            assert all(size <= 10 for size in delete_chunk_sizes), (
-                f"DELETE chunk exceeded the configured write_chunk=10: "
-                f"{delete_chunk_sizes}"
-            )
-            assert sum(delete_chunk_sizes) == n
+            assert idx.rebuild(max_seconds=60) == n
+            assert not delete_sql_seen
+            assert len(idx._row_cache) == n
         finally:
             idx.close()
 
