@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 import types
 
 import httpx
@@ -507,6 +508,114 @@ def test_tunnel_jsonrpc_falls_back_to_generic_message_on_unparseable_body(monkey
 
     with pytest.raises(RuntimeError, match="502"):
         asyncio.run(tn._tunnel_jsonrpc("t1", "fs", "tools/list", {}))
+
+
+def test_tunnel_jsonrpc_initializes_and_reuses_persistent_session(monkeypatch):
+    """Persistent slots list and call tools through one initialized session."""
+    tenant = "persistent-bridge"
+    socket = object()
+    key = (tenant, "debug")
+    monkeypatch.setitem(tn._tunnel_debug_sockets, tenant, socket)
+    monkeypatch.setitem(
+        tn._tunnel_mcp_sessions, key,
+        ("discard-me", id(socket), 0),
+    )
+    monkeypatch.setitem(tn._tunnel_mcp_session_locks, key, asyncio.Lock())
+    calls = []
+
+    async def fake_do_proxy(
+        tenant_id, http_method, path, query, headers, body, sockets, pending,
+        label, *, timeout=None,
+    ):
+        request = json.loads(body)
+        method = request["method"]
+        session_id = headers.get("Mcp-Session-Id")
+        calls.append((method, session_id, timeout))
+        if method == "tools/list" and session_id is None:
+            return Response(
+                content='{"error":"missing Mcp-Session-Id"}',
+                status_code=400,
+            )
+        if method == "initialize":
+            assert timeout is not None
+            return Response(
+                content='{"jsonrpc":"2.0","id":"meridian-bridge-init","result":{}}',
+                headers={"mcp-session-id": "debug-session"},
+            )
+        if method == "notifications/initialized":
+            return Response(status_code=202)
+        if method == "tools/list":
+            return Response(content='{"result":{"tools":[{"name":"launch"}]}}')
+        return Response(content='{"result":{"content":[{"type":"text","text":"ok"}]}}')
+
+    monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
+    listed = asyncio.run(
+        tn._tunnel_jsonrpc(tenant, "debug", "tools/list", {})
+    )
+    called = asyncio.run(
+        tn._tunnel_jsonrpc(
+            tenant, "debug", "tools/call",
+            {"name": "launch", "arguments": {}},
+        )
+    )
+
+    assert listed["result"]["tools"][0]["name"] == "launch"
+    assert called["result"]["content"][0]["text"] == "ok"
+    assert [(method, session_id) for method, session_id, _ in calls] == [
+        ("tools/list", None),
+        ("initialize", None),
+        ("notifications/initialized", "debug-session"),
+        ("tools/list", "debug-session"),
+        ("tools/call", "debug-session"),
+    ]
+
+
+def test_tunnel_jsonrpc_recovers_expired_persistent_session(monkeypatch):
+    """An HTTP 404 invalidates the cached session and replays through a new one."""
+    tenant = "expired-bridge"
+    socket = object()
+    key = (tenant, "debug")
+    monkeypatch.setitem(tn._tunnel_debug_sockets, tenant, socket)
+    monkeypatch.setitem(tn._tunnel_mcp_sessions, key, (
+        "expired-session", id(socket), time.monotonic() + 60,
+    ))
+    monkeypatch.setitem(tn._tunnel_mcp_session_locks, key, asyncio.Lock())
+    calls = []
+
+    async def fake_do_proxy(
+        tenant_id, http_method, path, query, headers, body, sockets, pending,
+        label, *, timeout=None,
+    ):
+        request = json.loads(body)
+        method = request["method"]
+        session_id = headers.get("Mcp-Session-Id")
+        calls.append((method, session_id))
+        if session_id == "expired-session":
+            return Response(content='{"error":"session expired"}', status_code=404)
+        if method == "initialize":
+            return Response(
+                content='{"result":{}}',
+                headers={"mcp-session-id": "replacement-session"},
+            )
+        if method == "notifications/initialized":
+            return Response(status_code=202)
+        return Response(content='{"result":{"content":[]}}')
+
+    monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
+    result = asyncio.run(
+        tn._tunnel_jsonrpc(
+            tenant, "debug", "tools/call",
+            {"name": "launch", "arguments": {}},
+        )
+    )
+
+    assert result == {"result": {"content": []}}
+    assert calls == [
+        ("tools/call", "expired-session"),
+        ("initialize", None),
+        ("notifications/initialized", "replacement-session"),
+        ("tools/call", "replacement-session"),
+    ]
 
 
 def test_call_tunnel_tool_surfaces_proxy_not_connected_race(monkeypatch):

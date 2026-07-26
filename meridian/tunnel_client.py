@@ -816,6 +816,9 @@ async def _staleness_alert_loop(
         )
 
 
+_SLOT_HEALTH_ATTEMPT_TIMEOUT = 10.0
+
+
 async def _probe_slot_health(
     port: int, *, attempts: int = 2, delay: float = 3.0
 ) -> bool:
@@ -840,28 +843,42 @@ async def _probe_slot_health(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     }
+    async def _bounded(factory, deadline: float):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(factory(), timeout=remaining)
+
     for attempt in range(max(1, attempts)):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as c:
+            deadline = time.monotonic() + _SLOT_HEALTH_ATTEMPT_TIMEOUT
+            async with httpx.AsyncClient(
+                timeout=_SLOT_HEALTH_ATTEMPT_TIMEOUT
+            ) as c:
                 url = f"http://127.0.0.1:{port}/mcp"
-                r = await c.post(url, json=payload, headers=headers)
+                r = await _bounded(
+                    lambda: c.post(url, json=payload, headers=headers), deadline
+                )
                 if r.status_code == 400:
-                    init = await c.post(
-                        url,
-                        json={
-                            "jsonrpc": "2.0",
-                            "id": "preflight-init",
-                            "method": "initialize",
-                            "params": {
-                                "protocolVersion": "2025-03-26",
-                                "capabilities": {},
-                                "clientInfo": {
-                                    "name": "meridian-tunnel-health",
-                                    "version": "1",
+                    init = await _bounded(
+                        lambda: c.post(
+                            url,
+                            json={
+                                "jsonrpc": "2.0",
+                                "id": "preflight-init",
+                                "method": "initialize",
+                                "params": {
+                                    "protocolVersion": "2025-03-26",
+                                    "capabilities": {},
+                                    "clientInfo": {
+                                        "name": "meridian-tunnel-health",
+                                        "version": "1",
+                                    },
                                 },
                             },
-                        },
-                        headers=headers,
+                            headers=headers,
+                        ),
+                        deadline,
                     )
                     session_id = init.headers.get("mcp-session-id")
                     if init.status_code < 400 and session_id:
@@ -870,22 +887,35 @@ async def _probe_slot_health(
                             "Mcp-Session-Id": session_id,
                         }
                         try:
-                            notified = await c.post(
-                                url,
-                                json={
-                                    "jsonrpc": "2.0",
-                                    "method": "notifications/initialized",
-                                    "params": {},
-                                },
-                                headers=session_headers,
+                            notified = await _bounded(
+                                lambda: c.post(
+                                    url,
+                                    json={
+                                        "jsonrpc": "2.0",
+                                        "method": "notifications/initialized",
+                                        "params": {},
+                                    },
+                                    headers=session_headers,
+                                ),
+                                deadline,
                             )
                             if notified.status_code < 400:
-                                r = await c.post(
-                                    url, json=payload, headers=session_headers
+                                r = await _bounded(
+                                    lambda: c.post(
+                                        url,
+                                        json=payload,
+                                        headers=session_headers,
+                                    ),
+                                    deadline,
                                 )
                         finally:
                             try:
-                                await c.delete(url, headers=session_headers)
+                                await _bounded(
+                                    lambda: c.delete(
+                                        url, headers=session_headers
+                                    ),
+                                    deadline,
+                                )
                             except Exception:  # noqa: BLE001 - cleanup is best-effort
                                 pass
             if r.status_code < 400:
