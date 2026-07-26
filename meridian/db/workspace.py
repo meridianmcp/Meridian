@@ -652,6 +652,9 @@ async def promote_workspace_proposal(
     sprint_item_title: str | None = None,
     sprint_item_version: str | None = None,
     tenant_id: str | None = None,
+    touches_resources: list[str] | None = None,
+    infer_touches_resources: bool = False,
+    file_github_issue: bool = False,
 ) -> dict[str, Any]:
     """Promote a proposal to a real sprint item and link the two.
 
@@ -686,12 +689,16 @@ async def promote_workspace_proposal(
     # a56f0951 — infer touches_resources from proposal content so the created
     # sprint item is not silently bare (same gap class as fba94f1a).
     proposal_body = proposal.get("body") or ""
-    inferred = _infer_touches_resources_from_proposal(title, proposal_body)
+    resource_candidates = touches_resources
+    if resource_candidates is None and infer_touches_resources:
+        resource_candidates = _infer_touches_resources_from_proposal(
+            title, proposal_body
+        )
     resources_json: str | None = None
     item_notes: str | None = None
-    if inferred:
+    if resource_candidates:
         try:
-            resources_json = serialize_touches_resources(inferred)
+            resources_json = serialize_touches_resources(resource_candidates)
         except Exception:  # noqa: BLE001 — never block promotion
             resources_json = None
     if not resources_json:
@@ -714,9 +721,18 @@ async def promote_workspace_proposal(
     # Mark the proposal promoted.
     await db.execute(
         f"UPDATE workspace_proposals "
-        f"SET status = 'promoted', promoted_to_sprint_item_id = ?, updated_at = datetime('now') "
+        f"SET status = 'promoted', promoted_to_sprint_item_id = ?, "
+        f"updated_at = datetime('now'), last_activity_at = datetime('now') "
         f"WHERE id = ?{scope_sql}",
         [si_id, proposal_id, *scope_params],
+    )
+    await _append_proposal_event(
+        db,
+        proposal_id,
+        "promoted",
+        f"Promoted to sprint item {si_id}",
+        payload={"sprint_item_id": si_id, "touches_resources": resource_candidates},
+        tenant_id=(tenant_id if tenant_id is not None else proposal.get("tenant_id")),
     )
     await db.commit()
     async with db.execute(
@@ -737,9 +753,8 @@ async def promote_workspace_proposal(
     # the number/URL back on this proposal — never done inline here, since
     # this module has no GitHub API / tenant-PAT access.
     github_issue_hitl: dict[str, Any] | None = None
-    is_code_related = bool(inferred)
     github_repo = (project.get("github_repo") or "").strip()
-    if is_code_related and github_repo:
+    if file_github_issue and github_repo:
         # Lazy import: request_hitl lives in meridian.db (defined after this
         # module is imported by it) — see the identical pattern in
         # sprint_items.py's _maybe_file_chain_handoff.

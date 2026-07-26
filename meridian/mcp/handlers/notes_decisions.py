@@ -2070,6 +2070,9 @@ async def handle_promote_proposal(
             sprint_item_title=args.get("sprint_item_title"),
             sprint_item_version=args.get("sprint_item_version"),
             tenant_id=_mcp_tenant_id,
+            touches_resources=args.get("touches_resources"),
+            infer_touches_resources=args.get("infer_touches_resources", False),
+            file_github_issue=args.get("file_github_issue", False),
         )
     except ValueError as exc:
         return {"error": str(exc)}
