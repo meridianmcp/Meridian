@@ -1,5 +1,11 @@
 name: Test (dev branch)
 
+# f4ab2787 — Canonical dev/PR CI. deploy.yml's workflow_run trigger treats
+# this workflow's whole conclusion as the promotion gate. The workflow name is
+# therefore a cross-file API; update deploy.yml if it changes. deploy.yml's
+# inline jobs are narrower supplemental release checks, not a substitute for
+# this workflow. See divergent runs 30182367824 and 30182376358.
+
 on:
   push:
     branches: [dev]
