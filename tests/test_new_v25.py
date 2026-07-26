@@ -1332,16 +1332,18 @@ async def test_delete_project_cleans_all_child_tables(db):
 
     # --- Assert every child table is clean ---
     async def _count(table, col="project_id"):
-        async with db.execute(f"SELECT COUNT(*) FROM {table} WHERE {col} = ?", (pid,)) as cur:
+        async with db.execute(
+            f"SELECT COUNT(*) AS cnt FROM {table} WHERE {col} = ?", (pid,)
+        ) as cur:
             row = await cur.fetchone()
-        return row[0] if row else 0
+        return int(row["cnt"]) if row else 0
 
     async def _count_by_session(table):
         async with db.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE session_id = ?", (sid,)
+            f"SELECT COUNT(*) AS cnt FROM {table} WHERE session_id = ?", (sid,)
         ) as cur:
             row = await cur.fetchone()
-        return row[0] if row else 0
+        return int(row["cnt"]) if row else 0
 
     # Direct project_id columns
     assert await _count("goal_states") == 0, "goal_states not cleaned"
