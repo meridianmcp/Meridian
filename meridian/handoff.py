@@ -733,10 +733,10 @@ def _infer_sprint_type(items: list[dict[str, Any]]) -> str:
     """f9fa00e4 — infer a sprint 'type' from the pending items so the /goal can
     carry type-appropriate guidance. Heuristic (no LLM): dependency graph →
     orchestrator; large count → megasprint; else by dominant item_group / title
-    keyword (research/refactor/ops/hotfix); default feature."""
+    keyword (research/refactor/ops/hotfix/feature); otherwise general."""
     n = len(items)
     if n == 0:
-        return "feature"
+        return "general"
     groups = [(it.get("item_group") or "").lower() for it in items]
     titles = [(it.get("title") or "").lower() for it in items]
 
@@ -758,7 +758,9 @@ def _infer_sprint_type(items: list[dict[str, Any]]) -> str:
         return "ops"
     if n <= 3 and (frac_title("hotfix") + frac_title("bug") + frac_title("fix:")) >= 0.5:
         return "hotfix"
-    return "feature"
+    if frac_group({"feature", "feat"}) >= 0.5 or frac_title("feat") >= 0.5:
+        return "feature"
+    return "general"
 
 
 def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
@@ -916,6 +918,7 @@ def _build_quick_start_goal(
     force_included_ids: "frozenset[str] | set[str] | None" = None,
     pointer_evidence_ids: "frozenset[str] | set[str] | None" = None,
     include_pointer_lines: bool = False,
+    completion_criteria_override: str | None = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -983,6 +986,12 @@ def _build_quick_start_goal(
     mode turns it on since that mode strips the separate L1 section that
     would otherwise carry this same information.
     """
+    _completion_override = (
+        completion_criteria_override.strip()
+        if isinstance(completion_criteria_override, str)
+        and completion_criteria_override.strip()
+        else None
+    )
     try:
         _turns = int(max_turns)
         if _turns <= 0:
@@ -1139,6 +1148,10 @@ def _build_quick_start_goal(
         _build_goal_pointer_lines(pending_sprint_items) if include_pointer_lines else ""
     )
     if not item_ids:
+        _empty_completion = _completion_override or (
+            "Done when remaining work is verified against its stated scope "
+            "and generate_handoff() is called at the end."
+        )
         # 5abf3e12 — empty-board branch: same constraints as before (verify,
         # test floor, generate_handoff, turn/HITL stop) re-expressed as XML tags.
         # This branch has no items and therefore no anti-stop completion clause,
@@ -1148,9 +1161,7 @@ def _build_quick_start_goal(
             "<executor_directive>Verify remaining work is complete.</executor_directive>\n"
             # 0d5453bc — explicit single-run wording: full suite runs once,
             # at the end of the megasprint, not per item.
-            "<completion_criteria>Done when pixi run test passes "
-            f"{test_floor}+ (run once at the end, not per item), "
-            "and generate_handoff() is called at the end."
+            f"<completion_criteria>{_xml_escape(_empty_completion)}"
             "</completion_criteria>\n"
             f"<stop_conditions>Stop after {_turns} turns "
             f"{_xml_escape(_hitl_clause)}</stop_conditions>"
@@ -1261,8 +1272,16 @@ def _build_quick_start_goal(
     # f9fa00e4 — tag the /goal with an inferred sprint type + tailored guidance.
     # 5abf3e12 — carried on a <sprint_type value="..."> tag (was a "[sprint:TYPE]"
     # inline tag); the type value + note guidance are preserved verbatim.
-    _stype = _infer_sprint_type(pending_sprint_items)
-    _stype_note = _SPRINT_TYPE_NOTES.get(_stype, "")
+    _stype = (
+        "general"
+        if _completion_override is not None
+        else _infer_sprint_type(pending_sprint_items)
+    )
+    _stype_note = (
+        "GENERAL sprint: satisfy each item's stated scope and record completion."
+        if _stype == "general"
+        else _SPRINT_TYPE_NOTES.get(_stype, "")
+    )
     _type_clause = (
         f'\n<sprint_type value="{_xml_escape(_stype, {chr(34): "&quot;"})}">'
         f"{_xml_escape(_stype_note)}</sprint_type>"
@@ -1285,6 +1304,23 @@ def _build_quick_start_goal(
             "</not_done_until>"
         )
     )
+    if _completion_override is not None:
+        _completion_text = _completion_override
+    elif _stype == "general":
+        _completion_text = (
+            "Done when all listed sprint items satisfy their stated scope, "
+            "are marked complete via complete_sprint_item(), and "
+            "generate_handoff() is called at the end."
+        )
+    else:
+        _completion_text = (
+            "Done when all listed sprint items are marked complete via "
+            "complete_sprint_item(), pixi run test passes "
+            f"{test_floor}+ (run the full suite ONCE at the very end of the "
+            "entire megasprint as the single deploy gate -- not per item; "
+            "per-item verification uses targeted tests for that item only), "
+            "and generate_handoff() is called at the end."
+        )
     return (
         f"{_loop_prefix}/goal\n"
         f"<executor_directive>{_xml_escape(directive)}</executor_directive>\n"
@@ -1298,13 +1334,7 @@ def _build_quick_start_goal(
         # 0d5453bc — explicit per-item vs end-of-megasprint split: targeted tests
         # only per item; the full suite is a single gate at the very end. This
         # prevents the anti-pattern of running the full suite 6x for one item.
-        "<completion_criteria>Done when all listed sprint items are marked "
-        "complete via complete_sprint_item(), "
-        "pixi run test passes "
-        f"{test_floor}+ (run the full suite ONCE at the very end of the entire "
-        "megasprint as the single deploy gate -- not per item; "
-        "per-item verification uses targeted tests for that item only), "
-        "and generate_handoff() is called at the end."
+        f"<completion_criteria>{_xml_escape(_completion_text)}"
         "</completion_criteria>"
         # 2a06a840 — xdist worker-crash guidance: an INTERNALERROR produced by
         # pytest-xdist (e.g. "AssertionError: ('tests/…::test_name', <WorkerController
@@ -1315,7 +1345,10 @@ def _build_quick_start_goal(
         # literal `<path>::<test>` placeholder angle brackets, which XML parsers
         # read as unclosed tags ("mismatched tag") and broke every consumer that
         # parses the generated /goal as XML (3 real test_cov_handoff.py failures).
-        "\n<test_gate_note>" + _xml_escape(
+        + (
+            ""
+            if _completion_override is not None or _stype == "general"
+            else "\n<test_gate_note>" + _xml_escape(
             "If `pixi run test -n auto` produces an INTERNALERROR "
             "or worker crash (a line starting with 'INTERNALERROR>' rather than a "
             "normal 'FAILED tests/...' line), this is very likely a parallel-execution "
@@ -1326,8 +1359,9 @@ def _build_quick_start_goal(
             "very likely fine — restore your changes (`git stash pop`) and re-run the "
             "full suite WITHOUT -n auto (`pixi run python -m pytest tests/ -q "
             "--timeout=60`) for a clean, honest count before deciding pass/fail."
-        ) + "</test_gate_note>"
-        f"{_not_done_until}\n"
+            ) + "</test_gate_note>"
+        )
+        + f"{_not_done_until}\n"
         f"<stop_conditions>Stop after {_turns} turns "
         f"{_xml_escape(_hitl_clause)}</stop_conditions>"
         f"{_type_clause}"
@@ -3950,8 +3984,23 @@ async def generate_handoff(
     if mode == "planner":
         _pl_path, _pl_content = await _generate_planner_handoff(db, project_id, output_dir)
         return _pl_path, _pl_content, False
+    _project_completion_criteria_override: str | None = None
+    try:
+        _stored_criteria = await db_module.get_sprint_version_description(
+            db, project_id, ""
+        )
+        if isinstance(_stored_criteria, str) and _stored_criteria.strip():
+            _project_completion_criteria_override = _stored_criteria.strip()
+    except Exception:  # noqa: BLE001 - optional pre-migration/project setting
+        pass
     if mode in {"starter", "compact"}:
-        _st_path, _st_content = await _generate_starter_handoff(db, project, output_dir, identity=identity)
+        _st_path, _st_content = await _generate_starter_handoff(
+            db,
+            project,
+            output_dir,
+            identity=identity,
+            completion_criteria_override=_project_completion_criteria_override,
+        )
         return _st_path, _st_content, False
     if mode == "goal":
         # 682005f4 — bare-/goal-only mode: no readiness header, no workspace
@@ -3964,6 +4013,7 @@ async def generate_handoff(
             output_dir,
             graph_searcher=graph_searcher,
             force_include_ids=force_include_ids,
+            completion_criteria_override=_project_completion_criteria_override,
         )
         return _g_path, _g_content, False
     if mode not in {"full", "delta"}:
@@ -4124,7 +4174,11 @@ async def generate_handoff(
     _model_hints_on = _model_tier_hints_enabled(proj_settings)
     if _model_hints_on:
         try:
-            _stype_for_hints = _infer_sprint_type(pending_sprint_items)
+            _stype_for_hints = (
+                "general"
+                if _project_completion_criteria_override is not None
+                else _infer_sprint_type(pending_sprint_items)
+            )
             for _it in pending_sprint_items:
                 _it["suggested_model"] = suggest_model_tier(_it, _stype_for_hints)
         except Exception:  # noqa: BLE001 — hints are best-effort, never fatal
@@ -4244,6 +4298,7 @@ async def generate_handoff(
         # d5849a67 — durable pointer evidence, batch-resolved above, so the
         # excluded_unprospected tag agrees with claim_sprint_item's own gate.
         pointer_evidence_ids=_pointer_evidence_ids,
+        completion_criteria_override=_project_completion_criteria_override,
     )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
@@ -4746,6 +4801,8 @@ async def _generate_starter_handoff(
     project: dict[str, Any],
     output_dir: str,
     identity: str | None = None,
+    *,
+    completion_criteria_override: str | None = None,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -4823,6 +4880,7 @@ async def _generate_starter_handoff(
         # 490e100d — workspace-level default tool priority per task category.
         tool_priority_map=(_s_ws_settings or {}).get("tool_priority_map"),
         pointer_evidence_ids=_s_pointer_evidence_ids,
+        completion_criteria_override=completion_criteria_override,
     )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
@@ -4861,6 +4919,7 @@ async def _generate_goal_only_handoff(
     *,
     graph_searcher: Callable[[str], Any] | None = None,
     force_include_ids: list[str] | None = None,
+    completion_criteria_override: str | None = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
@@ -4985,6 +5044,7 @@ async def _generate_goal_only_handoff(
         pointer_evidence_ids=_pointer_evidence_ids,
         # 682005f4(b) — thread resolved pointers into the goal block itself.
         include_pointer_lines=True,
+        completion_criteria_override=completion_criteria_override,
     )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.
