@@ -2605,6 +2605,68 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )"""
     )
+    # v0.2.2 — expand the lifecycle state machine for databases created before
+    # resumable proposal states existed. SQLite cannot alter a CHECK constraint
+    # in place, so rebuild this one small table while preserving all known
+    # columns (including optional columns added by later migrations).
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'workspace_proposals'"
+    ) as cur:
+        schema_row = await cur.fetchone()
+    schema_sql = str(schema_row["sql"] if schema_row is not None else "")
+    if "paused" not in schema_sql.lower():
+        async with db.execute("PRAGMA table_info(workspace_proposals)") as cur:
+            legacy_rows = await cur.fetchall()
+        legacy_columns = {row["name"] for row in legacy_rows}
+        await db.execute("DROP TRIGGER IF EXISTS trg_workspace_proposals_created_seq")
+        await db.execute("DROP INDEX IF EXISTS idx_workspace_proposals_tenant")
+        await db.execute(
+            "ALTER TABLE workspace_proposals RENAME TO "
+            "workspace_proposals_legacy_v022"
+        )
+        await db.execute(
+            """CREATE TABLE workspace_proposals (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                tags TEXT,
+                status TEXT NOT NULL DEFAULT 'raw'
+                    CHECK (status IN (
+                        'raw', 'investigating', 'paused', 'promoted',
+                        'rejected', 'closed', 'superseded'
+                    )),
+                promoted_to_sprint_item_id TEXT,
+                tenant_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_seq INTEGER,
+                slug TEXT,
+                nickname TEXT,
+                github_issue_number INTEGER,
+                github_issue_url TEXT
+            )"""
+        )
+        preserved_columns = (
+            "id", "title", "body", "tags", "status",
+            "promoted_to_sprint_item_id", "tenant_id", "created_at",
+            "updated_at", "created_seq", "slug", "nickname",
+            "github_issue_number", "github_issue_url",
+        )
+        expressions = []
+        for column in preserved_columns:
+            if column == "created_seq" and column not in legacy_columns:
+                expressions.append("rowid")
+            elif column in legacy_columns:
+                expressions.append(column)
+            else:
+                expressions.append("NULL")
+        await db.execute(
+            "INSERT INTO workspace_proposals (" + ", ".join(preserved_columns) + ") "
+            "SELECT " + ", ".join(expressions) + " "
+            "FROM workspace_proposals_legacy_v022"
+        )
+        await db.execute("DROP TABLE workspace_proposals_legacy_v022")
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_tenant "
         "ON workspace_proposals(tenant_id)"

@@ -805,7 +805,10 @@ CREATE TABLE IF NOT EXISTS workspace_proposals (
     body TEXT NOT NULL,
     tags TEXT,
     status TEXT NOT NULL DEFAULT 'raw'
-        CHECK (status IN ('raw', 'investigating', 'promoted', 'rejected')),
+        CHECK (status IN (
+            'raw', 'investigating', 'paused', 'promoted', 'rejected',
+            'closed', 'superseded'
+        )),
     promoted_to_sprint_item_id TEXT,
     tenant_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -10499,6 +10502,7 @@ from .workspace import (  # noqa: F401
     delete_workspace_decision,
     # Public workspace-proposal functions
     add_workspace_proposal,
+    append_proposal_update,
     get_workspace_proposals,
     advance_workspace_proposal_status,
     promote_workspace_proposal,

@@ -324,20 +324,86 @@ async def delete_workspace_decision(
 # --- Workspace proposals (human-only "drawer of inspiration") ---------------
 # 5c4dcc0f — workspace-scoped (tenant_id) flash-of-insight capture. Distinct
 # from workspace_notes (no lifecycle) and sprint_items (executor-claimable).
-# status machine: raw → investigating → promoted | rejected.
+# status machine: raw → investigating → paused → promoted | rejected | closed.
 
-_VALID_PROPOSAL_STATUSES = {"raw", "investigating", "promoted", "rejected"}
+_VALID_PROPOSAL_STATUSES = {
+    "raw",
+    "investigating",
+    "paused",
+    "promoted",
+    "rejected",
+    "closed",
+    "superseded",
+}
 # 45c4c178 — "live" statuses: proposals still awaiting human triage. Terminal
-# statuses (promoted/rejected) are excluded from the default (status-omitted)
+# statuses (promoted/rejected/closed/superseded) are excluded from the default
+# (status-omitted)
 # view of get_workspace_proposals so the common "what's still open" query
 # doesn't require the caller to already know to pass status= explicitly.
-_LIVE_PROPOSAL_STATUSES = {"raw", "investigating"}
+_LIVE_PROPOSAL_STATUSES = {"raw", "investigating", "paused"}
 _PROPOSAL_TRANSITIONS: dict[str, set[str]] = {
-    "raw": {"investigating", "rejected"},
-    "investigating": {"promoted", "rejected", "raw"},
+    "raw": {"investigating", "paused", "rejected", "closed", "superseded"},
+    "investigating": {
+        "promoted", "paused", "rejected", "raw", "closed", "superseded",
+    },
+    "paused": {"investigating", "raw", "closed", "superseded"},
     "promoted": set(),   # terminal — use promote_workspace_proposal instead
     "rejected": {"raw"},  # allow un-reject back to raw
+    "closed": {"raw"},  # reopening is represented by the raw state
+    "superseded": set(),
 }
+
+
+async def _append_proposal_event(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    event_type: str,
+    content: str = "",
+    *,
+    payload: Any = None,
+    actor: str | None = None,
+    session_id: str | None = None,
+    source: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Append one immutable proposal event without committing the transaction."""
+    async with db.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
+        "FROM proposal_events WHERE proposal_id = ?",
+        (proposal_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    sequence = int((row["next_sequence"] if row is not None else 1) or 1)
+    event_id = _new_id()
+    if payload is not None and not isinstance(payload, str):
+        payload = json.dumps(payload, sort_keys=True)
+    await db.execute(
+        "INSERT INTO proposal_events "
+        "(id, proposal_id, tenant_id, sequence, event_type, content, payload, "
+        "actor, session_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event_id,
+            proposal_id,
+            tenant_id,
+            sequence,
+            event_type,
+            content,
+            payload,
+            actor,
+            session_id,
+            source,
+        ),
+    )
+    async with db.execute(
+        "SELECT * FROM proposal_events WHERE id = ?", (event_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {
+        "id": event_id,
+        "proposal_id": proposal_id,
+        "sequence": sequence,
+        "event_type": event_type,
+    }
 
 
 async def add_workspace_proposal(
@@ -346,6 +412,9 @@ async def add_workspace_proposal(
     body: str,
     tags: str | None = None,
     tenant_id: str | None = None,
+    actor: str | None = None,
+    session_id: str | None = None,
+    source: str | None = "workspace",
 ) -> dict[str, Any]:
     """Insert a workspace_proposals row with status='raw'.
 
@@ -369,12 +438,71 @@ async def add_workspace_proposal(
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (pid, title, body, tags, tenant_id, _slug, _nickname),
     )
+    await _append_proposal_event(
+        db,
+        pid,
+        "created",
+        body,
+        payload={"title": title, "tags": tags},
+        actor=actor,
+        session_id=session_id,
+        source=source,
+        tenant_id=tenant_id,
+    )
     await db.commit()
     async with db.execute(
         "SELECT * FROM workspace_proposals WHERE id = ?", (pid,)
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row) or {"id": pid}
+
+
+async def append_proposal_update(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    content: str,
+    event_type: str = "update",
+    *,
+    payload: Any = None,
+    actor: str | None = None,
+    session_id: str | None = None,
+    source: str | None = "workspace",
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Append a structured proposal update and return the new event.
+
+    Proposal rows are intentionally never edited for evidence or decisions.
+    Each update becomes a new event carrying optional structured payload and
+    provenance, which makes interrupted investigations resumable.
+    """
+    if not event_type.strip():
+        raise ValueError("Proposal event_type cannot be blank")
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    scope_sql = f" AND {scope}" if scope else ""
+    async with db.execute(
+        f"SELECT id, tenant_id FROM workspace_proposals WHERE id = ?{scope_sql}",
+        [proposal_id, *scope_params],
+    ) as cur:
+        proposal = await cur.fetchone()
+    if proposal is None:
+        return None
+    event = await _append_proposal_event(
+        db,
+        proposal_id,
+        event_type.strip(),
+        content,
+        payload=payload,
+        actor=actor,
+        session_id=session_id,
+        source=source,
+        tenant_id=(
+            tenant_id
+            if tenant_id is not None
+            else (proposal["tenant_id"] if proposal is not None else None)
+        ),
+    )
+    await db.commit()
+    return event
 
 
 async def get_workspace_proposals(
@@ -387,7 +515,8 @@ async def get_workspace_proposals(
 ) -> list[dict[str, Any]]:
     """Return a bounded page of workspace proposals, newest first.
 
-    Optional filters: ``status`` (raw/investigating/promoted/rejected) and
+    Optional filters: ``status`` (raw/investigating/paused/promoted/rejected,
+    closed, or superseded) and
     ``tag`` (substring match). Scoped to ``tenant_id`` when provided.
 
     When ``status`` is omitted, defaults to "live" proposals only (raw +
@@ -442,10 +571,13 @@ async def advance_workspace_proposal_status(
 
     Allowed transitions::
 
-        raw         → investigating | rejected
-        investigating → promoted | rejected | raw
+        raw         → investigating | paused | rejected | closed | superseded
+        investigating → promoted | paused | rejected | raw | closed | superseded
+        paused      → investigating | raw | closed | superseded
         promoted    → (terminal — use promote_workspace_proposal)
         rejected    → raw
+        closed      → raw (reopened)
+        superseded  → (terminal)
 
     Returns the updated row, or None if not found / wrong tenant.
     Raises ``ValueError`` on an invalid or disallowed transition."""
@@ -474,6 +606,17 @@ async def advance_workspace_proposal_status(
     await db.execute(
         f"UPDATE workspace_proposals SET status = ?, updated_at = datetime('now') WHERE id = ?{scope_sql}",
         [new_status, proposal_id, *scope_params],
+    )
+    event_type = "resumed" if current == "paused" and new_status in {
+        "raw", "investigating"
+    } else "status_changed"
+    await _append_proposal_event(
+        db,
+        proposal_id,
+        event_type,
+        f"{current} -> {new_status}",
+        payload={"from": current, "to": new_status},
+        tenant_id=(tenant_id if tenant_id is not None else proposal.get("tenant_id")),
     )
     await db.commit()
     async with db.execute(

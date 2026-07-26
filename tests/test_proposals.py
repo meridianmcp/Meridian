@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import aiosqlite
 import pytest
 
 from meridian import db as db_module
@@ -63,18 +64,19 @@ async def test_proposal_events_preserve_ordered_history_and_payload(db):
             "test",
         )
         for sequence, event_type, content in (
-            (1, "created", "Initial proposal"),
             (2, "evidence", "Observed the failure"),
             (3, "decision", "Keep the migration additive"),
+            (4, "next_step", "Add a resumable status"),
         )
     ]
-    await db.executemany(
+    insert_sql = (
         "INSERT INTO proposal_events "
         "(id, proposal_id, sequence, event_type, content, payload, actor, "
         "session_id, source) "
-        f"VALUES ({', '.join([placeholder] * 9)})",
-        values,
+        f"VALUES ({', '.join([placeholder] * 9)})"
     )
+    for value in values:
+        await db.execute(insert_sql, value)
     await db.commit()
 
     async with db.execute(
@@ -84,15 +86,16 @@ async def test_proposal_events_preserve_ordered_history_and_payload(db):
     ) as cur:
         rows = await cur.fetchall()
 
-    assert [row["sequence"] for row in rows] == [1, 2, 3]
+    assert [row["sequence"] for row in rows] == [1, 2, 3, 4]
     assert [row["event_type"] for row in rows] == [
         "created",
         "evidence",
         "decision",
+        "next_step",
     ]
     assert json.loads(rows[1]["payload"])["pointer"] == "tests/test_2.py"
-    assert rows[2]["actor"] == "Adam"
-    assert rows[2]["session_id"] == "session-1"
+    assert rows[3]["actor"] == "Adam"
+    assert rows[3]["session_id"] == "session-1"
 
 
 @pytest.mark.asyncio
@@ -124,3 +127,97 @@ async def test_proposal_lifecycle_transition_matrix(db, current, next_status):
 
     assert updated is not None
     assert updated["status"] == next_status
+
+
+@pytest.mark.asyncio
+async def test_append_proposal_update_is_ordered_and_does_not_mutate_proposal(db):
+    proposal = await db_module.add_workspace_proposal(
+        db, "P1", "original body", tenant_id="tenant-1"
+    )
+
+    event = await db_module.append_proposal_update(
+        db,
+        proposal["id"],
+        "Observed a second signal",
+        event_type="evidence",
+        payload={"pointer": "tests/test_proposals.py:120"},
+        actor="Adam",
+        session_id="session-2",
+        source="executor",
+        tenant_id="tenant-1",
+    )
+
+    assert event is not None
+    assert event["sequence"] == 2
+    assert event["event_type"] == "evidence"
+    assert event["actor"] == "Adam"
+    assert json.loads(event["payload"])["pointer"] == "tests/test_proposals.py:120"
+    rows = await db_module.get_workspace_proposals(
+        db, status="all", tenant_id="tenant-1"
+    )
+    assert rows[0]["body"] == "original body"
+
+
+@pytest.mark.asyncio
+async def test_paused_proposal_can_resume_with_a_distinct_event(db):
+    proposal = await db_module.add_workspace_proposal(db, "P1", "body")
+
+    paused = await db_module.advance_workspace_proposal_status(
+        db, proposal["id"], "paused"
+    )
+    resumed = await db_module.advance_workspace_proposal_status(
+        db, proposal["id"], "investigating"
+    )
+
+    assert paused is not None and paused["status"] == "paused"
+    assert resumed is not None and resumed["status"] == "investigating"
+    async with db.execute(
+        "SELECT event_type FROM proposal_events "
+        "WHERE proposal_id = ? ORDER BY sequence",
+        (proposal["id"],),
+    ) as cur:
+        event_types = [row["event_type"] for row in await cur.fetchall()]
+    assert event_types == ["created", "status_changed", "resumed"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_proposal_schema_is_rebuilt_for_resumable_statuses():
+    legacy = await aiosqlite.connect(":memory:")
+    legacy.row_factory = aiosqlite.Row
+    await legacy.execute(
+        """CREATE TABLE workspace_proposals (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            tags TEXT,
+            status TEXT NOT NULL DEFAULT 'raw'
+                CHECK (status IN ('raw', 'investigating', 'promoted', 'rejected')),
+            promoted_to_sprint_item_id TEXT,
+            tenant_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await legacy.execute(
+        "INSERT INTO workspace_proposals (id, title, body) VALUES (?, ?, ?)",
+        ("legacy-1", "Legacy", "Keep the evidence"),
+    )
+
+    await db_module._migrate_workspace_proposals(legacy)
+    await legacy.execute(
+        "UPDATE workspace_proposals SET status = 'paused' WHERE id = ?",
+        ("legacy-1",),
+    )
+    await legacy.commit()
+
+    async with legacy.execute(
+        "SELECT status FROM workspace_proposals WHERE id = ?", ("legacy-1",)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row["status"] == "paused"
+    assert await _table_columns(legacy, "proposal_events") >= {
+        "proposal_id",
+        "sequence",
+        "event_type",
+    }
+    await legacy.close()
