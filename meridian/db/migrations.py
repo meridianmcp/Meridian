@@ -2635,6 +2635,32 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
             WHERE id = NEW.id;
         END"""
     )
+    # v0.2.2 proposal lifecycle — append-only evidence, decision, and
+    # transition history.  Keep this in the guarded migration so upgrades of
+    # existing databases receive the same table as fresh CREATE_TABLES DBs.
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS proposal_events (
+            id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL,
+            tenant_id TEXT,
+            sequence INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            payload TEXT,
+            actor TEXT,
+            session_id TEXT,
+            source TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proposal_events_proposal_sequence "
+        "ON proposal_events(proposal_id, sequence)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proposal_events_tenant_created_at "
+        "ON proposal_events(tenant_id, created_at)"
+    )
     await db.commit()
 
 

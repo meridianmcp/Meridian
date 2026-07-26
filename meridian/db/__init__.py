@@ -812,6 +812,24 @@ CREATE TABLE IF NOT EXISTS workspace_proposals (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- v0.2.2 proposal lifecycle — immutable evidence and decision history.
+-- Events are append-only records owned by a proposal.  The flexible payload
+-- keeps the initial schema stable while later lifecycle features add typed
+-- evidence, decisions, pointers, and resume metadata.
+CREATE TABLE IF NOT EXISTS proposal_events (
+    id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL,
+    tenant_id TEXT,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    payload TEXT,
+    actor TEXT,
+    session_id TEXT,
+    source TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 356d6ac8 — file_patch_counters: structural-degradation early-warning signal.
 -- Tracks how many times (session_id, file_path) has been write-claimed within a
 -- session, approximating "how many patch cycles hit this file without a refactor."
