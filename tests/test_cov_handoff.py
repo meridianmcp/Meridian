@@ -82,7 +82,12 @@ def test_completed_after_branches():
 def test_build_quick_start_goal_with_and_without_items():
     empty = handoff_module._build_quick_start_goal([])
     assert "Verify remaining work is complete" in empty
-    full = handoff_module._build_quick_start_goal([{"id": "abc123"}, {"id": "def456"}])
+    full = handoff_module._build_quick_start_goal(
+        [
+            {"id": "abc123", "title": "FEAT: first change"},
+            {"id": "def456", "title": "FEAT: second change"},
+        ]
+    )
     assert "abc123" in full and "def456" in full
     assert "complete_sprint_item()" in full
     # f628b880 — non-deferential executor directive leads the items /goal.
@@ -234,10 +239,11 @@ def test_build_quick_start_goal_all_manual_still_surfaces_todo():
     assert "m1" in goal              # present only in the note
 
 
-def test_infer_sprint_type_heuristics():
+def test_infer_sprint_type_heuristics(monkeypatch):
     """f9fa00e4 — sprint-type inference by count / item_group / title keyword."""
+    from meridian import handoff as h
     from meridian.handoff import _infer_sprint_type
-    assert _infer_sprint_type([]) == "feature"
+    assert _infer_sprint_type([]) == "general"
     assert _infer_sprint_type(
         [{"id": str(i), "title": "feat x"} for i in range(12)]) == "megasprint"
     assert _infer_sprint_type(
@@ -248,8 +254,36 @@ def test_infer_sprint_type_heuristics():
     assert _infer_sprint_type(
         [{"id": "1", "item_group": "ops"}, {"id": "2", "item_group": "release"}]) == "ops"
     assert _infer_sprint_type([{"id": "1", "title": "hotfix: crash on start"}]) == "hotfix"
+    assert _infer_sprint_type([{"id": "1", "title": "FEAT: add a button"}]) == "feature"
     assert _infer_sprint_type(
-        [{"id": "1", "title": "add button"}, {"id": "2", "title": "add page"}]) == "feature"
+        [{"id": "1", "title": "add button"}, {"id": "2", "title": "add page"}]) == "general"
+
+    general_goal = h._build_quick_start_goal(
+        [{"id": "1", "title": "add button"}]
+    )
+    assert '<sprint_type value="general">' in general_goal
+    assert "<test_gate_note>" not in general_goal
+    assert "pixi run test" not in general_goal
+    assert "deploy" not in general_goal
+
+    empty_goal = h._build_quick_start_goal([])
+    assert "pixi run test" not in empty_goal
+    assert "deploy" not in empty_goal
+
+    original_infer = h._infer_sprint_type
+
+    def _unexpected_infer(_items):
+        raise AssertionError("custom project criteria must skip inference")
+
+    monkeypatch.setattr(h, "_infer_sprint_type", _unexpected_infer)
+    custom_goal = h._build_quick_start_goal(
+        [{"id": "1", "title": "FEAT: still skipped"}],
+        completion_criteria_override="Ship when A < B & C > D.",
+    )
+    assert "Ship when A &lt; B &amp; C &gt; D." in custom_goal
+    assert '<sprint_type value="general">' in custom_goal
+    assert "<test_gate_note>" not in custom_goal
+    monkeypatch.setattr(h, "_infer_sprint_type", original_infer)
 
 
 def test_build_quick_start_goal_tags_sprint_type():
@@ -880,6 +914,9 @@ async def test_generate_handoff_bad_mode(db, tmp_path):
 async def test_generate_handoff_no_goal_uses_placeholder(db, tmp_path):
     """No goal set → handoff still renders with placeholder + warnings."""
     p = await db_module.create_project(db, "alpha-nogoal")
+    await db_module.upsert_sprint_version_description(
+        db, p["id"], "", "Project done when A < B & C > D."
+    )
     path, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True
     )
@@ -887,7 +924,18 @@ async def test_generate_handoff_no_goal_uses_placeholder(db, tmp_path):
     assert "No sprint name set" in content
     assert "No pending sprint items" in content
     assert "No pinned decisions" in content
+    assert "Project done when A &lt; B &amp; C &gt; D." in content
     assert path.endswith(f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md")
+
+    for mode in ("delta", "starter", "compact", "goal"):
+        _, mode_content, _ = await handoff_module.generate_handoff(
+            db,
+            p["id"],
+            str(tmp_path),
+            skip_ai_summary=True,
+            mode=mode,
+        )
+        assert "Project done when A &lt; B &amp; C &gt; D." in mode_content
 
 
 @pytest.mark.asyncio

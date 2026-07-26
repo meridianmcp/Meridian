@@ -593,6 +593,8 @@ Read-only: List workspace proposals (human-authored flashes of insight), newest 
 |-----------|------|----------|-------------|
 | `status` | string | optional | Filter to proposals in this status. Defaults to raw+investigating ('live') when omitted; use 'all' for every status. |
 | `tag` | string | optional | Substring filter on tags. |
+| `limit` | integer | optional | Maximum proposals to return (default 20, clamped to 1..100). |
+| `offset` | integer | optional | Zero-based pagination offset (default 0). |
 
 **Example:**
 ```

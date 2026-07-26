@@ -2934,6 +2934,8 @@ async def _migrate_pg_workspace_proposals(conn: PostgresConnection) -> None:
         f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
         f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
         ");"
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
+        "created_seq BIGSERIAL;"
         "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_tenant "
         "ON workspace_proposals(tenant_id)"
     )

@@ -1324,17 +1324,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "tags": {"type": "string", "description": "Optional comma-separated tags."}},
          "required": ["title", "body"]}},
     {"name": "get_workspace_proposals", "description":
-        "Read-only: List workspace proposals (human-authored flashes of insight), newest first. "
+        "Read-only: List a bounded page of workspace proposals (human-authored flashes of insight), newest first. "
         "When status is omitted, defaults to 'live' proposals only (raw + investigating) — "
         "terminal proposals (promoted/rejected) are excluded so the default view reflects "
         "what's actually still open. Pass status='all' to fetch every status, or an explicit "
         "status (including promoted/rejected) to filter to just that one. Optional tag "
-        "substring filter.",
+        "substring filter. Pagination defaults to 20 rows (maximum 100); pass offset to "
+        "fetch the next page.",
      "inputSchema": {"type": "object", "properties": {
          "status": {"type": "string", "enum": ["raw", "investigating", "promoted", "rejected", "all"],
                     "description": "Filter to proposals in this status. Defaults to raw+investigating "
                     "('live') when omitted; use 'all' for every status."},
-         "tag": {"type": "string", "description": "Substring filter on tags."}},
+         "tag": {"type": "string", "description": "Substring filter on tags."},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 100,
+                   "description": "Maximum proposals to return (default 20, clamped to 1..100)."},
+         "offset": {"type": "integer", "minimum": 0,
+                    "description": "Zero-based pagination offset (default 0)."}},
          "required": []}},
     {"name": "advance_proposal_status", "description":
         "Transition a workspace proposal through its lifecycle. Enforced transitions: "
@@ -1475,6 +1480,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string"},
          "title": {"type": "string"},
+         "notes": {"type": "string", "description": "Optional free-form context stored on the item at creation time."},
          "group": {"type": "string", "description": "Optional objective name for grouping."},
          "human_id": {"type": "string", "description": "Optional: person this item is assigned to."},
          "depends_on": {"type": "string", "description": "Sprint item id that must complete first."},

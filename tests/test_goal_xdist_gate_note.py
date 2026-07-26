@@ -27,7 +27,7 @@ _ITEM = {"id": "aabbccdd-0000-0000-0000-000000000001", "version": None}
 
 def test_xdist_gate_note_present_in_items_path():
     """The <test_gate_note> tag must appear when there are pending sprint items."""
-    goal = h._build_quick_start_goal([_ITEM])
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
     assert "<test_gate_note>" in goal, (
         "<test_gate_note> block missing from _build_quick_start_goal output"
     )
@@ -35,13 +35,13 @@ def test_xdist_gate_note_present_in_items_path():
 
 def test_xdist_gate_note_mentions_internalerror():
     """Guidance must explicitly mention the INTERNALERROR marker."""
-    goal = h._build_quick_start_goal([_ITEM])
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
     assert "INTERNALERROR" in goal
 
 
 def test_xdist_gate_note_mentions_stash_steps():
     """Triage steps (stash, isolate, restore) must be present in order."""
-    goal = h._build_quick_start_goal([_ITEM])
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
     # Check all three numbered steps appear
     assert "git stash" in goal
     assert "no:xdist" in goal
@@ -50,7 +50,7 @@ def test_xdist_gate_note_mentions_stash_steps():
 
 def test_xdist_gate_note_mentions_serial_fallback():
     """The guidance must recommend re-running without -n auto as the fallback."""
-    goal = h._build_quick_start_goal([_ITEM])
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
     # Both forms of the recommendation should be present
     assert "WITHOUT -n auto" in goal or "without -n auto" in goal
     assert "timeout=60" in goal
@@ -58,7 +58,7 @@ def test_xdist_gate_note_mentions_serial_fallback():
 
 def test_xdist_gate_note_is_closed_tag():
     """The XML tag must be properly closed — malformed XML would confuse parsers."""
-    goal = h._build_quick_start_goal([_ITEM])
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
     assert "</test_gate_note>" in goal
 
 
@@ -81,7 +81,7 @@ def test_empty_board_path_still_works():
 
 def test_xdist_gate_note_after_completion_criteria():
     """The test_gate_note must appear after the completion_criteria tag."""
-    goal = h._build_quick_start_goal([_ITEM])
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
     cc_pos = goal.find("</completion_criteria>")
     gate_pos = goal.find("<test_gate_note>")
     assert cc_pos != -1, "</completion_criteria> not found in goal"
@@ -103,7 +103,7 @@ def test_xdist_gate_note_after_completion_criteria():
 def test_xdist_gate_note_across_modes(execution_mode: str, completion_mode: str):
     """The <test_gate_note> must appear regardless of execution/completion mode."""
     goal = h._build_quick_start_goal(
-        [_ITEM],
+        [{**_ITEM, "title": "FEAT: implementation"}],
         execution_mode=execution_mode,
         completion_mode=completion_mode,
     )

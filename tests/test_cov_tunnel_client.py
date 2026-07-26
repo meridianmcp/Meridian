@@ -925,6 +925,74 @@ def test_probe_slot_health_ok_first_try(monkeypatch):
     _patch_probe_client(monkeypatch, [200])
     assert asyncio.run(tc._probe_slot_health(8808, attempts=2, delay=0)) is True
 
+    # ab956c80 — persistent mcp-proxy rejects a sessionless tools/list with
+    # HTTP 400 even while mcp-debugger is healthy. The probe must initialize a
+    # temporary session, list tools through it, and clean that session up.
+    calls = []
+
+    class _Resp:
+        def __init__(self, status, headers=None):
+            self.status_code = status
+            self.headers = headers or {}
+
+    class _PersistentClient:
+        def __init__(self, *a, **k):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        async def post(self, url, *, json, headers):
+            method = json["method"]
+            session_id = headers.get("Mcp-Session-Id")
+            calls.append((method, session_id))
+            if calls == [("tools/list", None)]:
+                return _Resp(400)
+            if method == "initialize":
+                return _Resp(200, {"mcp-session-id": "debug-session"})
+            if method == "notifications/initialized":
+                return _Resp(202)
+            return _Resp(200)
+        async def delete(self, url, *, headers):
+            calls.append(("DELETE", headers.get("Mcp-Session-Id")))
+            return _Resp(200)
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", _PersistentClient)
+
+    assert asyncio.run(tc._probe_slot_health(8821, attempts=1, delay=0)) is True
+    assert calls == [
+        ("tools/list", None),
+        ("initialize", None),
+        ("notifications/initialized", "debug-session"),
+        ("tools/list", "debug-session"),
+        ("DELETE", "debug-session"),
+    ]
+
+
+def test_probe_slot_health_bounds_whole_persistent_handshake(monkeypatch):
+    """One slow handshake cannot multiply the 10s per-attempt startup budget."""
+    class _SlowClient:
+        def __init__(self, *a, **k):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        async def post(self, *a, **k):
+            await asyncio.sleep(1)
+            return _FakeProbeResp(400)
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", _SlowClient)
+    monkeypatch.setattr(tc, "_SLOT_HEALTH_ATTEMPT_TIMEOUT", 0.02)
+
+    started = time.monotonic()
+    assert asyncio.run(
+        tc._probe_slot_health(8821, attempts=1, delay=0)
+    ) is False
+    assert time.monotonic() - started < 0.2
+
 
 def test_probe_slot_health_retries_then_succeeds(monkeypatch):
     # First a connection error, then a 200 on the retry.

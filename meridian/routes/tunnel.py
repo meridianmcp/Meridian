@@ -192,6 +192,29 @@ _pending_zotero_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_outputs_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_debug_reqs: dict[str, asyncio.Future[dict]] = {}
 
+# ab956c80 follow-up — Streamable HTTP MCP servers such as persistent
+# ``mcp-proxy`` require initialize/initialized before real tools traffic. Keep
+# one bridge-owned session per live (tenant, slot) socket. The socket identity
+# prevents a reconnect from accidentally reusing a session owned by the old
+# local proxy process; the idle TTL bounds stale process memory even if a
+# disconnect callback is missed.
+_TUNNEL_MCP_SESSION_INIT_BUDGET = 10.0
+_TUNNEL_MCP_SESSION_IDLE_TTL = 30 * 60.0
+_tunnel_mcp_sessions: dict[tuple[str, str], tuple[str, int, float]] = {}
+_tunnel_mcp_session_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def _clear_tunnel_mcp_session(
+    tenant_id: str, label: str, *, socket: object | None = None,
+) -> None:
+    """Forget a cached inner MCP session, optionally only for one socket."""
+    key = (tenant_id, label)
+    cached = _tunnel_mcp_sessions.get(key)
+    if cached is None:
+        return
+    if socket is None or cached[1] == id(socket):
+        _tunnel_mcp_sessions.pop(key, None)
+
 # 0e973e52 — run_verification: per-request futures for run_cmd control messages
 # sent over the FS WebSocket. The FS receive loop resolves these when the client
 # sends back a {"type": "run_cmd_result", "id": "...", ...} message. Keyed by
@@ -459,6 +482,7 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
             pass
 
     _tunnel_sockets[tenant_id] = ws
+    _clear_tunnel_mcp_session(tenant_id, "fs")
     _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd — reconnect: rebuild tool routes
     # af5b5739 — record THIS Fly instance as the socket owner so a request that
     # lands on a sibling instance can Fly-replay to us (no-op off Fly).
@@ -518,6 +542,7 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
         _log.debug("tunnel: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
         _tunnel_sockets.pop(tenant_id, None)
+        _clear_tunnel_mcp_session(tenant_id, "fs", socket=ws)
         _clear_slot_health(tenant_id, "fs")
         # af5b5739 — forget our ownership claim only if it's still ours (a newer
         # connection on another instance may already have re-claimed the tenant).
@@ -578,6 +603,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
             pass
 
     _tunnel_code_sockets[tenant_id] = ws
+    _clear_tunnel_mcp_session(tenant_id, "code")
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that misses can Fly-replay to us (no-op off Fly). af5b5739 wired
     # this only for the FS slot (tunnel_ws); this is the equivalent for code.
@@ -618,6 +644,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
         _log.debug("tunnel-code: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
         _tunnel_code_sockets.pop(tenant_id, None)
+        _clear_tunnel_mcp_session(tenant_id, "code", socket=ws)
         _clear_slot_health(tenant_id, "code")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
         clear_tenant_owner_instance(tenant_id, owner_instance)
@@ -665,6 +692,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
             pass
 
     _tunnel_extract_sockets[tenant_id] = ws
+    _clear_tunnel_mcp_session(tenant_id, "extract")
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that misses an extract request can Fly-replay to us (no-op off
     # Fly). af5b5739 wired this only for the FS slot; this is the extract fix.
@@ -705,6 +733,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
         _log.debug("tunnel-extract: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
         _tunnel_extract_sockets.pop(tenant_id, None)
+        _clear_tunnel_mcp_session(tenant_id, "extract", socket=ws)
         _clear_slot_health(tenant_id, "extract")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
         clear_tenant_owner_instance(tenant_id, owner_instance)
@@ -761,6 +790,7 @@ async def _serve_tunnel_ws(
             pass
 
     sockets[tenant_id] = ws
+    _clear_tunnel_mcp_session(tenant_id, label)
     # 4331f9cd — a (re)connect may change the slot's tool set; drop the cached
     # routes so the next tools/list rebuilds them for this tenant.
     _tunnel_tool_routes.pop(tenant_id, None)
@@ -808,6 +838,7 @@ async def _serve_tunnel_ws(
         _log.debug("tunnel-%s: tenant %s disconnected: %s", label, tenant_id[:8], exc)
     finally:
         sockets.pop(tenant_id, None)
+        _clear_tunnel_mcp_session(tenant_id, label, socket=ws)
         _clear_slot_health(tenant_id, label)
         # 4331f9cd — slot dropped; if no tunnel remains, drop cached routes so the
         # next tools/list rebuilds cleanly.
@@ -1000,6 +1031,8 @@ async def _do_proxy(
     sockets: dict[str, WebSocket],
     pending: dict[str, "asyncio.Future[dict]"],
     label: str,
+    *,
+    timeout: float | None = None,
 ) -> Response:
     """Forward one HTTP request over the given tunnel socket and return the response."""
     ws = sockets.get(tenant_id)
@@ -1052,7 +1085,10 @@ async def _do_proxy(
 
     try:
         await ws.send_json(payload)
-        resp_msg = await asyncio.wait_for(fut, timeout=_PROXY_TIMEOUT)
+        resp_msg = await asyncio.wait_for(
+            fut,
+            timeout=_PROXY_TIMEOUT if timeout is None else max(0.001, timeout),
+        )
     except asyncio.TimeoutError:
         pending.pop(req_id, None)
         return Response(
@@ -2928,23 +2964,139 @@ async def _tunnel_jsonrpc(
     instead of the actionable underlying reason.
     """
     sockets, pending = _label_maps(label)
-    if tenant_id not in sockets:
+    if sockets.get(tenant_id) is None:
         return None
-    body = json.dumps({
-        "jsonrpc": "2.0",
-        "id": "meridian-bridge",
-        "method": method,
-        "params": params or {},
-    }).encode()
-    headers: dict[str, str] = {
-        "content-type": "application/json",
-        "accept": "application/json, text/event-stream",
-    }
-    if repo_path:
-        headers["x-meridian-repo-path"] = repo_path
-    resp = await _do_proxy(
-        tenant_id, "POST", "/mcp", "", headers, body, sockets, pending, label,
+    key = (tenant_id, label)
+
+    def _cached_session() -> str | None:
+        cached = _tunnel_mcp_sessions.get(key)
+        if cached is None:
+            return None
+        active_socket = sockets.get(tenant_id)
+        session_id, socket_id, expires_at = cached
+        if (
+            active_socket is None
+            or socket_id != id(active_socket)
+            or expires_at <= time.monotonic()
+        ):
+            _tunnel_mcp_sessions.pop(key, None)
+            return None
+        _tunnel_mcp_sessions[key] = (
+            session_id, socket_id,
+            time.monotonic() + _TUNNEL_MCP_SESSION_IDLE_TTL,
+        )
+        return session_id
+
+    async def _send(
+        rpc_method: str,
+        rpc_params: dict | None,
+        *,
+        rpc_id: str | None,
+        session_id: str | None = None,
+        deadline: float | None = None,
+    ) -> Response:
+        payload: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "method": rpc_method,
+            "params": rpc_params or {},
+        }
+        if rpc_id is not None:
+            payload["id"] = rpc_id
+        headers: dict[str, str] = {
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+        }
+        if repo_path:
+            headers["x-meridian-repo-path"] = repo_path
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+        proxy_kwargs: dict[str, float] = {}
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("tunnel MCP session initialization timed out")
+            proxy_kwargs["timeout"] = remaining
+        return await _do_proxy(
+            tenant_id,
+            "POST",
+            "/mcp",
+            "",
+            headers,
+            json.dumps(payload).encode(),
+            sockets,
+            pending,
+            label,
+            **proxy_kwargs,
+        )
+
+    async def _initialize_session() -> str:
+        deadline = time.monotonic() + _TUNNEL_MCP_SESSION_INIT_BUDGET
+        session_socket = sockets.get(tenant_id)
+        if session_socket is None:
+            raise RuntimeError(f"{label} tunnel not connected")
+        init_resp = await _send(
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "meridian-tunnel-bridge",
+                    "version": "1",
+                },
+            },
+            rpc_id="meridian-bridge-init",
+            deadline=deadline,
+        )
+        if init_resp.status_code >= 400:
+            raise RuntimeError(_proxy_error_message(init_resp))
+        init_payload = _parse_mcp_payload(init_resp.body)
+        if init_payload and init_payload.get("error"):
+            raise RuntimeError(str(init_payload["error"]))
+        session_id = init_resp.headers.get("mcp-session-id")
+        if not session_id:
+            raise RuntimeError(
+                "tunnel MCP initialize succeeded without Mcp-Session-Id"
+            )
+        notified = await _send(
+            "notifications/initialized",
+            {},
+            rpc_id=None,
+            session_id=session_id,
+            deadline=deadline,
+        )
+        if notified.status_code >= 400:
+            raise RuntimeError(_proxy_error_message(notified))
+        if sockets.get(tenant_id) is not session_socket:
+            raise RuntimeError(
+                "tunnel reconnected during MCP session initialization — retry"
+            )
+        _tunnel_mcp_sessions[key] = (
+            session_id,
+            id(session_socket),
+            time.monotonic() + _TUNNEL_MCP_SESSION_IDLE_TTL,
+        )
+        return session_id
+
+    session_id = _cached_session()
+    resp = await _send(
+        method, params, rpc_id="meridian-bridge", session_id=session_id,
     )
+    # A missing/expired Streamable HTTP session is an HTTP 400/404. Ordinary
+    # JSON-RPC method errors remain HTTP 200 with an ``error`` payload, so these
+    # statuses are safe to treat as a session negotiation/recovery signal.
+    if resp.status_code in (400, 404):
+        lock = _tunnel_mcp_session_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _tunnel_mcp_session_locks[key] = lock
+        async with lock:
+            current = _cached_session()
+            if current is None or current == session_id:
+                _tunnel_mcp_sessions.pop(key, None)
+                current = await _initialize_session()
+        resp = await _send(
+            method, params, rpc_id="meridian-bridge", session_id=current,
+        )
     if resp.status_code >= 400:
         raise RuntimeError(_proxy_error_message(resp))
     return _parse_mcp_payload(resp.body)

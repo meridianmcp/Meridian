@@ -88,6 +88,7 @@ async def handle_add_sprint_item(
     if not args.get("project_id"):
         return {"error": "project_id is required (or pass project_name)"}
     validate_input_size(args.get("title"), "sprint item title", 500)
+    validate_input_size(args.get("notes"), "sprint item notes", 50_000)
     # 7e212375 — codebase drift check: if the title looks already-implemented
     # (3+ keyword overlap with a specific migration or a recent commit),
     # block with a warning unless force=true. Closes the "adding items for
@@ -129,6 +130,7 @@ async def handle_add_sprint_item(
         _new_item = await db_module.add_sprint_item(
             db, args["project_id"], args["version"], args["title"],
             group=args.get("group"),
+            notes=args.get("notes"),
             human_id=args.get("human_id"),
             depends_on=args.get("depends_on"),
             failure_mode=args.get("failure_mode"),

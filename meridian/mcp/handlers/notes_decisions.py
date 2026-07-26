@@ -2027,6 +2027,8 @@ async def handle_get_workspace_proposals(
     return await db_module.get_workspace_proposals(
         db, status=args.get("status"), tag=args.get("tag"),
         tenant_id=_mcp_tenant_id,
+        limit=int(args.get("limit", 20)),
+        offset=int(args.get("offset", 0)),
     )
 
 
