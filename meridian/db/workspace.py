@@ -415,6 +415,7 @@ async def add_workspace_proposal(
     actor: str | None = None,
     session_id: str | None = None,
     source: str | None = "workspace",
+    family_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a workspace_proposals row with status='raw'.
 
@@ -434,9 +435,10 @@ async def add_workspace_proposal(
         db, tenant_id, _sprint_item_nickname_base(title, pid)
     )
     await db.execute(
-        "INSERT INTO workspace_proposals (id, title, body, tags, tenant_id, slug, nickname) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (pid, title, body, tags, tenant_id, _slug, _nickname),
+        "INSERT INTO workspace_proposals "
+        "(id, title, body, tags, tenant_id, family_id, slug, nickname) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (pid, title, body, tags, tenant_id, family_id, _slug, _nickname),
     )
     await _append_proposal_event(
         db,
@@ -501,6 +503,11 @@ async def append_proposal_update(
             else (proposal["tenant_id"] if proposal is not None else None)
         ),
     )
+    await db.execute(
+        "UPDATE workspace_proposals SET last_activity_at = datetime('now') "
+        f"WHERE id = ?{scope_sql}",
+        [proposal_id, *scope_params],
+    )
     await db.commit()
     return event
 
@@ -512,6 +519,8 @@ async def get_workspace_proposals(
     tenant_id: str | None = None,
     limit: int = 20,
     offset: int = 0,
+    family_id: str | None = None,
+    sort_by: str = "activity",
 ) -> list[dict[str, Any]]:
     """Return a bounded page of workspace proposals, newest first.
 
@@ -544,6 +553,9 @@ async def get_workspace_proposals(
     if tag:
         clauses.append("tags LIKE ?")
         params.append(f"%{tag}%")
+    if family_id:
+        clauses.append("family_id = ?")
+        params.append(family_id)
     scope, scope_params = _ws_tenant_clause(tenant_id)
     if scope:
         clauses.append(scope)
@@ -552,9 +564,14 @@ async def get_workspace_proposals(
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
     params.extend((limit, offset))
+    order_by = (
+        "COALESCE(last_activity_at, created_at) DESC, created_seq DESC"
+        if sort_by in {"activity", "last_activity"}
+        else "created_at DESC, created_seq DESC"
+    )
     async with db.execute(
         f"SELECT * FROM workspace_proposals{where} "
-        "ORDER BY created_at DESC, created_seq DESC LIMIT ? OFFSET ?",
+        f"ORDER BY {order_by} LIMIT ? OFFSET ?",
         params,
     ) as cur:
         rows = await cur.fetchall()
@@ -604,7 +621,8 @@ async def advance_workspace_proposal_status(
             f"Allowed from '{current}': {sorted(allowed) or '(none)'}"
         )
     await db.execute(
-        f"UPDATE workspace_proposals SET status = ?, updated_at = datetime('now') WHERE id = ?{scope_sql}",
+        f"UPDATE workspace_proposals SET status = ?, updated_at = datetime('now'), "
+        f"last_activity_at = datetime('now') WHERE id = ?{scope_sql}",
         [new_status, proposal_id, *scope_params],
     )
     event_type = "resumed" if current == "paused" and new_status in {

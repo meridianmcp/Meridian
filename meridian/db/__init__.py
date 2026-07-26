@@ -811,8 +811,10 @@ CREATE TABLE IF NOT EXISTS workspace_proposals (
         )),
     promoted_to_sprint_item_id TEXT,
     tenant_id TEXT,
+    family_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_activity_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- v0.2.2 proposal lifecycle — immutable evidence and decision history.

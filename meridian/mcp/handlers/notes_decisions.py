@@ -2013,6 +2013,7 @@ async def handle_add_workspace_proposal(
         db, args["title"], args["body"],
         tags=args.get("tags"),
         tenant_id=_mcp_tenant_id,
+        family_id=args.get("family_id"),
     )
 
 
@@ -2029,6 +2030,8 @@ async def handle_get_workspace_proposals(
         tenant_id=_mcp_tenant_id,
         limit=int(args.get("limit", 20)),
         offset=int(args.get("offset", 0)),
+        family_id=args.get("family_id"),
+        sort_by=args.get("sort_by", "activity"),
     )
 
 

@@ -47,6 +47,41 @@ async def test_proposal_events_schema_supports_append_only_provenance(db):
 
 
 @pytest.mark.asyncio
+async def test_proposal_schema_supports_family_and_activity_discovery(db):
+    columns = await _table_columns(db, "workspace_proposals")
+    assert columns >= {"family_id", "last_activity_at"}
+
+
+@pytest.mark.asyncio
+async def test_proposal_discovery_filters_family_and_sorts_by_activity(db):
+    first = await db_module.add_workspace_proposal(
+        db, "First", "body", family_id="family-a"
+    )
+    second = await db_module.add_workspace_proposal(
+        db, "Second", "body", family_id="family-a"
+    )
+    await db_module.add_workspace_proposal(
+        db, "Other family", "body", family_id="family-b"
+    )
+    await db.execute(
+        "UPDATE workspace_proposals SET last_activity_at = ? WHERE id = ?",
+        ("2026-01-01 00:00:01", first["id"]),
+    )
+    await db.execute(
+        "UPDATE workspace_proposals SET last_activity_at = ? WHERE id = ?",
+        ("2026-01-01 00:00:02", second["id"]),
+    )
+    await db.commit()
+
+    rows = await db_module.get_workspace_proposals(
+        db, family_id="family-a", sort_by="activity"
+    )
+
+    assert [row["id"] for row in rows] == [second["id"], first["id"]]
+    assert {row["family_id"] for row in rows} == {"family-a"}
+
+
+@pytest.mark.asyncio
 async def test_proposal_events_preserve_ordered_history_and_payload(db):
     """Multiple event rows retain their order and structured provenance."""
     proposal = await db_module.add_workspace_proposal(db, "P1", "body")

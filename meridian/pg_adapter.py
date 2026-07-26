@@ -910,8 +910,10 @@ CREATE TABLE IF NOT EXISTS workspace_proposals (
     status TEXT NOT NULL DEFAULT 'raw',
     promoted_to_sprint_item_id TEXT,
     tenant_id TEXT,
+    family_id TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS}),
-    updated_at TEXT NOT NULL DEFAULT ({_TS})
+    updated_at TEXT NOT NULL DEFAULT ({_TS}),
+    last_activity_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
 -- 8c147109 — session_activity: lightweight ring-buffer heartbeat feed.
@@ -2931,14 +2933,23 @@ async def _migrate_pg_workspace_proposals(conn: PostgresConnection) -> None:
         "    status TEXT NOT NULL DEFAULT 'raw',"
         "    promoted_to_sprint_item_id TEXT,"
         "    tenant_id TEXT,"
+        "    family_id TEXT,"
         f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
-        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    last_activity_at TEXT NOT NULL DEFAULT ({_TS})"
         ");"
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS family_id TEXT;"
+        f"ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ NOT NULL DEFAULT ({_TS});"
+        "UPDATE workspace_proposals SET last_activity_at = COALESCE(last_activity_at, created_at);"
         "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
         "created_seq BIGSERIAL;"
         "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_tenant "
         "ON workspace_proposals(tenant_id)"
         ";"
+        "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_activity "
+        "ON workspace_proposals(tenant_id, last_activity_at, created_seq);"
+        "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_family "
+        "ON workspace_proposals(tenant_id, family_id);"
         "CREATE TABLE IF NOT EXISTS proposal_events ("
         "    id TEXT PRIMARY KEY,"
         "    proposal_id TEXT NOT NULL,"

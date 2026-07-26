@@ -2638,8 +2638,10 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
                     )),
                 promoted_to_sprint_item_id TEXT,
                 tenant_id TEXT,
+                family_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
                 created_seq INTEGER,
                 slug TEXT,
                 nickname TEXT,
@@ -2650,13 +2652,16 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
         preserved_columns = (
             "id", "title", "body", "tags", "status",
             "promoted_to_sprint_item_id", "tenant_id", "created_at",
-            "updated_at", "created_seq", "slug", "nickname",
+            "family_id", "updated_at", "last_activity_at", "created_seq",
+            "slug", "nickname",
             "github_issue_number", "github_issue_url",
         )
         expressions = []
         for column in preserved_columns:
             if column == "created_seq" and column not in legacy_columns:
                 expressions.append("rowid")
+            elif column == "last_activity_at" and column not in legacy_columns:
+                expressions.append("created_at")
             elif column in legacy_columns:
                 expressions.append(column)
             else:
@@ -2667,6 +2672,16 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
             "FROM workspace_proposals_legacy_v022"
         )
         await db.execute("DROP TABLE workspace_proposals_legacy_v022")
+    await _migrate_add_column_if_missing(
+        db, "workspace_proposals", "family_id", "TEXT"
+    )
+    await _migrate_add_column_if_missing(
+        db, "workspace_proposals", "last_activity_at", "TEXT"
+    )
+    await db.execute(
+        "UPDATE workspace_proposals SET last_activity_at = created_at "
+        "WHERE last_activity_at IS NULL"
+    )
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_tenant "
         "ON workspace_proposals(tenant_id)"
@@ -2722,6 +2737,14 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_proposal_events_tenant_created_at "
         "ON proposal_events(tenant_id, created_at)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_activity "
+        "ON workspace_proposals(tenant_id, last_activity_at, created_seq)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_family "
+        "ON workspace_proposals(tenant_id, family_id)"
     )
     await db.commit()
 
