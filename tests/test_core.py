@@ -303,9 +303,9 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     # 5abf3e12 — empty-board /goal is XML-structured: the verify text is the
     # <executor_directive> body now, not inline after "/goal ".
     assert "<executor_directive>Verify remaining work is complete.</executor_directive>" in content
-    assert "pixi run test passes 2150+" in content
-    # 0d5453bc — empty-board goal must also state the single-run constraint.
-    assert "run once at the end, not per item" in content
+    assert "verified against its stated scope" in content
+    assert "pixi run test" not in content
+    assert "<test_gate_note>" not in content
     assert "## Resume Instructions" in content
     on_disk = tmp_path / f"{handoff_module.handoff_file_stem(p['id'])}_handoff.md"
     assert on_disk.exists()
