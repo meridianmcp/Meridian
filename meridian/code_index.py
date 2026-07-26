@@ -62,10 +62,12 @@ def search_code_semantic(
     (``normalize_root_dir`` / ``get_code_index`` / ``_vectors_enabled``,
     re-exported above); this wrapper adds nothing but the guard + orchestration.
     """
+    from meridian_codeindex import code_index as impl
+
     if os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes"):
         return {
             "root_dir": root_dir, "query": query, "hits": [],
-            "total_indexed": 0, "vectors_enabled": _vectors_enabled(),
+            "total_indexed": 0, "vectors_enabled": impl._vectors_enabled(),
             "error": (
                 "search_code_semantic requires access to YOUR local filesystem "
                 "and cannot run on hosted Meridian -- the server has no access "
@@ -78,13 +80,13 @@ def search_code_semantic(
     # handed to us in a quoted or ~-prefixed shape resolves; report the resolved
     # path back so the caller sees exactly what was searched. "does not exist" is
     # then returned ONLY when the normalized path truly is not a directory.
-    root_dir = normalize_root_dir(root_dir)
+    root_dir = impl.normalize_root_dir(root_dir)
     result: dict[str, Any] = {
         "root_dir": root_dir,
         "query": query,
         "hits": [],
         "total_indexed": 0,
-        "vectors_enabled": _vectors_enabled(),
+        "vectors_enabled": impl._vectors_enabled(),
     }
     if not query or not str(query).strip():
         result["error"] = "query is required"
@@ -92,7 +94,7 @@ def search_code_semantic(
     if not root_dir or not os.path.isdir(root_dir):
         result["error"] = f"root_dir does not exist: {root_dir}"
         return result
-    idx = get_code_index(root_dir, db_path=db_path)
+    idx = impl.get_code_index(root_dir, db_path=db_path)
     if reindex:
         idx.reindex()
     result["total_indexed"] = idx.count()
