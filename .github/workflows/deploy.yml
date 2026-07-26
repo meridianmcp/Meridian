@@ -1,5 +1,15 @@
 name: Deploy to Fly.io
 
+# f4ab2787 — test.yml is the canonical dev promotion gate. Its entire
+# workflow conclusion (tests, blocking lint, frontend, docs, and UX) controls
+# auto-promotion. The inline jobs below are supplemental preview/release checks
+# for push, tag, and dispatch paths; they are intentionally not equivalent and
+# must not be read as proof that canonical dev CI passed. workflow_run skips
+# them because test.yml already ran.
+#
+# Regression evidence: canonical run 30182367824 failed while direct-main
+# deploy run 30182376358 passed its narrower supplemental checks.
+
 # Pipeline: dev push → test → preview → smoke → merge main → prod (with rollback)
 # Production deploys ONLY happen when:
 #   (a) dev branch smoke tests pass and auto-merge fires, OR
@@ -50,6 +60,7 @@ env:
 jobs:
   # ─── 1. Tests (skipped entirely for hotfix) ────────────────────────────────
   test:
+    name: Supplemental preview/release test gate
     runs-on: ubuntu-latest
     # Skip on the workflow_run auto-promote event — test.yml already ran the full
     # suite; re-running it here would be wasteful and pointless. (427b7902)
@@ -81,6 +92,7 @@ jobs:
           fi
 
   playwright-tests:
+    name: Supplemental Playwright signal
     runs-on: ubuntu-latest
     continue-on-error: true
     # Skip on the workflow_run auto-promote event (test.yml already covers UX). (427b7902)
