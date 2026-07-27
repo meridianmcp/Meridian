@@ -1,6 +1,6 @@
 """Tests for 2a06a840 — xdist INTERNALERROR guidance in the megasprint /goal.
 
-When pixi run test -n auto produces a pytest-xdist worker crash (INTERNALERROR)
+When pixi run test -n 3 produces a pytest-xdist worker crash (INTERNALERROR)
 rather than a normal per-test FAILED line, executors must not misattribute the
 infra flake as a real regression. _build_quick_start_goal now injects a
 <test_gate_note> block with explicit triage steps so this is documented inline
@@ -49,10 +49,10 @@ def test_xdist_gate_note_mentions_stash_steps():
 
 
 def test_xdist_gate_note_mentions_serial_fallback():
-    """The guidance must recommend re-running without -n auto as the fallback."""
+    """The guidance must recommend re-running without -n 3 as the fallback."""
     goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
     # Both forms of the recommendation should be present
-    assert "WITHOUT -n auto" in goal or "without -n auto" in goal
+    assert "WITHOUT -n 3" in goal or "without -n 3" in goal
     assert "timeout=60" in goal
 
 

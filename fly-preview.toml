@@ -1,3 +1,6 @@
+# meridian-preview -- the "nightly" channel: kept in sync with the latest
+# dev commit by the deploy-preview job in .github/workflows/deploy.yml
+# (cd9c2bf7). Do not repoint any job here to redeploy from main/prod.
 app = "meridian-preview"
 primary_region = "iad"
 

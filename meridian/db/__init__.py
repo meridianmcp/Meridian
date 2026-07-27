@@ -805,11 +805,34 @@ CREATE TABLE IF NOT EXISTS workspace_proposals (
     body TEXT NOT NULL,
     tags TEXT,
     status TEXT NOT NULL DEFAULT 'raw'
-        CHECK (status IN ('raw', 'investigating', 'promoted', 'rejected')),
+        CHECK (status IN (
+            'raw', 'investigating', 'paused', 'promoted', 'rejected',
+            'closed', 'superseded'
+        )),
     promoted_to_sprint_item_id TEXT,
     tenant_id TEXT,
+    family_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_activity_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- v0.2.2 proposal lifecycle — immutable evidence and decision history.
+-- Events are append-only records owned by a proposal.  The flexible payload
+-- keeps the initial schema stable while later lifecycle features add typed
+-- evidence, decisions, pointers, and resume metadata.
+CREATE TABLE IF NOT EXISTS proposal_events (
+    id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL,
+    tenant_id TEXT,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    payload TEXT,
+    actor TEXT,
+    session_id TEXT,
+    source TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- 356d6ac8 — file_patch_counters: structural-degradation early-warning signal.
@@ -10481,6 +10504,7 @@ from .workspace import (  # noqa: F401
     delete_workspace_decision,
     # Public workspace-proposal functions
     add_workspace_proposal,
+    append_proposal_update,
     get_workspace_proposals,
     advance_workspace_proposal_status,
     promote_workspace_proposal,

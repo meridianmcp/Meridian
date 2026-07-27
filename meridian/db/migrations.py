@@ -2605,6 +2605,83 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )"""
     )
+    # v0.2.2 — expand the lifecycle state machine for databases created before
+    # resumable proposal states existed. SQLite cannot alter a CHECK constraint
+    # in place, so rebuild this one small table while preserving all known
+    # columns (including optional columns added by later migrations).
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'workspace_proposals'"
+    ) as cur:
+        schema_row = await cur.fetchone()
+    schema_sql = str(schema_row["sql"] if schema_row is not None else "")
+    if "paused" not in schema_sql.lower():
+        async with db.execute("PRAGMA table_info(workspace_proposals)") as cur:
+            legacy_rows = await cur.fetchall()
+        legacy_columns = {row["name"] for row in legacy_rows}
+        await db.execute("DROP TRIGGER IF EXISTS trg_workspace_proposals_created_seq")
+        await db.execute("DROP INDEX IF EXISTS idx_workspace_proposals_tenant")
+        await db.execute(
+            "ALTER TABLE workspace_proposals RENAME TO "
+            "workspace_proposals_legacy_v022"
+        )
+        await db.execute(
+            """CREATE TABLE workspace_proposals (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                tags TEXT,
+                status TEXT NOT NULL DEFAULT 'raw'
+                    CHECK (status IN (
+                        'raw', 'investigating', 'paused', 'promoted',
+                        'rejected', 'closed', 'superseded'
+                    )),
+                promoted_to_sprint_item_id TEXT,
+                tenant_id TEXT,
+                family_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_seq INTEGER,
+                slug TEXT,
+                nickname TEXT,
+                github_issue_number INTEGER,
+                github_issue_url TEXT
+            )"""
+        )
+        preserved_columns = (
+            "id", "title", "body", "tags", "status",
+            "promoted_to_sprint_item_id", "tenant_id", "created_at",
+            "family_id", "updated_at", "last_activity_at", "created_seq",
+            "slug", "nickname",
+            "github_issue_number", "github_issue_url",
+        )
+        expressions = []
+        for column in preserved_columns:
+            if column == "created_seq" and column not in legacy_columns:
+                expressions.append("rowid")
+            elif column == "last_activity_at" and column not in legacy_columns:
+                expressions.append("created_at")
+            elif column in legacy_columns:
+                expressions.append(column)
+            else:
+                expressions.append("NULL")
+        await db.execute(
+            "INSERT INTO workspace_proposals (" + ", ".join(preserved_columns) + ") "
+            "SELECT " + ", ".join(expressions) + " "
+            "FROM workspace_proposals_legacy_v022"
+        )
+        await db.execute("DROP TABLE workspace_proposals_legacy_v022")
+    await _migrate_add_column_if_missing(
+        db, "workspace_proposals", "family_id", "TEXT"
+    )
+    await _migrate_add_column_if_missing(
+        db, "workspace_proposals", "last_activity_at", "TEXT"
+    )
+    await db.execute(
+        "UPDATE workspace_proposals SET last_activity_at = created_at "
+        "WHERE last_activity_at IS NULL"
+    )
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_tenant "
         "ON workspace_proposals(tenant_id)"
@@ -2634,6 +2711,40 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
             )
             WHERE id = NEW.id;
         END"""
+    )
+    # v0.2.2 proposal lifecycle — append-only evidence, decision, and
+    # transition history.  Keep this in the guarded migration so upgrades of
+    # existing databases receive the same table as fresh CREATE_TABLES DBs.
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS proposal_events (
+            id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL,
+            tenant_id TEXT,
+            sequence INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            payload TEXT,
+            actor TEXT,
+            session_id TEXT,
+            source TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proposal_events_proposal_sequence "
+        "ON proposal_events(proposal_id, sequence)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proposal_events_tenant_created_at "
+        "ON proposal_events(tenant_id, created_at)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_activity "
+        "ON workspace_proposals(tenant_id, last_activity_at, created_seq)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_family "
+        "ON workspace_proposals(tenant_id, family_id)"
     )
     await db.commit()
 

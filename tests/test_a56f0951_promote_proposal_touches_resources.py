@@ -138,7 +138,7 @@ async def test_promote_proposal_sets_touches_resources_when_files_match(db):
 
     with patch("meridian.db.workspace.subprocess.run", return_value=mock_result):
         result = await db_module.promote_workspace_proposal(
-            db, proposal["id"], proj["id"]
+            db, proposal["id"], proj["id"], infer_touches_resources=True
         )
 
     si_id = result["sprint_item_id"]
@@ -170,7 +170,7 @@ async def test_promote_proposal_sets_notes_flag_when_no_files_match(db):
 
     with patch("meridian.db.workspace.subprocess.run", return_value=mock_result):
         result = await db_module.promote_workspace_proposal(
-            db, proposal["id"], proj["id"]
+            db, proposal["id"], proj["id"], infer_touches_resources=True
         )
 
     # touches_resources should be None/empty
@@ -193,7 +193,7 @@ async def test_promote_proposal_sets_notes_when_git_unavailable(db):
 
     with patch("meridian.db.workspace.subprocess.run", side_effect=OSError("no git")):
         result = await db_module.promote_workspace_proposal(
-            db, proposal["id"], proj["id"]
+            db, proposal["id"], proj["id"], infer_touches_resources=True
         )
 
     notes = result.get("sprint_item_notes")
@@ -215,7 +215,7 @@ async def test_promote_proposal_sprint_item_db_row_has_touches_resources(db):
 
     with patch("meridian.db.workspace.subprocess.run", return_value=mock_result):
         result = await db_module.promote_workspace_proposal(
-            db, proposal["id"], proj["id"]
+            db, proposal["id"], proj["id"], infer_touches_resources=True
         )
 
     si_id = result["sprint_item_id"]
@@ -242,7 +242,7 @@ async def test_promote_proposal_sprint_item_db_row_has_notes_flag(db):
 
     with patch("meridian.db.workspace.subprocess.run", return_value=mock_result):
         result = await db_module.promote_workspace_proposal(
-            db, proposal["id"], proj["id"]
+            db, proposal["id"], proj["id"], infer_touches_resources=True
         )
 
     si_id = result["sprint_item_id"]
@@ -277,3 +277,42 @@ async def test_promote_proposal_still_sets_status_pending_and_proposal_promoted(
     item = await db_module.get_sprint_item(db, si_id)
     assert item is not None
     assert item["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_promote_proposal_does_not_guess_resources_or_file_github_by_default(db):
+    proj = await db_module.create_project(db, "test-project-promote-explicit")
+    await db_module.update_project_settings(db, proj["id"], github_repo="acme/widgets")
+    proposal = await db_module.add_workspace_proposal(
+        db, "Dashboard rendering fix", "Fix the dashboard layout rendering"
+    )
+
+    with patch("meridian.db.workspace.subprocess.run") as run:
+        result = await db_module.promote_workspace_proposal(
+            db, proposal["id"], proj["id"]
+        )
+
+    run.assert_not_called()
+    assert result["sprint_item_touches_resources"] is None
+    assert result["github_issue_hitl"] is None
+
+
+@pytest.mark.asyncio
+async def test_promote_proposal_accepts_explicit_resources_without_inference(db):
+    proj = await db_module.create_project(db, "test-project-promote-explicit-resources")
+    proposal = await db_module.add_workspace_proposal(
+        db, "Workspace persistence", "Keep the proposal history durable"
+    )
+
+    with patch("meridian.db.workspace.subprocess.run") as run:
+        result = await db_module.promote_workspace_proposal(
+            db,
+            proposal["id"],
+            proj["id"],
+            touches_resources=["file:meridian/db/workspace.py"],
+        )
+
+    run.assert_not_called()
+    assert json.loads(result["sprint_item_touches_resources"]) == [
+        "file:meridian/db/workspace.py"
+    ]

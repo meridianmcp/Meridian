@@ -49,7 +49,10 @@ async def test_promote_fires_hitl_when_code_related_and_repo_connected(db):
         "meridian.db.workspace.subprocess.run",
         return_value=_mock_git_result("meridian/static/dashboard.js\n"),
     ):
-        result = await db_module.promote_workspace_proposal(db, proposal["id"], proj["id"])
+        result = await db_module.promote_workspace_proposal(
+            db, proposal["id"], proj["id"],
+            infer_touches_resources=True, file_github_issue=True,
+        )
 
     hitl = result.get("github_issue_hitl")
     assert hitl is not None, "HITL should be filed for a code-related proposal + connected repo"
@@ -80,7 +83,9 @@ async def test_promote_skips_hitl_when_not_code_related(db):
         "meridian.db.workspace.subprocess.run",
         return_value=_mock_git_result(""),
     ):
-        result = await db_module.promote_workspace_proposal(db, proposal["id"], proj["id"])
+        result = await db_module.promote_workspace_proposal(
+            db, proposal["id"], proj["id"], infer_touches_resources=True
+        )
 
     assert result.get("github_issue_hitl") is None
     pending = await db_module.list_hitl_requests(db, proj["id"], status="pending")
@@ -99,7 +104,10 @@ async def test_promote_skips_hitl_when_repo_not_connected(db):
         "meridian.db.workspace.subprocess.run",
         return_value=_mock_git_result("meridian/static/dashboard.js\n"),
     ):
-        result = await db_module.promote_workspace_proposal(db, proposal["id"], proj["id"])
+        result = await db_module.promote_workspace_proposal(
+            db, proposal["id"], proj["id"],
+            infer_touches_resources=True, file_github_issue=True,
+        )
 
     assert result.get("github_issue_hitl") is None
 

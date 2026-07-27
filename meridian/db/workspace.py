@@ -324,20 +324,86 @@ async def delete_workspace_decision(
 # --- Workspace proposals (human-only "drawer of inspiration") ---------------
 # 5c4dcc0f — workspace-scoped (tenant_id) flash-of-insight capture. Distinct
 # from workspace_notes (no lifecycle) and sprint_items (executor-claimable).
-# status machine: raw → investigating → promoted | rejected.
+# status machine: raw → investigating → paused → promoted | rejected | closed.
 
-_VALID_PROPOSAL_STATUSES = {"raw", "investigating", "promoted", "rejected"}
+_VALID_PROPOSAL_STATUSES = {
+    "raw",
+    "investigating",
+    "paused",
+    "promoted",
+    "rejected",
+    "closed",
+    "superseded",
+}
 # 45c4c178 — "live" statuses: proposals still awaiting human triage. Terminal
-# statuses (promoted/rejected) are excluded from the default (status-omitted)
+# statuses (promoted/rejected/closed/superseded) are excluded from the default
+# (status-omitted)
 # view of get_workspace_proposals so the common "what's still open" query
 # doesn't require the caller to already know to pass status= explicitly.
-_LIVE_PROPOSAL_STATUSES = {"raw", "investigating"}
+_LIVE_PROPOSAL_STATUSES = {"raw", "investigating", "paused"}
 _PROPOSAL_TRANSITIONS: dict[str, set[str]] = {
-    "raw": {"investigating", "rejected"},
-    "investigating": {"promoted", "rejected", "raw"},
+    "raw": {"investigating", "paused", "rejected", "closed", "superseded"},
+    "investigating": {
+        "promoted", "paused", "rejected", "raw", "closed", "superseded",
+    },
+    "paused": {"investigating", "raw", "closed", "superseded"},
     "promoted": set(),   # terminal — use promote_workspace_proposal instead
     "rejected": {"raw"},  # allow un-reject back to raw
+    "closed": {"raw"},  # reopening is represented by the raw state
+    "superseded": set(),
 }
+
+
+async def _append_proposal_event(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    event_type: str,
+    content: str = "",
+    *,
+    payload: Any = None,
+    actor: str | None = None,
+    session_id: str | None = None,
+    source: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Append one immutable proposal event without committing the transaction."""
+    async with db.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
+        "FROM proposal_events WHERE proposal_id = ?",
+        (proposal_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    sequence = int((row["next_sequence"] if row is not None else 1) or 1)
+    event_id = _new_id()
+    if payload is not None and not isinstance(payload, str):
+        payload = json.dumps(payload, sort_keys=True)
+    await db.execute(
+        "INSERT INTO proposal_events "
+        "(id, proposal_id, tenant_id, sequence, event_type, content, payload, "
+        "actor, session_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event_id,
+            proposal_id,
+            tenant_id,
+            sequence,
+            event_type,
+            content,
+            payload,
+            actor,
+            session_id,
+            source,
+        ),
+    )
+    async with db.execute(
+        "SELECT * FROM proposal_events WHERE id = ?", (event_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {
+        "id": event_id,
+        "proposal_id": proposal_id,
+        "sequence": sequence,
+        "event_type": event_type,
+    }
 
 
 async def add_workspace_proposal(
@@ -346,6 +412,10 @@ async def add_workspace_proposal(
     body: str,
     tags: str | None = None,
     tenant_id: str | None = None,
+    actor: str | None = None,
+    session_id: str | None = None,
+    source: str | None = "workspace",
+    family_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a workspace_proposals row with status='raw'.
 
@@ -365,9 +435,21 @@ async def add_workspace_proposal(
         db, tenant_id, _sprint_item_nickname_base(title, pid)
     )
     await db.execute(
-        "INSERT INTO workspace_proposals (id, title, body, tags, tenant_id, slug, nickname) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (pid, title, body, tags, tenant_id, _slug, _nickname),
+        "INSERT INTO workspace_proposals "
+        "(id, title, body, tags, tenant_id, family_id, slug, nickname) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (pid, title, body, tags, tenant_id, family_id, _slug, _nickname),
+    )
+    await _append_proposal_event(
+        db,
+        pid,
+        "created",
+        body,
+        payload={"title": title, "tags": tags},
+        actor=actor,
+        session_id=session_id,
+        source=source,
+        tenant_id=tenant_id,
     )
     await db.commit()
     async with db.execute(
@@ -377,6 +459,59 @@ async def add_workspace_proposal(
     return _row_to_dict(row) or {"id": pid}
 
 
+async def append_proposal_update(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    content: str,
+    event_type: str = "update",
+    *,
+    payload: Any = None,
+    actor: str | None = None,
+    session_id: str | None = None,
+    source: str | None = "workspace",
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Append a structured proposal update and return the new event.
+
+    Proposal rows are intentionally never edited for evidence or decisions.
+    Each update becomes a new event carrying optional structured payload and
+    provenance, which makes interrupted investigations resumable.
+    """
+    if not event_type.strip():
+        raise ValueError("Proposal event_type cannot be blank")
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    scope_sql = f" AND {scope}" if scope else ""
+    async with db.execute(
+        f"SELECT id, tenant_id FROM workspace_proposals WHERE id = ?{scope_sql}",
+        [proposal_id, *scope_params],
+    ) as cur:
+        proposal = await cur.fetchone()
+    if proposal is None:
+        return None
+    event = await _append_proposal_event(
+        db,
+        proposal_id,
+        event_type.strip(),
+        content,
+        payload=payload,
+        actor=actor,
+        session_id=session_id,
+        source=source,
+        tenant_id=(
+            tenant_id
+            if tenant_id is not None
+            else (proposal["tenant_id"] if proposal is not None else None)
+        ),
+    )
+    await db.execute(
+        "UPDATE workspace_proposals SET last_activity_at = datetime('now') "
+        f"WHERE id = ?{scope_sql}",
+        [proposal_id, *scope_params],
+    )
+    await db.commit()
+    return event
+
+
 async def get_workspace_proposals(
     db: aiosqlite.Connection,
     status: str | None = None,
@@ -384,10 +519,13 @@ async def get_workspace_proposals(
     tenant_id: str | None = None,
     limit: int = 20,
     offset: int = 0,
+    family_id: str | None = None,
+    sort_by: str = "activity",
 ) -> list[dict[str, Any]]:
     """Return a bounded page of workspace proposals, newest first.
 
-    Optional filters: ``status`` (raw/investigating/promoted/rejected) and
+    Optional filters: ``status`` (raw/investigating/paused/promoted/rejected,
+    closed, or superseded) and
     ``tag`` (substring match). Scoped to ``tenant_id`` when provided.
 
     When ``status`` is omitted, defaults to "live" proposals only (raw +
@@ -415,6 +553,9 @@ async def get_workspace_proposals(
     if tag:
         clauses.append("tags LIKE ?")
         params.append(f"%{tag}%")
+    if family_id:
+        clauses.append("family_id = ?")
+        params.append(family_id)
     scope, scope_params = _ws_tenant_clause(tenant_id)
     if scope:
         clauses.append(scope)
@@ -423,9 +564,14 @@ async def get_workspace_proposals(
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
     params.extend((limit, offset))
+    order_by = (
+        "COALESCE(last_activity_at, created_at) DESC, created_seq DESC"
+        if sort_by in {"activity", "last_activity"}
+        else "created_at DESC, created_seq DESC"
+    )
     async with db.execute(
         f"SELECT * FROM workspace_proposals{where} "
-        "ORDER BY created_at DESC, created_seq DESC LIMIT ? OFFSET ?",
+        f"ORDER BY {order_by} LIMIT ? OFFSET ?",
         params,
     ) as cur:
         rows = await cur.fetchall()
@@ -442,10 +588,13 @@ async def advance_workspace_proposal_status(
 
     Allowed transitions::
 
-        raw         → investigating | rejected
-        investigating → promoted | rejected | raw
+        raw         → investigating | paused | rejected | closed | superseded
+        investigating → promoted | paused | rejected | raw | closed | superseded
+        paused      → investigating | raw | closed | superseded
         promoted    → (terminal — use promote_workspace_proposal)
         rejected    → raw
+        closed      → raw (reopened)
+        superseded  → (terminal)
 
     Returns the updated row, or None if not found / wrong tenant.
     Raises ``ValueError`` on an invalid or disallowed transition."""
@@ -472,8 +621,20 @@ async def advance_workspace_proposal_status(
             f"Allowed from '{current}': {sorted(allowed) or '(none)'}"
         )
     await db.execute(
-        f"UPDATE workspace_proposals SET status = ?, updated_at = datetime('now') WHERE id = ?{scope_sql}",
+        f"UPDATE workspace_proposals SET status = ?, updated_at = datetime('now'), "
+        f"last_activity_at = datetime('now') WHERE id = ?{scope_sql}",
         [new_status, proposal_id, *scope_params],
+    )
+    event_type = "resumed" if current == "paused" and new_status in {
+        "raw", "investigating"
+    } else "status_changed"
+    await _append_proposal_event(
+        db,
+        proposal_id,
+        event_type,
+        f"{current} -> {new_status}",
+        payload={"from": current, "to": new_status},
+        tenant_id=(tenant_id if tenant_id is not None else proposal.get("tenant_id")),
     )
     await db.commit()
     async with db.execute(
@@ -491,6 +652,9 @@ async def promote_workspace_proposal(
     sprint_item_title: str | None = None,
     sprint_item_version: str | None = None,
     tenant_id: str | None = None,
+    touches_resources: list[str] | None = None,
+    infer_touches_resources: bool = False,
+    file_github_issue: bool = False,
 ) -> dict[str, Any]:
     """Promote a proposal to a real sprint item and link the two.
 
@@ -525,12 +689,16 @@ async def promote_workspace_proposal(
     # a56f0951 — infer touches_resources from proposal content so the created
     # sprint item is not silently bare (same gap class as fba94f1a).
     proposal_body = proposal.get("body") or ""
-    inferred = _infer_touches_resources_from_proposal(title, proposal_body)
+    resource_candidates = touches_resources
+    if resource_candidates is None and infer_touches_resources:
+        resource_candidates = _infer_touches_resources_from_proposal(
+            title, proposal_body
+        )
     resources_json: str | None = None
     item_notes: str | None = None
-    if inferred:
+    if resource_candidates:
         try:
-            resources_json = serialize_touches_resources(inferred)
+            resources_json = serialize_touches_resources(resource_candidates)
         except Exception:  # noqa: BLE001 — never block promotion
             resources_json = None
     if not resources_json:
@@ -553,9 +721,18 @@ async def promote_workspace_proposal(
     # Mark the proposal promoted.
     await db.execute(
         f"UPDATE workspace_proposals "
-        f"SET status = 'promoted', promoted_to_sprint_item_id = ?, updated_at = datetime('now') "
+        f"SET status = 'promoted', promoted_to_sprint_item_id = ?, "
+        f"updated_at = datetime('now'), last_activity_at = datetime('now') "
         f"WHERE id = ?{scope_sql}",
         [si_id, proposal_id, *scope_params],
+    )
+    await _append_proposal_event(
+        db,
+        proposal_id,
+        "promoted",
+        f"Promoted to sprint item {si_id}",
+        payload={"sprint_item_id": si_id, "touches_resources": resource_candidates},
+        tenant_id=(tenant_id if tenant_id is not None else proposal.get("tenant_id")),
     )
     await db.commit()
     async with db.execute(
@@ -576,9 +753,8 @@ async def promote_workspace_proposal(
     # the number/URL back on this proposal — never done inline here, since
     # this module has no GitHub API / tenant-PAT access.
     github_issue_hitl: dict[str, Any] | None = None
-    is_code_related = bool(inferred)
     github_repo = (project.get("github_repo") or "").strip()
-    if is_code_related and github_repo:
+    if file_github_issue and github_repo:
         # Lazy import: request_hitl lives in meridian.db (defined after this
         # module is imported by it) — see the identical pattern in
         # sprint_items.py's _maybe_file_chain_handoff.
