@@ -94,6 +94,44 @@ def search_paragraphs(index_db_path: str, query: str, limit: int = 20) -> list[d
     """Substring-search paragraphs in a previously-built index."""
     return docs_intel.find_paragraphs(index_db_path, query, limit)
 
+@mcp.tool()
+def search_document(
+    docx_path: str,
+    query: str,
+    element_types: list[str] | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """BM25-search all searchable DOCX XML parts with structural filters."""
+    return docs_intel.search_document_xml(
+        docx_path=docx_path,
+        query=query,
+        element_types=element_types,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def highlight_document(
+    docx_path: str,
+    query: str,
+    element_types: list[str] | None = None,
+    color: str = "yellow",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Apply native Word highlighting to structural XML search matches."""
+    return docs_intel.highlight_document_matches(
+        docx_path=docx_path,
+        query=query,
+        element_types=element_types,
+        color=color,
+        limit=limit,
+    )
+
+@mcp.tool()
+def read_document_snapshot(docx_path: str) -> dict[str, Any]:
+    """Read the last saved DOCX snapshot without writing or requiring a close."""
+    return docs_intel.read_document_snapshot(docx_path)
+
 
 @mcp.tool()
 def ingest_local_document(
@@ -997,31 +1035,14 @@ def insert_highlighted_note(
     position: str = "after",
     style: str = "internal_note",
     index_db_path: str | None = None,
+    mode: str = "inline",
+    author: str = "Meridian",
+    initials: str = "M",
 ) -> dict[str, Any]:
-    """65c8eb31 — Insert a genuinely highlighted internal-author-note paragraph.
+    """Insert an internal note inline or as a native Word comment.
 
-    Addresses a real recurring pattern: bracket-header/NOTE-block text left
-    inline in results-section prose, indistinguishable from real
-    dissertation content. Writes a structurally distinct paragraph instead —
-    a real w:highlight run property plus a dedicated paragraph style name and
-    its own bookmark — so notes can be found and stripped programmatically
-    (see list_internal_notes / scan_stale_notes) before final submission.
-
-    Args:
-      docx_path:       Absolute path to the .docx file (mutated in place).
-      text:            Note content (no bracket/NOTE-prefix decoration
-                       needed — the highlight + style ARE the signal).
-      anchor_para_id:  w14:paraId (or p{N}) of the paragraph to anchor on.
-      position:        "before" or "after" (default) the anchor.
-      style:           Must be "internal_note" (the only supported style
-                       today).
-      index_db_path:   If supplied, the note is ALSO recorded in the
-                       sidecar's docx_internal_notes table so
-                       list_internal_notes can find it.
-
-    Returns:
-      {status, note_id, text, anchor_para_id, position, style, docx_path}
-      or {error: <message>} (file NOT mutated on error).
+    mode="inline" preserves the highlighted Meridian note paragraph.
+    mode="comment" creates a real Word comment visible in Word's review pane.
     """
     return docs_intel.insert_highlighted_note(
         docx_path=docx_path,
@@ -1030,6 +1051,9 @@ def insert_highlighted_note(
         position=position,
         style=style,
         index_db_path=index_db_path,
+        mode=mode,
+        author=author,
+        initials=initials,
     )
 
 

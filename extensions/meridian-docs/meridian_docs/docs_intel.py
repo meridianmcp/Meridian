@@ -6155,55 +6155,48 @@ def insert_highlighted_note(
     position: str = "after",
     style: str = "internal_note",
     index_db_path: str | None = None,
+    mode: str = "inline",
+    author: str = "Meridian",
+    initials: str = "M",
 ) -> dict[str, Any]:
-    """65c8eb31 -- insert a genuinely highlighted internal-author-note paragraph.
+    """Insert an internal note inline or as a native Word comment.
 
-    Addresses a real recurring pattern: bracket-header/NOTE-block text
-    (``"[NOTE: ...]"``) left inline in results-section prose, indistinguishable
-    from real dissertation content until a human re-reads every paragraph
-    looking for it. This writes a STRUCTURALLY distinct paragraph instead --
-    a real ``w:highlight`` run property (renders visibly highlighted in Word
-    regardless of whether the ``style`` name below is defined in styles.xml)
-    plus a dedicated paragraph style name and its own ``_MNote<digits>``
-    bookmark -- so notes can be found and stripped programmatically (see
-    :func:`list_internal_notes` and :func:`scan_stale_notes`) before final
-    submission, rather than grepped for by hoping the author's bracket
-    convention was followed consistently.
-
-    ``text`` should be the note's plain content -- no bracket/NOTE-prefix
-    decoration needed; the highlight + dedicated style ARE the signal.
-
-    Args:
-        docx_path:      Absolute path to the .docx file (mutated in place).
-        text:            Note content.
-        anchor_para_id:  w14:paraId (or p{N}) of the paragraph to anchor on.
-        position:        "before" or "after" (default) the anchor.
-        style:           Must be ``"internal_note"`` -- the only supported
-                         note style today. Present as an explicit parameter
-                         (rather than hard-coded) so a future note *kind*
-                         (e.g. a reviewer-question style distinct from an
-                         author-note style) can be added without an API
-                         break.
-        index_db_path:   If supplied, the note is ALSO recorded in the
-                         sidecar's docx_internal_notes table so
-                         :func:`list_internal_notes` can find it. Without
-                         it the note still exists in the .docx (findable via
-                         :func:`scan_stale_notes`'s style exclusion, or by
-                         its ``MeridianInternalNote`` paragraph style /
-                         ``_MNote`` bookmark directly) but won't show up in
-                         a sidecar-backed audit query -- see the "risks"
-                         section of the accompanying task report.
-
-    Returns:
-        ``{status, note_id, text, anchor_para_id, position, style, docx_path}``
-        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+    mode="inline" preserves the original Meridian highlighted-note behavior.
+    mode="comment" writes Word's comments.xml part, relationship, content-type
+    override, range markers, and comment reference so Microsoft Word displays
+    the note in its normal review pane.
     """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
     if position not in ("before", "after"):
         return {"error": f"position must be 'before' or 'after', got {position!r}"}
     if style != "internal_note":
-        return {"error": f"style must be 'internal_note' (the only supported note style), got {style!r}"}
+        return {
+            "error": (
+                "style must be 'internal_note' (the only supported internal-note "
+                f"style), got {style!r}"
+            )
+        }
+    if mode not in ("inline", "comment"):
+        return {"error": f"mode must be 'inline' or 'comment', got {mode!r}"}
+
+    if mode == "comment":
+        result = insert_word_comment(
+            docx_path=docx_path,
+            text=text,
+            anchor_para_id=anchor_para_id,
+            author=author,
+            initials=initials,
+        )
+        if result.get("status") == "inserted":
+            comment_id = result["comment_id"]
+            note_id = f"_MComment{comment_id}"
+            result["note_id"] = note_id
+            result["style"] = style
+            _invalidate_sidecar_mtime(index_db_path)
+            if index_db_path and os.path.exists(index_db_path):
+                _upsert_sidecar_note(index_db_path, note_id, text.strip(), anchor_para_id)
+        return result
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -6218,7 +6211,9 @@ def insert_highlighted_note(
     body, _anchor_elem, child_idx = result
 
     note_id = _next_note_bookmark_name(root)
-    note_p = _build_internal_note_paragraph(text.strip(), note_id, _INTERNAL_NOTE_STYLE_DEFAULT)
+    note_p = _build_internal_note_paragraph(
+        text.strip(), note_id, _INTERNAL_NOTE_STYLE_DEFAULT
+    )
 
     insert_at = child_idx if position == "before" else child_idx + 1
     body.insert(insert_at, note_p)
@@ -6235,6 +6230,7 @@ def insert_highlighted_note(
 
     return {
         "status": "inserted",
+        "mode": "inline",
         "note_id": note_id,
         "text": text.strip(),
         "anchor_para_id": anchor_para_id,
@@ -8012,3 +8008,550 @@ def set_page_footer(
     docstring for the full parameter/return contract.
     """
     return _set_page_header_or_footer(docx_path, text, "footer", footer_type, index_db_path)
+
+# ---------------------------------------------------------------------------
+# 7c5e0e9a — document-wide XML search and native Word-comment write-back.
+# ---------------------------------------------------------------------------
+
+_SEARCH_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_COMMENTS_REL_TYPE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+)
+_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+
+def _search_tokens(text: str) -> list[str]:
+    return _SEARCH_TOKEN_RE.findall(text.casefold())
+
+
+def _search_snippet(text: str, terms: list[str], radius: int = 90) -> str:
+    if not text:
+        return ""
+    folded = text.casefold()
+    positions = [folded.find(term) for term in terms if term and folded.find(term) >= 0]
+    if not positions:
+        return text[: radius * 2]
+    start = max(0, min(positions) - radius)
+    end = min(len(text), max(positions) + max(map(len, terms)) + radius)
+    prefix = "…" if start else ""
+    suffix = "…" if end < len(text) else ""
+    return prefix + text[start:end] + suffix
+
+
+def _search_element_text(element: ET.Element) -> str:
+    return "".join(
+        node.text or ""
+        for node in element.iter()
+        if node.tag in (_q(_W, "t"), _q(_W, "delText"))
+    ).strip()
+
+
+def _search_part_kind(part_name: str) -> str:
+    lower = part_name.lower()
+    if lower == "word/document.xml":
+        return "document"
+    if "/header" in lower:
+        return "header"
+    if "/footer" in lower:
+        return "footer"
+    if "footnotes" in lower:
+        return "footnote"
+    if "endnotes" in lower:
+        return "endnote"
+    return "xml"
+
+
+def _search_style(paragraph: ET.Element) -> str | None:
+    p_pr = paragraph.find(_q(_W, "pPr"))
+    p_style = p_pr.find(_q(_W, "pStyle")) if p_pr is not None else None
+    return p_style.get(_q(_W, "val")) if p_style is not None else None
+
+
+def _search_is_caption(paragraph: ET.Element, text: str) -> str | None:
+    lowered = text.casefold()
+    instruction_parts: list[str] = []
+    for node in paragraph.iter():
+        if node.tag == _q(_W, "fldSimple"):
+            instruction_parts.append(node.get(_q(_W, "instr"), ""))
+        elif node.tag == _q(_W, "instrText"):
+            instruction_parts.append(node.text or "")
+    instructions = " ".join(instruction_parts).casefold()
+    style = (_search_style(paragraph) or "").casefold()
+    figure = "seq figure" in instructions or re.match(r"^\s*figure\b", lowered)
+    table = "seq table" in instructions or re.match(r"^\s*table\b", lowered)
+    if figure and (style == "caption" or "seq figure" in instructions):
+        return "figure_caption"
+    if table and (style == "caption" or "seq table" in instructions):
+        return "table_caption"
+    return None
+
+
+def _search_paragraph_kind(
+    paragraph: ET.Element, part_kind: str, text: str
+) -> str:
+    if part_kind in {"header", "footer"}:
+        return part_kind
+    caption_kind = _search_is_caption(paragraph, text)
+    if caption_kind:
+        return caption_kind
+    style = _search_style(paragraph)
+    p_pr = paragraph.find(_q(_W, "pPr"))
+    has_outline = p_pr is not None and p_pr.find(_q(_W, "outlineLvl")) is not None
+    if _is_heading(style) or has_outline:
+        return "heading"
+    return "paragraph"
+
+
+def _search_heading_path(
+    paragraphs: list[tuple[ET.Element, str, str | None, str]],
+) -> dict[int, list[str]]:
+    path: list[str] = []
+    result: dict[int, list[str]] = {}
+    for index, (paragraph, kind, _style, text) in enumerate(paragraphs):
+        if kind == "heading":
+            level = _heading_level(_search_style(paragraph))
+            path = path[: max(0, level - 1)]
+            path.append(text)
+        result[index] = list(path)
+    return result
+
+
+def _iter_document_search_units(raw: bytes) -> list[dict[str, Any]]:
+    units: list[dict[str, Any]] = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        part_names = [
+            name
+            for name in archive.namelist()
+            if name.startswith("word/")
+            and name.endswith(".xml")
+            and "/_rels/" not in name
+            and not name.endswith(".rels")
+        ]
+        for part_name in part_names:
+            try:
+                root = ET.fromstring(archive.read(part_name))
+            except ET.ParseError:
+                continue
+            part_kind = _search_part_kind(part_name)
+            paragraphs: list[tuple[ET.Element, str, str | None, str]] = []
+            for paragraph in root.iter(_q(_W, "p")):
+                text = _search_element_text(paragraph)
+                style = _search_style(paragraph)
+                kind = _search_paragraph_kind(paragraph, part_kind, text)
+                paragraphs.append((paragraph, kind, style, text))
+            section_paths = _search_heading_path(paragraphs)
+            for p_index, (paragraph, kind, style, text) in enumerate(paragraphs):
+                if not text:
+                    continue
+                element_id = paragraph.get(_q(_W14, "paraId")) or f"{part_name}#p{p_index}"
+                section_path = section_paths[p_index]
+                units.append(
+                    {
+                        "element_id": element_id,
+                        "element_type": kind,
+                        "part": part_name,
+                        "text": text,
+                        "style": style,
+                        "section_path": section_path,
+                        "xml_kind": "paragraph",
+                    }
+                )
+                if kind == "heading" and part_kind == "document":
+                    units.append(
+                        {
+                            "element_id": f"{part_name}#section{p_index}",
+                            "element_type": "section",
+                            "part": part_name,
+                            "text": text,
+                            "style": style,
+                            "section_path": section_path,
+                            "xml_kind": "section",
+                        }
+                    )
+            for table_index, table in enumerate(root.iter(_q(_W, "tbl"))):
+                table_text = _search_element_text(table)
+                if table_text:
+                    units.append(
+                        {
+                            "element_id": f"{part_name}#table{table_index}",
+                            "element_type": "table",
+                            "part": part_name,
+                            "text": table_text,
+                            "style": None,
+                            "section_path": [],
+                            "xml_kind": "table",
+                        }
+                    )
+    return units
+
+
+def _search_allowed_type(element_type: str, requested: set[str] | None) -> bool:
+    if not requested:
+        return True
+    aliases = {
+        "body": "paragraph",
+        "paragraphs": "paragraph",
+        "headings": "heading",
+        "figures": "figure_caption",
+        "tables": "table",
+        "sections": "section",
+        "headers": "header",
+        "footers": "footer",
+    }
+    normalized = {aliases.get(value, value) for value in requested}
+    return element_type in normalized or (
+        "caption" in requested and element_type.endswith("_caption")
+    )
+
+
+def _bm25_search_units(
+    units: list[dict[str, Any]], query: str, limit: int
+) -> list[dict[str, Any]]:
+    terms = _search_tokens(query)
+    if not terms or not units:
+        return []
+    term_set = set(terms)
+    document_frequency = {
+        term: sum(term in set(_search_tokens(unit["text"])) for unit in units)
+        for term in term_set
+    }
+    average_length = sum(len(_search_tokens(unit["text"])) for unit in units) / len(units)
+    average_length = max(average_length, 1.0)
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    for order, unit in enumerate(units):
+        tokens = _search_tokens(unit["text"])
+        counts = {term: tokens.count(term) for term in term_set}
+        length = max(len(tokens), 1)
+        score = 0.0
+        for term in terms:
+            tf = counts.get(term, 0)
+            if not tf:
+                continue
+            df = document_frequency[term]
+            idf = __import__("math").log(1.0 + (len(units) - df + 0.5) / (df + 0.5))
+            score += idf * (tf * 2.2) / (
+                tf + 1.2 * (0.25 + 0.75 * length / average_length)
+            )
+        if score:
+            enriched = dict(unit)
+            enriched["bm25_score"] = score
+            enriched["snippet"] = _search_snippet(unit["text"], terms)
+            enriched["highlight_ranges"] = [
+                [match.start(), match.end()]
+                for term in terms
+                for match in re.finditer(re.escape(term), unit["text"], re.IGNORECASE)
+            ]
+            scored.append((score, order, enriched))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [unit for _score, _order, unit in scored[: max(0, int(limit))]]
+
+
+def search_document_xml(
+    docx_path: str,
+    query: str,
+    element_types: list[str] | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """BM25-search all searchable Word XML parts with structural filters.
+
+    The search reads word/document.xml plus header/footer, footnote, and
+    endnote parts. Results are typed as paragraph, heading, section,
+    figure_caption, table_caption, table, header, or footer. element_types
+    accepts those names and aliases such as caption, body, headings, and
+    tables. This is a stateless first-stage search; the existing sidecar FTS5
+    index remains the fast paragraph-only path, while this surface covers the
+    whole package and leaves a clean seam for a future vector engine.
+    """
+    if not query or not str(query).strip():
+        return []
+    try:
+        with open(docx_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return [{"error": str(exc)}]
+    requested = {str(value).casefold() for value in element_types or []}
+    units = [
+        unit
+        for unit in _iter_document_search_units(raw)
+        if _search_allowed_type(unit["element_type"], requested)
+    ]
+    return _bm25_search_units(units, str(query), limit)
+
+
+def _highlight_run_if_matching(run: ET.Element, terms: list[str], color: str) -> bool:
+    run_text = _search_element_text(run)
+    if not run_text:
+        return False
+    if not any(re.search(re.escape(term), run_text, re.IGNORECASE) for term in terms):
+        return False
+    r_pr = run.find(_q(_W, "rPr"))
+    if r_pr is None:
+        r_pr = ET.Element(_q(_W, "rPr"))
+        run.insert(0, r_pr)
+    highlight = r_pr.find(_q(_W, "highlight"))
+    if highlight is None:
+        highlight = ET.SubElement(r_pr, _q(_W, "highlight"))
+    highlight.set(_q(_W, "val"), color)
+    return True
+
+
+def highlight_document_matches(
+    docx_path: str,
+    query: str,
+    element_types: list[str] | None = None,
+    color: str = "yellow",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Apply native w:highlight to matching text runs in a DOCX.
+
+    Search and write-back use the same structural filters as search_document_xml.
+    Matching runs retain their original content and formatting; a run is
+    highlighted when it contains at least one query term. The operation is
+    idempotent and returns the matched result records.
+    """
+    if color not in {
+        "yellow", "brightGreen", "turquoise", "pink", "blue", "red",
+        "darkBlue", "teal", "green", "violet", "darkRed", "darkYellow",
+        "gray50", "gray25", "black", "white",
+    }:
+        return {"error": f"unsupported highlight color: {color!r}"}
+    if not query or not str(query).strip():
+        return {"error": "query must be a non-empty string"}
+    try:
+        raw, _root = _load_docx_xml_stdlib(docx_path)
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}
+    matches = search_document_xml(docx_path, query, element_types, limit)
+    target_keys = {
+        (match["part"], match["element_id"])
+        for match in matches
+        if match.get("xml_kind") == "paragraph"
+    }
+    if not target_keys:
+        return {"status": "no_matches", "matched_runs": 0, "matches": matches}
+    terms = _search_tokens(query)
+    updated_parts: dict[str, bytes] = {}
+    matched_runs = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        for part_name, target_id in target_keys:
+            if part_name not in archive.namelist():
+                continue
+            root = ET.fromstring(archive.read(part_name))
+            for index, paragraph in enumerate(root.iter(_q(_W, "p"))):
+                expected = paragraph.get(_q(_W14, "paraId")) or f"{part_name}#p{index}"
+                if expected != target_id:
+                    continue
+                for run in paragraph.iter(_q(_W, "r")):
+                    if _highlight_run_if_matching(run, terms, color):
+                        matched_runs += 1
+                updated_parts[part_name] = (
+                    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                    + ET.tostring(root, encoding="utf-8")
+                )
+                break
+    if not updated_parts:
+        return {"status": "no_matches", "matched_runs": 0, "matches": matches}
+    _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+    return {
+        "status": "highlighted",
+        "matched_runs": matched_runs,
+        "match_count": len(matches),
+        "matches": matches,
+        "color": color,
+    }
+
+
+def _next_word_comment_id(document_root: ET.Element, comments_root: ET.Element | None) -> int:
+    ids: list[int] = []
+    for element in document_root.iter():
+        if element.tag.rsplit("}", 1)[-1] in {
+            "commentRangeStart", "commentRangeEnd", "commentReference",
+        }:
+            value = element.get(_q(_W, "id")) or element.get("id")
+            if value is not None:
+                try:
+                    ids.append(int(value))
+                except ValueError:
+                    pass
+    if comments_root is not None:
+        for comment in comments_root.findall(_q(_W, "comment")):
+            try:
+                ids.append(int(comment.get(_q(_W, "id"), "-1")))
+            except ValueError:
+                pass
+    return max(ids, default=-1) + 1
+
+
+def insert_word_comment(
+    docx_path: str,
+    text: str,
+    anchor_para_id: str,
+    author: str = "Meridian",
+    initials: str = "M",
+) -> dict[str, Any]:
+    """Insert a real Word comment anchored to an existing paragraph."""
+    if not text or not str(text).strip():
+        return {"error": "text must be a non-empty string"}
+    if not author or not str(author).strip():
+        return {"error": "author must be a non-empty string"}
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}
+    found = _find_para_by_id(root, anchor_para_id)
+    if found is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    _body, paragraph, _child_index = found
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        comments_part = "word/comments.xml"
+        try:
+            rels_root = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+        except (KeyError, ET.ParseError):
+            rels_root = ET.Element(_q(_REL_NS, "Relationships"))
+        for relation in rels_root.findall(_q(_REL_NS, "Relationship")):
+            if relation.get("Type") == _COMMENTS_REL_TYPE:
+                target = relation.get("Target", "comments.xml").lstrip("/")
+                comments_part = target if target.startswith("word/") else f"word/{target}"
+                break
+        try:
+            comments_root = ET.fromstring(archive.read(comments_part))
+        except (KeyError, ET.ParseError):
+            comments_root = ET.Element(_q(_W, "comments"))
+    comment_id = _next_word_comment_id(root, comments_root)
+    comment = ET.SubElement(comments_root, _q(_W, "comment"))
+    comment.set(_q(_W, "id"), str(comment_id))
+    comment.set(_q(_W, "author"), str(author).strip())
+    comment.set(_q(_W, "initials"), str(initials or "").strip()[:9])
+    comment.set(_q(_W, "date"), datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    comment_paragraph = ET.SubElement(comment, _q(_W, "p"))
+    comment_run = ET.SubElement(comment_paragraph, _q(_W, "r"))
+    comment_text = ET.SubElement(comment_run, _q(_W, "t"))
+    comment_text.set(_q(_XML_NS, "space"), "preserve")
+    comment_text.text = str(text).strip()
+
+    p_pr = paragraph.find(_q(_W, "pPr"))
+    start_index = list(paragraph).index(p_pr) + 1 if p_pr is not None else 0
+    start = ET.Element(_q(_W, "commentRangeStart"))
+    start.set(_q(_W, "id"), str(comment_id))
+    paragraph.insert(start_index, start)
+    end = ET.Element(_q(_W, "commentRangeEnd"))
+    end.set(_q(_W, "id"), str(comment_id))
+    paragraph.append(end)
+    reference_run = ET.SubElement(paragraph, _q(_W, "r"))
+    reference = ET.SubElement(reference_run, _q(_W, "commentReference"))
+    reference.set(_q(_W, "id"), str(comment_id))
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        updated_parts: dict[str, bytes] = {
+            "word/document.xml": (
+                b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                + ET.tostring(root, encoding="utf-8")
+            ),
+            comments_part: (
+                b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                + ET.tostring(comments_root, encoding="utf-8")
+            ),
+        }
+        try:
+            rels_root = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+        except (KeyError, ET.ParseError):
+            rels_root = ET.Element(_q(_REL_NS, "Relationships"))
+        comments_relation = next(
+            (
+                rel for rel in rels_root.findall(_q(_REL_NS, "Relationship"))
+                if rel.get("Type") == _COMMENTS_REL_TYPE
+            ),
+            None,
+        )
+        if comments_relation is None:
+            used_ids = {
+                rel.get("Id", "")
+                for rel in rels_root.findall(_q(_REL_NS, "Relationship"))
+            }
+            next_id = 1
+            while f"rId{next_id}" in used_ids:
+                next_id += 1
+            comments_relation = ET.SubElement(rels_root, _q(_REL_NS, "Relationship"))
+            comments_relation.set("Id", f"rId{next_id}")
+            comments_relation.set("Type", _COMMENTS_REL_TYPE)
+            comments_relation.set("Target", comments_part.removeprefix("word/"))
+        updated_parts["word/_rels/document.xml.rels"] = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            + ET.tostring(rels_root, encoding="utf-8")
+        )
+        try:
+            content_types_root = ET.fromstring(archive.read("[Content_Types].xml"))
+        except (KeyError, ET.ParseError):
+            content_types_root = ET.Element(_q(_CONTENT_TYPES_NS, "Types"))
+        override = next(
+            (
+                item for item in content_types_root.findall(_q(_CONTENT_TYPES_NS, "Override"))
+                if item.get("PartName") == f"/{comments_part}"
+            ),
+            None,
+        )
+        if override is None:
+            override = ET.SubElement(content_types_root, _q(_CONTENT_TYPES_NS, "Override"))
+            override.set("PartName", f"/{comments_part}")
+            override.set(
+                "ContentType",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+            )
+        updated_parts["[Content_Types].xml"] = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            + ET.tostring(content_types_root, encoding="utf-8")
+        )
+    _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+    return {
+        "status": "inserted",
+        "mode": "comment",
+        "comment_id": comment_id,
+        "text": str(text).strip(),
+        "anchor_para_id": anchor_para_id,
+        "author": str(author).strip(),
+        "initials": str(initials or "").strip()[:9],
+        "docx_path": docx_path,
+    }
+
+def read_document_snapshot(docx_path: str) -> dict[str, Any]:
+    """Read the saved DOCX snapshot without writing or requiring a close.
+
+    Word normally leaves a sibling ~$ lock file while a document is open.
+    That file is reported as a hint, not treated as a blocker. The returned
+    content is the last saved on-disk snapshot; unsaved edits remain visible
+    only inside Word until the document is saved.
+    """
+    try:
+        with open(docx_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+    try:
+        paragraphs = parse_docx(raw)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        return {"error": str(exc)}
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        xml_parts = sorted(
+            name
+            for name in archive.namelist()
+            if name.startswith("word/")
+            and name.endswith(".xml")
+            and "/_rels/" not in name
+            and not name.endswith(".rels")
+        )
+    lock_hint = os.path.join(
+        os.path.dirname(docx_path),
+        "~$" + os.path.basename(docx_path),
+    )
+    return {
+        "status": "read_only",
+        "docx_path": docx_path,
+        "byte_size": len(raw),
+        "saved_mtime": _stat_mtime(docx_path),
+        "word_lock_hint": os.path.exists(lock_hint),
+        "xml_parts": xml_parts,
+        "paragraph_count": len(paragraphs),
+        "heading_count": sum(1 for paragraph in paragraphs if _is_heading(paragraph["style"])),
+        "paragraphs": paragraphs,
+    }
