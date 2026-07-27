@@ -118,6 +118,14 @@ jobs:
       - run: pixi run python -m pytest tests/test_demo_ux.py -q --tb=short
 
   # ─── 2. Preview deploy (dev branch only, skip for hotfix) ────────────────
+  # meridian-preview is the real "nightly" channel: this is the ONLY job that
+  # deploys it, always from the latest dev commit that just passed `test`
+  # above. (cd9c2bf7 -- a second job, `refresh-preview`, used to also redeploy
+  # this same app from `main` right after every prod promotion; since
+  # auto-promote fires within minutes of most green dev pushes, that
+  # collapsed preview back to "identical to prod" almost immediately instead
+  # of tracking dev. Removed rather than retargeted, since duplicating this
+  # exact `flyctl deploy` on a dev trigger would just run it twice per push.)
   deploy-preview:
     needs: test
     if: github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes'
@@ -417,22 +425,15 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
-  # ─── 5b. Refresh preview to latest main ───────────────────────────────────
-  # After a successful prod deploy, redeploy meridian-preview from the same
-  # commit so preview never drifts behind main. Non-fatal: a preview hiccup
-  # must not fail the prod pipeline.
-  refresh-preview:
-    needs: deploy
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Redeploy meridian-preview from main
-        run: flyctl deploy --remote-only --config fly-preview.toml --build-arg MERIDIAN_GIT_SHA=$(git rev-parse --short=12 HEAD)
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PREVIEW }}
+  # ─── 5b. (removed) Refresh preview to latest main ─────────────────────────
+  # cd9c2bf7 -- this job used to redeploy meridian-preview from `main` after
+  # every prod deploy ("so preview never drifts behind main"). That is
+  # backwards for a preview meant to be the "nightly" channel: `deploy-preview`
+  # (job 2, above) already redeploys meridian-preview from the latest `dev`
+  # commit on every dev push, which is the actual nightly behavior wanted.
+  # This job fired right behind it on every auto-promote and overwrote that
+  # dev deploy with the just-promoted main commit, so preview never actually
+  # tracked dev for more than a few minutes at a time. See fly-preview.toml.
 
   # ─── 6. CHANGELOG ─────────────────────────────────────────────────────────
   changelog:
