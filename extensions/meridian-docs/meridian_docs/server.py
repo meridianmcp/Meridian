@@ -206,6 +206,32 @@ def ingest_local_document_structure(
     )
 
 
+
+@mcp.tool()
+def insert_image(
+    docx_path: str,
+    image_path: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """Insert a local image as a centered inline OOXML figure.
+
+    The generated image paragraph is always centered with w:jc val="center",
+    equivalent to pressing Ctrl+E in Word.
+    """
+    return docs_intel.insert_image(
+        docx_path=docx_path,
+        image_path=image_path,
+        anchor_para_id=anchor_para_id,
+        position=position,
+        width_inches=width_inches,
+        height_inches=height_inches,
+        index_db_path=index_db_path,
+    )
+
 @mcp.tool()
 def find_image_paragraph(
     docx_path: str,

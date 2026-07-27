@@ -1752,6 +1752,356 @@ _WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 _V = "urn:schemas-microsoft-com:vml"
 
 
+
+# ---------------------------------------------------------------------------
+# Native image insertion
+# ---------------------------------------------------------------------------
+
+_IMAGE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+_WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+_IMAGE_REL_TYPE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+)
+_EMU_PER_INCH = 914400
+_IMAGE_TYPES = {
+    ".png": ("png", "image/png"),
+    ".jpg": ("jpeg", "image/jpeg"),
+    ".jpeg": ("jpeg", "image/jpeg"),
+    ".gif": ("gif", "image/gif"),
+    ".bmp": ("bmp", "image/bmp"),
+    ".tif": ("tiff", "image/tiff"),
+    ".tiff": ("tiff", "image/tiff"),
+}
+
+
+def _image_dimensions_px(data: bytes, extension: str) -> tuple[int, int] | None:
+    """Read common raster dimensions without adding an image-library dependency."""
+    if extension == ".png" and data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if extension == ".gif" and data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if extension == ".bmp" and data[:2] == b"BM" and len(data) >= 26:
+        return abs(int.from_bytes(data[18:22], "little", signed=True)), abs(
+            int.from_bytes(data[22:26], "little", signed=True)
+        )
+    if extension not in (".jpg", ".jpeg") or not data.startswith(b"\xff\xd8"):
+        return None
+    offset = 2
+    sof_markers = set(range(0xC0, 0xC4)) | set(range(0xC5, 0xC8))
+    sof_markers |= set(range(0xC9, 0xCC)) | set(range(0xCD, 0xD0))
+    while offset + 4 <= len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            break
+        marker = data[offset]
+        offset += 1
+        if marker in (0xD8, 0xD9):
+            continue
+        if offset + 2 > len(data):
+            break
+        segment_length = int.from_bytes(data[offset:offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            break
+        if marker in sof_markers and segment_length >= 7:
+            height = int.from_bytes(data[offset + 3:offset + 5], "big")
+            width = int.from_bytes(data[offset + 5:offset + 7], "big")
+            return width, height
+        offset += segment_length
+    return None
+
+
+def _image_size_emu(
+    data: bytes,
+    extension: str,
+    width_inches: float | None,
+    height_inches: float | None,
+) -> tuple[int, int]:
+    dimensions = _image_dimensions_px(data, extension)
+    if width_inches is None and height_inches is None:
+        width_inches = 6.0
+        if dimensions and dimensions[0] > 0 and dimensions[1] > 0:
+            height_inches = width_inches * dimensions[1] / dimensions[0]
+        else:
+            height_inches = 4.0
+    elif width_inches is None:
+        if not dimensions or dimensions[1] <= 0:
+            raise ValueError("width_inches is required when image dimensions cannot be read")
+        width_inches = height_inches * dimensions[0] / dimensions[1]
+    elif height_inches is None:
+        if not dimensions or dimensions[0] <= 0:
+            raise ValueError("height_inches is required when image dimensions cannot be read")
+        height_inches = width_inches * dimensions[1] / dimensions[0]
+    return round(width_inches * _EMU_PER_INCH), round(height_inches * _EMU_PER_INCH)
+
+
+def _next_relationship_id(rels_root: ET.Element) -> str:
+    used = {child.get("Id") for child in rels_root if child.get("Id")}
+    number = 1
+    while f"rId{number}" in used:
+        number += 1
+    return f"rId{number}"
+
+
+def _next_media_name(entries: dict[str, bytes], extension: str) -> str:
+    stem = "word/media/image"
+    number = 1
+    pattern = re.compile(r"^word/media/image(\d+)\.[^.]+$", re.IGNORECASE)
+    for name in entries:
+        match = pattern.match(name)
+        if match:
+            number = max(number, int(match.group(1)) + 1)
+    candidate = f"{stem}{number}{extension}"
+    while candidate in entries:
+        number += 1
+        candidate = f"{stem}{number}{extension}"
+    return candidate
+
+
+def _build_image_drawing(
+    relationship_id: str,
+    width_emu: int,
+    height_emu: int,
+    doc_pr_id: int,
+    image_name: str,
+) -> ET.Element:
+    """Build an inline DrawingML picture in a centered image paragraph."""
+    drawing = ET.Element(_q(_W, "drawing"))
+    inline = ET.SubElement(drawing, _q(_WP, "inline"))
+    for attr in ("distT", "distB", "distL", "distR"):
+        inline.set(attr, "0")
+    ET.SubElement(
+        inline, _q(_WP, "extent"), {"cx": str(width_emu), "cy": str(height_emu)}
+    )
+    ET.SubElement(
+        inline, _q(_WP, "docPr"),
+        {"id": str(doc_pr_id), "name": f"Picture {doc_pr_id}"},
+    )
+    graphic = ET.SubElement(inline, _q(_A, "graphic"))
+    graphic_data = ET.SubElement(
+        graphic, _q(_A, "graphicData"),
+        {"uri": "http://schemas.openxmlformats.org/drawingml/2006/picture"},
+    )
+    pic = ET.SubElement(graphic_data, _q(_PIC, "pic"))
+    nv_pic_pr = ET.SubElement(pic, _q(_PIC, "nvPicPr"))
+    ET.SubElement(
+        nv_pic_pr, _q(_PIC, "cNvPr"),
+        {"id": str(doc_pr_id), "name": os.path.basename(image_name)},
+    )
+    ET.SubElement(nv_pic_pr, _q(_PIC, "cNvPicPr"))
+    blip_fill = ET.SubElement(pic, _q(_PIC, "blipFill"))
+    ET.SubElement(
+        blip_fill, _q(_A, "blip"), {_q(_IMAGE_REL_NS, "embed"): relationship_id}
+    )
+    stretch = ET.SubElement(blip_fill, _q(_A, "stretch"))
+    ET.SubElement(stretch, _q(_A, "fillRect"))
+    sp_pr = ET.SubElement(pic, _q(_PIC, "spPr"))
+    xfrm = ET.SubElement(sp_pr, _q(_A, "xfrm"))
+    ET.SubElement(xfrm, _q(_A, "off"), {"x": "0", "y": "0"})
+    ET.SubElement(
+        xfrm, _q(_A, "ext"), {"cx": str(width_emu), "cy": str(height_emu)}
+    )
+    prst_geom = ET.SubElement(sp_pr, _q(_A, "prstGeom"), {"prst": "rect"})
+    ET.SubElement(prst_geom, _q(_A, "avLst"))
+    return drawing
+
+
+def _save_docx_with_image(
+    raw: bytes,
+    root: ET.Element,
+    image_bytes: bytes,
+    image_name: str,
+    relationship_id: str,
+    content_type: str,
+    dest: str,
+) -> None:
+    """Repack a DOCX after changing document.xml, relationships, and media."""
+    entries: dict[str, bytes] = {}
+    with zipfile.ZipFile(io.BytesIO(raw)) as source:
+        for info in source.infolist():
+            entries[info.filename] = source.read(info.filename)
+
+    rels_path = "word/_rels/document.xml.rels"
+    rels_xml = entries.get(
+        rels_path,
+        b'<?xml version="1.0" encoding="UTF-8"?><Relationships '
+        b'xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+    )
+    rels_root = ET.fromstring(rels_xml)
+    ET.SubElement(
+        rels_root, _q(_PACKAGE_REL_NS, "Relationship"),
+        {
+            "Id": relationship_id,
+            "Type": _IMAGE_REL_TYPE,
+            "Target": f"media/{os.path.basename(image_name)}",
+        },
+    )
+    entries[rels_path] = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
+
+    content_types_path = "[Content_Types].xml"
+    content_types_xml = entries.get(
+        content_types_path,
+        b'<?xml version="1.0" encoding="UTF-8"?><Types '
+        b'xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+    )
+    content_types_root = ET.fromstring(content_types_xml)
+    extension = os.path.splitext(image_name)[1].lstrip(".")
+    has_default = any(
+        child.get("Extension", "").lower() == extension.lower()
+        for child in content_types_root
+        if child.tag.rsplit("}", 1)[-1] == "Default"
+    )
+    if not has_default:
+        ET.SubElement(
+            content_types_root, _q(_CONTENT_TYPES_NS, "Default"),
+            {"Extension": extension, "ContentType": content_type},
+        )
+    entries[content_types_path] = ET.tostring(
+        content_types_root, encoding="utf-8", xml_declaration=True
+    )
+    entries["word/document.xml"] = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        + ET.tostring(root, encoding="utf-8")
+    )
+    entries[image_name] = image_bytes
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as destination:
+        for name, data in entries.items():
+            destination.writestr(name, data)
+    if os.path.exists(dest):
+        try:
+            shutil.copy2(dest, dest + ".bak")
+        except OSError:
+            pass
+    with open(dest, "wb") as handle:
+        handle.write(out.getvalue())
+
+
+def insert_image(
+    docx_path: str,
+    image_path: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """Insert a local raster image as a centered inline OOXML figure.
+
+    The new image is always placed in a dedicated paragraph with
+    w:jc w:val="center" (the OOXML equivalent of Ctrl+E). When an anchor
+    is supplied, position controls whether the image paragraph is inserted
+    before or after that direct body paragraph. With no anchor, it is appended
+    before the document's final sectPr.
+
+    Supported formats are PNG, JPEG, GIF, BMP, and TIFF. Width/height are in
+    inches; if omitted, dimensions are inferred from the image header when
+    possible, with a six-inch default width.
+
+    Returns {status, image_para_id, image_name, docx_path}, or
+    {error: message} without mutating the document on validation failure.
+    """
+    if not isinstance(docx_path, str) or not docx_path:
+        return {"error": "docx_path must be a non-empty string"}
+    if not isinstance(image_path, str) or not image_path:
+        return {"error": "image_path must be a non-empty string"}
+    if position not in ("before", "after"):
+        return {"error": "position must be before or after"}
+    suffix = os.path.splitext(image_path)[1].lower()
+    image_type = _IMAGE_TYPES.get(suffix)
+    if image_type is None:
+        return {"error": f"unsupported image format: {suffix or 'missing extension'}"}
+    if width_inches is not None and width_inches <= 0:
+        return {"error": "width_inches must be greater than zero"}
+    if height_inches is not None and height_inches <= 0:
+        return {"error": "height_inches must be greater than zero"}
+    try:
+        with open(image_path, "rb") as handle:
+            image_bytes = handle.read()
+    except OSError as exc:
+        return {"error": f"could not read image {image_path}: {exc}"}
+    if not image_bytes:
+        return {"error": f"image file is empty: {image_path}"}
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+        width_emu, height_emu = _image_size_emu(
+            image_bytes, suffix, width_inches, height_inches
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"document has no body: {docx_path}"}
+    children = list(body)
+    if anchor_para_id is None:
+        insert_at = next(
+            (idx for idx, child in enumerate(children) if child.tag == _q(_W, "sectPr")),
+            len(children),
+        )
+    else:
+        located = _find_para_by_id(root, anchor_para_id)
+        if located is None:
+            return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+        _located_body, anchor, anchor_idx = located
+        if _located_body is not body or children[anchor_idx] is not anchor:
+            return {
+                "error": (
+                    "anchor_para_id must identify a direct body paragraph; "
+                    "table-cell paragraphs cannot anchor image insertion"
+                )
+            }
+        insert_at = anchor_idx + (1 if position == "after" else 0)
+
+    entries: dict[str, bytes] = {}
+    with zipfile.ZipFile(io.BytesIO(raw)) as source:
+        for info in source.infolist():
+            entries[info.filename] = source.read(info.filename)
+    rels_xml = entries.get("word/_rels/document.xml.rels")
+    rels_root = (
+        ET.fromstring(rels_xml)
+        if rels_xml
+        else ET.Element(_q(_PACKAGE_REL_NS, "Relationships"))
+    )
+    relationship_id = _next_relationship_id(rels_root)
+    image_name = _next_media_name(entries, f".{image_type[0]}")
+    taken = _existing_para_ids(root)
+    image_para_id = _new_para_id(taken)
+    doc_pr_id = len(root.findall(f".//{_q(_WP, 'docPr')}")) + 1
+    paragraph = ET.Element(_q(_W, "p"))
+    paragraph.set(_q(_W14, "paraId"), image_para_id)
+    ppr = ET.SubElement(paragraph, _q(_W, "pPr"))
+    ET.SubElement(ppr, _q(_W, "jc"), {_q(_W, "val"): "center"})
+    run = ET.SubElement(paragraph, _q(_W, "r"))
+    run.append(
+        _build_image_drawing(
+            relationship_id, width_emu, height_emu, doc_pr_id, image_name
+        )
+    )
+    body.insert(insert_at, paragraph)
+    try:
+        _save_docx_with_image(
+            raw, root, image_bytes, image_name, relationship_id,
+            image_type[1], docx_path
+        )
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+    _invalidate_sidecar_mtime(index_db_path)
+    return {
+        "status": "inserted",
+        "image_para_id": image_para_id,
+        "image_name": image_name,
+        "docx_path": docx_path,
+    }
+
 def find_image_paragraph(
     docx_path: str,
     figure_index: int | None = None,
