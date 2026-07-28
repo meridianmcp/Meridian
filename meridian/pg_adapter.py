@@ -3632,6 +3632,24 @@ async def _migrate_pg_wave_runs(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_project_capabilities(conn: PostgresConnection) -> None:
+    """649e095f — project_capabilities (mirrors SQLite).
+
+    One row per project: a normalized JSON list of capability declarations
+    plus schema version and content hash. Mirrors
+    db.migrations._migrate_project_capabilities.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS project_capabilities ("
+        "    project_id TEXT PRIMARY KEY,"
+        "    manifest TEXT NOT NULL DEFAULT '[]',"
+        "    manifest_version INTEGER NOT NULL DEFAULT 1,"
+        "    manifest_hash TEXT,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3727,4 +3745,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_board_snapshot_revisions,
     _migrate_pg_wave_runs,
     _migrate_pg_handoff_tokens_body_hash,
+    _migrate_pg_project_capabilities,
 )

@@ -93,6 +93,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "list_projects": 'list_projects()',
     "get_sessions": 'get_sessions(project_id="abc-123")',
     "set_executor_config": 'set_executor_config(project_id="abc-123", repo_path="/repo", env_file="/repo/.env", test_cmd="pixi run test", test_min=619, deploy_cmd="git push", shell_type="powershell", branch="dev")',
+    "get_capability_manifest": 'get_capability_manifest(project_id="abc-123")',
+    "set_capability_manifest": 'set_capability_manifest(project_id="abc-123", capabilities=[{"id": "code-search", "purpose": "find symbols/functions/classes", "required_tools": ["Serena: find_symbol"], "fallback_chain": ["search_code_semantic"], "availability_policy": "required"}])',
     "claim_file": 'claim_file(session_id="session-uuid", file_path="meridian/server.py")',
     "release_file": 'release_file(session_id="session-uuid", file_path="meridian/server.py")',
     "idle_until_session_done": 'idle_until_session_done(watching_session_id="session-uuid")',
@@ -2018,6 +2020,42 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "context_threshold": {"type": "integer", "description": "Turns before a context-budget warning is surfaced to the session."},
          "max_turns": {"type": "integer", "description": "Turn ceiling injected into the /goal string ('Stop after N turns'). Default 200."}},
          "required": []}},
+    {"name": "get_capability_manifest", "description":
+        "649e095f — Read-only: return a project's structured capability manifest "
+        "(id/purpose/required_tools/fallback_chain/provenance/availability_policy/"
+        "verification_command per capability), plus its schema version and a "
+        "stable content hash for change detection. A project that has never set "
+        "one gets an empty manifest back, never an error — old projects continue "
+        "unaffected. Foundation-only: this is the raw declared manifest, not yet "
+        "resolved against live tool/tunnel availability or profile inheritance.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
+    {"name": "set_capability_manifest", "description":
+        "649e095f — Persist a project's structured capability manifest: a list of "
+        "capability declarations, each with id, purpose, required_tools (non-empty "
+        "list of tool/server names), optional fallback_chain, optional provenance "
+        "(string or object), availability_policy ('required'|'optional'|"
+        "'degraded_ok', default 'required'), and an optional verification_command. "
+        "REPLACES the existing manifest wholesale (not a merge). Rejects "
+        "deterministically with {error} on any unknown/missing field, duplicate "
+        "capability id, secret-shaped value, or machine-local absolute path — "
+        "manifests are shared, multi-machine project state, never a place for "
+        "secrets or one executor's local filesystem layout. Normalizes to a "
+        "stable, sorted-by-id order so the same capability set always hashes "
+        "identically regardless of input order.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "capabilities": {"type": "array", "items": {"type": "object", "properties": {
+             "id": {"type": "string"},
+             "purpose": {"type": "string"},
+             "required_tools": {"type": "array", "items": {"type": "string"}},
+             "fallback_chain": {"type": "array", "items": {"type": "string"}},
+             "availability_policy": {"type": "string", "enum": ["required", "optional", "degraded_ok"]},
+             "verification_command": {"type": "string"},
+             "provenance": {"type": "string"}}},
+             "description": "The full manifest — replaces whatever is currently stored."}},
+         "required": ["capabilities"]}},
     {"name": "claim_file", "description":
         "Claim edit rights on a file for this session. Whole-file by default "
         "(auto-expires after 2 hours). For symbol-level claims — so two sessions "
@@ -2581,6 +2619,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "reset_plugin_override": "plugin",
     # config / infra
     "set_executor_config": "config",
+    "get_capability_manifest": "config",
+    "set_capability_manifest": "config",
     "set_active_repo":     "config",
     "run_verification":    "config",
     "add_custom_hook":     "config",
@@ -2698,6 +2738,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_agent_instructions":    "both",
     "set_agent_instructions":    "both",
     "set_executor_config":       "both",
+    "get_capability_manifest":   "both",
+    "set_capability_manifest":   "both",
     "add_custom_hook":           "both",
     "get_custom_hooks":          "both",
     "delete_custom_hook":        "both",

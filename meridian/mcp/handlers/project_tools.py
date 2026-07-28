@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 import meridian.server as _server
+from meridian import capability_manifest as _capability_manifest
 from meridian import db as db_module
 from meridian._deps import _hosted_mode
 from meridian.mcp_tools import _select_active_tool_set
@@ -536,3 +537,49 @@ async def handle_delete_custom_hook(
         return {"error": "project_id and hook_id are both required"}
     deleted = await db_module.delete_custom_hook(db, _pid, _hook_id)
     return {"hook_id": _hook_id, "deleted": deleted}
+
+
+async def handle_get_capability_manifest(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_capability_manifest (649e095f).
+
+    Read-only. A project with no persisted manifest gets an empty profile
+    back, never an error.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    return await db_module.get_project_capability_manifest(db, _pid)
+
+
+async def handle_set_capability_manifest(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: set_capability_manifest (649e095f).
+
+    Validates and persists a project's capability manifest wholesale.
+    Malformed input (unknown/missing fields, duplicate ids, secret-shaped
+    values, machine-local absolute paths) rejects deterministically with
+    {error} — never a partial write.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    capabilities = args.get("capabilities")
+    if capabilities is None:
+        return {"error": "capabilities is required"}
+    try:
+        return await db_module.set_project_capability_manifest(db, _pid, capabilities)
+    except _capability_manifest.CapabilityManifestError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}

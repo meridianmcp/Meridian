@@ -25,6 +25,8 @@ from typing import Any
 
 import aiosqlite
 
+from meridian import capability_manifest as _capability_manifest
+
 _log = logging.getLogger(__name__)
 
 _UNSET = object()  # sentinel for "not passed" in optional keyword args
@@ -1114,6 +1116,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_board_snapshot_revisions(db)
     await _migrate_wave_runs(db)
     await _migrate_handoff_tokens_body_hash(db)
+    await _migrate_project_capabilities(db)
     return db
 
 
@@ -1760,6 +1763,80 @@ async def set_executor_config(
         raise ValueError(f"unknown project: {project_id}")
     cfg = settings.get("executor_config") or {}
     return cfg if isinstance(cfg, dict) else {}
+
+
+async def get_project_capability_manifest(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, Any]:
+    """Return the persisted capability manifest for a project (649e095f).
+
+    A project with no ``project_capabilities`` row -- every project that
+    predates this feature, or one that has simply never set one -- gets an
+    empty profile back, never an error. Foundation-only: profile
+    inheritance and live availability probing are separate, later slices.
+    """
+    async with db.execute(
+        "SELECT manifest, manifest_version, manifest_hash, updated_at "
+        "FROM project_capabilities WHERE project_id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return {
+            "project_id": project_id,
+            "manifest_version": _capability_manifest.MANIFEST_SCHEMA_VERSION,
+            "capabilities": [],
+            "manifest_hash": _capability_manifest.manifest_hash([]),
+            "updated_at": None,
+        }
+    data = _row_to_dict(row) or {}
+    try:
+        capabilities = json.loads(data.get("manifest") or "[]")
+    except (TypeError, ValueError):
+        capabilities = []
+    return {
+        "project_id": project_id,
+        "manifest_version": int(data.get("manifest_version") or _capability_manifest.MANIFEST_SCHEMA_VERSION),
+        "capabilities": capabilities,
+        "manifest_hash": data.get("manifest_hash"),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+async def set_project_capability_manifest(
+    db: aiosqlite.Connection,
+    project_id: str,
+    capabilities: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Validate, normalize, and persist a project's capability manifest (649e095f).
+
+    Raises ``capability_manifest.CapabilityManifestError`` on any malformed
+    entry (unknown/missing fields, secret-shaped values, absolute
+    machine-local paths, duplicate ids) -- callers (the MCP handler) turn
+    that into an ``{error}`` dict rather than a partial write. Raises
+    ``ValueError`` if the project does not exist.
+    """
+    project = await get_project(db, project_id)
+    if project is None:
+        raise ValueError(f"unknown project: {project_id}")
+    normalized = _capability_manifest.normalize_manifest(capabilities)
+    digest = _capability_manifest.manifest_hash(normalized)
+    await db.execute(
+        "INSERT INTO project_capabilities "
+        "(project_id, manifest, manifest_version, manifest_hash, updated_at) "
+        "VALUES (?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(project_id) DO UPDATE SET "
+        "manifest = excluded.manifest, manifest_version = excluded.manifest_version, "
+        "manifest_hash = excluded.manifest_hash, updated_at = excluded.updated_at",
+        (
+            project_id,
+            json.dumps(normalized),
+            _capability_manifest.MANIFEST_SCHEMA_VERSION,
+            digest,
+        ),
+    )
+    await db.commit()
+    return await get_project_capability_manifest(db, project_id)
 
 
 async def get_project_ntfy_url(
