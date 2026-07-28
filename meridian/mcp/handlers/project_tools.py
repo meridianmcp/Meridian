@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 import meridian.server as _server
+from meridian import capability_availability as _capability_availability
 from meridian import capability_manifest as _capability_manifest
 from meridian import db as db_module
 from meridian._deps import _hosted_mode
@@ -686,3 +687,139 @@ async def handle_get_effective_capability_profile(
         return {"error": str(exc)}
     except ValueError as exc:
         return {"error": str(exc)}
+
+
+async def _build_live_inventory(tenant: dict[str, Any] | None) -> dict[str, Any]:
+    """Live-inventory snapshot (ac80aaaf) for :func:`check_capability_availability`.
+
+    Derives ``{tunnel_reachable, builtin_tools, plugins, stdio_registry}`` --
+    the shape :func:`meridian.capability_availability.classify_tool` expects --
+    from the tenant's resolved tunnel-plugin config and current tunnel
+    connection state, mirroring the same cross-instance-aware reachability
+    check ``list_plugins``/``get_plugin_details`` already use (see
+    ``meridian/mcp/handler.py::_handle_plugin_tools``). Best-effort and
+    non-fatal throughout: any failure fetching a slot's live tools just leaves
+    that slot with an empty tool set (not invocable) rather than raising, so a
+    capability-availability check never crashes on a flaky tunnel probe.
+
+    ``stdio_registry`` is always empty here -- stdio tool identities are
+    project/capability-declared local state with no live-fetchable
+    equivalent, so callers who use ``stdio:`` tool references must build their
+    own inventory (or merge one in) rather than rely on this default.
+    """
+    import asyncio  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    from meridian.mcp_tools import _MCP_TOOLS_LIST  # noqa: PLC0415
+    from meridian.routes import tunnel as _tunnel_mod  # noqa: PLC0415
+    from meridian.tool_manifest import build_tool_manifest  # noqa: PLC0415
+    from meridian.tunnel_plugins import resolve_plugins  # noqa: PLC0415
+
+    builtin_manifest = build_tool_manifest(_MCP_TOOLS_LIST)
+    builtin_tool_names = {
+        t["name"] for t in builtin_manifest.get("tools", []) if isinstance(t, dict) and t.get("name")
+    }
+
+    raw_tp = tenant.get("tunnel_plugins") if tenant else None
+    if isinstance(raw_tp, str) and raw_tp.strip():
+        try:
+            raw_tp = json.loads(raw_tp)
+        except Exception:  # noqa: BLE001
+            raw_tp = None
+    resolved = resolve_plugins(raw_tp)
+
+    tenant_id = tenant.get("id") if tenant else None
+    local_active = bool(tenant_id and _tunnel_mod.has_active_tunnel(tenant_id))
+    cross_instance_active = bool(
+        tenant_id and (
+            _tunnel_mod.tenant_owner_instance(tenant_id)
+            or (tenant and tenant.get("tunnel_active"))
+        )
+    )
+    tunnel_reachable = local_active or cross_instance_active
+
+    # Live per-slot tool names are only fetchable when THIS instance holds the
+    # tunnel socket (mirrors list_plugins -- _fetch_slot_tools returns [] on a
+    # cross-instance miss, so there's no point calling it otherwise).
+    slot_tool_names: dict[str, set[str]] = {}
+    if tenant_id and tunnel_reachable and local_active:
+        try:
+            slot_results = await asyncio.gather(*[
+                _tunnel_mod._fetch_slot_tools(  # type: ignore[attr-defined]
+                    tenant_id, p["slot"],
+                    budget=_tunnel_mod._slot_tools_fetch_budget(p["slot"]),  # type: ignore[attr-defined]
+                )
+                for p in resolved
+            ])
+        except Exception:  # noqa: BLE001
+            slot_results = []
+        for label, tools in (slot_results or []):
+            if tools:
+                slot_tool_names[label] = {
+                    str(t.get("name")) for t in tools if isinstance(t, dict) and t.get("name")
+                }
+
+    # Index plugins by BOTH their catalog name (e.g. "code-intel") and their
+    # connector-facing display name (e.g. "codebase", from SLOT_DISPLAY_NAMES)
+    # so a capability's tool_ref can use either prefix convention.
+    display_map = _tunnel_mod.SLOT_DISPLAY_NAMES
+    plugins: dict[str, dict[str, Any]] = {}
+    for p in resolved:
+        slot = p["slot"]
+        tools_here = slot_tool_names.get(slot, set())
+        entry = {
+            "slot": slot,
+            "enabled": bool(p.get("enabled")),
+            "invocable": bool(tools_here),
+            "tools": tools_here,
+        }
+        plugins[p["name"]] = entry
+        disp = display_map.get(slot)
+        if disp and disp not in plugins:
+            plugins[disp] = entry
+
+    return {
+        "tunnel_reachable": tunnel_reachable,
+        "builtin_tools": builtin_tool_names,
+        "plugins": plugins,
+        "stdio_registry": {},
+    }
+
+
+async def check_capability_availability(
+    db: Any,
+    project_id: str,
+    tenant: dict[str, Any] | None = None,
+    *,
+    capability_id: "str | None" = None,
+    live_inventory: "dict[str, Any] | None" = None,
+) -> list[dict[str, Any]]:
+    """Verify a project's declared capability manifest against live MCP/tunnel state (ac80aaaf).
+
+    Plain importable helper (deliberately NOT its own MCP tool -- this item's
+    job is the verification logic itself; a user-facing surface is later
+    capability-contract work, 98aaccf4) so that work can call straight into
+    this. Loads the project's persisted capability manifest
+    (:func:`meridian.db.get_project_capability_manifest` -- an empty manifest
+    for a project with none, never an error) and classifies each capability's
+    ``required_tools``/``fallback_chain`` against a live inventory snapshot via
+    :func:`meridian.capability_availability.evaluate_capability_availability`.
+
+    ``live_inventory`` is normally derived automatically from *tenant*'s
+    resolved tunnel-plugin config and tunnel connection state (see
+    :func:`_build_live_inventory`); passing it explicitly (as tests do) skips
+    that async, I/O-bound derivation entirely -- the standard no-network,
+    mocked-tunnel-state test seam for this function.
+
+    Returns one availability result per declared capability (``[]`` for a
+    project with no manifest), each shaped as
+    :func:`meridian.capability_availability.evaluate_capability_availability`
+    returns.
+    """
+    manifest = await db_module.get_project_capability_manifest(db, project_id)
+    capabilities = manifest.get("capabilities") or []
+    if capability_id:
+        capabilities = [c for c in capabilities if c.get("id") == capability_id]
+    if live_inventory is None:
+        live_inventory = await _build_live_inventory(tenant)
+    return _capability_availability.evaluate_manifest_availability(capabilities, live_inventory)
