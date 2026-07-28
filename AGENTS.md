@@ -360,6 +360,55 @@ sequence, every time you touch a shared file:
 
 ---
 
+## Capability manifests & fallback contracts (649e095f, v0.2.5)
+
+A **capability profile** is a project's declared list of capabilities a
+deterministic executor toolchain depends on — schema and validation live in
+`meridian/capability_manifest.py`; persistence is
+`db.get_project_capability_manifest` / `db.set_project_capability_manifest`
+(MCP: `get_capability_manifest` / `set_capability_manifest`). Each capability
+has an id, a purpose, a non-empty `required_tools` list, an ordered
+`fallback_chain`, an `availability_policy` (`required` / `optional` /
+`degraded_ok`), an optional `verification_command`, and optional
+`provenance`. A project with no manifest gets an empty profile back, never
+an error — old projects are not broken by this feature existing.
+
+**Provenance rules (non-negotiable):** never put a secret or a machine-local
+absolute path in any manifest field. `capability_manifest.py` already
+rejects secret-shaped strings (API keys, bearer tokens, passwords,
+credentials embedded in a connection string) and absolute paths
+(`C:\...`, `/home/...`, `/Users/...`, UNC paths) at write time — reuse that
+validation, don't bypass or re-implement it. This state is project-shared
+and multi-machine; a value that is fine in a local `.env` is not fine here.
+
+**Tunnel-down / degraded behavior (design contract, ahead of implementation):**
+a capability manifest exists so an executor can decide, deterministically,
+whether it can proceed when a tool it depends on is unavailable — no
+guessing, no silent partial work.
+
+- A capability marked `required` with no available tool **and** no working
+  fallback makes the handoff/session **non-executable**: fail closed, stop,
+  and surface why — don't improvise a workaround for a required capability.
+- A capability marked `optional` or `degraded_ok` may proceed without it —
+  degrade, note what was skipped and why, and continue rather than blocking
+  the whole session over a non-essential tool.
+- Fallbacks are tried in `fallback_chain` order; only exhausting the chain
+  (or having none) counts as "no available tool" for the required/optional
+  distinction above.
+- Executability itself is expected to be a first-class, machine-readable
+  flag on a handoff (not something an executor has to infer from prose) so
+  a receiving session can check it before doing any work.
+
+**Approved fallback patterns:** prefer a documented, already-wired
+alternative tool over ad-hoc improvisation (e.g. a grep-based search when a
+semantic code-search tool is down); prefer degrading a nice-to-have over
+blocking on it; never substitute a fallback that requires a secret or
+machine-local path the manifest itself couldn't declare. If no approved
+fallback exists for a `required` capability, that is a signal to stop and
+request human input, not to invent one.
+
+---
+
 ## Hard rules
 
 - ⛔ **Never run `hooks.ps1` / `hooks.sh`** — they rotate the API token and kill the
