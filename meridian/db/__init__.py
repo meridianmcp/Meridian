@@ -10792,6 +10792,7 @@ from .locks import (  # noqa: F401
     claim_symbol,
     get_symbol_claims,
     release_symbol_claims_for_session,
+    release_symbol,
     get_symbol_hotspots,
     get_hotspot_suggestions,
     # Public docx-region claim functions

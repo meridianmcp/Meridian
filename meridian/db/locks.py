@@ -1123,6 +1123,40 @@ async def release_symbol_claims_for_session(
     return cur.rowcount
 
 
+async def release_symbol(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+    symbol_name: str,
+) -> bool:
+    """Soft-release exactly ONE active symbol claim (session_id, file_path,
+    symbol_name).
+
+    18c488b6 — surgical counterpart to release_symbol_claims_for_session's
+    bulk (all-symbols-in-file) release. Needed so a claim-time rollback (e.g.
+    the sprint-item resource-lock gate backing out a partial multi-symbol
+    acquisition after a LATER resource in the same call conflicts) can drop
+    exactly the one claim it just took without clobbering any OTHER symbol
+    claim the session already held on the same file from earlier, unrelated
+    work. Sets released_at instead of deleting so hotspot scoring retains the
+    history, matching every other release_* helper in this module. Returns
+    True if a live claim was actually released, False if none matched
+    (already released / never claimed).
+    """
+    normalized = (file_path or "").strip()
+    sym = (symbol_name or "").strip()
+    if not normalized or not sym:
+        return False
+    cur = await db.execute(
+        "UPDATE file_symbol_claims SET released_at = datetime('now') "
+        "WHERE session_id = ? AND file_path = ? AND symbol_name = ? "
+        "AND released_at IS NULL",
+        (session_id, normalized, sym),
+    )
+    await db.commit()
+    return cur.rowcount > 0
+
+
 async def get_symbol_hotspots(
     db: aiosqlite.Connection,
     file_path: str | None = None,
