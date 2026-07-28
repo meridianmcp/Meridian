@@ -928,6 +928,15 @@ async def set_tunnel_active_repo(request: Request) -> Response:
     The tunnel client's _run_extract_pool_connection handles this message and
     updates SerenaPool.default_repo_path at runtime — no tunnel restart needed.
     Returns 503 when no extract tunnel is connected, 404 when auth fails.
+
+    46fd16f1 — delegates to :func:`send_active_repo_control` instead of sending
+    the WebSocket message itself, so this HTTP entry point ALSO updates
+    ``_tenant_active_repo`` (previously it only pushed the WS control message,
+    leaving the server-side cache stale — a worktree-scoped caller that
+    switched repos through this REST endpoint would see subsequent
+    ``call_tunnel_tool`` calls without an explicit ``repo_path`` [e.g.
+    ``prospect_symbol``'s Serena rung] keep routing to whatever repo was
+    active BEFORE this call, silently querying the wrong checkout).
     """
     if not _hosted_mode():
         return Response(
@@ -972,39 +981,30 @@ async def set_tunnel_active_repo(request: Request) -> Response:
         )
 
     tenant_id = tenant["id"]
-    ws = _tunnel_extract_sockets.get(tenant_id)
-    if ws is None:
-        return Response(
-            content='{"status":"not_connected","message":"no active extract tunnel — start meridian --tunnel first"}',
-            status_code=503,
-            media_type="application/json",
-        )
+    result = await send_active_repo_control(tenant_id, repo_path)
+    status = result.get("status")
+    if status == "not_connected":
+        return Response(content=json.dumps(result), status_code=503, media_type="application/json")
+    if status == "error":
+        return Response(content=json.dumps(result), status_code=502, media_type="application/json")
 
-    try:
-        await ws.send_json({"type": "set_active_repo", "repo_path": repo_path})
-    except Exception as exc:
-        _log.debug("set_active_repo: send error for %s: %s", tenant_id[:8], exc)
-        return Response(
-            content=json.dumps({"status": "error", "message": str(exc)}),
-            status_code=502,
-            media_type="application/json",
-        )
-
-    return Response(
-        content=json.dumps({"status": "ok", "repo_path": repo_path}),
-        status_code=200,
-        media_type="application/json",
-    )
+    return Response(content=json.dumps(result), status_code=200, media_type="application/json")
 
 
 async def send_active_repo_control(tenant_id: str, repo_path: str) -> dict[str, str]:
     """Send set_active_repo over the extract WebSocket for a tenant.
 
-    Called by the MCP handler (no HTTP round-trip needed). Returns a status dict
-    with ``status`` of ``"ok"``, ``"not_connected"``, or ``"error"``.
+    Called by the MCP handler AND the ``/tunnel/active-repo`` HTTP route (no
+    HTTP round-trip needed from the former). Returns a status dict with
+    ``status`` of ``"ok"``, ``"not_connected"``, or ``"error"``.
 
     4d9ad87b — always updates _tenant_active_repo so subsequent call_tunnel_tool
     calls can inject X-Meridian-Repo-Path without a separate set_active_repo.
+
+    46fd16f1 — this is now the SOLE place that mutates ``_tenant_active_repo``;
+    every caller that changes the active repo (MCP tool, HTTP route) must route
+    through here so the cache never goes stale relative to the WS control
+    message actually sent to the tunnel client.
     """
     _tenant_active_repo[tenant_id] = repo_path
     ws = _tunnel_extract_sockets.get(tenant_id)
