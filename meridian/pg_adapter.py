@@ -3723,6 +3723,44 @@ async def _migrate_pg_capability_profiles(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_tool_requirements(conn: PostgresConnection) -> None:
+    """76dde31f (665 follow-up) — sprint_items.tool_requirements: typed,
+    per-item MCP tool-requirement contract (mirrors SQLite).
+
+    Nullable TEXT column holding a JSON array of normalized entries (see
+    meridian.tool_requirements). Distinct from touches_resources (scheduling
+    metadata) and the legacy free-form required_tool pin (4d1fb28f) — the
+    structured field is canonical once set; required_tool remains a
+    read-time compatibility fallback only when this column is empty.
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db.migrations._migrate_sprint_item_tool_requirements.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS tool_requirements TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_artifact_declaration(conn: PostgresConnection) -> None:
+    """2f9cb288 (b7308039 / 665 follow-up) — sprint_items.artifact_kind /
+    planned_output / artifact_policy (mirrors SQLite).
+
+    ``artifact_kind`` is a plain enum column (like milestone_type/priority);
+    ``planned_output``/``artifact_policy`` are nullable JSON-encoded TEXT
+    columns, validated via meridian.artifact_declaration before ever
+    reaching this table. NULL on all three = no declaration (read back as
+    "unknown"/project-default, never a guess or a hard block).
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db.migrations._migrate_sprint_item_artifact_declaration.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS artifact_kind TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS planned_output TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS artifact_policy TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3820,5 +3858,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoff_tokens_body_hash,
     _migrate_pg_project_capabilities,
     _migrate_pg_capability_profiles,
+    _migrate_pg_sprint_item_tool_requirements,
+    _migrate_pg_sprint_item_artifact_declaration,
     _migrate_pg_docx_merge_manifests,
 )

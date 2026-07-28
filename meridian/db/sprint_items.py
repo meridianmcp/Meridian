@@ -30,6 +30,8 @@ from meridian.db import (  # noqa: PLC0415
     parse_touches_resources,
     _resource_sets_conflict,
 )
+from .. import tool_requirements as _tool_requirements  # 76dde31f (665 follow-up)
+from .. import artifact_declaration as _artifact_declaration  # 2f9cb288 (665 follow-up)
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +776,10 @@ async def add_sprint_item(
     sprint_name: str | None = None,
     prospect_bypass: bool = False,
     required_tool: str | None = None,
+    tool_requirements: Any = None,
+    artifact_kind: str | None = None,
+    planned_output: Any = None,
+    artifact_policy: Any = None,
     notes: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
@@ -804,6 +810,36 @@ async def add_sprint_item(
     replace_symbol_body'). NULL means ordinary executor discretion. When set,
     it is rendered as a hard directive (not a hint) in the /goal block built by
     ``handoff._build_quick_start_goal`` / ``build_item_briefing``.
+    ``tool_requirements`` (76dde31f, 665 follow-up) is the TYPED successor to
+    ``required_tool``: a list of normalized entries (see
+    ``meridian.tool_requirements.normalize_tool_requirement`` for the schema —
+    name, server_or_namespace, required_or_preferred, purpose, call_template,
+    fallback, availability_check, verification). Distinct from
+    ``touches_resources`` (parallel-conflict scheduling metadata) and from
+    ``required_tool`` (a single free-form string) — once set, this structured
+    field is the CANONICAL source for what build_item_briefing / the batch
+    /goal's ``<tool_requirements>`` clause / the machine-readable capability
+    contract render; ``required_tool`` keeps working unchanged and is used as
+    a read-time compatibility fallback only when this field is empty (see
+    ``tool_requirements.effective_tool_requirements``). Raises ``ValueError``
+    (via ``tool_requirements.ToolRequirementError``) on malformed input —
+    unknown fields, missing required fields, secret-shaped values, or
+    machine-local absolute paths.
+    ``artifact_kind`` / ``planned_output`` / ``artifact_policy`` (2f9cb288,
+    665 follow-up) are the normalized, persisted artifact declaration
+    contract — see ``meridian.artifact_declaration`` for the full schema.
+    ``artifact_kind`` is a plain enum (``document_only``/``figure``/``table``),
+    NULL meaning "unknown" (never guessed). ``planned_output`` is a typed
+    pointer (validated via ``meridian.pointers.validate_pointer`` — NOT a
+    free-form path), carrying ``source_type``, ``targets``, ``label``, and
+    ``provenance_required``. ``artifact_policy`` is the artifact-pointer-check
+    policy (``artifact_pointer_check`` off/warn/strict plus guard flags); an
+    absent policy reads back as the project default (warn) via
+    ``artifact_declaration.effective_artifact_policy``, never a hard block.
+    All three raise ``ValueError`` (via ``artifact_declaration.ArtifactDeclarationError``)
+    on malformed input — unknown fields, bad enum values, or a secret-shaped /
+    machine-local-absolute-path value in ``planned_output`` (same screen
+    ``tool_requirements`` reuses).
     ``notes`` is optional free-form context stored on the item at creation time.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
@@ -868,6 +904,19 @@ async def add_sprint_item(
                     }
     # 501ec93f — normalize + validate typed resource identifiers (raises on bad input).
     resources_json = serialize_touches_resources(touches_resources)
+    # 76dde31f (665 follow-up) — normalize + validate the typed tool_requirements
+    # contract (raises ToolRequirementError, a ValueError subclass, on bad input —
+    # same fail-fast discipline as the touches_resources line above).
+    tool_requirements_json = _tool_requirements.serialize_tool_requirements(tool_requirements)
+    # 2f9cb288 (665 follow-up) — normalize + validate the typed artifact
+    # declaration contract (raises ArtifactDeclarationError, a ValueError
+    # subclass, on bad input — same fail-fast discipline as above).
+    artifact_kind_value = (
+        _artifact_declaration.normalize_artifact_kind(artifact_kind)
+        if artifact_kind is not None else None
+    )
+    planned_output_json = _artifact_declaration.serialize_planned_output(planned_output)
+    artifact_policy_json = _artifact_declaration.serialize_artifact_policy(artifact_policy)
     iid = _new_id()
     # b944c905 — auto-populate a human-readable slug from the title (or a
     # caller-supplied one), deduped per project.
@@ -883,13 +932,15 @@ async def add_sprint_item(
         "(id, project_id, version, title, notes, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
         "deferred_until, track, priority, blocker_kind, wave, sprint_name, "
-        "prospect_bypass, required_tool) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "prospect_bypass, required_tool, tool_requirements, "
+        "artifact_kind, planned_output, artifact_policy) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, notes, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
          priority, blocker_kind or None, wave or None, sprint_name or None,
-         1 if prospect_bypass else 0, required_tool or None),
+         1 if prospect_bypass else 0, required_tool or None, tool_requirements_json,
+         artifact_kind_value, planned_output_json, artifact_policy_json),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -2359,6 +2410,10 @@ async def patch_sprint_item(
     depends_on: Any = _UNSET,
     require_verification: Any = _UNSET,
     required_tool: Any = _UNSET,
+    tool_requirements: Any = _UNSET,
+    artifact_kind: Any = _UNSET,
+    planned_output: Any = _UNSET,
+    artifact_policy: Any = _UNSET,
     github_channel: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
@@ -2407,6 +2462,29 @@ async def patch_sprint_item(
     executor discretion), or a free-form tool/plugin name (e.g. 'Serena:
     replace_symbol_body') to SET it — rendered as a hard directive in the
     /goal block, not left to executor habit.
+    ``tool_requirements`` (76dde31f, 665 follow-up) uses the ``_UNSET``
+    sentinel: omit to leave unchanged, pass ``None`` / ``[]`` to CLEAR the
+    structured contract (falls back to ``required_tool`` if still set — see
+    ``tool_requirements.effective_tool_requirements``), or a list of typed
+    entries (schema: name, server_or_namespace, required_or_preferred,
+    purpose, call_template, fallback, availability_check, verification) to
+    SET/REPLACE it wholesale. Raises ``ValueError`` (via
+    ``tool_requirements.ToolRequirementError``) on malformed input — unknown
+    fields, missing required fields, secret-shaped values, or machine-local
+    absolute paths.
+    ``artifact_kind`` / ``planned_output`` / ``artifact_policy`` (2f9cb288,
+    665 follow-up) each independently use the ``_UNSET`` sentinel: omit to
+    leave unchanged, pass ``None`` (or ``""`` for ``artifact_kind``) to CLEAR
+    it, or a valid value to SET/REPLACE it wholesale — see
+    ``meridian.artifact_declaration`` for the full schema. ``artifact_kind``
+    is one of ``document_only``/``figure``/``table``. ``planned_output`` is a
+    typed pointer object (``source_type``, ``targets``, ``label?``,
+    ``provenance_required?``), validated via
+    ``meridian.pointers.validate_pointer``. ``artifact_policy`` is
+    ``{artifact_pointer_check?, require_exact_figure_output_pointer?,
+    require_exact_table_output_pointer?, allow_document_only_override?}``.
+    Raises ``ValueError`` (via
+    ``artifact_declaration.ArtifactDeclarationError``) on malformed input.
     ``github_channel`` (7c82f7c8) uses the ``_UNSET`` sentinel: omit to leave
     unchanged, pass an empty string / ``None`` to CLEAR it, or one of
     {nightly, stable, graduated} to set it. Mirrors the channel:nightly /
@@ -2547,6 +2625,39 @@ async def patch_sprint_item(
         # replace_symbol_body', a named tunnel plugin, 'meridian__patch_file').
         ns_fields.append("required_tool = ?")
         ns_values.append(required_tool or None)
+    if tool_requirements is not _UNSET:
+        # 76dde31f (665 follow-up) — None/[] CLEARS the structured contract
+        # (falls back to required_tool if still set); any other value is
+        # validated/normalized and REPLACES the stored list wholesale. Raises
+        # ToolRequirementError (a ValueError) on malformed input.
+        ns_fields.append("tool_requirements = ?")
+        ns_values.append(_tool_requirements.serialize_tool_requirements(tool_requirements))
+    if artifact_kind is not _UNSET:
+        # 2f9cb288 (665 follow-up) — empty string / None CLEARS it (unknown);
+        # otherwise validate the enum (document_only/figure/table), like
+        # blocker_kind/github_channel. Raises ArtifactDeclarationError (a
+        # ValueError) on an unlisted value.
+        ns_fields.append("artifact_kind = ?")
+        ns_values.append(
+            _artifact_declaration.normalize_artifact_kind(artifact_kind)
+            if artifact_kind else None
+        )
+    if planned_output is not _UNSET:
+        # 2f9cb288 (665 follow-up) — None CLEARS the declared planned output;
+        # any other value is validated (a typed pointer, via
+        # meridian.pointers.validate_pointer — NOT a free-form path) and
+        # REPLACES the stored value wholesale. Raises ArtifactDeclarationError
+        # (a ValueError) on malformed input.
+        ns_fields.append("planned_output = ?")
+        ns_values.append(_artifact_declaration.serialize_planned_output(planned_output))
+    if artifact_policy is not _UNSET:
+        # 2f9cb288 (665 follow-up) — None CLEARS the per-item policy override
+        # (reads back as the project default warn policy — see
+        # artifact_declaration.effective_artifact_policy); any other value is
+        # validated/normalized and REPLACES the stored policy wholesale.
+        # Raises ArtifactDeclarationError (a ValueError) on malformed input.
+        ns_fields.append("artifact_policy = ?")
+        ns_values.append(_artifact_declaration.serialize_artifact_policy(artifact_policy))
     if github_channel is not _UNSET:
         # 7c82f7c8 — empty string / None CLEARS it; otherwise validate the
         # enum (nightly / stable / graduated), like blocker_kind.

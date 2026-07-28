@@ -1119,6 +1119,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoff_tokens_body_hash(db)
     await _migrate_project_capabilities(db)
     await _migrate_capability_profiles(db)
+    await _migrate_sprint_item_tool_requirements(db)
+    await _migrate_sprint_item_artifact_declaration(db)
     await _migrate_docx_merge_manifests(db)
     return db
 

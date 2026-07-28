@@ -32,9 +32,17 @@ from xml.sax.saxutils import escape as _xml_escape  # 5abf3e12 — XML-safe /goa
 import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from . import artifact_classification as artifact_classification_module
+from . import artifact_declaration as artifact_declaration_module
 from . import capability_contract as capability_contract_module
 from . import db as db_module
-from .db.sprint_items import _is_deferred, is_item_claim_prospected, _split_wave_label
+from . import tool_requirements as tool_requirements_module
+from .db.sprint_items import (
+    _is_deferred,
+    is_item_claim_prospected,
+    _item_declares_resources,
+    _split_wave_label,
+)
 from .executor_config import build_executor_config_block, has_executor_config
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -1076,6 +1084,18 @@ def _build_quick_start_goal(
             item for item in pending_sprint_items
             if item.get("version") == version
         ]
+    # 76dde31f (665 follow-up) — capture the version-scoped pending-item list
+    # HERE, before any of the manual/backburner/unprospected/wave-gate
+    # exclusions below narrow `pending_sprint_items` down to just today's
+    # claimable batch. The <tool_requirements> clause deliberately reports
+    # the FULL typed inventory (status in {todo, pending}, deferred already
+    # excluded by the caller, version-scoped) rather than the narrower
+    # claimable subset, so it matches EXACTLY what
+    # capability_contract.build_capability_contract's item_tool_requirements
+    # section computes via the identical filter criteria — see
+    # capability_contract._resolve_pending_items_for_contract and
+    # _build_tool_requirements_clause below.
+    _all_pending_for_tool_requirements = list(pending_sprint_items)
     # 3a02041a — split MANUAL/human items out of the executable list so they are
     # never named under the "claim and execute" directive; they're surfaced
     # separately as the maintainer's own todo (no completion-pressure language).
@@ -1440,6 +1460,18 @@ def _build_quick_start_goal(
         # category: same hard, unconditional treatment, for items with no
         # item-level pin of their own.
         + _build_workspace_tool_priority_clause(pending_sprint_items, tool_priority_map)
+        # 76dde31f (665 follow-up) — typed per-item tool_requirements contract:
+        # the FULL pending inventory (see _all_pending_for_tool_requirements
+        # above), not the narrower claimable-now batch the two clauses above
+        # use, so this matches capability_contract's item_tool_requirements
+        # section exactly.
+        + _build_tool_requirements_clause(_all_pending_for_tool_requirements)
+        # 665 follow-up — typed per-item durable sprint_item_pointers
+        # contract: the SAME full pending inventory as the tool_requirements
+        # clause above (not the narrower claimable-now batch), so this
+        # matches capability_contract's item_sprint_item_pointers section
+        # exactly for the same request.
+        + _build_pointer_records_clause(_all_pending_for_tool_requirements)
         + f"{_manual_note}"
         f"{_backburner_note}"
         f"{_excluded_unprospected_note}"
@@ -1508,6 +1540,71 @@ def _build_required_tool_clause(items: list[dict[str, Any]]) -> str:
         "a hard requirement, not a suggestion: " + "; ".join(pins)
     )
     return f"\n<required_tool>{_xml_escape(body)}</required_tool>"
+
+
+def _build_tool_requirements_clause(items: list[dict[str, Any]]) -> str:
+    """76dde31f (665 follow-up) — build a ``<tool_requirements>`` XML clause
+    carrying the TYPED, canonical per-item tool-requirement contract.
+
+    Distinct from ``_build_required_tool_clause`` above (a single free-form
+    string pin, rendered as short prose): this clause embeds the CANONICAL
+    JSON of every pending item's normalized ``tool_requirements`` entries
+    (structured field when set; a legacy ``required_tool`` pin as a read-time
+    compatibility fallback otherwise — see
+    ``tool_requirements.effective_tool_requirements``). The body is the SAME
+    canonical JSON ``capability_contract.build_capability_contract`` embeds in
+    its ``item_tool_requirements`` section for the SAME request, so the batch
+    /goal's XML rendering and the structured ``generate_handoff`` response
+    never diverge — one typed extraction
+    (``capability_contract.extract_tool_requirements``), two representations
+    of the identical data, never two independently-maintained derivations.
+
+    Returns an empty string when no item in the batch has an effective tool
+    requirement, so it never adds noise to an ordinary /goal.
+    """
+    per_item = capability_contract_module.extract_tool_requirements(items)
+    if not per_item:
+        return ""
+    body = json.dumps(per_item, sort_keys=True, separators=(",", ":"))
+    return f"\n<tool_requirements>{_xml_escape(body)}</tool_requirements>"
+
+
+def _build_pointer_records_clause(items: list[dict[str, Any]]) -> str:
+    """665 follow-up — build a ``<sprint_item_pointers>`` XML clause carrying
+    the TYPED, canonical per-item durable pointer records.
+
+    Distinct from ``_build_goal_pointer_lines`` above (compact, human-
+    readable lines rendered INSIDE ``<sprint_items>`` — kept byte-for-byte
+    unchanged for legacy backward compatibility): this clause embeds the
+    FULL typed record per pointer — source_type, target uri, selector/
+    anchor, target_kind (existing/planned_new), label, an explicit per-
+    target resolution status (resolved/unresolved/planned/stale/archival),
+    canonical/archival metadata where available — plus each item's
+    provenance-required state (whether durable pointer evidence is REQUIRED
+    to satisfy the prospecting gate, whether a human bypassed it, and
+    whether it is currently satisfied). Items must already carry
+    ``pointer_records``/``pointer_provenance`` (set by
+    ``_annotate_resolved_pointers`` — both call sites that build a /goal run
+    that annotation pass first).
+
+    The body is the SAME canonical JSON
+    ``capability_contract.extract_sprint_item_pointers`` produces for items
+    annotated the same way, via the shared
+    ``pointers.assemble_pointer_entries_from_annotated_items`` — so the
+    batch /goal's XML rendering and the structured ``generate_handoff`` JSON
+    response never diverge for the same request.
+
+    Returns ``""`` when nothing in the batch has an effective pointer or a
+    required-provenance state worth reporting, so it never adds noise to an
+    ordinary /goal.
+    """
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+
+    entries = pointers_module.assemble_pointer_entries_from_annotated_items(items)
+    if not entries:
+        return ""
+    body = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    return f"\n<sprint_item_pointers>{_xml_escape(body)}</sprint_item_pointers>"
 
 
 # ---------------------------------------------------------------------------
@@ -1770,6 +1867,55 @@ def build_item_briefing(
                 f"hard requirement, not a suggestion: {required_tool}"
             )
             + "</required_tool>"
+        )
+    # 76dde31f (665 follow-up) — typed tool_requirements contract: structured
+    # field wins when set; required_tool above is used as a read-time
+    # compatibility fallback only when it's empty (see
+    # tool_requirements.effective_tool_requirements). The body is the SAME
+    # canonical JSON capability_contract.extract_tool_requirements would embed
+    # for this item, so a caller can parse it back into the identical typed
+    # objects rather than re-deriving them from prose.
+    _tool_requirements = tool_requirements_module.effective_tool_requirements(item)
+    if _tool_requirements:
+        parts.append(
+            "<tool_requirements>"
+            + _xml_escape(tool_requirements_module.canonical_json(_tool_requirements))
+            + "</tool_requirements>"
+        )
+    # 2f9cb288 (665 follow-up) — typed artifact declaration contract: only
+    # rendered when the item actually declares SOMETHING (mirrors
+    # tool_requirements's "no tag when nothing declared" restraint above).
+    # ``policy`` is always the EFFECTIVE (merged-with-project-default) one —
+    # an executor reasoning about enforcement needs the resolved answer, not
+    # "whatever this one item happened to set" — see
+    # artifact_declaration.effective_artifact_policy.
+    if artifact_declaration_module.has_artifact_declaration(item):
+        _artifact_decl: dict[str, Any] = {
+            "artifact_kind": artifact_declaration_module.effective_artifact_kind(item),
+            "planned_output": artifact_declaration_module.effective_planned_output(item),
+            "policy": artifact_declaration_module.effective_artifact_policy(item),
+        }
+        parts.append(
+            "<artifact_declaration>"
+            + _xml_escape(json.dumps(_artifact_decl, sort_keys=True))
+            + "</artifact_declaration>"
+        )
+    # 5fd9d2fd (665 follow-up) — deterministic figure/table-vs-safe-category
+    # classification: declared artifact_kind FIRST (authoritative, see
+    # artifact_classification.classify_artifact_work), conservative
+    # title/notes/pointer evidence as a fallback for legacy items with no
+    # declared kind. Rendered whenever the classifier found SOMETHING to say
+    # — mirrors <artifact_declaration>'s "no tag when nothing declared"
+    # restraint, but the ONE genuinely uninformative fallback result (no
+    # artifact_kind AND no title/notes/pointer signal at all — rule
+    # "no_signal_ambiguous") is skipped too, so an item with nothing to do
+    # with artifacts doesn't get a noise tag on every briefing.
+    _artifact_classification = artifact_classification_module.classify_artifact_work(item)
+    if _artifact_classification.get("rule") != "no_signal_ambiguous":
+        parts.append(
+            "<artifact_work_classification>"
+            + _xml_escape(json.dumps(_artifact_classification, sort_keys=True))
+            + "</artifact_work_classification>"
         )
     parts += [
         f"<completion_criteria>{_xml_escape(completion_text)}</completion_criteria>",
@@ -2706,10 +2852,37 @@ async def _annotate_resolved_pointers(
     resolve_sprint_item_pointers uses), then flatten every resolved target into a
     compact string line. Items with no stored pointers are left untouched.
 
-    Fully guarded: a per-item failure degrades to no ``resolved_pointers`` for
-    that item; the pass NEVER raises so the mandatory handoff can't break.
+    665 follow-up — in the SAME resolve pass, ALSO attach:
+
+    * ``pointer_records`` — the FULL typed, machine-readable record per pointer
+      (see ``pointers.build_typed_pointer_record``): source_type, target uri,
+      selector/anchor, target_kind (existing/planned_new), label, an explicit
+      per-target resolution ``status`` (resolved/unresolved/planned/stale/
+      archival), and canonical/archival metadata where available. This is
+      what ``_build_pointer_records_clause`` embeds verbatim as canonical
+      JSON in the /goal block's ``<sprint_item_pointers>`` XML clause, and
+      what ``capability_contract.extract_sprint_item_pointers`` reuses
+      directly (no re-fetch/re-resolve) when it finds this field already set
+      — see that function's docstring. ONE ``resolve_pointer`` call per
+      stored pointer produces both this and ``resolved_pointers`` above —
+      never two independent resolve passes over the same data.
+    * ``pointer_provenance`` — item-level ``{required, bypassed, satisfied}``
+      derived read-only from the SAME evidence signal
+      ``claim_sprint_item``'s UNPROSPECTED gate checks
+      (``is_item_claim_prospected`` / ``_item_declares_resources`` — this
+      pass never touches the gate itself, it only reports its state), so a
+      receiving executor sees explicitly whether durable pointer evidence is
+      REQUIRED for this item and whether it is currently SATISFIED, instead
+      of re-deriving it from the raw pointer list. Computed for every item
+      (even one with zero stored pointers — that IS the "required but not
+      yet satisfied" case), unlike ``resolved_pointers``/``pointer_records``
+      which need >=1 stored row to produce anything.
+
+    Fully guarded: a per-item failure degrades to no ``resolved_pointers``/
+    ``pointer_records``/``pointer_provenance`` for that item; the pass NEVER
+    raises so the mandatory handoff can't break.
     """
-    from .pointers import resolve_pointer  # noqa: PLC0415 — avoid import cycle
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
     for item in pending_items:
         iid = item.get("id")
         if not iid:
@@ -2718,12 +2891,29 @@ async def _annotate_resolved_pointers(
             stored = await db_module.get_sprint_item_pointers(db, iid)
         except Exception:  # noqa: BLE001 — pre-migration DB / fetch failure
             continue
+        # 665 follow-up — provenance state is meaningful even with zero
+        # durable pointers, so it's computed unconditionally per item, unlike
+        # resolved_pointers/pointer_records below (which need >=1 stored row).
+        try:
+            item["pointer_provenance"] = {
+                "required": (
+                    _item_declares_resources(item)
+                    and not bool(item.get("prospect_bypass"))
+                ),
+                "bypassed": bool(item.get("prospect_bypass")),
+                "satisfied": is_item_claim_prospected(
+                    item, has_pointer_evidence=bool(stored)
+                ),
+            }
+        except Exception:  # noqa: BLE001 — provenance annotation is best-effort
+            pass
         if not stored:
             continue
         rendered: list[dict[str, Any]] = []
+        typed_records: list[dict[str, Any]] = []
         for ptr in stored:
             try:
-                resolved = await resolve_pointer(
+                resolved = await pointers_module.resolve_pointer(
                     db, ptr, project_id=project_id, node_resolver=node_resolver
                 )
             except Exception:  # noqa: BLE001 — resolve_pointer never raises, but be safe
@@ -2731,8 +2921,16 @@ async def _annotate_resolved_pointers(
             formatted = _format_resolved_pointer(resolved)
             if formatted:
                 rendered.append(formatted)
+            try:
+                typed = pointers_module.build_typed_pointer_record(ptr, resolved)
+            except Exception:  # noqa: BLE001 — one bad pointer must not drop the rest
+                typed = None
+            if typed:
+                typed_records.append(typed)
         if rendered:
             item["resolved_pointers"] = rendered
+        if typed_records:
+            item["pointer_records"] = typed_records
     return pending_items
 
 
@@ -3849,13 +4047,48 @@ async def _generate_handoff_l0(
     return str(out_path.resolve()), content
 
 
+def _build_artifact_readiness_warnings(
+    pending_items: "list[dict[str, Any]] | None",
+) -> "list[str]":
+    """5fd9d2fd (665 follow-up) — surface figure/table-sensitive pending
+    items that have no ``planned_output``/durable pointer evidence yet, as
+    ``=== HANDOFF READINESS ===`` warning line(s). Best-effort: any failure
+    (bad item shape, classifier error) degrades to no warnings — this must
+    never break the mandatory handoff.
+    """
+    try:
+        summary = artifact_classification_module.summarize_artifact_classifications(
+            pending_items
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    warnings: list[str] = []
+    missing = summary.get("sensitive_without_pointer") or []
+    if missing:
+        n = len(missing)
+        sample = ", ".join(missing[:5])
+        more = f" (+{n - 5} more)" if n > 5 else ""
+        warnings.append(
+            f"⚠ {n} pending item{'s' if n != 1 else ''} look like figure/table "
+            f"work with no planned_output/pointer evidence yet: {sample}{more}"
+        )
+    return warnings
+
+
 def _build_readiness_block(
     sprint: "str | None",
     pending_count: int,
     decisions_count: int,
     sprint_stale_days: "int | None" = None,
+    artifact_warnings: "list[str] | None" = None,
 ) -> str:
-    """Build the =HANDOFF READINESS= header block prepended to every handoff."""
+    """Build the =HANDOFF READINESS= header block prepended to every handoff.
+
+    ``artifact_warnings`` (5fd9d2fd, 665 follow-up) — pre-formatted warning
+    lines from ``_build_artifact_readiness_warnings`` (figure/table-sensitive
+    pending items with no planned_output/pointer evidence yet). Optional and
+    additive: every existing positional call site keeps working unchanged.
+    """
     lines = ["=== HANDOFF READINESS ==="]
     if sprint_stale_days is not None:
         # 08c355c2 — sprint field is stale: demote it with an age warning so
@@ -3878,6 +4111,8 @@ def _build_readiness_block(
     else:
         n = decisions_count
         lines.append(f"✓ {n} pinned decision{'s' if n != 1 else ''}")
+    for _w in artifact_warnings or []:
+        lines.append(_w)
     lines.append("=========================")
     return "\n".join(lines)
 
@@ -4044,6 +4279,7 @@ async def _resolve_session_sprint_version(
 
 async def build_effective_capability_contract(
     db: Any, project_id: str, *, board_stale: bool = False,
+    version: "str | None" = None, items: "list[dict[str, Any]] | None" = None,
 ) -> "dict[str, Any] | None":
     """98aaccf4 — thin, fully-guarded wrapper over
     ``capability_contract.build_capability_contract`` for the two trusted
@@ -4058,10 +4294,16 @@ async def build_effective_capability_contract(
 
     ``board_stale`` is passed straight through -- see
     ``capability_contract.build_capability_contract`` for what it means.
+
+    ``version`` / ``items`` (76dde31f, 665 follow-up) are also passed
+    straight through -- they scope the contract's ``item_tool_requirements``
+    section (see ``capability_contract.build_capability_contract`` and
+    ``_build_tool_requirements_clause`` above) so it agrees with the batch
+    /goal's own ``<tool_requirements>`` clause for the SAME request.
     """
     try:
         return await capability_contract_module.build_capability_contract(
-            db, project_id, board_stale=board_stale,
+            db, project_id, board_stale=board_stale, version=version, items=items,
         )
     except Exception:  # noqa: BLE001 — capability contract is best-effort
         return None
@@ -4690,6 +4932,7 @@ async def generate_handoff(
         pending_count=len(pending_sprint_items),
         decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
         sprint_stale_days=_sprint_stale,
+        artifact_warnings=_build_artifact_readiness_warnings(pending_sprint_items),
     )
     content = f"{readiness_block}\n\n{content}"
 

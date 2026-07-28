@@ -2613,6 +2613,7 @@ async def _handle_task_tools(
         # field rather than breaking the mandatory handoff.
         _capability_contract = await handoff_module_local.build_effective_capability_contract(
             db, args["project_id"], board_stale=_handoff_degraded,
+            version=_effective_version,
         )
         return {
             "file_path": path,
