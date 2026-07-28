@@ -3650,6 +3650,29 @@ async def _migrate_pg_project_capabilities(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_capability_profiles(conn: PostgresConnection) -> None:
+    """02038afe — capability_profiles (mirrors SQLite).
+
+    One row per (scope_type, scope_id): a normalized JSON capability list,
+    an explicit disabled-capability-id list, schema version, content hash,
+    non-secret provenance, and updated_at. Mirrors
+    db.migrations._migrate_capability_profiles.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS capability_profiles ("
+        "    scope_type TEXT NOT NULL,"
+        "    scope_id TEXT NOT NULL,"
+        "    manifest TEXT NOT NULL DEFAULT '[]',"
+        "    disabled_ids TEXT NOT NULL DEFAULT '[]',"
+        "    manifest_version INTEGER NOT NULL DEFAULT 1,"
+        "    manifest_hash TEXT,"
+        "    provenance TEXT,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    PRIMARY KEY (scope_type, scope_id)"
+        ");"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3746,4 +3769,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_wave_runs,
     _migrate_pg_handoff_tokens_body_hash,
     _migrate_pg_project_capabilities,
+    _migrate_pg_capability_profiles,
 )

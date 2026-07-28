@@ -2264,7 +2264,8 @@ async def _handle_project_tools(
     register_session, start_session, list_projects, get_project_by_name,
     get_goal, set_goal, set_north_star, merge_project, add_custom_hook,
     get_custom_hooks, delete_custom_hook, get_capability_manifest,
-    set_capability_manifest.
+    set_capability_manifest, set_capability_profile, clear_capability_profile,
+    get_effective_capability_profile.
 
     97d695c4 — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -2290,6 +2291,9 @@ async def _handle_project_tools(
         handle_delete_custom_hook,
         handle_get_capability_manifest,
         handle_set_capability_manifest,
+        handle_set_capability_profile,
+        handle_clear_capability_profile,
+        handle_get_effective_capability_profile,
     )
 
     # Tools that need no extra context beyond the standard five parameters.
@@ -2309,6 +2313,9 @@ async def _handle_project_tools(
         "delete_custom_hook": handle_delete_custom_hook,
         "get_capability_manifest": handle_get_capability_manifest,
         "set_capability_manifest": handle_set_capability_manifest,
+        "set_capability_profile": handle_set_capability_profile,
+        "clear_capability_profile": handle_clear_capability_profile,
+        "get_effective_capability_profile": handle_get_effective_capability_profile,
     }
 
     if name in _standard_dispatch:

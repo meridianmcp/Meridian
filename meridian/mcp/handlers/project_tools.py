@@ -583,3 +583,106 @@ async def handle_set_capability_manifest(
         return {"error": str(exc)}
     except ValueError as exc:
         return {"error": str(exc)}
+
+
+async def handle_set_capability_profile(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: set_capability_profile (02038afe).
+
+    Persists ONE layer of the workspace/user/project/sprint_version/item
+    capability-inheritance chain — wholesale-replaces that scope's stored
+    capabilities and disabled-capability-id list (not a merge). Rejects
+    deterministically with {error} on a bad scope_type, any malformed
+    capability entry (same schema/safety checks as set_capability_manifest),
+    a malformed disabled_capability_ids list, or unsafe (secret-shaped /
+    machine-local-path) provenance.
+    """
+    scope_type = (args.get("scope_type") or "").strip()
+    scope_id = (args.get("scope_id") or "").strip()
+    if not scope_type:
+        return {"error": "scope_type is required"}
+    if not scope_id:
+        return {"error": "scope_id is required"}
+    try:
+        return await db_module.set_capability_profile(
+            db,
+            scope_type,
+            scope_id,
+            capabilities=args.get("capabilities"),
+            disabled_capability_ids=args.get("disabled_capability_ids"),
+            provenance=args.get("provenance"),
+        )
+    except _capability_manifest.CapabilityManifestError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_clear_capability_profile(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: clear_capability_profile (02038afe).
+
+    Deletes a scope's ENTIRE capability profile row (both its capabilities
+    and its disabled-capability-id list) — distinct from disabling
+    individual capability ids. Idempotent: clearing an already-empty or
+    never-set scope is a no-op, not an error.
+    """
+    scope_type = (args.get("scope_type") or "").strip()
+    scope_id = (args.get("scope_id") or "").strip()
+    if not scope_type:
+        return {"error": "scope_type is required"}
+    if not scope_id:
+        return {"error": "scope_id is required"}
+    try:
+        return await db_module.clear_capability_profile(db, scope_type, scope_id)
+    except _capability_manifest.CapabilityManifestError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_effective_capability_profile(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_effective_capability_profile (02038afe).
+
+    Read-only. Resolves and returns the merged capability profile for a
+    project (optionally narrowed to one sprint item) across every applicable
+    layer: workspace -> user -> project -> sprint_version -> item. Includes
+    a per-capability source-layer map and audit trails of every override
+    (flagging the ones that were real conflicts — same capability id,
+    incompatible required_tools/availability_policy across layers) and every
+    disable that actually removed something.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    sprint_item_id = (args.get("sprint_item_id") or "").strip() or None
+    user_scope_id = (args.get("user_scope_id") or "").strip() or None
+    workspace_scope_id = (args.get("workspace_scope_id") or "").strip() or "singleton"
+    try:
+        return await db_module.get_effective_capability_profile(
+            db,
+            _pid,
+            sprint_item_id=sprint_item_id,
+            workspace_scope_id=workspace_scope_id,
+            user_scope_id=user_scope_id,
+        )
+    except _capability_manifest.CapabilityManifestError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}

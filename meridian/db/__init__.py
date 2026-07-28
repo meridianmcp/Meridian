@@ -26,6 +26,7 @@ from typing import Any
 import aiosqlite
 
 from meridian import capability_manifest as _capability_manifest
+from meridian import capability_profile as _capability_profile
 
 _log = logging.getLogger(__name__)
 
@@ -1117,6 +1118,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_wave_runs(db)
     await _migrate_handoff_tokens_body_hash(db)
     await _migrate_project_capabilities(db)
+    await _migrate_capability_profiles(db)
     return db
 
 
@@ -1837,6 +1839,198 @@ async def set_project_capability_manifest(
     )
     await db.commit()
     return await get_project_capability_manifest(db, project_id)
+
+
+async def get_capability_profile(
+    db: aiosqlite.Connection, scope_type: str, scope_id: str
+) -> dict[str, Any]:
+    """Return the raw, single-layer capability profile for one scope (02038afe).
+
+    A scope with no persisted row gets an empty profile back, never an error
+    — mirrors get_project_capability_manifest's "never a read error" contract.
+    This is one layer only; see get_effective_capability_profile for the
+    merged, multi-layer view.
+    """
+    scope_type = _capability_profile.normalize_scope_type(scope_type)
+    scope_id = _capability_profile.normalize_scope_id(scope_id)
+    async with db.execute(
+        "SELECT manifest, disabled_ids, manifest_version, manifest_hash, provenance, updated_at "
+        "FROM capability_profiles WHERE scope_type = ? AND scope_id = ?",
+        (scope_type, scope_id),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return {
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "manifest_version": _capability_manifest.MANIFEST_SCHEMA_VERSION,
+            "capabilities": [],
+            "disabled_capability_ids": [],
+            "manifest_hash": _capability_manifest.manifest_hash([]),
+            "provenance": None,
+            "updated_at": None,
+        }
+    data = _row_to_dict(row) or {}
+    try:
+        capabilities = json.loads(data.get("manifest") or "[]")
+    except (TypeError, ValueError):
+        capabilities = []
+    try:
+        disabled_ids = json.loads(data.get("disabled_ids") or "[]")
+    except (TypeError, ValueError):
+        disabled_ids = []
+    raw_provenance = data.get("provenance")
+    try:
+        provenance = json.loads(raw_provenance) if raw_provenance else None
+    except (TypeError, ValueError):
+        provenance = None
+    return {
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "manifest_version": int(data.get("manifest_version") or _capability_manifest.MANIFEST_SCHEMA_VERSION),
+        "capabilities": capabilities,
+        "disabled_capability_ids": disabled_ids,
+        "manifest_hash": data.get("manifest_hash"),
+        "provenance": provenance,
+        "updated_at": data.get("updated_at"),
+    }
+
+
+async def set_capability_profile(
+    db: aiosqlite.Connection,
+    scope_type: str,
+    scope_id: str,
+    capabilities: list[dict[str, Any]] | None = None,
+    disabled_capability_ids: list[str] | None = None,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate, normalize, and persist one layer's capability profile (02038afe).
+
+    Wholesale-replaces this scope's stored capabilities and disabled-id list
+    (not a merge) — same "replace, not merge" contract as
+    set_project_capability_manifest, just scoped to one layer of the
+    workspace/user/project/sprint_version/item inheritance chain. Raises
+    ``capability_profile.CapabilityProfileError`` (a CapabilityManifestError
+    subclass) on any malformed capability entry, bad scope_type, malformed
+    disabled_capability_ids, or unsafe (secret-shaped / machine-local-path)
+    provenance — callers (the MCP handler) turn that into an {error} dict
+    rather than a partial write.
+    """
+    scope_type = _capability_profile.normalize_scope_type(scope_type)
+    scope_id = _capability_profile.normalize_scope_id(scope_id)
+    normalized_caps = _capability_manifest.normalize_manifest(capabilities)
+    normalized_disabled = _capability_profile.normalize_disabled_capability_ids(disabled_capability_ids)
+    normalized_provenance = _capability_profile.normalize_provenance(provenance)
+    digest = _capability_manifest.manifest_hash(normalized_caps)
+    await db.execute(
+        "INSERT INTO capability_profiles "
+        "(scope_type, scope_id, manifest, disabled_ids, manifest_version, manifest_hash, provenance, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(scope_type, scope_id) DO UPDATE SET "
+        "manifest = excluded.manifest, disabled_ids = excluded.disabled_ids, "
+        "manifest_version = excluded.manifest_version, manifest_hash = excluded.manifest_hash, "
+        "provenance = excluded.provenance, updated_at = excluded.updated_at",
+        (
+            scope_type,
+            scope_id,
+            json.dumps(normalized_caps),
+            json.dumps(normalized_disabled),
+            _capability_manifest.MANIFEST_SCHEMA_VERSION,
+            digest,
+            json.dumps(normalized_provenance) if normalized_provenance is not None else None,
+        ),
+    )
+    await db.commit()
+    return await get_capability_profile(db, scope_type, scope_id)
+
+
+async def clear_capability_profile(
+    db: aiosqlite.Connection, scope_type: str, scope_id: str
+) -> dict[str, Any]:
+    """Delete a scope's entire capability profile row (02038afe).
+
+    Explicit "clear" semantics distinct from "disable": clearing removes this
+    layer's contribution entirely (both its capabilities and its disabled-id
+    list), so the scope reverts to inheriting purely from less-specific
+    layers. Idempotent — clearing an already-empty/never-set scope is a no-op.
+    """
+    scope_type = _capability_profile.normalize_scope_type(scope_type)
+    scope_id = _capability_profile.normalize_scope_id(scope_id)
+    await db.execute(
+        "DELETE FROM capability_profiles WHERE scope_type = ? AND scope_id = ?",
+        (scope_type, scope_id),
+    )
+    await db.commit()
+    return await get_capability_profile(db, scope_type, scope_id)
+
+
+async def get_effective_capability_profile(
+    db: aiosqlite.Connection,
+    project_id: str,
+    sprint_item_id: str | None = None,
+    *,
+    workspace_scope_id: str = "singleton",
+    user_scope_id: str | None = None,
+) -> dict[str, Any]:
+    """Resolve the merged capability profile across all applicable layers (02038afe).
+
+    Walks workspace -> user -> project -> sprint_version -> item (least to
+    most specific — see meridian.capability_profile.merge_layers), skipping
+    any layer that has no applicable scope_id (e.g. no ``user_scope_id``
+    given, or no ``sprint_item_id`` so there's no sprint_version/item layer).
+    Read-only: never persists anything. Raises ValueError for an unknown
+    project_id, or an unknown sprint_item_id / one that belongs to a
+    different project.
+    """
+    project = await get_project(db, project_id)
+    if project is None:
+        raise ValueError(f"unknown project: {project_id}")
+
+    sprint_version: str | None = None
+    if sprint_item_id:
+        item = await get_sprint_item(db, sprint_item_id)
+        if item is None:
+            raise ValueError(f"unknown sprint item: {sprint_item_id}")
+        if item.get("project_id") != project_id:
+            raise ValueError(
+                f"sprint item {sprint_item_id} does not belong to project {project_id}"
+            )
+        sprint_version = item.get("version")
+
+    layer_scopes: list[tuple[str, str | None]] = [
+        ("workspace", workspace_scope_id),
+        ("user", user_scope_id),
+        ("project", project_id),
+        ("sprint_version", f"{project_id}:{sprint_version}" if sprint_version else None),
+        ("item", sprint_item_id),
+    ]
+
+    layers_for_merge: list[dict[str, Any]] = []
+    layers_applied: list[str] = []
+    for layer_name, scope_id in layer_scopes:
+        if not scope_id:
+            continue
+        profile = await get_capability_profile(db, layer_name, scope_id)
+        if profile["capabilities"] or profile["disabled_capability_ids"]:
+            layers_applied.append(layer_name)
+        layers_for_merge.append({
+            "layer": layer_name,
+            "capabilities": profile["capabilities"],
+            "disabled_capability_ids": profile["disabled_capability_ids"],
+        })
+
+    effective, sources, overrides, disabled_log = _capability_profile.merge_layers(layers_for_merge)
+    return {
+        "project_id": project_id,
+        "sprint_item_id": sprint_item_id,
+        "sprint_version": sprint_version,
+        "capabilities": effective,
+        "manifest_hash": _capability_manifest.manifest_hash(effective),
+        "capability_sources": sources,
+        "layers_applied": layers_applied,
+        "overrides": overrides,
+        "disabled": disabled_log,
+    }
 
 
 async def get_project_ntfy_url(

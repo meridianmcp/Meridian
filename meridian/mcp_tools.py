@@ -95,6 +95,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "set_executor_config": 'set_executor_config(project_id="abc-123", repo_path="/repo", env_file="/repo/.env", test_cmd="pixi run test", test_min=619, deploy_cmd="git push", shell_type="powershell", branch="dev")',
     "get_capability_manifest": 'get_capability_manifest(project_id="abc-123")',
     "set_capability_manifest": 'set_capability_manifest(project_id="abc-123", capabilities=[{"id": "code-search", "purpose": "find symbols/functions/classes", "required_tools": ["Serena: find_symbol"], "fallback_chain": ["search_code_semantic"], "availability_policy": "required"}])',
+    "set_capability_profile": 'set_capability_profile(scope_type="project", scope_id="abc-123", capabilities=[{"id": "code-search", "purpose": "find symbols/functions/classes", "required_tools": ["Serena: find_symbol"], "availability_policy": "required"}], disabled_capability_ids=["legacy-grep-search"])',
+    "clear_capability_profile": 'clear_capability_profile(scope_type="item", scope_id="item-uuid")',
+    "get_effective_capability_profile": 'get_effective_capability_profile(project_id="abc-123", sprint_item_id="item-uuid")',
     "claim_file": 'claim_file(session_id="session-uuid", file_path="meridian/server.py")',
     "release_file": 'release_file(session_id="session-uuid", file_path="meridian/server.py")',
     "idle_until_session_done": 'idle_until_session_done(watching_session_id="session-uuid")',
@@ -2056,6 +2059,73 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
              "provenance": {"type": "string"}}},
              "description": "The full manifest — replaces whatever is currently stored."}},
          "required": ["capabilities"]}},
+    {"name": "set_capability_profile", "description":
+        "02038afe — Persist ONE layer of the capability-inheritance chain: "
+        "workspace -> user -> project -> sprint_version -> item (least to most "
+        "specific). scope_type selects the layer; scope_id is that layer's key "
+        "(a tenant/workspace id for 'workspace', a user/human id for 'user', the "
+        "project_id for 'project', the sprint item's id for 'item', or the "
+        "project_id for 'sprint_version' — the sprint version itself is resolved "
+        "from whichever sprint item you query via get_effective_capability_profile). "
+        "capabilities uses the exact same schema as set_capability_manifest and "
+        "REPLACES this scope's capabilities wholesale (not a merge). "
+        "disabled_capability_ids explicitly retracts capability ids this scope "
+        "inherited from a less specific layer, without redeclaring them — that "
+        "list also REPLACES whatever was previously disabled at this scope. "
+        "provenance is an optional object recording non-secret context (e.g. "
+        "config source label, a config/tool-list hash, observed_at, client/server "
+        "identity, fallback policy) — never raw secrets or machine-local absolute "
+        "paths, rejected the same way set_capability_manifest rejects them. Use "
+        "clear_capability_profile to remove a scope's row entirely instead of "
+        "replacing it with an empty one.",
+     "inputSchema": {"type": "object", "properties": {
+         "scope_type": {"type": "string", "enum": ["workspace", "user", "project", "sprint_version", "item"]},
+         "scope_id": {"type": "string", "description": "The key for this layer — see the tool description for what goes here per scope_type."},
+         "capabilities": {"type": "array", "items": {"type": "object", "properties": {
+             "id": {"type": "string"},
+             "purpose": {"type": "string"},
+             "required_tools": {"type": "array", "items": {"type": "string"}},
+             "fallback_chain": {"type": "array", "items": {"type": "string"}},
+             "availability_policy": {"type": "string", "enum": ["required", "optional", "degraded_ok"]},
+             "verification_command": {"type": "string"},
+             "provenance": {"type": "string"}}},
+             "description": "This layer's capability declarations — replaces whatever is currently stored at this scope."},
+         "disabled_capability_ids": {"type": "array", "items": {"type": "string"},
+             "description": "Capability ids to retract at this scope even though a less specific layer declared them. Replaces this scope's previous disable list."},
+         "provenance": {"type": "object", "description": "Non-secret provenance for this layer's declaration (config source, hashes, observed_at, client/server identity, fallback policy). No secrets or machine-local absolute paths."}},
+         "required": ["scope_type", "scope_id"]}},
+    {"name": "clear_capability_profile", "description":
+        "02038afe — Delete a scope's ENTIRE capability profile row (both its "
+        "capabilities and its disabled_capability_ids) so it reverts to purely "
+        "inheriting from less specific layers. Distinct from disabling individual "
+        "capability ids via set_capability_profile's disabled_capability_ids — "
+        "this clears the whole layer. Idempotent: clearing an already-empty or "
+        "never-set scope is a no-op, not an error.",
+     "inputSchema": {"type": "object", "properties": {
+         "scope_type": {"type": "string", "enum": ["workspace", "user", "project", "sprint_version", "item"]},
+         "scope_id": {"type": "string"}},
+         "required": ["scope_type", "scope_id"]}},
+    {"name": "get_effective_capability_profile", "description":
+        "02038afe — Read-only: resolve and return the MERGED capability profile "
+        "for a project (optionally narrowed to one sprint item) across every "
+        "applicable layer — workspace -> user -> project -> sprint_version -> item, "
+        "least to most specific. A capability id declared at more than one layer "
+        "resolves to the most specific layer's declaration; the response's "
+        "capability_sources maps each effective capability id to the layer that "
+        "won. overrides lists every capability id declared by more than one layer "
+        "(each entry flagged conflict=true when the two declarations disagree on "
+        "required_tools or availability_policy — the fields that change what an "
+        "executor can actually rely on). disabled lists every disable that "
+        "actually retracted an inherited capability. Pass sprint_item_id to also "
+        "resolve that item's sprint_version and item layers; omit it to get just "
+        "workspace/user/project. Never resolves against live tool/tunnel "
+        "availability — this is the declared, merged profile only.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "sprint_item_id": {"type": "string", "description": "Optional — also resolve this item's sprint_version and item-scoped layers."},
+         "user_scope_id": {"type": "string", "description": "Optional — a user/human id whose 'user' layer should be included in the merge."},
+         "workspace_scope_id": {"type": "string", "description": "Optional — defaults to 'singleton' (the self-host default workspace key)."}},
+         "required": []}},
     {"name": "claim_file", "description":
         "Claim edit rights on a file for this session. Whole-file by default "
         "(auto-expires after 2 hours). For symbol-level claims — so two sessions "
@@ -2621,6 +2691,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "set_executor_config": "config",
     "get_capability_manifest": "config",
     "set_capability_manifest": "config",
+    "set_capability_profile": "config",
+    "clear_capability_profile": "config",
+    "get_effective_capability_profile": "config",
     "set_active_repo":     "config",
     "run_verification":    "config",
     "add_custom_hook":     "config",
@@ -2740,6 +2813,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "set_executor_config":       "both",
     "get_capability_manifest":   "both",
     "set_capability_manifest":   "both",
+    "set_capability_profile":    "both",
+    "clear_capability_profile":  "both",
+    "get_effective_capability_profile": "both",
     "add_custom_hook":           "both",
     "get_custom_hooks":          "both",
     "delete_custom_hook":        "both",
