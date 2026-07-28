@@ -17179,6 +17179,104 @@ async def test_start_session_injects_execution_mode_directive(db, tmp_path):
     assert res_if["agent_instructions"].startswith("EXECUTION MODE: interactive")
 
 
+def _mcp_result(resp):
+    """Parse a Meridian MCP tools/call response body into its result payload."""
+    assert resp.get("result") is not None, resp
+    return json.loads(resp["result"]["content"][0]["text"])
+
+
+def test_mcp_start_session_includes_execution_policy(client):
+    """75ac1c8e — start_session's execution_policy field is the canonical,
+    machine-readable contract: immediate mode by default (autonomous
+    project), relaxed for an interactive project, present on both compact
+    (default) and full (compact=False) shapes."""
+    pid = client.post("/projects", json={"name": "mcp-exec-policy-auto"}).json()["id"]
+    compact = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "exec-policy-compact",
+    }))
+    assert "execution_policy" in compact
+    policy = compact["execution_policy"]
+    assert policy is not None
+    assert policy["execution_mode"] == "immediate"
+    assert policy["required_first_action"] == "claim_sprint_item"
+    assert policy["no_confirmation"] is True
+    assert policy["permitted_parallel_wave"] is True
+    assert policy["claim_before_edit"] is True
+    assert isinstance(policy["max_planning_turns"], int) and policy["max_planning_turns"] >= 1
+    assert "genuine_blocker_escalation" in policy
+
+    full = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "exec-policy-full", "compact": False,
+    }))
+    assert full["execution_policy"] == policy
+
+    # Interactive project -> relaxed policy mode. POST /projects has no
+    # execution_mode field; set it via PATCH .../settings like the dashboard does.
+    pid2 = client.post("/projects", json={"name": "mcp-exec-policy-inter"}).json()["id"]
+    patch_resp = client.patch(
+        f"/projects/{pid2}/settings", json={"execution_mode": "interactive"},
+    )
+    assert patch_resp.status_code == 200
+    inter = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid2, "session_name": "exec-policy-inter",
+    }))
+    inter_policy = inter["execution_policy"]
+    assert inter_policy["execution_mode"] == "relaxed"
+    assert inter_policy["required_first_action"] == "get_sprint_items"
+    assert inter_policy["no_confirmation"] is False
+    assert inter_policy["permitted_parallel_wave"] is False
+    assert inter_policy["claim_before_edit"] is True
+
+
+def test_mcp_set_executor_config_max_planning_turns_reflected_in_start_session(client):
+    """75ac1c8e — an executor_config.max_planning_turns override set via
+    set_executor_config is reflected in the next start_session's
+    execution_policy without any other field changing."""
+    pid = client.post("/projects", json={"name": "mcp-exec-policy-override"}).json()["id"]
+    baseline = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "before-override",
+    }))
+    assert baseline["execution_policy"]["max_planning_turns"] == 1
+
+    _mcp_result(_mcp_call(client, "set_executor_config", {
+        "project_id": pid, "max_planning_turns": 4,
+    }))
+    after = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "after-override",
+    }))
+    assert after["execution_policy"]["max_planning_turns"] == 4
+    assert after["execution_policy"]["execution_mode"] == "immediate"
+
+    # An invalid override never produces an unsafe live policy — falls back
+    # to the immediate-mode default instead of persisting verbatim.
+    _mcp_result(_mcp_call(client, "set_executor_config", {
+        "project_id": pid, "max_planning_turns": -1,
+    }))
+    rejected = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "after-invalid-override",
+    }))
+    assert rejected["execution_policy"]["max_planning_turns"] == 1
+
+
+@pytest.mark.parametrize("mode", ["full", "delta", "starter", "goal"])
+def test_mcp_generate_handoff_embeds_execution_policy_tag_all_modes(client, mode):
+    """75ac1c8e — every generate_handoff mode's /goal text carries the same
+    canonical <execution_policy> tag (embedded in `content` for full/delta/
+    starter, or the entire body for goal mode)."""
+    pid = client.post("/projects", json={"name": f"mcp-handoff-exec-policy-{mode}"}).json()["id"]
+    sess = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": f"handoff-exec-policy-{mode}",
+    }))
+    result = _mcp_result(_mcp_call(client, "generate_handoff", {
+        "project_id": pid, "mode": mode, "session_id": sess.get("session_id"),
+    }))
+    body = result.get("content") or ""
+    assert 'execution_mode="immediate"' in body
+    assert 'required_first_action="claim_sprint_item"' in body
+    assert 'no_confirmation="true"' in body
+    assert 'claim_before_edit="true"' in body
+
+
 @pytest.mark.asyncio
 async def test_executor_goal_prompt_scopes_to_active_version(db):
     """The executor-goal MCP prompt filters its item list + /goal to the

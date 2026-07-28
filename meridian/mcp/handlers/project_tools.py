@@ -375,6 +375,28 @@ async def handle_start_session(
             )
     except Exception:  # noqa: BLE001 — capability contract is best-effort
         pass
+    # 75ac1c8e — canonical, machine-readable execution policy: bounds
+    # planning/tool-free turns and names the required first action
+    # deterministically (see executor_config.build_execution_policy). Added
+    # here — after the composite call — so BOTH the compact and full
+    # start_session shapes (and the "continue" resume shape) get the exact
+    # same structured dict from one code path, mirroring how
+    # capability_contract is attached just above rather than duplicating the
+    # compute inside _start_session_composite's two branches. Best-effort: a
+    # failure here must never break start_session.
+    try:
+        if isinstance(result, dict):
+            from meridian.executor_config import build_execution_policy  # noqa: PLC0415
+            _policy_project = await db_module.get_project(db, _pid)
+            _policy_mode = db_module.normalize_execution_mode(
+                (_policy_project or {}).get("execution_mode")
+            )
+            _policy_exec_cfg = await db_module.get_executor_config(db, _pid)
+            result["execution_policy"] = build_execution_policy(
+                _policy_exec_cfg, execution_mode=_policy_mode,
+            )
+    except Exception:  # noqa: BLE001 — execution policy is best-effort
+        pass
     return result
 
 

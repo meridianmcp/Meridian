@@ -616,7 +616,14 @@ async def handle_set_executor_config(
               "isolation", "max_turns",
               # b970fe07 — dashboard-configurable Serena default repo + code-intel
               # index dirs (mirror filesystem_roots: scalar/list overwrite).
-              "serena_repo_path", "codebase_code_dirs"):
+              "serena_repo_path", "codebase_code_dirs",
+              # 75ac1c8e — execution-policy override: turns allowed before the
+              # required first action. Invalid/unsafe values (non-numeric,
+              # <=0, absurdly large) are never persisted verbatim as a live
+              # policy — executor_config.build_execution_policy clamps/rejects
+              # at read time (falls back to the mode default), same fail-safe
+              # convention max_turns already uses.
+              "max_planning_turns"):
         if k in args:
             cfg[k] = args[k]
     if "repo_paths" in args:
