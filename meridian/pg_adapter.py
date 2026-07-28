@@ -3520,6 +3520,33 @@ async def _migrate_pg_handoff_tokens_consumed_at(conn: PostgresConnection) -> No
     )
 
 
+async def _migrate_pg_board_snapshot_revisions(conn: PostgresConnection) -> None:
+    """ef665ef8 — board_snapshot_revisions (mirrors SQLite).
+
+    One row per DISTINCT revision hash observed for a ``(project_id,
+    version_filter)`` bucket; ``revision_counter`` is a monotonic,
+    persisted counter so a caller can tell "newer" from merely "different"
+    when comparing two canonical expanded-board snapshots (see
+    meridian.db.board_snapshot). CREATE_TABLES_CORE covers fresh DBs; this is
+    the upgrade path. The index lives here, never inline in
+    CREATE_TABLES_CORE, to avoid the unguarded-index boot crash. Idempotent.
+    Mirrors db._migrate_board_snapshot_revisions.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS board_snapshot_revisions ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    version_filter TEXT NOT NULL DEFAULT '',"
+        "    revision_hash TEXT NOT NULL,"
+        "    revision_counter INTEGER NOT NULL,"
+        "    item_count INTEGER NOT NULL DEFAULT 0,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_board_snapshot_revisions_bucket "
+        "ON board_snapshot_revisions(project_id, version_filter, revision_counter DESC);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3612,4 +3639,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_github_channel,
     _migrate_pg_claim_verification_mode,
     _migrate_pg_handoff_tokens_consumed_at,
+    _migrate_pg_board_snapshot_revisions,
 )

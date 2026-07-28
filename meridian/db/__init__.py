@@ -1111,6 +1111,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_github_channel(db)
     await _migrate_workspace_claim_verification_mode(db)
     await _migrate_handoff_tokens_consumed_at(db)
+    await _migrate_board_snapshot_revisions(db)
     return db
 
 
@@ -10426,6 +10427,18 @@ from .sprint_items import (  # noqa: F401
     _topo_depth_map,
     _transition_status,
     _update_sprint_item_status,
+)
+
+
+# ef665ef8 — canonical expanded-board snapshots, revisions, and resume diffs.
+# Imported after sprint_items (needs get_sprint_items/get_sprint_item_pointers/
+# parse_touches_resources already bound onto this module's namespace).
+from .board_snapshot import (  # noqa: F401
+    canonical_json,
+    build_board_snapshot,
+    diff_board_snapshots,
+    get_latest_board_snapshot_revision,
+    record_board_snapshot_revision,
 )
 
 
