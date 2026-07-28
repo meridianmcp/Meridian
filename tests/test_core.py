@@ -7733,10 +7733,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_handoff_tokens_consumed_at",
         "_migrate_pg_board_snapshot_revisions",
         "_migrate_pg_wave_runs",
+        "_migrate_pg_handoff_tokens_body_hash",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 128
+    assert len(allnames) == len(set(allnames)) == 129
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

@@ -82,6 +82,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "assign_sprint_waves": 'assign_sprint_waves(project_id="abc-123")',
     "start_wave_run": 'start_wave_run(project_id="abc-123", version="v0.2.5", wave_label="wave-2", item_ids=["item-uuid-a", "item-uuid-b"], failure_modes={"item-uuid-a": "stop"})',
     "finalize_wave_run": 'finalize_wave_run(wave_run_id="run-uuid", evidence={"status": "ok", "exit_code": 0, "passed": 1780, "failed": 0}, expected_revision_hash="sha256:...")',
+    "resume_wave": 'resume_wave(wave_run_id="run-uuid", goal_token="a1b2c3d4e5f6a7b8", presented_body="/goal\\n<sprint_items>...</sprint_items>")',
     "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
     "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
@@ -1751,6 +1752,36 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "expected_revision_hash": {"type": "string", "description": "Optional staleness gate: the board revision_hash you believe this run was planned against. A mismatch refuses the finalization instead of merging against unseen state."},
          "actor": {"type": "string", "description": "Optional session_id or actor name recorded as finalizing the run."}},
          "required": ["wave_run_id"]}},
+    {"name": "resume_wave", "description":
+        "efaa918a — STALE-MANIFEST GATING: check whether a wave run opened by "
+        "start_wave_run is still safe to resume against the LIVE board before you "
+        "act on its pinned manifest. Re-queries the board across ALL non-done "
+        "statuses (pending, todo, in_progress, provisional_complete, indeterminate, "
+        "failed, skipped, pushed) via build_board_snapshot — NEVER status='pending' "
+        "alone, which is the exact b763d2ba bug class (a sibling-claimed in_progress "
+        "item looks like it vanished). Fails CLOSED with SPECIFIC, actionable reasons "
+        "the moment the live board differs from the pinned manifest in ANY of: "
+        "revision_hash mismatch (added/removed items, status/dependency/resource/"
+        "pointer changes — reusing diff_board_snapshots's added/removed/changed_items "
+        "shape verbatim as resume_delta), an item's wave membership changed, or an "
+        "item was newly marked blocker_kind='superseded' (its premise was replaced). "
+        "Optionally also verifies a handoff token: pass goal_token (+ presented_body "
+        "to additionally check body-hash binding, efaa918a — closes the 2ee0000c gap "
+        "where a genuine token could be re-attached to an edited body and still verify). "
+        "Token outcomes keep the four existing distinct meanings from verify_handoff_token "
+        "(not_found/wrong_project are real spoofing signals; already_consumed/expired "
+        "usually mean a sibling already acted) PLUS the new body_mismatch (a real "
+        "spoofing signal — genuine token, edited body). Read-only w.r.t. the wave run "
+        "itself (does not advance wave_run status — call advance_wave_run_status "
+        "separately once resumable). Returns {resumable, wave_run_id, status, "
+        "resume_delta, pinned_revision_hash, live_revision_hash, token_check} on "
+        "success, or {error, resumable: false, reasons, resume_delta, token_check} "
+        "naming exactly what is stale.",
+     "inputSchema": {"type": "object", "properties": {
+         "wave_run_id": {"type": "string", "description": "The immutable id returned by start_wave_run."},
+         "goal_token": {"type": "string", "description": "Optional <goal_token> value to verify via verify_handoff_token, scoped to this run's project_id."},
+         "presented_body": {"type": "string", "description": "Optional canonical body text (e.g. the /goal block) to check against the token's stored body_hash, if any. Only meaningful together with goal_token."}},
+         "required": ["wave_run_id"]}},
     {"name": "configure_wave_gate", "description":
         "74a8f420 — PLANNING: configure (or on-the-fly reconfigure) a deterministic action "
         "pipeline attached to a wave or wave-range, ENFORCED STRUCTURALLY — not just "
@@ -2432,6 +2463,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "configure_wave_gate":           "sprint-management",
     "start_wave_run":                "sprint-management",
     "finalize_wave_run":             "sprint-management",
+    "resume_wave":                   "sprint-management",
     "analyze_sprint":                "sprint-management",
     "split_sprint_item":             "sprint-management",
     "merge_sprint_items":            "sprint-management",
@@ -2567,6 +2599,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "complete_wave_gate":        "executor",
     "start_wave_run":            "executor",
     "finalize_wave_run":         "executor",
+    "resume_wave":               "executor",
     "add_sprint_item":           "executor",
     "update_sprint_item":        "executor",
     "split_sprint_item":         "executor",
@@ -2991,6 +3024,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "configure_wave_gate": "Configure Wave Gate",
     "start_wave_run": "Start Wave Run",
     "finalize_wave_run": "Finalize Wave Run",
+    "resume_wave": "Resume Wave",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

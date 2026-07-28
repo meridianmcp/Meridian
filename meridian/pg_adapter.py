@@ -3520,6 +3520,23 @@ async def _migrate_pg_handoff_tokens_consumed_at(conn: PostgresConnection) -> No
     )
 
 
+async def _migrate_pg_handoff_tokens_body_hash(conn: PostgresConnection) -> None:
+    """efaa918a — handoff_tokens.body_hash (mirrors SQLite).
+
+    Nullable SHA-256 hex digest binding a token to the canonical body it was
+    minted for, closing the 2ee0000c token/body-integrity gap documented in
+    AGENTS.md. See db.migrations._migrate_handoff_tokens_body_hash for the
+    full writeup.
+
+    ADD COLUMN IF NOT EXISTS is idempotent; existing rows default to NULL, and
+    a NULL body_hash means verify_handoff_token's body check is skipped —
+    purely additive. Mirrors db._migrate_handoff_tokens_body_hash.
+    """
+    await conn.executescript(
+        "ALTER TABLE handoff_tokens ADD COLUMN IF NOT EXISTS body_hash TEXT"
+    )
+
+
 async def _migrate_pg_board_snapshot_revisions(conn: PostgresConnection) -> None:
     """ef665ef8 — board_snapshot_revisions (mirrors SQLite).
 
@@ -3709,4 +3726,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoff_tokens_consumed_at,
     _migrate_pg_board_snapshot_revisions,
     _migrate_pg_wave_runs,
+    _migrate_pg_handoff_tokens_body_hash,
 )

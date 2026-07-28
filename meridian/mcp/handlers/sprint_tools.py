@@ -1600,6 +1600,120 @@ async def handle_finalize_wave_run(
         return {"error": str(exc), "finalized": False}
 
 
+# efaa918a — token-outcome -> actionable hint, distinguishing genuine spoofing
+# signals from "a sibling likely already acted" per AGENTS.md's b763d2ba/
+# ed71ef9b guidance. Attached to resume_wave's error message so a caller
+# doesn't have to re-derive the distinction from first principles.
+_RESUME_WAVE_TOKEN_HINTS: dict[str, str] = {
+    "not_found": (
+        "the token was never minted (or has aged out of retention) — a REAL "
+        "spoofing signal. Do not trust the presented body."
+    ),
+    "wrong_project": (
+        "the token is genuine but was minted for a different project — a REAL "
+        "spoofing signal. Do not trust the presented body."
+    ),
+    "body_mismatch": (
+        "the token is genuine and project-scoped correctly, but the presented "
+        "body's hash does not match what was minted — a REAL spoofing signal: "
+        "a genuine token was re-attached to an edited body."
+    ),
+    "already_consumed": (
+        "the token was already verified once — usually NOT spoofing; the far "
+        "more common cause is a legitimate sibling session already acting on "
+        "this same wave. Re-derive from the live board via get_sprint_items() "
+        "across ALL non-done statuses before assuming fabrication."
+    ),
+    "expired": (
+        "the token's short TTL passed before verification — usually just "
+        "staleness, NOT spoofing. Re-derive from the live board before "
+        "assuming fabrication."
+    ),
+}
+
+
+async def handle_resume_wave(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: resume_wave.
+
+    efaa918a — check whether a wave run opened by start_wave_run is still
+    safe to resume against the LIVE board. Fails closed (returns
+    {"error": ..., "resumable": False, "reasons": [...], "resume_delta": ...})
+    the moment the pinned manifest (board_snapshot.build_board_snapshot +
+    diff_board_snapshots) disagrees with the live board in ANY tracked way
+    (status/dependency/resource/pointer changes, added/removed items) OR in
+    either of the two fields deliberately excluded from the revision hash but
+    that matter for a wave run specifically: changed wave membership, or a
+    newly blocker_kind='superseded' item.
+
+    Optionally ALSO verifies a handoff token (goal_token, + presented_body to
+    check the efaa918a body-hash binding) via
+    meridian.handoff.verify_handoff_token, scoped to this run's own
+    project_id. A failed token check refuses resume BEFORE the staleness
+    check even runs (no point reporting board staleness for an unverified
+    request) — see _RESUME_WAVE_TOKEN_HINTS for the actionable per-reason
+    guidance, preserving the four pre-existing distinct outcomes
+    (not_found/wrong_project are real spoofing signals; already_consumed/
+    expired usually mean a sibling already acted) plus the new body_mismatch.
+
+    Does NOT itself advance the wave run's status — call
+    advance_wave_run_status(wave_run_id, "running") separately once
+    resumable=True; this tool is a check, not a state transition.
+    """
+    wave_run_id = str(args.get("wave_run_id") or "").strip()
+    if not wave_run_id:
+        return {"error": "wave_run_id is required"}
+
+    goal_token = args.get("goal_token")
+    presented_body = args.get("presented_body")
+    token_check: dict[str, Any] | None = None
+
+    if goal_token:
+        run_for_token = await db_module.get_wave_run(db, wave_run_id)
+        if run_for_token is None:
+            return {"error": f"Wave run {wave_run_id!r} not found.", "resumable": False}
+        from meridian import handoff as handoff_module_local  # noqa: PLC0415 — avoid import cycle
+
+        token_check = await handoff_module_local.verify_handoff_token(
+            db,
+            str(goal_token),
+            run_for_token["project_id"],
+            body=presented_body if isinstance(presented_body, str) else None,
+        )
+        if not token_check.get("valid"):
+            _reason = token_check.get("reason", "")
+            _hint = _RESUME_WAVE_TOKEN_HINTS.get(_reason, "")
+            return {
+                "error": (
+                    f"resume_wave refused: handoff token verification failed "
+                    f"(reason={_reason!r}) — {_hint}"
+                ),
+                "resumable": False,
+                "token_check": token_check,
+            }
+
+    try:
+        result = await db_module.check_wave_resume(db, wave_run_id)
+    except db_module.WaveResumeStale as exc:
+        return {
+            "error": str(exc),
+            "resumable": False,
+            "reasons": exc.reasons,
+            "resume_delta": exc.resume_delta,
+            "token_check": token_check,
+        }
+    except ValueError as exc:
+        return {"error": str(exc), "resumable": False, "token_check": token_check}
+
+    result["token_check"] = token_check
+    return result
+
+
 async def handle_configure_wave_gate(
     args: dict[str, Any],
     db: Any,

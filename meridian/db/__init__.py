@@ -1113,6 +1113,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoff_tokens_consumed_at(db)
     await _migrate_board_snapshot_revisions(db)
     await _migrate_wave_runs(db)
+    await _migrate_handoff_tokens_body_hash(db)
     return db
 
 
@@ -10469,6 +10470,15 @@ from .wave_runs import (  # noqa: F401
     get_wave_run_children,
     # Finalization
     finalize_wave_run,
+)
+
+
+# efaa918a — resume_wave stale-manifest gating. Imported after wave_runs (needs
+# get_wave_run/WAVE_RUN_TERMINAL_STATUSES already bound) and after board_snapshot
+# (needs build_board_snapshot/diff_board_snapshots already bound).
+from .wave_resume import (  # noqa: F401
+    WaveResumeStale,
+    check_wave_resume,
 )
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import os
 import re
@@ -97,7 +98,22 @@ _HANDOFF_TOKEN_CLEANUP_GRACE_SECONDS = max(
 # pending_goal always reports "expired" rather than a swept-away "not_found"
 
 
-async def mint_handoff_token(db: Any, project_id: str) -> str:
+def _hash_goal_body(body: str) -> str:
+    """efaa918a — canonical SHA-256 hex digest of a /goal (or other handoff)
+    body, used to bind a handoff token to the exact body it was minted for.
+
+    Plain ``hashlib.sha256`` over the UTF-8 bytes of ``body`` as given — no
+    normalization beyond that. Callers that want the hash to be robust to
+    incidental whitespace differences should normalize before calling this;
+    ``resume_wave`` treats the presented body as the "canonical" one and
+    hashes it exactly as received, matching how it was hashed at mint time.
+    """
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+async def mint_handoff_token(
+    db: Any, project_id: str, *, body: str | None = None,
+) -> str:
     """cb8e7c0f — Mint a short-lived, single-use provenance token for a handoff.
 
     The token is a URL-safe random hex string (16 chars). It is persisted to the
@@ -115,6 +131,20 @@ async def mint_handoff_token(db: Any, project_id: str) -> str:
     Falls back to the in-process ``_HANDOFF_TOKENS`` dict on DB error so the
     best-effort handoff never fails due to a token-store write problem.
 
+    ``body`` (efaa918a) — optional canonical body text (e.g. the full /goal
+    block, or a wave-run's serialized manifest). When given, a SHA-256 hex
+    digest (:func:`_hash_goal_body`) is stored alongside the token as
+    ``body_hash``, so a LATER ``verify_handoff_token(..., body=...)`` call can
+    additionally confirm the presented body is byte-identical to what was
+    minted — closing the 2ee0000c gap documented in AGENTS.md: a genuine token
+    extracted from one /goal block and re-attached to a DIFFERENT (edited)
+    body previously still verified ``valid=True``, because the token was a
+    standalone opaque value with no binding to body content. Purely additive:
+    omitting ``body`` (the default) stores no ``body_hash`` and preserves the
+    exact prior behavior for every existing caller — the body check in
+    ``verify_handoff_token`` is skipped whenever no ``body_hash`` was recorded
+    (including every token minted before this parameter existed).
+
     Returns the token string to embed in the /goal block.
     """
     token = secrets.token_hex(8)  # 16-char hex, unambiguous, paste-friendly
@@ -122,11 +152,12 @@ async def mint_handoff_token(db: Any, project_id: str) -> str:
         seconds=_HANDOFF_TOKEN_TTL_SECONDS
     )
     expires_at_str = expires_at.strftime("%Y-%m-%d %H:%M:%S.%f")
+    body_hash = _hash_goal_body(body) if isinstance(body, str) else None
     try:
         await db.execute(
-            "INSERT INTO handoff_tokens (token, project_id, expires_at, consumed) "
-            "VALUES (?, ?, ?, 0)",
-            (token, project_id, expires_at_str),
+            "INSERT INTO handoff_tokens (token, project_id, expires_at, consumed, body_hash) "
+            "VALUES (?, ?, ?, 0, ?)",
+            (token, project_id, expires_at_str, body_hash),
         )
         await db.commit()
         # Opportunistic cleanup: delete rows past the grace window so the table
@@ -164,6 +195,7 @@ async def mint_handoff_token(db: Any, project_id: str) -> str:
             "expires_at": expires_at,
             "consumed": False,
             "consumed_at": None,
+            "body_hash": body_hash,
         }
         _evict_expired_tokens()
     return token
@@ -173,6 +205,8 @@ async def verify_handoff_token(
     db: Any,
     token: str,
     project_id: str,
+    *,
+    body: str | None = None,
 ) -> dict[str, Any]:
     """cb8e7c0f — Verify and consume a handoff provenance token.
 
@@ -219,6 +253,21 @@ async def verify_handoff_token(
       same /goal) already consumed it first, since tokens are single-use.
     - ``{valid: False, reason: "wrong_project"}`` — token is real but was minted
       for a different project_id. A REAL spoofing signal.
+    - ``{valid: False, reason: "body_mismatch"}`` — efaa918a: the token was
+      minted WITH a ``body_hash`` (see ``mint_handoff_token``'s ``body``
+      param), the caller supplied ``body`` here, and the two hashes disagree.
+      A REAL spoofing signal — it means a genuine token was extracted from one
+      body and re-attached to a DIFFERENT one. Checked ONLY after not_found/
+      expired/already_consumed/wrong_project all pass (the token itself must
+      already be genuine, unconsumed, and project-scoped correctly), and ONLY
+      when the token actually carries a ``body_hash`` AND the caller supplied
+      a ``body`` to check it against — a token minted without ``body`` (every
+      pre-efaa918a token, and every caller that doesn't pass ``body``) never
+      produces this outcome; the check is a strict superset of the prior
+      behavior. Deliberately does NOT consume the token (mirrors
+      ``wrong_project``'s own non-consuming behavior below): the failure is in
+      the presented body, not in the token, so the legitimate holder of the
+      CORRECT body must still be able to verify successfully afterward.
 
     b763d2ba (2026-07-21 false-positive incident): ``already_consumed`` and
     ``not_found`` must stay distinguishable to the caller. The DB row is
@@ -242,7 +291,7 @@ async def verify_handoff_token(
     # Primary path: DB-backed store (shared across all machines).
     try:
         async with db.execute(
-            "SELECT project_id, expires_at, consumed FROM handoff_tokens WHERE token = ?",
+            "SELECT project_id, expires_at, consumed, body_hash FROM handoff_tokens WHERE token = ?",
             (token,),
         ) as cur:
             row = await cur.fetchone()
@@ -250,6 +299,7 @@ async def verify_handoff_token(
             row_project_id = row["project_id"] if isinstance(row, dict) else row[0]
             row_expires_at = row["expires_at"] if isinstance(row, dict) else row[1]
             row_consumed = row["consumed"] if isinstance(row, dict) else row[2]
+            row_body_hash = row["body_hash"] if isinstance(row, dict) else row[3]
             # b763d2ba — check `consumed` BEFORE expiry/deletion. See the
             # docstring above: a token consumed by a legitimate sibling
             # session within its own short TTL keeps that original (now
@@ -276,6 +326,13 @@ async def verify_handoff_token(
                 return {"valid": False, "reason": "expired"}
             if row_project_id != project_id:
                 return {"valid": False, "reason": "wrong_project"}
+            # efaa918a — body-integrity check: only when the token actually
+            # carries a body_hash AND the caller supplied a body to check it
+            # against. Deliberately does NOT consume the token (see docstring)
+            # so the legitimate holder of the correct body can still verify.
+            if row_body_hash and body is not None:
+                if _hash_goal_body(body) != row_body_hash:
+                    return {"valid": False, "reason": "body_mismatch"}
             # Consume: mark single-use (and stamp consumed_at, b763d2ba) so a
             # second verification is rejected as "already_consumed" — not
             # "not_found" — for as long as the row is retained.
@@ -300,6 +357,11 @@ async def verify_handoff_token(
         return {"valid": False, "reason": "expired"}
     if entry["project_id"] != project_id:
         return {"valid": False, "reason": "wrong_project"}
+    # efaa918a — same body-integrity check as the DB path above; does not
+    # consume the entry on mismatch.
+    if entry.get("body_hash") and body is not None:
+        if _hash_goal_body(body) != entry["body_hash"]:
+            return {"valid": False, "reason": "body_mismatch"}
     entry["consumed"] = True
     entry["consumed_at"] = now
     return {"valid": True, "reason": "ok"}
@@ -3944,6 +4006,34 @@ def _stale_template_warning(stored_instructions: str | None) -> str:
     )
 
 
+async def _resolve_session_sprint_version(
+    db: Any, session_id: str | None,
+) -> str | None:
+    """b1f2c3d4 (efaa918a fallout) — look up a session's ``sprint_version``
+    scope (a76cb7c0), for handoff modes that should be scoped to the SAME
+    sprint-version bucket ``start_session(version=...)`` already resolved for
+    this session rather than showing the whole project's backlog.
+
+    Best-effort: returns ``None`` on a missing/unknown session_id or any DB
+    error — never breaks a handoff over an orientation convenience. ``None``
+    means "unscoped" everywhere this is used, which is the exact pre-existing
+    behavior for a session that was never version-scoped, so this is purely
+    additive.
+    """
+    if not session_id:
+        return None
+    try:
+        async with db.execute(
+            "SELECT sprint_version FROM sessions WHERE id = ?", (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return row["sprint_version"] if isinstance(row, dict) else row[0]
+    except Exception:  # noqa: BLE001 — best-effort only
+        return None
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3958,6 +4048,7 @@ async def generate_handoff(
     extra_narrative: str | None = None,
     identity: str | None = None,
     force_include_ids: list[str] | None = None,
+    version: str | None = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -3977,6 +4068,38 @@ async def generate_handoff(
     is NOT cleared, so ``claim_sprint_item``'s own deferral gate is unaffected.
     Use when a human genuinely wants a backburnered item back in scope for one
     planning run without permanently re-enabling claiming.
+
+    ``version`` (efaa918a) — optional explicit sprint-version bucket, currently
+    consumed by ``mode='starter'``/``'compact'`` ONLY (see the regression this
+    closes below). When omitted and ``session_id`` is given, the STARTER path
+    falls back to that session's own ``sprint_version`` (the same scope
+    ``start_session(version=...)`` already resolved and stored on the session
+    row) rather than showing the whole project's backlog across every version.
+
+    KNOWN REGRESSION FIXED (efaa918a): ``generate_handoff(mode='starter')``
+    called ``get_sprint_items(db, project_id)`` with NO version filter at all
+    and never passed a ``version`` to ``_build_quick_start_goal`` either (that
+    function's own ``version`` kwarg existed but was dead code — no call site
+    in this file ever passed it a real value). The practical effect: a
+    version-scoped session (e.g. ``start_session(version='v0.2.5')``) still
+    got the ENTIRE cross-version backlog (~44 items in one observed case) in
+    its starter /goal, and freshly-added v0.2.5 items — not yet prospected —
+    got silently excluded by the (correctly-functioning) unprospected gate
+    while unrelated OLDER items (already prospected from an earlier round)
+    dominated the executable list instead. Fixed here for the starter path by
+    resolving and threading the session's own scope through to
+    ``_generate_starter_handoff``.
+
+    NOT FIXED (separate, larger issue — see the efaa918a investigation notes
+    below): the full/delta (mode='full'/'delta') and goal-only (mode='goal')
+    paths have the IDENTICAL underlying gap — neither ever passes ``version``
+    to ``get_sprint_items`` or ``_build_quick_start_goal`` either, so they too
+    always return every sprint version. Fixing those requires touching more
+    call sites (the full/delta branch's ~250-line pending-items pipeline, plus
+    every ``generate_handoff(mode='full'/'delta'/'goal')`` caller across
+    handler.py/server.py that would need to start passing the caller's own
+    session scope) and is out of scope for this item; flagged here rather than
+    silently expanded into.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -3994,12 +4117,16 @@ async def generate_handoff(
     except Exception:  # noqa: BLE001 - optional pre-migration/project setting
         pass
     if mode in {"starter", "compact"}:
+        _starter_version = version
+        if _starter_version is None:
+            _starter_version = await _resolve_session_sprint_version(db, session_id)
         _st_path, _st_content = await _generate_starter_handoff(
             db,
             project,
             output_dir,
             identity=identity,
             completion_criteria_override=_project_completion_criteria_override,
+            version=_starter_version,
         )
         return _st_path, _st_content, False
     if mode == "goal":
@@ -4803,6 +4930,7 @@ async def _generate_starter_handoff(
     identity: str | None = None,
     *,
     completion_criteria_override: str | None = None,
+    version: str | None = None,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -4812,9 +4940,17 @@ async def _generate_starter_handoff(
     claimable batch in quick_start_goal below always carries the full list),
     and a ready-to-paste /goal string.  No decisions, no north star, no
     file paths — just enough to orient and execute.
+
+    ``version`` (efaa918a) — optional sprint-version bucket to scope BOTH the
+    "recently completed" and pending/claimable lists to. ``None`` preserves
+    the pre-existing behavior (every version, unscoped) — see generate_handoff's
+    own docstring for the regression this closes when the caller resolves a
+    session's own scope and passes it through here.
     """
     project_id = project["id"]
-    sprint_items_all = await db_module.get_sprint_items(db, project_id)
+    sprint_items_all = await db_module.get_sprint_items(
+        db, project_id, version=version,
+    )
     completed = [
         it for it in sprint_items_all
         if it.get("status") in {"done", "skipped", "failed", "pushed"}
