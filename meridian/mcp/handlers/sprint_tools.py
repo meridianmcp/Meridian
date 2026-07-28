@@ -1457,6 +1457,149 @@ async def handle_complete_wave_gate(
     return result
 
 
+async def handle_start_wave_run(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: start_wave_run.
+
+    2a654cb0 — open a durable wave run: an immutable wave_run_id pinned to the
+    canonical expanded board snapshot (ef665ef8) the wave was planned against,
+    so a session that dies mid-wave can be resumed against a manifest whose
+    staleness is detectable rather than assumed.
+
+    Builds the board snapshot server-side (the caller cannot supply one — a
+    caller-supplied snapshot would defeat the point of pinning what the SERVER
+    saw). Optionally records the wave's items as children with their
+    failure_mode, and any degraded tools.
+
+    Returns the created run, or {"error": ...}.
+    """
+    project_id = str(args.get("project_id") or "").strip()
+    project_name = str(args.get("project_name") or "").strip()
+    if not project_id and project_name:
+        _proj = await db_module.get_project_by_name(db, project_name)
+        if _proj:
+            project_id = _proj.get("id", "")
+    if not project_id:
+        return {"error": "project_id is required"}
+
+    version = str(args.get("version") or "").strip() or None
+    wave_label = str(args.get("wave_label") or "").strip() or None
+    actor = str(args.get("actor") or "").strip() or None
+
+    item_ids = args.get("item_ids")
+    if item_ids is not None and not isinstance(item_ids, list):
+        return {"error": "item_ids must be a list of sprint item ids"}
+    item_ids = [str(i) for i in (item_ids or [])]
+
+    snapshot = await db_module.build_board_snapshot(db, project_id, version=version)
+
+    try:
+        run = await db_module.create_wave_run(
+            db,
+            project_id,
+            version=version,
+            wave_label=wave_label,
+            snapshot=snapshot,
+            item_ids=item_ids,
+            actor=actor,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    # Register the wave's items as children up front so their failure_mode is
+    # on record BEFORE any of them can fail — a stop-mode contract discovered
+    # only after the failure is not a contract.
+    failure_modes = args.get("failure_modes")
+    failure_modes = failure_modes if isinstance(failure_modes, dict) else {}
+    for item_id in item_ids:
+        mode = str(failure_modes.get(item_id) or "continue")
+        if mode not in db_module.WAVE_RUN_CHILD_FAILURE_MODES:
+            mode = "continue"
+        await db_module.record_wave_run_child(
+            db, run["id"], item_id, failure_mode=mode, status="running", actor=actor,
+        )
+
+    degraded = args.get("degraded_tools")
+    if isinstance(degraded, list):
+        for entry in degraded:
+            if not isinstance(entry, dict) or not entry.get("tool"):
+                continue
+            await db_module.record_degraded_tool(
+                db,
+                run["id"],
+                str(entry["tool"]),
+                str(entry.get("reason") or "unspecified"),
+                fallback=(str(entry["fallback"]) if entry.get("fallback") else None),
+                actor=actor,
+            )
+
+    fresh = await db_module.get_wave_run(db, run["id"])
+    return {
+        "wave_run_id": run["id"],
+        "run": fresh,
+        "children": await db_module.get_wave_run_children(db, run["id"]),
+        "revision_hash": run.get("revision_hash"),
+        "revision_counter": run.get("revision_counter"),
+    }
+
+
+async def handle_finalize_wave_run(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: finalize_wave_run.
+
+    2a654cb0 — idempotently finalize a wave run. Retrying after a dropped
+    connection is safe and expected: an already-merged run returns the ORIGINAL
+    result with already_finalized=True, writes no row and appends no event.
+
+    Refuses (fails closed) when a failure_mode='stop' child has failed, when the
+    caller's expected_revision_hash does not match the board the run was planned
+    against, or when the evidence is not a genuine run_verification result
+    (status='ok', exit_code=0) — the same evidence contract complete_wave_gate
+    enforces.
+    """
+    wave_run_id = str(args.get("wave_run_id") or "").strip()
+    if not wave_run_id:
+        return {"error": "wave_run_id is required"}
+
+    evidence = args.get("evidence")
+    actor = str(args.get("actor") or "").strip() or None
+    expected = str(args.get("expected_revision_hash") or "").strip() or None
+
+    try:
+        return await db_module.finalize_wave_run(
+            db,
+            wave_run_id,
+            evidence=evidence,
+            actor=actor,
+            expected_revision_hash=expected,
+        )
+    except db_module.WaveRunFinalizationBlocked as exc:
+        return {
+            "error": str(exc),
+            "finalized": False,
+            "blocked_by": [
+                {
+                    "sprint_item_id": c.get("sprint_item_id"),
+                    "status": c.get("status"),
+                    "failure_mode": c.get("failure_mode"),
+                }
+                for c in exc.blocking_children
+            ],
+        }
+    except ValueError as exc:
+        return {"error": str(exc), "finalized": False}
+
+
 async def handle_configure_wave_gate(
     args: dict[str, Any],
     db: Any,

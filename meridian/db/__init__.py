@@ -1112,6 +1112,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_claim_verification_mode(db)
     await _migrate_handoff_tokens_consumed_at(db)
     await _migrate_board_snapshot_revisions(db)
+    await _migrate_wave_runs(db)
     return db
 
 
@@ -10439,6 +10440,35 @@ from .board_snapshot import (  # noqa: F401
     diff_board_snapshots,
     get_latest_board_snapshot_revision,
     record_board_snapshot_revision,
+)
+
+
+# 2a654cb0 — durable wave-run state, append/supersede history, idempotent
+# finalization. Imported after board_snapshot: create_wave_run records a board
+# snapshot revision, so record_board_snapshot_revision must already be bound.
+from .wave_runs import (  # noqa: F401
+    # State machine constants
+    WAVE_RUN_STATUSES,
+    WAVE_RUN_TERMINAL_STATUSES,
+    WAVE_RUN_TRANSITIONS,
+    WAVE_RUN_CHILD_FAILURE_MODES,
+    WAVE_RUN_CHILD_STATUSES,
+    WaveRunFinalizationBlocked,
+    # Runs
+    create_wave_run,
+    get_wave_run,
+    list_wave_runs,
+    advance_wave_run_status,
+    record_degraded_tool,
+    # Append-only history
+    append_wave_run_event,
+    get_wave_run_events,
+    supersede_wave_run_event,
+    # Children
+    record_wave_run_child,
+    get_wave_run_children,
+    # Finalization
+    finalize_wave_run,
 )
 
 

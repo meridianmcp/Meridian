@@ -3547,6 +3547,74 @@ async def _migrate_pg_board_snapshot_revisions(conn: PostgresConnection) -> None
     )
 
 
+async def _migrate_pg_wave_runs(conn: PostgresConnection) -> None:
+    """2a654cb0 — wave_runs / wave_run_events / wave_run_children (mirrors SQLite).
+
+    Durable state for a paused/resumed multi-agent wave: the run itself (with
+    its immutable id, enumerated status, pinned board snapshot + revision hash,
+    degraded-tool provenance, and write-once finalizer evidence), its strictly
+    append-only event history (monotonic per-run seq, corrections expressed by
+    superseding rather than mutation), and its per-sprint-item children (whose
+    failure_mode='stop' outcome structurally blocks finalization).
+
+    CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path. Every index
+    lives here, never inline in CREATE_TABLES_CORE, to avoid the unguarded-index
+    boot crash. Idempotent. Mirrors db.migrations._migrate_wave_runs.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS wave_runs ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    version TEXT,"
+        "    wave_label TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'planned',"
+        "    board_snapshot TEXT,"
+        "    revision_hash TEXT,"
+        "    revision_counter INTEGER,"
+        "    item_ids TEXT NOT NULL DEFAULT '[]',"
+        "    degraded_tools TEXT NOT NULL DEFAULT '[]',"
+        "    finalizer_evidence TEXT,"
+        "    finalized_at TEXT,"
+        "    actor TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_runs_project "
+        "ON wave_runs(project_id, status, created_at DESC);"
+        "CREATE TABLE IF NOT EXISTS wave_run_events ("
+        "    id TEXT PRIMARY KEY,"
+        "    wave_run_id TEXT NOT NULL,"
+        "    seq INTEGER NOT NULL,"
+        "    event_type TEXT NOT NULL,"
+        "    from_status TEXT,"
+        "    to_status TEXT,"
+        "    detail TEXT,"
+        "    payload TEXT,"
+        "    actor TEXT,"
+        "    supersedes TEXT,"
+        "    superseded_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE(wave_run_id, seq)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_events_run "
+        "ON wave_run_events(wave_run_id, seq);"
+        "CREATE TABLE IF NOT EXISTS wave_run_children ("
+        "    id TEXT PRIMARY KEY,"
+        "    wave_run_id TEXT NOT NULL,"
+        "    sprint_item_id TEXT NOT NULL,"
+        "    failure_mode TEXT NOT NULL DEFAULT 'continue',"
+        "    status TEXT NOT NULL DEFAULT 'running',"
+        "    evidence TEXT,"
+        "    actor TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE(wave_run_id, sprint_item_id)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_children_run "
+        "ON wave_run_children(wave_run_id, status);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3640,4 +3708,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_claim_verification_mode,
     _migrate_pg_handoff_tokens_consumed_at,
     _migrate_pg_board_snapshot_revisions,
+    _migrate_pg_wave_runs,
 )

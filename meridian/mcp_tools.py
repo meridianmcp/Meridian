@@ -80,6 +80,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
     "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
     "assign_sprint_waves": 'assign_sprint_waves(project_id="abc-123")',
+    "start_wave_run": 'start_wave_run(project_id="abc-123", version="v0.2.5", wave_label="wave-2", item_ids=["item-uuid-a", "item-uuid-b"], failure_modes={"item-uuid-a": "stop"})',
+    "finalize_wave_run": 'finalize_wave_run(wave_run_id="run-uuid", evidence={"status": "ok", "exit_code": 0, "passed": 1780, "failed": 0}, expected_revision_hash="sha256:...")',
     "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
     "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
@@ -1707,6 +1709,48 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "verification_payload": {"type": "object", "description": "The FULL dict returned by run_verification. Must have status='ok' and exit_code=0. Any other value (non-zero exit, error, not_configured, not_connected) is rejected. Do NOT fabricate or self-report — the server validates the payload."},
          "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."}},
          "required": ["wave_label", "verification_payload"]}},
+    {"name": "start_wave_run", "description":
+        "2a654cb0 — DURABLE WAVE STATE: open a wave run before dispatching a parallel "
+        "wave. Returns an immutable wave_run_id pinned to the canonical expanded board "
+        "snapshot (revision_hash + monotonic revision_counter) the wave was planned "
+        "against, so a session that dies mid-wave can be resumed against a manifest "
+        "whose staleness is DETECTABLE instead of assumed. The snapshot is built "
+        "server-side — you cannot supply one, because the point is to pin what the "
+        "server saw. Pass item_ids (the sprint items in this wave) and optionally "
+        "failure_modes ({item_id: 'stop'|'continue'}) to register them as children up "
+        "front: a failed 'stop' child then structurally BLOCKS finalize_wave_run. "
+        "degraded_tools ([{tool, reason, fallback}]) records which tools were "
+        "unavailable while the wave ran, so a later reader knows the evidence quality. "
+        "Returns {wave_run_id, run, children, revision_hash, revision_counter}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "version": {"type": "string", "description": "Optional sprint-version bucket this wave covers. Scopes the pinned board snapshot to that bucket."},
+         "wave_label": {"type": "string", "description": "Optional label for the wave, e.g. 'wave-2'."},
+         "item_ids": {"type": "array", "items": {"type": "string"}, "description": "Sprint item ids in this wave. Registered as children in status='running'."},
+         "failure_modes": {"type": "object", "description": "Optional {item_id: 'stop'|'continue'}. A 'stop' child that later fails blocks finalization. Unlisted items default to 'continue'."},
+         "degraded_tools": {"type": "array", "items": {"type": "object"}, "description": "Optional [{tool, reason, fallback}] provenance for tools unavailable during this wave (e.g. Serena tunnel inactive)."},
+         "actor": {"type": "string", "description": "Optional session_id or actor name recorded as opening the run."}},
+         "required": []}},
+    {"name": "finalize_wave_run", "description":
+        "2a654cb0 — IDEMPOTENT FINALIZATION: close a wave run opened by start_wave_run. "
+        "Safe to retry: if the run is already merged this returns the ORIGINAL result "
+        "with already_finalized=true, writes no row and appends no event (event_count is "
+        "identical across the retry — that is the observable proof). Fails CLOSED in "
+        "three cases: (1) a failure_mode='stop' child has failed — returns "
+        "{finalized: false, blocked_by: [...]} naming the items; (2) "
+        "expected_revision_hash does not match the board the run was planned against — "
+        "you are holding a stale manifest, re-read the board first; (3) evidence is not "
+        "a genuine run_verification result (status='ok', exit_code=0) — the SAME "
+        "evidence contract complete_wave_gate enforces; a self-report is rejected. "
+        "Returns {finalized, already_finalized, wave_run_id, status, finalized_at, "
+        "finalizer_evidence, children_summary, event_count}.",
+     "inputSchema": {"type": "object", "properties": {
+         "wave_run_id": {"type": "string", "description": "The immutable id returned by start_wave_run."},
+         "evidence": {"type": "object", "description": "The FULL dict returned by run_verification. Must have status='ok' and exit_code=0. Not required when replaying an already-finalized run."},
+         "expected_revision_hash": {"type": "string", "description": "Optional staleness gate: the board revision_hash you believe this run was planned against. A mismatch refuses the finalization instead of merging against unseen state."},
+         "actor": {"type": "string", "description": "Optional session_id or actor name recorded as finalizing the run."}},
+         "required": ["wave_run_id"]}},
     {"name": "configure_wave_gate", "description":
         "74a8f420 — PLANNING: configure (or on-the-fly reconfigure) a deterministic action "
         "pipeline attached to a wave or wave-range, ENFORCED STRUCTURALLY — not just "
@@ -2386,6 +2430,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "assign_sprint_waves":           "sprint-management",
     "complete_wave_gate":            "sprint-management",
     "configure_wave_gate":           "sprint-management",
+    "start_wave_run":                "sprint-management",
+    "finalize_wave_run":             "sprint-management",
     "analyze_sprint":                "sprint-management",
     "split_sprint_item":             "sprint-management",
     "merge_sprint_items":            "sprint-management",
@@ -2519,6 +2565,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "claim_sprint_item":         "executor",
     "complete_sprint_item":      "executor",
     "complete_wave_gate":        "executor",
+    "start_wave_run":            "executor",
+    "finalize_wave_run":         "executor",
     "add_sprint_item":           "executor",
     "update_sprint_item":        "executor",
     "split_sprint_item":         "executor",
@@ -2941,6 +2989,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "assign_sprint_waves": "Assign Sprint Waves",
     "complete_wave_gate": "Complete Wave Gate",
     "configure_wave_gate": "Configure Wave Gate",
+    "start_wave_run": "Start Wave Run",
+    "finalize_wave_run": "Finalize Wave Run",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",
