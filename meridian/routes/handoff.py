@@ -70,6 +70,13 @@ async def generate_handoff_endpoint(
         body.get("mode"),
         session_id if isinstance(session_id, str) else None,
     )
+    # b8f89491 — optional explicit sprint-version scope, same contract as the
+    # MCP path: wins over the session's own stored sprint_version; None (no
+    # version, no session, or a session with no stored scope) is unchanged
+    # unscoped behaviour.
+    _version = body.get("version")
+    if isinstance(_version, str) and not _version.strip():
+        _version = None
     skip_summary = not os.environ.get("ANTHROPIC_API_KEY")
     db = await _db(request)
     data_dir = _data_dir(request)
@@ -81,6 +88,7 @@ async def generate_handoff_endpoint(
                 skip_ai_summary=skip_summary,
                 mode=mode,
                 session_id=session_id if isinstance(session_id, str) else None,
+                version=_version if isinstance(_version, str) else None,
             ),
             timeout=90.0,
         )

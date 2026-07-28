@@ -2467,6 +2467,20 @@ async def _handle_task_tools(
             args.get("mode"),
             session_id,
         )
+        # b8f89491 — resolve + surface the effective sprint-version scope so a
+        # caller never has to infer it: an explicit version argument always
+        # wins; otherwise fall back to the calling session's own stored
+        # sprint_version. Mirrors generate_handoff's own resolution exactly
+        # (same helper) so this reported scope can never disagree with what
+        # generate_handoff actually used to build `content`.
+        _requested_version = args.get("version")
+        if isinstance(_requested_version, str) and not _requested_version.strip():
+            _requested_version = None
+        _effective_version = _requested_version
+        if _effective_version is None and session_id:
+            _effective_version = await handoff_module_local._resolve_session_sprint_version(
+                db, session_id
+            )
         # Fetch recent commits for reconcile annotations (non-fatal)
         _gh_project = await db_module.get_project(db, args["project_id"])
         _gh_commits = await _fetch_recent_commits(_gh_project or {}, tenant)
@@ -2512,6 +2526,7 @@ async def _handle_task_tools(
                     identity=_resolve_caller_identity(tenant),
                     force_include_ids=_force_include_ids,
                     skip_ai_summary=_skip_ai,
+                    version=_requested_version,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -2613,6 +2628,17 @@ async def _handle_task_tools(
             "goal_length_warning": _goal_warn,
             "goal_compliance": _goal_compliance,
             "capability_contract": _capability_contract,
+            # b8f89491 — machine-readable scope: which sprint-version bucket
+            # this handoff actually resolved to, and why (explicit argument vs.
+            # session-derived vs. unscoped). effective_version is None when the
+            # call is genuinely unscoped (no version arg, no session, or a
+            # session with no stored sprint_version) — same meaning as before
+            # this field existed, just made explicit rather than silent.
+            "scope": {
+                "requested_version": _requested_version,
+                "effective_version": _effective_version,
+                "session_id": session_id,
+            },
         }
     if name == "load_handoff":
         # 5efe254b — trusted retrieval of the latest stored handoff for a project

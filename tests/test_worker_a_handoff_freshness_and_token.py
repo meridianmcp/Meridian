@@ -120,7 +120,12 @@ async def test_pending_list_excludes_item_claimed_mid_generation(db, tmp_path, m
     call_count = {"n": 0}
 
     async def _side_effect(*args, **kwargs):
-        if kwargs == match_kwargs:
+        # b8f89491 — match on the subset of kwargs this test actually cares
+        # about (the executor-scoped pending fetch), not exact equality: the
+        # real call site now also always passes version= (None when the
+        # handoff is unscoped, as it is here), which is unrelated to the race
+        # this test is exercising.
+        if all(kwargs.get(k) == v for k, v in match_kwargs.items()):
             call_count["n"] += 1
             if call_count["n"] == 2:
                 # Simulate a second live session claiming the item in the

@@ -4102,37 +4102,36 @@ async def generate_handoff(
     Use when a human genuinely wants a backburnered item back in scope for one
     planning run without permanently re-enabling claiming.
 
-    ``version`` (efaa918a) — optional explicit sprint-version bucket, currently
-    consumed by ``mode='starter'``/``'compact'`` ONLY (see the regression this
-    closes below). When omitted and ``session_id`` is given, the STARTER path
-    falls back to that session's own ``sprint_version`` (the same scope
-    ``start_session(version=...)`` already resolved and stored on the session
-    row) rather than showing the whole project's backlog across every version.
+    ``version`` (efaa918a, extended by b8f89491) — optional explicit sprint-
+    version bucket. Resolved ONCE, up front, and threaded through EVERY
+    executable mode (``starter``/``compact``, ``goal``, ``full``, ``delta``):
+    an explicit ``version`` argument always wins; otherwise, when
+    ``session_id`` is given, it falls back to that session's own
+    ``sprint_version`` (the same scope ``start_session(version=...)`` already
+    resolved and stored on the session row). ``None`` (no explicit version,
+    no session, or a session with no stored scope) preserves the original
+    unscoped behaviour — every pending item across every version is returned,
+    unchanged from before this parameter existed.
 
-    KNOWN REGRESSION FIXED (efaa918a): ``generate_handoff(mode='starter')``
-    called ``get_sprint_items(db, project_id)`` with NO version filter at all
-    and never passed a ``version`` to ``_build_quick_start_goal`` either (that
-    function's own ``version`` kwarg existed but was dead code — no call site
-    in this file ever passed it a real value). The practical effect: a
-    version-scoped session (e.g. ``start_session(version='v0.2.5')``) still
-    got the ENTIRE cross-version backlog (~44 items in one observed case) in
-    its starter /goal, and freshly-added v0.2.5 items — not yet prospected —
-    got silently excluded by the (correctly-functioning) unprospected gate
-    while unrelated OLDER items (already prospected from an earlier round)
-    dominated the executable list instead. Fixed here for the starter path by
-    resolving and threading the session's own scope through to
-    ``_generate_starter_handoff``.
-
-    NOT FIXED (separate, larger issue — see the efaa918a investigation notes
-    below): the full/delta (mode='full'/'delta') and goal-only (mode='goal')
-    paths have the IDENTICAL underlying gap — neither ever passes ``version``
-    to ``get_sprint_items`` or ``_build_quick_start_goal`` either, so they too
-    always return every sprint version. Fixing those requires touching more
-    call sites (the full/delta branch's ~250-line pending-items pipeline, plus
-    every ``generate_handoff(mode='full'/'delta'/'goal')`` caller across
-    handler.py/server.py that would need to start passing the caller's own
-    session scope) and is out of scope for this item; flagged here rather than
-    silently expanded into.
+    KNOWN REGRESSION FIXED (efaa918a, then b8f89491): ``generate_handoff``
+    used to call ``get_sprint_items(db, project_id)`` with NO version filter
+    at all for the full/delta/goal paths, and never passed ``version`` to
+    ``_build_quick_start_goal`` either (that function's own ``version`` kwarg
+    existed but was dead code on those paths). The practical effect: a
+    version-scoped session (e.g. ``start_session(version='v0.2.6')``) still
+    got the ENTIRE cross-version backlog in its full/goal /goal block, and the
+    "=== HANDOFF READINESS ===" header leaked the project-global legacy
+    ``goal.sprint`` text (e.g. stale ``v0.2.5`` copy) even for a v0.2.6-scoped
+    session — no reliable, scoped, paste-ready /goal was ever produced for
+    the session's own work. efaa918a fixed the starter/compact path only;
+    b8f89491 closes the same gap for full/delta/goal by resolving
+    ``_effective_version`` once here and threading it into every
+    ``get_sprint_items`` call, ``_build_quick_start_goal``, and the readiness
+    header's sprint text (via ``get_sprint_version_description``, keeping the
+    project-global sprint field itself untouched). The MCP dispatch layer
+    (``mcp/handler.py``) additionally returns a machine-readable
+    ``scope: {requested_version, effective_version, session_id}`` so a caller
+    never has to infer what scope a handoff actually resolved to.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -4140,6 +4139,11 @@ async def generate_handoff(
     if mode == "planner":
         _pl_path, _pl_content = await _generate_planner_handoff(db, project_id, output_dir)
         return _pl_path, _pl_content, False
+    # b8f89491 — resolve the effective sprint-version scope ONCE, for every
+    # remaining executable mode. See the ``version`` docstring above.
+    _effective_version = version
+    if _effective_version is None:
+        _effective_version = await _resolve_session_sprint_version(db, session_id)
     _project_completion_criteria_override: str | None = None
     try:
         _stored_criteria = await db_module.get_sprint_version_description(
@@ -4150,16 +4154,13 @@ async def generate_handoff(
     except Exception:  # noqa: BLE001 - optional pre-migration/project setting
         pass
     if mode in {"starter", "compact"}:
-        _starter_version = version
-        if _starter_version is None:
-            _starter_version = await _resolve_session_sprint_version(db, session_id)
         _st_path, _st_content = await _generate_starter_handoff(
             db,
             project,
             output_dir,
             identity=identity,
             completion_criteria_override=_project_completion_criteria_override,
-            version=_starter_version,
+            version=_effective_version,
         )
         return _st_path, _st_content, False
     if mode == "goal":
@@ -4174,6 +4175,7 @@ async def generate_handoff(
             graph_searcher=graph_searcher,
             force_include_ids=force_include_ids,
             completion_criteria_override=_project_completion_criteria_override,
+            version=_effective_version,
         )
         return _g_path, _g_content, False
     if mode not in {"full", "delta"}:
@@ -4235,8 +4237,13 @@ async def generate_handoff(
     workspace_notes = await db_module.get_workspace_notes(db)
     # 45f519a0 — include_deferred=False so a deferred item is genuinely invisible
     # to executors in the handoff pending-items list, not just gated at claim time.
+    # b8f89491 — version=_effective_version scopes the ENTIRE downstream pipeline
+    # (pending, in_progress, and — for mode='delta' — completed items, since all
+    # three are derived from this one list) to the caller's sprint-version bucket
+    # instead of always returning the whole project's cross-version backlog.
     sprint_items_all = await db_module.get_sprint_items(
-        db, project_id, include_human=False, include_deferred=False
+        db, project_id, include_human=False, include_deferred=False,
+        version=_effective_version,
     )
     # Separate genuinely pending from actively-claimed in_progress items so:
     # (1) quick_start_goal only names items that haven't been claimed yet, and
@@ -4399,7 +4406,8 @@ async def generate_handoff(
     # snapshot rather than breaking the mandatory handoff.
     try:
         _fresh_sprint_items = await db_module.get_sprint_items(
-            db, project_id, include_human=False, include_deferred=False
+            db, project_id, include_human=False, include_deferred=False,
+            version=_effective_version,
         )
         _fresh_status_by_id = {
             it["id"]: it.get("status") for it in _fresh_sprint_items if it.get("id")
@@ -4459,6 +4467,11 @@ async def generate_handoff(
         # excluded_unprospected tag agrees with claim_sprint_item's own gate.
         pointer_evidence_ids=_pointer_evidence_ids,
         completion_criteria_override=_project_completion_criteria_override,
+        # b8f89491 — belt-and-suspenders: pending_sprint_items is already
+        # scoped via get_sprint_items(version=...) above, but this function's
+        # own version filter guards any future call site that forgets to
+        # pre-filter its input list.
+        version=_effective_version,
     )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
@@ -4493,6 +4506,29 @@ async def generate_handoff(
     # sprint-item tracking took over as the authoritative source of work.
     _has_any_sprint_items = bool(sprint_items_all)
     _sprint_stale = _sprint_stale_days(goal, _has_any_sprint_items)
+
+    # b8f89491 — when this handoff is scoped to a version with its own stored
+    # description, prefer that over the project-global legacy goal.sprint text
+    # for EVERY display surface (the Jinja2 template's own "**Sprint:**" line,
+    # AND the readiness header built further below) — goal.sprint is a
+    # separate, project-global data source that would otherwise leak an
+    # unrelated/stale version's text into a version-scoped session's handoff
+    # even though item-level filtering is already correctly scoped above. The
+    # legacy staleness demotion is skipped for the override (it only applies
+    # to the unscoped goal.sprint field). Mutating `goal` here (shallow copy)
+    # rather than only the readiness block's own local means the two surfaces
+    # can never disagree — a fix that only touched the readiness header left
+    # the template's own Sprint line still leaking the global text.
+    if _effective_version:
+        try:
+            _version_desc = await db_module.get_sprint_version_description(
+                db, project_id, _effective_version
+            )
+        except Exception:  # noqa: BLE001 — display override is best-effort
+            _version_desc = None
+        if _version_desc:
+            goal = {**goal, "sprint": f"{_effective_version} — {_version_desc}"}
+            _sprint_stale = None
 
     if mode == "delta":
         # 00dbeed0 — since_ts MUST be durable, not the in-memory
@@ -4645,6 +4681,10 @@ async def generate_handoff(
     if ws_block:
         content = f"{ws_block}\n\n{content}"
 
+    # b8f89491 — `goal["sprint"]`/`_sprint_stale` were already resolved to the
+    # version-scoped description (when one is in scope) right after `goal` was
+    # fetched above, so the readiness header and the template's own "Sprint:"
+    # line can never disagree.
     readiness_block = _build_readiness_block(
         sprint=goal.get("sprint"),
         pending_count=len(pending_sprint_items),
@@ -5089,8 +5129,14 @@ async def _generate_goal_only_handoff(
     graph_searcher: Callable[[str], Any] | None = None,
     force_include_ids: list[str] | None = None,
     completion_criteria_override: str | None = None,
+    version: str | None = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
+
+    ``version`` (b8f89491) — optional effective sprint-version scope, resolved
+    by the caller (``generate_handoff``) from an explicit ``version`` argument
+    or the calling session's own ``sprint_version``. ``None`` preserves the
+    original unscoped behaviour (every pending item, every version).
 
     No readiness header, no workspace decisions/notes, no L0/L1/L2 context —
     unlike every other mode (including ``starter``/``compact``, which still
@@ -5120,8 +5166,12 @@ async def _generate_goal_only_handoff(
         raise ValueError(f"project not found: {project_id}")
     # 45f519a0 — include_deferred=False; force_include_ids re-adds specific ids
     # below, mirroring generate_handoff's own full/delta handling.
+    # b8f89491 — version=version scopes this mode the same way full/delta are
+    # scoped, closing the gap where goal-only mode always returned every
+    # sprint version regardless of the caller's session scope.
     sprint_items_all = await db_module.get_sprint_items(
-        db, project_id, include_human=False, include_deferred=False
+        db, project_id, include_human=False, include_deferred=False,
+        version=version,
     )
     pending_sprint_items = [
         it for it in sprint_items_all
@@ -5214,6 +5264,8 @@ async def _generate_goal_only_handoff(
         # 682005f4(b) — thread resolved pointers into the goal block itself.
         include_pointer_lines=True,
         completion_criteria_override=completion_criteria_override,
+        # b8f89491 — belt-and-suspenders, mirroring the full/delta call site.
+        version=version,
     )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.
