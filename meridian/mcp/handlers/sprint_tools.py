@@ -144,10 +144,12 @@ async def handle_add_sprint_item(
             wave=args.get("wave"),
             sprint_name=args.get("sprint_name"),
             required_tool=args.get("required_tool"),
+            tool_requirements=args.get("tool_requirements"),
         )
     except ValueError as exc:
         # 501ec93f — malformed touches_resources identifier; also e08fee30 /
-        # 2282a636 bad priority / blocker_kind. Surface, don't crash.
+        # 2282a636 bad priority / blocker_kind; also 76dde31f (665 follow-up)
+        # malformed tool_requirements entries. Surface, don't crash.
         return {"error": str(exc)}
     # b0d42ef6 — duplicate guard blocked the insert: surface the error as-is
     # (no item was created, so the warnings below don't apply).
@@ -418,6 +420,13 @@ async def handle_update_sprint_item(
     # or a tool/plugin name to pin it — rendered as hard /goal guidance.
     if "required_tool" in args:
         _patch_kwargs["required_tool"] = args.get("required_tool")
+    # 76dde31f (665 follow-up) — set/clear/replace the typed tool_requirements
+    # contract. Only forward when the caller supplied the key (_UNSET
+    # sentinel), so omitting it leaves the stored value untouched; pass
+    # None/[] to clear (falls back to required_tool if still set), or a list
+    # of typed entries to set/replace it wholesale.
+    if "tool_requirements" in args:
+        _patch_kwargs["tool_requirements"] = args.get("tool_requirements")
     # 7c82f7c8 — set/clear github_channel. Only forward when the caller
     # supplied the key (_UNSET sentinel), so omitting it leaves the stored
     # value untouched; pass "" / null to clear, or one of

@@ -34,6 +34,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from . import capability_contract as capability_contract_module
 from . import db as db_module
+from . import tool_requirements as tool_requirements_module
 from .db.sprint_items import _is_deferred, is_item_claim_prospected, _split_wave_label
 from .executor_config import build_executor_config_block, has_executor_config
 
@@ -1076,6 +1077,18 @@ def _build_quick_start_goal(
             item for item in pending_sprint_items
             if item.get("version") == version
         ]
+    # 76dde31f (665 follow-up) — capture the version-scoped pending-item list
+    # HERE, before any of the manual/backburner/unprospected/wave-gate
+    # exclusions below narrow `pending_sprint_items` down to just today's
+    # claimable batch. The <tool_requirements> clause deliberately reports
+    # the FULL typed inventory (status in {todo, pending}, deferred already
+    # excluded by the caller, version-scoped) rather than the narrower
+    # claimable subset, so it matches EXACTLY what
+    # capability_contract.build_capability_contract's item_tool_requirements
+    # section computes via the identical filter criteria — see
+    # capability_contract._resolve_pending_items_for_contract and
+    # _build_tool_requirements_clause below.
+    _all_pending_for_tool_requirements = list(pending_sprint_items)
     # 3a02041a — split MANUAL/human items out of the executable list so they are
     # never named under the "claim and execute" directive; they're surfaced
     # separately as the maintainer's own todo (no completion-pressure language).
@@ -1440,6 +1453,12 @@ def _build_quick_start_goal(
         # category: same hard, unconditional treatment, for items with no
         # item-level pin of their own.
         + _build_workspace_tool_priority_clause(pending_sprint_items, tool_priority_map)
+        # 76dde31f (665 follow-up) — typed per-item tool_requirements contract:
+        # the FULL pending inventory (see _all_pending_for_tool_requirements
+        # above), not the narrower claimable-now batch the two clauses above
+        # use, so this matches capability_contract's item_tool_requirements
+        # section exactly.
+        + _build_tool_requirements_clause(_all_pending_for_tool_requirements)
         + f"{_manual_note}"
         f"{_backburner_note}"
         f"{_excluded_unprospected_note}"
@@ -1508,6 +1527,33 @@ def _build_required_tool_clause(items: list[dict[str, Any]]) -> str:
         "a hard requirement, not a suggestion: " + "; ".join(pins)
     )
     return f"\n<required_tool>{_xml_escape(body)}</required_tool>"
+
+
+def _build_tool_requirements_clause(items: list[dict[str, Any]]) -> str:
+    """76dde31f (665 follow-up) — build a ``<tool_requirements>`` XML clause
+    carrying the TYPED, canonical per-item tool-requirement contract.
+
+    Distinct from ``_build_required_tool_clause`` above (a single free-form
+    string pin, rendered as short prose): this clause embeds the CANONICAL
+    JSON of every pending item's normalized ``tool_requirements`` entries
+    (structured field when set; a legacy ``required_tool`` pin as a read-time
+    compatibility fallback otherwise — see
+    ``tool_requirements.effective_tool_requirements``). The body is the SAME
+    canonical JSON ``capability_contract.build_capability_contract`` embeds in
+    its ``item_tool_requirements`` section for the SAME request, so the batch
+    /goal's XML rendering and the structured ``generate_handoff`` response
+    never diverge — one typed extraction
+    (``capability_contract.extract_tool_requirements``), two representations
+    of the identical data, never two independently-maintained derivations.
+
+    Returns an empty string when no item in the batch has an effective tool
+    requirement, so it never adds noise to an ordinary /goal.
+    """
+    per_item = capability_contract_module.extract_tool_requirements(items)
+    if not per_item:
+        return ""
+    body = json.dumps(per_item, sort_keys=True, separators=(",", ":"))
+    return f"\n<tool_requirements>{_xml_escape(body)}</tool_requirements>"
 
 
 # ---------------------------------------------------------------------------
@@ -1770,6 +1816,20 @@ def build_item_briefing(
                 f"hard requirement, not a suggestion: {required_tool}"
             )
             + "</required_tool>"
+        )
+    # 76dde31f (665 follow-up) — typed tool_requirements contract: structured
+    # field wins when set; required_tool above is used as a read-time
+    # compatibility fallback only when it's empty (see
+    # tool_requirements.effective_tool_requirements). The body is the SAME
+    # canonical JSON capability_contract.extract_tool_requirements would embed
+    # for this item, so a caller can parse it back into the identical typed
+    # objects rather than re-deriving them from prose.
+    _tool_requirements = tool_requirements_module.effective_tool_requirements(item)
+    if _tool_requirements:
+        parts.append(
+            "<tool_requirements>"
+            + _xml_escape(tool_requirements_module.canonical_json(_tool_requirements))
+            + "</tool_requirements>"
         )
     parts += [
         f"<completion_criteria>{_xml_escape(completion_text)}</completion_criteria>",
@@ -4044,6 +4104,7 @@ async def _resolve_session_sprint_version(
 
 async def build_effective_capability_contract(
     db: Any, project_id: str, *, board_stale: bool = False,
+    version: "str | None" = None, items: "list[dict[str, Any]] | None" = None,
 ) -> "dict[str, Any] | None":
     """98aaccf4 — thin, fully-guarded wrapper over
     ``capability_contract.build_capability_contract`` for the two trusted
@@ -4058,10 +4119,16 @@ async def build_effective_capability_contract(
 
     ``board_stale`` is passed straight through -- see
     ``capability_contract.build_capability_contract`` for what it means.
+
+    ``version`` / ``items`` (76dde31f, 665 follow-up) are also passed
+    straight through -- they scope the contract's ``item_tool_requirements``
+    section (see ``capability_contract.build_capability_contract`` and
+    ``_build_tool_requirements_clause`` above) so it agrees with the batch
+    /goal's own ``<tool_requirements>`` clause for the SAME request.
     """
     try:
         return await capability_contract_module.build_capability_contract(
-            db, project_id, board_stale=board_stale,
+            db, project_id, board_stale=board_stale, version=version, items=items,
         )
     except Exception:  # noqa: BLE001 — capability contract is best-effort
         return None

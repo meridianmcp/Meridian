@@ -112,6 +112,49 @@ _TOOL_EXAMPLES: dict[str, str] = {
 }
 
 
+# 76dde31f (665 follow-up) — typed per-item tool_requirements schema, shared
+# verbatim between add_sprint_item and update_sprint_item so the two tool
+# definitions can never drift on field names/enum values. Distinct from
+# touches_resources (parallel-conflict scheduling metadata) and the legacy
+# free-form required_tool pin (a single string) — see
+# meridian.tool_requirements.normalize_tool_requirement for the canonical
+# validation this mirrors.
+_TOOL_REQUIREMENTS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "description": (
+        "76dde31f — typed per-item MCP tool-requirement contract, distinct from "
+        "touches_resources (scheduling metadata) and the legacy free-form "
+        "required_tool pin (a single string). Each entry: name, server_or_namespace, "
+        "required_or_preferred ('required'|'preferred'), purpose (all required); "
+        "call_template, fallback (a string or list of alternate tool ids), "
+        "availability_check, verification (all optional). Once set, this structured "
+        "field is the CANONICAL source build_item_briefing / the batch /goal's "
+        "<tool_requirements> clause / the machine-readable capability contract render "
+        "— required_tool keeps working and is used as a read-time compatibility "
+        "fallback only when this is empty. No secrets or machine-local absolute paths "
+        "(validated, same check as set_capability_manifest). Pass [] to clear."
+    ),
+    "items": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "The tool's name, e.g. 'find_symbol'."},
+            "server_or_namespace": {"type": "string", "description": "Which server/namespace it lives under, e.g. 'Serena', 'meridian', 'Filesystem'."},
+            "required_or_preferred": {"type": "string", "enum": ["required", "preferred"],
+                "description": "'required' = hard requirement; 'preferred' = soft preference, never blocking."},
+            "purpose": {"type": "string", "description": "Why this item needs it."},
+            "call_template": {"type": "string", "description": "Optional example invocation/signature."},
+            "fallback": {
+                "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+                "description": "Optional alternate tool id(s) to try, in order, if this one is unavailable.",
+            },
+            "availability_check": {"type": "string", "description": "Optional: how to confirm the tool is present (e.g. a tools/list name match)."},
+            "verification": {"type": "string", "description": "Optional: how to confirm the call actually worked."},
+        },
+        "required": ["name", "server_or_namespace", "required_or_preferred", "purpose"],
+    },
+}
+
+
 _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "create_project", "description": "Create a new Meridian project.",
      "inputSchema": {"type": "object", "properties": {
@@ -1521,7 +1564,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "wave": {"type": "string",
                   "description": "58a45b92 — stored, deterministic wave/batch label (e.g. 'wave-1') for enforced wave-a/wave-b grouping. Usually auto-filled by assign_sprint_waves from the conflict-free parallel groups; set it here only to pin an item to a specific wave up front. Omit to leave unassigned."},
          "required_tool": {"type": "string",
-                  "description": "4d1fb28f — pin the specific MCP tool/plugin the executor MUST use for this item (e.g. 'Serena: replace_symbol_body', 'meridian__patch_file', a named tunnel plugin) instead of leaving tool choice to executor habit. Rendered as a hard directive in the /goal block (not a soft hint) — see build_item_briefing / the batch /goal's <required_tool> clause. Omit for ordinary executor discretion."}},
+                  "description": "4d1fb28f — pin the specific MCP tool/plugin the executor MUST use for this item (e.g. 'Serena: replace_symbol_body', 'meridian__patch_file', a named tunnel plugin) instead of leaving tool choice to executor habit. Rendered as a hard directive in the /goal block (not a soft hint) — see build_item_briefing / the batch /goal's <required_tool> clause. Omit for ordinary executor discretion."},
+         "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -1582,6 +1626,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                              "description": "e2e1b682 — set true to require an independent fresh-session PASS (see complete_sprint_item's verifier_session_id/verification_verdict) before the item can be completed. A same-session self-report does not satisfy this gate. Set false to re-enable ordinary completion (evidence gate only). Omit to leave unchanged."},
          "required_tool": {"type": "string",
                   "description": "4d1fb28f — pin (or re-pin) the specific MCP tool/plugin the executor MUST use for this item, rendered as a hard directive in the /goal block — not left to executor habit. Pass an empty string to CLEAR the pin (ordinary executor discretion); omit to leave unchanged."},
+         "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA,
          "github_channel": {"type": "string", "enum": ["nightly", "stable", "graduated"],
                   "description": "7c82f7c8 — release-channel classification for this item's linked, auto-filed GitHub issue (fdaa5b55), mirroring the channel:nightly / channel:stable labels applied via which issue template (.github/ISSUE_TEMPLATE/) the reporter picked. 'graduated' marks a bug that started as nightly-only noise but is now confirmed reproducing on stable too — needs a real fix before general release. Pass an empty string to CLEAR it; omit to leave unchanged."}},
          "required": ["item_id"]}},

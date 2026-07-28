@@ -49,6 +49,7 @@ from typing import Any, Callable
 
 from . import capability_manifest as _cm
 from . import db as db_module
+from . import tool_requirements as _tool_requirements
 
 CONTRACT_SCHEMA_VERSION = 1
 
@@ -94,6 +95,42 @@ def extract_required_tool_pins(items: list[dict[str, Any]]) -> list[dict[str, st
         for it in items
         if it.get("id") and it.get("required_tool")
     ]
+
+
+def extract_tool_requirements(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Typed extraction of the per-item ``tool_requirements`` contract
+    (76dde31f, 665 follow-up).
+
+    Structured ``tool_requirements`` is the canonical source; a legacy
+    free-form ``required_tool`` pin is honoured as a read-time compatibility
+    fallback ONLY for items that carry no structured requirements at all —
+    see ``tool_requirements.effective_tool_requirements`` for the exact
+    precedence rule. Pure data, no XML/JSON rendering — the SAME extraction
+    ``handoff._build_tool_requirements_clause`` uses for the batch /goal's
+    ``<tool_requirements>`` clause, so the XML rendering and this module's
+    structured contract read one shared source of truth instead of
+    maintaining two independent derivations that could drift (mirrors
+    :func:`extract_required_tool_pins`'s existing role for the legacy
+    ``<required_tool>`` clause).
+
+    Deterministic ordering: the result is sorted by ``item_id`` regardless of
+    ``items``' own order, so two callers extracting from the SAME underlying
+    item set — but via independently-fetched/re-ordered lists (e.g. the batch
+    /goal's dependency-topo-sorted render vs. a plain
+    ``get_sprint_items`` fetch) — always produce byte-identical output. This
+    is what lets the batch /goal's ``<tool_requirements>`` XML clause and
+    :func:`build_capability_contract`'s ``item_tool_requirements`` section be
+    compared directly for the SAME request.
+    """
+    result: list[dict[str, Any]] = []
+    for it in items:
+        item_id = it.get("id")
+        if not item_id:
+            continue
+        requirements = _tool_requirements.effective_tool_requirements(it)
+        if requirements:
+            result.append({"item_id": item_id, "requirements": requirements})
+    return sorted(result, key=lambda r: r["item_id"])
 
 
 def _resolve_effective_capabilities(
@@ -275,6 +312,32 @@ def _scrub_secrets(contract: dict[str, Any]) -> dict[str, Any]:
     return contract
 
 
+async def _resolve_pending_items_for_contract(
+    db: Any, project_id: str, *, version: "str | None",
+) -> list[dict[str, Any]]:
+    """Fetch the pending-item set (76dde31f, 665 follow-up) used for the
+    contract's ``item_tool_requirements`` section, using the EXACT SAME
+    filter criteria ``handoff.generate_handoff`` uses to build its own
+    ``pending_sprint_items`` right before rendering the batch /goal's
+    ``<tool_requirements>`` clause: status in {todo, pending},
+    ``include_deferred=False``, scoped to ``version`` when given. Run within
+    the same request against the same (unmutated-in-between) DB state, this
+    produces the identical item set — see
+    ``handoff._build_tool_requirements_clause`` and the module docstring.
+
+    Best-effort: any DB error degrades to an empty list rather than breaking
+    contract building.
+    """
+    try:
+        items = await db_module.get_sprint_items(
+            db, project_id, include_human=False, include_deferred=False,
+            version=version,
+        )
+    except Exception:  # noqa: BLE001 — contract building must never break on this
+        return []
+    return [it for it in items if it.get("status") in ("todo", "pending")]
+
+
 async def build_capability_contract(
     db: Any,
     project_id: str,
@@ -282,6 +345,8 @@ async def build_capability_contract(
     board_stale: bool = False,
     effective_resolver: "EffectiveResolver | None" = None,
     availability_checker: "AvailabilityChecker | None" = None,
+    version: "str | None" = None,
+    items: "list[dict[str, Any]] | None" = None,
 ) -> dict[str, Any]:
     """Build the effective capability contract for ``project_id``.
 
@@ -291,6 +356,18 @@ async def build_capability_contract(
     its emergency L0 render after a timeout). Purely additive input — this
     module has no independent way to detect staleness itself, so it trusts
     the caller's own already-computed signal rather than re-deriving one.
+
+    ``items`` / ``version`` (76dde31f, 665 follow-up) — the sprint-item list
+    the contract's ``item_tool_requirements`` section is extracted from (see
+    :func:`extract_tool_requirements`). Pass ``items`` explicitly when the
+    caller already has the SAME pending-item list it used to render a /goal
+    block (e.g. a test asserting XML/JSON parity, or a future call site with
+    the list already in scope) — this is the strongest identical-data
+    guarantee. When omitted, this function self-fetches via
+    :func:`_resolve_pending_items_for_contract`, scoped to ``version`` — the
+    same query ``generate_handoff`` runs for its own pending-item list, so
+    the two agree for any request where nothing mutates sprint_items in
+    between.
 
     Never raises: ``get_project_capability_manifest`` returns an empty
     profile for any project with no persisted manifest (649e095f's own
@@ -302,6 +379,16 @@ async def build_capability_contract(
     """
     manifest = await db_module.get_project_capability_manifest(db, project_id)
     requested_capabilities = manifest.get("capabilities") or []
+
+    # 76dde31f (665 follow-up) — typed per-item tool_requirements, extracted
+    # from the caller-supplied pending-item list when given, else self-fetched
+    # with the identical filter criteria generate_handoff uses. See
+    # _resolve_pending_items_for_contract and extract_tool_requirements.
+    _pending_items_for_tool_reqs = (
+        items if items is not None
+        else await _resolve_pending_items_for_contract(db, project_id, version=version)
+    )
+    item_tool_requirements = extract_tool_requirements(_pending_items_for_tool_reqs)
 
     effective_capabilities, effective_source = _resolve_effective_capabilities(
         db, project_id, requested_capabilities, resolver=effective_resolver,
@@ -368,6 +455,7 @@ async def build_capability_contract(
             "degraded": degraded,
         },
         "manifest_hash": effective_hash,
+        "item_tool_requirements": item_tool_requirements,
         "board_stale": bool(board_stale),
         "executable": executable,
         "executable_reasons": executable_reasons,

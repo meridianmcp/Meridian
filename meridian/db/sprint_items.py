@@ -30,6 +30,7 @@ from meridian.db import (  # noqa: PLC0415
     parse_touches_resources,
     _resource_sets_conflict,
 )
+from .. import tool_requirements as _tool_requirements  # 76dde31f (665 follow-up)
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +775,7 @@ async def add_sprint_item(
     sprint_name: str | None = None,
     prospect_bypass: bool = False,
     required_tool: str | None = None,
+    tool_requirements: Any = None,
     notes: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
@@ -804,6 +806,21 @@ async def add_sprint_item(
     replace_symbol_body'). NULL means ordinary executor discretion. When set,
     it is rendered as a hard directive (not a hint) in the /goal block built by
     ``handoff._build_quick_start_goal`` / ``build_item_briefing``.
+    ``tool_requirements`` (76dde31f, 665 follow-up) is the TYPED successor to
+    ``required_tool``: a list of normalized entries (see
+    ``meridian.tool_requirements.normalize_tool_requirement`` for the schema —
+    name, server_or_namespace, required_or_preferred, purpose, call_template,
+    fallback, availability_check, verification). Distinct from
+    ``touches_resources`` (parallel-conflict scheduling metadata) and from
+    ``required_tool`` (a single free-form string) — once set, this structured
+    field is the CANONICAL source for what build_item_briefing / the batch
+    /goal's ``<tool_requirements>`` clause / the machine-readable capability
+    contract render; ``required_tool`` keeps working unchanged and is used as
+    a read-time compatibility fallback only when this field is empty (see
+    ``tool_requirements.effective_tool_requirements``). Raises ``ValueError``
+    (via ``tool_requirements.ToolRequirementError``) on malformed input —
+    unknown fields, missing required fields, secret-shaped values, or
+    machine-local absolute paths.
     ``notes`` is optional free-form context stored on the item at creation time.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
@@ -868,6 +885,10 @@ async def add_sprint_item(
                     }
     # 501ec93f — normalize + validate typed resource identifiers (raises on bad input).
     resources_json = serialize_touches_resources(touches_resources)
+    # 76dde31f (665 follow-up) — normalize + validate the typed tool_requirements
+    # contract (raises ToolRequirementError, a ValueError subclass, on bad input —
+    # same fail-fast discipline as the touches_resources line above).
+    tool_requirements_json = _tool_requirements.serialize_tool_requirements(tool_requirements)
     iid = _new_id()
     # b944c905 — auto-populate a human-readable slug from the title (or a
     # caller-supplied one), deduped per project.
@@ -883,13 +904,13 @@ async def add_sprint_item(
         "(id, project_id, version, title, notes, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
         "deferred_until, track, priority, blocker_kind, wave, sprint_name, "
-        "prospect_bypass, required_tool) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "prospect_bypass, required_tool, tool_requirements) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, notes, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
          priority, blocker_kind or None, wave or None, sprint_name or None,
-         1 if prospect_bypass else 0, required_tool or None),
+         1 if prospect_bypass else 0, required_tool or None, tool_requirements_json),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -2359,6 +2380,7 @@ async def patch_sprint_item(
     depends_on: Any = _UNSET,
     require_verification: Any = _UNSET,
     required_tool: Any = _UNSET,
+    tool_requirements: Any = _UNSET,
     github_channel: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
@@ -2407,6 +2429,16 @@ async def patch_sprint_item(
     executor discretion), or a free-form tool/plugin name (e.g. 'Serena:
     replace_symbol_body') to SET it — rendered as a hard directive in the
     /goal block, not left to executor habit.
+    ``tool_requirements`` (76dde31f, 665 follow-up) uses the ``_UNSET``
+    sentinel: omit to leave unchanged, pass ``None`` / ``[]`` to CLEAR the
+    structured contract (falls back to ``required_tool`` if still set — see
+    ``tool_requirements.effective_tool_requirements``), or a list of typed
+    entries (schema: name, server_or_namespace, required_or_preferred,
+    purpose, call_template, fallback, availability_check, verification) to
+    SET/REPLACE it wholesale. Raises ``ValueError`` (via
+    ``tool_requirements.ToolRequirementError``) on malformed input — unknown
+    fields, missing required fields, secret-shaped values, or machine-local
+    absolute paths.
     ``github_channel`` (7c82f7c8) uses the ``_UNSET`` sentinel: omit to leave
     unchanged, pass an empty string / ``None`` to CLEAR it, or one of
     {nightly, stable, graduated} to set it. Mirrors the channel:nightly /
@@ -2547,6 +2579,13 @@ async def patch_sprint_item(
         # replace_symbol_body', a named tunnel plugin, 'meridian__patch_file').
         ns_fields.append("required_tool = ?")
         ns_values.append(required_tool or None)
+    if tool_requirements is not _UNSET:
+        # 76dde31f (665 follow-up) — None/[] CLEARS the structured contract
+        # (falls back to required_tool if still set); any other value is
+        # validated/normalized and REPLACES the stored list wholesale. Raises
+        # ToolRequirementError (a ValueError) on malformed input.
+        ns_fields.append("tool_requirements = ?")
+        ns_values.append(_tool_requirements.serialize_tool_requirements(tool_requirements))
     if github_channel is not _UNSET:
         # 7c82f7c8 — empty string / None CLEARS it; otherwise validate the
         # enum (nightly / stable / graduated), like blocker_kind.
