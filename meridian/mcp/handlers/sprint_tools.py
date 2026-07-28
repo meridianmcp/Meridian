@@ -736,6 +736,8 @@ async def handle_claim_sprint_item(
     from ..handler import (  # noqa: PLC0415
         _parse_touches_files,
         _sprint_item_file_claim_conflicts,
+        _sprint_item_resource_claim_gate,
+        _rollback_sprint_item_resource_locks,
         _board_change_for_session,
         _suggest_files_for_title,
         _prospect_code_context,
@@ -793,6 +795,19 @@ async def handle_claim_sprint_item(
                 "conflicts": _file_conflicts,
             }
 
+    # 18c488b6 — symbol-scoped resource-lock gate: ACQUIRES (not just checks)
+    # a file or symbol claim for every touches_resources entry the item
+    # declares, under the caller's session_id. Unlike the touches_files
+    # CONFLICT check above, this is NEVER softened by worktree isolation —
+    # worktrees isolate the working tree, not the eventual merge, so a real
+    # symbol-range overlap stays a hard block regardless of isolation mode.
+    _resource_lock_gate = await _sprint_item_resource_claim_gate(
+        db, args["project_id"], args["item_id"], args.get("session_id"),
+        resource_contents=args.get("resource_contents"),
+    )
+    if not _resource_lock_gate.get("ok"):
+        return _resource_lock_gate
+
     try:
         # 5823db0b — actor attribution: record who claimed the item (explicit
         # actor arg, else the claiming session id).
@@ -801,6 +816,13 @@ async def handle_claim_sprint_item(
             db, args["project_id"], args["item_id"], actor=_claim_actor
         )
     except ValueError:
+        # 18c488b6 — the status transition never landed for THIS session (lost
+        # the race, or the item was otherwise unclaimable) — any resource locks
+        # the gate above newly acquired must not outlive a claim that never
+        # actually happened.
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
         # 10c0f6a0 — if already in_progress, check for stale claim and surface info
         _stale_item = await db_module.get_sprint_item(db, args["item_id"])
         if _stale_item and _stale_item.get("status") == "in_progress" and _stale_item.get("claimed_at"):
@@ -859,8 +881,17 @@ async def handle_claim_sprint_item(
     # and stop; the item was NOT claimed, so the worktree plumbing below (which
     # assumes a real item row) must be skipped.
     if isinstance(item, dict) and item.get("blocked"):
+        # 18c488b6 — a structural gate (DEFERRED/SUPERSEDED/WAVE_GATE_PENDING/
+        # UNPROSPECTED) declined the transition — same "never outlive a claim
+        # that didn't land" rollback as the ValueError-race path above.
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
         return item
     if item is None:
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
         raise ValueError("sprint item not found")
 
     if _suggest_worktree:
@@ -907,6 +938,15 @@ async def handle_claim_sprint_item(
             ),
             "conflicts": _file_conflicts,
         }
+
+    # 18c488b6 — expose the symbol/file resource-lock scope this claim actually
+    # acquired (or explicitly fell back on) so the executor sees machine-readable
+    # lock_scope metadata rather than having to infer it. Omitted entirely when
+    # there was nothing to declare (no touches_resources) so the field stays
+    # compact for the common case.
+    if _resource_lock_gate.get("lock_scope"):
+        item = dict(item)
+        item["resource_lock_scope"] = _resource_lock_gate["lock_scope"]
 
     _bc_claim = await _board_change_for_session(
         db, args["project_id"], args.get("session_id")
