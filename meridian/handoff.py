@@ -43,7 +43,11 @@ from .db.sprint_items import (
     _item_declares_resources,
     _split_wave_label,
 )
-from .executor_config import build_executor_config_block, has_executor_config
+from .executor_config import (
+    build_executor_config_block,
+    build_execution_policy,
+    has_executor_config,
+)
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _env = Environment(
@@ -748,6 +752,25 @@ def _loop_enabled_from_settings(
     return True if default is None else bool(default)
 
 
+def _execution_policy_from_settings(
+    proj_settings: dict[str, Any] | None,
+    execution_mode: str,
+) -> dict[str, Any]:
+    """75ac1c8e — resolve the canonical execution policy dict for this project.
+
+    Same two-input shape as every other ``_xxx_from_settings`` helper in this
+    module (``proj_settings`` + the already-normalized ``execution_mode``) so
+    every ``_build_quick_start_goal`` call site can wire it in identically.
+    Delegates to ``executor_config.build_execution_policy`` — see that
+    docstring for the field contract. Never raises: a non-dict/missing
+    executor_config degrades to the mode's defaults.
+    """
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    return build_execution_policy(
+        cfg if isinstance(cfg, dict) else {}, execution_mode=execution_mode
+    )
+
+
 def _partition_into_waves(
     items: list[dict[str, Any]],
 ) -> list[list[dict[str, Any]]]:
@@ -971,6 +994,46 @@ def _build_goal_pointer_lines(pending_sprint_items: list[dict[str, Any]]) -> str
     return "\n" + "\n".join(f"- {_xml_escape(line)}" for line in lines)
 
 
+def _build_execution_policy_clause(policy: dict[str, Any] | None) -> str:
+    """75ac1c8e — render the canonical ``<execution_policy>`` /goal tag.
+
+    Every field except the escalation-rule prose lands as an XML attribute
+    (not free text) so a receiver can parse the policy deterministically —
+    e.g. ``required_first_action="claim_sprint_item"`` — instead of having to
+    interpret ``<executor_directive>``'s prose to figure out what to do
+    first. ``policy`` is expected to already be the dict shape
+    ``executor_config.build_execution_policy`` returns (see
+    ``_execution_policy_from_settings``). Returns ``""`` for a falsy/invalid
+    policy so a caller with no policy degrades to no tag rather than a
+    malformed one.
+    """
+    if not isinstance(policy, dict) or not policy:
+        return ""
+    _attr_escape = {chr(34): "&quot;"}
+    mode = _xml_escape(str(policy.get("execution_mode") or "immediate"), _attr_escape)
+    try:
+        turns = int(policy.get("max_planning_turns") or 1)
+    except (TypeError, ValueError):
+        turns = 1
+    first_action = _xml_escape(
+        str(policy.get("required_first_action") or ""), _attr_escape
+    )
+    no_confirmation = "true" if policy.get("no_confirmation") else "false"
+    parallel_wave = "true" if policy.get("permitted_parallel_wave") else "false"
+    claim_before_edit = "true" if policy.get("claim_before_edit") else "false"
+    escalation = _xml_escape(str(policy.get("genuine_blocker_escalation") or ""))
+    # Attribute names deliberately mirror the JSON dict's own keys 1:1
+    # (execution_mode, max_planning_turns, ...) so a receiver reading either
+    # surface (start_session's execution_policy dict, or this tag) uses the
+    # SAME field names — no separate mapping to remember.
+    return (
+        f'\n<execution_policy execution_mode="{mode}" max_planning_turns="{turns}" '
+        f'required_first_action="{first_action}" no_confirmation="{no_confirmation}" '
+        f'permitted_parallel_wave="{parallel_wave}" '
+        f'claim_before_edit="{claim_before_edit}">{escalation}</execution_policy>'
+    )
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -990,6 +1053,7 @@ def _build_quick_start_goal(
     pointer_evidence_ids: "frozenset[str] | set[str] | None" = None,
     include_pointer_lines: bool = False,
     completion_criteria_override: str | None = None,
+    execution_policy: dict[str, Any] | None = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -1056,6 +1120,17 @@ def _build_quick_start_goal(
     delta/starter output is byte-for-byte unchanged; the goal-only handoff
     mode turns it on since that mode strips the separate L1 section that
     would otherwise carry this same information.
+
+    ``execution_policy`` (75ac1c8e) — the canonical dict from
+    ``executor_config.build_execution_policy`` (see
+    ``_execution_policy_from_settings``), rendered as a structured
+    ``<execution_policy>`` tag right after ``<executor_directive>`` via
+    :func:`_build_execution_policy_clause`, in BOTH the empty-board and
+    normal branches below. ``None`` (the default — every existing call site
+    that hasn't been updated to pass it) computes a policy from the
+    ``execution_mode`` param alone via ``build_execution_policy({},
+    execution_mode=execution_mode)``, so the tag is always present and no
+    caller can silently omit it.
     """
     _completion_override = (
         completion_criteria_override.strip()
@@ -1063,6 +1138,12 @@ def _build_quick_start_goal(
         and completion_criteria_override.strip()
         else None
     )
+    _policy = (
+        execution_policy
+        if isinstance(execution_policy, dict) and execution_policy
+        else build_execution_policy({}, execution_mode=execution_mode)
+    )
+    _policy_clause = _build_execution_policy_clause(_policy)
     try:
         _turns = int(max_turns)
         if _turns <= 0:
@@ -1241,7 +1322,8 @@ def _build_quick_start_goal(
         # exactly as the prior prose form did.
         return (
             f"{_loop_prefix}/goal\n"
-            "<executor_directive>Verify remaining work is complete.</executor_directive>\n"
+            "<executor_directive>Verify remaining work is complete.</executor_directive>"
+            f"{_policy_clause}\n"
             # 0d5453bc — explicit single-run wording: full suite runs once,
             # at the end of the megasprint, not per item.
             f"<completion_criteria>{_xml_escape(_empty_completion)}"
@@ -1406,7 +1488,8 @@ def _build_quick_start_goal(
         )
     return (
         f"{_loop_prefix}/goal\n"
-        f"<executor_directive>{_xml_escape(directive)}</executor_directive>\n"
+        f"<executor_directive>{_xml_escape(directive)}</executor_directive>"
+        f"{_policy_clause}\n"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
         # board query keeps a resumed session honest about mid-run injections
         # and already-claimed items instead of trusting a stale list.
@@ -4685,11 +4768,12 @@ async def generate_handoff(
     _pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
         db, [it.get("id") for it in pending_sprint_items]
     )
+    _effective_execution_mode = db_module.normalize_execution_mode(
+        project.get("execution_mode")
+    )
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
-        execution_mode=db_module.normalize_execution_mode(
-            project.get("execution_mode")
-        ),
+        execution_mode=_effective_execution_mode,
         max_turns=_max_turns_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_aa_mode,
         completion_mode=_completion_mode_from_settings(proj_settings),
@@ -4714,6 +4798,12 @@ async def generate_handoff(
         # own version filter guards any future call site that forgets to
         # pre-filter its input list.
         version=_effective_version,
+        # 75ac1c8e — canonical execution policy (bounds planning, forces the
+        # first required action); executor_config.max_planning_turns override
+        # honored via _execution_policy_from_settings.
+        execution_policy=_execution_policy_from_settings(
+            proj_settings, _effective_execution_mode
+        ),
     )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
@@ -5317,11 +5407,12 @@ async def _generate_starter_handoff(
         )
     except Exception:  # noqa: BLE001
         _s_pointer_evidence_ids = None
+    _s_execution_mode = db_module.normalize_execution_mode(
+        project.get("execution_mode")
+    )
     quick_start_goal = _build_quick_start_goal(
         pending,
-        execution_mode=db_module.normalize_execution_mode(
-            project.get("execution_mode")
-        ),
+        execution_mode=_s_execution_mode,
         max_turns=_max_turns_from_settings(settings),
         hitl_auto_answer_mode=_s_hitl_mode,
         completion_mode=_completion_mode_from_settings(settings),
@@ -5333,6 +5424,9 @@ async def _generate_starter_handoff(
         tool_priority_map=(_s_ws_settings or {}).get("tool_priority_map"),
         pointer_evidence_ids=_s_pointer_evidence_ids,
         completion_criteria_override=completion_criteria_override,
+        # 75ac1c8e — canonical execution policy (bounds planning, forces the
+        # first required action).
+        execution_policy=_execution_policy_from_settings(settings, _s_execution_mode),
     )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
@@ -5490,9 +5584,10 @@ async def _generate_goal_only_handoff(
     except Exception:  # noqa: BLE001
         _pointer_evidence_ids = None
 
+    _g_execution_mode = db_module.normalize_execution_mode(project.get("execution_mode"))
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
-        execution_mode=db_module.normalize_execution_mode(project.get("execution_mode")),
+        execution_mode=_g_execution_mode,
         max_turns=_max_turns_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_mode,
         completion_mode=_completion_mode_from_settings(proj_settings),
@@ -5509,6 +5604,9 @@ async def _generate_goal_only_handoff(
         completion_criteria_override=completion_criteria_override,
         # b8f89491 — belt-and-suspenders, mirroring the full/delta call site.
         version=version,
+        # 75ac1c8e — canonical execution policy (bounds planning, forces the
+        # first required action).
+        execution_policy=_execution_policy_from_settings(proj_settings, _g_execution_mode),
     )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.

@@ -201,6 +201,7 @@ Store project-level executor defaults so worker sessions start with repo path, e
 | `codebase_code_dirs` | array | optional | b970fe07 — directories codebase-memory-mcp (the tunnel's code-intel slot) auto-indexes. Deduped-union across the tenant's projects; used only when --code-dir is not passed on the CLI. Overwrites the existing list. |
 | `context_threshold` | integer | optional | Turns before a context-budget warning is surfaced to the session. |
 | `max_turns` | integer | optional | Turn ceiling injected into the /goal string ('Stop after N turns'). Default 200. |
+| `max_planning_turns` | integer | optional | 75ac1c8e — override for the execution_policy planning-turn ceiling (turns allowed before the required first action). Default 1 in immediate/autonomous mode, 10 in relaxed/interactive mode; clamped 1-50. Invalid/non-positive values fall back to the mode default rather than erroring. |
 
 **Example:**
 ```
