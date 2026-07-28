@@ -32,6 +32,7 @@ from xml.sax.saxutils import escape as _xml_escape  # 5abf3e12 — XML-safe /goa
 import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from . import artifact_classification as artifact_classification_module
 from . import artifact_declaration as artifact_declaration_module
 from . import capability_contract as capability_contract_module
 from . import db as db_module
@@ -1898,6 +1899,23 @@ def build_item_briefing(
             "<artifact_declaration>"
             + _xml_escape(json.dumps(_artifact_decl, sort_keys=True))
             + "</artifact_declaration>"
+        )
+    # 5fd9d2fd (665 follow-up) — deterministic figure/table-vs-safe-category
+    # classification: declared artifact_kind FIRST (authoritative, see
+    # artifact_classification.classify_artifact_work), conservative
+    # title/notes/pointer evidence as a fallback for legacy items with no
+    # declared kind. Rendered whenever the classifier found SOMETHING to say
+    # — mirrors <artifact_declaration>'s "no tag when nothing declared"
+    # restraint, but the ONE genuinely uninformative fallback result (no
+    # artifact_kind AND no title/notes/pointer signal at all — rule
+    # "no_signal_ambiguous") is skipped too, so an item with nothing to do
+    # with artifacts doesn't get a noise tag on every briefing.
+    _artifact_classification = artifact_classification_module.classify_artifact_work(item)
+    if _artifact_classification.get("rule") != "no_signal_ambiguous":
+        parts.append(
+            "<artifact_work_classification>"
+            + _xml_escape(json.dumps(_artifact_classification, sort_keys=True))
+            + "</artifact_work_classification>"
         )
     parts += [
         f"<completion_criteria>{_xml_escape(completion_text)}</completion_criteria>",
@@ -4029,13 +4047,48 @@ async def _generate_handoff_l0(
     return str(out_path.resolve()), content
 
 
+def _build_artifact_readiness_warnings(
+    pending_items: "list[dict[str, Any]] | None",
+) -> "list[str]":
+    """5fd9d2fd (665 follow-up) — surface figure/table-sensitive pending
+    items that have no ``planned_output``/durable pointer evidence yet, as
+    ``=== HANDOFF READINESS ===`` warning line(s). Best-effort: any failure
+    (bad item shape, classifier error) degrades to no warnings — this must
+    never break the mandatory handoff.
+    """
+    try:
+        summary = artifact_classification_module.summarize_artifact_classifications(
+            pending_items
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    warnings: list[str] = []
+    missing = summary.get("sensitive_without_pointer") or []
+    if missing:
+        n = len(missing)
+        sample = ", ".join(missing[:5])
+        more = f" (+{n - 5} more)" if n > 5 else ""
+        warnings.append(
+            f"⚠ {n} pending item{'s' if n != 1 else ''} look like figure/table "
+            f"work with no planned_output/pointer evidence yet: {sample}{more}"
+        )
+    return warnings
+
+
 def _build_readiness_block(
     sprint: "str | None",
     pending_count: int,
     decisions_count: int,
     sprint_stale_days: "int | None" = None,
+    artifact_warnings: "list[str] | None" = None,
 ) -> str:
-    """Build the =HANDOFF READINESS= header block prepended to every handoff."""
+    """Build the =HANDOFF READINESS= header block prepended to every handoff.
+
+    ``artifact_warnings`` (5fd9d2fd, 665 follow-up) — pre-formatted warning
+    lines from ``_build_artifact_readiness_warnings`` (figure/table-sensitive
+    pending items with no planned_output/pointer evidence yet). Optional and
+    additive: every existing positional call site keeps working unchanged.
+    """
     lines = ["=== HANDOFF READINESS ==="]
     if sprint_stale_days is not None:
         # 08c355c2 — sprint field is stale: demote it with an age warning so
@@ -4058,6 +4111,8 @@ def _build_readiness_block(
     else:
         n = decisions_count
         lines.append(f"✓ {n} pinned decision{'s' if n != 1 else ''}")
+    for _w in artifact_warnings or []:
+        lines.append(_w)
     lines.append("=========================")
     return "\n".join(lines)
 
@@ -4877,6 +4932,7 @@ async def generate_handoff(
         pending_count=len(pending_sprint_items),
         decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
         sprint_stale_days=_sprint_stale,
+        artifact_warnings=_build_artifact_readiness_warnings(pending_sprint_items),
     )
     content = f"{readiness_block}\n\n{content}"
 
