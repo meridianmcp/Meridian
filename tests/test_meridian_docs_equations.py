@@ -636,6 +636,68 @@ def test_edit_equation_local_malformed_new_payload_returns_error(tmp_path):
     assert "error" in result
     assert _read_docx_xml(path) == before
 
+def test_edit_equation_local_preserves_surrounding_run_order(tmp_path):
+    xml = _WRITE_XML.replace(
+        "      <m:oMath>\n",
+        "      <w:r><w:t>before</w:t></w:r>\n      <m:oMath>\n",
+    ).replace(
+        "      </m:oMath>\n    </w:p>",
+        "      </m:oMath>\n      <w:r><w:t>after</w:t></w:r>\n    </w:p>",
+    )
+    path = _write_docx(tmp_path, xml)
+    replacement = (
+        f'<m:oMath xmlns:m="{_M}">'
+        "<m:r><m:t>replacement</m:t></m:r>"
+        "</m:oMath>"
+    )
+
+    result = docs_intel.edit_equation_local(path, "0000C002", replacement)
+
+    assert "error" not in result
+    output = _read_docx_xml(path).decode("utf-8")
+    assert output.index("before") < output.index("replacement") < output.index("after")
+
+
+def test_append_text_run_after_math_adds_run_in_place(tmp_path):
+    path = _write_docx(tmp_path, _INLINE_XML)
+
+    result = docs_intel.append_text_run_after_math(path, "0000D001", " after")
+
+    assert result["status"] == "appended"
+    output = _read_docx_xml(path).decode("utf-8")
+    assert output.index("</m:oMath>") < output.index(" after")
+    assert output.index(" after") < output.index("End.")
+
+
+def test_append_text_run_after_math_rejects_ambiguous_equation(tmp_path):
+    xml = _INLINE_XML.replace(
+        "</m:oMath>",
+        "</m:oMath><m:oMath><m:r><m:t>G</m:t></m:r></m:oMath>",
+        1,
+    )
+    path = _write_docx(tmp_path, xml)
+
+    result = docs_intel.append_text_run_after_math(path, "0000D001", " after")
+
+    assert "error" in result
+    assert "math_index is required" in result["error"]
+    assert " after" not in _read_docx_xml(path).decode("utf-8")
+
+
+def test_append_text_run_after_math_selects_by_index(tmp_path):
+    xml = _INLINE_XML.replace(
+        "</m:oMath>",
+        "</m:oMath><m:oMath><m:r><m:t>G</m:t></m:r></m:oMath>",
+        1,
+    )
+    path = _write_docx(tmp_path, xml)
+
+    result = docs_intel.append_text_run_after_math(path, "0000D001", " after", math_index=1)
+
+    assert result["status"] == "appended"
+    output = _read_docx_xml(path).decode("utf-8")
+    assert output.index(">G<") < output.index(" after")
+
 
 # ---------------------------------------------------------------------------
 # remove_equation_local — display-mode (whole paragraph)

@@ -44,6 +44,7 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -1238,15 +1239,40 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
                     data = new_document_bytes
                 dst.writestr(info, data)
 
-    if os.path.exists(dest):
-        backup = dest + ".bak"
-        try:
-            shutil.copy2(dest, backup)
-        except OSError:
-            pass  # backup failure is non-fatal
+    _atomic_write_docx_bytes(out.getvalue(), dest)
 
-    with open(dest, "wb") as fh:
-        fh.write(out.getvalue())
+
+def _atomic_write_docx_bytes(payload: bytes, dest: str) -> None:
+    """Persist a DOCX with backup + same-directory atomic replacement.
+
+    A mutation is not considered written until the complete ZIP has been
+    flushed and atomically replaced. A failed temp write leaves the original
+    document in place and removes the temporary artifact.
+    """
+    parent = os.path.dirname(os.path.abspath(dest)) or "."
+    os.makedirs(parent, exist_ok=True)
+    temp_path: str | None = None
+    if os.path.exists(dest):
+        try:
+            shutil.copy2(dest, dest + ".bak")
+        except OSError:
+            pass
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".meridian-docx-", suffix=".tmp", dir=parent, delete=False
+        ) as fh:
+            temp_path = fh.name
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, dest)
+        temp_path = None
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -3989,19 +4015,21 @@ def edit_equation_local(
 ) -> dict[str, Any]:
     """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
 
-    Locates the paragraph by ``equation_para_id``, verifies it contains at
-    least one ``<m:oMath>``, removes all existing ``<m:oMath>`` children, and
-    inserts the new equation (resolved from OMML or LaTeX).
+    Locates the paragraph by equation_para_id, verifies it contains at
+    least one <m:oMath>, removes all existing equation containers, and
+    inserts the new equation (resolved from OMML or LaTeX). The replacement
+    occupies the first existing equation slot so surrounding text runs retain
+    their original order.
 
     Args:
         docx_path:         Absolute path to the .docx file (mutated in place).
-        equation_para_id:  ``w14:paraId`` or ``p{N}`` of the equation paragraph.
+        equation_para_id:  w14:paraId or p{N} of the equation paragraph.
         new_payload:       Raw OMML XML or LaTeX expression.
         index_db_path:     If supplied, sidecar is invalidated after write.
 
     Returns:
-        ``{status, equation_para_id, omml, docx_path}``
-        or ``{"error": <message>}`` on failure.
+        {status, equation_para_id, omml, docx_path}
+        or {"error": <message>} on failure.
     """
     if not new_payload or not str(new_payload).strip():
         return {"error": "new_payload must be a non-empty string (OMML XML or LaTeX)"}
@@ -4026,12 +4054,10 @@ def edit_equation_local(
 
     _body, para_elem, _cidx = result
 
-    # Verify: paragraph must contain at least one oMath.
     m_omath_tag = _qm("oMath")
-    existing = [el for el in para_elem if el.tag == m_omath_tag]
-    if not existing:
-        # Also check deeper (oMath might be wrapped in oMathPara).
-        existing = list(para_elem.iter(m_omath_tag))
+    m_omath_para_tag = _qm("oMathPara")
+    equation_container_tags = (m_omath_tag, m_omath_para_tag)
+    existing = list(para_elem.iter(m_omath_tag))
     if not existing:
         return {
             "error": (
@@ -4040,15 +4066,36 @@ def edit_equation_local(
             )
         }
 
-    # Remove all direct-child oMath elements (and oMathPara wrappers).
-    m_omath_para_tag = _qm("oMathPara")
-    for child in list(para_elem):
-        if child.tag in (m_omath_tag, m_omath_para_tag):
-            para_elem.remove(child)
-
-    # Append the new oMath.
-    omath_el = ET.fromstring(omml)
-    para_elem.append(omath_el)
+    # Replace the first direct equation container in place. A display equation
+    # may be wrapped in <m:oMathPara>; replacing that wrapper preserves the
+    # paragraph child slot just as replacing a direct <m:oMath> does.
+    replacement = ET.fromstring(omml)
+    direct_containers = [
+        child for child in list(para_elem) if child.tag in equation_container_tags
+    ]
+    if direct_containers:
+        new_children = []
+        inserted = False
+        for child in list(para_elem):
+            if child.tag in equation_container_tags:
+                if not inserted:
+                    new_children.append(replacement)
+                    inserted = True
+            else:
+                new_children.append(child)
+        para_elem[:] = new_children
+    else:
+        # Preserve legacy behavior for unusual nested equation markup by
+        # replacing the first nested <m:oMath> in its existing parent.
+        parent = next(
+            (candidate for candidate in para_elem.iter() if existing[0] in list(candidate)),
+            None,
+        )
+        if parent is None:
+            return {"error": "could not locate the existing equation container"}
+        children = list(parent)
+        children[children.index(existing[0])] = replacement
+        parent[:] = children
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
@@ -4061,6 +4108,93 @@ def edit_equation_local(
         "status": "edited",
         "equation_para_id": equation_para_id,
         "omml": omml,
+        "docx_path": docx_path,
+    }
+
+def append_text_run_after_math(
+    docx_path: str,
+    equation_para_id: str,
+    text: str,
+    math_index: int | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """Append a normal Word text run immediately after a selected equation.
+
+    The paragraph is resolved by its stable paragraph id. If it contains more
+    than one equation, math_index is required to avoid guessing which equation
+    receives the text.
+    """
+    if not isinstance(text, str) or not text:
+        return {"error": "text must be a non-empty string"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, equation_para_id)
+    if result is None:
+        return {"error": f"para_id {equation_para_id!r} not found in {docx_path}"}
+
+    _body, para_elem, _cidx = result
+    m_omath_tag = _qm("oMath")
+    equations = list(para_elem.iter(m_omath_tag))
+    if not equations:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} does not contain an <m:oMath> element"
+            )
+        }
+    if math_index is None and len(equations) != 1:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} contains {len(equations)} equations; "
+                "math_index is required"
+            )
+        }
+    if math_index is None:
+        selected_index = 0
+    elif not isinstance(math_index, int) or isinstance(math_index, bool):
+        return {"error": "math_index must be a non-negative integer"}
+    elif math_index < 0 or math_index >= len(equations):
+        return {
+            "error": (
+                f"math_index {math_index} is out of range for "
+                f"{len(equations)} equations"
+            )
+        }
+    else:
+        selected_index = math_index
+
+    selected = equations[selected_index]
+    parent = next(
+        (candidate for candidate in para_elem.iter() if selected in list(candidate)),
+        None,
+    )
+    if parent is None:
+        return {"error": "could not locate the selected equation container"}
+
+    run = ET.Element(_q(_W, "r"))
+    text_elem = ET.SubElement(run, _q(_W, "t"))
+    text_elem.text = text
+    children = list(parent)
+    children.insert(children.index(selected) + 1, run)
+    parent[:] = children
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "appended",
+        "equation_para_id": equation_para_id,
+        "math_index": selected_index,
+        "text": text,
         "docx_path": docx_path,
     }
 
@@ -7371,6 +7505,224 @@ def copy_section(
 # for, so this locates the source purely by its own body-child position.
 # ---------------------------------------------------------------------------
 
+def relocate_figure(
+    docx_path: str,
+    figure_index: int,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
+) -> dict[str, Any]:
+    """Relocate one image paragraph together with its immediately following Figure caption.
+
+    The source is selected by the same 1-based image order exposed by
+    find_image_paragraph. The operation is deliberately strict: the image
+    must be a direct body paragraph and the next body child must contain
+    a SEQ Figure field. This prevents accidentally detaching a caption
+    or moving an image out of a table cell.
+
+    The two existing body elements are moved as one live OOXML range, so image
+    relationship IDs, drawing properties, paragraph IDs, bookmarks, and
+    caption formatting are preserved verbatim. The operation gates bookmark
+    splits before writing, verifies the saved document from disk, invalidates
+    the local structure sidecar, and runs renumber_sequences so Figure
+    SEQ caches and REF display text remain correct after the reorder.
+
+    Returns {status, figure_index, moved_block_count, image_para_id,
+    caption_para_id, new_body_index, renumber_sequences, docx_path}, or an
+    {"error": ...} result with the source document untouched for validation and
+    pre-write safety failures.
+    """
+    if destination_position not in ("before", "after"):
+        return {
+            "error": (
+                "destination_position must be 'before' or 'after', "
+                f"got {destination_position!r}"
+            )
+        }
+    if (
+        not isinstance(figure_index, int)
+        or isinstance(figure_index, bool)
+        or figure_index < 1
+    ):
+        return {
+            "error": (
+                "figure_index must be a positive 1-based int, "
+                f"got {figure_index!r}"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    body_list = list(body)
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+    w_drawing = _q(_W, "drawing")
+    w_pict = _q(_W, "pict")
+    w_fld_simple = _q(_W, "fldSimple")
+    w_instr = _q(_W, "instr")
+    w_instr_text = _q(_W, "instrText")
+
+    def _has_image(paragraph: ET.Element) -> bool:
+        return (
+            paragraph.find(f".//{w_drawing}") is not None
+            or paragraph.find(f".//{w_pict}") is not None
+        )
+
+    def _has_figure_seq(paragraph: ET.Element) -> bool:
+        for field in paragraph.iter(w_fld_simple):
+            if _SEQ_FIGURE_RE.search(field.get(w_instr) or ""):
+                return True
+        for instr in paragraph.iter(w_instr_text):
+            if _SEQ_FIGURE_RE.search("".join(instr.itertext())):
+                return True
+        return False
+
+    image_indices = [
+        i for i, child in enumerate(body_list)
+        if child.tag == w_p and _has_image(child)
+    ]
+    if figure_index > len(image_indices):
+        return {
+            "error": (
+                f"figure_index {figure_index} is out of range: document has "
+                f"{len(image_indices)} direct-body image paragraph(s)"
+            )
+        }
+
+    source_idx = image_indices[figure_index - 1]
+    caption_idx = source_idx + 1
+    if caption_idx >= len(body_list) or body_list[caption_idx].tag != w_p:
+        return {
+            "error": (
+                f"figure {figure_index} image paragraph at body index {source_idx} "
+                "is not immediately followed by a paragraph caption"
+            )
+        }
+    caption_el = body_list[caption_idx]
+    if not _has_figure_seq(caption_el):
+        return {
+            "error": (
+                f"figure {figure_index} image paragraph at body index {source_idx} "
+                "is not immediately followed by a SEQ Figure caption"
+            )
+        }
+
+    dest_result = _find_para_by_id(root, destination_anchor_para_id)
+    if dest_result is None:
+        return {
+            "error": (
+                f"para_id {destination_anchor_para_id!r} not found in {docx_path}"
+            )
+        }
+    _dbody, _delem, dest_idx = dest_result
+    if source_idx <= dest_idx < caption_idx + 1:
+        return {
+            "error": (
+                "destination_anchor_para_id resolves inside the figure block "
+                "(image + caption); choose an anchor outside it"
+            )
+        }
+
+    dest_section_bounds = (
+        _locate_section_bounds(body, destination_anchor_para_id)
+        if destination_position == "after"
+        else None
+    )
+
+    split_bookmarks = _bookmarks_split_by_range(
+        body_list, source_idx, caption_idx + 1
+    )
+    if split_bookmarks and not allow_bookmark_split:
+        return {
+            "error": (
+                f"aborting relocate_figure: moving figure {figure_index} would "
+                f"split bookmark(s) {split_bookmarks!r} across the move boundary "
+                "(their w:bookmarkStart and w:bookmarkEnd would end up in two "
+                "disconnected parts of the document) -- pass "
+                "allow_bookmark_split=True to force the move anyway"
+            ),
+            "split_bookmarks": split_bookmarks,
+        }
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+    moved_elements = body_list[source_idx:caption_idx + 1]
+    expected_hash = _hash_elements(moved_elements)
+    removed_count = len(moved_elements)
+
+    for element in moved_elements:
+        body.remove(element)
+
+    def _shift(index: int) -> int:
+        if index >= caption_idx + 1:
+            return index - removed_count
+        if index >= source_idx:
+            return source_idx
+        return index
+
+    if dest_section_bounds is not None:
+        _dest_start_idx, dest_end_idx, _dest_heading_text, _dest_level = (
+            dest_section_bounds
+        )
+        insert_at = _shift(dest_end_idx)
+    else:
+        dest_idx_after = _shift(dest_idx)
+        insert_at = (
+            dest_idx_after
+            if destination_position == "before"
+            else dest_idx_after + 1
+        )
+
+    for offset, element in enumerate(moved_elements):
+        body.insert(insert_at + offset, element)
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    verify_error = _verify_docx_write(
+        docx_path,
+        expected_counts=baseline_counts,
+        expected_hash=expected_hash,
+        expected_range=(insert_at, insert_at + removed_count),
+    )
+    if verify_error is not None:
+        verify_error["file_restored"] = _restore_docx_backup(docx_path)
+        verify_error["figure_index"] = figure_index
+        verify_error["moved_block_count"] = removed_count
+        return verify_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+    renumber_result = renumber_sequences(
+        docx_path, index_db_path=index_db_path
+    )
+
+    image_para_id = body_list[source_idx].get(w14_para_id)
+    caption_para_id = body_list[caption_idx].get(w14_para_id)
+    return {
+        "status": "moved",
+        "figure_index": figure_index,
+        "moved_block_count": removed_count,
+        "image_para_id": image_para_id,
+        "caption_para_id": caption_para_id,
+        "new_body_index": insert_at,
+        "destination_anchor_para_id": destination_anchor_para_id,
+        "destination_position": destination_position,
+        "renumber_sequences": renumber_result,
+        "docx_path": docx_path,
+    }
+
 def relocate_table(
     docx_path: str,
     table_index: int,
@@ -7723,15 +8075,7 @@ def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes]
                 if part_name not in written:
                     dst.writestr(part_name, data)
 
-    if os.path.exists(dest):
-        backup = dest + ".bak"
-        try:
-            shutil.copy2(dest, backup)
-        except OSError:
-            pass  # backup failure is non-fatal
-
-    with open(dest, "wb") as fh:
-        fh.write(out.getvalue())
+    _atomic_write_docx_bytes(out.getvalue(), dest)
 
 
 def _insert_before_closing_tag(xml_bytes: bytes, root_tag_name: str, new_element_xml: str) -> bytes:

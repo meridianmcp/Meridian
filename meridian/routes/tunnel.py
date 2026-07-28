@@ -3293,6 +3293,8 @@ _WORD_WRITE_TOOLS = frozenset({
     "set_document_properties",
     "convert_document",
     "copy_document",
+    # Confirmed active in the pinned uvx docx-mcp==0.1.8 tools/list contract.
+    "search_and_replace",
 })
 
 # Argument keys a docx-mcp tool uses to name its target document, in priority order.
@@ -3308,7 +3310,7 @@ def _word_write_target(name: str, arguments: "dict | None") -> "str | None":
     be found in ``arguments`` (fail-open — we can't guard what we can't identify).
     """
     bare = name.split("__", 1)[1] if "__" in name else name
-    if bare not in _WORD_WRITE_TOOLS:
+    if bare != "search_and_replace" and bare not in _WORD_WRITE_TOOLS:
         return None
     if not isinstance(arguments, dict):
         return None
@@ -3985,6 +3987,33 @@ async def call_tunnel_tool(
                 pass
         raise RuntimeError(_msg)
     result = resp.get("result")
+    if label == "word" and bare_name == "search_and_replace":
+        # The live docx-mcp server wraps its text response in
+        # structuredContent.result. Accept only its observed positive-count
+        # message; a zero count or any other shape is ambiguous and must not be
+        # reported as a successful document mutation.
+        if not isinstance(result, dict) or result.get("isError") is True:
+            raise RuntimeError(
+                "Word search_and_replace returned an unexpected result envelope"
+            )
+        structured = result.get("structuredContent")
+        message = structured.get("result") if isinstance(structured, dict) else None
+        marker = "替换了"
+        prefix = "搜索替换完成:"
+        if not isinstance(message, str) or not message.strip().startswith(prefix):
+            raise RuntimeError(
+                "Word search_and_replace returned no structured replacement count"
+            )
+        suffix = message.strip().split(marker, 1)[-1].strip() if marker in message else ""
+        if not suffix.endswith("处"):
+            raise RuntimeError(
+                "Word search_and_replace returned no structured replacement count"
+            )
+        count_text = suffix[:-1].strip()
+        if not count_text.isdigit() or int(count_text) <= 0:
+            raise RuntimeError(
+                "Word search_and_replace did not report a positive replacement count"
+            )
     # caf95f81 — detect silent truncation in get_code_snippet responses from the
     # code slot.  When the declared line range (start_line/end_line) is
     # meaningfully larger than the actual source line count, attach a

@@ -726,6 +726,27 @@ def edit_equation(
         index_db_path=index_db_path,
     )
 
+@mcp.tool()
+def append_text_run_after_math(
+    docx_path: str,
+    equation_para_id: str,
+    text: str,
+    math_index: int | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """Append a normal text run after an equation selected by stable paragraph id.
+
+    When a paragraph contains multiple equations, math_index is required so the
+    operation never guesses which equation should receive the text.
+    """
+    return docs_intel.append_text_run_after_math(
+        docx_path=docx_path,
+        equation_para_id=equation_para_id,
+        text=text,
+        math_index=math_index,
+        index_db_path=index_db_path,
+    )
+
 
 @mcp.tool()
 def remove_equation(
@@ -1270,6 +1291,33 @@ def copy_section(
         trim_original_to=trim_original_to,
     )
 
+
+@mcp.tool()
+def relocate_figure(
+    docx_path: str,
+    figure_index: int,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
+) -> dict[str, Any]:
+    """Move an image paragraph together with its immediately following Figure caption.
+
+    figure_index is the 1-based order among direct-body image paragraphs. The
+    operation requires the next body child to be a SEQ Figure caption and
+    preserves the original OOXML elements and relationship IDs. It rejects
+    bookmark-splitting moves before writing, verifies the saved document,
+    invalidates the local structure sidecar, and renumbers Figure SEQ/REF
+    caches after a successful reorder.
+    """
+    return docs_intel.relocate_figure(
+        docx_path=docx_path,
+        figure_index=figure_index,
+        destination_anchor_para_id=destination_anchor_para_id,
+        destination_position=destination_position,
+        index_db_path=index_db_path,
+        allow_bookmark_split=allow_bookmark_split,
+    )
 
 @mcp.tool()
 def relocate_table(
