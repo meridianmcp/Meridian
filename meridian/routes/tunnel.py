@@ -328,6 +328,8 @@ def consume_tools_list_changed(tenant_id: str) -> bool:
 def _record_slot_health(
     tenant_id: str, slot: str, healthy: bool,
     reason: "str | None" = None, detail: "str | None" = None,
+    *, state: "str | None" = None, retry_count: "int | None" = None,
+    quarantine_reason: "str | None" = None,
 ) -> None:
     """Record a core slot's health for a tenant (from a plugin_status message).
     9a8645c1 — when unhealthy, also stash an optional reason/detail; healthy
@@ -337,7 +339,15 @@ def _record_slot_health(
     :func:`notify_tools_list_changed` so the recovered slot's tools become visible
     to an already-connected MCP session (which cached the old tools/list) on its
     next tools/list, instead of staying hidden until a full tunnel reconnect. The
-    prior state MUST be read before we overwrite it below."""
+    prior state MUST be read before we overwrite it below.
+
+    ddd46cc8 — ``state``/``retry_count``/``quarantine_reason`` are optional and
+    purely additive: a client's ``tunnel_client.py`` SlotDiagnostics lifecycle
+    contract (state machine: configured/starting/healthy/dependency_missing/
+    quarantined/...) rides along on the same ``plugin_status`` message and is
+    stored verbatim so ``tunnel_status()``'s ``slot_status`` surfaces it with no
+    further wiring. Omitted (an older client, or a call site that never passes
+    them) leaves the stored dict in its pre-existing ``{reason, detail}`` shape."""
     if not slot:
         return
     was_unhealthy = not _slot_is_healthy(tenant_id, slot)
@@ -359,11 +369,18 @@ def _record_slot_health(
         # dark despite the TTL). ``was_unhealthy`` is the prior state read above.
         if not was_unhealthy:
             _slot_unhealthy_since.setdefault(tenant_id, {})[slot] = time.monotonic()
-        if reason or detail:
-            _slot_status_detail.setdefault(tenant_id, {})[slot] = {
+        if reason or detail or state or quarantine_reason:
+            entry = {
                 "reason": reason or "unhealthy",
                 "detail": detail or "",
             }
+            if state:
+                entry["state"] = state
+            if retry_count is not None:
+                entry["retry_count"] = retry_count
+            if quarantine_reason:
+                entry["quarantine_reason"] = quarantine_reason
+            _slot_status_detail.setdefault(tenant_id, {})[slot] = entry
 
 
 def _slot_is_healthy(tenant_id: str, slot: str) -> bool:
@@ -515,9 +532,13 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
 
             if msg_type == "plugin_status":
                 # d71ba2e7 — client reports this slot's live health (+ 9a8645c1 reason).
+                # ddd46cc8 — state/retry_count/quarantine_reason are optional
+                # SlotDiagnostics fields; absent on an older client (msg.get → None).
                 _record_slot_health(
                     tenant_id, msg.get("slot") or "fs", msg.get("healthy", True),
                     reason=msg.get("reason"), detail=msg.get("detail"),
+                    state=msg.get("state"), retry_count=msg.get("retry_count"),
+                    quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
 
@@ -627,9 +648,12 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
             if msg_type == "ping":
                 continue
             if msg_type == "plugin_status":
+                # ddd46cc8 — see the "fs" plugin_status handler above.
                 _record_slot_health(
                     tenant_id, msg.get("slot") or "code", msg.get("healthy", True),
                     reason=msg.get("reason"), detail=msg.get("detail"),
+                    state=msg.get("state"), retry_count=msg.get("retry_count"),
+                    quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
             if msg_type == "response":
@@ -716,9 +740,12 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
             if msg_type == "ping":
                 continue
             if msg_type == "plugin_status":
+                # ddd46cc8 — see the "fs" plugin_status handler above.
                 _record_slot_health(
                     tenant_id, msg.get("slot") or "extract", msg.get("healthy", True),
                     reason=msg.get("reason"), detail=msg.get("detail"),
+                    state=msg.get("state"), retry_count=msg.get("retry_count"),
+                    quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
             if msg_type == "response":
@@ -821,9 +848,12 @@ async def _serve_tunnel_ws(
                 # a898710a — dc/ppt/word slots report health too; record it so a
                 # failed pre-flight surfaces as "unhealthy" (not "inactive"), and
                 # a later healthy report clears the diagnostic.
+                # ddd46cc8 — see the "fs" plugin_status handler above.
                 _record_slot_health(
                     tenant_id, msg.get("slot") or label, msg.get("healthy", True),
                     reason=msg.get("reason"), detail=msg.get("detail"),
+                    state=msg.get("state"), retry_count=msg.get("retry_count"),
+                    quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
             if msg_type == "response":
