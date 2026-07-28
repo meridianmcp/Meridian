@@ -49,6 +49,7 @@ from typing import Any, Callable
 
 from . import capability_manifest as _cm
 from . import db as db_module
+from . import pointers as _pointers
 from . import tool_requirements as _tool_requirements
 
 CONTRACT_SCHEMA_VERSION = 1
@@ -131,6 +132,97 @@ def extract_tool_requirements(items: list[dict[str, Any]]) -> list[dict[str, Any
         if requirements:
             result.append({"item_id": item_id, "requirements": requirements})
     return sorted(result, key=lambda r: r["item_id"])
+
+
+async def extract_sprint_item_pointers(
+    db: Any,
+    project_id: str,
+    items: list[dict[str, Any]],
+    *,
+    node_resolver: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Typed extraction of the per-item durable ``sprint_item_pointers``
+    contract (665 follow-up): source_type, target uri, selector/anchor,
+    target_kind (existing/planned_new), label, an explicit per-target
+    resolution status (resolved/unresolved/planned/stale/archival),
+    canonical/archival metadata where available, and each item's
+    provenance-required state — the SAME fields
+    ``handoff._build_pointer_records_clause`` embeds in the batch /goal's
+    ``<sprint_item_pointers>`` XML clause, so the two never independently
+    diverge for the same request.
+
+    Two paths, depending on whether ``items`` already carry the
+    ``pointer_records``/``pointer_provenance`` annotation
+    ``handoff._annotate_resolved_pointers`` sets (the SAME resolve pass a
+    /goal render already ran):
+
+    * **Pre-annotated** (an item carries either key) — reuse it directly via
+      :func:`pointers.assemble_pointer_entries_from_annotated_items`. NO
+      extra DB fetch or ``resolve_pointer`` call — this is the strongest
+      identical-data guarantee (mirrors :func:`extract_tool_requirements`'s
+      own "pass items explicitly" fast path).
+    * **Not annotated** (the common case for a self-fetched pending-item
+      list, e.g. :func:`build_capability_contract`'s own default fetch) —
+      fetch + resolve THIS item's stored pointers itself, via
+      ``db.get_sprint_item_pointers`` and
+      :func:`pointers.build_item_pointer_records` (the SAME per-pointer
+      resolve+type primitive the annotation pass uses), and derive
+      provenance the SAME read-only way
+      (``is_item_claim_prospected``/``_item_declares_resources`` — never
+      touches the actual prospecting gate). So the JSON contract is
+      complete and correct even for a caller that never rendered a /goal in
+      this request.
+
+    Deterministic ordering: sorted by ``item_id``, mirroring
+    :func:`extract_tool_requirements`. Fully guarded per item — a DB/resolve
+    failure degrades that ONE item to no entry rather than breaking contract
+    building; NEVER raises.
+    """
+    entries: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        item_id = it.get("id")
+        if not item_id:
+            continue
+        if "pointer_records" in it or "pointer_provenance" in it:
+            records = it.get("pointer_records") or []
+            provenance = it.get("pointer_provenance")
+        else:
+            try:
+                stored = await db_module.get_sprint_item_pointers(db, item_id)
+            except Exception:  # noqa: BLE001 — pre-migration DB / fetch failure
+                stored = []
+            try:
+                provenance = {
+                    "required": (
+                        db_module._item_declares_resources(it)
+                        and not bool(it.get("prospect_bypass"))
+                    ),
+                    "bypassed": bool(it.get("prospect_bypass")),
+                    "satisfied": db_module.is_item_claim_prospected(
+                        it, has_pointer_evidence=bool(stored)
+                    ),
+                }
+            except Exception:  # noqa: BLE001 — provenance derivation is best-effort
+                provenance = None
+            records = []
+            if stored:
+                try:
+                    records = await _pointers.build_item_pointer_records(
+                        db, project_id, stored, node_resolver=node_resolver,
+                    )
+                except Exception:  # noqa: BLE001 — resolve failure -> no records for this item
+                    records = []
+        if not records and not (isinstance(provenance, dict) and provenance.get("required")):
+            continue
+        entry: dict[str, Any] = {"item_id": item_id}
+        if provenance:
+            entry["provenance"] = provenance
+        if records:
+            entry["pointers"] = records
+        entries.append(entry)
+    return sorted(entries, key=lambda e: e["item_id"])
 
 
 def _resolve_effective_capabilities(
@@ -367,7 +459,14 @@ async def build_capability_contract(
     :func:`_resolve_pending_items_for_contract`, scoped to ``version`` — the
     same query ``generate_handoff`` runs for its own pending-item list, so
     the two agree for any request where nothing mutates sprint_items in
-    between.
+    between. The SAME ``items`` list also feeds
+    ``item_sprint_item_pointers`` (665 follow-up, see
+    :func:`extract_sprint_item_pointers`) — the typed, canonical durable-
+    pointer contract (source_type/target uri/selector/anchor/target_kind/
+    label/explicit resolution status/canonical+archival metadata/
+    provenance-required state) for the SAME item set, matching
+    ``handoff._build_pointer_records_clause``'s ``<sprint_item_pointers>``
+    XML clause for the same request.
 
     Never raises: ``get_project_capability_manifest`` returns an empty
     profile for any project with no persisted manifest (649e095f's own
@@ -389,6 +488,19 @@ async def build_capability_contract(
         else await _resolve_pending_items_for_contract(db, project_id, version=version)
     )
     item_tool_requirements = extract_tool_requirements(_pending_items_for_tool_reqs)
+
+    # 665 follow-up — typed per-item durable sprint_item_pointers contract,
+    # extracted from the SAME pending-item list as item_tool_requirements
+    # above (caller-supplied when given, else self-fetched with the
+    # identical filter criteria generate_handoff uses). See
+    # extract_sprint_item_pointers for the pre-annotated-vs-self-resolve
+    # split.
+    try:
+        item_sprint_item_pointers = await extract_sprint_item_pointers(
+            db, project_id, _pending_items_for_tool_reqs,
+        )
+    except Exception:  # noqa: BLE001 — contract building must never break on this
+        item_sprint_item_pointers = []
 
     effective_capabilities, effective_source = _resolve_effective_capabilities(
         db, project_id, requested_capabilities, resolver=effective_resolver,
@@ -456,6 +568,7 @@ async def build_capability_contract(
         },
         "manifest_hash": effective_hash,
         "item_tool_requirements": item_tool_requirements,
+        "item_sprint_item_pointers": item_sprint_item_pointers,
         "board_stale": bool(board_stale),
         "executable": executable,
         "executable_reasons": executable_reasons,

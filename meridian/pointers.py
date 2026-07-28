@@ -814,3 +814,272 @@ async def resolve_pointer(
     if pointer.get("id") is not None:
         result["id"] = pointer.get("id")
     return result
+
+
+# ---------------------------------------------------------------------------
+# 665 follow-up — typed, machine-readable pointer records for XML/JSON
+# handoff serialization.
+#
+# ``handoff._format_resolved_pointer`` (above this module, in handoff.py)
+# already turns a ``resolve_pointer()`` result into a COMPACT human-readable
+# ``{source_type, label?, targets: [str, ...]}`` for markdown/goal-line
+# rendering — that stays byte-for-byte unchanged (backward compatibility for
+# every existing legacy compact pointer line).
+#
+# This section builds the FULL typed record instead: source_type, target
+# uri, selector/anchor (the whole selector object, including any nested
+# subSelector), target_kind ("existing"/"planned_new"), label, an EXPLICIT
+# per-target resolution ``status`` ("resolved" | "unresolved" | "planned" |
+# "stale" | "archival" — see ``_typed_target_status``), canonical metadata
+# (the resolved zotero item / doc_store element+document / graph match /
+# finding artifact, when the selector type produces one) and archival
+# metadata (a text_quote's Internet-Archive ``archived_url``/``archived_at``
+# snapshot plus live ``drift``), when available. Everything a receiving
+# executor needs to see a pointer's full typed state without re-resolving
+# it, and without weakening ``validate_pointer``/the prospecting gate — this
+# is a READ-ONLY, best-effort rendering over already-validated, already-
+# persisted data.
+#
+# ``build_item_pointer_records`` is the ONE shared extraction both
+# ``handoff.py``'s ``<sprint_item_pointers>`` XML clause and
+# ``capability_contract.py``'s ``item_sprint_item_pointers`` JSON section
+# call, so the two representations can never independently drift (mirrors
+# the ``tool_requirements`` 76dde31f precedent).
+# ---------------------------------------------------------------------------
+
+# Selector-type-specific fields a RESOLVED target carries that count as
+# "canonical metadata" for that selector type (the zotero bibliographic item,
+# the doc_store element/document, the best-match graph symbol, the
+# save_finding artifact). range/text_quote have none — text_quote's extra
+# fields are archival metadata instead (see _ARCHIVAL_RESOLVED_FIELDS).
+_CANONICAL_RESOLVED_FIELDS: dict[str, tuple[str, ...]] = {
+    "symbol": ("file", "match"),
+    "node_id": ("element", "document"),
+    "zotero_key": ("item",),
+    "finding_id": ("artifact",),
+}
+# text_quote's Internet-Archive snapshot metadata, captured at citation time.
+_ARCHIVAL_RESOLVED_FIELDS = ("archived_url", "archived_at")
+
+
+def _typed_target_status(target_kind: str, resolved_target: dict[str, Any]) -> str:
+    """One explicit status word per target so a receiving executor never has
+    to re-derive "is this planned / stale / archival / unresolved" from
+    separate booleans scattered across the record:
+
+    * ``"planned"``    — ``target_kind == "planned_new"`` (the file/target is
+      declared but not expected to exist yet; never filesystem-checked).
+    * ``"unresolved"`` — the resolver could not locate the target (see the
+      sibling ``reason`` field on the record).
+    * ``"stale"``      — resolved, but a ``text_quote`` target's cited
+      passage has drifted (the live content no longer contains it).
+    * ``"archival"``   — resolved, backed by an archived snapshot
+      (``archived_url``) rather than (or in addition to) the live source.
+    * ``"resolved"``   — resolved with none of the above special states.
+    """
+    if target_kind == "planned_new":
+        return "planned"
+    if not resolved_target.get("resolved"):
+        return "unresolved"
+    if resolved_target.get("drift"):
+        return "stale"
+    if resolved_target.get("archived_url"):
+        return "archival"
+    return "resolved"
+
+
+def _extract_canonical_metadata(
+    selector: Any, resolved_target: dict[str, Any]
+) -> "dict[str, Any] | None":
+    """Selector-type-specific canonical metadata the resolver produced, or
+    ``None`` when this selector type has none (``range``/``text_quote``)."""
+    stype = selector.get("type") if isinstance(selector, dict) else None
+    fields = _CANONICAL_RESOLVED_FIELDS.get(stype or "")
+    if not fields:
+        return None
+    out = {
+        k: resolved_target[k] for k in fields if resolved_target.get(k) is not None
+    }
+    return out or None
+
+
+def _extract_archival_metadata(resolved_target: dict[str, Any]) -> "dict[str, Any] | None":
+    """A ``text_quote`` target's archived-snapshot metadata (``archived_url``/
+    ``archived_at``) plus the live ``drift`` flag, when present. ``None``
+    when the resolved target carries neither."""
+    out: dict[str, Any] = {
+        k: resolved_target[k]
+        for k in _ARCHIVAL_RESOLVED_FIELDS
+        if resolved_target.get(k) is not None
+    }
+    if "drift" in resolved_target:
+        out["drift"] = bool(resolved_target["drift"])
+    return out or None
+
+
+def build_typed_pointer_record(
+    pointer: dict[str, Any], resolved: "dict[str, Any] | None" = None
+) -> "dict[str, Any] | None":
+    """Build ONE typed, machine-readable pointer record.
+
+    ``pointer`` is a STORED pointer (as returned by ``row_to_pointer`` /
+    ``db.get_sprint_item_pointers`` — normalized targets carrying
+    ``target_kind``); ``resolved`` is that SAME pointer's
+    :func:`resolve_pointer` output (targets in the identical order/count —
+    ``resolve_pointer`` always appends exactly one resolved entry per input
+    target, even a malformed one, so a positional zip is safe).
+
+    Returns ``None`` when the pointer has no renderable target — mirrors
+    ``handoff._format_resolved_pointer``'s "no lines -> None" contract for
+    its compact sibling. ``resolved`` may be omitted (or ``None``): every
+    target is then treated as unresolved with no reason, which is still a
+    fully valid, explicit typed record.
+
+    Never raises: a malformed stored target is skipped rather than blowing
+    up the whole record — this must be safe to call from a mandatory
+    handoff path.
+    """
+    if not isinstance(pointer, dict):
+        return None
+    stored_targets = pointer.get("targets")
+    if not isinstance(stored_targets, list) or not stored_targets:
+        return None
+    resolved = resolved if isinstance(resolved, dict) else {}
+    resolved_targets = resolved.get("targets")
+    if not isinstance(resolved_targets, list):
+        resolved_targets = []
+
+    typed_targets: list[dict[str, Any]] = []
+    for idx, raw_target in enumerate(stored_targets):
+        if not isinstance(raw_target, dict):
+            continue
+        uri = raw_target.get("uri")
+        selector = raw_target.get("selector")
+        target_kind = raw_target.get("target_kind") or _DEFAULT_TARGET_KIND
+        rtarget = (
+            resolved_targets[idx]
+            if idx < len(resolved_targets) and isinstance(resolved_targets[idx], dict)
+            else {}
+        )
+        entry: dict[str, Any] = {
+            "uri": uri,
+            "selector": selector,
+            "target_kind": target_kind,
+            "resolved": bool(rtarget.get("resolved")),
+            "status": _typed_target_status(target_kind, rtarget),
+        }
+        if not rtarget.get("resolved") and rtarget.get("reason"):
+            entry["reason"] = rtarget["reason"]
+        canonical = _extract_canonical_metadata(selector, rtarget)
+        if canonical:
+            entry["canonical"] = canonical
+        archival = _extract_archival_metadata(rtarget)
+        if archival:
+            entry["archival"] = archival
+        # A subSelector narrows the outer target ("these lines, within this
+        # function") — surface its resolution too, so "resolution status …
+        # explicit" also holds for the nested anchor, not just the outer one.
+        sub_resolved = rtarget.get("subResolved")
+        if isinstance(sub_resolved, dict):
+            sub_entry: dict[str, Any] = {"resolved": bool(sub_resolved.get("resolved"))}
+            if not sub_resolved.get("resolved") and sub_resolved.get("reason"):
+                sub_entry["reason"] = sub_resolved["reason"]
+            entry["sub_resolved"] = sub_entry
+        if rtarget.get("narrowed_range"):
+            entry["narrowed_range"] = rtarget["narrowed_range"]
+        typed_targets.append(entry)
+
+    if not typed_targets:
+        return None
+
+    record: dict[str, Any] = {
+        "source_type": pointer.get("source_type") or resolved.get("source_type"),
+        "targets": typed_targets,
+    }
+    if pointer.get("id"):
+        record["id"] = pointer["id"]
+    if pointer.get("label"):
+        record["label"] = pointer["label"]
+    return record
+
+
+async def build_item_pointer_records(
+    db: Any,
+    project_id: str,
+    stored_pointers: list[dict[str, Any]],
+    *,
+    node_resolver: "NodeResolver | None" = None,
+) -> list[dict[str, Any]]:
+    """Resolve + type EVERY stored pointer for one item in a single pass.
+
+    The canonical, shared extraction behind BOTH ``handoff.py``'s
+    ``<sprint_item_pointers>`` XML clause and ``capability_contract.py``'s
+    ``item_sprint_item_pointers`` JSON section (665 follow-up) — one
+    :func:`resolve_pointer` call per stored pointer, never two independent
+    resolve passes over the same data.
+
+    Guarded per-pointer: a resolve failure degrades that ONE pointer to an
+    unresolved typed record (via ``build_typed_pointer_record(ptr, None)``)
+    rather than dropping the item's other evidence; NEVER raises.
+    """
+    records: list[dict[str, Any]] = []
+    for ptr in stored_pointers:
+        if not isinstance(ptr, dict):
+            continue
+        resolved: "dict[str, Any] | None"
+        try:
+            resolved = await resolve_pointer(
+                db, ptr, project_id=project_id, node_resolver=node_resolver
+            )
+        except Exception:  # noqa: BLE001 — resolve_pointer never raises, but be safe
+            resolved = None
+        try:
+            record = build_typed_pointer_record(ptr, resolved)
+        except Exception:  # noqa: BLE001 — a malformed pointer must not break the batch
+            record = None
+        if record:
+            records.append(record)
+    return records
+
+
+def assemble_pointer_entries_from_annotated_items(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Pure, synchronous assembly of the canonical per-item pointer entries
+    from items ALREADY annotated with ``pointer_records``/
+    ``pointer_provenance`` (see ``handoff._annotate_resolved_pointers``,
+    which sets both in the SAME resolve pass this module's
+    :func:`build_item_pointer_records` powers).
+
+    Each entry is ``{item_id, provenance: {required, bypassed, satisfied}?,
+    pointers: [<typed pointer record>, ...]?}``, sorted by ``item_id`` for
+    deterministic byte-for-byte output. An item contributes an entry only
+    when it has >=1 typed pointer record OR its provenance state is
+    ``required`` — an ordinary item with neither is silently skipped, so
+    this never adds noise for the common case.
+
+    Shared by ``handoff._build_pointer_records_clause`` (the /goal block's
+    ``<sprint_item_pointers>`` XML clause) and
+    ``capability_contract.extract_sprint_item_pointers`` (the JSON
+    ``item_sprint_item_pointers`` section, when the caller already supplied
+    pre-annotated items) — 665 follow-up — so neither maintains its own
+    independent derivation of "which items make the cut."
+    """
+    entries: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        iid = it.get("id")
+        if not iid:
+            continue
+        records = it.get("pointer_records") or []
+        provenance = it.get("pointer_provenance")
+        if not records and not (isinstance(provenance, dict) and provenance.get("required")):
+            continue
+        entry: dict[str, Any] = {"item_id": iid}
+        if provenance:
+            entry["provenance"] = provenance
+        if records:
+            entry["pointers"] = records
+        entries.append(entry)
+    return sorted(entries, key=lambda e: e["item_id"])

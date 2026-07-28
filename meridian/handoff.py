@@ -35,7 +35,12 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from . import capability_contract as capability_contract_module
 from . import db as db_module
 from . import tool_requirements as tool_requirements_module
-from .db.sprint_items import _is_deferred, is_item_claim_prospected, _split_wave_label
+from .db.sprint_items import (
+    _is_deferred,
+    is_item_claim_prospected,
+    _item_declares_resources,
+    _split_wave_label,
+)
 from .executor_config import build_executor_config_block, has_executor_config
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -1459,6 +1464,12 @@ def _build_quick_start_goal(
         # use, so this matches capability_contract's item_tool_requirements
         # section exactly.
         + _build_tool_requirements_clause(_all_pending_for_tool_requirements)
+        # 665 follow-up — typed per-item durable sprint_item_pointers
+        # contract: the SAME full pending inventory as the tool_requirements
+        # clause above (not the narrower claimable-now batch), so this
+        # matches capability_contract's item_sprint_item_pointers section
+        # exactly for the same request.
+        + _build_pointer_records_clause(_all_pending_for_tool_requirements)
         + f"{_manual_note}"
         f"{_backburner_note}"
         f"{_excluded_unprospected_note}"
@@ -1554,6 +1565,44 @@ def _build_tool_requirements_clause(items: list[dict[str, Any]]) -> str:
         return ""
     body = json.dumps(per_item, sort_keys=True, separators=(",", ":"))
     return f"\n<tool_requirements>{_xml_escape(body)}</tool_requirements>"
+
+
+def _build_pointer_records_clause(items: list[dict[str, Any]]) -> str:
+    """665 follow-up — build a ``<sprint_item_pointers>`` XML clause carrying
+    the TYPED, canonical per-item durable pointer records.
+
+    Distinct from ``_build_goal_pointer_lines`` above (compact, human-
+    readable lines rendered INSIDE ``<sprint_items>`` — kept byte-for-byte
+    unchanged for legacy backward compatibility): this clause embeds the
+    FULL typed record per pointer — source_type, target uri, selector/
+    anchor, target_kind (existing/planned_new), label, an explicit per-
+    target resolution status (resolved/unresolved/planned/stale/archival),
+    canonical/archival metadata where available — plus each item's
+    provenance-required state (whether durable pointer evidence is REQUIRED
+    to satisfy the prospecting gate, whether a human bypassed it, and
+    whether it is currently satisfied). Items must already carry
+    ``pointer_records``/``pointer_provenance`` (set by
+    ``_annotate_resolved_pointers`` — both call sites that build a /goal run
+    that annotation pass first).
+
+    The body is the SAME canonical JSON
+    ``capability_contract.extract_sprint_item_pointers`` produces for items
+    annotated the same way, via the shared
+    ``pointers.assemble_pointer_entries_from_annotated_items`` — so the
+    batch /goal's XML rendering and the structured ``generate_handoff`` JSON
+    response never diverge for the same request.
+
+    Returns ``""`` when nothing in the batch has an effective pointer or a
+    required-provenance state worth reporting, so it never adds noise to an
+    ordinary /goal.
+    """
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+
+    entries = pointers_module.assemble_pointer_entries_from_annotated_items(items)
+    if not entries:
+        return ""
+    body = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    return f"\n<sprint_item_pointers>{_xml_escape(body)}</sprint_item_pointers>"
 
 
 # ---------------------------------------------------------------------------
@@ -2766,10 +2815,37 @@ async def _annotate_resolved_pointers(
     resolve_sprint_item_pointers uses), then flatten every resolved target into a
     compact string line. Items with no stored pointers are left untouched.
 
-    Fully guarded: a per-item failure degrades to no ``resolved_pointers`` for
-    that item; the pass NEVER raises so the mandatory handoff can't break.
+    665 follow-up — in the SAME resolve pass, ALSO attach:
+
+    * ``pointer_records`` — the FULL typed, machine-readable record per pointer
+      (see ``pointers.build_typed_pointer_record``): source_type, target uri,
+      selector/anchor, target_kind (existing/planned_new), label, an explicit
+      per-target resolution ``status`` (resolved/unresolved/planned/stale/
+      archival), and canonical/archival metadata where available. This is
+      what ``_build_pointer_records_clause`` embeds verbatim as canonical
+      JSON in the /goal block's ``<sprint_item_pointers>`` XML clause, and
+      what ``capability_contract.extract_sprint_item_pointers`` reuses
+      directly (no re-fetch/re-resolve) when it finds this field already set
+      — see that function's docstring. ONE ``resolve_pointer`` call per
+      stored pointer produces both this and ``resolved_pointers`` above —
+      never two independent resolve passes over the same data.
+    * ``pointer_provenance`` — item-level ``{required, bypassed, satisfied}``
+      derived read-only from the SAME evidence signal
+      ``claim_sprint_item``'s UNPROSPECTED gate checks
+      (``is_item_claim_prospected`` / ``_item_declares_resources`` — this
+      pass never touches the gate itself, it only reports its state), so a
+      receiving executor sees explicitly whether durable pointer evidence is
+      REQUIRED for this item and whether it is currently SATISFIED, instead
+      of re-deriving it from the raw pointer list. Computed for every item
+      (even one with zero stored pointers — that IS the "required but not
+      yet satisfied" case), unlike ``resolved_pointers``/``pointer_records``
+      which need >=1 stored row to produce anything.
+
+    Fully guarded: a per-item failure degrades to no ``resolved_pointers``/
+    ``pointer_records``/``pointer_provenance`` for that item; the pass NEVER
+    raises so the mandatory handoff can't break.
     """
-    from .pointers import resolve_pointer  # noqa: PLC0415 — avoid import cycle
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
     for item in pending_items:
         iid = item.get("id")
         if not iid:
@@ -2778,12 +2854,29 @@ async def _annotate_resolved_pointers(
             stored = await db_module.get_sprint_item_pointers(db, iid)
         except Exception:  # noqa: BLE001 — pre-migration DB / fetch failure
             continue
+        # 665 follow-up — provenance state is meaningful even with zero
+        # durable pointers, so it's computed unconditionally per item, unlike
+        # resolved_pointers/pointer_records below (which need >=1 stored row).
+        try:
+            item["pointer_provenance"] = {
+                "required": (
+                    _item_declares_resources(item)
+                    and not bool(item.get("prospect_bypass"))
+                ),
+                "bypassed": bool(item.get("prospect_bypass")),
+                "satisfied": is_item_claim_prospected(
+                    item, has_pointer_evidence=bool(stored)
+                ),
+            }
+        except Exception:  # noqa: BLE001 — provenance annotation is best-effort
+            pass
         if not stored:
             continue
         rendered: list[dict[str, Any]] = []
+        typed_records: list[dict[str, Any]] = []
         for ptr in stored:
             try:
-                resolved = await resolve_pointer(
+                resolved = await pointers_module.resolve_pointer(
                     db, ptr, project_id=project_id, node_resolver=node_resolver
                 )
             except Exception:  # noqa: BLE001 — resolve_pointer never raises, but be safe
@@ -2791,8 +2884,16 @@ async def _annotate_resolved_pointers(
             formatted = _format_resolved_pointer(resolved)
             if formatted:
                 rendered.append(formatted)
+            try:
+                typed = pointers_module.build_typed_pointer_record(ptr, resolved)
+            except Exception:  # noqa: BLE001 — one bad pointer must not drop the rest
+                typed = None
+            if typed:
+                typed_records.append(typed)
         if rendered:
             item["resolved_pointers"] = rendered
+        if typed_records:
+            item["pointer_records"] = typed_records
     return pending_items
 
 
