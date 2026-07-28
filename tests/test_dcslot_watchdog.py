@@ -99,7 +99,10 @@ def test_kill_on_request_timeout_kills_running_proxy():
         is_running = True
         killed = 0
 
-        def kill(self):
+        def kill(self, reason: str = "stopped"):
+            # ddd46cc8 — _kill_on_request_timeout now calls
+            # kill(reason="transport_closed"); accept the kwarg like the real
+            # SlotProxy.kill() does.
             type(self).killed += 1
             type(self).is_running = False
 
@@ -236,9 +239,11 @@ def test_run_connection_lazy_timeout_kills_then_next_request_respawns(monkeypatc
 
     real_kill = tc.SlotProxy.kill
 
-    def counting_kill(self):
+    def counting_kill(self, reason: str = "stopped"):
+        # ddd46cc8 — forward the reason kwarg to the real kill() so diagnostics
+        # still get recorded correctly under this monkeypatch.
         killed["n"] += 1
-        real_kill(self)
+        real_kill(self, reason)
     monkeypatch.setattr(tc.SlotProxy, "kill", counting_kill)
     # taskkill (win32 path of _terminate_proc_tree) must not hit the real shell.
     monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)

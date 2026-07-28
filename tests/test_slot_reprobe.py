@@ -163,6 +163,71 @@ def _stub_proxy(monkeypatch, responder):
     monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
 
 
+# ---------------------------------------------------------------------------
+# ddd46cc8 — optional SlotDiagnostics fields (state/retry_count/
+# quarantine_reason) riding along on _record_slot_health, purely additive.
+# ---------------------------------------------------------------------------
+
+def test_record_slot_health_without_diagnostics_fields_keeps_old_shape(monkeypatch):
+    """Every pre-existing caller omits state/retry_count/quarantine_reason —
+    the stored dict must stay EXACTLY {reason, detail}, no extra keys."""
+    tid = "reprobe-old-shape"
+    try:
+        tn._record_slot_health(tid, "code", False, reason="unreachable", detail="x")
+        assert tn._slot_status_detail[tid]["code"] == {
+            "reason": "unreachable", "detail": "x",
+        }
+    finally:
+        _reset(tid)
+
+
+def test_record_slot_health_stores_state_and_quarantine_reason(monkeypatch):
+    tid = "reprobe-quarantine-fields"
+    try:
+        tn._record_slot_health(
+            tid, "docs", False, reason="quarantined", detail="missing dependency",
+            state="quarantined", retry_count=3, quarantine_reason="missing dependency",
+        )
+        entry = tn._slot_status_detail[tid]["docs"]
+        assert entry["state"] == "quarantined"
+        assert entry["retry_count"] == 3
+        assert entry["quarantine_reason"] == "missing dependency"
+    finally:
+        _reset(tid)
+
+
+def test_record_slot_health_diagnostics_fields_surface_via_tunnel_status(monkeypatch):
+    tid = "reprobe-status-surface"
+    tn._tunnel_sockets[tid] = object()
+    try:
+        tn._record_slot_health(
+            tid, "docs", False, reason="quarantined", detail="missing dependency",
+            state="quarantined", quarantine_reason="missing dependency",
+        )
+        status = asyncio.run(tn.tunnel_status(tid))
+        assert status["slot_status"]["docs"]["state"] == "quarantined"
+        assert status["slot_status"]["docs"]["quarantine_reason"] == "missing dependency"
+    finally:
+        _reset(tid)
+        tn._tunnel_sockets.pop(tid, None)
+
+
+def test_record_slot_health_healthy_report_clears_diagnostics_fields():
+    """A recovery report (healthy=True) drops the whole diagnostic entry —
+    including any state/quarantine_reason a prior unhealthy report stored —
+    exactly as it already does for reason/detail."""
+    tid = "reprobe-recovery-clears-state"
+    try:
+        tn._record_slot_health(
+            tid, "docs", False, state="quarantined", quarantine_reason="x",
+        )
+        assert "docs" in tn._slot_status_detail.get(tid, {})
+        tn._record_slot_health(tid, "docs", True)
+        assert "docs" not in tn._slot_status_detail.get(tid, {})
+    finally:
+        _reset(tid)
+
+
 def test_list_tunnel_tools_readvertises_after_ttl(monkeypatch):
     """End-to-end: a slot suppressed past the TTL is re-advertised by
     list_tunnel_tools; a freshly-suppressed one is not."""

@@ -613,10 +613,12 @@ def test_slotproxy_ensure_running_spawn_does_not_block_event_loop(monkeypatch):
     SPAWN_SECONDS = 0.5
     HEARTBEAT_INTERVAL = 0.05
 
-    def slow_spawn(cmd, env, label):
+    def slow_spawn(cmd, env, label, diagnostics=None):
         # Stands in for the real blocking chain (time.sleep + Popen.communicate)
         # inside _spawn_with_cache_retry — a real, thread-blocking sleep, not an
         # asyncio one, so it only "yields" if run off the event loop thread.
+        # ddd46cc8 — ensure_running() now passes self.diagnostics as a 4th
+        # positional arg; accept (and ignore) it here.
         _time.sleep(SPAWN_SECONDS)
         return _FakeProc(cmd)
 
@@ -663,9 +665,11 @@ def test_idle_killer_kills_idle_proxy_then_cancels(monkeypatch):
 
     killed = {"n": 0}
     real_kill = sp.kill
-    def counting_kill():
+    def counting_kill(reason: str = "stopped"):
+        # ddd46cc8 — _idle_killer now calls kill(reason="idle_killed"); accept
+        # (and forward) the reason kwarg like the real SlotProxy.kill().
         killed["n"] += 1
-        real_kill()
+        real_kill(reason)
     sp.kill = counting_kill
     # Force the idle window to be exceeded.
     monkeypatch.setattr(sp, "idle_seconds", lambda: 9999.0)
@@ -1294,6 +1298,434 @@ def test_reprobe_backs_off_after_max_retries(monkeypatch):
     # exceeded the gap jumps to the much larger cooldown.
     assert all(g < tc._WATCHDOG_COOLDOWN_SECONDS * 0.6 for g in fast_gaps)
     assert cooled_gap >= tc._WATCHDOG_COOLDOWN_SECONDS * 0.6
+
+
+# ---------------------------------------------------------------------------
+# ddd46cc8 — unified slot lifecycle contract: SlotState/SlotDiagnostics,
+# failure classification, kill() reasons, _spawn_with_cache_retry diagnostics,
+# _preflight_slot(proxy=...), quarantine/reprobe, cross-slot isolation.
+# ---------------------------------------------------------------------------
+
+# --- pure classification helpers --------------------------------------------
+
+def test_classify_stderr_signature_detects_module_not_found():
+    r = tc._classify_stderr_signature(
+        "Traceback (most recent call last):\n"
+        "ModuleNotFoundError: No module named 'mcp.server.fastmcp'\n"
+    )
+    assert r is not None
+    state, detail = r
+    assert state is tc.SlotState.DEPENDENCY_MISSING
+    assert "mcp.server.fastmcp" in detail
+
+
+def test_classify_stderr_signature_detects_import_error_pydantic_settings():
+    r = tc._classify_stderr_signature("ImportError: No module named 'pydantic_settings'")
+    assert r is not None
+    assert r[0] is tc.SlotState.DEPENDENCY_MISSING
+    assert "pydantic_settings" in r[1]
+
+
+def test_classify_stderr_signature_none_for_unrelated_text():
+    assert tc._classify_stderr_signature("Server listening on port 8813\n") is None
+    assert tc._classify_stderr_signature("") is None
+    assert tc._classify_stderr_signature(None) is None
+
+
+def test_classify_launch_exception_file_not_found_is_dependency_missing():
+    state, detail = tc._classify_launch_exception(FileNotFoundError("no such file: uvx"))
+    assert state is tc.SlotState.DEPENDENCY_MISSING
+    assert "uvx" in detail or "not found" in detail
+
+
+def test_classify_launch_exception_generic_error_is_child_crashed():
+    state, detail = tc._classify_launch_exception(OSError("boom"))
+    assert state is tc.SlotState.CHILD_CRASHED
+    assert "boom" in detail
+
+
+def test_probe_fast_exit_stderr_captures_output(monkeypatch):
+    class _FastExitProc:
+        def __init__(self, *a, **k): pass
+        def communicate(self, timeout=None):
+            return (b"", b"ModuleNotFoundError: No module named 'pydantic_settings'\n")
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FastExitProc())
+    text = tc._probe_fast_exit_stderr(["python", "-m", "x"], None, wait_seconds=1.0)
+    assert "ModuleNotFoundError" in text
+
+
+def test_probe_fast_exit_stderr_returns_none_on_timeout(monkeypatch):
+    class _HangingProc:
+        def __init__(self, *a, **k): pass
+        def communicate(self, timeout=None):
+            raise tc.subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+        def kill(self): pass
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _HangingProc())
+    assert tc._probe_fast_exit_stderr(["x"], None, wait_seconds=0.01) is None
+
+
+def test_probe_fast_exit_stderr_returns_none_on_popen_exception(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("cannot spawn")
+    monkeypatch.setattr(tc.subprocess, "Popen", boom)
+    assert tc._probe_fast_exit_stderr(["x"], None) is None
+
+
+# --- SlotDiagnostics / SlotState -------------------------------------------
+
+def test_slot_diagnostics_set_updates_state_phase_and_extra_fields():
+    d = tc.SlotDiagnostics(slot="fs")
+    assert d.state is tc.SlotState.CONFIGURED
+    before = d.updated_at
+    d.set(tc.SlotState.HEALTHY, retry_count=0, root_cause=None)
+    assert d.state is tc.SlotState.HEALTHY
+    assert d.phase == "healthy"  # defaults to state.value when phase omitted
+    assert d.updated_at >= before
+
+
+def test_slot_diagnostics_to_dict_is_json_safe():
+    d = tc.SlotDiagnostics(slot="dc")
+    d.set(tc.SlotState.DEPENDENCY_MISSING, root_cause="missing pydantic_settings")
+    out = d.to_dict()
+    assert out["slot"] == "dc"
+    assert out["state"] == "dependency_missing"
+    assert out["root_cause"] == "missing pydantic_settings"
+    json.dumps(out)  # must not raise — every field is JSON-serializable
+
+
+def test_slot_is_quarantined_only_true_for_quarantined_state():
+    d = tc.SlotDiagnostics(slot="fs")
+    assert tc._slot_is_quarantined(d) is False
+    d.set(tc.SlotState.DEGRADED)
+    assert tc._slot_is_quarantined(d) is False
+    d.set(tc.SlotState.QUARANTINED)
+    assert tc._slot_is_quarantined(d) is True
+
+
+# --- quarantine decision (pure) ---------------------------------------------
+
+def test_note_reprobe_failure_transient_never_quarantines():
+    d = tc.SlotDiagnostics(slot="fs")
+    for _ in range(10):
+        quarantined = tc._note_reprobe_failure(d, None)  # unclassified == transient
+        assert quarantined is False
+    assert d.state is tc.SlotState.RECONNECTING
+    assert d.consecutive_deterministic_failures == 0
+
+
+def test_note_reprobe_failure_deterministic_quarantines_after_threshold():
+    d = tc.SlotDiagnostics(slot="docs")
+    classification = (tc.SlotState.DEPENDENCY_MISSING, "missing 'mcp.server.fastmcp'")
+    results = [tc._note_reprobe_failure(d, classification) for _ in range(tc._QUARANTINE_THRESHOLD)]
+    # Not quarantined until the threshold-th consecutive deterministic failure.
+    assert results[:-1] == [False] * (tc._QUARANTINE_THRESHOLD - 1)
+    assert results[-1] is True
+    assert d.state is tc.SlotState.QUARANTINED
+    assert d.quarantine_reason == "missing 'mcp.server.fastmcp'"
+    assert d.next_retry_at is not None
+
+
+def test_note_reprobe_failure_flaky_blip_does_not_accumulate_toward_quarantine():
+    """A single non-deterministic failure mixed into an otherwise-deterministic
+    streak resets the streak — only a CONSISTENT deterministic signature earns
+    quarantine, matching the "transient failures recover, deterministic ones
+    quarantine" design split."""
+    d = tc.SlotDiagnostics(slot="docs")
+    classification = (tc.SlotState.CHILD_CRASHED, "exited immediately")
+    tc._note_reprobe_failure(d, classification)
+    tc._note_reprobe_failure(d, classification)
+    assert d.consecutive_deterministic_failures == 2
+    tc._note_reprobe_failure(d, None)  # one flaky/transient blip
+    assert d.consecutive_deterministic_failures == 0
+    # Would need _QUARANTINE_THRESHOLD MORE consecutive deterministic failures now.
+    for _ in range(tc._QUARANTINE_THRESHOLD - 1):
+        assert tc._note_reprobe_failure(d, classification) is False
+    assert tc._note_reprobe_failure(d, classification) is True
+
+
+def test_note_reprobe_success_fully_resets_diagnostics():
+    d = tc.SlotDiagnostics(slot="docs")
+    d.set(tc.SlotState.QUARANTINED, quarantine_reason="x", retry_count=9,
+          consecutive_deterministic_failures=5)
+    tc._note_reprobe_success(d)
+    assert d.state is tc.SlotState.HEALTHY
+    assert d.retry_count == 0
+    assert d.consecutive_deterministic_failures == 0
+    assert d.quarantine_reason is None
+    assert d.last_healthy_at is not None
+
+
+# --- SlotProxy.kill(reason=...) --------------------------------------------
+
+def test_kill_reason_idle_killed_sets_diagnostics_state(monkeypatch):
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+    sp = tc.SlotProxy(["x"], 8808, "fs")
+    sp._proc = tc.subprocess.Popen(["x"])
+    sp.holder["proc"] = sp._proc
+    sp.kill(reason="idle_killed")
+    assert sp.diagnostics.state is tc.SlotState.IDLE_KILLED
+
+
+def test_kill_reason_transport_closed_sets_diagnostics_state(monkeypatch):
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+    sp = tc.SlotProxy(["x"], 8808, "fs")
+    sp._proc = tc.subprocess.Popen(["x"])
+    sp.holder["proc"] = sp._proc
+    sp.kill(reason="transport_closed")
+    assert sp.diagnostics.state is tc.SlotState.TRANSPORT_CLOSED
+
+
+def test_kill_default_reason_is_stopped(monkeypatch):
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+    sp = tc.SlotProxy(["x"], 8808, "fs")
+    sp._proc = tc.subprocess.Popen(["x"])
+    sp.holder["proc"] = sp._proc
+    sp.kill()
+    assert sp.diagnostics.state is tc.SlotState.STOPPED
+
+
+def test_kill_unrecognised_reason_falls_back_to_stopped(monkeypatch):
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+    sp = tc.SlotProxy(["x"], 8808, "fs")
+    sp._proc = tc.subprocess.Popen(["x"])
+    sp.holder["proc"] = sp._proc
+    sp.kill(reason="some-typo'd-reason")  # must not raise
+    assert sp.diagnostics.state is tc.SlotState.STOPPED
+
+
+def test_kill_on_reused_occupant_does_not_touch_diagnostics(monkeypatch):
+    """A reused (not-ours) occupant is never actually torn down — diagnostics
+    must stay whatever they already were (kill() returns before recording)."""
+    sp = tc.SlotProxy(["x"], 8808, "fs")
+    sp._reused = True
+    sp.diagnostics.set(tc.SlotState.HEALTHY)
+    sp.kill(reason="idle_killed")
+    assert sp.diagnostics.state is tc.SlotState.HEALTHY  # unchanged
+    assert sp._reused is False  # reuse tracking still dropped
+
+
+# --- _spawn_with_cache_retry(diagnostics=...) -------------------------------
+
+def test_spawn_with_cache_retry_without_diagnostics_unchanged(monkeypatch):
+    """Every pre-existing (positional, 3-arg) caller passes no diagnostics —
+    confirm the classification code path is never even entered in that case."""
+    monkeypatch.setattr(tc, "_probe_fast_exit_stderr", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("must not be called when diagnostics is None")))
+    fake_proc = _FakeProc()
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: fake_proc)
+    result = tc._spawn_with_cache_retry(["uvx", "some-tool"], None, "test")
+    assert result is fake_proc
+
+
+def test_spawn_with_cache_retry_classifies_dependency_missing_fast_exit(monkeypatch):
+    """A fast-exiting Popen whose stderr shows a ModuleNotFoundError classifies
+    onto *diagnostics* as DEPENDENCY_MISSING — the confirmed failure pattern
+    (a connector child dying at import time because e.g. mcp.server.fastmcp or
+    pydantic_settings isn't installed) — while leaving the function's own
+    return value/retry behaviour untouched."""
+    exited_proc = _FakeProc()
+    exited_proc._alive = False
+    exited_proc.returncode = 1
+    retried_proc = _FakeProc()
+
+    calls = {"n": 0}
+    def _popen(cmd, env=None, **kw):
+        calls["n"] += 1
+        return exited_proc if calls["n"] == 1 else retried_proc
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+    monkeypatch.setattr(tc, "_scoped_cache_clear", lambda cmd, label="": True)
+    monkeypatch.setattr(
+        tc, "_probe_fast_exit_stderr",
+        lambda cmd, env, wait_seconds=2.0: "ModuleNotFoundError: No module named 'mcp.server.fastmcp'",
+    )
+    # Keep the existing TAR-error probe out of the way (unrelated classifier).
+    monkeypatch.setattr(tc, "_probe_tar_entry_error", lambda *a, **k: False)
+
+    diag = tc.SlotDiagnostics(slot="docs")
+    result = tc._spawn_with_cache_retry(["python", "-m", "meridian_docs"], None, "docs", diag)
+
+    assert result is retried_proc  # existing retry behaviour unaffected
+    assert diag.state is tc.SlotState.DEPENDENCY_MISSING
+    assert "mcp.server.fastmcp" in diag.dependency_missing
+    assert diag.exit_code == 1
+
+
+def test_spawn_with_cache_retry_fast_exit_without_signature_is_child_crashed(monkeypatch):
+    exited_proc = _FakeProc()
+    exited_proc._alive = False
+    exited_proc.returncode = 1
+    retried_proc = _FakeProc()
+
+    calls = {"n": 0}
+    def _popen(cmd, env=None, **kw):
+        calls["n"] += 1
+        return exited_proc if calls["n"] == 1 else retried_proc
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+    monkeypatch.setattr(tc, "_scoped_cache_clear", lambda cmd, label="": True)
+    monkeypatch.setattr(tc, "_probe_fast_exit_stderr", lambda *a, **k: "segfault, core dumped")
+    monkeypatch.setattr(tc, "_probe_tar_entry_error", lambda *a, **k: False)
+
+    diag = tc.SlotDiagnostics(slot="dc")
+    result = tc._spawn_with_cache_retry(["npx", "-y", "tool"], None, "dc", diag)
+
+    assert result is retried_proc
+    assert diag.state is tc.SlotState.CHILD_CRASHED
+    assert diag.exit_code == 1
+
+
+# --- _preflight_slot(proxy=...) ---------------------------------------------
+
+def test_preflight_slot_without_proxy_unchanged(monkeypatch):
+    """Byte-identical to the pre-existing (no proxy kwarg) behaviour."""
+    sent = []
+    class _WS:
+        async def send(self, data): sent.append(json.loads(data))
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+    healthy = asyncio.run(tc._preflight_slot(_WS(), 8808, "fs"))
+    assert healthy is False
+    assert sent == [{
+        "type": "plugin_status", "slot": "fs", "healthy": False,
+        "reason": "unreachable", "detail": sent[0]["detail"],
+    }]
+
+
+def test_preflight_slot_with_proxy_marks_diagnostics_healthy(monkeypatch):
+    class _WS:
+        async def send(self, data): pass
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+    sp = tc.SlotProxy(["x"], 8808, "code")
+    healthy = asyncio.run(tc._preflight_slot(_WS(), 8808, "code", proxy=sp))
+    assert healthy is True
+    assert sp.diagnostics.state is tc.SlotState.HEALTHY
+
+
+def test_preflight_slot_with_proxy_marks_diagnostics_tools_list_timeout(monkeypatch):
+    sent = []
+    class _WS:
+        async def send(self, data): sent.append(json.loads(data))
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+    sp = tc.SlotProxy(["x"], 8808, "code")
+    healthy = asyncio.run(tc._preflight_slot(_WS(), 8808, "code", proxy=sp))
+    assert healthy is False
+    assert sp.diagnostics.state is tc.SlotState.TOOLS_LIST_TIMEOUT
+    # The wire report also carries the state so a server-side consumer can
+    # distinguish this from a bare "unhealthy".
+    assert sent[0]["state"] == "tools_list_timeout"
+
+
+# --- reprobe_slot — explicit operator recovery ------------------------------
+
+def test_reprobe_slot_recovers_a_quarantined_slot(monkeypatch):
+    sp = tc.SlotProxy(["x"], 8808, "docs")
+    sp.diagnostics.set(
+        tc.SlotState.QUARANTINED, quarantine_reason="missing dependency",
+        consecutive_deterministic_failures=tc._QUARANTINE_THRESHOLD,
+    )
+
+    async def fake_reprobe_once(proxy, probe):
+        return True  # operator fixed the underlying issue; probe now succeeds
+    monkeypatch.setattr(tc, "_reprobe_once", fake_reprobe_once)
+
+    result = asyncio.run(tc.reprobe_slot(sp))
+    assert result.state is tc.SlotState.HEALTHY
+    assert result.quarantine_reason is None
+    assert result.consecutive_deterministic_failures == 0
+
+
+def test_reprobe_slot_still_failing_reaffirms_quarantine(monkeypatch):
+    sp = tc.SlotProxy(["x"], 8808, "docs")
+    sp.diagnostics.set(
+        tc.SlotState.DEPENDENCY_MISSING, root_cause="still missing",
+        consecutive_deterministic_failures=tc._QUARANTINE_THRESHOLD,
+    )
+
+    async def fake_reprobe_once(proxy, probe):
+        return False  # still broken
+    monkeypatch.setattr(tc, "_reprobe_once", fake_reprobe_once)
+
+    result = asyncio.run(tc.reprobe_slot(sp))
+    assert result.state is tc.SlotState.QUARANTINED
+
+
+# --- integration: deterministic quarantine + cross-slot isolation ----------
+
+def test_run_connection_lazy_quarantines_after_persistent_dependency_missing(monkeypatch):
+    """End-to-end through _run_connection_lazy's real _reprobe() closure: a
+    slot whose spawn ALWAYS fails with the confirmed dependency-missing
+    signature (FileNotFoundError from Popen) is escalated to unhealthy, then
+    QUARANTINED after _QUARANTINE_THRESHOLD consecutive deterministic reprobe
+    failures — and the quarantine plugin_status carries state/quarantine_reason."""
+    monkeypatch.setattr(tc, "_SLOT_REPROBE_INTERVAL", 0.01)
+    monkeypatch.setattr(tc, "_WATCHDOG_MAX_RETRIES", 1)
+    monkeypatch.setattr(tc, "_QUARANTINE_THRESHOLD", 2)
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+
+    def always_missing(cmd, *a, **k):
+        raise FileNotFoundError("no such file: uvx")
+    monkeypatch.setattr(tc.subprocess, "Popen", always_missing)
+
+    sent = []
+    n_requests = tc._WATCHDOG_MAX_RETRIES + 1
+
+    class FakeWS:
+        def __init__(self):
+            self._n = 0
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def __aiter__(self): return self
+        async def __anext__(self):
+            self._n += 1
+            if self._n <= n_requests:
+                return json.dumps({"type": "request", "id": str(self._n)})
+            # Escalation happened — idle-ping long enough for several reprobe
+            # cycles (past the quarantine threshold) to run, then end.
+            if self._n < n_requests + 20:
+                await asyncio.sleep(0.02)
+                return json.dumps({"type": "ping"})
+            raise StopAsyncIteration
+        async def send(self, data): sent.append(json.loads(data))
+
+    class FakeHttpClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+
+    proxy = tc.SlotProxy(["uvx", "meridian-docs-mcp"], 8808, "docs")
+    asyncio.run(tc._run_connection_lazy("wss://x", proxy, "docs"))
+
+    statuses = [m for m in sent if m.get("type") == "plugin_status"]
+    quarantine_msgs = [m for m in statuses if m.get("state") == "quarantined"]
+    assert quarantine_msgs, f"never quarantined; statuses={statuses}"
+    assert quarantine_msgs[0]["quarantine_reason"]
+    assert proxy.diagnostics.state is tc.SlotState.QUARANTINED
+
+
+def test_quarantine_is_isolated_per_slot_never_cross_contaminates():
+    """Two independent SlotProxy instances (as run_tunnel constructs one per
+    connector slot) never share diagnostics state — quarantining one must
+    leave a sibling slot's diagnostics completely untouched."""
+    broken = tc.SlotProxy(["uvx", "docs-mcp"], 8813, "docs")
+    healthy = tc.SlotProxy(["uvx", "outputs-mcp"], 8814, "outputs")
+
+    classification = (tc.SlotState.DEPENDENCY_MISSING, "missing 'pydantic_settings'")
+    for _ in range(tc._QUARANTINE_THRESHOLD):
+        tc._note_reprobe_failure(broken.diagnostics, classification)
+    tc._note_reprobe_success(healthy.diagnostics)
+
+    assert broken.diagnostics.state is tc.SlotState.QUARANTINED
+    assert healthy.diagnostics.state is tc.SlotState.HEALTHY
+    assert healthy.diagnostics.quarantine_reason is None
+    assert healthy.diagnostics.consecutive_deterministic_failures == 0
 
 
 # ---------------------------------------------------------------------------
