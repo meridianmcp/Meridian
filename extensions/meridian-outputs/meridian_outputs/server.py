@@ -44,6 +44,7 @@ def search_outputs(
     limit: int = 10,
     include_archival: bool = True,
     max_seconds: float | None = outputs_local.DEFAULT_REBUILD_BUDGET_SECONDS,
+    subtree: str | None = None,
 ) -> dict[str, Any]:
     """BM25 full-text search over a local outputs directory tree, with a
     literal-filename-match boost (item c6236ef4).
@@ -90,18 +91,36 @@ def search_outputs(
                         tree (partial=True signals more indexing remains --
                         call again to continue); raise it to converge in
                         fewer calls on a tree too large for the default budget.
+      subtree:          6af1518d -- optional sub-path of ``outputs_dir`` to
+                        scope indexing/searching to, WITHOUT requiring a
+                        full re-walk of the root. Uses a separate,
+                        independently-converging index for the subtree,
+                        seeded from a slice of the root's own cached index
+                        when available (so files the root already indexed
+                        aren't re-hashed). The response's convergence/
+                        partial fields then describe the SUBTREE's own
+                        convergence, not the whole root's -- fixes the real
+                        inconsistency this item was opened to close: root
+                        vs. narrow-subdirectory searches giving different
+                        zero-hit answers with no way to tell why.
 
     Returns:
-      {outputs_dir, query, hits, total_indexed} plus optional {partial,
-      pending_stale_count, fts_pending, tantivy_lock_warning, db_write_error,
-      zero_hits_warning, error}. ``pending_stale_count`` (only present when
-      ``partial`` is True) is the number of confirmed-stale files still
-      queued for analysis+write -- distinguishes a zero-hit result on a
-      mid-pass index (more indexing queued) from a genuine miss on a
-      fully-converged index (81a0b23d). ``zero_hits_warning`` is present
-      whenever ``hits`` is empty AND the index isn't fully converged
-      (partial/fts_pending/db_write_error set) -- treat its presence as "do
+      {outputs_dir, query, hits, total_indexed} plus optional {subtree,
+      partial, pending_stale_count, fts_pending, tantivy_lock_warning,
+      db_write_error, zero_hits_warning, error, convergence}.
+      ``pending_stale_count`` (only present when ``partial`` is True) is the
+      number of confirmed-stale files still queued for analysis+write --
+      distinguishes a zero-hit result on a mid-pass index (more indexing
+      queued) from a genuine miss on a fully-converged index (81a0b23d).
+      ``zero_hits_warning`` is present whenever ``hits`` is empty AND the
+      index isn't fully converged (partial/fts_pending/db_write_error set,
+      OR ``convergence.converged`` is False) -- treat its presence as "do
       not conclude not-found yet, re-invoke this tool instead."
+      ``convergence`` (6af1518d) is the explicit, structured convergence
+      snapshot: {outputs_dir, subtree, converged, walk_complete,
+      scan_boundary, pending_count, indexed_count, expected_count,
+      last_error, fts_pending, partial} -- the single authoritative object
+      the other ad hoc fields are derived from.
       Each hit has: path, score, bm25, is_archival, canonical_path, kind,
       generating_script, csv_columns, json_keys, size, mtime, annotations,
       literal_match.
@@ -112,7 +131,41 @@ def search_outputs(
         limit=limit,
         include_archival=include_archival,
         max_seconds=max_seconds,
+        subtree=subtree,
     )
+
+
+@mcp.tool()
+def get_convergence_state(
+    outputs_dir: str, subtree: str | None = None,
+) -> dict[str, Any]:
+    """Explicit convergence-state snapshot for a local outputs index (item
+    6af1518d requirement 1) -- read-only, does NOT trigger any indexing.
+
+    Answers, without guessing from a search result's shape: how far has the
+    index walk gotten (``scan_boundary``), how much work is still queued
+    (``pending_count``), did the walk hit anything it couldn't read
+    (``last_error``), and how does the indexed count compare to the best-
+    known expected total (``indexed_count``/``expected_count``)? Call this
+    BEFORE trusting a zero-hit ``search_outputs`` result as a genuine miss,
+    or poll it while a large tree is still converging across multiple
+    ``search_outputs`` calls.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      subtree:      Optional sub-path of ``outputs_dir``. When given, scopes
+                    the answer to that subtree specifically (has THIS
+                    sub-path been fully covered by the walk so far), using
+                    the SAME cached root index -- does not spin up a
+                    separate subtree index (see ``search_outputs``'s
+                    ``subtree`` param for that).
+
+    Returns:
+      {outputs_dir, subtree, converged, walk_complete, scan_boundary,
+      pending_count, indexed_count, expected_count, last_error, fts_pending,
+      partial}, or {error: ...} if ``outputs_dir`` doesn't exist.
+    """
+    return outputs_local.get_convergence_state(outputs_dir, subtree=subtree)
 
 
 @mcp.tool()

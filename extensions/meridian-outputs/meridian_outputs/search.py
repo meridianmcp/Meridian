@@ -101,6 +101,7 @@ def search_outputs(
     limit: int = 10,
     include_archival: bool = True,
     max_seconds: float | None = outputs_local.DEFAULT_REBUILD_BUDGET_SECONDS,
+    subtree: str | None = None,
 ) -> dict[str, Any]:
     """BM25 output search with a literal-filename-match boost.
 
@@ -119,6 +120,9 @@ def search_outputs(
                         True) -- passed straight through.
       max_seconds:      Rebuild wall-clock budget -- passed straight
                         through (same default as ``outputs_local``).
+      subtree:          Optional sub-path of ``outputs_dir`` to scope
+                        indexing/searching to (item 6af1518d) -- passed
+                        straight through to ``outputs_local.search_outputs``.
 
     Returns:
       Identical shape to ``outputs_local.search_outputs``'s return value
@@ -142,6 +146,7 @@ def search_outputs(
         limit=limit,
         include_archival=include_archival,
         max_seconds=max_seconds,
+        subtree=subtree,
     )
     hits = result.get("hits")
     if not hits or result.get("error"):
