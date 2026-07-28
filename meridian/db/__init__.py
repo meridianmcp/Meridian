@@ -1119,6 +1119,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoff_tokens_body_hash(db)
     await _migrate_project_capabilities(db)
     await _migrate_capability_profiles(db)
+    await _migrate_docx_merge_manifests(db)
     return db
 
 
@@ -10805,6 +10806,24 @@ from .locks import (  # noqa: F401
     _increment_file_patch_counter,
     get_structural_degradation_warnings,
     flag_file_refactor,
+)
+
+
+from .docx_merge import (  # noqa: F401
+    # Private helpers (also called directly by tests)
+    _MERGE_OWNER_TTL_MINUTES,
+    _get_manifest_row,
+    _get_draft_row,
+    _migrate_docx_merge_manifests,
+    # fe989980 — wave-scoped merge manifest + serialized canonical merge gate
+    open_merge_manifest,
+    declare_merge_anchors,
+    claim_merge_owner,
+    release_merge_owner,
+    check_merge_stale_or_overlap,
+    record_merge_result,
+    finalize_merge_manifest,
+    get_merge_manifest,
 )
 
 

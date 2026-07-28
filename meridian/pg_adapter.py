@@ -2521,6 +2521,56 @@ async def _migrate_pg_file_docx_region_claims(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_docx_merge_manifests(conn: PostgresConnection) -> None:
+    """fe989980 — wave-scoped DOCX merge manifests + serialized canonical merge gate.
+
+    Creates docx_merge_manifests / docx_merge_drafts / docx_merge_anchor_locks
+    on existing Postgres DBs. Mirrors db.docx_merge._migrate_docx_merge_manifests.
+    Runs on every DB (LATE, not hosted-only — sessions exist on customer DBs
+    too, same rationale as _migrate_pg_file_docx_region_claims).
+    """
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS docx_merge_manifests ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    wave_id TEXT NOT NULL,"
+        f"    file_path TEXT NOT NULL,"
+        f"    status TEXT NOT NULL DEFAULT 'open',"
+        f"    base_revision TEXT,"
+        f"    merge_owner_session_id TEXT,"
+        f"    merge_owner_claimed_at TEXT,"
+        f"    merge_owner_expires_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    completed_at TEXT,"
+        f"    verification TEXT"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_docx_merge_manifests_wave_file "
+        f"ON docx_merge_manifests (wave_id, file_path);"
+        f"CREATE TABLE IF NOT EXISTS docx_merge_drafts ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    manifest_id TEXT NOT NULL REFERENCES docx_merge_manifests(id) ON DELETE CASCADE,"
+        f"    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        f"    draft_path TEXT NOT NULL,"
+        f"    anchors TEXT NOT NULL DEFAULT '[]',"
+        f"    declared_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    merged_at TEXT"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_docx_merge_drafts_manifest_session "
+        f"ON docx_merge_drafts (manifest_id, session_id);"
+        f"CREATE TABLE IF NOT EXISTS docx_merge_anchor_locks ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    manifest_id TEXT NOT NULL REFERENCES docx_merge_manifests(id) ON DELETE CASCADE,"
+        f"    element_id TEXT NOT NULL,"
+        f"    draft_id TEXT,"
+        f"    session_id TEXT NOT NULL,"
+        f"    merged_at TEXT NOT NULL DEFAULT ({_TS})"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_docx_merge_anchor_locks_manifest_element "
+        f"ON docx_merge_anchor_locks (manifest_id, element_id);"
+        f"CREATE INDEX IF NOT EXISTS idx_docx_merge_anchor_locks_session "
+        f"ON docx_merge_anchor_locks (session_id);"
+    )
+
+
 async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> None:
     """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
 
@@ -3770,4 +3820,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoff_tokens_body_hash,
     _migrate_pg_project_capabilities,
     _migrate_pg_capability_profiles,
+    _migrate_pg_docx_merge_manifests,
 )
