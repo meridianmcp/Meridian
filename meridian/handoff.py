@@ -32,6 +32,7 @@ from xml.sax.saxutils import escape as _xml_escape  # 5abf3e12 — XML-safe /goa
 import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from . import artifact_declaration as artifact_declaration_module
 from . import capability_contract as capability_contract_module
 from . import db as db_module
 from . import tool_requirements as tool_requirements_module
@@ -1879,6 +1880,24 @@ def build_item_briefing(
             "<tool_requirements>"
             + _xml_escape(tool_requirements_module.canonical_json(_tool_requirements))
             + "</tool_requirements>"
+        )
+    # 2f9cb288 (665 follow-up) — typed artifact declaration contract: only
+    # rendered when the item actually declares SOMETHING (mirrors
+    # tool_requirements's "no tag when nothing declared" restraint above).
+    # ``policy`` is always the EFFECTIVE (merged-with-project-default) one —
+    # an executor reasoning about enforcement needs the resolved answer, not
+    # "whatever this one item happened to set" — see
+    # artifact_declaration.effective_artifact_policy.
+    if artifact_declaration_module.has_artifact_declaration(item):
+        _artifact_decl: dict[str, Any] = {
+            "artifact_kind": artifact_declaration_module.effective_artifact_kind(item),
+            "planned_output": artifact_declaration_module.effective_planned_output(item),
+            "policy": artifact_declaration_module.effective_artifact_policy(item),
+        }
+        parts.append(
+            "<artifact_declaration>"
+            + _xml_escape(json.dumps(_artifact_decl, sort_keys=True))
+            + "</artifact_declaration>"
         )
     parts += [
         f"<completion_criteria>{_xml_escape(completion_text)}</completion_criteria>",

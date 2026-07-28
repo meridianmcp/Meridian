@@ -155,6 +155,65 @@ _TOOL_REQUIREMENTS_SCHEMA: dict[str, Any] = {
 }
 
 
+# 2f9cb288 (665 follow-up) — typed per-item artifact declaration schema,
+# shared verbatim between add_sprint_item and update_sprint_item (same
+# sharing discipline as _TOOL_REQUIREMENTS_SCHEMA above) so the three tool
+# definitions can never drift on field names/enum values. See
+# meridian.artifact_declaration for the canonical validation this mirrors.
+_ARTIFACT_KIND_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "enum": ["document_only", "figure", "table"],
+    "description": (
+        "2f9cb288 — the kind of artifact this item produces. Omit when unknown "
+        "(never guessed/inferred) — an absent value is distinct from any listed "
+        "kind. Pass an empty string on update_sprint_item to CLEAR it."
+    ),
+}
+
+_PLANNED_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "2f9cb288 — a TYPED POINTER declaring where this item's output is "
+        "expected to land — NOT a free-form path. Validated via meridian.pointers."
+        "validate_pointer: source_type + a non-empty targets array of "
+        "{uri, selector, target_kind?, subSelector?}, plus an optional label. "
+        "Do not infer this from a directory or a generic 'mcp_tool:' resource id "
+        "— only an explicit pointer counts. No secrets or machine-local absolute "
+        "paths (same check as set_capability_manifest / tool_requirements). Pass "
+        "null on update_sprint_item to clear."
+    ),
+    "properties": {
+        "source_type": {"type": "string", "description": "e.g. 'code', 'docs', 'experiment' — what kind of source the target lives in."},
+        "targets": {
+            "type": "array",
+            "description": "Non-empty array of {uri, selector, target_kind?, subSelector?} — see add_sprint_item_pointer for the full selector shape (range/symbol/node_id/zotero_key/text_quote/finding_id).",
+            "items": {"type": "object"},
+        },
+        "label": {"type": "string", "description": "Optional human-readable label for this output."},
+        "provenance_required": {"type": "boolean", "description": "Whether the executor must record_provenance for this output before it counts as satisfied. Default false."},
+    },
+    "required": ["source_type", "targets"],
+}
+
+_ARTIFACT_POLICY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "2f9cb288 — per-item override of how strictly a missing/wrong artifact "
+        "output pointer is enforced. Absent (omit, or on update_sprint_item pass "
+        "null to clear) falls back to the project default: artifact_pointer_check="
+        "'warn', every guard flag false — never a silent 'off', never a silent "
+        "'strict'. See meridian.artifact_declaration.effective_artifact_policy."
+    ),
+    "properties": {
+        "artifact_pointer_check": {"type": "string", "enum": ["off", "warn", "strict"],
+            "description": "off = no enforcement; warn = surface but don't block (default); strict = block completion without a valid planned_output pointer."},
+        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, a figure-kind item must declare an exact planned_output pointer (default false)."},
+        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, a table-kind item must declare an exact planned_output pointer (default false)."},
+        "allow_document_only_override": {"type": "boolean", "description": "When true, a document_only-kind item may override/bypass the pointer check (default false)."},
+    },
+}
+
+
 _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "create_project", "description": "Create a new Meridian project.",
      "inputSchema": {"type": "object", "properties": {
@@ -1565,7 +1624,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                   "description": "58a45b92 — stored, deterministic wave/batch label (e.g. 'wave-1') for enforced wave-a/wave-b grouping. Usually auto-filled by assign_sprint_waves from the conflict-free parallel groups; set it here only to pin an item to a specific wave up front. Omit to leave unassigned."},
          "required_tool": {"type": "string",
                   "description": "4d1fb28f — pin the specific MCP tool/plugin the executor MUST use for this item (e.g. 'Serena: replace_symbol_body', 'meridian__patch_file', a named tunnel plugin) instead of leaving tool choice to executor habit. Rendered as a hard directive in the /goal block (not a soft hint) — see build_item_briefing / the batch /goal's <required_tool> clause. Omit for ordinary executor discretion."},
-         "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA},
+         "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA,
+         "artifact_kind": _ARTIFACT_KIND_SCHEMA,
+         "planned_output": _PLANNED_OUTPUT_SCHEMA,
+         "policy": _ARTIFACT_POLICY_SCHEMA},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -1627,6 +1689,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required_tool": {"type": "string",
                   "description": "4d1fb28f — pin (or re-pin) the specific MCP tool/plugin the executor MUST use for this item, rendered as a hard directive in the /goal block — not left to executor habit. Pass an empty string to CLEAR the pin (ordinary executor discretion); omit to leave unchanged."},
          "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA,
+         "artifact_kind": _ARTIFACT_KIND_SCHEMA,
+         "planned_output": _PLANNED_OUTPUT_SCHEMA,
+         "policy": _ARTIFACT_POLICY_SCHEMA,
          "github_channel": {"type": "string", "enum": ["nightly", "stable", "graduated"],
                   "description": "7c82f7c8 — release-channel classification for this item's linked, auto-filed GitHub issue (fdaa5b55), mirroring the channel:nightly / channel:stable labels applied via which issue template (.github/ISSUE_TEMPLATE/) the reporter picked. 'graduated' marks a bug that started as nightly-only noise but is now confirmed reproducing on stable too — needs a real fix before general release. Pass an empty string to CLEAR it; omit to leave unchanged."}},
          "required": ["item_id"]}},
