@@ -2588,6 +2588,17 @@ async def _handle_task_tools(
                 )
             except Exception:  # noqa: BLE001
                 _goal_compliance = None
+        # 98aaccf4 — machine-readable effective capability contract, emitted
+        # on every generate_handoff mode (the surrounding dict construction
+        # is common to all of them regardless of which branch built `content`
+        # above). board_stale mirrors _handoff_degraded: the L0 emergency
+        # fallback means this handoff's own board/profile snapshot is known
+        # incomplete, so a contract built alongside it must not silently
+        # report executable=true. Fully guarded — a failure degrades to no
+        # field rather than breaking the mandatory handoff.
+        _capability_contract = await handoff_module_local.build_effective_capability_contract(
+            db, args["project_id"], board_stale=_handoff_degraded,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -2601,6 +2612,7 @@ async def _handle_task_tools(
             "insight_hints": _insight_hints[:5],
             "goal_length_warning": _goal_warn,
             "goal_compliance": _goal_compliance,
+            "capability_contract": _capability_contract,
         }
     if name == "load_handoff":
         # 5efe254b — trusted retrieval of the latest stored handoff for a project

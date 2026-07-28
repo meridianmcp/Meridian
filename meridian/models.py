@@ -327,6 +327,12 @@ class HandoffResult(BaseModel):
     path: str
     content: str
     mode: str | None = None
+    # 98aaccf4 — machine-readable effective capability contract (see
+    # meridian.capability_contract). dict, not a typed submodel: its shape is
+    # intentionally allowed to evolve (richer effective/availability data once
+    # the 02038afe/ac80aaaf sibling items land) without a models.py migration
+    # each time. None only if contract-building itself failed (best-effort).
+    capability_contract: dict[str, Any] | None = None
 
 
 class TaskUpdate(BaseModel):

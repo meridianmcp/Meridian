@@ -32,6 +32,7 @@ from xml.sax.saxutils import escape as _xml_escape  # 5abf3e12 — XML-safe /goa
 import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from . import capability_contract as capability_contract_module
 from . import db as db_module
 from .db.sprint_items import _is_deferred, is_item_claim_prospected, _split_wave_label
 from .executor_config import build_executor_config_block, has_executor_config
@@ -1487,11 +1488,18 @@ def _build_required_tool_clause(items: list[dict[str, Any]]) -> str:
     suggestion the executor can weigh and skip. Returns an empty string when
     no item in the batch has a pin set, so it never adds noise to an ordinary
     /goal.
+
+    98aaccf4 — the pin EXTRACTION (which items carry a pin, and what tool)
+    is delegated to ``capability_contract.extract_required_tool_pins``, the
+    same typed data source the structured capability contract reads, so this
+    XML clause and the contract never maintain two independent list
+    comprehensions that could silently drift apart. Only the rendering
+    (this function's job) stays here — output is byte-for-byte unchanged
+    from before this refactor.
     """
     pins = [
-        f"{it['id']}: {it['required_tool']}"
-        for it in items
-        if it.get("id") and it.get("required_tool")
+        f"{pin['item_id']}: {pin['tool']}"
+        for pin in capability_contract_module.extract_required_tool_pins(items)
     ]
     if not pins:
         return ""
@@ -4031,6 +4039,31 @@ async def _resolve_session_sprint_version(
             return None
         return row["sprint_version"] if isinstance(row, dict) else row[0]
     except Exception:  # noqa: BLE001 — best-effort only
+        return None
+
+
+async def build_effective_capability_contract(
+    db: Any, project_id: str, *, board_stale: bool = False,
+) -> "dict[str, Any] | None":
+    """98aaccf4 — thin, fully-guarded wrapper over
+    ``capability_contract.build_capability_contract`` for the two trusted
+    channels that emit it: ``start_session``'s orientation response
+    (``mcp/handlers/project_tools.py::handle_start_session``) and every
+    ``generate_handoff`` mode (``mcp/handler.py``'s ``generate_handoff``
+    dispatch). Both call sites already wrap their own optional enrichments
+    in try/except so a failure here never breaks the mandatory tool result —
+    this wrapper adds one more layer of the same guard directly, returning
+    ``None`` on any failure so a caller can simply skip attaching the field
+    rather than needing its own try/except around this call too.
+
+    ``board_stale`` is passed straight through -- see
+    ``capability_contract.build_capability_contract`` for what it means.
+    """
+    try:
+        return await capability_contract_module.build_capability_contract(
+            db, project_id, board_stale=board_stale,
+        )
+    except Exception:  # noqa: BLE001 — capability contract is best-effort
         return None
 
 

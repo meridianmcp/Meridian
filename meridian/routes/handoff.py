@@ -40,7 +40,15 @@ async def planner_handoff_endpoint(
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="planner handoff timed out")
-    return {"path": path, "content": content, "mode": "planner"}
+    # 98aaccf4 — machine-readable effective capability contract; best-effort,
+    # never breaks the planner handoff.
+    capability_contract = await handoff_module.build_effective_capability_contract(
+        db, project_id,
+    )
+    return {
+        "path": path, "content": content, "mode": "planner",
+        "capability_contract": capability_contract,
+    }
 
 
 @router.post("/projects/{project_id}/handoff", response_model=HandoffResult)
@@ -65,6 +73,7 @@ async def generate_handoff_endpoint(
     skip_summary = not os.environ.get("ANTHROPIC_API_KEY")
     db = await _db(request)
     data_dir = _data_dir(request)
+    _board_stale = False
     try:
         path, content, _ = await asyncio.wait_for(
             handoff_module.generate_handoff(
@@ -78,4 +87,16 @@ async def generate_handoff_endpoint(
     except asyncio.TimeoutError:
         path, content = await handoff_module._generate_handoff_l0(db, project_id, data_dir)
         mode = "full"
-    return {"path": path, "content": content, "mode": mode}
+        # 98aaccf4 — the L0 emergency fallback means this handoff's own
+        # board/profile snapshot is known incomplete; a contract built
+        # alongside it must not silently report executable=true.
+        _board_stale = True
+    # 98aaccf4 — machine-readable effective capability contract; best-effort,
+    # never breaks the mandatory handoff.
+    capability_contract = await handoff_module.build_effective_capability_contract(
+        db, project_id, board_stale=_board_stale,
+    )
+    return {
+        "path": path, "content": content, "mode": mode,
+        "capability_contract": capability_contract,
+    }

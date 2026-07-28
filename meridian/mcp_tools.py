@@ -161,7 +161,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "human_id": {"type": "string"},
          "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]}},
          "required": ["session_name"]}},
-    {"name": "start_session", "description": "Register a session and return orientation. Compact by default (session_id, sprint focus + status counts, 3 recent tasks, board_change count) to keep an executor's context small. Pass compact=false for the full block (goal XML, decisions, MERIDIAN.md instructions, workspace context, sprint items) — or fetch it later with get_session_brief. Pass version to scope the session to one sprint-version bucket (e.g. 'v0.1.x'): the orientation's sprint counts/items filter to it and the scope is remembered for the /goal template. Omit version to auto-scope to the bucket with the most pending items (empty board → unscoped).",
+    {"name": "start_session", "description": "Register a session and return orientation. Compact by default (session_id, sprint focus + status counts, 3 recent tasks, board_change count) to keep an executor's context small. Pass compact=false for the full block (goal XML, decisions, MERIDIAN.md instructions, workspace context, sprint items) — or fetch it later with get_session_brief. Pass version to scope the session to one sprint-version bucket (e.g. 'v0.1.x'): the orientation's sprint counts/items filter to it and the scope is remembered for the /goal template. Omit version to auto-scope to the bucket with the most pending items (empty board → unscoped). Also returns capability_contract (98aaccf4): a machine-readable {requested, effective, availability, manifest_hash, executable, executable_reasons, generated_at} object describing the project's declared capabilities and whether an executor can run right now — null if contract-building failed.",
      "inputSchema": {"type": "object", "properties": {
           "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "session_name": {"type": "string", "description": "Optional (599d0097): omit or leave blank to auto-generate a meaningful name from the first pending sprint item title + a timestamp, instead of inventing a string."},
           "human_id": {"type": "string"},
@@ -221,7 +221,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "delivers content pre-wrapped in a single 4-backtick code fence so it renders as "
         "one copy-pasteable block in any markdown client. Do NOT add extra headers, "
         "blockquotes, or fences around it — just output the field value as-is. "
-        "Do NOT just narrate that the handoff succeeded; paste the actual text.",
+        "Do NOT just narrate that the handoff succeeded; paste the actual text. "
+        "Also returns capability_contract (98aaccf4) on every mode: a machine-readable "
+        "{requested, effective, availability, manifest_hash, executable, "
+        "executable_reasons, generated_at} object describing the project's declared "
+        "capabilities and whether an executor can run right now — null if contract-"
+        "building failed.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},

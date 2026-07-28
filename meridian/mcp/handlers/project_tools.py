@@ -360,6 +360,21 @@ async def handle_start_session(
                     )
     except Exception:  # noqa: BLE001 — setup_warning must never break orientation
         pass
+    # 98aaccf4 — machine-readable effective capability contract, emitted
+    # alongside every start_session orientation (both compact and full;
+    # neither shape excludes it). board_stale mirrors this session's own
+    # pending_goal_stale signal (set just above, when present) -- a stale
+    # unconsumed handoff is a reasonable proxy for "the board/profile
+    # snapshot behind this contract may itself be stale." Fully guarded: a
+    # failure here degrades to no field rather than breaking start_session.
+    try:
+        if isinstance(result, dict):
+            from meridian import handoff as _handoff_module  # noqa: PLC0415
+            result["capability_contract"] = await _handoff_module.build_effective_capability_contract(
+                db, _pid, board_stale=bool(result.get("pending_goal_stale")),
+            )
+    except Exception:  # noqa: BLE001 — capability contract is best-effort
+        pass
     return result
 
 
