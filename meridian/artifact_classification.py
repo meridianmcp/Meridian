@@ -245,17 +245,26 @@ def _classify_uri(uri: Any) -> "str | None":
     return None
 
 
-def _iter_candidate_uris(item: dict[str, Any]) -> list[tuple[str, str]]:
+def _iter_candidate_uris(
+    item: dict[str, Any],
+) -> "list[tuple[str, str, str | None]]":
     """Pull every pointer-shaped uri a legacy item might carry, tagged with
-    which field it came from (for explainable evidence strings).
+    which field it came from (for explainable evidence strings) and, when
+    available, the durable ``sprint_item_pointers`` row id it came from.
 
     Sources, in order: ``planned_output`` (rare on a legacy item, but
     checked for completeness — see module docstring), ``pointer_records``
     (the typed records ``handoff._annotate_resolved_pointers`` attaches from
     the item's durable ``sprint_item_pointers`` rows), and ``file:``-typed
     ``touches_resources`` identifiers. Never raises on malformed input.
+
+    The third tuple element (``pointer_id``, 88f82c15/b730 follow-up) is the
+    stored pointer's own ``id`` when the candidate came from a
+    ``pointer_records`` entry (the only source with a persisted row to name
+    in a remediation message) — ``None`` for ``planned_output``/
+    ``touches_resources`` candidates, which have no durable row of their own.
     """
-    out: list[tuple[str, str]] = []
+    out: "list[tuple[str, str, str | None]]" = []
 
     try:
         planned = _artifact_declaration.effective_planned_output(item)
@@ -264,14 +273,16 @@ def _iter_candidate_uris(item: dict[str, Any]) -> list[tuple[str, str]]:
     if isinstance(planned, dict):
         for t in planned.get("targets") or []:
             if isinstance(t, dict) and t.get("uri"):
-                out.append((str(t["uri"]), "planned_output"))
+                out.append((str(t["uri"]), "planned_output", None))
 
     for rec in item.get("pointer_records") or []:
         if not isinstance(rec, dict):
             continue
+        rec_id = rec.get("id")
+        pointer_id = str(rec_id) if rec_id else None
         for t in rec.get("targets") or []:
             if isinstance(t, dict) and t.get("uri"):
-                out.append((str(t["uri"]), "pointer_records"))
+                out.append((str(t["uri"]), "pointer_records", pointer_id))
 
     raw_resources = item.get("touches_resources")
     ids: list[Any] = []
@@ -291,7 +302,7 @@ def _iter_candidate_uris(item: dict[str, Any]) -> list[tuple[str, str]]:
             s = s[len("inferred:"):]
         head, sep, tail = s.partition(":")
         if sep and head == "file" and tail:
-            out.append((tail, "touches_resources"))
+            out.append((tail, "touches_resources", None))
 
     return out
 
@@ -306,7 +317,7 @@ def _pointer_evidence(item: dict[str, Any]) -> "tuple[str | None, list[str], boo
     """
     figure_hits: list[str] = []
     table_hits: list[str] = []
-    for uri, source in _iter_candidate_uris(item):
+    for uri, source, _pointer_id in _iter_candidate_uris(item):
         kind = _classify_uri(uri)
         if kind == "figure":
             figure_hits.append(f"{source} target {uri!r} resolves to a figure-typed file")
@@ -319,6 +330,153 @@ def _pointer_evidence(item: dict[str, Any]) -> "tuple[str | None, list[str], boo
     if table_hits:
         return "table", table_hits, False
     return None, [], False
+
+
+# ---------------------------------------------------------------------------
+# 88f82c15 (b730 follow-up) — WHY a candidate pointer is insufficient.
+#
+# ``_classify_uri`` above collapses every non-exact case to a bare ``None``
+# ("not evidence"), which is all ``_pointer_evidence``/``classify_artifact_work``
+# need. The warn/strict POLICY evaluator (:mod:`meridian.pointers`'s
+# ``evaluate_artifact_pointer_policy``) needs more: which SPECIFIC exclusion
+# fired, so a structured warning can name the deficiency (a bare .docx vs. a
+# directory vs. a generic meridian-outputs/Outputs tool reference) instead of
+# a generic "no pointer found". This section mirrors ``_classify_uri``'s
+# branches verbatim, in the same order, so the two can never silently
+# disagree about what counts as sufficient.
+# ---------------------------------------------------------------------------
+
+INSUFFICIENT_MISSING_POINTER = "missing_pointer"
+INSUFFICIENT_BARE_DOCX = "insufficient_pointer_bare_docx"
+INSUFFICIENT_DIRECTORY = "insufficient_pointer_directory"
+INSUFFICIENT_GENERIC_REFERENCE = "insufficient_pointer_generic_reference"
+INSUFFICIENT_UNSUPPORTED_TYPE = "insufficient_pointer_unsupported_type"
+
+# Priority order when a single item carries several insufficient candidates
+# for different reasons — the MOST actionable/specific one wins, so a caller
+# renders one clear remediation instead of an ambiguous list.
+_INSUFFICIENCY_PRIORITY = (
+    INSUFFICIENT_BARE_DOCX,
+    INSUFFICIENT_DIRECTORY,
+    INSUFFICIENT_GENERIC_REFERENCE,
+    INSUFFICIENT_UNSUPPORTED_TYPE,
+)
+
+_INSUFFICIENCY_REMEDIATION: dict[str, str] = {
+    INSUFFICIENT_MISSING_POINTER: (
+        "Attach a planned_output or sprint_item_pointer target whose uri "
+        "resolves to a concrete figure file (.png/.jpg/.jpeg/.gif/.svg/"
+        ".webp/.tif/.tiff/.eps/.bmp) or table file (.csv/.tsv/.xlsx/.xls) — "
+        "figure/table work needs an exact output pointer, not just a title/"
+        "notes description."
+    ),
+    INSUFFICIENT_BARE_DOCX: (
+        "Point at the SPECIFIC figure/table file this item produces (e.g. "
+        "outputs/figures/foo.png), not the bare .docx document — a .docx "
+        "may CONTAIN the figure/table but does not identify which asset it "
+        "is."
+    ),
+    INSUFFICIENT_DIRECTORY: (
+        "Point at the specific output FILE this item produces, not the "
+        "containing directory."
+    ),
+    INSUFFICIENT_GENERIC_REFERENCE: (
+        "A generic meridian-outputs/Outputs tool reference (mcp_tool:/"
+        "route:/db:/… or another scheme-prefixed resource id) does not name "
+        "a specific file — attach a pointer at the concrete figure/table "
+        "file uri instead."
+    ),
+    INSUFFICIENT_UNSUPPORTED_TYPE: (
+        "The pointer's file extension is not a recognized figure "
+        "(.png/.jpg/.jpeg/.gif/.svg/.webp/.tif/.tiff/.eps/.bmp) or table "
+        "(.csv/.tsv/.xlsx/.xls) output type — attach a pointer at a "
+        "concrete figure/table file."
+    ),
+}
+
+
+def _classify_uri_insufficiency(uri: Any) -> "str | None":
+    """Like :func:`_classify_uri`, but names the SPECIFIC reason a candidate
+    uri fails to count as exact figure/table evidence, instead of a bare
+    ``None``.
+
+    Returns ``None`` when the uri is actually SUFFICIENT (i.e. when
+    :func:`_classify_uri` would return ``"figure"``/``"table"``) — every
+    exclusion branch below mirrors ``_classify_uri`` verbatim, in the same
+    order, so the two functions can never silently disagree about what
+    counts.
+    """
+    if not isinstance(uri, str):
+        return None
+    u = uri.strip()
+    if not u:
+        return None
+    if "://" in u:
+        return INSUFFICIENT_UNSUPPORTED_TYPE
+    if _GENERIC_SCHEME_RE.match(u):
+        return INSUFFICIENT_GENERIC_REFERENCE
+    normalized = u.replace("\\", "/").rstrip("/")
+    if not normalized:
+        return INSUFFICIENT_DIRECTORY
+    fname = normalized.rsplit("/", 1)[-1]
+    if "." not in fname:
+        return INSUFFICIENT_DIRECTORY
+    ext = "." + fname.rsplit(".", 1)[-1].lower()
+    if ext == ".docx":
+        return INSUFFICIENT_BARE_DOCX
+    if ext in _FIGURE_EXTENSIONS or ext in _TABLE_EXTENSIONS:
+        return None  # sufficient — _classify_uri would resolve this one
+    return INSUFFICIENT_UNSUPPORTED_TYPE
+
+
+def artifact_pointer_insufficiency_evidence(
+    item: dict[str, Any],
+) -> "tuple[str | None, list[str]]":
+    """For a figure/table-sensitive item with NO concrete pointer evidence
+    (:func:`_pointer_evidence` returned a ``None`` kind), determine the
+    DOMINANT insufficiency reason and the durable pointer ids it implicates.
+
+    Returns ``(reason_code, affected_pointer_ids)``. ``reason_code`` is
+    ``None`` only when the item has ZERO candidate pointer uris at all (no
+    ``planned_output``, no ``pointer_records``, no ``file:``-typed
+    ``touches_resources``) — the caller substitutes
+    :data:`INSUFFICIENT_MISSING_POINTER` in that case, distinguishing "there
+    is a pointer but it's the wrong shape" from "there is no pointer at
+    all". When multiple candidates fail for different reasons, the most
+    actionable one wins by fixed priority (bare docx > directory > generic
+    reference > unsupported type — see :data:`_INSUFFICIENCY_PRIORITY`) so a
+    caller renders ONE clear remediation instead of an ambiguous list.
+
+    ``affected_pointer_ids`` names the durable ``sprint_item_pointers`` row
+    ids (from ``pointer_records``) whose target triggered the DOMINANT
+    reason, sorted for determinism. A candidate sourced from
+    ``touches_resources``/``planned_output`` carries no durable row id and
+    is never included — there is no persisted pointer to name.
+
+    Never raises: reused by :func:`meridian.pointers.evaluate_artifact_pointer_policy`,
+    a mandatory handoff-annotation path.
+    """
+    candidates = _iter_candidate_uris(item)
+    if not candidates:
+        return None, []
+    reasons_by_code: dict[str, list[str]] = {}
+    for uri, _source, pointer_id in candidates:
+        code = _classify_uri_insufficiency(uri)
+        if not code:
+            continue  # this ONE candidate is actually sufficient
+        bucket = reasons_by_code.setdefault(code, [])
+        if pointer_id:
+            bucket.append(str(pointer_id))
+    if not reasons_by_code:
+        return None, []
+    for code in _INSUFFICIENCY_PRIORITY:
+        if code in reasons_by_code:
+            return code, sorted(set(reasons_by_code[code]))
+    # Unreachable in practice (every _classify_uri_insufficiency code is
+    # listed in _INSUFFICIENCY_PRIORITY) — fall back rather than silently
+    # dropping evidence.
+    first_code = next(iter(reasons_by_code))
+    return first_code, sorted(set(reasons_by_code[first_code]))
 
 
 # ---------------------------------------------------------------------------
