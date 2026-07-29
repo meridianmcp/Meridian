@@ -52,6 +52,7 @@ rest of the ``meridian_outputs`` package.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -60,6 +61,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import outputs_local
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "ProvenanceRecord",
@@ -195,6 +198,17 @@ def record_provenance(
 
     Returns:
       The stored record as a dict, or ``{"error": ...}`` on failure.
+
+    6af1518d (requirement 3) -- once the record is successfully written,
+    ``path`` is also registered for TARGETED, PROMPT indexing via
+    ``outputs_local.register_priority_path``: rather than waiting for the
+    ambient full-root walk to eventually reach ``path`` (which on a large
+    tree could be many ``search_outputs`` calls away), a small, explicit,
+    synchronous index update runs right here so the file is searchable via
+    ``search_outputs(outputs_dir, ...)`` promptly. Best-effort: a failure to
+    register never fails ``record_provenance`` itself -- the provenance
+    record is the durable fact; fast indexing is a latency optimisation on
+    top of it, not a correctness requirement.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         return {"error": "outputs_dir is required"}
@@ -227,6 +241,16 @@ def record_provenance(
         _write_ledger_entry(outputs_dir, key, record.to_dict())
     except (OSError, TypeError) as exc:
         return {"error": f"failed to write provenance record: {exc}"}
+
+    try:
+        outputs_local.register_priority_path(outputs_dir, path)
+    except Exception:  # noqa: BLE001 -- never let the fast-path optimisation
+        # break the (already-durable) provenance write it rides on top of.
+        _log.debug(
+            "record_provenance: register_priority_path failed for %r under %r",
+            path, outputs_dir, exc_info=True,
+        )
+
     return record.to_dict()
 
 

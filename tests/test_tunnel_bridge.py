@@ -1343,6 +1343,133 @@ def test_call_tunnel_tool_no_repo_path_no_header(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 46fd16f1 — set_tunnel_active_repo (HTTP /tunnel/active-repo) must ALSO
+# update _tenant_active_repo, not just push the WS control message.
+# Regression coverage: a worktree-scoped executor session that switches repos
+# through the raw HTTP endpoint (rather than the MCP set_active_repo tool)
+# must not leave call_tunnel_tool routing Serena/codebase requests to a stale
+# (e.g. main-checkout) repo_path.
+# ---------------------------------------------------------------------------
+
+class _FakeActiveRepoReq:
+    """Minimal Starlette-Request stand-in for POST /tunnel/active-repo."""
+
+    def __init__(self, repo_path, token="sk_meridian_wt_token"):
+        self.headers = {"authorization": f"Bearer {token}"}
+        self.query_params = {}
+        self._repo_path = repo_path
+        self.app = types.SimpleNamespace(state=types.SimpleNamespace(db=None))
+
+    async def json(self):
+        return {"repo_path": self._repo_path}
+
+
+def _patch_active_repo_auth(monkeypatch, tenant_id="wt-http-tenant"):
+    """hosted mode + a resolvable pro tenant, so the route reaches its body."""
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+
+    async def fake_resolve(auth_db, token):
+        return {"id": tenant_id, "plan": "pro"} if token else None
+
+    monkeypatch.setattr(tn, "_resolve_tenant_from_token", fake_resolve)
+    return tenant_id
+
+
+def test_set_tunnel_active_repo_route_updates_cache(monkeypatch):
+    """The HTTP route (not just the MCP-tool helper) must sync _tenant_active_repo.
+
+    Before the 46fd16f1 fix this route only sent the WS control message and
+    left _tenant_active_repo stale, so subsequent call_tunnel_tool calls (which
+    fall back to the cache when no explicit repo_path is passed — e.g.
+    prospect_symbol's Serena rung) kept routing to whatever repo was active
+    before this call.
+    """
+    tenant_id = _patch_active_repo_auth(monkeypatch)
+    ws = _FakeExtractWS()
+    tn._tunnel_extract_sockets[tenant_id] = ws
+    tn._tenant_active_repo.pop(tenant_id, None)
+
+    resp = asyncio.run(tn.set_tunnel_active_repo(_FakeActiveRepoReq("/worktrees/W")))
+
+    assert resp.status_code == 200
+    assert tn._tenant_active_repo.get(tenant_id) == "/worktrees/W"
+    assert ws.sent == [{"type": "set_active_repo", "repo_path": "/worktrees/W"}]
+
+
+def test_set_tunnel_active_repo_route_not_sticky_across_calls(monkeypatch):
+    """Regression: a request for worktree W actually operates against W, not
+    the main repo root, even when a request for the main repo root was issued
+    earlier in the same process (i.e. not sticky/cached across active repos).
+    """
+    tenant_id = _patch_active_repo_auth(monkeypatch, tenant_id="wt-sticky-tenant")
+    ws = _FakeExtractWS()
+    tn._tunnel_extract_sockets[tenant_id] = ws
+    tn._tenant_active_repo.pop(tenant_id, None)
+    tn._tunnel_tool_routes[tenant_id] = {"extractor__find_symbol": "extract"}
+
+    main_repo = "C:\\Users\\13144\\Documents\\Meridian\\repository"
+    worktree = "C:\\Users\\13144\\Documents\\Meridian\\worktrees\\wt-46fd16f1"
+
+    # An earlier request activated the MAIN repo root.
+    resp1 = asyncio.run(tn.set_tunnel_active_repo(_FakeActiveRepoReq(main_repo)))
+    assert resp1.status_code == 200
+    assert tn._tenant_active_repo.get(tenant_id) == main_repo
+
+    # This session now switches to its own isolated worktree.
+    resp2 = asyncio.run(tn.set_tunnel_active_repo(_FakeActiveRepoReq(worktree)))
+    assert resp2.status_code == 200
+    assert tn._tenant_active_repo.get(tenant_id) == worktree, (
+        "active repo must reflect the LATEST switch, not the main repo root "
+        "issued earlier in the same process"
+    )
+    assert ws.sent == [
+        {"type": "set_active_repo", "repo_path": main_repo},
+        {"type": "set_active_repo", "repo_path": worktree},
+    ]
+
+    # A generic (no explicit repo_path) call_tunnel_tool call — the shape every
+    # real Serena/codebase tool call takes — must route to the worktree, not
+    # the stale main-repo value.
+    captured_headers = {}
+
+    async def fake_do_proxy(tenant_id_, method, path, query, headers, body, sockets, pending, label):
+        captured_headers.update(headers)
+        return Response(
+            content=json.dumps({"result": {"content": []}}).encode(),
+            status_code=200, media_type="application/json",
+        )
+
+    monkeypatch.setattr(tn, "_do_proxy", fake_do_proxy)
+    asyncio.run(tn.call_tunnel_tool(tenant_id, "extractor__find_symbol", {"name": "foo"}))
+    assert captured_headers.get("x-meridian-repo-path") == worktree
+
+
+def test_set_tunnel_active_repo_route_not_connected(monkeypatch):
+    """No extract WS registered → 503 not_connected, but the cache still updates
+    (mirrors send_active_repo_control's always-update-the-cache contract) so a
+    tunnel that reconnects later immediately picks up the right repo."""
+    tenant_id = _patch_active_repo_auth(monkeypatch, tenant_id="wt-noconn-tenant")
+    tn._tunnel_extract_sockets.pop(tenant_id, None)
+    tn._tenant_active_repo.pop(tenant_id, None)
+
+    resp = asyncio.run(tn.set_tunnel_active_repo(_FakeActiveRepoReq("/worktrees/W2")))
+
+    assert resp.status_code == 503
+    assert tn._tenant_active_repo.get(tenant_id) == "/worktrees/W2"
+
+
+def test_set_tunnel_active_repo_route_invalid_auth(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+
+    async def fake_resolve(auth_db, token):
+        return None
+
+    monkeypatch.setattr(tn, "_resolve_tenant_from_token", fake_resolve)
+    resp = asyncio.run(tn.set_tunnel_active_repo(_FakeActiveRepoReq("/worktrees/W")))
+    assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # 9f6aec5f — codebase-context injection for start_session orientation
 # ---------------------------------------------------------------------------
 

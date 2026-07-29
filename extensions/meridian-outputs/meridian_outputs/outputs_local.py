@@ -231,11 +231,22 @@ def _matches_exclude_pattern(
 
 def _walk_safe_output_files(
     outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
+    on_error: Callable[[str, OSError], None] | None = None,
 ):
     """Generator yielding regular files under ``outputs_dir`` that pass the
     secret-file exclusion filter AND the (optional) user exclude-pattern
     list, in deterministic (sorted-directories, sorted-files) order -- the
     same order :func:`_iter_safe_output_files` has always returned.
+
+    ``on_error`` (item 6af1518d, requirement 1 -- convergence state's "last
+    error" field): optional callback invoked as ``on_error(dir_path, exc)``
+    whenever a directory can't be listed (permission denied, removed mid-walk,
+    etc.). Purely observational -- the walk always continues past the failed
+    directory exactly as before (best-effort, never aborts); this only lets a
+    caller (:class:`_ResumableFileWalk` / :class:`OutputsFtsIndex`) SEE that
+    it happened instead of the failure being silently swallowed at DEBUG log
+    level with no caller-visible signal at all. Optional and additive --
+    omitting it reproduces the exact prior behaviour.
 
     This is a plain generator, which means pulling from it can be paused
     (simply stop calling ``next()``) and resumed later exactly where it left
@@ -270,7 +281,16 @@ def _walk_safe_output_files(
         try:
             with os.scandir(root) as it:
                 entries = list(it)
-        except OSError:
+        except OSError as exc:
+            if on_error is not None:
+                try:
+                    on_error(root, exc)
+                except Exception:  # noqa: BLE001 -- never let a caller's
+                    # observer callback break the walk itself.
+                    _log.debug(
+                        "_walk_safe_output_files: on_error callback raised "
+                        "for %r", root, exc_info=True,
+                    )
             continue
         dir_entries: list[os.DirEntry] = []
         file_entries: list[os.DirEntry] = []
@@ -435,9 +455,10 @@ class _ResumableFileWalk:
     def __init__(
         self, outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
         max_batch: int | None = None,
+        on_error: Callable[[str, OSError], None] | None = None,
     ) -> None:
         self._iterator = _walk_safe_output_files(
-            outputs_dir, exclude_patterns=exclude_patterns,
+            outputs_dir, exclude_patterns=exclude_patterns, on_error=on_error,
         )
         self.exhausted = False
         self.max_batch = self._resolve_max_batch(max_batch)
@@ -1199,6 +1220,78 @@ def _analyse_file(
 
 
 # ---------------------------------------------------------------------------
+# Explicit convergence state (item 6af1518d, requirement 1)
+# ---------------------------------------------------------------------------
+#
+# Real incident behind this: searching from the full root of a large tree vs.
+# a narrow subdirectory gave inconsistent results, because the index walk
+# over a huge tree is resumable/incremental and a search issued while the
+# walk is still in progress can silently return a "zero hits" result
+# indistinguishable from a genuine "this file doesn't exist" zero-hits
+# result. `partial`/`fts_pending`/`pending_stale_count`/`db_write_error` were
+# already tracked internally (see OutputsFtsIndex.rebuild) and surfaced ad
+# hoc on search_outputs()'s result dict (81a0b23d, b1789c0d, 1a799e52) -- this
+# dataclass is the single, explicit, structured object those fields are
+# derived from, with two additions the ad hoc fields didn't cover: a scan
+# boundary (how far the walk has gotten) and an expected/indexed count pair
+# (progress signal), plus (via `subtree`) a convergence answer SCOPED to a
+# sub-path, not just the whole outputs_dir -- see
+# OutputsFtsIndex.get_convergence_state.
+
+@dataclass(frozen=True)
+class ConvergenceState:
+    """A single, explicit snapshot of how converged an index (or a subtree
+    of it) is, right now. See :meth:`OutputsFtsIndex.get_convergence_state`.
+    """
+
+    outputs_dir: str
+    subtree: str | None
+    converged: bool
+    walk_complete: bool
+    scan_boundary: str | None
+    pending_count: int
+    indexed_count: int
+    expected_count: int | None
+    last_error: str | None
+    fts_pending: bool
+    partial: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _subtree_scanned_past(boundary: str | None, subtree_norm: str) -> bool:
+    """Best-effort heuristic: True when the walk's tracked scan boundary
+    (the last path handed back by a drain() call) proves ``subtree_norm``
+    can have no more undiscovered files THIS pass.
+
+    Relies on :func:`_walk_safe_output_files`'s documented traversal order:
+    deterministic, sorted, depth-first, a directory's own files before its
+    subdirectories, subdirectories visited in sorted-name order -- i.e. for
+    any path prefix S, every path under S is visited as one contiguous block
+    before the walk moves on to whatever sorts immediately after S among its
+    siblings. Once the boundary is no longer inside S (doesn't start with
+    ``S + "/"`` and isn't S itself) AND sorts after S, the walk has moved
+    past S's entire block for this pass -- nothing under S can still be
+    queued.
+
+    This is a documented, best-effort heuristic (plain lexicographic path
+    comparison), not exact per-directory queue-depth bookkeeping -- exposing
+    the walk's internal directory stack size was deliberately left out of
+    scope (see _ResumableFileWalk's docstring); this heuristic answers the
+    same practical question ("has this subtree's zero-hit result actually
+    been confirmed, or is the walk just not there yet") without it.
+    """
+    if boundary is None:
+        return False
+    b = _normalize_output_path(boundary) or boundary.replace("\\", "/")
+    s = subtree_norm.rstrip("/")
+    if b == s or b.startswith(s + "/"):
+        return False  # boundary is still inside the subtree -- not done yet
+    return b > s
+
+
+# ---------------------------------------------------------------------------
 # Persistent DuckDB FTS index with write locking
 # ---------------------------------------------------------------------------
 
@@ -1568,6 +1661,37 @@ class OutputsFtsIndex:
         # Cleared once a rebuild() call fully converges (walk complete, no
         # deadline breach, empty backlog) -- see rebuild()'s tail.
         self._pending_hash_upgrade = False
+        # ------------------------------------------------------------------
+        # Explicit convergence state (item 6af1518d) -- see ConvergenceState
+        # and get_convergence_state() below.
+        # ------------------------------------------------------------------
+        # Last path handed back by the resumable walk's drain() this pass
+        # (None once a pass completes, or before the first drain of a fresh
+        # pass). Used both as a raw progress signal and, via
+        # _subtree_scanned_past(), to answer subtree-scoped convergence
+        # queries without a second walk.
+        self._scan_boundary: str | None = None
+        # Most recent directory the walk could not list (permission denied,
+        # removed mid-walk, etc.), if any -- see _walk_safe_output_files's
+        # on_error hook. Distinct from last_db_write_error (a PERSISTENCE
+        # failure); this is a DISCOVERY failure -- the walk best-effort
+        # continues past it, but a subtree under an unreadable directory can
+        # never converge, so this must be surfaced rather than silently
+        # swallowed at DEBUG level.
+        self._last_walk_error: str | None = None
+        # Best current estimate of the total file count under outputs_dir --
+        # set from the authoritative len(all_paths) each time a walk pass
+        # completes. None until the very first pass has ever completed.
+        self._expected_count: int | None = None
+        # Every path ever registered via register_priority_path -- purely
+        # observational (get_convergence_state doesn't currently read this),
+        # kept so callers/tests can confirm a specific path really was
+        # fast-pathed rather than organically discovered by the ambient walk.
+        self._priority_registered: set[str] = set()
+        # Set once seed_from_ancestor() has been attempted (successfully or
+        # not) for this instance, so get_subtree_index() only ever tries the
+        # ancestor-seeding lookup once per subtree index, not on every call.
+        self._seeded_from_ancestor = False
 
     def _connect(self) -> Any:
         if self._con is None:
@@ -2117,6 +2241,20 @@ class OutputsFtsIndex:
         self._adaptive_batch = target
         return target
 
+    def _record_walk_error(self, dir_path: str, exc: OSError) -> None:
+        """``on_error`` callback for :class:`_ResumableFileWalk` (item
+        6af1518d): records the most recent directory the walk could not
+        list, so :meth:`get_convergence_state` can surface it as
+        ``last_error`` instead of it being silently swallowed at DEBUG
+        level. Best-effort observational only -- never raises, never
+        affects the walk itself continuing past the failed directory.
+        """
+        self._last_walk_error = f"could not list directory {dir_path!r}: {exc}"
+        _log.warning(
+            "OutputsFtsIndex: walk could not list directory %r: %s",
+            dir_path, exc,
+        )
+
     def rebuild(
         self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
     ) -> int:
@@ -2207,7 +2345,7 @@ class OutputsFtsIndex:
             if self._walk_state is None:
                 self._walk_state = _ResumableFileWalk(
                     self.outputs_dir, exclude_patterns=self._exclude_patterns,
-                    max_batch=batch_limit,
+                    max_batch=batch_limit, on_error=self._record_walk_error,
                 )
                 self._walk_accumulated = []
             else:
@@ -2217,6 +2355,11 @@ class OutputsFtsIndex:
             if len(self._pending_stale) < batch_limit:
                 newly_seen = self._walk_state.drain(phase1_deadline)
                 self._walk_accumulated.extend(newly_seen)
+                if newly_seen:
+                    # 6af1518d -- convergence state's scan boundary: how far
+                    # the walk has gotten this pass, in its own deterministic
+                    # sorted-DFS order (see _subtree_scanned_past).
+                    self._scan_boundary = newly_seen[-1]
             walk_complete = self._walk_state.exhausted
         else:
             self._walk_state = None
@@ -2238,6 +2381,12 @@ class OutputsFtsIndex:
             # drop it from the backlog so it isn't retried forever.
             for p in removed_paths:
                 self._pending_stale.pop(p, None)
+            # 6af1518d -- a full pass just completed: this is the new
+            # authoritative "expected" total (progress-signal denominator for
+            # ConvergenceState), and the scan boundary resets -- the NEXT
+            # rebuild() call starts a fresh pass from the top.
+            self._expected_count = len(all_paths)
+            self._scan_boundary = None
         else:
             # Walk pass still in progress -- we only know about the files
             # revisited so far THIS pass, not the full tree. Optimistically
@@ -3007,6 +3156,313 @@ class OutputsFtsIndex:
         hits.sort(key=lambda h: h["score"], reverse=True)
         return hits
 
+    # ------------------------------------------------------------------
+    # Explicit convergence state (item 6af1518d, requirement 1 & 2)
+    # ------------------------------------------------------------------
+
+    def get_convergence_state(self, subtree: str | None = None) -> "ConvergenceState":
+        """Return an explicit, structured convergence-state snapshot.
+
+        Without ``subtree``, describes convergence of this index's whole
+        ``outputs_dir``. With ``subtree`` (any path under ``outputs_dir``),
+        additionally answers "has THIS specific sub-path been fully covered
+        by the walk so far" -- the exact ambiguity behind the real incident
+        motivating this item: searching the full root of a large tree vs. a
+        narrow subdirectory gave inconsistent zero-hit results because there
+        was no way to tell "the walk hasn't reached this subtree yet" apart
+        from "this subtree is genuinely empty". See
+        :func:`_subtree_scanned_past` for the scan-boundary heuristic this
+        uses, and its documented limits.
+        """
+        with self._read_lock:
+            walk_in_progress = self._walk_state is not None
+            last_error = self.last_db_write_error or self._last_walk_error
+            if subtree is None:
+                pending = len(self._pending_stale)
+                converged = (
+                    not walk_in_progress and pending == 0
+                    and not self._fts_pending and last_error is None
+                )
+                scope_desc = None
+            else:
+                sub_norm = _normalize_output_path(subtree) or str(subtree).replace("\\", "/")
+                scope_desc = subtree
+                subtree_scanned = (
+                    not walk_in_progress
+                    or _subtree_scanned_past(self._scan_boundary, sub_norm)
+                )
+                pending = sum(
+                    1 for p in self._pending_stale
+                    if (
+                        (n := _normalize_output_path(p)) == sub_norm
+                        or n.startswith(sub_norm + "/")
+                    )
+                )
+                converged = (
+                    subtree_scanned and pending == 0
+                    and not self._fts_pending and last_error is None
+                )
+            return ConvergenceState(
+                outputs_dir=self.outputs_dir,
+                subtree=scope_desc,
+                converged=converged,
+                walk_complete=not walk_in_progress,
+                scan_boundary=self._scan_boundary,
+                pending_count=pending,
+                indexed_count=len(self._row_cache),
+                expected_count=self._expected_count,
+                last_error=last_error,
+                fts_pending=bool(self._fts_pending),
+                partial=bool(self.last_rebuild_partial),
+            )
+
+    # ------------------------------------------------------------------
+    # Provenance-triggered targeted registration (item 6af1518d,
+    # requirement 3)
+    # ------------------------------------------------------------------
+
+    def _build_rows_for_paths(
+        self,
+        paths: list[str],
+        stale_sigs: dict[str, tuple[float | None, int | None]],
+        precomputed: dict[str, "_FileAnalysis"],
+        classifications: dict[str, ArchivalClassification],
+    ) -> tuple[list[OutputRow], list[str]]:
+        """Build+cache :class:`OutputRow` objects for a small, EXPLICIT path
+        set. This is the row-construction slice of :meth:`_apply_precomputed`
+        's stale-processing loop, factored out standalone (not shared code)
+        so :meth:`index_paths` can reuse the exact same row shape without
+        touching ``self.last_rebuild_partial`` or processing
+        ``removed_paths``/the archival-metadata-refresh loop -- both are
+        root-walk-scoped concerns that a small targeted side-channel write
+        must never perturb (a provenance-triggered registration must not be
+        able to flip a genuinely-in-progress root rebuild's ``partial`` flag
+        back to ``False``).
+        """
+        new_rows: list[OutputRow] = []
+        paths_to_delete: list[str] = []
+        for p in sorted(paths):
+            analysis = precomputed.get(p)
+            if analysis is None:
+                continue
+            fp = analysis.fingerprint
+            had_existing = p in self._row_cache or self._pending_hash_upgrade
+            cls = classifications.get(p)
+            row = OutputRow(
+                path=p,
+                content=(
+                    analysis.content if analysis.content is not None
+                    else _content_for_fts(p, fp)
+                ),
+                mtime=analysis.mtime,
+                sha256=analysis.sha256,
+                size=analysis.size,
+                generating_script=fp.generating_script,
+                kind=fp.kind,
+                is_archival=bool(cls and cls.is_archival),
+                canonical_path=(cls.canonical_path if cls else None),
+                csv_columns=fp.csv_columns,
+                json_keys=fp.json_keys,
+            )
+            self._row_cache[p] = _light_row(row)
+            self._manifest[p] = stale_sigs.get(p, (row.mtime, row.size))
+            if had_existing:
+                paths_to_delete.append(p)
+            new_rows.append(row)
+        return new_rows, paths_to_delete
+
+    def _write_rows_locked(
+        self, con: Any, new_rows: list[OutputRow], paths_to_delete: list[str],
+    ) -> None:
+        """Persist ``new_rows``/``paths_to_delete`` and stage+commit the
+        matching Tantivy delta. Must be called with ``self._write_lock``
+        already held. Deliberately a plain per-row ``execute`` loop (not the
+        pyarrow bulk-insert path ``rebuild()`` uses) -- this is only ever
+        called with a small, explicit path list (a handful of
+        provenance-registered files or an ancestor-index seed slice), never
+        a whole-tree batch, so the bulk-insert machinery's extra complexity
+        isn't warranted here.
+        """
+        for p in paths_to_delete:
+            if p not in {r.path for r in new_rows}:
+                con.execute("DELETE FROM outputs_index WHERE path = ?", [p])
+        for r in new_rows:
+            con.execute(
+                "INSERT OR REPLACE INTO outputs_index VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    r.path, r.content, r.mtime, r.sha256, r.size,
+                    r.generating_script, r.kind, r.is_archival, r.canonical_path,
+                    json.dumps(r.csv_columns) if r.csv_columns else None,
+                    json.dumps(r.json_keys) if r.json_keys else None,
+                ],
+            )
+        self._pending_tantivy_deletes.update(paths_to_delete)
+        self._pending_tantivy_deletes.update(r.path for r in new_rows)
+        for r in new_rows:
+            self._pending_tantivy_upserts[r.path] = r
+        try:
+            self._rebuild_fts(con)
+        except Exception:  # noqa: BLE001
+            _log.debug("_write_rows_locked: _rebuild_fts failed", exc_info=True)
+            # Rows are already persisted in DuckDB; just defer the FTS
+            # commit to the next rebuild()/search() call, same contract as
+            # rebuild()'s own deadline-deferral path (b1789c0d).
+            if not self._fts_built:
+                self._fts_pending = True
+
+    def index_paths(self, paths: list[str]) -> dict[str, Any]:
+        """Synchronously analyse + persist a small, EXPLICIT set of paths,
+        bypassing the ambient resumable walk (Phase 0) and its
+        deadline/backlog-throttle machinery entirely.
+
+        Cost is bounded by ``len(paths)``, not by ``outputs_dir``'s total
+        size -- safe to call synchronously from a fast, latency-sensitive
+        caller (e.g. right after ``record_provenance``) even on a huge,
+        still-converging tree. Secret-pattern paths are silently skipped
+        (same filter the ambient walk applies). A path that doesn't exist
+        yet is queued into ``self._pending_stale`` (stat signature
+        ``(None, None)``) so a future call -- once the file actually exists
+        -- indexes it without the caller needing to retry explicitly.
+
+        Returns ``{"indexed": N, "queued": N, "paths": [...]}`` -- best
+        effort, never raises.
+        """
+        norm_paths: list[str] = []
+        for p in paths:
+            if not p:
+                continue
+            pp = os.path.normpath(p)
+            if is_secret_path(pp):
+                continue
+            norm_paths.append(pp)
+        if not norm_paths:
+            return {"indexed": 0, "queued": 0, "paths": []}
+
+        stale_sigs: dict[str, tuple[float | None, int | None]] = {}
+        existing: list[str] = []
+        queued = 0
+        for p in norm_paths:
+            try:
+                st = os.stat(p)
+            except OSError:
+                with self._write_lock:
+                    self._pending_stale.setdefault(p, (None, None))
+                queued += 1
+                continue
+            stale_sigs[p] = (st.st_mtime, st.st_size)
+            existing.append(p)
+
+        if not existing:
+            return {"indexed": 0, "queued": queued, "paths": []}
+
+        precomputed: dict[str, _FileAnalysis] = {}
+        for p in existing:
+            try:
+                precomputed[p] = _analyse_file(
+                    p, self._hasher, needs_hash=True, stat_signature=stale_sigs[p],
+                )
+            except Exception:  # noqa: BLE001
+                _log.debug("index_paths: _analyse_file failed for %r", p, exc_info=True)
+
+        if not precomputed:
+            return {"indexed": 0, "queued": queued, "paths": []}
+
+        def _cached_hasher(path: str) -> str | None:
+            a = precomputed.get(path)
+            return a.sha256 if a else None
+
+        classifications = classify_canonical_archival(
+            sorted(precomputed), hasher=_cached_hasher,
+        )
+
+        with self._write_lock:
+            con = self._connect()
+            self._ensure_schema(con)
+            new_rows, paths_to_delete = self._build_rows_for_paths(
+                list(precomputed), stale_sigs, precomputed, classifications,
+            )
+            if new_rows:
+                try:
+                    self._write_rows_locked(con, new_rows, paths_to_delete)
+                except Exception as exc:  # noqa: BLE001
+                    _log.debug("index_paths: write failed", exc_info=True)
+                    self.last_db_write_error = f"{type(exc).__name__}: {exc}"
+                    return {"indexed": 0, "queued": queued, "paths": []}
+            for p in precomputed:
+                self._pending_stale.pop(p, None)
+
+        return {
+            "indexed": len(new_rows), "queued": queued,
+            "paths": [r.path for r in new_rows],
+        }
+
+    def register_priority_path(self, path: str) -> dict[str, Any]:
+        """Mark ``path`` as known-important (typically because provenance
+        was just recorded for it via ``record_provenance``) so it becomes
+        searchable promptly via :meth:`index_paths` instead of waiting for
+        the ambient full-root walk to reach it -- item 6af1518d requirement
+        3. Thin, intent-named wrapper around :meth:`index_paths` -- kept as
+        a separate name so callers/tests can express "this is a
+        provenance-triggered registration" even though the underlying
+        primitive is generic.
+        """
+        self._priority_registered.add(os.path.normpath(path))
+        return self.index_paths([path])
+
+    # ------------------------------------------------------------------
+    # Hierarchical subtree indexing (item 6af1518d, requirement 4)
+    # ------------------------------------------------------------------
+
+    def seed_from_ancestor(self, ancestor: "OutputsFtsIndex", subtree_path: str) -> int:
+        """Copy the slice of ``ancestor``'s already-indexed rows that fall
+        under ``subtree_path`` into THIS (subtree-scoped) index, so this
+        index's own resumable walk never has to re-discover/re-hash files
+        the ancestor (root, or a nearer parent subtree) already converged
+        on -- "reuse a slice of" the parent index, per requirement 4.
+
+        Best-effort and purely additive: never removes or overwrites a row
+        this index already has, and never raises -- a seeding failure just
+        means this index's own walk will (more slowly, but always
+        correctly) rediscover the same files itself.
+
+        Returns the number of rows copied.
+        """
+        self._seeded_from_ancestor = True
+        prefix = os.path.normpath(os.path.abspath(subtree_path))
+        try:
+            with ancestor._read_lock:
+                ancestor_paths = [
+                    p for p in ancestor._row_cache
+                    if p == prefix or p.startswith(prefix + os.sep)
+                ]
+            if not ancestor_paths:
+                return 0
+            with self._write_lock:
+                con = self._connect()
+                self._ensure_schema(con)
+                new_rows: list[OutputRow] = []
+                for p in ancestor_paths:
+                    if p in self._row_cache:
+                        continue  # a local write always wins
+                    light = ancestor._row_cache.get(p)
+                    if light is None:
+                        continue
+                    content = ancestor._fetch_content_from_db(p)
+                    row = replace(light, content=content)
+                    self._row_cache[p] = _light_row(row)
+                    self._manifest[p] = ancestor._manifest.get(p, (row.mtime, row.size))
+                    new_rows.append(row)
+                if new_rows:
+                    self._write_rows_locked(con, new_rows, [])
+                return len(new_rows)
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "seed_from_ancestor: failed seeding %r from %r",
+                subtree_path, ancestor.outputs_dir, exc_info=True,
+            )
+            return 0
+
     def resolve_output(self, file_path: str) -> dict[str, Any] | None:
         """Exact-match lookup of an output row by file path.
 
@@ -3203,6 +3659,117 @@ def _get_cached_index(outputs_dir: str) -> OutputsFtsIndex:
         return idx
 
 
+def get_convergence_state(
+    outputs_dir: str, subtree: str | None = None,
+) -> dict[str, Any]:
+    """Module-level convenience wrapper: explicit convergence state (item
+    6af1518d requirement 1) for the SAME cached :class:`OutputsFtsIndex`
+    instance ``search_outputs``/``annotate_outputs`` use for this
+    ``outputs_dir``. Does NOT trigger a rebuild -- purely reads current
+    state, so it's cheap and safe to poll.
+
+    ``subtree`` (optional): scope the answer to a sub-path, not just the
+    whole ``outputs_dir`` -- see :meth:`OutputsFtsIndex.get_convergence_state`.
+
+    Returns ``{"error": ...}`` if ``outputs_dir`` doesn't exist; otherwise
+    the :class:`ConvergenceState` as a dict.
+    """
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return {"error": f"outputs_dir does not exist: {outputs_dir}"}
+    index = _get_cached_index(outputs_dir)
+    return index.get_convergence_state(subtree=subtree).to_dict()
+
+
+def register_priority_path(outputs_dir: str, path: str) -> dict[str, Any]:
+    """Module-level convenience wrapper: provenance-triggered targeted
+    registration (item 6af1518d requirement 3), using the SAME cached
+    :class:`OutputsFtsIndex` instance a subsequent ``search_outputs`` call
+    for this ``outputs_dir`` will use -- so a path registered here is
+    genuinely reflected in the very next search, not a throwaway side index.
+
+    Intended caller: ``annotate.record_provenance``, right after it
+    successfully records a provenance entry for ``path`` -- so a
+    provenance-known path becomes searchable promptly instead of waiting
+    for the ambient full-root walk to reach it.
+    """
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return {"registered": False, "reason": "outputs_dir does not exist"}
+    if not path or not str(path).strip():
+        return {"registered": False, "reason": "path is required"}
+    index = _get_cached_index(outputs_dir)
+    result = index.register_priority_path(path)
+    result["registered"] = True
+    return result
+
+
+def _find_ancestor_cached_index(subtree_dir: str) -> "OutputsFtsIndex | None":
+    """Best-effort lookup of an already-cached :class:`OutputsFtsIndex`
+    whose ``outputs_dir`` is an ANCESTOR of (or equal to) ``subtree_dir`` --
+    i.e. a root/parent index that may already have indexed some or all of
+    ``subtree_dir``'s files. Picks the DEEPEST (most specific) ancestor
+    present in the cache, so a subtree-of-a-subtree prefers the nearer
+    parent's data over the ultimate root's. Returns ``None`` if no such
+    index is currently cached (nothing to reuse -- not an error).
+    """
+    target = os.path.normpath(os.path.abspath(subtree_dir))
+    best: OutputsFtsIndex | None = None
+    best_len = -1
+    with _index_cache_lock:
+        candidates = list(_index_cache.values())
+    for idx in candidates:
+        cand = os.path.normpath(os.path.abspath(idx.outputs_dir))
+        if cand == target:
+            continue
+        try:
+            common = os.path.commonpath([cand, target])
+        except ValueError:
+            continue  # different drives on Windows, etc.
+        if common == cand and len(cand) > best_len:
+            best = idx
+            best_len = len(cand)
+    return best
+
+
+def get_subtree_index(root_outputs_dir: str, subtree_path: str) -> OutputsFtsIndex:
+    """Hierarchical subtree indexing (item 6af1518d requirement 4): return a
+    persistent, INDEPENDENTLY-converging :class:`OutputsFtsIndex` scoped to
+    ``subtree_path``, seeded from a slice of any already-cached ancestor
+    index's rows so a subtree already partly/fully covered by a prior
+    root-level (or nearer-parent) rebuild doesn't pay a full re-walk/re-hash
+    just because the query is now scoped narrower.
+
+    ``subtree_path`` must be ``root_outputs_dir`` itself or a path
+    underneath it -- raises ``ValueError`` otherwise (a "subtree" outside
+    its claimed root is a caller bug, not a degrade-gracefully case).
+
+    The returned index is the SAME cached instance ``search_outputs(subtree_
+    path, ...)`` would use (both go through :func:`_get_cached_index`), so
+    calling this before a search under the narrower path is a pure
+    optimisation -- searching the subtree directly without ever calling this
+    still works, just without the ancestor-seeding speedup.
+    """
+    root_norm = os.path.normpath(os.path.abspath(root_outputs_dir))
+    sub_norm = os.path.normpath(os.path.abspath(subtree_path))
+    if sub_norm != root_norm:
+        try:
+            common = os.path.commonpath([root_norm, sub_norm])
+        except ValueError as exc:
+            raise ValueError(
+                f"{subtree_path!r} is not under {root_outputs_dir!r}"
+            ) from exc
+        if common != root_norm:
+            raise ValueError(
+                f"{subtree_path!r} is not under {root_outputs_dir!r}"
+            )
+
+    index = _get_cached_index(subtree_path)
+    if not index._row_cache and not index._seeded_from_ancestor:
+        ancestor = _find_ancestor_cached_index(subtree_path)
+        if ancestor is not None:
+            index.seed_from_ancestor(ancestor, subtree_path)
+    return index
+
+
 def search_outputs(
     outputs_dir: str,
     query: str,
@@ -3210,8 +3777,23 @@ def search_outputs(
     limit: int = 10,
     include_archival: bool = True,
     max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
+    subtree: str | None = None,
 ) -> dict[str, Any]:
     """BM25 search over a local outputs tree.
+
+    ``subtree`` (item 6af1518d requirement 4, optional): scope indexing AND
+    searching to a sub-path of ``outputs_dir`` without requiring a full
+    re-walk of the root. When given, this delegates to a SEPARATE,
+    independently-converging index for ``subtree`` (see
+    :func:`get_subtree_index`) -- seeded from a slice of ``outputs_dir``'s
+    own cached index when one already exists and has already covered some or
+    all of ``subtree``, so the narrower query doesn't pay to re-hash files
+    the root already indexed. The response's ``convergence``/``partial``/
+    etc. fields then describe the SUBTREE's own convergence, not the whole
+    root's -- giving a real, scoped answer instead of "ask the whole-root
+    index and hope it's gotten there yet" (the exact inconsistency the real
+    incident behind this item hit: root vs. narrow-subdirectory searches
+    gave different zero-hit answers with no way to tell why).
 
     *** A ZERO-HIT RESULT IS NOT PROOF THE FILE/TERM DOESN'T EXIST. ***
     Always check ``partial``, ``fts_pending``, ``pending_stale_count``, and
@@ -3272,7 +3854,18 @@ def search_outputs(
     if not os.path.isdir(outputs_dir):
         result["error"] = f"outputs_dir does not exist: {outputs_dir}"
         return result
-    index = _get_cached_index(outputs_dir)
+    if subtree:
+        if not os.path.isdir(subtree):
+            result["error"] = f"subtree does not exist: {subtree}"
+            return result
+        try:
+            index = get_subtree_index(outputs_dir, subtree)
+        except ValueError as exc:
+            result["error"] = str(exc)
+            return result
+        result["subtree"] = subtree
+    else:
+        index = _get_cached_index(outputs_dir)
     result["total_indexed"] = index.rebuild(max_seconds=max_seconds)
     # b1789c0d -- expose cumulative row count from the DB (which may be
     # larger than total_indexed on a partial rebuild that resumes prior work)
@@ -3323,9 +3916,16 @@ def search_outputs(
         # hits with no indication why isn't actionable -- surface the same
         # clear message OutputsFtsIndex already logged at WARNING.
         result["tantivy_lock_warning"] = index._last_tantivy_error
+    # 6af1518d requirement 1 -- explicit, structured convergence state,
+    # additive alongside the ad hoc partial/fts_pending/pending_stale_count
+    # fields above (unchanged, for backwards compatibility). When `subtree`
+    # was given, `index` is already the subtree-scoped instance, so this
+    # describes the SUBTREE's own convergence, not the whole root's.
+    result["convergence"] = index.get_convergence_state().to_dict()
     if not hits and (
         result.get("partial") or result.get("fts_pending")
         or result.get("db_write_error")
+        or not result["convergence"]["converged"]
     ):
         # <surface-it-loudly> -- b1789c0d/81a0b23d already tracked
         # partial/fts_pending/pending_stale_count/db_write_error internally,

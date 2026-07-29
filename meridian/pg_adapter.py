@@ -2521,6 +2521,56 @@ async def _migrate_pg_file_docx_region_claims(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_docx_merge_manifests(conn: PostgresConnection) -> None:
+    """fe989980 — wave-scoped DOCX merge manifests + serialized canonical merge gate.
+
+    Creates docx_merge_manifests / docx_merge_drafts / docx_merge_anchor_locks
+    on existing Postgres DBs. Mirrors db.docx_merge._migrate_docx_merge_manifests.
+    Runs on every DB (LATE, not hosted-only — sessions exist on customer DBs
+    too, same rationale as _migrate_pg_file_docx_region_claims).
+    """
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS docx_merge_manifests ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    wave_id TEXT NOT NULL,"
+        f"    file_path TEXT NOT NULL,"
+        f"    status TEXT NOT NULL DEFAULT 'open',"
+        f"    base_revision TEXT,"
+        f"    merge_owner_session_id TEXT,"
+        f"    merge_owner_claimed_at TEXT,"
+        f"    merge_owner_expires_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    completed_at TEXT,"
+        f"    verification TEXT"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_docx_merge_manifests_wave_file "
+        f"ON docx_merge_manifests (wave_id, file_path);"
+        f"CREATE TABLE IF NOT EXISTS docx_merge_drafts ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    manifest_id TEXT NOT NULL REFERENCES docx_merge_manifests(id) ON DELETE CASCADE,"
+        f"    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        f"    draft_path TEXT NOT NULL,"
+        f"    anchors TEXT NOT NULL DEFAULT '[]',"
+        f"    declared_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    merged_at TEXT"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_docx_merge_drafts_manifest_session "
+        f"ON docx_merge_drafts (manifest_id, session_id);"
+        f"CREATE TABLE IF NOT EXISTS docx_merge_anchor_locks ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    manifest_id TEXT NOT NULL REFERENCES docx_merge_manifests(id) ON DELETE CASCADE,"
+        f"    element_id TEXT NOT NULL,"
+        f"    draft_id TEXT,"
+        f"    session_id TEXT NOT NULL,"
+        f"    merged_at TEXT NOT NULL DEFAULT ({_TS})"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_docx_merge_anchor_locks_manifest_element "
+        f"ON docx_merge_anchor_locks (manifest_id, element_id);"
+        f"CREATE INDEX IF NOT EXISTS idx_docx_merge_anchor_locks_session "
+        f"ON docx_merge_anchor_locks (session_id);"
+    )
+
+
 async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> None:
     """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
 
@@ -3520,6 +3570,197 @@ async def _migrate_pg_handoff_tokens_consumed_at(conn: PostgresConnection) -> No
     )
 
 
+async def _migrate_pg_handoff_tokens_body_hash(conn: PostgresConnection) -> None:
+    """efaa918a — handoff_tokens.body_hash (mirrors SQLite).
+
+    Nullable SHA-256 hex digest binding a token to the canonical body it was
+    minted for, closing the 2ee0000c token/body-integrity gap documented in
+    AGENTS.md. See db.migrations._migrate_handoff_tokens_body_hash for the
+    full writeup.
+
+    ADD COLUMN IF NOT EXISTS is idempotent; existing rows default to NULL, and
+    a NULL body_hash means verify_handoff_token's body check is skipped —
+    purely additive. Mirrors db._migrate_handoff_tokens_body_hash.
+    """
+    await conn.executescript(
+        "ALTER TABLE handoff_tokens ADD COLUMN IF NOT EXISTS body_hash TEXT"
+    )
+
+
+async def _migrate_pg_board_snapshot_revisions(conn: PostgresConnection) -> None:
+    """ef665ef8 — board_snapshot_revisions (mirrors SQLite).
+
+    One row per DISTINCT revision hash observed for a ``(project_id,
+    version_filter)`` bucket; ``revision_counter`` is a monotonic,
+    persisted counter so a caller can tell "newer" from merely "different"
+    when comparing two canonical expanded-board snapshots (see
+    meridian.db.board_snapshot). CREATE_TABLES_CORE covers fresh DBs; this is
+    the upgrade path. The index lives here, never inline in
+    CREATE_TABLES_CORE, to avoid the unguarded-index boot crash. Idempotent.
+    Mirrors db._migrate_board_snapshot_revisions.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS board_snapshot_revisions ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    version_filter TEXT NOT NULL DEFAULT '',"
+        "    revision_hash TEXT NOT NULL,"
+        "    revision_counter INTEGER NOT NULL,"
+        "    item_count INTEGER NOT NULL DEFAULT 0,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_board_snapshot_revisions_bucket "
+        "ON board_snapshot_revisions(project_id, version_filter, revision_counter DESC);"
+    )
+
+
+async def _migrate_pg_wave_runs(conn: PostgresConnection) -> None:
+    """2a654cb0 — wave_runs / wave_run_events / wave_run_children (mirrors SQLite).
+
+    Durable state for a paused/resumed multi-agent wave: the run itself (with
+    its immutable id, enumerated status, pinned board snapshot + revision hash,
+    degraded-tool provenance, and write-once finalizer evidence), its strictly
+    append-only event history (monotonic per-run seq, corrections expressed by
+    superseding rather than mutation), and its per-sprint-item children (whose
+    failure_mode='stop' outcome structurally blocks finalization).
+
+    CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path. Every index
+    lives here, never inline in CREATE_TABLES_CORE, to avoid the unguarded-index
+    boot crash. Idempotent. Mirrors db.migrations._migrate_wave_runs.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS wave_runs ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    version TEXT,"
+        "    wave_label TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'planned',"
+        "    board_snapshot TEXT,"
+        "    revision_hash TEXT,"
+        "    revision_counter INTEGER,"
+        "    item_ids TEXT NOT NULL DEFAULT '[]',"
+        "    degraded_tools TEXT NOT NULL DEFAULT '[]',"
+        "    finalizer_evidence TEXT,"
+        "    finalized_at TEXT,"
+        "    actor TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_runs_project "
+        "ON wave_runs(project_id, status, created_at DESC);"
+        "CREATE TABLE IF NOT EXISTS wave_run_events ("
+        "    id TEXT PRIMARY KEY,"
+        "    wave_run_id TEXT NOT NULL,"
+        "    seq INTEGER NOT NULL,"
+        "    event_type TEXT NOT NULL,"
+        "    from_status TEXT,"
+        "    to_status TEXT,"
+        "    detail TEXT,"
+        "    payload TEXT,"
+        "    actor TEXT,"
+        "    supersedes TEXT,"
+        "    superseded_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE(wave_run_id, seq)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_events_run "
+        "ON wave_run_events(wave_run_id, seq);"
+        "CREATE TABLE IF NOT EXISTS wave_run_children ("
+        "    id TEXT PRIMARY KEY,"
+        "    wave_run_id TEXT NOT NULL,"
+        "    sprint_item_id TEXT NOT NULL,"
+        "    failure_mode TEXT NOT NULL DEFAULT 'continue',"
+        "    status TEXT NOT NULL DEFAULT 'running',"
+        "    evidence TEXT,"
+        "    actor TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE(wave_run_id, sprint_item_id)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_children_run "
+        "ON wave_run_children(wave_run_id, status);"
+    )
+
+
+async def _migrate_pg_project_capabilities(conn: PostgresConnection) -> None:
+    """649e095f — project_capabilities (mirrors SQLite).
+
+    One row per project: a normalized JSON list of capability declarations
+    plus schema version and content hash. Mirrors
+    db.migrations._migrate_project_capabilities.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS project_capabilities ("
+        "    project_id TEXT PRIMARY KEY,"
+        "    manifest TEXT NOT NULL DEFAULT '[]',"
+        "    manifest_version INTEGER NOT NULL DEFAULT 1,"
+        "    manifest_hash TEXT,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+    )
+
+
+async def _migrate_pg_capability_profiles(conn: PostgresConnection) -> None:
+    """02038afe — capability_profiles (mirrors SQLite).
+
+    One row per (scope_type, scope_id): a normalized JSON capability list,
+    an explicit disabled-capability-id list, schema version, content hash,
+    non-secret provenance, and updated_at. Mirrors
+    db.migrations._migrate_capability_profiles.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS capability_profiles ("
+        "    scope_type TEXT NOT NULL,"
+        "    scope_id TEXT NOT NULL,"
+        "    manifest TEXT NOT NULL DEFAULT '[]',"
+        "    disabled_ids TEXT NOT NULL DEFAULT '[]',"
+        "    manifest_version INTEGER NOT NULL DEFAULT 1,"
+        "    manifest_hash TEXT,"
+        "    provenance TEXT,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    PRIMARY KEY (scope_type, scope_id)"
+        ");"
+    )
+
+
+async def _migrate_pg_sprint_item_tool_requirements(conn: PostgresConnection) -> None:
+    """76dde31f (665 follow-up) — sprint_items.tool_requirements: typed,
+    per-item MCP tool-requirement contract (mirrors SQLite).
+
+    Nullable TEXT column holding a JSON array of normalized entries (see
+    meridian.tool_requirements). Distinct from touches_resources (scheduling
+    metadata) and the legacy free-form required_tool pin (4d1fb28f) — the
+    structured field is canonical once set; required_tool remains a
+    read-time compatibility fallback only when this column is empty.
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db.migrations._migrate_sprint_item_tool_requirements.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS tool_requirements TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_artifact_declaration(conn: PostgresConnection) -> None:
+    """2f9cb288 (b7308039 / 665 follow-up) — sprint_items.artifact_kind /
+    planned_output / artifact_policy (mirrors SQLite).
+
+    ``artifact_kind`` is a plain enum column (like milestone_type/priority);
+    ``planned_output``/``artifact_policy`` are nullable JSON-encoded TEXT
+    columns, validated via meridian.artifact_declaration before ever
+    reaching this table. NULL on all three = no declaration (read back as
+    "unknown"/project-default, never a guess or a hard block).
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db.migrations._migrate_sprint_item_artifact_declaration.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS artifact_kind TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS planned_output TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS artifact_policy TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3612,4 +3853,12 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_github_channel,
     _migrate_pg_claim_verification_mode,
     _migrate_pg_handoff_tokens_consumed_at,
+    _migrate_pg_board_snapshot_revisions,
+    _migrate_pg_wave_runs,
+    _migrate_pg_handoff_tokens_body_hash,
+    _migrate_pg_project_capabilities,
+    _migrate_pg_capability_profiles,
+    _migrate_pg_sprint_item_tool_requirements,
+    _migrate_pg_sprint_item_artifact_declaration,
+    _migrate_pg_docx_merge_manifests,
 )

@@ -567,6 +567,117 @@ def test_max_turns_from_settings():
     assert f({"executor_config": "notadict"}) == 200
 
 
+def test_execution_policy_from_settings():
+    """75ac1c8e — resolves the canonical execution policy from proj_settings +
+    the already-normalized execution_mode, honoring executor_config.max_planning_turns."""
+    f = handoff_module._execution_policy_from_settings
+    default = f(None, "autonomous")
+    assert default["execution_mode"] == "immediate"
+    assert default["required_first_action"] == "claim_sprint_item"
+    assert default["max_planning_turns"] == 1
+    assert default["no_confirmation"] is True
+    assert default["permitted_parallel_wave"] is True
+    assert default["claim_before_edit"] is True
+
+    relaxed = f({"executor_config": {}}, "interactive")
+    assert relaxed["execution_mode"] == "relaxed"
+    assert relaxed["required_first_action"] == "get_sprint_items"
+    assert relaxed["no_confirmation"] is False
+    assert relaxed["permitted_parallel_wave"] is False
+
+    overridden = f({"executor_config": {"max_planning_turns": 7}}, "autonomous")
+    assert overridden["max_planning_turns"] == 7
+
+    # A non-dict executor_config degrades to the mode default, never raises.
+    assert f({"executor_config": "nope"}, "autonomous")["max_planning_turns"] == 1
+
+
+def test_build_execution_policy_clause_renders_attributes_and_escapes():
+    from meridian.handoff import _build_execution_policy_clause
+
+    policy = {
+        "execution_mode": "immediate",
+        "max_planning_turns": 1,
+        "required_first_action": "claim_sprint_item",
+        "no_confirmation": True,
+        "permitted_parallel_wave": True,
+        "claim_before_edit": True,
+        "genuine_blocker_escalation": 'Escalate only for "genuine" blockers.',
+    }
+    clause = _build_execution_policy_clause(policy)
+    assert clause.startswith("\n<execution_policy ")
+    assert 'execution_mode="immediate"' in clause
+    assert 'max_planning_turns="1"' in clause
+    assert 'required_first_action="claim_sprint_item"' in clause
+    assert 'no_confirmation="true"' in clause
+    assert 'permitted_parallel_wave="true"' in clause
+    assert 'claim_before_edit="true"' in clause
+    assert clause.endswith("</execution_policy>")
+    # Falsy/invalid policy degrades to no tag.
+    assert _build_execution_policy_clause(None) == ""
+    assert _build_execution_policy_clause({}) == ""
+
+
+def test_build_quick_start_goal_execution_policy_default_immediate():
+    """75ac1c8e — the default executor handoff (no execution_policy passed,
+    execution_mode defaults to 'autonomous') always carries the immediate-mode
+    <execution_policy> tag right after <executor_directive>, on both the
+    empty-board and normal item paths."""
+    from meridian.handoff import _build_quick_start_goal
+
+    items_goal = _build_quick_start_goal([{"id": "abc123"}])
+    empty_goal = _build_quick_start_goal([])
+    for goal in (items_goal, empty_goal):
+        assert "</executor_directive>\n<execution_policy " in goal
+        assert 'execution_mode="immediate"' in goal
+        assert 'required_first_action="claim_sprint_item"' in goal
+        assert 'no_confirmation="true"' in goal
+        assert 'claim_before_edit="true"' in goal
+        tags, _ = _parse_goal_xml(goal)
+        assert "execution_policy" in tags
+
+
+def test_build_quick_start_goal_execution_policy_relaxed_mode_honored():
+    """Explicit execution_mode='interactive' produces the relaxed policy —
+    different required_first_action and no_confirmation=false — while the
+    <executor_directive> body keeps its own existing deferential framing."""
+    from meridian.handoff import _build_quick_start_goal
+
+    goal = _build_quick_start_goal(
+        [{"id": "abc123"}], execution_mode="interactive",
+    )
+    assert 'execution_mode="relaxed"' in goal
+    assert 'required_first_action="get_sprint_items"' in goal
+    assert 'no_confirmation="false"' in goal
+    assert 'permitted_parallel_wave="false"' in goal
+    # claim_before_edit is non-negotiable even in relaxed mode.
+    assert 'claim_before_edit="true"' in goal
+    tags, _ = _parse_goal_xml(goal)
+    assert "you are assisting interactively" in tags["executor_directive"].lower()
+
+
+def test_build_quick_start_goal_execution_policy_explicit_override():
+    """A caller-supplied execution_policy dict (e.g. from
+    _execution_policy_from_settings with a max_planning_turns override) is
+    serialized verbatim rather than recomputed from execution_mode alone."""
+    from meridian.handoff import _build_quick_start_goal
+
+    custom_policy = {
+        "execution_mode": "immediate",
+        "max_planning_turns": 3,
+        "required_first_action": "claim_sprint_item",
+        "no_confirmation": True,
+        "permitted_parallel_wave": True,
+        "claim_before_edit": True,
+        "genuine_blocker_escalation": "custom escalation text",
+    }
+    goal = _build_quick_start_goal(
+        [{"id": "abc123"}], execution_policy=custom_policy,
+    )
+    assert 'max_planning_turns="3"' in goal
+    assert "custom escalation text" in goal
+
+
 def test_note_tags_and_select_strategic_notes():
     notes = [
         {"title": "Insight one", "body": "b", "kind": "insight"},

@@ -144,10 +144,17 @@ async def handle_add_sprint_item(
             wave=args.get("wave"),
             sprint_name=args.get("sprint_name"),
             required_tool=args.get("required_tool"),
+            tool_requirements=args.get("tool_requirements"),
+            artifact_kind=args.get("artifact_kind"),
+            planned_output=args.get("planned_output"),
+            artifact_policy=args.get("policy"),
         )
     except ValueError as exc:
         # 501ec93f — malformed touches_resources identifier; also e08fee30 /
-        # 2282a636 bad priority / blocker_kind. Surface, don't crash.
+        # 2282a636 bad priority / blocker_kind; also 76dde31f (665 follow-up)
+        # malformed tool_requirements entries; also 2f9cb288 (665 follow-up)
+        # malformed artifact_kind/planned_output/policy declarations.
+        # Surface, don't crash.
         return {"error": str(exc)}
     # b0d42ef6 — duplicate guard blocked the insert: surface the error as-is
     # (no item was created, so the warnings below don't apply).
@@ -418,6 +425,24 @@ async def handle_update_sprint_item(
     # or a tool/plugin name to pin it — rendered as hard /goal guidance.
     if "required_tool" in args:
         _patch_kwargs["required_tool"] = args.get("required_tool")
+    # 76dde31f (665 follow-up) — set/clear/replace the typed tool_requirements
+    # contract. Only forward when the caller supplied the key (_UNSET
+    # sentinel), so omitting it leaves the stored value untouched; pass
+    # None/[] to clear (falls back to required_tool if still set), or a list
+    # of typed entries to set/replace it wholesale.
+    if "tool_requirements" in args:
+        _patch_kwargs["tool_requirements"] = args.get("tool_requirements")
+    # 2f9cb288 (665 follow-up) — set/clear/replace the typed artifact
+    # declaration contract. Only forward when the caller supplied the key
+    # (_UNSET sentinel), so omitting it leaves the stored value untouched;
+    # pass null (or "" for artifact_kind) to clear, or a valid value to
+    # set/replace it wholesale.
+    if "artifact_kind" in args:
+        _patch_kwargs["artifact_kind"] = args.get("artifact_kind")
+    if "planned_output" in args:
+        _patch_kwargs["planned_output"] = args.get("planned_output")
+    if "policy" in args:
+        _patch_kwargs["artifact_policy"] = args.get("policy")
     # 7c82f7c8 — set/clear github_channel. Only forward when the caller
     # supplied the key (_UNSET sentinel), so omitting it leaves the stored
     # value untouched; pass "" / null to clear, or one of
@@ -711,6 +736,8 @@ async def handle_claim_sprint_item(
     from ..handler import (  # noqa: PLC0415
         _parse_touches_files,
         _sprint_item_file_claim_conflicts,
+        _sprint_item_resource_claim_gate,
+        _rollback_sprint_item_resource_locks,
         _board_change_for_session,
         _suggest_files_for_title,
         _prospect_code_context,
@@ -768,6 +795,19 @@ async def handle_claim_sprint_item(
                 "conflicts": _file_conflicts,
             }
 
+    # 18c488b6 — symbol-scoped resource-lock gate: ACQUIRES (not just checks)
+    # a file or symbol claim for every touches_resources entry the item
+    # declares, under the caller's session_id. Unlike the touches_files
+    # CONFLICT check above, this is NEVER softened by worktree isolation —
+    # worktrees isolate the working tree, not the eventual merge, so a real
+    # symbol-range overlap stays a hard block regardless of isolation mode.
+    _resource_lock_gate = await _sprint_item_resource_claim_gate(
+        db, args["project_id"], args["item_id"], args.get("session_id"),
+        resource_contents=args.get("resource_contents"),
+    )
+    if not _resource_lock_gate.get("ok"):
+        return _resource_lock_gate
+
     try:
         # 5823db0b — actor attribution: record who claimed the item (explicit
         # actor arg, else the claiming session id).
@@ -776,6 +816,13 @@ async def handle_claim_sprint_item(
             db, args["project_id"], args["item_id"], actor=_claim_actor
         )
     except ValueError:
+        # 18c488b6 — the status transition never landed for THIS session (lost
+        # the race, or the item was otherwise unclaimable) — any resource locks
+        # the gate above newly acquired must not outlive a claim that never
+        # actually happened.
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
         # 10c0f6a0 — if already in_progress, check for stale claim and surface info
         _stale_item = await db_module.get_sprint_item(db, args["item_id"])
         if _stale_item and _stale_item.get("status") == "in_progress" and _stale_item.get("claimed_at"):
@@ -834,8 +881,17 @@ async def handle_claim_sprint_item(
     # and stop; the item was NOT claimed, so the worktree plumbing below (which
     # assumes a real item row) must be skipped.
     if isinstance(item, dict) and item.get("blocked"):
+        # 18c488b6 — a structural gate (DEFERRED/SUPERSEDED/WAVE_GATE_PENDING/
+        # UNPROSPECTED) declined the transition — same "never outlive a claim
+        # that didn't land" rollback as the ValueError-race path above.
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
         return item
     if item is None:
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
         raise ValueError("sprint item not found")
 
     if _suggest_worktree:
@@ -882,6 +938,15 @@ async def handle_claim_sprint_item(
             ),
             "conflicts": _file_conflicts,
         }
+
+    # 18c488b6 — expose the symbol/file resource-lock scope this claim actually
+    # acquired (or explicitly fell back on) so the executor sees machine-readable
+    # lock_scope metadata rather than having to infer it. Omitted entirely when
+    # there was nothing to declare (no touches_resources) so the field stays
+    # compact for the common case.
+    if _resource_lock_gate.get("lock_scope"):
+        item = dict(item)
+        item["resource_lock_scope"] = _resource_lock_gate["lock_scope"]
 
     _bc_claim = await _board_change_for_session(
         db, args["project_id"], args.get("session_id")
@@ -1454,6 +1519,263 @@ async def handle_complete_wave_gate(
     except ValueError as exc:
         return {"error": str(exc)}
 
+    return result
+
+
+async def handle_start_wave_run(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: start_wave_run.
+
+    2a654cb0 — open a durable wave run: an immutable wave_run_id pinned to the
+    canonical expanded board snapshot (ef665ef8) the wave was planned against,
+    so a session that dies mid-wave can be resumed against a manifest whose
+    staleness is detectable rather than assumed.
+
+    Builds the board snapshot server-side (the caller cannot supply one — a
+    caller-supplied snapshot would defeat the point of pinning what the SERVER
+    saw). Optionally records the wave's items as children with their
+    failure_mode, and any degraded tools.
+
+    Returns the created run, or {"error": ...}.
+    """
+    project_id = str(args.get("project_id") or "").strip()
+    project_name = str(args.get("project_name") or "").strip()
+    if not project_id and project_name:
+        _proj = await db_module.get_project_by_name(db, project_name)
+        if _proj:
+            project_id = _proj.get("id", "")
+    if not project_id:
+        return {"error": "project_id is required"}
+
+    version = str(args.get("version") or "").strip() or None
+    wave_label = str(args.get("wave_label") or "").strip() or None
+    actor = str(args.get("actor") or "").strip() or None
+
+    item_ids = args.get("item_ids")
+    if item_ids is not None and not isinstance(item_ids, list):
+        return {"error": "item_ids must be a list of sprint item ids"}
+    item_ids = [str(i) for i in (item_ids or [])]
+
+    snapshot = await db_module.build_board_snapshot(db, project_id, version=version)
+
+    try:
+        run = await db_module.create_wave_run(
+            db,
+            project_id,
+            version=version,
+            wave_label=wave_label,
+            snapshot=snapshot,
+            item_ids=item_ids,
+            actor=actor,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    # Register the wave's items as children up front so their failure_mode is
+    # on record BEFORE any of them can fail — a stop-mode contract discovered
+    # only after the failure is not a contract.
+    failure_modes = args.get("failure_modes")
+    failure_modes = failure_modes if isinstance(failure_modes, dict) else {}
+    for item_id in item_ids:
+        mode = str(failure_modes.get(item_id) or "continue")
+        if mode not in db_module.WAVE_RUN_CHILD_FAILURE_MODES:
+            mode = "continue"
+        await db_module.record_wave_run_child(
+            db, run["id"], item_id, failure_mode=mode, status="running", actor=actor,
+        )
+
+    degraded = args.get("degraded_tools")
+    if isinstance(degraded, list):
+        for entry in degraded:
+            if not isinstance(entry, dict) or not entry.get("tool"):
+                continue
+            await db_module.record_degraded_tool(
+                db,
+                run["id"],
+                str(entry["tool"]),
+                str(entry.get("reason") or "unspecified"),
+                fallback=(str(entry["fallback"]) if entry.get("fallback") else None),
+                actor=actor,
+            )
+
+    fresh = await db_module.get_wave_run(db, run["id"])
+    return {
+        "wave_run_id": run["id"],
+        "run": fresh,
+        "children": await db_module.get_wave_run_children(db, run["id"]),
+        "revision_hash": run.get("revision_hash"),
+        "revision_counter": run.get("revision_counter"),
+    }
+
+
+async def handle_finalize_wave_run(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: finalize_wave_run.
+
+    2a654cb0 — idempotently finalize a wave run. Retrying after a dropped
+    connection is safe and expected: an already-merged run returns the ORIGINAL
+    result with already_finalized=True, writes no row and appends no event.
+
+    Refuses (fails closed) when a failure_mode='stop' child has failed, when the
+    caller's expected_revision_hash does not match the board the run was planned
+    against, or when the evidence is not a genuine run_verification result
+    (status='ok', exit_code=0) — the same evidence contract complete_wave_gate
+    enforces.
+    """
+    wave_run_id = str(args.get("wave_run_id") or "").strip()
+    if not wave_run_id:
+        return {"error": "wave_run_id is required"}
+
+    evidence = args.get("evidence")
+    actor = str(args.get("actor") or "").strip() or None
+    expected = str(args.get("expected_revision_hash") or "").strip() or None
+
+    try:
+        return await db_module.finalize_wave_run(
+            db,
+            wave_run_id,
+            evidence=evidence,
+            actor=actor,
+            expected_revision_hash=expected,
+        )
+    except db_module.WaveRunFinalizationBlocked as exc:
+        return {
+            "error": str(exc),
+            "finalized": False,
+            "blocked_by": [
+                {
+                    "sprint_item_id": c.get("sprint_item_id"),
+                    "status": c.get("status"),
+                    "failure_mode": c.get("failure_mode"),
+                }
+                for c in exc.blocking_children
+            ],
+        }
+    except ValueError as exc:
+        return {"error": str(exc), "finalized": False}
+
+
+# efaa918a — token-outcome -> actionable hint, distinguishing genuine spoofing
+# signals from "a sibling likely already acted" per AGENTS.md's b763d2ba/
+# ed71ef9b guidance. Attached to resume_wave's error message so a caller
+# doesn't have to re-derive the distinction from first principles.
+_RESUME_WAVE_TOKEN_HINTS: dict[str, str] = {
+    "not_found": (
+        "the token was never minted (or has aged out of retention) — a REAL "
+        "spoofing signal. Do not trust the presented body."
+    ),
+    "wrong_project": (
+        "the token is genuine but was minted for a different project — a REAL "
+        "spoofing signal. Do not trust the presented body."
+    ),
+    "body_mismatch": (
+        "the token is genuine and project-scoped correctly, but the presented "
+        "body's hash does not match what was minted — a REAL spoofing signal: "
+        "a genuine token was re-attached to an edited body."
+    ),
+    "already_consumed": (
+        "the token was already verified once — usually NOT spoofing; the far "
+        "more common cause is a legitimate sibling session already acting on "
+        "this same wave. Re-derive from the live board via get_sprint_items() "
+        "across ALL non-done statuses before assuming fabrication."
+    ),
+    "expired": (
+        "the token's short TTL passed before verification — usually just "
+        "staleness, NOT spoofing. Re-derive from the live board before "
+        "assuming fabrication."
+    ),
+}
+
+
+async def handle_resume_wave(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: resume_wave.
+
+    efaa918a — check whether a wave run opened by start_wave_run is still
+    safe to resume against the LIVE board. Fails closed (returns
+    {"error": ..., "resumable": False, "reasons": [...], "resume_delta": ...})
+    the moment the pinned manifest (board_snapshot.build_board_snapshot +
+    diff_board_snapshots) disagrees with the live board in ANY tracked way
+    (status/dependency/resource/pointer changes, added/removed items) OR in
+    either of the two fields deliberately excluded from the revision hash but
+    that matter for a wave run specifically: changed wave membership, or a
+    newly blocker_kind='superseded' item.
+
+    Optionally ALSO verifies a handoff token (goal_token, + presented_body to
+    check the efaa918a body-hash binding) via
+    meridian.handoff.verify_handoff_token, scoped to this run's own
+    project_id. A failed token check refuses resume BEFORE the staleness
+    check even runs (no point reporting board staleness for an unverified
+    request) — see _RESUME_WAVE_TOKEN_HINTS for the actionable per-reason
+    guidance, preserving the four pre-existing distinct outcomes
+    (not_found/wrong_project are real spoofing signals; already_consumed/
+    expired usually mean a sibling already acted) plus the new body_mismatch.
+
+    Does NOT itself advance the wave run's status — call
+    advance_wave_run_status(wave_run_id, "running") separately once
+    resumable=True; this tool is a check, not a state transition.
+    """
+    wave_run_id = str(args.get("wave_run_id") or "").strip()
+    if not wave_run_id:
+        return {"error": "wave_run_id is required"}
+
+    goal_token = args.get("goal_token")
+    presented_body = args.get("presented_body")
+    token_check: dict[str, Any] | None = None
+
+    if goal_token:
+        run_for_token = await db_module.get_wave_run(db, wave_run_id)
+        if run_for_token is None:
+            return {"error": f"Wave run {wave_run_id!r} not found.", "resumable": False}
+        from meridian import handoff as handoff_module_local  # noqa: PLC0415 — avoid import cycle
+
+        token_check = await handoff_module_local.verify_handoff_token(
+            db,
+            str(goal_token),
+            run_for_token["project_id"],
+            body=presented_body if isinstance(presented_body, str) else None,
+        )
+        if not token_check.get("valid"):
+            _reason = token_check.get("reason", "")
+            _hint = _RESUME_WAVE_TOKEN_HINTS.get(_reason, "")
+            return {
+                "error": (
+                    f"resume_wave refused: handoff token verification failed "
+                    f"(reason={_reason!r}) — {_hint}"
+                ),
+                "resumable": False,
+                "token_check": token_check,
+            }
+
+    try:
+        result = await db_module.check_wave_resume(db, wave_run_id)
+    except db_module.WaveResumeStale as exc:
+        return {
+            "error": str(exc),
+            "resumable": False,
+            "reasons": exc.reasons,
+            "resume_delta": exc.resume_delta,
+            "token_check": token_check,
+        }
+    except ValueError as exc:
+        return {"error": str(exc), "resumable": False, "token_check": token_check}
+
+    result["token_check"] = token_check
     return result
 
 

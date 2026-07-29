@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended', '_migrate_connection_events', '_migrate_redis_overage_fields', '_migrate_sprint_version_descriptions', '_migrate_workspace_settings_active_session_threshold', '_migrate_sprint_item_sprint_name', '_migrate_proposal_slug_nickname', '_migrate_decision_slug_nickname', '_migrate_note_nickname', '_migrate_sprint_item_prospect_bypass', '_migrate_handoff_tokens', '_migrate_wave_gate_results', '_migrate_wave_gate_configs', '_migrate_server_logs', '_migrate_custom_hooks', '_migrate_sprint_item_require_verification', '_migrate_sprint_item_verifications_table', '_migrate_proposal_github_issue', '_migrate_sprint_item_required_tool', '_migrate_sprint_item_github_issue_link', '_migrate_manual_issue_screening_toggle', '_migrate_action_audit_log_table', '_migrate_manual_issue_content_log_table', '_migrate_workspace_tool_priority_map', '_migrate_sprint_item_github_channel', '_migrate_workspace_claim_verification_mode', '_migrate_handoff_tokens_consumed_at']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended', '_migrate_connection_events', '_migrate_redis_overage_fields', '_migrate_sprint_version_descriptions', '_migrate_workspace_settings_active_session_threshold', '_migrate_sprint_item_sprint_name', '_migrate_proposal_slug_nickname', '_migrate_decision_slug_nickname', '_migrate_note_nickname', '_migrate_sprint_item_prospect_bypass', '_migrate_handoff_tokens', '_migrate_wave_gate_results', '_migrate_wave_gate_configs', '_migrate_server_logs', '_migrate_custom_hooks', '_migrate_sprint_item_require_verification', '_migrate_sprint_item_verifications_table', '_migrate_proposal_github_issue', '_migrate_sprint_item_required_tool', '_migrate_sprint_item_github_issue_link', '_migrate_manual_issue_screening_toggle', '_migrate_action_audit_log_table', '_migrate_manual_issue_content_log_table', '_migrate_workspace_tool_priority_map', '_migrate_sprint_item_github_channel', '_migrate_workspace_claim_verification_mode', '_migrate_handoff_tokens_consumed_at', '_migrate_board_snapshot_revisions', '_migrate_wave_runs', '_migrate_handoff_tokens_body_hash', '_migrate_project_capabilities', '_migrate_capability_profiles', '_migrate_sprint_item_tool_requirements', '_migrate_sprint_item_artifact_declaration']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -3110,6 +3110,172 @@ async def _migrate_handoff_tokens_consumed_at(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _migrate_handoff_tokens_body_hash(db: aiosqlite.Connection) -> None:
+    """efaa918a — handoff_tokens.body_hash: nullable SHA-256 hex digest binding
+    a token to the canonical body it was minted for.
+
+    Closes the 2ee0000c gap documented in AGENTS.md: ``verify_handoff_token``
+    used to prove only that a ``<goal_token>`` was minted by a real
+    ``generate_handoff`` call for the right ``project_id`` — it never checked
+    that the surrounding /goal body was unmodified, so a genuine token
+    extracted from one body and re-attached to a DIFFERENT (edited) body
+    still verified ``valid=True``. ``mint_handoff_token(..., body=...)`` now
+    optionally stores ``hashlib.sha256(body).hexdigest()`` here, and
+    ``verify_handoff_token(..., body=...)`` compares it against the presented
+    body, returning ``reason="body_mismatch"`` on a disagreement.
+
+    Nullable, no default: a token minted without a ``body`` argument (every
+    pre-efaa918a token, and every caller that still omits ``body``) simply
+    never gets a value, and the body check in ``verify_handoff_token`` is
+    skipped whenever ``body_hash`` is NULL — this migration and the code path
+    it backs are purely additive. Idempotent via
+    ``_migrate_add_column_if_missing``. Mirrored in
+    pg_adapter._migrate_pg_handoff_tokens_body_hash.
+    """
+    await _migrate_add_column_if_missing(
+        db, "handoff_tokens", "body_hash", "TEXT"
+    )
+
+
+async def _migrate_board_snapshot_revisions(db: aiosqlite.Connection) -> None:
+    """ef665ef8 — board_snapshot_revisions: monotonic revision counter for
+    canonical expanded-board snapshots (meridian.db.board_snapshot).
+
+    One row per DISTINCT revision hash observed for a ``(project_id,
+    version_filter)`` bucket — ``version_filter`` is ``''`` (empty string,
+    NOT NULL) for the whole-board snapshot, or a sprint version string for a
+    version-scoped one. ``revision_counter`` increments by 1 each time
+    ``record_board_snapshot_revision`` sees a hash it hasn't already recorded
+    as the latest for that bucket; calling it again with an unchanged hash is
+    a no-op (idempotent, no new row). This is what lets a resumed session
+    tell "newer" (higher counter) from merely "different" (any changed hash),
+    per the ef665ef8 handoff-staleness incident this table fixes.
+
+    CREATE_TABLES covers fresh DBs; this is the upgrade path for existing
+    ones. The index lives INSIDE this guarded migration (CREATE INDEX IF NOT
+    EXISTS), never inline in the CREATE_TABLES literal — an unguarded inline
+    index on a migration-added table would crash startup on a DB predating it
+    (the 2026-07-04 outage trap). Idempotent. Mirrored in
+    pg_adapter._migrate_pg_board_snapshot_revisions.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS board_snapshot_revisions (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            version_filter TEXT NOT NULL DEFAULT '',
+            revision_hash TEXT NOT NULL,
+            revision_counter INTEGER NOT NULL,
+            item_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_board_snapshot_revisions_bucket "
+        "ON board_snapshot_revisions(project_id, version_filter, revision_counter DESC)"
+    )
+    await db.commit()
+
+
+async def _migrate_wave_runs(db: aiosqlite.Connection) -> None:
+    """2a654cb0 — wave_runs / wave_run_events / wave_run_children.
+
+    Durable state for a paused/resumed multi-agent wave (see
+    meridian.db.wave_runs for the full design writeup):
+
+      wave_runs          — one row per wave run. ``id`` is the immutable
+                           wave_run_id. ``status`` is the enumerated state
+                           machine (planned/running/paused/awaiting_human/
+                           rebase_required/ready_to_resume/merged/aborted).
+                           ``board_snapshot`` + ``revision_hash`` +
+                           ``revision_counter`` pin the canonical expanded
+                           board (ef665ef8) the run was planned against, so a
+                           resumed session can detect a stale manifest.
+                           ``degraded_tools`` is a JSON list recording tools
+                           that were unavailable while the wave ran.
+                           ``finalizer_evidence`` + ``finalized_at`` are
+                           written exactly once by finalize_wave_run.
+      wave_run_events    — STRICTLY append-only history, monotonic per-run
+                           ``seq`` (UNIQUE(wave_run_id, seq)). Rows are never
+                           updated or deleted; a correction appends a new event
+                           and sets only ``superseded_by`` on the old row, so
+                           the superseded body stays a faithful record.
+      wave_run_children  — one row per sprint item in the wave, carrying its
+                           ``failure_mode`` ('stop'|'continue') and outcome.
+                           A failed stop-mode child structurally blocks
+                           finalization.
+
+    CREATE_TABLES covers fresh DBs; this is the upgrade path for existing ones.
+    Every index lives INSIDE this guarded migration (CREATE INDEX IF NOT
+    EXISTS), never inline in a CREATE_TABLES literal — an unguarded inline
+    index on a migration-added table crashes startup on a DB predating it (the
+    2026-07-04 outage trap). Idempotent. Mirrored in
+    pg_adapter._migrate_pg_wave_runs.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS wave_runs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            version TEXT,
+            wave_label TEXT,
+            status TEXT NOT NULL DEFAULT 'planned',
+            board_snapshot TEXT,
+            revision_hash TEXT,
+            revision_counter INTEGER,
+            item_ids TEXT NOT NULL DEFAULT '[]',
+            degraded_tools TEXT NOT NULL DEFAULT '[]',
+            finalizer_evidence TEXT,
+            finalized_at TEXT,
+            actor TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wave_runs_project "
+        "ON wave_runs(project_id, status, created_at DESC)"
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS wave_run_events (
+            id TEXT PRIMARY KEY,
+            wave_run_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            from_status TEXT,
+            to_status TEXT,
+            detail TEXT,
+            payload TEXT,
+            actor TEXT,
+            supersedes TEXT,
+            superseded_by TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(wave_run_id, seq)
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_events_run "
+        "ON wave_run_events(wave_run_id, seq)"
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS wave_run_children (
+            id TEXT PRIMARY KEY,
+            wave_run_id TEXT NOT NULL,
+            sprint_item_id TEXT NOT NULL,
+            failure_mode TEXT NOT NULL DEFAULT 'continue',
+            status TEXT NOT NULL DEFAULT 'running',
+            evidence TEXT,
+            actor TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(wave_run_id, sprint_item_id)
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_children_run "
+        "ON wave_run_children(wave_run_id, status)"
+    )
+    await db.commit()
+
+
 async def _migrate_wave_gate_results(db: aiosqlite.Connection) -> None:
     """d2430713 — wave_gate_results: persist complete_wave_gate evidence records.
 
@@ -3590,3 +3756,121 @@ async def _migrate_workspace_tool_priority_map(db: aiosqlite.Connection) -> None
     Mirrored in pg_adapter._migrate_pg_workspace_tool_priority_map.
     """
     await _migrate_add_column_if_missing(db, "workspace_settings", "tool_priority_map", "TEXT")
+
+
+async def _migrate_project_capabilities(db: aiosqlite.Connection) -> None:
+    """649e095f — project_capabilities: versioned capability manifest per project.
+
+    Foundation table for deterministic executor toolchains: one row per
+    project, storing a normalized JSON list of capability declarations
+    (id/purpose/required_tools/fallback_chain/provenance/availability_policy/
+    verification_command — see meridian.capability_manifest) plus the schema
+    version and a stable content hash for change detection. A project with no
+    row is treated as an empty profile by
+    db.get_project_capability_manifest — never a read/startup error, so
+    existing projects continue working unchanged.
+
+    CREATE_TABLES covers fresh DBs; this is the upgrade path for existing
+    ones. Idempotent. Mirrored in pg_adapter._migrate_pg_project_capabilities.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS project_capabilities (
+            project_id TEXT PRIMARY KEY,
+            manifest TEXT NOT NULL DEFAULT '[]',
+            manifest_version INTEGER NOT NULL DEFAULT 1,
+            manifest_hash TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.commit()
+
+
+async def _migrate_capability_profiles(db: aiosqlite.Connection) -> None:
+    """02038afe — capability_profiles: layered capability inheritance.
+
+    One row per (scope_type, scope_id) pair, scope_type in
+    workspace|user|project|sprint_version|item — see
+    meridian.capability_profile for the inheritance order and merge rules.
+    Each row stores a normalized JSON capability list (same schema as
+    project_capabilities, see meridian.capability_manifest), an explicit
+    disabled-capability-id list (a more specific layer retracting an
+    inherited id without redeclaring it), the schema version, a stable
+    content hash, non-secret provenance, and updated_at.
+
+    Builds on, and is independent of, project_capabilities (649e095f) — that
+    table remains the single-layer "declared manifest" surface;
+    capability_profiles is the new multi-layer inheritance surface resolved
+    by db.get_effective_capability_profile. Idempotent. Mirrored in
+    pg_adapter._migrate_pg_capability_profiles.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS capability_profiles (
+            scope_type TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            manifest TEXT NOT NULL DEFAULT '[]',
+            disabled_ids TEXT NOT NULL DEFAULT '[]',
+            manifest_version INTEGER NOT NULL DEFAULT 1,
+            manifest_hash TEXT,
+            provenance TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (scope_type, scope_id)
+        )"""
+    )
+    await db.commit()
+
+
+async def _migrate_sprint_item_tool_requirements(db: aiosqlite.Connection) -> None:
+    """76dde31f (665 follow-up) — sprint_items.tool_requirements: typed,
+    per-item MCP tool-requirement contract.
+
+    Distinct from ``touches_resources`` (parallel-conflict SCHEDULING
+    metadata) and the legacy free-form ``required_tool`` pin (4d1fb28f, a
+    single string). ``tool_requirements`` is a nullable TEXT column holding a
+    JSON array of normalized entries (see ``meridian.tool_requirements`` for
+    the schema: name, server_or_namespace, required_or_preferred, purpose,
+    call_template, fallback, availability_check, verification). NULL = no
+    structured requirements declared; ``required_tool`` still works unchanged
+    for backward compatibility and is used as a read-time compatibility
+    fallback ONLY when this column is empty
+    (``tool_requirements.effective_tool_requirements``) — once an item sets
+    ``tool_requirements``, that structured field is the canonical source.
+
+    Nullable plain ``ALTER TABLE ADD COLUMN`` — safe on existing DBs, no
+    inline index (guarded-migration rule). Idempotent
+    (``_migrate_add_column_if_missing`` is a no-op when the column exists).
+    Mirrored in pg_adapter._migrate_pg_sprint_item_tool_requirements.
+    """
+    await _migrate_add_column_if_missing(db, "sprint_items", "tool_requirements", "TEXT")
+
+
+async def _migrate_sprint_item_artifact_declaration(db: aiosqlite.Connection) -> None:
+    """2f9cb288 (b7308039 / 665 follow-up) — sprint_items.artifact_kind /
+    planned_output / artifact_policy: typed, per-item artifact declaration.
+
+    Three nullable columns, added together (same feature, same migration):
+
+    * ``artifact_kind`` TEXT — plain enum
+      (``document_only``/``figure``/``table``, see
+      ``meridian.artifact_declaration.ARTIFACT_KINDS``), like
+      ``milestone_type``/``priority``/``blocker_kind`` — not JSON.
+    * ``planned_output`` TEXT — a JSON-encoded typed pointer (source_type,
+      targets, label, target_kind) plus ``provenance_required``, validated
+      via ``meridian.artifact_declaration.normalize_planned_output`` (which
+      itself reuses ``meridian.pointers.validate_pointer`` — never
+      reimplemented).
+    * ``artifact_policy`` TEXT — a JSON-encoded artifact-pointer-check
+      policy (``artifact_pointer_check`` off/warn/strict + guard flags),
+      validated via ``meridian.artifact_declaration.normalize_artifact_policy``.
+
+    NULL on all three = no declaration — treated as "unknown", not any
+    specific kind and not any specific policy; an absent policy reads back
+    as the project default (``artifact_pointer_check="warn"``) via
+    ``meridian.artifact_declaration.effective_artifact_policy``, never
+    raising or hard-blocking a pre-existing item. Nullable plain
+    ``ALTER TABLE ADD COLUMN`` — safe on existing DBs, no inline index
+    (guarded-migration rule). Idempotent. Mirrored in
+    pg_adapter._migrate_pg_sprint_item_artifact_declaration.
+    """
+    await _migrate_add_column_if_missing(db, "sprint_items", "artifact_kind", "TEXT")
+    await _migrate_add_column_if_missing(db, "sprint_items", "planned_output", "TEXT")
+    await _migrate_add_column_if_missing(db, "sprint_items", "artifact_policy", "TEXT")

@@ -94,6 +94,44 @@ def search_paragraphs(index_db_path: str, query: str, limit: int = 20) -> list[d
     """Substring-search paragraphs in a previously-built index."""
     return docs_intel.find_paragraphs(index_db_path, query, limit)
 
+@mcp.tool()
+def search_document(
+    docx_path: str,
+    query: str,
+    element_types: list[str] | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """BM25-search all searchable DOCX XML parts with structural filters."""
+    return docs_intel.search_document_xml(
+        docx_path=docx_path,
+        query=query,
+        element_types=element_types,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def highlight_document(
+    docx_path: str,
+    query: str,
+    element_types: list[str] | None = None,
+    color: str = "yellow",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Apply native Word highlighting to structural XML search matches."""
+    return docs_intel.highlight_document_matches(
+        docx_path=docx_path,
+        query=query,
+        element_types=element_types,
+        color=color,
+        limit=limit,
+    )
+
+@mcp.tool()
+def read_document_snapshot(docx_path: str) -> dict[str, Any]:
+    """Read the last saved DOCX snapshot without writing or requiring a close."""
+    return docs_intel.read_document_snapshot(docx_path)
+
 
 @mcp.tool()
 def ingest_local_document(
@@ -205,6 +243,32 @@ def ingest_local_document_structure(
         force_hosted=force_hosted,
     )
 
+
+
+@mcp.tool()
+def insert_image(
+    docx_path: str,
+    image_path: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """Insert a local image as a centered inline OOXML figure.
+
+    The generated image paragraph is always centered with w:jc val="center",
+    equivalent to pressing Ctrl+E in Word.
+    """
+    return docs_intel.insert_image(
+        docx_path=docx_path,
+        image_path=image_path,
+        anchor_para_id=anchor_para_id,
+        position=position,
+        width_inches=width_inches,
+        height_inches=height_inches,
+        index_db_path=index_db_path,
+    )
 
 @mcp.tool()
 def find_image_paragraph(
@@ -662,6 +726,27 @@ def edit_equation(
         index_db_path=index_db_path,
     )
 
+@mcp.tool()
+def append_text_run_after_math(
+    docx_path: str,
+    equation_para_id: str,
+    text: str,
+    math_index: int | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """Append a normal text run after an equation selected by stable paragraph id.
+
+    When a paragraph contains multiple equations, math_index is required so the
+    operation never guesses which equation should receive the text.
+    """
+    return docs_intel.append_text_run_after_math(
+        docx_path=docx_path,
+        equation_para_id=equation_para_id,
+        text=text,
+        math_index=math_index,
+        index_db_path=index_db_path,
+    )
+
 
 @mcp.tool()
 def remove_equation(
@@ -971,31 +1056,14 @@ def insert_highlighted_note(
     position: str = "after",
     style: str = "internal_note",
     index_db_path: str | None = None,
+    mode: str = "inline",
+    author: str = "Meridian",
+    initials: str = "M",
 ) -> dict[str, Any]:
-    """65c8eb31 — Insert a genuinely highlighted internal-author-note paragraph.
+    """Insert an internal note inline or as a native Word comment.
 
-    Addresses a real recurring pattern: bracket-header/NOTE-block text left
-    inline in results-section prose, indistinguishable from real
-    dissertation content. Writes a structurally distinct paragraph instead —
-    a real w:highlight run property plus a dedicated paragraph style name and
-    its own bookmark — so notes can be found and stripped programmatically
-    (see list_internal_notes / scan_stale_notes) before final submission.
-
-    Args:
-      docx_path:       Absolute path to the .docx file (mutated in place).
-      text:            Note content (no bracket/NOTE-prefix decoration
-                       needed — the highlight + style ARE the signal).
-      anchor_para_id:  w14:paraId (or p{N}) of the paragraph to anchor on.
-      position:        "before" or "after" (default) the anchor.
-      style:           Must be "internal_note" (the only supported style
-                       today).
-      index_db_path:   If supplied, the note is ALSO recorded in the
-                       sidecar's docx_internal_notes table so
-                       list_internal_notes can find it.
-
-    Returns:
-      {status, note_id, text, anchor_para_id, position, style, docx_path}
-      or {error: <message>} (file NOT mutated on error).
+    mode="inline" preserves the highlighted Meridian note paragraph.
+    mode="comment" creates a real Word comment visible in Word's review pane.
     """
     return docs_intel.insert_highlighted_note(
         docx_path=docx_path,
@@ -1004,6 +1072,9 @@ def insert_highlighted_note(
         position=position,
         style=style,
         index_db_path=index_db_path,
+        mode=mode,
+        author=author,
+        initials=initials,
     )
 
 
@@ -1220,6 +1291,33 @@ def copy_section(
         trim_original_to=trim_original_to,
     )
 
+
+@mcp.tool()
+def relocate_figure(
+    docx_path: str,
+    figure_index: int,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
+) -> dict[str, Any]:
+    """Move an image paragraph together with its immediately following Figure caption.
+
+    figure_index is the 1-based order among direct-body image paragraphs. The
+    operation requires the next body child to be a SEQ Figure caption and
+    preserves the original OOXML elements and relationship IDs. It rejects
+    bookmark-splitting moves before writing, verifies the saved document,
+    invalidates the local structure sidecar, and renumbers Figure SEQ/REF
+    caches after a successful reorder.
+    """
+    return docs_intel.relocate_figure(
+        docx_path=docx_path,
+        figure_index=figure_index,
+        destination_anchor_para_id=destination_anchor_para_id,
+        destination_position=destination_position,
+        index_db_path=index_db_path,
+        allow_bookmark_split=allow_bookmark_split,
+    )
 
 @mcp.tool()
 def relocate_table(

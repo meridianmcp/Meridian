@@ -16,6 +16,8 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 import meridian.server as _server
+from meridian import capability_availability as _capability_availability
+from meridian import capability_manifest as _capability_manifest
 from meridian import db as db_module
 from meridian._deps import _hosted_mode
 from meridian.mcp_tools import _select_active_tool_set
@@ -358,6 +360,43 @@ async def handle_start_session(
                     )
     except Exception:  # noqa: BLE001 — setup_warning must never break orientation
         pass
+    # 98aaccf4 — machine-readable effective capability contract, emitted
+    # alongside every start_session orientation (both compact and full;
+    # neither shape excludes it). board_stale mirrors this session's own
+    # pending_goal_stale signal (set just above, when present) -- a stale
+    # unconsumed handoff is a reasonable proxy for "the board/profile
+    # snapshot behind this contract may itself be stale." Fully guarded: a
+    # failure here degrades to no field rather than breaking start_session.
+    try:
+        if isinstance(result, dict):
+            from meridian import handoff as _handoff_module  # noqa: PLC0415
+            result["capability_contract"] = await _handoff_module.build_effective_capability_contract(
+                db, _pid, board_stale=bool(result.get("pending_goal_stale")),
+            )
+    except Exception:  # noqa: BLE001 — capability contract is best-effort
+        pass
+    # 75ac1c8e — canonical, machine-readable execution policy: bounds
+    # planning/tool-free turns and names the required first action
+    # deterministically (see executor_config.build_execution_policy). Added
+    # here — after the composite call — so BOTH the compact and full
+    # start_session shapes (and the "continue" resume shape) get the exact
+    # same structured dict from one code path, mirroring how
+    # capability_contract is attached just above rather than duplicating the
+    # compute inside _start_session_composite's two branches. Best-effort: a
+    # failure here must never break start_session.
+    try:
+        if isinstance(result, dict):
+            from meridian.executor_config import build_execution_policy  # noqa: PLC0415
+            _policy_project = await db_module.get_project(db, _pid)
+            _policy_mode = db_module.normalize_execution_mode(
+                (_policy_project or {}).get("execution_mode")
+            )
+            _policy_exec_cfg = await db_module.get_executor_config(db, _pid)
+            result["execution_policy"] = build_execution_policy(
+                _policy_exec_cfg, execution_mode=_policy_mode,
+            )
+    except Exception:  # noqa: BLE001 — execution policy is best-effort
+        pass
     return result
 
 
@@ -536,3 +575,288 @@ async def handle_delete_custom_hook(
         return {"error": "project_id and hook_id are both required"}
     deleted = await db_module.delete_custom_hook(db, _pid, _hook_id)
     return {"hook_id": _hook_id, "deleted": deleted}
+
+
+async def handle_get_capability_manifest(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_capability_manifest (649e095f).
+
+    Read-only. A project with no persisted manifest gets an empty profile
+    back, never an error.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    return await db_module.get_project_capability_manifest(db, _pid)
+
+
+async def handle_set_capability_manifest(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: set_capability_manifest (649e095f).
+
+    Validates and persists a project's capability manifest wholesale.
+    Malformed input (unknown/missing fields, duplicate ids, secret-shaped
+    values, machine-local absolute paths) rejects deterministically with
+    {error} — never a partial write.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    capabilities = args.get("capabilities")
+    if capabilities is None:
+        return {"error": "capabilities is required"}
+    try:
+        return await db_module.set_project_capability_manifest(db, _pid, capabilities)
+    except _capability_manifest.CapabilityManifestError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_set_capability_profile(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: set_capability_profile (02038afe).
+
+    Persists ONE layer of the workspace/user/project/sprint_version/item
+    capability-inheritance chain — wholesale-replaces that scope's stored
+    capabilities and disabled-capability-id list (not a merge). Rejects
+    deterministically with {error} on a bad scope_type, any malformed
+    capability entry (same schema/safety checks as set_capability_manifest),
+    a malformed disabled_capability_ids list, or unsafe (secret-shaped /
+    machine-local-path) provenance.
+    """
+    scope_type = (args.get("scope_type") or "").strip()
+    scope_id = (args.get("scope_id") or "").strip()
+    if not scope_type:
+        return {"error": "scope_type is required"}
+    if not scope_id:
+        return {"error": "scope_id is required"}
+    try:
+        return await db_module.set_capability_profile(
+            db,
+            scope_type,
+            scope_id,
+            capabilities=args.get("capabilities"),
+            disabled_capability_ids=args.get("disabled_capability_ids"),
+            provenance=args.get("provenance"),
+        )
+    except _capability_manifest.CapabilityManifestError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_clear_capability_profile(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: clear_capability_profile (02038afe).
+
+    Deletes a scope's ENTIRE capability profile row (both its capabilities
+    and its disabled-capability-id list) — distinct from disabling
+    individual capability ids. Idempotent: clearing an already-empty or
+    never-set scope is a no-op, not an error.
+    """
+    scope_type = (args.get("scope_type") or "").strip()
+    scope_id = (args.get("scope_id") or "").strip()
+    if not scope_type:
+        return {"error": "scope_type is required"}
+    if not scope_id:
+        return {"error": "scope_id is required"}
+    try:
+        return await db_module.clear_capability_profile(db, scope_type, scope_id)
+    except _capability_manifest.CapabilityManifestError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_effective_capability_profile(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_effective_capability_profile (02038afe).
+
+    Read-only. Resolves and returns the merged capability profile for a
+    project (optionally narrowed to one sprint item) across every applicable
+    layer: workspace -> user -> project -> sprint_version -> item. Includes
+    a per-capability source-layer map and audit trails of every override
+    (flagging the ones that were real conflicts — same capability id,
+    incompatible required_tools/availability_policy across layers) and every
+    disable that actually removed something.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    sprint_item_id = (args.get("sprint_item_id") or "").strip() or None
+    user_scope_id = (args.get("user_scope_id") or "").strip() or None
+    workspace_scope_id = (args.get("workspace_scope_id") or "").strip() or "singleton"
+    try:
+        return await db_module.get_effective_capability_profile(
+            db,
+            _pid,
+            sprint_item_id=sprint_item_id,
+            workspace_scope_id=workspace_scope_id,
+            user_scope_id=user_scope_id,
+        )
+    except _capability_manifest.CapabilityManifestError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def _build_live_inventory(tenant: dict[str, Any] | None) -> dict[str, Any]:
+    """Live-inventory snapshot (ac80aaaf) for :func:`check_capability_availability`.
+
+    Derives ``{tunnel_reachable, builtin_tools, plugins, stdio_registry}`` --
+    the shape :func:`meridian.capability_availability.classify_tool` expects --
+    from the tenant's resolved tunnel-plugin config and current tunnel
+    connection state, mirroring the same cross-instance-aware reachability
+    check ``list_plugins``/``get_plugin_details`` already use (see
+    ``meridian/mcp/handler.py::_handle_plugin_tools``). Best-effort and
+    non-fatal throughout: any failure fetching a slot's live tools just leaves
+    that slot with an empty tool set (not invocable) rather than raising, so a
+    capability-availability check never crashes on a flaky tunnel probe.
+
+    ``stdio_registry`` is always empty here -- stdio tool identities are
+    project/capability-declared local state with no live-fetchable
+    equivalent, so callers who use ``stdio:`` tool references must build their
+    own inventory (or merge one in) rather than rely on this default.
+    """
+    import asyncio  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    from meridian.mcp_tools import _MCP_TOOLS_LIST  # noqa: PLC0415
+    from meridian.routes import tunnel as _tunnel_mod  # noqa: PLC0415
+    from meridian.tool_manifest import build_tool_manifest  # noqa: PLC0415
+    from meridian.tunnel_plugins import resolve_plugins  # noqa: PLC0415
+
+    builtin_manifest = build_tool_manifest(_MCP_TOOLS_LIST)
+    builtin_tool_names = {
+        t["name"] for t in builtin_manifest.get("tools", []) if isinstance(t, dict) and t.get("name")
+    }
+
+    raw_tp = tenant.get("tunnel_plugins") if tenant else None
+    if isinstance(raw_tp, str) and raw_tp.strip():
+        try:
+            raw_tp = json.loads(raw_tp)
+        except Exception:  # noqa: BLE001
+            raw_tp = None
+    resolved = resolve_plugins(raw_tp)
+
+    tenant_id = tenant.get("id") if tenant else None
+    local_active = bool(tenant_id and _tunnel_mod.has_active_tunnel(tenant_id))
+    cross_instance_active = bool(
+        tenant_id and (
+            _tunnel_mod.tenant_owner_instance(tenant_id)
+            or (tenant and tenant.get("tunnel_active"))
+        )
+    )
+    tunnel_reachable = local_active or cross_instance_active
+
+    # Live per-slot tool names are only fetchable when THIS instance holds the
+    # tunnel socket (mirrors list_plugins -- _fetch_slot_tools returns [] on a
+    # cross-instance miss, so there's no point calling it otherwise).
+    slot_tool_names: dict[str, set[str]] = {}
+    if tenant_id and tunnel_reachable and local_active:
+        try:
+            slot_results = await asyncio.gather(*[
+                _tunnel_mod._fetch_slot_tools(  # type: ignore[attr-defined]
+                    tenant_id, p["slot"],
+                    budget=_tunnel_mod._slot_tools_fetch_budget(p["slot"]),  # type: ignore[attr-defined]
+                )
+                for p in resolved
+            ])
+        except Exception:  # noqa: BLE001
+            slot_results = []
+        for label, tools in (slot_results or []):
+            if tools:
+                slot_tool_names[label] = {
+                    str(t.get("name")) for t in tools if isinstance(t, dict) and t.get("name")
+                }
+
+    # Index plugins by BOTH their catalog name (e.g. "code-intel") and their
+    # connector-facing display name (e.g. "codebase", from SLOT_DISPLAY_NAMES)
+    # so a capability's tool_ref can use either prefix convention.
+    display_map = _tunnel_mod.SLOT_DISPLAY_NAMES
+    plugins: dict[str, dict[str, Any]] = {}
+    for p in resolved:
+        slot = p["slot"]
+        tools_here = slot_tool_names.get(slot, set())
+        entry = {
+            "slot": slot,
+            "enabled": bool(p.get("enabled")),
+            "invocable": bool(tools_here),
+            "tools": tools_here,
+        }
+        plugins[p["name"]] = entry
+        disp = display_map.get(slot)
+        if disp and disp not in plugins:
+            plugins[disp] = entry
+
+    return {
+        "tunnel_reachable": tunnel_reachable,
+        "builtin_tools": builtin_tool_names,
+        "plugins": plugins,
+        "stdio_registry": {},
+    }
+
+
+async def check_capability_availability(
+    db: Any,
+    project_id: str,
+    tenant: dict[str, Any] | None = None,
+    *,
+    capability_id: "str | None" = None,
+    live_inventory: "dict[str, Any] | None" = None,
+) -> list[dict[str, Any]]:
+    """Verify a project's declared capability manifest against live MCP/tunnel state (ac80aaaf).
+
+    Plain importable helper (deliberately NOT its own MCP tool -- this item's
+    job is the verification logic itself; a user-facing surface is later
+    capability-contract work, 98aaccf4) so that work can call straight into
+    this. Loads the project's persisted capability manifest
+    (:func:`meridian.db.get_project_capability_manifest` -- an empty manifest
+    for a project with none, never an error) and classifies each capability's
+    ``required_tools``/``fallback_chain`` against a live inventory snapshot via
+    :func:`meridian.capability_availability.evaluate_capability_availability`.
+
+    ``live_inventory`` is normally derived automatically from *tenant*'s
+    resolved tunnel-plugin config and tunnel connection state (see
+    :func:`_build_live_inventory`); passing it explicitly (as tests do) skips
+    that async, I/O-bound derivation entirely -- the standard no-network,
+    mocked-tunnel-state test seam for this function.
+
+    Returns one availability result per declared capability (``[]`` for a
+    project with no manifest), each shaped as
+    :func:`meridian.capability_availability.evaluate_capability_availability`
+    returns.
+    """
+    manifest = await db_module.get_project_capability_manifest(db, project_id)
+    capabilities = manifest.get("capabilities") or []
+    if capability_id:
+        capabilities = [c for c in capabilities if c.get("id") == capability_id]
+    if live_inventory is None:
+        live_inventory = await _build_live_inventory(tenant)
+    return _capability_availability.evaluate_manifest_availability(capabilities, live_inventory)

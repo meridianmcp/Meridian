@@ -1552,6 +1552,289 @@ async def _sprint_item_file_claim_conflicts(
     return conflicts
 
 
+# ---------------------------------------------------------------------------
+# 18c488b6 — symbol-scoped resource-lock gate for claim_sprint_item
+#
+# _sprint_item_file_claim_conflicts (above) only ever compared touches_files
+# against file_locks — a whole-file-only view that silently discarded any
+# finer-grained symbol: declaration a sprint item's touches_resources might
+# carry, and never actually ACQUIRED anything (informational only, for
+# touches_files; the caller was expected to separately call claim_file).
+# Two disjoint symbols in the same file could never be scheduled reliably
+# (both got treated as one file-level unit) and overlapping symbol claims
+# were never hard-blocked at claim time.
+#
+# This gate closes that: for every touches_resources entry the item declares,
+# it ACQUIRES (not just checks) the appropriate lock —
+#   file:<path>            -> whole-file lock via claim_file
+#   symbol:<path>::<name>  -> a real symbol-range claim via claim_symbol, IF
+#                              the caller supplied that file's source in
+#                              resource_contents (the server has no direct
+#                              filesystem access to the target repo — see
+#                              handoff.build_declared_symbol_targets's same
+#                              tunnel-free boundary note); otherwise it falls
+#                              back to a whole-file lock with an EXPLICIT,
+#                              machine-readable fallback_reason (never a
+#                              silent downgrade).
+# Acquisitions this call newly makes are tracked so a later conflict (or a
+# later failure of the actual status transition) can roll back exactly what
+# THIS call took, leaving any pre-existing claim from earlier work untouched.
+# ---------------------------------------------------------------------------
+
+async def _session_holds_file_lock(db: Any, file_path: str, session_id: str) -> bool:
+    """True if ``session_id`` already holds the live whole-file lock on
+    ``file_path`` (read-only; used to distinguish a fresh acquisition from an
+    idempotent refresh for rollback bookkeeping)."""
+    claims = await db_module.get_file_claims(db, file_path)
+    lock = claims.get("file_lock")
+    return bool(lock and lock.get("session_id") == session_id)
+
+
+async def _session_holds_symbol_claim(
+    db: Any, file_path: str, symbol_name: str, session_id: str
+) -> bool:
+    """True if ``session_id`` already holds a live claim on ``symbol_name`` in
+    ``file_path`` (read-only; same rollback-bookkeeping purpose as
+    :func:`_session_holds_file_lock`)."""
+    claims = await db_module.get_symbol_claims(db, file_path)
+    return any(
+        c.get("symbol_name") == symbol_name and c.get("session_id") == session_id
+        for c in claims
+    )
+
+
+def _resource_content_lookup(
+    resource_contents: "dict[str, Any] | None", file_path: str
+) -> str | None:
+    """Best-effort lookup of caller-supplied source for ``file_path`` in the
+    optional ``resource_contents`` map, tolerant of the same backslash/``./``
+    path-separator variance :func:`_parse_touches_files` normalizes away."""
+    if not resource_contents or not isinstance(resource_contents, dict):
+        return None
+    if file_path in resource_contents:
+        val = resource_contents[file_path]
+        return val if isinstance(val, str) and val else None
+    normalized = file_path.strip().replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    for key, val in resource_contents.items():
+        k = str(key or "").strip().replace("\\", "/")
+        if k.startswith("./"):
+            k = k[2:]
+        if k == normalized and isinstance(val, str) and val:
+            return val
+    return None
+
+
+async def _sprint_item_resource_claim_gate(
+    db: Any,
+    project_id: str,
+    item_id: str,
+    session_id: str | None,
+    *,
+    resource_contents: "dict[str, Any] | None" = None,
+) -> dict[str, Any]:
+    """18c488b6 — transactional claim-time symbol/file resource-lock gate.
+
+    Parses the item's ``touches_resources`` and ACQUIRES the appropriate lock
+    (claim_file / claim_symbol — the same machinery ``claim_file``/
+    ``claim_symbol`` already use for AST/tree-sitter symbol-range resolution
+    and overlap detection) for every ``file:`` / ``symbol:`` entry, under
+    ``session_id``. All-or-nothing for this call: the first hard conflict with
+    ANOTHER live session rolls back every lock THIS call newly acquired (not
+    ones already held from earlier work) and returns ``ok=False`` with
+    structured ``conflicts`` + ``lock_scope`` — the caller (claim_sprint_item)
+    must not transition the item's status when this returns ``ok=False``.
+
+    Fail-open only for the cases that are genuinely "nothing to enforce":
+    no ``session_id`` (no identity to acquire under — every pre-18c488b6
+    caller that omits it, direct ``db_module.claim_sprint_item()`` callers
+    included, sees zero behavior change), item not found, or no declared
+    ``touches_resources``. A REAL conflict is always a hard ``ok=False``, never
+    silently swallowed.
+
+    Returns ``{"ok": True, "lock_scope": [...]}`` on success (including the
+    no-op cases above), or ``{"ok": False, "error": "RESOURCE_LOCKED",
+    "lock_scope": [...], "conflicts": [...], "message": ...}`` on conflict.
+    """
+    if not session_id:
+        return {"ok": True, "lock_scope": [], "skipped_reason": "no_session_id"}
+
+    item = await db_module.get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return {"ok": True, "lock_scope": []}
+
+    declared = db_module.parse_touches_resources(item.get("touches_resources"))
+    if not declared:
+        return {"ok": True, "lock_scope": []}
+
+    lock_scope: list[dict[str, Any]] = []
+    acquired_this_call: list[dict[str, str]] = []
+
+    async def _rollback() -> None:
+        for entry in reversed(acquired_this_call):
+            if entry["kind"] == "file":
+                await db_module.release_file(db, entry["file_path"], session_id)
+            else:
+                await db_module.release_symbol(
+                    db, session_id, entry["file_path"], entry["symbol"]
+                )
+
+    async def _blocked(entry: dict[str, Any], message: str) -> dict[str, Any]:
+        lock_scope.append(entry)
+        await _rollback()
+        return {
+            "ok": False,
+            "error": "RESOURCE_LOCKED",
+            "message": message,
+            "lock_scope": lock_scope,
+            "conflicts": [entry],
+        }
+
+    for resource in declared:
+        if resource.startswith("file:"):
+            file_path = resource[len("file:"):]
+            pre_held = await _session_holds_file_lock(db, file_path, session_id)
+            result = await db_module.claim_file(db, file_path, session_id, mode="write")
+            if result.get("claimed"):
+                lock_scope.append({
+                    "resource": resource, "scope": "file", "file_path": file_path,
+                    "acquired": True, "newly_acquired": not pre_held,
+                })
+                if not pre_held:
+                    acquired_this_call.append({"kind": "file", "file_path": file_path})
+                continue
+            return await _blocked(
+                {
+                    "resource": resource, "scope": "file", "file_path": file_path,
+                    "acquired": False,
+                    "conflict": {
+                        "reason": result.get("reason") or "locked",
+                        "holder_session_id": result.get("holder_session_id"),
+                    },
+                },
+                f"Cannot claim sprint item: resource {resource!r} is locked by "
+                f"another live session ({result.get('holder_session_id')}).",
+            )
+
+        if resource.startswith("symbol:"):
+            value = resource[len("symbol:"):]
+            file_path, sep, symbol_name = value.partition("::")
+            if not sep or not symbol_name or not file_path:
+                # Bare symbol id with no resolvable file scope (e.g. the
+                # handoff-side "symbol:<name>" shorthand) — nothing to lock.
+                lock_scope.append({
+                    "resource": resource, "scope": "none", "acquired": False,
+                    "fallback_reason": "no_file_scope",
+                })
+                continue
+
+            content = _resource_content_lookup(resource_contents, file_path)
+            fallback_reason: str | None = None
+            if content:
+                pre_held = await _session_holds_symbol_claim(
+                    db, file_path, symbol_name, session_id
+                )
+                symbol_result = await db_module.claim_symbol(
+                    db, session_id, file_path, symbol_name, content
+                )
+                if symbol_result.get("claimed"):
+                    lock_scope.append({
+                        "resource": resource, "scope": "symbol", "file_path": file_path,
+                        "symbol": symbol_name, "acquired": True,
+                        "newly_acquired": not pre_held,
+                        "line_start": symbol_result.get("line_start"),
+                        "line_end": symbol_result.get("line_end"),
+                    })
+                    if not pre_held:
+                        acquired_this_call.append({
+                            "kind": "symbol", "file_path": file_path, "symbol": symbol_name,
+                        })
+                    continue
+                if symbol_result.get("reason") in ("symbol_conflict", "file_locked"):
+                    _holder = symbol_result.get("holder_session_id")
+                    if not _holder:
+                        _conf = symbol_result.get("conflicts") or [{}]
+                        _holder = _conf[0].get("holder_session_id")
+                    return await _blocked(
+                        {
+                            "resource": resource, "scope": "symbol", "file_path": file_path,
+                            "symbol": symbol_name, "acquired": False,
+                            "conflict": {
+                                "reason": symbol_result.get("reason"),
+                                "holder_session_id": _holder,
+                                "details": symbol_result,
+                            },
+                        },
+                        f"Cannot claim sprint item: symbol {resource!r} is locked "
+                        "by another live session.",
+                    )
+                # unparseable / symbol_not_found — explicit fallback, recorded below.
+                fallback_reason = symbol_result.get("reason") or "unparseable"
+            else:
+                fallback_reason = "no_source_supplied"
+
+            pre_held_file = await _session_holds_file_lock(db, file_path, session_id)
+            file_result = await db_module.claim_file(db, file_path, session_id, mode="write")
+            if file_result.get("claimed"):
+                lock_scope.append({
+                    "resource": resource, "scope": "file", "file_path": file_path,
+                    "symbol": symbol_name, "acquired": True,
+                    "newly_acquired": not pre_held_file,
+                    "fallback_reason": fallback_reason,
+                })
+                if not pre_held_file:
+                    acquired_this_call.append({"kind": "file", "file_path": file_path})
+                continue
+            return await _blocked(
+                {
+                    "resource": resource, "scope": "file", "file_path": file_path,
+                    "symbol": symbol_name, "acquired": False,
+                    "fallback_reason": fallback_reason,
+                    "conflict": {
+                        "reason": file_result.get("reason") or "locked",
+                        "holder_session_id": file_result.get("holder_session_id"),
+                    },
+                },
+                f"Cannot claim sprint item: fallback whole-file lock for {resource!r} "
+                f"is held by another live session ({file_result.get('holder_session_id')}).",
+            )
+
+        # Other resource types (db:, route:, mcp_tool:, ...) are not
+        # code-locking concerns — left untouched by this gate.
+
+    return {"ok": True, "lock_scope": lock_scope}
+
+
+async def _rollback_sprint_item_resource_locks(
+    db: Any, session_id: str | None, lock_gate_result: "dict[str, Any] | None"
+) -> None:
+    """Release every resource this call's :func:`_sprint_item_resource_claim_gate`
+    NEWLY acquired, used when the gate itself succeeded but the sprint item's
+    status transition subsequently failed/raced/was blocked by another gate
+    (DEFERRED/SUPERSEDED/WAVE_GATE_PENDING/UNPROSPECTED, or another session won
+    the claim race) — the resource locks must not outlive a claim that never
+    actually landed. Only entries this specific call newly acquired are
+    touched (tracked via each lock_scope entry's own claim call, not a bulk
+    session release), so a pre-existing claim from earlier work is untouched.
+    """
+    if not session_id or not lock_gate_result:
+        return
+    for entry in lock_gate_result.get("lock_scope") or []:
+        if not entry.get("acquired") or not entry.get("newly_acquired"):
+            continue
+        scope = entry.get("scope")
+        try:
+            if scope == "file":
+                await db_module.release_file(db, entry["file_path"], session_id)
+            elif scope == "symbol":
+                await db_module.release_symbol(
+                    db, session_id, entry["file_path"], entry["symbol"]
+                )
+        except Exception:  # noqa: BLE001 — best-effort cleanup, never raise from here
+            pass
+
+
 async def _board_change_for_session(
     db: Any,
     project_id: str,
@@ -2263,7 +2546,9 @@ async def _handle_project_tools(
     """Dispatch group: create_project, set_parent_project, rename_project,
     register_session, start_session, list_projects, get_project_by_name,
     get_goal, set_goal, set_north_star, merge_project, add_custom_hook,
-    get_custom_hooks, delete_custom_hook.
+    get_custom_hooks, delete_custom_hook, get_capability_manifest,
+    set_capability_manifest, set_capability_profile, clear_capability_profile,
+    get_effective_capability_profile.
 
     97d695c4 — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -2287,6 +2572,11 @@ async def _handle_project_tools(
         handle_add_custom_hook,
         handle_get_custom_hooks,
         handle_delete_custom_hook,
+        handle_get_capability_manifest,
+        handle_set_capability_manifest,
+        handle_set_capability_profile,
+        handle_clear_capability_profile,
+        handle_get_effective_capability_profile,
     )
 
     # Tools that need no extra context beyond the standard five parameters.
@@ -2304,6 +2594,11 @@ async def _handle_project_tools(
         "add_custom_hook": handle_add_custom_hook,
         "get_custom_hooks": handle_get_custom_hooks,
         "delete_custom_hook": handle_delete_custom_hook,
+        "get_capability_manifest": handle_get_capability_manifest,
+        "set_capability_manifest": handle_set_capability_manifest,
+        "set_capability_profile": handle_set_capability_profile,
+        "clear_capability_profile": handle_clear_capability_profile,
+        "get_effective_capability_profile": handle_get_effective_capability_profile,
     }
 
     if name in _standard_dispatch:
@@ -2455,6 +2750,20 @@ async def _handle_task_tools(
             args.get("mode"),
             session_id,
         )
+        # b8f89491 — resolve + surface the effective sprint-version scope so a
+        # caller never has to infer it: an explicit version argument always
+        # wins; otherwise fall back to the calling session's own stored
+        # sprint_version. Mirrors generate_handoff's own resolution exactly
+        # (same helper) so this reported scope can never disagree with what
+        # generate_handoff actually used to build `content`.
+        _requested_version = args.get("version")
+        if isinstance(_requested_version, str) and not _requested_version.strip():
+            _requested_version = None
+        _effective_version = _requested_version
+        if _effective_version is None and session_id:
+            _effective_version = await handoff_module_local._resolve_session_sprint_version(
+                db, session_id
+            )
         # Fetch recent commits for reconcile annotations (non-fatal)
         _gh_project = await db_module.get_project(db, args["project_id"])
         _gh_commits = await _fetch_recent_commits(_gh_project or {}, tenant)
@@ -2500,6 +2809,7 @@ async def _handle_task_tools(
                     identity=_resolve_caller_identity(tenant),
                     force_include_ids=_force_include_ids,
                     skip_ai_summary=_skip_ai,
+                    version=_requested_version,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -2576,6 +2886,18 @@ async def _handle_task_tools(
                 )
             except Exception:  # noqa: BLE001
                 _goal_compliance = None
+        # 98aaccf4 — machine-readable effective capability contract, emitted
+        # on every generate_handoff mode (the surrounding dict construction
+        # is common to all of them regardless of which branch built `content`
+        # above). board_stale mirrors _handoff_degraded: the L0 emergency
+        # fallback means this handoff's own board/profile snapshot is known
+        # incomplete, so a contract built alongside it must not silently
+        # report executable=true. Fully guarded — a failure degrades to no
+        # field rather than breaking the mandatory handoff.
+        _capability_contract = await handoff_module_local.build_effective_capability_contract(
+            db, args["project_id"], board_stale=_handoff_degraded,
+            version=_effective_version,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -2589,6 +2911,18 @@ async def _handle_task_tools(
             "insight_hints": _insight_hints[:5],
             "goal_length_warning": _goal_warn,
             "goal_compliance": _goal_compliance,
+            "capability_contract": _capability_contract,
+            # b8f89491 — machine-readable scope: which sprint-version bucket
+            # this handoff actually resolved to, and why (explicit argument vs.
+            # session-derived vs. unscoped). effective_version is None when the
+            # call is genuinely unscoped (no version arg, no session, or a
+            # session with no stored sprint_version) — same meaning as before
+            # this field existed, just made explicit rather than silent.
+            "scope": {
+                "requested_version": _requested_version,
+                "effective_version": _effective_version,
+                "session_id": session_id,
+            },
         }
     if name == "load_handoff":
         # 5efe254b — trusted retrieval of the latest stored handoff for a project
@@ -3301,7 +3635,8 @@ async def _handle_sprint_tools(
     analyze_sprint, claim_sprint_item, add_subtask, split_sprint_item,
     merge_sprint_items, complete_sprint_item, add_sprint_item_pointer,
     get_sprint_item_pointers, resolve_sprint_item_pointers,
-    delete_sprint_item_pointer, complete_wave_gate, configure_wave_gate.
+    delete_sprint_item_pointer, complete_wave_gate, configure_wave_gate,
+    start_wave_run, finalize_wave_run, resume_wave.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -3333,6 +3668,9 @@ async def _handle_sprint_tools(
         handle_delete_sprint_item_pointer,
         handle_complete_wave_gate,
         handle_configure_wave_gate,
+        handle_start_wave_run,
+        handle_finalize_wave_run,
+        handle_resume_wave,
     )
 
     _standard_dispatch: dict[str, Any] = {
@@ -3358,6 +3696,9 @@ async def _handle_sprint_tools(
         "delete_sprint_item_pointer": handle_delete_sprint_item_pointer,
         "complete_wave_gate": handle_complete_wave_gate,
         "configure_wave_gate": handle_configure_wave_gate,
+        "start_wave_run": handle_start_wave_run,
+        "finalize_wave_run": handle_finalize_wave_run,
+        "resume_wave": handle_resume_wave,
     }
 
     if name in _standard_dispatch:

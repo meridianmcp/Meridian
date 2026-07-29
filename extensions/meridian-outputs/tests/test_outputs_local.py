@@ -1559,8 +1559,11 @@ class TestRebuildWalkDeadlineAwareness:
         blows the budget, exactly 6ba77ada's reported signature."""
         real_walk = OL._walk_safe_output_files
 
-        def slow_walk(outputs_dir: str, *, exclude_patterns: tuple = ()):
-            for p in real_walk(outputs_dir, exclude_patterns=exclude_patterns):
+        def slow_walk(outputs_dir: str, *, exclude_patterns: tuple = (),
+                       on_error=None):
+            for p in real_walk(
+                outputs_dir, exclude_patterns=exclude_patterns, on_error=on_error,
+            ):
                 time.sleep(delay)
                 yield p
 
@@ -3571,3 +3574,502 @@ class TestSearchLogs:
         logs_dir = _make_dir(tmp_path, {"app.log": long_line + "\n"})
         result = OL.search_logs(logs_dir, "error", limit=10, max_line_chars=50)
         assert len(result["hits"][0]["line"]) <= 53  # 50 chars + "..."
+
+
+# ---------------------------------------------------------------------------
+# Explicit convergence state (item 6af1518d, requirement 1 & 2)
+# ---------------------------------------------------------------------------
+
+class TestConvergenceState:
+    @duckdb_required
+    def test_fully_converged_root_state(self, tmp_path: Path) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            state = idx.get_convergence_state()
+            assert state.converged is True
+            assert state.walk_complete is True
+            assert state.pending_count == 0
+            assert state.indexed_count == 1
+            assert state.expected_count == 1
+            assert state.last_error is None
+            assert state.scan_boundary is None
+            assert state.subtree is None
+            assert state.fts_pending is False
+            assert state.partial is False
+        finally:
+            idx.close()
+
+    def test_missing_dir_returns_error(self) -> None:
+        result = OL.get_convergence_state("/no/such/dir")
+        assert "error" in result
+
+    @duckdb_required
+    def test_module_wrapper_matches_instance_state(self, tmp_path: Path) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        OL.search_outputs(str(tmp_path), "col")
+        state = OL.get_convergence_state(str(tmp_path))
+        assert state["converged"] is True
+        # >= 1, not == 1: search_outputs uses the persistent on-disk cache
+        # (_get_cached_index), whose own auto-created .gitignore (via
+        # ensure_gitignored) is itself a real, indexable file at the
+        # outputs_dir root -- unrelated to this test's own file count.
+        assert state["indexed_count"] >= 1
+
+    @duckdb_required
+    def test_walk_in_progress_reports_not_converged(self, tmp_path: Path) -> None:
+        """Directly synthesizes an in-progress walk (rather than racing real
+        timing) so this asserts get_convergence_state()'s own logic, not
+        scheduler jitter."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.get_convergence_state().converged is True
+            idx._walk_state = object()  # sentinel: a pass is "in progress"
+            idx._scan_boundary = str(tmp_path / "a.csv")
+            state = idx.get_convergence_state()
+            assert state.converged is False
+            assert state.walk_complete is False
+            assert state.scan_boundary == str(tmp_path / "a.csv")
+        finally:
+            idx._walk_state = None
+            idx.close()
+
+    @duckdb_required
+    def test_pending_stale_reported_and_blocks_convergence(self, tmp_path: Path) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            idx._pending_stale[str(tmp_path / "a.csv")] = (1.0, 1)
+            state = idx.get_convergence_state()
+            assert state.pending_count == 1
+            assert state.converged is False
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_db_write_error_surfaced_as_last_error(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.last_db_write_error = "simulated write failure"
+            state = idx.get_convergence_state()
+            assert state.last_error == "simulated write failure"
+            assert state.converged is False
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_fts_pending_blocks_convergence(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            idx._fts_pending = True
+            state = idx.get_convergence_state()
+            assert state.fts_pending is True
+            assert state.converged is False
+        finally:
+            idx.close()
+
+
+class TestWalkErrorSurfacedInConvergence:
+    """6af1518d requirement 1: 'last error (if the walk hit something it
+    couldn't read)' -- _walk_safe_output_files's on_error hook must be wired
+    all the way through _ResumableFileWalk into OutputsFtsIndex and be
+    visible on ConvergenceState.last_error, while the walk itself keeps
+    making best-effort progress past the unreadable directory."""
+
+    @duckdb_required
+    def test_unreadable_subdir_surfaced_as_last_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        good = tmp_path / "good"
+        good.mkdir()
+        (good / "a.csv").write_text("col\n1", encoding="utf-8")
+        bad = tmp_path / "bad_dir"
+        bad.mkdir()
+        (bad / "b.csv").write_text("col\n2", encoding="utf-8")
+
+        real_scandir = os.scandir
+        bad_norm = os.path.normpath(str(bad))
+
+        def flaky_scandir(path):
+            if os.path.normpath(str(path)) == bad_norm:
+                raise PermissionError("simulated permission denied")
+            return real_scandir(path)
+
+        monkeypatch.setattr(OL.os, "scandir", flaky_scandir)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            state = idx.get_convergence_state()
+            assert state.last_error is not None
+            assert "bad_dir" in state.last_error
+            assert any("a.csv" in p for p in idx._row_cache)
+            assert not any("b.csv" in p for p in idx._row_cache)
+        finally:
+            idx.close()
+
+    def test_on_error_callback_receives_dir_and_exception(
+        self, tmp_path: Path,
+    ) -> None:
+        """Unit-level check directly on _walk_safe_output_files, independent
+        of OutputsFtsIndex, so a regression here is diagnosable without the
+        full rebuild() machinery."""
+        bad = tmp_path / "bad"
+        bad.mkdir()
+        real_scandir = os.scandir
+
+        def flaky_scandir(path):
+            if os.path.normpath(str(path)) == os.path.normpath(str(bad)):
+                raise OSError("boom")
+            return real_scandir(path)
+
+        seen: list[tuple[str, OSError]] = []
+        with patch("os.scandir", side_effect=flaky_scandir):
+            list(OL._walk_safe_output_files(
+                str(tmp_path), on_error=lambda p, e: seen.append((p, e)),
+            ))
+        assert len(seen) == 1
+        assert os.path.normpath(seen[0][0]) == os.path.normpath(str(bad))
+        assert isinstance(seen[0][1], OSError)
+
+    def test_on_error_callback_exception_does_not_break_walk(
+        self, tmp_path: Path,
+    ) -> None:
+        """A misbehaving on_error callback must never abort the walk itself
+        -- it's purely observational."""
+        (tmp_path / "ok.csv").write_text("col\n1", encoding="utf-8")
+
+        def boom_callback(dir_path: str, exc: OSError) -> None:
+            raise RuntimeError("observer callback misbehaving")
+
+        # No unreadable directory here -- this just proves a NON-raising
+        # walk still completes normally when on_error is supplied but never
+        # actually invoked, guarding the plumbing itself.
+        found = list(OL._walk_safe_output_files(str(tmp_path), on_error=boom_callback))
+        assert any("ok.csv" in p for p in found)
+
+
+class TestSubtreeConvergenceHeuristic:
+    """6af1518d requirement 2: a subtree-scoped convergence answer must be
+    correctly derived from the walk's own deterministic sorted-DFS order,
+    not just mirror whole-root state."""
+
+    @duckdb_required
+    def test_subtree_not_yet_reached_is_not_converged(self, tmp_path: Path) -> None:
+        aaa = tmp_path / "aaa"
+        aaa.mkdir()
+        zzz = tmp_path / "zzz"
+        zzz.mkdir()
+        (aaa / "f1.csv").write_text("col\n1", encoding="utf-8")
+        (zzz / "f2.csv").write_text("col\n2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._walk_state = object()
+            idx._scan_boundary = str(aaa / "f1.csv")
+            state = idx.get_convergence_state(subtree=str(zzz))
+            assert state.converged is False
+            assert state.walk_complete is False
+            assert state.subtree == str(zzz)
+        finally:
+            idx._walk_state = None
+            idx.close()
+
+    @duckdb_required
+    def test_subtree_already_scanned_past_is_converged(self, tmp_path: Path) -> None:
+        aaa = tmp_path / "aaa"
+        aaa.mkdir()
+        mmm = tmp_path / "mmm"
+        mmm.mkdir()
+        zzz = tmp_path / "zzz"
+        zzz.mkdir()
+        (aaa / "f1.csv").write_text("col\n1", encoding="utf-8")
+        (mmm / "f2.csv").write_text("col\n2", encoding="utf-8")
+        (zzz / "f3.csv").write_text("col\n3", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            # Simulate an in-progress full-root walk that has already moved
+            # past "aaa" and into "mmm" -- boundary sorts after "aaa".
+            idx._walk_state = object()
+            idx._scan_boundary = str(mmm / "f2.csv")
+            idx._row_cache[str(aaa / "f1.csv")] = OL.OutputRow(
+                path=str(aaa / "f1.csv"), content=None, mtime=1.0, sha256="x",
+                size=1, generating_script=None,
+            )
+            state = idx.get_convergence_state(subtree=str(aaa))
+            assert state.converged is True
+            # The overall root pass is still in progress even though this
+            # particular subtree is already done.
+            assert state.walk_complete is False
+        finally:
+            idx._walk_state = None
+            idx.close()
+
+    @duckdb_required
+    def test_subtree_still_inside_boundary_is_not_converged(self, tmp_path: Path) -> None:
+        mmm = tmp_path / "mmm"
+        mmm.mkdir()
+        (mmm / "f1.csv").write_text("col\n1", encoding="utf-8")
+        (mmm / "f2.csv").write_text("col\n2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._walk_state = object()
+            # Boundary is INSIDE mmm (its first file) -- mmm itself may still
+            # have more files queued (f2.csv) even though the walk has
+            # started visiting it.
+            idx._scan_boundary = str(mmm / "f1.csv")
+            state = idx.get_convergence_state(subtree=str(mmm))
+            assert state.converged is False
+        finally:
+            idx._walk_state = None
+            idx.close()
+
+    def test_no_walk_in_progress_means_any_subtree_converged(self, tmp_path: Path) -> None:
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            # _walk_state is None by default -- no pass currently running.
+            state = idx.get_convergence_state(subtree=str(sub))
+            assert state.walk_complete is True
+            assert state.converged is True
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Provenance-triggered targeted registration (item 6af1518d, requirement 3)
+# ---------------------------------------------------------------------------
+
+class TestProvenanceTriggeredRegistration:
+    @duckdb_required
+    def test_register_priority_path_indexes_immediately(self, tmp_path: Path) -> None:
+        f = tmp_path / "new_output.csv"
+        f.write_text("col\nvalue=priority\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            result = idx.register_priority_path(str(f))
+            assert result["indexed"] == 1
+            assert os.path.normpath(str(f)) in idx._priority_registered
+            hits = idx.search("priority")
+            assert len(hits) == 1
+            assert "new_output.csv" in hits[0]["path"]
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_register_priority_path_queues_not_yet_existing_file(
+        self, tmp_path: Path,
+    ) -> None:
+        missing = tmp_path / "not_written_yet.csv"
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            result = idx.register_priority_path(str(missing))
+            assert result["indexed"] == 0
+            assert result["queued"] == 1
+            assert os.path.normpath(str(missing)) in idx._pending_stale
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_index_paths_skips_secret_paths(self, tmp_path: Path) -> None:
+        secret = tmp_path / ".env"
+        secret.write_text("SECRET=x", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            result = idx.index_paths([str(secret)])
+            assert result["indexed"] == 0
+            assert result["paths"] == []
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_index_paths_does_not_reset_in_progress_root_partial_flag(
+        self, tmp_path: Path,
+    ) -> None:
+        """index_paths()/_build_rows_for_paths() must NEVER touch
+        last_rebuild_partial -- a small targeted registration must not be
+        able to make a genuinely-in-progress root rebuild look converged."""
+        f = tmp_path / "priority.csv"
+        f.write_text("col\nvalue=1\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.last_rebuild_partial = True
+            idx.index_paths([str(f)])
+            assert idx.last_rebuild_partial is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_record_provenance_registers_path_for_prompt_indexing(
+        self, tmp_path: Path,
+    ) -> None:
+        """The whole point of requirement 3: a provenance-known path becomes
+        searchable via search_outputs WITHOUT waiting for the ambient
+        full-root walk to reach it. The ambient walk is deterministically
+        crippled to 1 file/call (no timing race) so it provably could not
+        have organically reached an alphabetically-last new file within a
+        single search_outputs call on its own."""
+        from meridian_outputs import annotate as AN
+
+        for i in range(30):
+            (tmp_path / f"noise_{i:03d}.csv").write_text(
+                f"col\nvalue={i}\n", encoding="utf-8",
+            )
+        new_file = tmp_path / "zzz_after_everything_new_output.csv"
+        new_file.write_text("col\nvalue=freshly_produced\n", encoding="utf-8")
+
+        idx = OL._get_cached_index(str(tmp_path))
+        idx._max_batch = 1
+        idx._max_batch_overridden = True
+
+        result = AN.record_provenance(
+            str(tmp_path), str(new_file), generating_script="gen.py",
+        )
+        assert "error" not in result
+
+        search_result = OL.search_outputs(str(tmp_path), "freshly_produced")
+        hit_paths = [h["path"] for h in search_result["hits"]]
+        assert any("zzz_after_everything_new_output.csv" in p for p in hit_paths), (
+            "provenance-registered path was not searchable promptly -- "
+            "requirement 3 (targeted registration ahead of the crippled "
+            "ambient walk) was not satisfied"
+        )
+
+    @duckdb_required
+    def test_record_provenance_failure_does_not_block_on_registration_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """register_priority_path is a best-effort latency optimisation --
+        if it raises, record_provenance's own (already-durable) write must
+        still succeed and be returned normally."""
+        from meridian_outputs import annotate as AN
+
+        f = tmp_path / "output.csv"
+        f.write_text("col\n1", encoding="utf-8")
+
+        def _boom(outputs_dir: str, path: str):
+            raise RuntimeError("simulated indexing failure")
+
+        monkeypatch.setattr(OL, "register_priority_path", _boom)
+        result = AN.record_provenance(str(tmp_path), str(f))
+        assert "error" not in result
+        assert result["path"] == str(f)
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical subtree indexing (item 6af1518d, requirement 4)
+# ---------------------------------------------------------------------------
+
+class TestHierarchicalSubtreeIndexing:
+    def test_get_subtree_index_rejects_path_outside_root(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "definitely_elsewhere_meridian_6af1518d"
+        with pytest.raises(ValueError):
+            OL.get_subtree_index(str(tmp_path), str(outside))
+
+    @duckdb_required
+    def test_get_subtree_index_accepts_root_itself(self, tmp_path: Path) -> None:
+        idx = OL.get_subtree_index(str(tmp_path), str(tmp_path))
+        assert os.path.normpath(idx.outputs_dir) == os.path.normpath(str(tmp_path))
+
+    @duckdb_required
+    def test_subtree_seeded_from_already_converged_root(self, tmp_path: Path) -> None:
+        sub = tmp_path / "defense_plots"
+        sub.mkdir()
+        (sub / "results.csv").write_text("col\nvalue=1\n", encoding="utf-8")
+        (tmp_path / "other.csv").write_text("col\nvalue=2\n", encoding="utf-8")
+
+        root_result = OL.search_outputs(str(tmp_path), "value")
+        assert root_result["convergence"]["converged"] is True
+
+        sub_idx = OL.get_subtree_index(str(tmp_path), str(sub))
+        try:
+            seeded_paths = {os.path.normpath(p) for p in sub_idx._row_cache}
+            assert os.path.normpath(str(sub / "results.csv")) in seeded_paths, (
+                "subtree index was not seeded from the already-converged "
+                "root index -- requirement 4 (reuse a slice of the parent) "
+                "was not satisfied"
+            )
+            assert os.path.normpath(str(tmp_path / "other.csv")) not in seeded_paths, (
+                "subtree index seeded a file OUTSIDE its own scope"
+            )
+            # Seeded via a direct row copy -- the subtree's OWN walk never ran.
+            assert sub_idx._walk_state is None
+            hits = sub_idx.search("value=1")
+            assert len(hits) == 1
+        finally:
+            sub_idx.close()
+
+    @duckdb_required
+    def test_seed_from_ancestor_never_overwrites_local_write(self, tmp_path: Path) -> None:
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        f = sub / "a.csv"
+        f.write_text("col\nvalue=root_version\n", encoding="utf-8")
+
+        OL.search_outputs(str(tmp_path), "value")  # converge the root
+
+        sub_idx = OL.OutputsFtsIndex(str(sub))
+        try:
+            sub_idx.rebuild()  # subtree's own (independent) walk indexes it
+            root_idx = OL._get_cached_index(str(tmp_path))
+            copied = sub_idx.seed_from_ancestor(root_idx, str(sub))
+            # Already present locally -- nothing should be overwritten.
+            assert copied == 0
+        finally:
+            sub_idx.close()
+
+    @duckdb_required
+    def test_search_outputs_subtree_param_scopes_results(self, tmp_path: Path) -> None:
+        sub = tmp_path / "defense_plots"
+        sub.mkdir()
+        (sub / "a.csv").write_text("col\nneedle=1\n", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\nneedle=1\n", encoding="utf-8")
+
+        result = OL.search_outputs(str(tmp_path), "needle", subtree=str(sub))
+        assert result["subtree"] == str(sub)
+        paths = [h["path"] for h in result["hits"]]
+        assert any("a.csv" in p for p in paths)
+        assert all("b.csv" not in p for p in paths)
+
+    def test_search_outputs_subtree_missing_returns_error(self, tmp_path: Path) -> None:
+        result = OL.search_outputs(str(tmp_path), "q", subtree=str(tmp_path / "nope"))
+        assert "error" in result
+
+    def test_search_outputs_subtree_outside_root_returns_error(
+        self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory,
+    ) -> None:
+        other = tmp_path_factory.mktemp("outside_root")
+        result = OL.search_outputs(str(tmp_path), "q", subtree=str(other))
+        assert "error" in result
+
+    @duckdb_required
+    def test_search_outputs_subtree_zero_hits_flagged_partial_not_genuine(
+        self, tmp_path: Path,
+    ) -> None:
+        """Direct regression test for the real incident behind this item:
+        a zero-hit result on a not-yet-converged SUBTREE must be flagged,
+        not silently indistinguishable from a genuine miss. The subtree's
+        walk is deterministically batch-capped to 1 file/call so this is
+        guaranteed not-yet-converged after exactly one search_outputs call
+        (no timing race)."""
+        sub = tmp_path / "defense_plots"
+        sub.mkdir()
+        for i in range(5):
+            (sub / f"f{i}.csv").write_text(f"col\nvalue={i}\n", encoding="utf-8")
+
+        sub_idx = OL.get_subtree_index(str(tmp_path), str(sub))
+        sub_idx._max_batch = 1
+        sub_idx._max_batch_overridden = True
+
+        result = OL.search_outputs(
+            str(tmp_path), "no_such_term_at_all_xyz", subtree=str(sub),
+        )
+        assert result["hits"] == []
+        assert result["convergence"]["converged"] is False
+        assert result["convergence"]["subtree"] is None  # scoped index itself
+        assert "zero_hits_warning" in result

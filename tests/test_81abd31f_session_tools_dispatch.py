@@ -313,6 +313,54 @@ async def test_set_executor_config_merges_repo_paths(db, project):
     assert cfg is not None
 
 
+@pytest.mark.asyncio
+async def test_set_executor_config_max_planning_turns_round_trips(db, project):
+    """75ac1c8e — max_planning_turns is copied through set_executor_config and
+    feeds directly into executor_config.build_execution_policy."""
+    from meridian.executor_config import build_execution_policy
+
+    pid = project["id"]
+    await st_mod.handle_set_executor_config(
+        {"project_id": pid, "max_planning_turns": 5},
+        db, _DATA_DIR, None, None,
+    )
+    cfg = await db_module.get_executor_config(db, pid)
+    assert cfg["max_planning_turns"] == 5
+    policy = build_execution_policy(cfg, execution_mode="autonomous")
+    assert policy["max_planning_turns"] == 5
+
+    # An unsafe override (persisted as-is, same convention as max_turns) is
+    # still rejected at policy-build time -- never trusted verbatim.
+    await st_mod.handle_set_executor_config(
+        {"project_id": pid, "max_planning_turns": -3},
+        db, _DATA_DIR, None, None,
+    )
+    cfg2 = await db_module.get_executor_config(db, pid)
+    policy2 = build_execution_policy(cfg2, execution_mode="autonomous")
+    assert policy2["max_planning_turns"] == 1  # falls back to immediate default
+
+
+@pytest.mark.asyncio
+async def test_set_executor_config_other_keys_preserved_with_max_planning_turns(db, project):
+    """3adbc954-style regression guard: setting max_planning_turns must not
+    silently drop other already-copied scalar keys (context_threshold,
+    isolation, ...)."""
+    pid = project["id"]
+    await st_mod.handle_set_executor_config(
+        {
+            "project_id": pid,
+            "context_threshold": 40,
+            "isolation": "worktree",
+            "max_planning_turns": 3,
+        },
+        db, _DATA_DIR, None, None,
+    )
+    cfg = await db_module.get_executor_config(db, pid)
+    assert cfg["context_threshold"] == 40
+    assert cfg["isolation"] == "worktree"
+    assert cfg["max_planning_turns"] == 3
+
+
 # ---------------------------------------------------------------------------
 # get_session_log
 # ---------------------------------------------------------------------------

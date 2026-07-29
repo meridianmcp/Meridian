@@ -124,3 +124,101 @@ def test_ensure_running_still_noop_when_already_running(monkeypatch):
     assert probe.call_count == 1
     asyncio.run(sp.ensure_running())
     assert probe.call_count == 1  # no second probe — already running
+
+
+# ---------------------------------------------------------------------------
+# ddd46cc8 — unified slot lifecycle diagnostics: ensure_running must classify
+# the cold-spawn readiness OUTCOME onto SlotProxy.diagnostics (HEALTHY /
+# STARTUP_TIMEOUT), and a startup-timeout classification must stay TRANSIENT
+# (never immediately quarantine-eligible) since a cold cache can legitimately
+# still be resolving.
+# ---------------------------------------------------------------------------
+
+def test_ensure_running_marks_diagnostics_healthy_on_successful_probe(monkeypatch):
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    sp = tc.SlotProxy(["proxy", "cmd"], 8813, "dc")
+    assert sp.diagnostics.state is tc.SlotState.CONFIGURED
+    asyncio.run(sp.ensure_running())
+
+    assert sp.diagnostics.state is tc.SlotState.HEALTHY
+    assert sp.diagnostics.last_healthy_at is not None
+    assert sp.diagnostics.retry_count == 0
+    assert sp.diagnostics.quarantine_reason is None
+
+
+def test_ensure_running_marks_diagnostics_startup_timeout_on_failed_probe(monkeypatch):
+    """A cold-spawn probe that never answers is STARTUP_TIMEOUT — a TRANSIENT
+    state (in tc._TRANSIENT_STATES, never in tc._DETERMINISTIC_STATES) since a
+    cold uvx/npx cache may simply still be resolving in the background."""
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+
+    sp = tc.SlotProxy(["proxy", "cmd"], 8813, "dc")
+    asyncio.run(sp.ensure_running())
+
+    assert sp.diagnostics.state is tc.SlotState.STARTUP_TIMEOUT
+    assert sp.diagnostics.state in tc._TRANSIENT_STATES
+    assert sp.diagnostics.state not in tc._DETERMINISTIC_STATES
+    assert sp.diagnostics.root_cause
+    assert sp.diagnostics.retry_count == 1
+
+
+def test_ensure_running_startup_timeout_then_recovery_resets_diagnostics(monkeypatch):
+    """A slot that misses its readiness window once but comes up on the NEXT
+    ensure_running() call (post idle-kill respawn, say) fully recovers —
+    retry_count/quarantine bookkeeping resets to a clean HEALTHY state."""
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+    probe = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(tc, "_probe_slot_health", probe)
+
+    sp = tc.SlotProxy(["proxy", "cmd"], 8813, "dc")
+    asyncio.run(sp.ensure_running())
+    assert sp.diagnostics.state is tc.SlotState.STARTUP_TIMEOUT
+    assert sp.diagnostics.retry_count == 1
+
+    # Force a fresh spawn attempt (idle-kill would normally do this).
+    sp.kill(reason="idle_killed")
+    assert sp.diagnostics.state is tc.SlotState.IDLE_KILLED
+    asyncio.run(sp.ensure_running())
+
+    assert sp.diagnostics.state is tc.SlotState.HEALTHY
+    assert sp.diagnostics.retry_count == 0
+    assert sp.diagnostics.quarantine_reason is None
+
+
+def test_ensure_running_dependency_missing_launch_failure_is_deterministic(monkeypatch):
+    """A launcher binary/interpreter that's missing (FileNotFoundError from
+    Popen — the confirmed pattern for a missing runtime dependency) classifies
+    as DEPENDENCY_MISSING, a DETERMINISTIC state, not the transient
+    STARTUP_TIMEOUT the probe-timeout case above gets."""
+    def boom(cmd, *a, **k):
+        raise FileNotFoundError("no such file: python")
+    monkeypatch.setattr(tc.subprocess, "Popen", boom)
+
+    sp = tc.SlotProxy(["python", "-m", "some_missing_connector"], 8813, "docs")
+    asyncio.run(sp.ensure_running())  # must not raise
+
+    assert sp.diagnostics.state is tc.SlotState.DEPENDENCY_MISSING
+    assert sp.diagnostics.state in tc._DETERMINISTIC_STATES
+    assert "python" in sp.diagnostics.root_cause
+    assert not sp.is_running
+
+
+def test_ensure_running_generic_launch_exception_is_child_crashed(monkeypatch):
+    """A launch failure that ISN'T a missing-executable signature (e.g. a
+    generic OSError) still classifies deterministically, but as the more
+    generic CHILD_CRASHED rather than the specific DEPENDENCY_MISSING."""
+    def boom(cmd, *a, **k):
+        raise OSError("some other launch failure")
+    monkeypatch.setattr(tc.subprocess, "Popen", boom)
+
+    sp = tc.SlotProxy(["some", "cmd"], 8813, "dc")
+    asyncio.run(sp.ensure_running())
+
+    assert sp.diagnostics.state is tc.SlotState.CHILD_CRASHED
+    assert sp.diagnostics.state in tc._DETERMINISTIC_STATES
