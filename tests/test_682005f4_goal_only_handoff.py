@@ -393,3 +393,74 @@ async def test_starter_preview_full_batch_includes_all_pending_ids(db, tmp_path)
     )
     for iid in ids:
         assert iid in content
+
+
+# ---------------------------------------------------------------------------
+# 9c6cac08 (665 follow-up) — deterministic paste-ready serialization and
+# scope fidelity, specific to the bare goal-only mode this file covers.
+# ---------------------------------------------------------------------------
+
+
+_GOAL_TOKEN_RE = re.compile(r"<goal_token>[^<]*</goal_token>")
+
+
+def _strip_goal_token(content: str) -> str:
+    return _GOAL_TOKEN_RE.sub("<goal_token>STRIPPED</goal_token>", content)
+
+
+@pytest.mark.asyncio
+async def test_goal_mode_repeated_calls_deterministic_modulo_token(db, tmp_path):
+    """Two generate_handoff(mode='goal') calls against IDENTICAL DB state
+    (including a durable pointer, which mode='goal' inlines) must be
+    byte-identical apart from the single-use goal_token."""
+    p = await db_module.create_project(db, "goal-mode-determinism")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the migration guard")
+    await db_module.add_sprint_item_pointer(
+        db,
+        p["id"],
+        item["id"],
+        "code",
+        [
+            {
+                "uri": "file:meridian/db/migrations.py",
+                "selector": {"type": "range", "start_line": 100, "end_line": 120},
+            }
+        ],
+        label="guard site",
+    )
+
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    assert content_a != content_b  # tokens differ — fresh nonce every call
+    assert _strip_goal_token(content_a) == _strip_goal_token(content_b)
+
+
+@pytest.mark.asyncio
+async def test_goal_mode_scope_equals_requested_pending_items_exactly(db, tmp_path):
+    """With no exclusions in play, the claimable batch's id set must equal
+    EXACTLY the set get_sprint_items(version=..., pending) returns for that
+    version — no fewer (silent drop), no more (silent broadening from
+    another version)."""
+    p = await db_module.create_project(db, "goal-mode-scope-exact")
+    ids_v1 = set()
+    for i in range(3):
+        it = await db_module.add_sprint_item(
+            db, p["id"], "v1", f"v1 item {i}", force=True
+        )
+        ids_v1.add(it["id"])
+    await db_module.add_sprint_item(db, p["id"], "v2", "v2 item, out of scope")
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal", version="v1",
+    )
+    sprint_items_block = _sprint_items_tag_body(content)
+    emitted_ids = {
+        tok.strip().rstrip(".") for tok in
+        sprint_items_block.split("Complete sprint items:", 1)[-1].split(",")
+        if tok.strip().rstrip(".")
+    }
+    assert emitted_ids == ids_v1

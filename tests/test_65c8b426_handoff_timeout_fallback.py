@@ -70,6 +70,44 @@ async def test_generate_handoff_l0_fallback_mode_and_degraded_flag(db, tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_generate_handoff_l0_fallback_capability_contract_reports_stale_non_executable(
+    db, tmp_path, monkeypatch
+):
+    """9c6cac08 (665 follow-up) — the L0 emergency fallback's own capability_
+    contract must visibly report board_stale=True / executable=False with a
+    'stale_board_snapshot' reason, end-to-end through the REAL timeout
+    trigger (mcp/handler.py's _handoff_degraded -> board_stale plumbing),
+    not just via a direct build_capability_contract(board_stale=True) unit
+    call (already covered in test_capability_contract.py). A degraded
+    handoff that silently reported executable=True would be exactly the
+    'silently becoming an empty normal handoff' failure mode this item
+    guards against."""
+    p = await db_module.create_project(db, "stale-e2e-proj")
+    await db_module.set_goal(db, p["id"], "do things", sprint="v1")
+
+    async def _mock_wait_for(coro, timeout):
+        coro.close()
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(asyncio, "wait_for", _mock_wait_for)
+
+    result = await mh._handle_task_tools(
+        "generate_handoff",
+        {"project_id": p["id"]},
+        db,
+        str(tmp_path),
+        tenant=None,
+        _mcp_tenant_id=None,
+    )
+    assert result["degraded"] is True
+    contract = result.get("capability_contract")
+    assert contract is not None, "L0 fallback must still emit a capability_contract"
+    assert contract["board_stale"] is True
+    assert contract["executable"] is False
+    assert "stale_board_snapshot" in contract["executable_reasons"]
+
+
+@pytest.mark.asyncio
 async def test_generate_handoff_success_has_degraded_false(db, tmp_path):
     """On a successful handoff, degraded must be False (not absent, not True)."""
     p = await db_module.create_project(db, "success-proj")
