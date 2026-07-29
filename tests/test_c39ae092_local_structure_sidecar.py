@@ -7,6 +7,7 @@ which prefers the local path when index_db_path is supplied.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import sys
@@ -290,6 +291,190 @@ def test_structure_and_paragraph_index_coexist_in_same_sidecar(tmp_path):
     # Neither index corrupted the other.
     assert para_summary["paragraph_count"] > 0
     assert struct_summary["heading_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# e9b2cd2b — SHA-256 freshness fingerprint + completeness boundary marker
+#
+# index_docx_structure now stamps docx_index_meta with a source SHA-256
+# fingerprint and an explicit "structure_complete" boundary marker, and
+# get_local_structure_elements fails closed (raises) when the sidecar is
+# stale or the result of an interrupted indexing run, rather than silently
+# handing back partial/outdated counts as if they were authoritative.
+# ---------------------------------------------------------------------------
+
+def test_index_docx_structure_fresh_and_complete(tmp_path):
+    """A normal, uninterrupted run stamps complete=True and the correct
+    SHA-256 fingerprint of the exact bytes indexed, and reads it back as
+    trustworthy."""
+    try:
+        from meridian_docs import docs_intel
+    except ImportError:
+        pytest.skip("meridian_docs not importable")
+
+    docx_bytes = _make_docx()
+    db = str(tmp_path / "fresh.db")
+
+    result = docs_intel.index_docx_structure(docx_bytes, db)
+    assert result["complete"] is True
+    assert result["source_sha256"] == hashlib.sha256(docx_bytes).hexdigest()
+
+    freshness = docs_intel.get_structure_freshness(db)
+    assert freshness["indexed"] is True
+    assert freshness["complete"] is True
+    assert freshness["stale"] is False
+    assert freshness["trustworthy"] is True
+    assert freshness["source_sha256"] == result["source_sha256"]
+
+    # A trustworthy read never raises and never carries a "freshness" key
+    # (that key is only attached when allow_stale=True was needed).
+    elements = docs_intel.get_local_structure_elements(db)
+    assert elements["heading_count"] == 3
+    assert "freshness" not in elements
+
+
+def test_get_structure_freshness_never_indexed_is_trustworthy(tmp_path):
+    """A sidecar that has never had index_docx_structure run on it is not
+    stale or incomplete -- there's nothing to distrust yet -- matching the
+    pre-existing get_local_structure_elements empty-list behavior."""
+    try:
+        from meridian_docs import docs_intel
+    except ImportError:
+        pytest.skip("meridian_docs not importable")
+
+    db = str(tmp_path / "never_structured.db")
+    docs_intel.index_docx(_make_docx(), db)  # paragraph index only
+
+    freshness = docs_intel.get_structure_freshness(db)
+    assert freshness["indexed"] is False
+    assert freshness["trustworthy"] is True
+    assert freshness["reason"] == "never-indexed"
+
+    # Must not raise.
+    elements = docs_intel.get_local_structure_elements(db)
+    assert elements["heading_count"] == 0
+
+
+def test_index_docx_structure_stale_after_source_file_changes(tmp_path):
+    """When index_docx_structure is built from a file path and the file's
+    content changes afterward, the SHA-256 fingerprint no longer matches:
+    get_structure_freshness reports stale, and get_local_structure_elements
+    fails closed instead of serving the old (now-stale) counts."""
+    try:
+        from meridian_docs import docs_intel
+    except ImportError:
+        pytest.skip("meridian_docs not importable")
+
+    docx_path = tmp_path / "doc.docx"
+    docx_path.write_bytes(_make_docx())
+    db = str(tmp_path / "stale.db")
+
+    result = docs_intel.index_docx_structure(str(docx_path), db)
+    assert result["heading_count"] == 3
+
+    # A file path with unchanged content stays fresh.
+    freshness = docs_intel.get_structure_freshness(db)
+    assert freshness["stale"] is False
+    assert freshness["trustworthy"] is True
+
+    # Now change the source content on disk (fewer headings) without
+    # re-indexing -- simulates an edit landing after the index was built.
+    changed_xml = _STRUCTURAL_DOCUMENT_XML.replace(
+        '<w:pStyle w:val="Heading2"/></w:pPr>\n      <w:r><w:t>Results</w:t>',
+        '<w:pStyle w:val="Heading2"/></w:pPr>\n      <w:r><w:t>Discussion</w:t>',
+    )
+    docx_path.write_bytes(_make_docx(changed_xml))
+
+    staleness = docs_intel.check_structure_staleness(db)
+    assert staleness["stale"] is True
+    assert staleness["reason"] == "sha256-mismatch"
+
+    freshness = docs_intel.get_structure_freshness(db)
+    assert freshness["stale"] is True
+    assert freshness["trustworthy"] is False
+
+    with pytest.raises(docs_intel.StructureIndexNotTrustworthyError):
+        docs_intel.get_local_structure_elements(db)
+
+    # allow_stale=True still returns the (now-stale) old data, but flags it.
+    elements = docs_intel.get_local_structure_elements(db, allow_stale=True)
+    assert elements["heading_count"] == 3  # old data, not re-scanned
+    assert elements["freshness"]["stale"] is True
+
+
+def test_index_docx_structure_incomplete_run_fails_closed(tmp_path, monkeypatch):
+    """A run that is interrupted partway through the walk (simulated here by
+    forcing an exception after the document has been parsed but before the
+    structural tables are written) leaves the completeness boundary marker
+    at 'incomplete'. A subsequent read must fail closed rather than trust
+    whatever rows are still sitting in the sidecar from the prior good run."""
+    try:
+        from meridian_docs import docs_intel
+    except ImportError:
+        pytest.skip("meridian_docs not importable")
+
+    docx_bytes = _make_docx()
+    db = str(tmp_path / "incomplete.db")
+
+    # First, a normal successful run so there IS prior data sitting in the
+    # sidecar that a naive reader might otherwise be tempted to trust.
+    first = docs_intel.index_docx_structure(docx_bytes, db)
+    assert first["complete"] is True
+
+    # Now force the walk to blow up partway through the NEXT run, after the
+    # completeness boundary has already been opened (marked incomplete) but
+    # before the structural tables are rewritten/committed.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated interruption mid-walk")
+
+    monkeypatch.setattr(docs_intel, "_assign_section_types", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        docs_intel.index_docx_structure(docx_bytes, db)
+
+    freshness = docs_intel.get_structure_freshness(db)
+    assert freshness["complete"] is False
+    assert freshness["trustworthy"] is False
+    assert freshness["reason"] == "incomplete-run"
+
+    # The old rows are still physically present (DELETE never ran)...
+    with pytest.raises(docs_intel.StructureIndexNotTrustworthyError):
+        docs_intel.get_local_structure_elements(db)
+
+    # ...and are only visible via the explicit escape hatch, clearly flagged.
+    elements = docs_intel.get_local_structure_elements(db, allow_stale=True)
+    assert elements["heading_count"] == 3
+    assert elements["freshness"]["complete"] is False
+
+
+def test_get_structure_elements_mcp_tool_fails_closed_on_incomplete(tmp_path, monkeypatch):
+    """The get_structure_elements MCP tool (server.py) surfaces the same
+    fail-closed behavior as the underlying docs_intel function -- a consumer
+    that only goes through the MCP layer still can't accidentally trust an
+    incomplete index."""
+    try:
+        from meridian_docs import docs_intel
+        from meridian_docs import server as mcp_server
+    except ImportError:
+        pytest.skip("meridian_docs not importable")
+
+    docx_bytes = _make_docx()
+    db = str(tmp_path / "mcp_incomplete.db")
+    docs_intel.index_docx_structure(docx_bytes, db)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated interruption mid-walk")
+
+    monkeypatch.setattr(docs_intel, "_assign_section_types", _boom)
+    with pytest.raises(RuntimeError):
+        docs_intel.index_docx_structure(docx_bytes, db)
+
+    with pytest.raises(docs_intel.StructureIndexNotTrustworthyError):
+        mcp_server.get_structure_elements(db)
+
+    # Explicit opt-in still works through the MCP layer too.
+    result = mcp_server.get_structure_elements(db, allow_stale=True)
+    assert result["freshness"]["trustworthy"] is False
 
 
 # ---------------------------------------------------------------------------

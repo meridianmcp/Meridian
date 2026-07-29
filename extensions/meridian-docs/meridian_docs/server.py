@@ -74,20 +74,38 @@ def index_document_structure(path: str, index_db_path: str) -> dict[str, Any]:
     detected by SEQ Figure field codes; tables by raw <w:tbl> blocks plus optional
     SEQ Table captions.
 
-    Returns {index_db, heading_count, figure_count, table_count}.
+    Returns {index_db, heading_count, figure_count, table_count, complete,
+    source_sha256}.
+
+    e9b2cd2b — complete is always True on a successful return (a failed/
+    interrupted run raises instead); source_sha256 is the SHA-256 fingerprint
+    of the source .docx bytes that were just indexed, so a caller can compare
+    it against a later re-fingerprint to detect drift out-of-band.
     """
     return docs_intel.index_docx_structure(path, index_db_path)
 
 
 @mcp.tool()
-def get_structure_elements(index_db_path: str) -> dict[str, Any]:
+def get_structure_elements(
+    index_db_path: str, allow_stale: bool = False
+) -> dict[str, Any]:
     """c39ae092 — retrieve all locally-stored structural elements from the sidecar.
 
     Returns {headings, figures, tables} lists from the docx_headings,
     docx_figures, docx_tables tables populated by index_document_structure.
     Returns empty lists for any table not yet populated.
+
+    e9b2cd2b — FAILS CLOSED by default: raises if the structural index is
+    stale (source .docx content changed since the last successful
+    index_document_structure run) or incomplete (that run never finished),
+    instead of returning partial/outdated counts as if they were
+    authoritative. Pass allow_stale=True to read the best-effort data anyway
+    — the result then includes a "freshness" key explaining why it wasn't
+    trusted.
     """
-    return docs_intel.get_local_structure_elements(index_db_path)
+    return docs_intel.get_local_structure_elements(
+        index_db_path, allow_stale=allow_stale
+    )
 
 
 @mcp.tool()

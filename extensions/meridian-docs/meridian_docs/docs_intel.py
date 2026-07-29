@@ -896,6 +896,41 @@ def _seq_cached_number(block: dict[str, Any], seq_re: re.Pattern[str]) -> str | 
     return None
 
 
+class StructureIndexNotTrustworthyError(Exception):
+    """e9b2cd2b — the structural sidecar (docx_headings/docx_figures/docx_tables,
+    populated by :func:`index_docx_structure`) is either STALE (the source
+    .docx's content has changed since the last successful indexing run) or
+    INCOMPLETE (that run never finished walking the document -- e.g. it
+    crashed partway through, or is still in progress).
+
+    Raised by :func:`get_local_structure_elements` (default behavior) instead
+    of silently returning partial or outdated counts as if they were
+    authoritative. Callers that explicitly want the best-effort data anyway
+    (diagnostics, manual inspection) can pass ``allow_stale=True`` to get the
+    data back with a ``"freshness"`` key describing why it wasn't trusted.
+    """
+
+
+def _source_fingerprint(source: str | bytes | bytearray) -> str:
+    """SHA-256 hex digest of the exact source .docx bytes.
+
+    e9b2cd2b — reads the FULL file into memory when ``source`` is a path, so
+    the fingerprint reflects the exact bytes :func:`document_content_tree`
+    is about to parse. This is a stronger freshness signal than the mtime
+    tracking :func:`index_docx`/:func:`check_staleness` already do for the
+    paragraph index: an mtime changes on a touch/copy/restore even when the
+    content is byte-identical (false positive staleness) and can also stay
+    put across a content-changing in-place edit on some filesystems/tools
+    (false negative). A content hash has neither failure mode.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        raw = bytes(source)
+    else:
+        with open(source, "rb") as fh:
+            raw = fh.read()
+    return hashlib.sha256(raw).hexdigest()
+
+
 def index_docx_structure(
     source: str | bytes | bytearray,
     index_db_path: str,
@@ -914,10 +949,44 @@ def index_docx_structure(
     table captions by SEQ Table field codes.  Raw table blocks (``kind="table"``)
     are stored with their cell data serialised as JSON.
 
-    Returns a summary ``{index_db, heading_count, figure_count, table_count}``.
-    Idempotent: all three structural tables are fully replaced on each run.
+    Returns a summary ``{index_db, heading_count, figure_count, table_count,
+    complete, source_sha256}``.  Idempotent: all three structural tables are
+    fully replaced on each run.
+
+    e9b2cd2b — freshness metadata: a SHA-256 fingerprint of the source .docx
+    bytes and an explicit "complete boundary" marker are stamped into
+    ``docx_index_meta`` (keys ``structure_source_sha256``,
+    ``structure_source_path``, ``structure_complete``,
+    ``structure_indexed_at``). The completeness marker is written as ``"0"``
+    (and committed immediately, in its own small transaction) BEFORE the
+    document walk starts, and only flipped to ``"1"`` -- atomically, in the
+    SAME commit as the headings/figures/tables replacement -- once the walk
+    and the write have both fully succeeded. If this function is interrupted
+    anywhere in between (a malformed/truncated document, a crash mid-walk,
+    etc.) the marker is left at ``"0"``, so a later read via
+    :func:`get_structure_freshness` / :func:`get_local_structure_elements`
+    correctly reports the index as incomplete rather than trusting whatever
+    rows happen to be sitting in the tables. See also
+    :func:`check_structure_staleness` for detecting a source that has
+    changed content since the last COMPLETE run.
     """
     from ._vendored_content_tree import document_content_tree  # noqa: PLC0415
+
+    source_path = source if isinstance(source, str) else None
+    source_sha256 = _source_fingerprint(source)
+
+    # Open the completeness boundary: commit "incomplete" up front so any
+    # interruption during the walk/write below leaves this as the last
+    # truthfully-committed state.
+    _boundary_conn = _connect(index_db_path)
+    try:
+        _boundary_conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_complete", "0"),
+        )
+        _boundary_conn.commit()
+    finally:
+        _boundary_conn.close()
 
     tree = document_content_tree(source)
     blocks: list[dict[str, Any]] = tree.get("blocks") or []
@@ -1044,6 +1113,27 @@ def index_docx_structure(
             "VALUES (?, ?, ?, ?, ?)",
             tables_out,
         )
+        # e9b2cd2b — close the completeness boundary opened above and stamp
+        # the source fingerprint in the SAME commit as the table replacement,
+        # so a reader never observes "complete=1" paired with rows that
+        # haven't actually finished writing (or a fingerprint that doesn't
+        # match what was just indexed).
+        conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_source_sha256", source_sha256),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_source_path", source_path),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_indexed_at", datetime.now(timezone.utc).isoformat()),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_complete", "1"),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1053,10 +1143,127 @@ def index_docx_structure(
         "heading_count": len(headings_out),
         "figure_count": len(figures_out),
         "table_count": len(tables_out),
+        "complete": True,
+        "source_sha256": source_sha256,
     }
 
 
-def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
+def check_structure_staleness(index_db_path: str) -> dict[str, Any]:
+    """e9b2cd2b — compare the structural index's last-recorded SHA-256
+    fingerprint against the source .docx's CURRENT content on disk.
+
+    Mirrors :func:`check_staleness` (which tracks the paragraph index via
+    mtime) but for the structural index populated by
+    :func:`index_docx_structure`, and compares a content hash rather than an
+    mtime -- see :func:`_source_fingerprint` for why that's a stronger
+    signal.
+
+    Returns ``{"stale": bool, "source_path": str|None, "reason": str}``.
+    A structural index that was never built, or was built from raw bytes
+    (no trackable path), always reports ``stale=False`` -- there is nothing
+    to compare against, so silence rather than a false-positive staleness
+    claim.
+    """
+    conn = _connect(index_db_path)
+    try:
+        rows = dict(
+            conn.execute(
+                "SELECT key, value FROM docx_index_meta "
+                "WHERE key IN ('structure_source_path', 'structure_source_sha256')"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+    source_path = rows.get("structure_source_path")
+    if not source_path:
+        return {"stale": False, "source_path": None, "reason": "no-source-tracked"}
+    stored_sha256 = rows.get("structure_source_sha256")
+    try:
+        with open(source_path, "rb") as fh:
+            current_sha256 = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return {"stale": False, "source_path": source_path, "reason": "source-unreadable"}
+    if stored_sha256 is None or stored_sha256 != current_sha256:
+        return {"stale": True, "source_path": source_path, "reason": "sha256-mismatch"}
+    return {"stale": False, "source_path": source_path, "reason": "current"}
+
+
+def get_structure_freshness(index_db_path: str) -> dict[str, Any]:
+    """e9b2cd2b — combined completeness + staleness verdict for the
+    structural index (:func:`index_docx_structure`'s ``docx_headings`` /
+    ``docx_figures`` / ``docx_tables`` tables).
+
+    Returns::
+
+        {
+          "indexed": bool,      # False if index_docx_structure was never run
+          "complete": bool,     # False if the last run didn't finish (crashed
+                                 # mid-walk, or is currently in progress)
+          "stale": bool,        # True if the source .docx's content has
+                                 # changed since the last COMPLETE run
+          "trustworthy": bool,  # complete and not stale (or never indexed --
+                                 # there's nothing to distrust yet)
+          "source_path": str | None,
+          "source_sha256": str | None,
+          "reason": str,
+        }
+
+    ``trustworthy=False`` is the fail-closed signal :func:`get_local_structure_elements`
+    checks by default.
+    """
+    conn = _connect(index_db_path)
+    try:
+        rows = dict(
+            conn.execute(
+                "SELECT key, value FROM docx_index_meta WHERE key IN ("
+                "'structure_complete', 'structure_source_path', "
+                "'structure_source_sha256')"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+    if "structure_complete" not in rows:
+        return {
+            "indexed": False,
+            "complete": True,
+            "stale": False,
+            "trustworthy": True,
+            "source_path": None,
+            "source_sha256": None,
+            "reason": "never-indexed",
+        }
+
+    complete = rows.get("structure_complete") == "1"
+    source_path = rows.get("structure_source_path")
+    source_sha256 = rows.get("structure_source_sha256")
+
+    if not complete:
+        return {
+            "indexed": True,
+            "complete": False,
+            "stale": False,
+            "trustworthy": False,
+            "source_path": source_path,
+            "source_sha256": source_sha256,
+            "reason": "incomplete-run",
+        }
+
+    staleness = check_structure_staleness(index_db_path)
+    return {
+        "indexed": True,
+        "complete": True,
+        "stale": staleness["stale"],
+        "trustworthy": not staleness["stale"],
+        "source_path": staleness["source_path"],
+        "source_sha256": source_sha256,
+        "reason": staleness["reason"],
+    }
+
+
+def get_local_structure_elements(
+    index_db_path: str, *, allow_stale: bool = False
+) -> dict[str, Any]:
     """c39ae092 — retrieve all locally-stored structural elements from the sidecar.
 
     Returns ``{headings, figures, tables}`` lists read from the
@@ -1064,7 +1271,29 @@ def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
     :func:`index_docx_structure`.  Returns empty lists for any table that
     does not yet exist (i.e., :func:`index_docx_structure` was never called on
     this sidecar).
+
+    e9b2cd2b — FAILS CLOSED by default: if the structural index is STALE (the
+    source .docx's content changed since the last successful
+    :func:`index_docx_structure` run) or INCOMPLETE (that run never
+    finished), raises :class:`StructureIndexNotTrustworthyError` instead of
+    returning partial/outdated counts as if they were authoritative. A
+    sidecar that was never structurally indexed is NOT considered stale or
+    incomplete (there's nothing to distrust yet) -- it just returns empty
+    lists, same as before this change.
+
+    Pass ``allow_stale=True`` to opt into reading the best-effort data
+    anyway (e.g. for diagnostics); the returned dict then always carries a
+    ``"freshness"`` key with the :func:`get_structure_freshness` verdict so
+    the caller can see exactly why it wasn't trusted.
     """
+    freshness = get_structure_freshness(index_db_path)
+    if not freshness["trustworthy"] and not allow_stale:
+        raise StructureIndexNotTrustworthyError(
+            f"structural index at {index_db_path!r} is not trustworthy "
+            f"(reason={freshness['reason']!r}); pass allow_stale=True to "
+            "read the best-effort data anyway"
+        )
+
     conn = _connect(index_db_path)
     try:
         heading_rows = conn.execute(
@@ -1104,7 +1333,7 @@ def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
         }
         for r in table_rows
     ]
-    return {
+    result = {
         "headings": headings,
         "figures": figures,
         "tables": tables,
@@ -1112,6 +1341,13 @@ def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
         "figure_count": len(figures),
         "table_count": len(tables),
     }
+    if allow_stale:
+        # e9b2cd2b — only attached when the caller explicitly opted into
+        # reading possibly-untrustworthy data, so it's visible exactly when
+        # it matters and callers that never hit the stale/incomplete path
+        # see the same shape this function has always returned.
+        result["freshness"] = freshness
+    return result
 
 
 def get_document_section_map(source: str | bytes | bytearray) -> dict[str, Any]:
