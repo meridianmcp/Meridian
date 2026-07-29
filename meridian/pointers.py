@@ -1604,3 +1604,186 @@ def evaluate_artifact_pointer_policy(item: dict[str, Any]) -> dict[str, Any]:
     result["affected_pointer_ids"] = affected_ids
     result["ready"] = mode != "strict"
     return result
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable artifact-pointer FINDING projection (70c10ca3 — b730
+# follow-up: consumes 3196ba0e, extends 88f82c15)
+# ---------------------------------------------------------------------------
+#
+# :func:`evaluate_artifact_pointer_policy` (88f82c15, above) answers the
+# warn/strict POLICY question at handoff-annotation time and stays
+# deliberately pure (no filesystem/meridian-outputs I/O — see its own
+# docstring). It never says whether the INSUFFICIENT pointer it flagged is
+# itself missing on disk, stale/archival, or ambiguous — that is a separate,
+# I/O-backed question :func:`verify_target_readiness` /
+# :func:`verify_pointer_readiness` (3196ba0e, above) already answer, but
+# neither primitive had ever been wired to the other.
+#
+# :func:`build_artifact_pointer_finding` is the seam that combines them into
+# ONE canonical, machine-readable finding per item — reused, verbatim, by
+# EVERY handoff representation (batch /goal XML, capability_contract JSON,
+# generate_handoff response metadata) so a receiving executor never has to
+# reconcile "the same warning" described independently in three places.
+# Mirrors 665's own precedent of "one shared extraction, many renderers"
+# (see :func:`build_typed_pointer_record` /
+# :func:`assemble_pointer_entries_from_annotated_items` above).
+# ---------------------------------------------------------------------------
+
+
+async def build_artifact_pointer_finding(
+    item: dict[str, Any],
+    *,
+    policy_result: "dict[str, Any] | None" = None,
+    stored_pointers: "list[dict[str, Any]] | None" = None,
+    outputs_dir: str | None = None,
+    figure_resolver: "FigureResolver | None" = None,
+    provenance_getter: "ProvenanceGetter | None" = None,
+) -> "dict[str, Any] | None":
+    """Combine :func:`evaluate_artifact_pointer_policy`'s warn/strict verdict
+    with :func:`verify_pointer_readiness`'s fail-closed provenance/existence
+    check for ONE item's implicated pointers.
+
+    ``policy_result`` lets a caller pass an ALREADY-COMPUTED
+    ``evaluate_artifact_pointer_policy(item)`` result (e.g.
+    ``handoff._annotate_resolved_pointers``, which already ran it earlier in
+    the same annotation pass) instead of recomputing it here; when omitted,
+    this function computes it itself from ``item``.
+
+    ``stored_pointers`` should be ``item``'s durable, RAW
+    ``sprint_item_pointers`` rows (``db.get_sprint_item_pointers`` /
+    :func:`row_to_pointer` shape — each carrying ``{id, targets:
+    [{uri, selector, target_kind}, ...]}``), used to resolve each
+    ``affected_pointer_ids`` entry to its actual target(s) for readiness
+    verification. ``None``/``[]`` degrades to an empty ``target_readiness``
+    (the policy verdict alone is still returned).
+
+    ``outputs_dir`` / ``figure_resolver`` / ``provenance_getter`` are the
+    SAME injectable meridian-outputs seams :func:`verify_target_readiness`
+    takes. ``figure_resolver`` defaults to :func:`_default_figure_resolver`
+    (core-local, always safe to call) when not explicitly given, so this
+    actually CONSUMES the 3196ba0e primitive by default rather than always
+    degrading to the "figure_resolver is None -> unavailable" branch;
+    ``provenance_getter`` has no core-local default (meridian-outputs' own
+    provenance ledger lives only in the extension) and stays ``None`` unless
+    a caller injects one.
+
+    Returns ``None`` when there is no ACTIVE warning (mirrors
+    ``evaluate_artifact_pointer_policy``'s / the existing
+    ``<artifact_pointer_policy>`` XML clause's own "nothing to say"
+    restraint) — an item with sufficient/exact pointer evidence, or one
+    that's simply not artifact-sensitive, contributes nothing here either.
+
+    Otherwise returns the FULL ``evaluate_artifact_pointer_policy`` verdict
+    (item_id/classification/policy/warning_code/required_remediation/
+    affected_pointer_ids/ready) plus:
+
+    * ``pointer_status`` — ``"missing"`` (warning_code is
+      ``missing_pointer`` — no candidate pointer at all) or ``"weak"`` (a
+      pointer exists but is not exact enough — every other insufficiency
+      code). The "exact" case never reaches here at all: it is exactly the
+      case with no active warning, handled by the early ``None`` return.
+    * ``target_readiness`` — ``[{"pointer_id": ..., <verify_pointer_readiness
+      result fields>}, ...]`` for each id in ``affected_pointer_ids`` that
+      has a matching entry in ``stored_pointers`` (matched by id), sorted by
+      ``pointer_id`` for deterministic output. Empty when
+      ``affected_pointer_ids`` is empty (e.g. ``missing_pointer`` — there is
+      no durable row to verify) or ``stored_pointers`` was not supplied.
+
+    Never raises: every sub-step is individually guarded, matching
+    ``evaluate_artifact_pointer_policy``'s own "must never break a mandatory
+    handoff" contract. A ``verify_pointer_readiness`` failure for one
+    affected pointer degrades that ONE entry to an explicit
+    ``"verification_error"`` status rather than dropping the whole finding.
+    """
+    if isinstance(policy_result, dict):
+        finding_src = policy_result
+    else:
+        try:
+            finding_src = evaluate_artifact_pointer_policy(item)
+        except Exception:  # noqa: BLE001 — never break a mandatory handoff
+            return None
+
+    warning_code = finding_src.get("warning_code")
+    if not warning_code:
+        return None
+
+    from . import artifact_classification as _artifact_classification  # noqa: PLC0415 — avoid import cycle
+
+    finding: dict[str, Any] = dict(finding_src)
+    finding["pointer_status"] = (
+        "missing"
+        if warning_code == _artifact_classification.INSUFFICIENT_MISSING_POINTER
+        else "weak"
+    )
+
+    resolver = (
+        figure_resolver if figure_resolver is not None else _default_figure_resolver()
+    )
+
+    target_readiness: list[dict[str, Any]] = []
+    affected_ids = finding.get("affected_pointer_ids") or []
+    if affected_ids and stored_pointers:
+        by_id: dict[str, dict[str, Any]] = {}
+        for p in stored_pointers:
+            if isinstance(p, dict) and p.get("id"):
+                by_id[str(p["id"])] = p
+        for pid in sorted({str(x) for x in affected_ids}):
+            ptr = by_id.get(pid)
+            if ptr is None:
+                continue
+            try:
+                verdict = await verify_pointer_readiness(
+                    ptr,
+                    outputs_dir=outputs_dir,
+                    figure_resolver=resolver,
+                    provenance_getter=provenance_getter,
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade, never break the batch
+                _log.debug(
+                    "build_artifact_pointer_finding: readiness check failed for %r",
+                    pid, exc_info=True,
+                )
+                verdict = {
+                    "ready": False, "status": "verification_error",
+                    "reason": f"readiness verification raised: {exc}",
+                }
+            target_readiness.append({"pointer_id": pid, **verdict})
+    finding["target_readiness"] = target_readiness
+    return finding
+
+
+def assemble_artifact_pointer_findings_from_annotated_items(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Pure, synchronous assembly of the canonical per-item artifact-pointer
+    findings from items ALREADY annotated with ``artifact_pointer_finding``
+    (see ``handoff._annotate_resolved_pointers``, which sets it via
+    :func:`build_artifact_pointer_finding` in the SAME resolve pass this
+    module's :func:`build_item_pointer_records` powers).
+
+    Only items carrying a non-``None`` ``artifact_pointer_finding`` (an
+    ACTIVE warning) contribute — mirrors that function's own "nothing to
+    say" restraint, so an ordinary /goal with no figure/table pointer
+    problems produces zero entries, never noise. Sorted by ``item_id`` for
+    deterministic byte-for-byte output; each entry's own ``target_readiness``
+    sub-list is already sorted by ``pointer_id`` (set by
+    :func:`build_artifact_pointer_finding`).
+
+    Shared by ``handoff._build_artifact_pointer_findings_clause`` (the
+    /goal block's ``<artifact_pointer_findings>`` XML clause) and
+    ``capability_contract.extract_artifact_pointer_findings`` (the JSON
+    ``item_artifact_pointer_findings`` section, pre-annotated fast path) —
+    70c10ca3 (b730 follow-up) — so neither maintains its own independent
+    derivation of "which items make the cut."
+    """
+    entries: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if not it.get("id"):
+            continue
+        finding = it.get("artifact_pointer_finding")
+        if isinstance(finding, dict):
+            entries.append(finding)
+    return sorted(entries, key=lambda e: e.get("item_id") or "")

@@ -1579,6 +1579,13 @@ def _build_quick_start_goal(
         # matches capability_contract's item_sprint_item_pointers section
         # exactly for the same request.
         + _build_pointer_records_clause(_all_pending_for_tool_requirements)
+        # 70c10ca3 (b730 follow-up) — typed per-item artifact-pointer
+        # findings (88f82c15's warn/strict verdict + 3196ba0e's readiness
+        # verification): the SAME full pending inventory as the two clauses
+        # above, so this matches capability_contract's
+        # item_artifact_pointer_findings section exactly for the same
+        # request.
+        + _build_artifact_pointer_findings_clause(_all_pending_for_tool_requirements)
         + f"{_manual_note}"
         f"{_backburner_note}"
         f"{_excluded_unprospected_note}"
@@ -1712,6 +1719,45 @@ def _build_pointer_records_clause(items: list[dict[str, Any]]) -> str:
         return ""
     body = json.dumps(entries, sort_keys=True, separators=(",", ":"))
     return f"\n<sprint_item_pointers>{_xml_escape(body)}</sprint_item_pointers>"
+
+
+def _build_artifact_pointer_findings_clause(items: list[dict[str, Any]]) -> str:
+    """70c10ca3 (b730 follow-up) — build an ``<artifact_pointer_findings>``
+    XML clause carrying the TYPED, canonical per-item artifact-pointer
+    findings: 88f82c15's warn/strict policy verdict (classification,
+    effective policy, warning code, remediation, ready/executability)
+    enriched with 3196ba0e's fail-closed readiness verification
+    (canonical/archival/unresolved/ambiguous/missing/...) for each pointer
+    id the verdict implicates.
+
+    Distinct from ``_build_pointer_records_clause`` above (every stored
+    pointer's resolved shape + item-level provenance-required state) and
+    from ``build_item_briefing``'s single-item ``<artifact_pointer_policy>``
+    clause (the bare policy verdict, no readiness data, only ever rendered
+    for ONE item at a time): this clause is the multi-item batch /goal's own
+    surface for the SAME finding — so a multi-item /goal run sees artifact-
+    pointer warnings inline too, not only when a caller separately requests
+    a single-item briefing.
+
+    Items must already carry ``artifact_pointer_finding`` (set by
+    ``_annotate_resolved_pointers`` — both call sites that build a /goal run
+    that annotation pass first). The body is the SAME canonical JSON
+    ``capability_contract.extract_artifact_pointer_findings`` produces for
+    items annotated the same way, via the shared
+    ``pointers.assemble_artifact_pointer_findings_from_annotated_items`` —
+    so the batch /goal's XML rendering and the structured
+    ``generate_handoff`` JSON response never diverge for the same request.
+
+    Returns ``""`` when nothing in the batch has an active finding, so it
+    never adds noise to an ordinary /goal.
+    """
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+
+    entries = pointers_module.assemble_artifact_pointer_findings_from_annotated_items(items)
+    if not entries:
+        return ""
+    body = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    return f"\n<artifact_pointer_findings>{_xml_escape(body)}</artifact_pointer_findings>"
 
 
 # ---------------------------------------------------------------------------
@@ -3018,11 +3064,23 @@ async def _annotate_resolved_pointers(
       view. Like ``pointer_provenance``, computed unconditionally (even for
       an item with zero stored pointers — "missing_pointer" is itself a
       possible verdict).
+    * ``artifact_pointer_finding`` (70c10ca3, b730 follow-up) — the SAME
+      ``artifact_pointer_policy`` verdict enriched with 3196ba0e's fail-
+      closed ``verify_pointer_readiness`` provenance/existence check
+      (canonical/archival/unresolved/ambiguous/missing/...) for every
+      pointer id the verdict implicates (see
+      ``pointers.build_artifact_pointer_finding``). ``None`` when
+      ``artifact_pointer_policy`` has no active warning — mirrors that
+      field's own "nothing to say" restraint. This is the ONE canonical
+      finding ``_build_artifact_pointer_findings_clause`` (batch /goal XML)
+      and ``capability_contract.extract_artifact_pointer_findings`` (JSON
+      ``item_artifact_pointer_findings``) both read, so an artifact-pointer
+      warning is never hidden in prose-only text.
 
     Fully guarded: a per-item failure degrades to no ``resolved_pointers``/
-    ``pointer_records``/``pointer_provenance``/``artifact_pointer_policy``
-    for that item; the pass NEVER raises so the mandatory handoff can't
-    break.
+    ``pointer_records``/``pointer_provenance``/``artifact_pointer_policy``/
+    ``artifact_pointer_finding`` for that item; the pass NEVER raises so the
+    mandatory handoff can't break.
     """
     from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
     for item in pending_items:
@@ -3081,6 +3139,26 @@ async def _annotate_resolved_pointers(
                 pointers_module.evaluate_artifact_pointer_policy(item)
             )
         except Exception:  # noqa: BLE001 — policy annotation is best-effort
+            pass
+        # 70c10ca3 (b730 follow-up) — combine that SAME policy verdict with
+        # 3196ba0e's fail-closed readiness verification (canonical/archival/
+        # unresolved/ambiguous/missing/...) for each pointer the policy
+        # verdict implicates, so every downstream projection (batch /goal
+        # XML, capability_contract JSON, generate_handoff response metadata)
+        # can consume ONE canonical finding instead of re-deriving it. Reuses
+        # `stored` (this item's raw durable pointers, already fetched above)
+        # for the readiness lookup — no extra DB round trip. `None` when
+        # there is no active warning (see build_artifact_pointer_finding).
+        # Best-effort: never breaks the mandatory handoff.
+        try:
+            item["artifact_pointer_finding"] = (
+                await pointers_module.build_artifact_pointer_finding(
+                    item,
+                    policy_result=item.get("artifact_pointer_policy"),
+                    stored_pointers=stored,
+                )
+            )
+        except Exception:  # noqa: BLE001 — finding annotation is best-effort
             pass
     return pending_items
 

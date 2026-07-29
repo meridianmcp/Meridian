@@ -225,6 +225,99 @@ async def extract_sprint_item_pointers(
     return sorted(entries, key=lambda e: e["item_id"])
 
 
+async def extract_artifact_pointer_findings(
+    db: Any,
+    project_id: str,
+    items: list[dict[str, Any]],
+    *,
+    node_resolver: Any | None = None,
+    outputs_dir: "str | None" = None,
+    figure_resolver: Any | None = None,
+    provenance_getter: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Typed extraction of the per-item artifact-pointer FINDING contract
+    (70c10ca3, b730 follow-up): 88f82c15's warn/strict policy verdict
+    (classification, effective policy, warning code, remediation,
+    ready/executability) enriched with 3196ba0e's fail-closed readiness
+    verification (canonical/archival/unresolved/ambiguous/missing/...) for
+    each pointer id the verdict implicates — the SAME fields
+    ``handoff._build_artifact_pointer_findings_clause`` embeds in the batch
+    /goal's ``<artifact_pointer_findings>`` XML clause, so the two never
+    independently diverge for the same request.
+
+    Two paths per item, mirroring :func:`extract_sprint_item_pointers`:
+
+    * **Pre-annotated** (an item already carries ``artifact_pointer_finding``
+      — set by ``handoff._annotate_resolved_pointers``, the SAME resolve
+      pass a /goal render already ran) — reuse it directly. NO extra DB
+      fetch, resolve, or readiness check — the strongest identical-data
+      guarantee.
+    * **Not annotated** (the common case for a self-fetched pending-item
+      list, e.g. :func:`build_capability_contract`'s own default fetch) —
+      fetch this item's stored pointers (``db.get_sprint_item_pointers``),
+      build its typed pointer records (:func:`pointers.build_item_pointer_records`,
+      attached as a local ``pointer_records`` copy so the policy evaluator
+      sees the SAME durable pointer evidence the pre-annotated path would
+      have), then compute the finding via
+      :func:`pointers.build_artifact_pointer_finding` — the SAME per-item
+      primitive the annotation pass uses, with the SAME default
+      ``figure_resolver``/``outputs_dir``/``provenance_getter`` seams
+      (``outputs_dir``/``figure_resolver``/``provenance_getter`` here let a
+      caller or test inject a stub; omitted, they degrade identically to
+      the annotation pass's own defaults, so self-fetch and pre-annotated
+      results agree for the SAME underlying DB state).
+
+    Only items with an ACTIVE finding contribute (mirrors
+    ``build_artifact_pointer_finding``'s own "nothing to say" restraint) —
+    an ordinary project with no figure/table pointer problems returns ``[]``,
+    not a wall of non-findings.
+
+    Deterministic ordering: sorted by ``item_id`` (each entry's own
+    ``target_readiness`` sub-list is already sorted by ``pointer_id``).
+    Fully guarded per item — a DB/resolve/readiness failure degrades that
+    ONE item to no entry rather than breaking contract building; NEVER
+    raises.
+    """
+    entries: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        item_id = it.get("id")
+        if not item_id:
+            continue
+        if "artifact_pointer_finding" in it:
+            finding = it.get("artifact_pointer_finding")
+        else:
+            try:
+                stored = await db_module.get_sprint_item_pointers(db, item_id)
+            except Exception:  # noqa: BLE001 — pre-migration DB / fetch failure
+                stored = []
+            work_item = it
+            if stored and "pointer_records" not in it:
+                try:
+                    records = await _pointers.build_item_pointer_records(
+                        db, project_id, stored, node_resolver=node_resolver,
+                    )
+                except Exception:  # noqa: BLE001 — resolve failure -> no enrichment
+                    records = []
+                if records:
+                    work_item = dict(it)
+                    work_item["pointer_records"] = records
+            try:
+                finding = await _pointers.build_artifact_pointer_finding(
+                    work_item,
+                    stored_pointers=stored,
+                    outputs_dir=outputs_dir,
+                    figure_resolver=figure_resolver,
+                    provenance_getter=provenance_getter,
+                )
+            except Exception:  # noqa: BLE001 — finding computation is best-effort
+                finding = None
+        if isinstance(finding, dict):
+            entries.append(finding)
+    return sorted(entries, key=lambda e: e.get("item_id") or "")
+
+
 def _resolve_effective_capabilities(
     db: Any,
     project_id: str,
@@ -466,7 +559,13 @@ async def build_capability_contract(
     label/explicit resolution status/canonical+archival metadata/
     provenance-required state) for the SAME item set, matching
     ``handoff._build_pointer_records_clause``'s ``<sprint_item_pointers>``
-    XML clause for the same request.
+    XML clause for the same request. It also feeds
+    ``item_artifact_pointer_findings`` (70c10ca3, b730 follow-up, see
+    :func:`extract_artifact_pointer_findings`) — 88f82c15's warn/strict
+    artifact-pointer policy verdict enriched with 3196ba0e's fail-closed
+    readiness verification, matching
+    ``handoff._build_artifact_pointer_findings_clause``'s
+    ``<artifact_pointer_findings>`` XML clause for the same request.
 
     Never raises: ``get_project_capability_manifest`` returns an empty
     profile for any project with no persisted manifest (649e095f's own
@@ -501,6 +600,20 @@ async def build_capability_contract(
         )
     except Exception:  # noqa: BLE001 — contract building must never break on this
         item_sprint_item_pointers = []
+
+    # 70c10ca3 (b730 follow-up) — typed per-item artifact-pointer FINDING
+    # contract: 88f82c15's warn/strict verdict enriched with 3196ba0e's
+    # readiness verification, extracted from the SAME pending-item list as
+    # the two sections above. See extract_artifact_pointer_findings for the
+    # pre-annotated-vs-self-resolve split. This is what makes an artifact-
+    # pointer warning machine-readable in the JSON/capability_contract
+    # projection, not just the human-readable XML clause.
+    try:
+        item_artifact_pointer_findings = await extract_artifact_pointer_findings(
+            db, project_id, _pending_items_for_tool_reqs,
+        )
+    except Exception:  # noqa: BLE001 — contract building must never break on this
+        item_artifact_pointer_findings = []
 
     # 23e20656 (665 follow-up) — one canonical per-item executor_contract,
     # composing item_tool_requirements/item_sprint_item_pointers above with
@@ -616,6 +729,7 @@ async def build_capability_contract(
         "manifest_hash": effective_hash,
         "item_tool_requirements": item_tool_requirements,
         "item_sprint_item_pointers": item_sprint_item_pointers,
+        "item_artifact_pointer_findings": item_artifact_pointer_findings,
         "item_executor_contracts": item_executor_contracts,
         "board_stale": bool(board_stale),
         "executable": executable,
