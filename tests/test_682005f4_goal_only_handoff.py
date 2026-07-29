@@ -568,3 +568,59 @@ async def test_generate_handoff_goal_mode_artifact_pointer_findings_deterministi
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
     )
     assert _strip_goal_token(content_a) == _strip_goal_token(content_b)
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_artifact_pointer_findings_respect_version_scope(
+    db, tmp_path
+):
+    """f9bacd5b (b730 follow-up, final gate) — a version-scoped mode='goal'
+    request must not leak an <artifact_pointer_findings> entry from a
+    DIFFERENT sprint version, and must not silently drop the entry that
+    genuinely belongs to the requested version. Mirrors
+    test_goal_mode_scope_equals_requested_pending_items_exactly's own
+    version-scope-exactness style, applied to the artifact-pointer-findings
+    clause specifically (not previously covered for this clause)."""
+    p = await db_module.create_project(db, "goal-mode-artifact-findings-version-scope")
+    item_v1 = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item_v1["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    item_v2 = await db_module.add_sprint_item(
+        db, p["id"], "v2", "Insert a new ablation chart figure into the results section",
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item_v2["id"], "docs",
+        [{"uri": "outputs/figures/",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+
+    _, content_v1, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal", version="v1",
+    )
+    findings_v1 = json.loads(
+        content_v1[
+            content_v1.index("<artifact_pointer_findings>") + len("<artifact_pointer_findings>"):
+            content_v1.index("</artifact_pointer_findings>")
+        ]
+    )
+    ids_v1 = {f["item_id"] for f in findings_v1}
+    assert item_v1["id"] in ids_v1  # requested-version finding present, not dropped
+    assert item_v2["id"] not in ids_v1  # other-version finding absent, not leaked
+
+    _, content_v2, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal", version="v2",
+    )
+    findings_v2 = json.loads(
+        content_v2[
+            content_v2.index("<artifact_pointer_findings>") + len("<artifact_pointer_findings>"):
+            content_v2.index("</artifact_pointer_findings>")
+        ]
+    )
+    ids_v2 = {f["item_id"] for f in findings_v2}
+    assert item_v2["id"] in ids_v2
+    assert item_v1["id"] not in ids_v2

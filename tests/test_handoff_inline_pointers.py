@@ -260,10 +260,20 @@ async def test_generate_handoff_survives_pointer_resolve_blowup(db, tmp_path, mo
 # ---------------------------------------------------------------------------
 
 _GOAL_TOKEN_RE = re.compile(r"<goal_token>[^<]*</goal_token>")
+# f9bacd5b (b730 follow-up, final gate) — full mode's MERIDIAN_CONTEXT header
+# (meridian/templates/handoff.md.j2) stamps a second-granularity
+# "Generated: <iso8601>" line from wall-clock time on EVERY call, same as the
+# goal_token nonce above. Two otherwise-identical generate_handoff() calls
+# landing in different wall-clock seconds is not guaranteed to be avoided —
+# under heavier parallel test load this flaked intermittently before this
+# line was normalized alongside the token.
+_GENERATED_AT_RE = re.compile(r"^Generated: .*$", re.MULTILINE)
 
 
 def _strip_goal_token(content: str) -> str:
-    return _GOAL_TOKEN_RE.sub("<goal_token>STRIPPED</goal_token>", content)
+    content = _GOAL_TOKEN_RE.sub("<goal_token>STRIPPED</goal_token>", content)
+    content = _GENERATED_AT_RE.sub("Generated: STRIPPED", content)
+    return content
 
 
 @pytest.mark.asyncio
@@ -393,3 +403,35 @@ async def test_full_mode_renders_artifact_pointer_findings_clause_too(db, tmp_pa
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     assert "<artifact_pointer_findings>" in content
+
+
+@pytest.mark.asyncio
+async def test_full_mode_artifact_pointer_findings_clause_well_formed_with_special_chars(
+    db, tmp_path
+):
+    """f9bacd5b (b730 follow-up, final gate) — a pointer uri carrying raw XML
+    metacharacters (&, <, >, a literal quote) must still leave the FULL-mode
+    embedded <artifact_pointer_findings> clause well-formed, standalone XML —
+    the companion mode to test_full_mode_renders_artifact_pointer_findings_clause_too
+    above, which never exercised special characters in the pointer text."""
+    import xml.etree.ElementTree as ET
+
+    p = await db_module.create_project(db, "inline-full-mode-artifact-findings-xml")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    tricky_uri = 'outputs/tables/results & "final" <v2>.docx'
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": tricky_uri, "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+    )
+    start = content.index("<artifact_pointer_findings>")
+    end = content.index("</artifact_pointer_findings>") + len("</artifact_pointer_findings>")
+    clause = content[start:end]
+    assert "<v2>.docx" not in clause  # raw metacharacters never appear unescaped
+    root = ET.fromstring(clause)  # raises ParseError if not well-formed
+    assert root.tag == "artifact_pointer_findings"

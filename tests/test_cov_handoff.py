@@ -2556,6 +2556,37 @@ async def test_artifact_pointer_findings_xml_clause_matches_capability_contract_
     assert finding["target_readiness"][0]["targets"][0]["status"] == "missing"
 
 
+_GOLDEN_ARTIFACT_FINDING_KEYS = {
+    "item_id", "classification", "policy", "warning_code",
+    "required_remediation", "affected_pointer_ids", "ready",
+    "pointer_status", "target_readiness",
+}
+
+
+async def test_golden_artifact_pointer_finding_schema_pinned(db, tmp_path):
+    """f9bacd5b (b730 follow-up, final gate) — pins the EXACT key set of an
+    ``item_artifact_pointer_findings`` entry, mirroring this file's own
+    golden-payload discipline (see the executor_contract golden tests above)
+    so an accidental field rename/removal/addition breaks immediately."""
+    p = await db_module.create_project(db, "golden-artifact-finding-schema")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    findings = result["capability_contract"]["item_artifact_pointer_findings"]
+    assert len(findings) == 1
+    assert set(findings[0].keys()) == _GOLDEN_ARTIFACT_FINDING_KEYS
+
+
 async def test_artifact_pointer_findings_absent_when_no_active_warning(db, tmp_path):
     p = await db_module.create_project(db, "parity-artifact-findings-none")
     await db_module.add_sprint_item(db, p["id"], "v1", "Renumber figure captions")
