@@ -54,7 +54,22 @@ async def handle_checkpoint(
         )
     except asyncio.TimeoutError:
         content = "delta handoff timed out"
-    pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
+    # 660314c1 — scope pending/in_progress + next_goal to the SAME
+    # sprint-version bucket generate_handoff (above) already resolved for this
+    # session, via the identical helper (`_resolve_session_sprint_version`) that
+    # b8f89491 wired into every generate_handoff mode. Before this fix,
+    # get_sprint_items() below was called with no version filter at all, so a
+    # session working a version-scoped bucket (e.g. v0.2.6) could get a
+    # checkpoint whose pending_ids/next_goal leaked items from a totally
+    # different version (v0.2.5, v0.3.x). `None` (a session never version-
+    # scoped, or version-scoping not in use for this project) preserves the
+    # original unscoped behaviour exactly.
+    _ckpt_version = await handoff_module_local._resolve_session_sprint_version(
+        db, session_id
+    )
+    pending_items = await db_module.get_sprint_items(
+        db, project_id, status="pending", version=_ckpt_version
+    )
     # Log drift warnings for high-confidence reconcile matches (non-fatal)
     if _commits and pending_items:
         try:
@@ -160,7 +175,7 @@ async def handle_checkpoint(
     # so the executor confirms done/not-done before the handoff is final
     # (the #1 cause of board drift is forgetting complete_sprint_item).
     _in_progress = await db_module.get_sprint_items(
-        db, project_id, status="in_progress"
+        db, project_id, status="in_progress", version=_ckpt_version
     )
     _ckpt_resp = {
         "summary": content,
