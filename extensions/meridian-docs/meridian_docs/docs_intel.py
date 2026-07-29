@@ -45,6 +45,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -1451,11 +1452,156 @@ def _load_docx_xml_stdlib(path: str) -> tuple[bytes, ET.Element]:
     return raw, root
 
 
+class DocxWriteVerificationError(OSError):
+    """dccc2311 — fail-closed rejection of a staged DOCX write transaction.
+
+    Raised by :func:`_atomic_write_docx_bytes` when the disposable staged
+    artifact fails structural verification (see ``_docx_structural_manifest``)
+    BEFORE it is ever promoted over the live file — ``dest`` is guaranteed
+    byte-for-byte untouched whenever this is raised.
+
+    Subclasses ``OSError`` (not a bare ``Exception``) so it is caught, without
+    any call-site change, by every one of this module's ~25 existing
+    ``except OSError as exc: return {"error": ...}`` guards around
+    ``_save_docx_xml_stdlib`` / ``_save_docx_with_new_parts_stdlib`` — while
+    still being distinguishable via ``isinstance()`` by tests/callers that
+    want the specific fail-closed-verification failure mode rather than a
+    generic disk/permission error.
+    """
+
+    def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.manifest = manifest or {}
+
+
+# dccc2311 — single serialized canonical-merge point per destination path.
+# Every write that goes through _atomic_write_docx_bytes only ever mutates
+# the live file inside this lock, keyed on the destination's normalized
+# absolute path — two threads racing to promote a staged draft into the SAME
+# .docx can never interleave their promotion (one full stage -> verify ->
+# promote cycle always completes before the next begins for that path).
+# Writers targeting DIFFERENT destinations never block each other, and the
+# lock table only ever grows by distinct live destination paths (bounded by
+# the number of documents actually being written to, not by request count).
+_DOCX_PROMOTION_LOCKS: dict[str, threading.Lock] = {}
+_DOCX_PROMOTION_LOCKS_GUARD = threading.Lock()
+
+
+def _docx_promotion_lock(dest: str) -> threading.Lock:
+    """Return the process-wide promotion lock for ``dest``'s canonical path."""
+    key = os.path.normcase(os.path.abspath(dest))
+    with _DOCX_PROMOTION_LOCKS_GUARD:
+        lock = _DOCX_PROMOTION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _DOCX_PROMOTION_LOCKS[key] = lock
+        return lock
+
+
+def _docx_style_count(raw: bytes) -> int:
+    """Count ``<w:style>`` elements in ``word/styles.xml`` (0 when absent)."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        if "word/styles.xml" not in zf.namelist():
+            return 0
+        data = zf.read("word/styles.xml")
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return 0
+    return sum(1 for _ in root.iter(_q(_W, "style")))
+
+
+_HEADER_FOOTER_PART_RE = re.compile(r"^word/(?:header|footer)\d+\.xml$")
+
+
+def _docx_equation_count(raw: bytes) -> int:
+    """Count ``<m:oMath>`` elements across ``word/document.xml`` plus any
+    ``word/header<N>.xml`` / ``word/footer<N>.xml`` parts present."""
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        names = [
+            name for name in zf.namelist()
+            if name == "word/document.xml" or _HEADER_FOOTER_PART_RE.match(name)
+        ]
+        for name in names:
+            try:
+                part_root = ET.fromstring(zf.read(name))
+            except ET.ParseError:
+                continue
+            total += sum(1 for _ in part_root.iter(_q(_M, "oMath")))
+    return total
+
+
+def _docx_relationship_count(raw: bytes) -> int:
+    """Count ``<Relationship>`` elements across every ``*.rels`` part."""
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        for name in zf.namelist():
+            if not name.endswith(".rels"):
+                continue
+            try:
+                rels_root = ET.fromstring(zf.read(name))
+            except ET.ParseError:
+                continue
+            total += sum(1 for _ in rels_root.iter(_q(_PKG_REL_NS, "Relationship")))
+    return total
+
+
+def _docx_structural_manifest(raw: bytes) -> dict[str, int]:
+    """Structural fingerprint used to gate a write transaction (dccc2311).
+
+    Counts the four structural families a DOCX write transaction must never
+    silently lose: embedded media (images), paragraph styles, equations, and
+    OOXML package relationships. Computed identically on the PRE-write bytes
+    and the STAGED post-write bytes so a caller can compare before ever
+    promoting a staged artifact into the live file.
+    """
+    return {
+        "media_count": _docx_media_count(raw),
+        "style_count": _docx_style_count(raw),
+        "equation_count": _docx_equation_count(raw),
+        "relationship_count": _docx_relationship_count(raw),
+    }
+
+
+def _docx_manifest_hash(changed_parts: dict[str, bytes]) -> str:
+    """Deterministic SHA-256 over the parts a write transaction actually changed.
+
+    Hashing only the CHANGED parts (never the whole repackaged archive) means
+    the hash identifies the transaction's actual delta: two transactions that
+    produce the exact same logical edit hash IDENTICALLY regardless of
+    unrelated ZIP member ordering, and two transactions that touch different
+    content hash differently even when everything else in the document is
+    byte-identical. Part names are sorted first, so caller iteration order
+    never affects the result — pure function of ``changed_parts``, so the
+    same input always yields the same hash.
+    """
+    h = hashlib.sha256()
+    for name in sorted(changed_parts):
+        name_bytes = name.encode("utf-8")
+        h.update(len(name_bytes).to_bytes(4, "big"))
+        h.update(name_bytes)
+        data = changed_parts[name]
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
+
+
 def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
     """Write ``root`` back into ``dest`` as ``word/document.xml``.
 
     All other ZIP members from ``raw`` are preserved byte-for-byte.
     Writes to a BytesIO buffer first, then flushes to disk.
+
+    Hardened (dccc2311) to route through :func:`_atomic_write_docx_bytes`'s
+    stage -> verify -> promote transaction: media/style/relationship counts
+    are gated to be UNCHANGED (this function only ever rewrites
+    ``word/document.xml`` — every other part is copied through byte-for-byte,
+    so those three families can never legitimately move here; a mismatch
+    means the staged artifact is corrupt, not that an intentional edit
+    happened). Equation count is intentionally NOT gated — editing
+    ``word/document.xml`` is the entire point of most callers
+    (insert_equation_local et al.) and is expected to change it.
 
     Backs up the existing file to ``dest + ".bak"`` when it already exists
     (best-effort, non-fatal on failure — same pattern as meridian/doc_store.py).
@@ -1475,40 +1621,123 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
                     data = new_document_bytes
                 dst.writestr(info, data)
 
-    _atomic_write_docx_bytes(out.getvalue(), dest)
+    _atomic_write_docx_bytes(
+        out.getvalue(),
+        dest,
+        pre_manifest=_docx_structural_manifest(raw),
+        protected_keys=("media_count", "style_count", "relationship_count"),
+        changed_parts={"word/document.xml": new_document_bytes},
+    )
 
 
-def _atomic_write_docx_bytes(payload: bytes, dest: str) -> None:
-    """Persist a DOCX with backup + same-directory atomic replacement.
+def _atomic_write_docx_bytes(
+    payload: bytes,
+    dest: str,
+    *,
+    pre_manifest: dict[str, int] | None = None,
+    protected_keys: tuple[str, ...] = (),
+    changed_parts: dict[str, bytes] | None = None,
+) -> dict[str, Any]:
+    """Persist a DOCX as a disposable-worker-artifact transaction (dccc2311).
 
-    A mutation is not considered written until the complete ZIP has been
-    flushed and atomically replaced. A failed temp write leaves the original
-    document in place and removes the temporary artifact.
+    1. STAGE — ``payload`` (the complete, already-repackaged ZIP) is flushed
+       to a disposable temp file in ``dest``'s own directory. It is NEVER
+       written to ``dest`` directly — ``dest`` is not touched at all unless
+       and until verification (step 2) passes.
+    2. VERIFY — when ``pre_manifest`` is supplied, the staged file is
+       re-opened FRESH FROM DISK (never the in-memory ``payload`` object,
+       which would just re-validate the build step's own intent) and its
+       structural manifest (:func:`_docx_structural_manifest`) is compared
+       against ``pre_manifest`` for every key in ``protected_keys``. Any
+       mismatch — or a staged artifact that isn't even a valid .docx — is a
+       fail-closed verification failure: :class:`DocxWriteVerificationError`
+       is raised, the staged file is discarded, and ``dest`` is left
+       byte-for-byte untouched (never a partially-written or corrupted file).
+    3. PROMOTE — the ONLY point at which the live file changes is inside
+       :func:`_docx_promotion_lock`'s single serialized canonical-merge
+       point for this destination — an ``os.replace`` (atomic on the same
+       filesystem) swaps the verified staged artifact over ``dest``. Two
+       concurrent writers targeting the same ``dest`` can never interleave
+       their promotions.
+
+    A pre-existing ``dest`` is backed up to ``dest + ".bak"`` immediately
+    before promotion (best-effort, non-fatal on failure).
+
+    Returns ``{"manifest_hash", "pre_counts", "post_counts"}`` — the
+    manifest hash is always computed (from ``changed_parts`` when given, else
+    ``None``); ``pre_counts``/``post_counts`` are ``None`` when
+    ``pre_manifest`` was not supplied (legacy callers that run their OWN
+    separate range-hash verification, like move_section/copy_section/
+    relocate_table via :func:`_verify_docx_write`, keep working exactly as
+    before — this is purely additive).
     """
     parent = os.path.dirname(os.path.abspath(dest)) or "."
     os.makedirs(parent, exist_ok=True)
-    temp_path: str | None = None
-    if os.path.exists(dest):
-        try:
-            shutil.copy2(dest, dest + ".bak")
-        except OSError:
-            pass
+    manifest_hash = _docx_manifest_hash(changed_parts) if changed_parts else None
+    post_counts: dict[str, int] | None = None
+
+    staged_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="wb", prefix=".meridian-docx-", suffix=".tmp", dir=parent, delete=False
+            mode="wb", prefix=".meridian-docx-stage-", suffix=".tmp", dir=parent, delete=False
         ) as fh:
-            temp_path = fh.name
+            staged_path = fh.name
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(temp_path, dest)
-        temp_path = None
-    finally:
-        if temp_path:
+
+        if pre_manifest is not None:
+            with open(staged_path, "rb") as fh:
+                staged_bytes = fh.read()
             try:
-                os.unlink(temp_path)
+                post_counts = _docx_structural_manifest(staged_bytes)
+            except (zipfile.BadZipFile, KeyError) as exc:
+                raise DocxWriteVerificationError(
+                    "post-write verification failed: the staged artifact for "
+                    f"{dest} is not a valid .docx after being flushed to disk: "
+                    f"{exc} — discarding it, {dest} is untouched",
+                    manifest={"pre_counts": pre_manifest, "post_counts": None},
+                ) from exc
+
+            mismatches = {
+                key: {"expected": pre_manifest.get(key), "actual": post_counts.get(key)}
+                for key in protected_keys
+                if post_counts.get(key) != pre_manifest.get(key)
+            }
+            if mismatches:
+                raise DocxWriteVerificationError(
+                    "post-write verification failed: the staged .docx does "
+                    "not preserve structural elements this write must never "
+                    f"lose ({dest}) — discarding the staged artifact instead "
+                    f"of promoting a corrupted write; {dest} is untouched",
+                    manifest={
+                        "pre_counts": pre_manifest,
+                        "post_counts": post_counts,
+                        "count_mismatches": mismatches,
+                    },
+                )
+
+        # --- PROMOTE: the single serialized canonical-merge point ----------
+        with _docx_promotion_lock(dest):
+            if os.path.exists(dest):
+                try:
+                    shutil.copy2(dest, dest + ".bak")
+                except OSError:
+                    pass
+            os.replace(staged_path, dest)
+            staged_path = None
+    finally:
+        if staged_path:
+            try:
+                os.unlink(staged_path)
             except OSError:
                 pass
+
+    return {
+        "manifest_hash": manifest_hash,
+        "pre_counts": pre_manifest,
+        "post_counts": post_counts,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -8735,6 +8964,16 @@ def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes]
     that are not already present in the original archive AND overwrites parts
     that are. Every other original ZIP member is preserved byte-for-byte.
 
+    Hardened (dccc2311) to route through :func:`_atomic_write_docx_bytes`'s
+    stage -> verify -> promote transaction, gating media/style counts to be
+    UNCHANGED. Unlike :func:`_save_docx_xml_stdlib`, relationship and
+    equation counts are deliberately NOT gated here: every current caller of
+    this multi-part writer (insert_word_comment, highlight_document_matches,
+    set_page_header/footer) legitimately adds relationships and/or new
+    content-type overrides as part of a correct write, so a relationship-count
+    delta is expected, not a corruption signal. Media and styles are never
+    legitimately touched by any of them, so those two stay hard invariants.
+
     Backs up the existing file to ``dest + ".bak"`` when it already exists
     (best-effort, non-fatal on failure -- same pattern as
     :func:`_save_docx_xml_stdlib`).
@@ -8756,7 +8995,13 @@ def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes]
                 if part_name not in written:
                     dst.writestr(part_name, data)
 
-    _atomic_write_docx_bytes(out.getvalue(), dest)
+    _atomic_write_docx_bytes(
+        out.getvalue(),
+        dest,
+        pre_manifest=_docx_structural_manifest(raw),
+        protected_keys=("media_count", "style_count"),
+        changed_parts=dict(updated_parts),
+    )
 
 
 def _insert_before_closing_tag(xml_bytes: bytes, root_tag_name: str, new_element_xml: str) -> bytes:
