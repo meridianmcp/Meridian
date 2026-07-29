@@ -44,6 +44,7 @@ Design choices, made explicit per this sprint item's spec:
 """
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from datetime import datetime, timezone
@@ -55,6 +56,10 @@ from . import worktree_cleanup
 logger = logging.getLogger(__name__)
 
 DEFAULT_STALE_AFTER_HOURS = 24.0
+
+#: event_type recorded in action_audit_log for an audited strict
+#: merge-approval override (e7548587).
+MERGE_APPROVAL_OVERRIDE_EVENT_TYPE = "sprint_item_merge_approval_override"
 
 
 def _git(cwd: Path, args: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess:
@@ -272,3 +277,59 @@ async def validate_worktree_merge(
         "head_sha": head_sha,
         "errors": errors,
     }
+
+
+async def record_merge_approval_override(
+    db: Any,
+    project_id: str,
+    item_id: str,
+    *,
+    actor: str | None,
+    reason: str | None,
+    worktree: dict[str, Any] | None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Audit-log an explicit override of the STRICT merge-approval block.
+
+    e7548587 — ``require_merge_approval`` mode 2 (strict) refuses to
+    complete a sprint item while the session holds a genuine active,
+    unmerged worktree (per ``db.get_active_worktree_for_session``). This is
+    the AUTHORIZED override path for that refusal: an explicit, auditable
+    acknowledgement, mirroring ``sprint_evidence_guard.
+    record_strict_evidence_override`` (5fe3502e) exactly — same audit
+    mechanism, same non-negotiable contract.
+
+    ``reason`` is REQUIRED and must be non-empty: an override with no stated
+    reason is not auditable and is refused outright (``ValueError``), never
+    silently accepted or defaulted to a generic placeholder.
+
+    Writes to ``action_audit_log`` (``event_type=
+    "sprint_item_merge_approval_override"``) via the existing, already-
+    audited ``db.record_action_audit_event`` (cd495afa / d86d70a5) — the
+    same append-only table used by 5fe3502e's strict-evidence override and
+    other discretionary security-relevant actions. ``created_at`` (when) and
+    ``actor`` (who) are recorded by that helper; ``detail`` (why + which
+    worktree was overridden) is a JSON blob here.
+    """
+    _reason = (reason or "").strip()
+    if not _reason:
+        raise ValueError(
+            "override_merge_approval_reason is required and must be "
+            "non-empty to override a strict merge-approval block — an "
+            "override with no stated reason is not auditable and is "
+            "refused."
+        )
+    from . import db as db_module  # noqa: PLC0415 — avoid import cycle at module load
+
+    detail = json.dumps({
+        "item_id": item_id,
+        "reason": _reason,
+        "worktree_id": (worktree or {}).get("id"),
+        "worktree_branch": (worktree or {}).get("branch"),
+        "worktree_path": (worktree or {}).get("path"),
+    })
+    return await db_module.record_action_audit_event(
+        db, MERGE_APPROVAL_OVERRIDE_EVENT_TYPE,
+        tenant_id=tenant_id, project_id=project_id,
+        actor=actor, detail=detail,
+    )

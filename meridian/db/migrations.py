@@ -1793,8 +1793,12 @@ async def _migrate_parallel_safety(db: aiosqlite.Connection) -> None:
     """0716c9e0 — per-project parallel safety toggles.
 
     auto_worktrees=1 (default ON): claim_sprint_item suggests a git worktree.
-    require_merge_approval=1 (default ON): complete_sprint_item warns when an
-    active worktree exists for the session (merge reminder HITL).
+    require_merge_approval=1 (default ON): tri-state (e7548587) — 0=off (no
+    check), 1=advisory (complete_sprint_item warns via HITL when an active
+    worktree exists for the session but always proceeds — the original
+    behavior, still the default), 2=strict (a genuine active, unmerged
+    worktree BLOCKS completion unless explicitly, auditedly overridden via
+    override_merge_approval + override_merge_approval_reason).
     """
     await _migrate_add_column_if_missing(
         db, "projects", "auto_worktrees", "INTEGER NOT NULL DEFAULT 1"
