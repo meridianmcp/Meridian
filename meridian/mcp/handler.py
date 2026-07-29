@@ -2898,6 +2898,13 @@ async def _handle_task_tools(
             db, args["project_id"], board_stale=_handoff_degraded,
             version=_effective_version,
         )
+        # 6cdc5df3 — machine-readable proposal-to-evidence linkage, emitted on
+        # every generate_handoff mode alongside the capability contract above.
+        # Fully guarded — a failure degrades to no field rather than breaking
+        # the mandatory handoff.
+        _proposal_evidence = await handoff_module_local.build_proposal_evidence_for_handoff(
+            db, args["project_id"],
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -2912,6 +2919,9 @@ async def _handle_task_tools(
             "goal_length_warning": _goal_warn,
             "goal_compliance": _goal_compliance,
             "capability_contract": _capability_contract,
+            # 6cdc5df3 — one entry per proposal id with linked evidence in this
+            # project (see meridian.db.proposal_links.get_proposal_evidence).
+            "proposal_evidence": _proposal_evidence,
             # b8f89491 — machine-readable scope: which sprint-version bucket
             # this handoff actually resolved to, and why (explicit argument vs.
             # session-derived vs. unscoped). effective_version is None when the

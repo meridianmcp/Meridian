@@ -7739,10 +7739,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_tool_requirements",
         "_migrate_pg_sprint_item_artifact_declaration",
         "_migrate_pg_docx_merge_manifests",
+        "_migrate_pg_proposal_evidence_links",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 134
+    assert len(allnames) == len(set(allnames)) == 135
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -18455,6 +18456,59 @@ async def test_workspace_proposal_promote_creates_sprint_item_and_links(db):
     # Sprint item actually exists.
     items = await db_module.get_sprint_items(db, project["id"])
     assert any(i["id"] == si_id for i in items)
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_promote_writes_durable_evidence_link(db):
+    """6cdc5df3 — promotion now ALSO writes a durable, typed
+    proposal_evidence_links row (not just the single promoted_to_sprint_item_id
+    column), so the relationship is queryable via get_proposal_evidence rather
+    than only inferable from that one legacy field."""
+    project = await db_module.create_project(db, "promo-evidence-target")
+    prop = await db_module.add_workspace_proposal(db, "Ship evidence linkage", "body")
+
+    result = await db_module.promote_workspace_proposal(
+        db, prop["id"], project["id"]
+    )
+    si_id = result["sprint_item_id"]
+    link = result["evidence_link"]
+    assert link is not None
+    assert link["proposal_id"] == prop["id"]
+    assert link["entity_type"] == "sprint_item"
+    assert link["entity_id"] == si_id
+    assert link["project_id"] == project["id"]
+
+    # The durable link is independently queryable via get_proposal_evidence —
+    # this is the actual "queryable link" the feature is about, not just a
+    # field on promote_workspace_proposal's one-shot return value.
+    evidence = await db_module.get_proposal_evidence(db, project["id"], prop["id"])
+    assert evidence["link_count"] == 1
+    assert len(evidence["sprint_items"]) == 1
+    assert evidence["sprint_items"][0]["id"] == si_id
+    assert evidence["notes"] == []
+    assert evidence["findings"] == []
+    assert evidence["decisions"] == []
+    assert evidence["artifacts"] == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_promote_evidence_link_is_idempotent_across_calls(db):
+    """Re-linking the same promotion's evidence (e.g. a caller re-running
+    link_proposal_evidence with the same ids) never duplicates the row."""
+    project = await db_module.create_project(db, "promo-evidence-dup")
+    prop = await db_module.add_workspace_proposal(db, "Dup-safe promotion", "body")
+    result = await db_module.promote_workspace_proposal(
+        db, prop["id"], project["id"]
+    )
+    si_id = result["sprint_item_id"]
+
+    # Simulate a redundant re-link of the exact same evidence.
+    await db_module.link_proposal_evidence(
+        db, project["id"], prop["id"], "sprint_item", si_id, label="Dup-safe promotion",
+    )
+    evidence = await db_module.get_proposal_evidence(db, project["id"], prop["id"])
+    assert evidence["link_count"] == 1
+    assert len(evidence["sprint_items"]) == 1
 
 
 @pytest.mark.asyncio
