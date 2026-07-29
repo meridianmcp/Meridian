@@ -1434,3 +1434,173 @@ async def verify_pointer_readiness(
     if isinstance(pointer, dict) and pointer.get("label") is not None:
         out["label"] = pointer.get("label")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Warn/strict artifact-pointer POLICY evaluator (88f82c15 — b730 follow-up)
+# ---------------------------------------------------------------------------
+#
+# :func:`verify_target_readiness` / :func:`verify_pointer_readiness` (3196ba0e,
+# above) answer a COMPLETION-time, per-target, fail-closed question: "is this
+# ALREADY-DECLARED target genuinely ready?" They never ask whether a pointer
+# was declared in the first place, and they run on-demand, per pointer, with
+# real filesystem/meridian-outputs I/O.
+#
+# :func:`evaluate_artifact_pointer_policy` answers a different, EARLIER
+# question, at handoff-ANNOTATION time (``handoff._annotate_resolved_pointers``
+# — see that function's own docstring for the wiring): "does this pending
+# item even HAVE an exact enough output pointer for the kind of work it is,
+# and what should happen if it does not?" It is pure/synchronous (no
+# filesystem or meridian-outputs I/O — item state only), and it never
+# duplicates classification or pointer-sufficiency logic: the figure/table
+# verdict comes straight from :func:`meridian.artifact_classification.classify_artifact_work`
+# (5fd9d2fd), and the "is this uri actually exact enough" judgment comes
+# straight from that SAME module's ``_pointer_evidence``/
+# ``_classify_uri_insufficiency``/``artifact_pointer_insufficiency_evidence``
+# — lazily imported below (never at module scope: artifact_classification ->
+# artifact_declaration -> pointers is already a cycle back to this module).
+#
+# Policy (``artifact_declaration.effective_artifact_policy``'s
+# ``artifact_pointer_check``, default ``"warn"``) controls what happens with
+# an insufficiency finding:
+#
+# * ``"strict"`` — the finding becomes an ACTIVE warning AND ``ready=False``
+#   (non-executable) — a receiving executor must not call
+#   ``complete_sprint_item`` on this item until the pointer is fixed or the
+#   policy is relaxed.
+# * ``"warn"`` (default) — the finding becomes an ACTIVE warning, but
+#   ``ready=True`` — surfaced, never blocking.
+# * ``"off"`` — the finding is SUPPRESSED (``warning_code``/
+#   ``required_remediation``/``affected_pointer_ids`` all come back empty)
+#   and ``ready=True``. The item's own ``classification``/``policy`` are
+#   still returned in full either way — "off" withholds the ACTIVE warning
+#   surface, it never discards the item's own declared/classified state.
+#
+# A figure/table item can NEVER self-declare its way out of this check:
+# whether an item is "genuinely" document_only/caption_only/equation_only/
+# embedded_docx_drawing/code_only is decided ENTIRELY by
+# ``classify_artifact_work``'s own ``is_artifact_sensitive`` verdict (which
+# already treats a human's declared ``artifact_kind`` as authoritative, per
+# that module's own docstring) — this evaluator never consults
+# ``policy.allow_document_only_override`` or any other flag to flip a
+# sensitive verdict to non-sensitive. Only the classifier's own reasoning
+# (declared kind, or conservative title/notes/pointer fallback evidence) can
+# make an item non-sensitive; policy only controls what happens AFTER that.
+# ---------------------------------------------------------------------------
+
+def evaluate_artifact_pointer_policy(item: dict[str, Any]) -> dict[str, Any]:
+    """Warn/strict policy evaluator for ONE pending sprint item's artifact
+    pointer, run at handoff-annotation time (see
+    ``handoff._annotate_resolved_pointers``).
+
+    Returns a dict always carrying exactly:
+
+    * ``item_id`` — the item's id (``None`` when absent/malformed).
+    * ``classification`` — the FULL :func:`meridian.artifact_classification.classify_artifact_work`
+      result (classification/is_artifact_sensitive/confidence/ambiguous/
+      rule/evidence) — never re-derived independently.
+    * ``policy`` — the FULL :func:`meridian.artifact_declaration.effective_artifact_policy`
+      result (the item's own declared policy merged over the project
+      default) — an executor reasoning about enforcement needs the resolved
+      answer, not "whatever this one item happened to set".
+    * ``warning_code`` — ``None`` when not applicable (not artifact-
+      sensitive, or a concrete figure/table pointer is already on file, or
+      policy is ``"off"``); otherwise one of
+      :data:`meridian.artifact_classification.INSUFFICIENT_MISSING_POINTER` /
+      ``INSUFFICIENT_BARE_DOCX`` / ``INSUFFICIENT_DIRECTORY`` /
+      ``INSUFFICIENT_GENERIC_REFERENCE`` / ``INSUFFICIENT_UNSUPPORTED_TYPE``.
+    * ``required_remediation`` — a human-readable fix instruction for
+      ``warning_code`` (``None`` iff ``warning_code`` is ``None``).
+    * ``affected_pointer_ids`` — durable ``sprint_item_pointers`` row ids
+      implicated by the dominant insufficiency reason (``[]`` when there is
+      nothing to name, e.g. ``missing_pointer`` or no active warning).
+    * ``ready`` — ``True`` unless policy is ``"strict"`` AND
+      ``warning_code`` is active (non-``None``) — the handoff-readiness/
+      non-executable signal a receiving executor checks before doing any
+      work, mirroring ``capability_contract``/``executor_contract``'s own
+      ``executable`` convention.
+
+    Never raises: every sub-step (classification, policy resolution,
+    pointer-evidence scan) is individually guarded and degrades to the
+    least-informative branch rather than breaking the mandatory handoff this
+    feeds — a malformed ``item`` (not a dict, missing fields) returns a
+    clean, non-warning, ``ready=True`` result.
+    """
+    from . import artifact_classification as _artifact_classification  # noqa: PLC0415 — avoid import cycle
+    from . import artifact_declaration as _artifact_declaration  # noqa: PLC0415 — avoid import cycle
+
+    if not isinstance(item, dict):
+        item = {}
+    item_id = item.get("id")
+
+    try:
+        classification = _artifact_classification.classify_artifact_work(item)
+    except Exception:  # noqa: BLE001 — never let a bad item break annotation
+        classification = {
+            "classification": _artifact_classification.AMBIGUOUS,
+            "is_artifact_sensitive": False,
+            "confidence": "low",
+            "ambiguous": True,
+            "rule": "fallback_error",
+            "evidence": ["classification raised — treated as unknown"],
+        }
+
+    try:
+        policy = _artifact_declaration.effective_artifact_policy(item)
+    except Exception:  # noqa: BLE001
+        policy = _artifact_declaration.default_artifact_policy()
+    mode = policy.get("artifact_pointer_check")
+    if mode not in _artifact_declaration.ARTIFACT_POINTER_CHECK_LEVELS:
+        mode = _artifact_declaration.DEFAULT_ARTIFACT_POINTER_CHECK
+
+    result: dict[str, Any] = {
+        "item_id": item_id,
+        "classification": classification,
+        "policy": policy,
+        "warning_code": None,
+        "required_remediation": None,
+        "affected_pointer_ids": [],
+        "ready": True,
+    }
+
+    # Not artifact-sensitive (per the classifier's OWN verdict — declared
+    # artifact_kind, or conservative fallback evidence): genuinely safe,
+    # never warns. No policy flag can reach this branch for a sensitive item.
+    if not classification.get("is_artifact_sensitive"):
+        return result
+
+    try:
+        pointer_kind, _hits, _mixed = _artifact_classification._pointer_evidence(item)
+    except Exception:  # noqa: BLE001
+        pointer_kind = None
+    if pointer_kind is not None:
+        return result  # a concrete figure/table pointer is already on file
+
+    try:
+        reason_code, affected_ids = (
+            _artifact_classification.artifact_pointer_insufficiency_evidence(item)
+        )
+    except Exception:  # noqa: BLE001
+        reason_code, affected_ids = None, []
+    if reason_code is None:
+        # Zero candidate uris at all — "there is no pointer", distinct from
+        # "there is a pointer but it's the wrong shape".
+        reason_code = _artifact_classification.INSUFFICIENT_MISSING_POINTER
+        affected_ids = []
+
+    if mode == "off":
+        # Suppressed: classification/policy above are still fully populated
+        # ("raw declarations... preserved") — only the ACTIVE warning
+        # surface is withheld.
+        return result
+
+    result["warning_code"] = reason_code
+    result["required_remediation"] = _artifact_classification._INSUFFICIENCY_REMEDIATION.get(
+        reason_code,
+        _artifact_classification._INSUFFICIENCY_REMEDIATION[
+            _artifact_classification.INSUFFICIENT_MISSING_POINTER
+        ],
+    )
+    result["affected_pointer_ids"] = affected_ids
+    result["ready"] = mode != "strict"
+    return result

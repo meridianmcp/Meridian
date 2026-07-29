@@ -1457,3 +1457,232 @@ async def test_readiness_pointer_level_malformed_target_never_raises():
     out = await verify_pointer_readiness({"source_type": "x", "targets": ["not-a-dict"]})
     assert out["ready"] is False
     assert out["targets"][0]["status"] == "malformed_target"
+
+
+# ---------------------------------------------------------------------------
+# 88f82c15 (b730 follow-up) — evaluate_artifact_pointer_policy: the warn/
+# strict POLICY evaluator that runs at handoff-ANNOTATION time, distinct
+# from (and built on top of) verify_target_readiness/verify_pointer_readiness
+# above (a completion-time, per-target, I/O-backed check) and the 5fd9d2fd
+# classifier (meridian.artifact_classification.classify_artifact_work, which
+# this evaluator reuses rather than duplicating).
+#
+# Covers: off/warn/strict mode behavior, every insufficiency reason code
+# (bare docx / directory / generic tool reference / unsupported type /
+# missing entirely), the "cannot self-declare out of the check" invariant,
+# and the false-positive exception (a genuinely document_only/caption_only
+# item with a bare/insufficient pointer must NEVER warn).
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from meridian.pointers import evaluate_artifact_pointer_policy
+
+
+_STRICT_POLICY = _json.dumps({"artifact_pointer_check": "strict"})
+_WARN_POLICY = _json.dumps({"artifact_pointer_check": "warn"})
+_OFF_POLICY = _json.dumps({"artifact_pointer_check": "off"})
+
+
+def _figure_item(**overrides):
+    item = {"id": "art-1", "title": "Insert a new ablation chart figure into the results"}
+    item.update(overrides)
+    return item
+
+
+# --- required result shape -------------------------------------------------
+
+def test_evaluate_artifact_pointer_policy_always_returns_required_fields():
+    """Each result must include: item id, classification, policy, warning
+    code, required remediation, and affected pointer ids."""
+    result = evaluate_artifact_pointer_policy(_figure_item())
+    for key in (
+        "item_id", "classification", "policy",
+        "warning_code", "required_remediation", "affected_pointer_ids",
+    ):
+        assert key in result
+    assert result["item_id"] == "art-1"
+    assert isinstance(result["classification"], dict)
+    assert isinstance(result["policy"], dict)
+
+
+def test_evaluate_artifact_pointer_policy_never_raises_on_malformed_item():
+    result = evaluate_artifact_pointer_policy(None)  # type: ignore[arg-type]
+    assert result["warning_code"] is None
+    assert result["ready"] is True
+    result2 = evaluate_artifact_pointer_policy({})
+    assert result2["warning_code"] is None
+
+
+# --- default policy is warn -------------------------------------------------
+
+def test_default_artifact_pointer_check_is_warn_when_undeclared():
+    result = evaluate_artifact_pointer_policy(_figure_item())
+    assert result["policy"]["artifact_pointer_check"] == "warn"
+    assert result["warning_code"] == "missing_pointer"
+    assert result["ready"] is True  # warn mode never blocks
+
+
+# --- not artifact-sensitive: never warns, regardless of policy -------------
+
+def test_not_sensitive_item_never_warns_even_under_strict():
+    item = _figure_item(
+        title="Renumber figure captions after Figure 4 was deleted",
+        artifact_policy=_STRICT_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["classification"]["classification"] == "caption_only"
+    assert result["classification"]["is_artifact_sensitive"] is False
+    assert result["warning_code"] is None
+    assert result["ready"] is True
+
+
+def test_false_positive_document_only_declared_kind_with_bare_pointer_never_warns():
+    """A genuinely document_only item (declared kind wins, per 5fd9d2fd) with
+    a bare .docx pointer must NOT warn, even under strict policy."""
+    item = _figure_item(
+        title="Insert a new ablation chart figure",  # figure-sounding title
+        artifact_kind="document_only",  # explicit override — genuinely document_only
+        touches_resources=_json.dumps(["file:outputs/report.docx"]),
+        artifact_policy=_STRICT_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["classification"]["classification"] == "document_only"
+    assert result["classification"]["rule"] == "declared_artifact_kind"
+    assert result["warning_code"] is None
+    assert result["ready"] is True
+
+
+def test_false_positive_fallback_caption_only_with_bare_pointer_never_warns():
+    item = _figure_item(
+        title="Renumber figure captions",
+        touches_resources=_json.dumps(["file:outputs/report.docx"]),
+        artifact_policy=_STRICT_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["classification"]["classification"] == "caption_only"
+    assert result["warning_code"] is None
+
+
+# --- a figure/table item cannot self-declare its way out --------------------
+
+def test_allow_document_only_override_does_not_bypass_a_sensitive_verdict():
+    """policy.allow_document_only_override is NOT consulted to flip a
+    genuinely sensitive (figure/table) classification to safe — only the
+    classifier's own verdict (declared kind, or fallback evidence) can do
+    that. A figure/table item cannot self-declare its way out of the check."""
+    item = _figure_item(
+        artifact_policy=_json.dumps({
+            "artifact_pointer_check": "strict",
+            "allow_document_only_override": True,
+        }),
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["classification"]["is_artifact_sensitive"] is True
+    assert result["warning_code"] == "missing_pointer"
+    assert result["ready"] is False
+
+
+# --- insufficiency reason codes ---------------------------------------------
+
+def test_insufficient_bare_docx_pointer_warns_with_specific_code():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/report.docx"]),
+        artifact_policy=_WARN_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "insufficient_pointer_bare_docx"
+    assert result["required_remediation"]
+    assert "docx" in result["required_remediation"].lower()
+    assert result["ready"] is True  # warn mode
+
+
+def test_insufficient_directory_pointer_warns_with_specific_code():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/figures/"]),
+        artifact_policy=_WARN_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "insufficient_pointer_directory"
+
+
+def test_insufficient_generic_tool_reference_warns_and_names_pointer_id():
+    item = _figure_item(
+        pointer_records=[{
+            "id": "ptr-abc123",
+            "source_type": "code",
+            "targets": [{"uri": "mcp_tool:search_outputs"}],
+        }],
+        artifact_policy=_WARN_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "insufficient_pointer_generic_reference"
+    assert result["affected_pointer_ids"] == ["ptr-abc123"]
+
+
+def test_insufficient_unsupported_extension_warns_with_specific_code():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/figures/notes.txt"]),
+        artifact_policy=_WARN_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "insufficient_pointer_unsupported_type"
+
+
+def test_missing_pointer_entirely_uses_missing_pointer_code():
+    item = _figure_item(artifact_policy=_WARN_POLICY)
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "missing_pointer"
+    assert result["affected_pointer_ids"] == []
+
+
+def test_concrete_evidence_never_warns_even_under_strict():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/figures/ablation.png"]),
+        artifact_policy=_STRICT_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is None
+    assert result["ready"] is True
+
+
+# --- off/warn/strict mode matrix --------------------------------------------
+
+def test_warn_mode_emits_warning_but_stays_ready():
+    item = _figure_item(artifact_policy=_WARN_POLICY)
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is not None
+    assert result["ready"] is True
+
+
+def test_strict_mode_emits_warning_and_is_not_ready():
+    item = _figure_item(artifact_policy=_STRICT_POLICY)
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is not None
+    assert result["ready"] is False
+
+
+def test_off_mode_suppresses_warning_but_preserves_classification_and_policy():
+    """off mode: the policy warning is suppressed while raw declarations
+    (classification + effective policy) are still preserved."""
+    item = _figure_item(artifact_policy=_OFF_POLICY)
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is None
+    assert result["required_remediation"] is None
+    assert result["affected_pointer_ids"] == []
+    assert result["ready"] is True
+    # "raw declarations... preserved" — the real classification/policy are
+    # NOT replaced with empty/unknown placeholders just because checking is off.
+    assert result["classification"]["classification"] == "figure"
+    assert result["classification"]["is_artifact_sensitive"] is True
+    assert result["policy"]["artifact_pointer_check"] == "off"
+
+
+def test_off_mode_with_insufficient_pointer_also_suppresses():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/report.docx"]),
+        artifact_policy=_OFF_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is None
+    assert result["ready"] is True

@@ -2000,6 +2000,29 @@ def build_item_briefing(
             + _xml_escape(json.dumps(_artifact_classification, sort_keys=True))
             + "</artifact_work_classification>"
         )
+    # 88f82c15 (b730 follow-up) — warn/strict artifact-pointer policy verdict
+    # (pointers.evaluate_artifact_pointer_policy): rendered ONLY when it found
+    # an ACTIVE warning (figure/table-sensitive work, no exact output pointer
+    # on file, and policy is warn/strict — never "off", which suppresses the
+    # surface entirely) — mirrors <artifact_declaration>/
+    # <artifact_work_classification>'s "no tag when nothing to say" restraint.
+    # A ``ready: false`` field inside this clause is the explicit,
+    # machine-readable "do not call complete_sprint_item yet" signal for a
+    # "strict" policy — an executor reading this briefing sees it inline,
+    # not buried in prose. Lazy import: mirrors
+    # ``_annotate_resolved_pointers``'s own local ``pointers`` import.
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+
+    try:
+        _artifact_pointer_policy = pointers_module.evaluate_artifact_pointer_policy(item)
+    except Exception:  # noqa: BLE001 — a briefing must never break on this
+        _artifact_pointer_policy = None
+    if _artifact_pointer_policy and _artifact_pointer_policy.get("warning_code"):
+        parts.append(
+            "<artifact_pointer_policy>"
+            + _xml_escape(json.dumps(_artifact_pointer_policy, sort_keys=True))
+            + "</artifact_pointer_policy>"
+        )
     parts += [
         f"<completion_criteria>{_xml_escape(completion_text)}</completion_criteria>",
         f"<not_done_until>{_xml_escape(not_done_text)}</not_done_until>",
@@ -2960,10 +2983,22 @@ async def _annotate_resolved_pointers(
       (even one with zero stored pointers — that IS the "required but not
       yet satisfied" case), unlike ``resolved_pointers``/``pointer_records``
       which need >=1 stored row to produce anything.
+    * ``artifact_pointer_policy`` (88f82c15, b730 follow-up) — the
+      ``pointers.evaluate_artifact_pointer_policy`` warn/strict verdict for
+      this item: classification, effective policy, an active warning code +
+      remediation + affected pointer ids when this is figure/table-sensitive
+      work with no exact output pointer on file, and a ``ready`` bool (False
+      only under a ``"strict"`` policy with an active warning). Computed
+      AFTER ``pointer_records`` above so the evaluator sees the SAME durable
+      pointer evidence this pass just resolved, never a stale/pre-annotation
+      view. Like ``pointer_provenance``, computed unconditionally (even for
+      an item with zero stored pointers — "missing_pointer" is itself a
+      possible verdict).
 
     Fully guarded: a per-item failure degrades to no ``resolved_pointers``/
-    ``pointer_records``/``pointer_provenance`` for that item; the pass NEVER
-    raises so the mandatory handoff can't break.
+    ``pointer_records``/``pointer_provenance``/``artifact_pointer_policy``
+    for that item; the pass NEVER raises so the mandatory handoff can't
+    break.
     """
     from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
     for item in pending_items:
@@ -2990,30 +3025,39 @@ async def _annotate_resolved_pointers(
             }
         except Exception:  # noqa: BLE001 — provenance annotation is best-effort
             pass
-        if not stored:
-            continue
-        rendered: list[dict[str, Any]] = []
-        typed_records: list[dict[str, Any]] = []
-        for ptr in stored:
-            try:
-                resolved = await pointers_module.resolve_pointer(
-                    db, ptr, project_id=project_id, node_resolver=node_resolver
-                )
-            except Exception:  # noqa: BLE001 — resolve_pointer never raises, but be safe
-                continue
-            formatted = _format_resolved_pointer(resolved)
-            if formatted:
-                rendered.append(formatted)
-            try:
-                typed = pointers_module.build_typed_pointer_record(ptr, resolved)
-            except Exception:  # noqa: BLE001 — one bad pointer must not drop the rest
-                typed = None
-            if typed:
-                typed_records.append(typed)
-        if rendered:
-            item["resolved_pointers"] = rendered
-        if typed_records:
-            item["pointer_records"] = typed_records
+        if stored:
+            rendered: list[dict[str, Any]] = []
+            typed_records: list[dict[str, Any]] = []
+            for ptr in stored:
+                try:
+                    resolved = await pointers_module.resolve_pointer(
+                        db, ptr, project_id=project_id, node_resolver=node_resolver
+                    )
+                except Exception:  # noqa: BLE001 — resolve_pointer never raises, but be safe
+                    continue
+                formatted = _format_resolved_pointer(resolved)
+                if formatted:
+                    rendered.append(formatted)
+                try:
+                    typed = pointers_module.build_typed_pointer_record(ptr, resolved)
+                except Exception:  # noqa: BLE001 — one bad pointer must not drop the rest
+                    typed = None
+                if typed:
+                    typed_records.append(typed)
+            if rendered:
+                item["resolved_pointers"] = rendered
+            if typed_records:
+                item["pointer_records"] = typed_records
+        # 88f82c15 (b730 follow-up) — warn/strict artifact-pointer policy
+        # verdict, computed AFTER pointer_records above so it sees this same
+        # pass's durable pointer evidence. Best-effort: never breaks the
+        # mandatory handoff.
+        try:
+            item["artifact_pointer_policy"] = (
+                pointers_module.evaluate_artifact_pointer_policy(item)
+            )
+        except Exception:  # noqa: BLE001 — policy annotation is best-effort
+            pass
     return pending_items
 
 
@@ -4158,12 +4202,55 @@ def _build_artifact_readiness_warnings(
     return warnings
 
 
+def _build_artifact_policy_blocking_warnings(
+    pending_items: "list[dict[str, Any]] | None",
+) -> "list[str]":
+    """88f82c15 (b730 follow-up) — surface STRICT-mode artifact-pointer-policy
+    violations as BLOCKING ``=== HANDOFF READINESS ===`` lines, distinct from
+    (and additive to) ``_build_artifact_readiness_warnings``'s warn-mode
+    aggregate above.
+
+    Reuses :func:`meridian.pointers.evaluate_artifact_pointer_policy` — the
+    per-item warn/strict policy evaluator built on the 5fd9d2fd classifier
+    and 3196ba0e's pointer-readiness primitives — never re-derives
+    classification/insufficiency logic independently. Only an item whose
+    evaluator verdict is ``ready=False`` (i.e. an active warning under a
+    ``"strict"`` policy — ``"warn"``/``"off"`` never produce a blocking
+    line here) is included.
+
+    A non-empty return means the handoff is NOT executable: a receiving
+    executor must resolve every listed item's pointer (or the project must
+    relax its policy) before calling ``complete_sprint_item`` on it.
+    Best-effort: any failure (bad item shape, evaluator error) degrades to
+    no warnings — this must never break the mandatory handoff.
+    """
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+
+    lines: list[str] = []
+    for item in pending_items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            result = pointers_module.evaluate_artifact_pointer_policy(item)
+        except Exception:  # noqa: BLE001
+            continue
+        if result.get("ready") is False and result.get("warning_code"):
+            _cls = (result.get("classification") or {}).get("classification")
+            lines.append(
+                f"✗ NOT EXECUTABLE — item {result.get('item_id')} [{_cls}] fails "
+                f"strict artifact_pointer_check ({result.get('warning_code')}): "
+                f"{result.get('required_remediation')}"
+            )
+    return lines
+
+
 def _build_readiness_block(
     sprint: "str | None",
     pending_count: int,
     decisions_count: int,
     sprint_stale_days: "int | None" = None,
     artifact_warnings: "list[str] | None" = None,
+    artifact_policy_blocking: "list[str] | None" = None,
 ) -> str:
     """Build the =HANDOFF READINESS= header block prepended to every handoff.
 
@@ -4171,6 +4258,13 @@ def _build_readiness_block(
     lines from ``_build_artifact_readiness_warnings`` (figure/table-sensitive
     pending items with no planned_output/pointer evidence yet). Optional and
     additive: every existing positional call site keeps working unchanged.
+
+    ``artifact_policy_blocking`` (88f82c15, b730 follow-up) — pre-formatted
+    BLOCKING lines from ``_build_artifact_policy_blocking_warnings`` (items
+    that fail a ``"strict"`` ``artifact_pointer_check`` policy). Optional and
+    additive, like ``artifact_warnings`` above. A non-empty list gets a
+    leading "HANDOFF NOT READY" summary line so the block is unambiguous at
+    a glance, distinct from the softer ``⚠`` warn-mode lines.
     """
     lines = ["=== HANDOFF READINESS ==="]
     if sprint_stale_days is not None:
@@ -4196,6 +4290,15 @@ def _build_readiness_block(
         lines.append(f"✓ {n} pinned decision{'s' if n != 1 else ''}")
     for _w in artifact_warnings or []:
         lines.append(_w)
+    _blocking = artifact_policy_blocking or []
+    if _blocking:
+        n = len(_blocking)
+        lines.append(
+            f"✗ HANDOFF NOT READY — {n} pending item{'s' if n != 1 else ''} "
+            "blocked by strict artifact_pointer_check policy:"
+        )
+        for _b in _blocking:
+            lines.append(_b)
     lines.append("=========================")
     return "\n".join(lines)
 
@@ -5054,6 +5157,7 @@ async def generate_handoff(
         decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
         sprint_stale_days=_sprint_stale,
         artifact_warnings=_build_artifact_readiness_warnings(pending_sprint_items),
+        artifact_policy_blocking=_build_artifact_policy_blocking_warnings(pending_sprint_items),
     )
     content = f"{readiness_block}\n\n{content}"
 
