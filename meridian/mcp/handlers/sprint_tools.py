@@ -998,6 +998,41 @@ async def handle_claim_sprint_item(
     return item
 
 
+async def handle_claim_parallel_batch(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: claim_parallel_batch.
+
+    22cad9b8 — thin wrapper over db.claim_parallel_batch: atomically claim an
+    entire parallel-safe batch of sprint items (every item's status AND
+    every declared resource) before launching workers, closing the gap
+    between get_parallelizable_groups computing a safe batch and each worker
+    individually calling claim_sprint_item afterward. See
+    meridian.db.sprint_items.claim_parallel_batch's docstring for the full
+    contract (structured error codes, all-or-nothing rollback semantics, the
+    immutable batch manifest).
+
+    ``item_ids`` (required, non-empty list) is typically one group from
+    get_parallelizable_groups' ``groups`` field. ``item_sessions`` (optional
+    ``{item_id: session_id}``) pre-assigns each item to the distinct worker
+    session that will execute it; omitted items default to the top-level
+    ``session_id``. ``resource_contents`` (optional ``{file_path: source}``)
+    supplies source text for any ``symbol:`` resources so they get a real
+    AST-resolved symbol claim instead of falling back to a whole-file lock.
+    """
+    return await db_module.claim_parallel_batch(
+        db, args["project_id"], args.get("session_id"), args.get("item_ids") or [],
+        item_sessions=args.get("item_sessions"),
+        resource_contents=args.get("resource_contents"),
+        force_manifest=args.get("force_manifest") in (True, 1, "true", "1", "yes"),
+        manifest_reason=args.get("manifest_reason"),
+    )
+
+
 async def handle_add_subtask(
     args: dict[str, Any],
     db: Any,

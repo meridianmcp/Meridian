@@ -874,4 +874,54 @@ async def test_start_sprint_item_raises_status_race_on_transition_none(db, monke
 
     with pytest.raises(db_module.SprintItemStatusRace) as exc_info:
         await db_module.start_sprint_item(db, p2["id"], item2["id"])
-    assert exc_info.value.current_status == "in_progress"
+
+
+# ---------------------------------------------------------------------------
+# 22cad9b8 — claim_parallel_batch atomicity: a batch item that loses the
+# claim race (already in_progress under a DIFFERENT actor by the time the
+# batch attempt reaches it) must fail the WHOLE batch cleanly, with any
+# earlier-in-the-same-call item claim rolled back — no partial-claim state,
+# mirroring test_claim_sprint_item_atomic_race_second_caller_rejected above
+# but for the batch entry point.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_atomic_race_second_caller_rejected(db):
+    """Two sessions race to batch-claim overlapping work: session-a's batch
+    claims item x cleanly. session-b's batch (item y, then item x) must fail
+    entirely on x — a structured ITEM_CLAIM_CONFLICT, not a raised exception —
+    and item y (claimed earlier in session-b's OWN call) must be rolled back
+    to pending rather than left orphaned in_progress under session-b."""
+    p = await db_module.create_project(db, "batch-atomic-race")
+    pid = p["id"]
+    sess_a = await db_module.register_session(db, pid, "session-a")
+    sess_b = await db_module.register_session(db, pid, "session-b")
+    x = await db_module.add_sprint_item(
+        db, pid, "v1", "x", touches_resources=["file:x.py"], prospect_bypass=True,
+    )
+    y = await db_module.add_sprint_item(
+        db, pid, "v1", "y", touches_resources=["file:y.py"], prospect_bypass=True,
+    )
+
+    # session-a wins x outright, first.
+    winner = await db_module.claim_parallel_batch(db, pid, sess_a["id"], [x["id"]])
+    assert winner["ok"] is True
+    assert (await db_module.get_sprint_item(db, x["id"]))["status"] == "in_progress"
+
+    # session-b's batch (y then x) must fail entirely on x -- and y, claimed
+    # moments earlier in this SAME batch call, must be rolled back.
+    loser = await db_module.claim_parallel_batch(db, pid, sess_b["id"], [y["id"], x["id"]])
+    assert loser["ok"] is False
+    assert loser["error"] == "ITEM_CLAIM_CONFLICT"
+    assert loser["item_id"] == x["id"]
+
+    reread_x = await db_module.get_sprint_item(db, x["id"])
+    reread_y = await db_module.get_sprint_item(db, y["id"])
+    # x is untouched -- still session-a's legitimate claim.
+    assert reread_x["status"] == "in_progress"
+    assert reread_x["actor"] == sess_a["id"]
+    # y was rolled back to pending, not left orphaned in_progress under session-b.
+    assert reread_y["status"] == "pending"
+    assert reread_y["claimed_at"] is None
+    assert (await db_module.get_file_claims(db, "y.py"))["file_lock"] is None

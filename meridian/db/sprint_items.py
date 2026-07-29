@@ -3864,6 +3864,462 @@ async def get_parallelizable_groups(
     }
 
 
+# ---------------------------------------------------------------------------
+# 22cad9b8 — atomic batch claim: reserve an ENTIRE parallel-safe batch (every
+# item's status AND every declared resource) before workers launch.
+#
+# get_parallelizable_groups (above) can prove a batch of items is safe to run
+# in parallel — their declared touches_resources are pairwise disjoint — but
+# it only COMPUTES that fact; nothing then atomically RESERVES it. Between
+# "compute the safe batch" and "each worker calls claim_sprint_item for its
+# item," another session can sneak in and claim one of those same resources,
+# or the batch composition can go stale (an item's declared resources drift,
+# or a sibling planner recolors the board). claim_parallel_batch closes that
+# gap: it is the single atomic operation that turns "this batch was proven
+# safe a moment ago" into "this batch is NOW reserved, or nothing changed."
+#
+# Design, mirroring eb2e44f8's immutable-manifest + this repo's existing
+# transactional-gate conventions (18c488b6's _sprint_item_resource_claim_gate
+# in meridian/mcp/handler.py, which this reuses the same acquire/rollback
+# shape from, kept self-contained here rather than imported across the
+# db→mcp layer boundary):
+#
+#   1. Validate every item exists, belongs to the project, and (for a
+#      multi-item batch) has NON-EMPTY declared touches_resources — an item
+#      with nothing declared can never be PROVEN parallel-safe, so it is
+#      refused as part of a multi-item batch rather than silently treated as
+#      conflict-free (empty ∩ anything == ∅ would otherwise let it slip
+#      through). A batch of exactly one such item is fine: nothing else in
+#      the batch exists for it to conflict with.
+#   2. Validate the requested batch is INTERNALLY conflict-free (no two
+#      items in it share/overlap a resource, using the same file⊃symbol-
+#      aware _resource_sets_conflict get_parallelizable_groups' coloring
+#      uses) — catches a stale or hand-assembled batch.
+#   3. Persist an immutable batch-claim manifest (db.batch_claim) BEFORE
+#      attempting any lock — a durable, auditable record of what was
+#      DECIDED, independent of whether the attempt below succeeds.
+#   4. Attempt, in order, for every item in the batch: claim the item's
+#      status (claim_sprint_item — the SAME gates/atomicity a normal solo
+#      claim gets: deferred/superseded/wave-gate/unprospected/race-lost all
+#      apply unchanged), then claim every one of its declared resources
+#      (file:/symbol: via claim_file/claim_symbol — preserving AST-resolved
+#      symbol-level concurrency, never downgraded to a coarser whole-file
+#      lock; any other typed resource via the generic claim_resource
+#      primitive). The FIRST failure anywhere — item-claim conflict/gate, or
+#      resource conflict — rolls back EVERYTHING this call acquired so far
+#      (resources released, item statuses reverted to what they were before
+#      this call touched them) and marks the manifest 'failed' with a
+#      structured detail identifying exactly what conflicted. No partial
+#      state is ever left behind.
+#   5. On full success the manifest is marked 'claimed' and every item comes
+#      back in_progress with its resources held.
+#
+# item_sessions lets a caller pre-assign a DISTINCT claiming session per item
+# (the normal real-parallelism shape: each worker gets its own session_id
+# before it launches, matching how 18c488b6's own tests exercise two
+# different sessions claiming two disjoint symbols in the same file) —
+# resources end up held under the SAME session that will actually do the
+# work, so nothing needs to be "handed off" after workers start. Any item_id
+# not present in item_sessions falls back to the top-level session_id (the
+# simple single-claimant case).
+# ---------------------------------------------------------------------------
+
+
+async def _claim_batch_resource(
+    db: aiosqlite.Connection,
+    resource: str,
+    session_id: str,
+    resource_contents: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Acquire ONE declared resource for the atomic batch gate.
+
+    Self-contained mirror of meridian.mcp.handler._sprint_item_resource_claim
+    _gate's per-resource acquisition logic (file:/symbol: via claim_file/
+    claim_symbol with AST-aware symbol disjointness and a whole-file
+    fallback when no source content is available; anything else via the
+    generic typed-resource lock claim_resource) — reimplemented here rather
+    than imported, since meridian.db must not depend on meridian.mcp.
+
+    Returns ``{"acquired": True, "newly_acquired": bool, "scope": "file"|
+    "symbol"|"generic"|"none", "resource": resource, ...}`` on success, or
+    ``{"acquired": False, "scope": ..., "resource": resource,
+    "holder_session_id": ..., "reason": ...}`` on conflict.
+    """
+    from meridian.db import (  # noqa: PLC0415
+        claim_file, claim_symbol, claim_resource,
+        get_file_claims, get_symbol_claims, get_resource_claims,
+    )
+
+    if resource.startswith("file:"):
+        file_path = resource[len("file:"):]
+        pre = await get_file_claims(db, file_path)
+        pre_held = bool((pre.get("file_lock") or {}).get("session_id") == session_id)
+        result = await claim_file(db, file_path, session_id, mode="write")
+        if result.get("claimed"):
+            return {
+                "acquired": True, "scope": "file", "resource": resource,
+                "file_path": file_path, "newly_acquired": not pre_held,
+            }
+        return {
+            "acquired": False, "scope": "file", "resource": resource,
+            "file_path": file_path,
+            "holder_session_id": result.get("holder_session_id"),
+            "reason": result.get("reason") or "locked",
+        }
+
+    if resource.startswith("symbol:"):
+        value = resource[len("symbol:"):]
+        file_path, sep, symbol_name = value.partition("::")
+        if not sep or not symbol_name or not file_path:
+            # Bare symbol id with no resolvable file scope — nothing to lock.
+            return {
+                "acquired": True, "scope": "none", "resource": resource,
+                "newly_acquired": False, "fallback_reason": "no_file_scope",
+            }
+
+        content = _batch_resource_content_lookup(resource_contents, file_path)
+        fallback_reason: str | None = None
+        if content:
+            symbol_claims = await get_symbol_claims(db, file_path)
+            pre_held = any(
+                c.get("symbol_name") == symbol_name and c.get("session_id") == session_id
+                for c in symbol_claims
+            )
+            symbol_result = await claim_symbol(db, session_id, file_path, symbol_name, content)
+            if symbol_result.get("claimed"):
+                return {
+                    "acquired": True, "scope": "symbol", "resource": resource,
+                    "file_path": file_path, "symbol": symbol_name,
+                    "newly_acquired": not pre_held,
+                }
+            if symbol_result.get("reason") in ("symbol_conflict", "file_locked"):
+                holder = symbol_result.get("holder_session_id")
+                if not holder:
+                    conf = symbol_result.get("conflicts") or [{}]
+                    holder = conf[0].get("holder_session_id")
+                return {
+                    "acquired": False, "scope": "symbol", "resource": resource,
+                    "file_path": file_path, "symbol": symbol_name,
+                    "holder_session_id": holder,
+                    "reason": symbol_result.get("reason"),
+                }
+            # unparseable / symbol_not_found — explicit fallback, recorded below.
+            fallback_reason = symbol_result.get("reason") or "unparseable"
+        else:
+            fallback_reason = "no_source_supplied"
+
+        file_claims = await get_file_claims(db, file_path)
+        pre_held_file = bool(
+            (file_claims.get("file_lock") or {}).get("session_id") == session_id
+        )
+        file_result = await claim_file(db, file_path, session_id, mode="write")
+        if file_result.get("claimed"):
+            return {
+                "acquired": True, "scope": "file", "resource": resource,
+                "file_path": file_path, "symbol": symbol_name,
+                "newly_acquired": not pre_held_file,
+                "fallback_reason": fallback_reason,
+            }
+        return {
+            "acquired": False, "scope": "file", "resource": resource,
+            "file_path": file_path, "symbol": symbol_name,
+            "holder_session_id": file_result.get("holder_session_id"),
+            "reason": file_result.get("reason") or "locked",
+            "fallback_reason": fallback_reason,
+        }
+
+    # Other typed resources (db:, route:, mcp_tool:, pypi:, github:, note:,
+    # decision:) — the generic typed-resource lock primitive.
+    claims = await get_resource_claims(db, resource)
+    pre_held = bool((claims.get("resource_lock") or {}).get("session_id") == session_id)
+    result = await claim_resource(db, resource, session_id)
+    if result.get("claimed"):
+        return {
+            "acquired": True, "scope": "generic", "resource": resource,
+            "newly_acquired": not pre_held,
+        }
+    return {
+        "acquired": False, "scope": "generic", "resource": resource,
+        "holder_session_id": result.get("holder_session_id"),
+        "reason": "locked",
+    }
+
+
+def _batch_resource_content_lookup(
+    resource_contents: dict[str, Any] | None, file_path: str
+) -> str | None:
+    """Best-effort lookup of caller-supplied source for ``file_path``,
+    tolerant of backslash/leading-``./`` path-separator variance. Mirrors
+    meridian.mcp.handler._resource_content_lookup."""
+    if not resource_contents or not isinstance(resource_contents, dict):
+        return None
+    if file_path in resource_contents:
+        val = resource_contents[file_path]
+        return val if isinstance(val, str) and val else None
+    normalized = file_path.strip().replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    for key, val in resource_contents.items():
+        k = str(key or "").strip().replace("\\", "/")
+        if k.startswith("./"):
+            k = k[2:]
+        if k == normalized and isinstance(val, str) and val:
+            return val
+    return None
+
+
+async def _release_batch_resource(
+    db: aiosqlite.Connection, entry: dict[str, Any], session_id: str
+) -> None:
+    """Release exactly one entry _claim_batch_resource newly acquired. Never
+    raises — best-effort cleanup during a batch rollback."""
+    from meridian.db import release_file, release_symbol, release_resource  # noqa: PLC0415
+    scope = entry.get("scope")
+    try:
+        if scope == "file":
+            await release_file(db, entry["file_path"], session_id)
+        elif scope == "symbol":
+            await release_symbol(db, session_id, entry["file_path"], entry["symbol"])
+        elif scope == "generic":
+            await release_resource(db, entry["resource"], session_id)
+        # scope == "none": nothing was ever acquired for this entry.
+    except Exception:  # noqa: BLE001 — best-effort cleanup, never raise from here
+        pass
+
+
+async def _revert_batch_item_claim(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    original_status: str,
+    original_actor: str | None,
+) -> None:
+    """Undo a claim_sprint_item this SAME batch call just made, used when a
+    LATER item/resource in the batch fails and the whole attempt must roll
+    back to a no-partial-claim state.
+
+    Reverts status back to ``original_status`` (whatever it was immediately
+    before this call claimed it) via _transition_status's atomic from-state
+    guard, then explicitly restores claimed_at/actor (mirroring
+    requeue_or_fail_stalled_item's re-queue bookkeeping — _transition_status
+    itself only clears claimed_at when told to set it "now", never to NULL).
+    """
+    reverted = await _transition_status(
+        db, project_id, item_id, original_status,
+        from_statuses=["in_progress"],
+    )
+    if reverted is None:
+        # Another session raced in and moved the item on from in_progress
+        # before this rollback landed — nothing safe to revert; leave it as
+        # is rather than force a status it may no longer legitimately hold.
+        return
+    await db.execute(
+        "UPDATE sprint_items SET claimed_at = NULL, actor = ? "
+        "WHERE id = ? AND project_id = ?",
+        (original_actor, item_id, project_id),
+    )
+    await db.commit()
+    _invalidate_sprint_items_cache(project_id)
+
+
+async def claim_parallel_batch(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session_id: str,
+    item_ids: list[str],
+    *,
+    item_sessions: dict[str, str] | None = None,
+    resource_contents: dict[str, Any] | None = None,
+    force_manifest: bool = False,
+    manifest_reason: str | None = None,
+) -> dict[str, Any]:
+    """22cad9b8 — atomically claim a whole parallel-safe batch of sprint items.
+
+    ``session_id`` is the requesting/orchestrating session, recorded on the
+    durable batch manifest and used as the default claiming identity for any
+    item not overridden in ``item_sessions``. ``item_sessions`` optionally
+    maps ``{item_id: claiming_session_id}`` so a caller can pre-assign each
+    item to the DISTINCT worker session that will actually execute it —
+    resources then end up held under the session that does the work, so
+    nothing needs handing off once workers launch.
+
+    Returns ``{"ok": True, "manifest_id", "batch_key", "claimed_item_ids",
+    "items", "resources", "manifest"}`` on success, or ``{"ok": False,
+    "error": <code>, "message": ...}`` (plus error-specific fields) on any
+    rejection — never raises for an expected validation/conflict outcome, only
+    for a genuine caller bug (empty item_ids / missing session_id). See the
+    module-level comment above for the full step-by-step contract; error
+    codes are: ITEM_NOT_FOUND, UNDECLARED_RESOURCE_IN_BATCH,
+    BATCH_COMPOSITION_CONFLICT, BATCH_MANIFEST_EXISTS, ITEM_CLAIM_CONFLICT,
+    <claim_sprint_item's own blocked "error" values e.g. DEFERRED/SUPERSEDED/
+    WAVE_GATE_PENDING/UNPROSPECTED>, BATCH_RESOURCE_CONFLICT.
+    """
+    if not session_id:
+        raise ValueError("session_id is required to claim a batch")
+    seen_ids: set[str] = set()
+    ordered_ids: list[str] = []
+    for iid in item_ids or []:
+        if iid and iid not in seen_ids:
+            seen_ids.add(iid)
+            ordered_ids.append(iid)
+    if not ordered_ids:
+        raise ValueError("item_ids must be a non-empty list")
+
+    from .batch_claim import (  # noqa: PLC0415
+        persist_batch_claim_manifest, mark_batch_claim_outcome, compute_batch_key,
+    )
+
+    # ── 1. Load + validate every item exists and belongs to this project ───
+    items_by_id: dict[str, dict[str, Any]] = {}
+    for iid in ordered_ids:
+        item = await get_sprint_item(db, iid)
+        if item is None or item.get("project_id") != project_id:
+            return {
+                "ok": False,
+                "error": "ITEM_NOT_FOUND",
+                "message": f"sprint item {iid!r} not found in project {project_id!r}",
+                "item_id": iid,
+            }
+        items_by_id[iid] = item
+
+    item_resources: dict[str, list[str]] = {
+        iid: parse_touches_resources(items_by_id[iid].get("touches_resources"))
+        for iid in ordered_ids
+    }
+
+    # ── Undeclared-resource guard: never silently treat "nothing declared"
+    # as "safe to parallelize" (mirrors get_parallelizable_groups' de730a25
+    # invariant). A batch of exactly one item is exempt — nothing else in a
+    # singleton batch exists for it to conflict with. ──
+    if len(ordered_ids) > 1:
+        undeclared = [iid for iid in ordered_ids if not item_resources[iid]]
+        if undeclared:
+            return {
+                "ok": False,
+                "error": "UNDECLARED_RESOURCE_IN_BATCH",
+                "message": (
+                    "item(s) "
+                    f"{', '.join(i[:8] for i in undeclared)} declare no "
+                    "touches_resources, so parallel safety can't be proven for "
+                    "them. Claim them individually (a batch of one) instead of "
+                    "including them in a multi-item atomic batch."
+                ),
+                "undeclared_item_ids": undeclared,
+            }
+
+    # ── 2. Internal composition check: the requested batch must itself be
+    # conflict-free, using the same file⊃symbol-aware comparison
+    # get_parallelizable_groups' coloring uses. Catches a stale or
+    # hand-assembled batch that was never actually disjoint. ──
+    composition_conflicts: list[dict[str, Any]] = []
+    for i, a_id in enumerate(ordered_ids):
+        a_res = set(item_resources[a_id])
+        for b_id in ordered_ids[i + 1:]:
+            b_res = set(item_resources[b_id])
+            if _resource_sets_conflict(a_res, b_res):
+                composition_conflicts.append({
+                    "item_a": a_id, "item_b": b_id,
+                    "resources_a": sorted(a_res), "resources_b": sorted(b_res),
+                })
+    if composition_conflicts:
+        return {
+            "ok": False,
+            "error": "BATCH_COMPOSITION_CONFLICT",
+            "message": (
+                "requested batch is not internally conflict-free — two or more "
+                "items in it declare overlapping resources. Recompute the batch "
+                "via get_parallelizable_groups and retry."
+            ),
+            "conflicting_pairs": composition_conflicts,
+        }
+
+    resources_union = sorted({r for lst in item_resources.values() for r in lst})
+
+    # ── 3. Persist the immutable manifest BEFORE attempting any lock — a
+    # durable audit record of what was decided, independent of whether the
+    # attempt below actually succeeds. ──
+    try:
+        manifest = await persist_batch_claim_manifest(
+            db, project_id, session_id, ordered_ids, item_resources, resources_union,
+            force=force_manifest, reason=manifest_reason,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": "BATCH_MANIFEST_EXISTS",
+            "message": str(exc),
+            "batch_key": compute_batch_key(ordered_ids),
+        }
+
+    # ── 4. Attempt to atomically claim every item's status AND every
+    # declared resource. All-or-nothing across the whole batch. ──
+    claimed_items: list[tuple[str, str, str | None]] = []  # (item_id, orig_status, orig_actor)
+    acquired_resources: list[dict[str, Any]] = []
+
+    async def _rollback_and_fail(error_code: str, message: str, **extra: Any) -> dict[str, Any]:
+        for entry in reversed(acquired_resources):
+            await _release_batch_resource(db, entry, entry["_session_id"])
+        for iid, orig_status, orig_actor in reversed(claimed_items):
+            await _revert_batch_item_claim(db, project_id, iid, orig_status, orig_actor)
+        detail = {"error": error_code, "message": message, **extra}
+        await mark_batch_claim_outcome(db, manifest["id"], "failed", failure_detail=detail)
+        return {"ok": False, "manifest_id": manifest["id"], **detail}
+
+    for iid in ordered_ids:
+        item = items_by_id[iid]
+        orig_status = item.get("status") or "pending"
+        orig_actor = item.get("actor")
+        claim_session = (item_sessions or {}).get(iid, session_id)
+        try:
+            claim_result = await claim_sprint_item(db, project_id, iid, actor=claim_session)
+        except ValueError as exc:
+            return await _rollback_and_fail(
+                "ITEM_CLAIM_CONFLICT",
+                f"could not claim sprint item {iid!r}: {exc}",
+                item_id=iid,
+            )
+        if claim_result is None:
+            return await _rollback_and_fail(
+                "ITEM_CLAIM_CONFLICT",
+                f"sprint item {iid!r} vanished during the batch claim attempt",
+                item_id=iid,
+            )
+        if isinstance(claim_result, dict) and claim_result.get("blocked"):
+            return await _rollback_and_fail(
+                claim_result.get("error") or "ITEM_CLAIM_BLOCKED",
+                claim_result.get("reason") or f"sprint item {iid!r} could not be claimed",
+                item_id=iid,
+            )
+        claimed_items.append((iid, orig_status, orig_actor))
+
+        for resource in item_resources[iid]:
+            outcome = await _claim_batch_resource(db, resource, claim_session, resource_contents)
+            if not outcome.get("acquired"):
+                return await _rollback_and_fail(
+                    "BATCH_RESOURCE_CONFLICT",
+                    f"resource {resource!r} (item {iid!r}) is locked by another "
+                    f"live session ({outcome.get('holder_session_id')}).",
+                    item_id=iid, resource=resource,
+                    holder_session_id=outcome.get("holder_session_id"),
+                )
+            if outcome.get("newly_acquired"):
+                outcome["_item_id"] = iid
+                outcome["_session_id"] = claim_session
+                acquired_resources.append(outcome)
+
+    final_manifest = await mark_batch_claim_outcome(db, manifest["id"], "claimed")
+    result_items = [await get_sprint_item(db, iid) for iid in ordered_ids]
+    return {
+        "ok": True,
+        "manifest_id": manifest["id"],
+        "batch_key": manifest["batch_key"],
+        "claimed_item_ids": ordered_ids,
+        "items": result_items,
+        "resources": resources_union,
+        "manifest": final_manifest,
+    }
+
+
 def _topo_depth_map(items: list[dict[str, Any]]) -> dict[str, int]:
     """Compute topological depth for each item in ``items`` by dependency.
 

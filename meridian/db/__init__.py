@@ -1124,6 +1124,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_docx_merge_manifests(db)
     await _migrate_proposal_evidence_links(db)
     await _migrate_wave_base_manifests(db)
+    await _migrate_sprint_batch_claims(db)
     return db
 
 
@@ -10630,6 +10631,7 @@ from .sprint_items import (  # noqa: F401
     assign_sprint_waves,
     build_github_completion_comment,
     build_sprint_items_xml,
+    claim_parallel_batch,
     claim_sprint_item,
     collapse_sprint_item_clusters,
     complete_sprint_item,
@@ -10952,4 +10954,19 @@ from .worktree_manifest import (  # noqa: F401
     persist_worktree_manifest,
     get_worktree_manifest,
     get_worktree_manifest_history,
+)
+
+
+# 22cad9b8 — immutable batch-claim manifests for atomic parallel sprint-item
+# claims (durable "what batch was decided" record), backing
+# sprint_items.claim_parallel_batch. Mirrors the worktree_manifest import
+# immediately above.
+from .batch_claim import (  # noqa: F401
+    _migrate_sprint_batch_claims,
+    compute_batch_key,
+    persist_batch_claim_manifest,
+    get_batch_claim_manifest,
+    get_batch_claim_manifest_by_id,
+    get_batch_claim_manifest_history,
+    mark_batch_claim_outcome,
 )
