@@ -1797,6 +1797,217 @@ def test_require_strict_evidence_item_flag_engages_gate_without_call_arg():
         _run(db.close())
 
 
+# ---------------------------------------------------------------------------
+# e7548587 — enforce active-worktree merge approval before sprint completion.
+# require_merge_approval is now a tri-state (0=off, 1=advisory, 2=strict),
+# full-stack via the MCP complete_sprint_item dispatch. Mirrors the
+# 5fe3502e strict-evidence block above: default (advisory, mode 1) behavior
+# is unchanged, strict mode (2) actually blocks, and the authorized override
+# path is auditable.
+# ---------------------------------------------------------------------------
+
+def test_merge_approval_advisory_default_completes_with_warning():
+    """DEFAULT CASE (mode 1, advisory, unset == 1): a session with a genuine
+    active worktree still completes — only a merge_warning + HITL reminder
+    are attached, exactly the pre-e7548587 behavior. This is the
+    backward-compatibility guarantee: existing projects (all default to 1)
+    see zero behavior change."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-advisory"}, db, "/tmp"))
+        pid = proj["id"]
+        sess = _run(db_module.register_session(db, pid, "advisory-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Advisory merge item", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/advisory", "../repo-worktree-advisory",
+            item_id=item["id"],
+        ))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert done["merge_warning"]["worktree_branch"] == "worktree/advisory"
+        assert "override" not in done["merge_warning"]
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_blocks_active_unmerged_worktree():
+    """require_merge_approval=2 (strict) + a genuine active worktree (per
+    get_active_worktree_for_session) -> MERGE_APPROVAL_REQUIRED, and the item
+    is NOT marked done."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-block"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        sess = _run(db_module.register_session(db, pid, "strict-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict merge item", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/strict", "../repo-worktree-strict",
+            item_id=item["id"],
+        ))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]}, db, "/tmp"))
+        assert result.get("error") == "MERGE_APPROVAL_REQUIRED"
+        assert result["worktree_branch"] == "worktree/strict"
+        still = _run(db_module.get_sprint_item(db, item["id"]))
+        assert still["status"] != "done"
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_override_without_reason_still_blocks():
+    """override_merge_approval=true alone (no reason) does NOT bypass strict
+    mode — an override can never be the silent default, mirroring
+    5fe3502e's strict-evidence override contract exactly."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-noreason"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        sess = _run(db_module.register_session(db, pid, "strict-noreason-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict override no reason", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/strict-nr", "../repo-worktree-strict-nr",
+            item_id=item["id"],
+        ))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+             "override_merge_approval": True}, db, "/tmp"))
+        assert result.get("error") == "MERGE_APPROVAL_REQUIRED"
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_override_with_reason_completes_and_is_audited():
+    """override_merge_approval=true + a non-empty
+    override_merge_approval_reason bypasses the strict block, completes the
+    item, and writes an auditable action_audit_log row (who/when/why) —
+    surfaced on the response too, mirroring
+    record_strict_evidence_override's contract."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-audited"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        sess = _run(db_module.register_session(db, pid, "strict-audited-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict override audited", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/strict-aud", "../repo-worktree-strict-aud",
+            item_id=item["id"],
+        ))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+             "override_merge_approval": True,
+             "override_merge_approval_reason": "merged manually outside Meridian, verified by hand",
+             "actor": "executor-2"}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert done["merge_warning"]["override"]["actor"] == "executor-2"
+
+        log = _run(db_module.get_action_audit_log(
+            db, project_id=pid, event_type="sprint_item_merge_approval_override",
+        ))
+        assert len(log) == 1
+        assert "merged manually outside Meridian" in log[0]["detail"]
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_no_registered_worktree_never_blocked():
+    """DEFAULT-SAFE INVARIANT: even with require_merge_approval=2 (strict)
+    configured, a session that never registered an active worktree (the
+    common case for sessions managing their own git worktrees manually via
+    raw `git worktree add`/cherry-pick, rather than Meridian's
+    create_worktree/register_worktree MCP tools) is NEVER blocked — the gate
+    only engages for a genuinely registered, still-active worktree."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-no-wt"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        sess = _run(db_module.register_session(db, pid, "no-worktree-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "No worktree registered", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert "merge_warning" not in done
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_no_session_id_never_blocked():
+    """DEFAULT-SAFE INVARIANT: a completion call with no session_id at all
+    (e.g. a caller that never plumbed it through) skips the entire
+    merge-approval block regardless of mode — there is no session to look up
+    a worktree for."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-no-session"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "No session id on completion", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_off_mode_skips_check_entirely():
+    """require_merge_approval=0 (off): even a genuine active worktree gets
+    NO merge_warning and NO HITL reminder — the check is fully disabled."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-off"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=0))
+        sess = _run(db_module.register_session(db, pid, "off-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Off mode item", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/off", "../repo-worktree-off",
+            item_id=item["id"],
+        ))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert "merge_warning" not in done
+    finally:
+        _run(db.close())
+
+
 def test_read_write_claim_distinction():
     """ffa03655 — shared read claims coexist; write is exclusive and waits for readers."""
     import meridian.db as db_module

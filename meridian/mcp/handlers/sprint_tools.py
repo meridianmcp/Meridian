@@ -1107,13 +1107,25 @@ async def handle_complete_sprint_item(
         _close_or_propose_github_issue,
     )
     # 0716c9e0 — check active worktree before marking done.
+    # e7548587 — require_merge_approval is a TRI-STATE (mirrors
+    # hitl_auto_answer's own 0/1/2 pattern): 0=off (no check at all),
+    # 1=advisory (warn via HITL, always proceed — the ORIGINAL 0716c9e0
+    # behavior, still the default so existing projects see zero change),
+    # 2=strict (a genuine active, unmerged worktree per
+    # get_active_worktree_for_session actually BLOCKS completion). Before
+    # this fix, ANY nonzero value only ever warned — require_merge_approval
+    # was advisory-only regardless of configuration; that was the bug.
     _complete_session_id = args.get("session_id") or ""
+    _complete_actor = args.get("actor") or _complete_session_id or None
     _merge_warning: dict[str, Any] | None = None
     if _complete_session_id:
         try:
             _ps_complete = await db_module.get_project_settings(db, args["project_id"])
-            _req_merge = bool(int((_ps_complete or {}).get("require_merge_approval") or 1))
-            if _req_merge:
+            _raw_merge_mode = (_ps_complete or {}).get("require_merge_approval")
+            _merge_mode = (
+                max(0, min(2, int(_raw_merge_mode))) if _raw_merge_mode is not None else 1
+            )
+            if _merge_mode > 0:
                 _wt = await db_module.get_active_worktree_for_session(db, _complete_session_id)
                 if _wt:
                     # eb2e44f8 — HARD GATE: when this worktree has a persisted
@@ -1153,6 +1165,55 @@ async def handle_complete_sprint_item(
                                     "manifest is stale) and retry."
                                 ),
                             }
+
+                    # e7548587 — STRICT merge-approval gate (mode 2 only).
+                    # Blocks unless the caller passes BOTH
+                    # override_merge_approval=true AND a non-empty
+                    # override_merge_approval_reason in the SAME call —
+                    # record_merge_approval_override then writes an
+                    # auditable action_audit_log row (who/when/why), mirroring
+                    # 5fe3502e's record_strict_evidence_override exactly. Mode
+                    # 1 (advisory, the pre-existing default) never enters this
+                    # branch — it falls straight through to the unconditional
+                    # HITL-reminder-only behavior below, byte-for-byte
+                    # unchanged from before this fix.
+                    _merge_approval_override: dict[str, Any] | None = None
+                    if _merge_mode >= 2:
+                        _mrg_override_requested = bool(args.get("override_merge_approval"))
+                        _mrg_override_reason = (
+                            args.get("override_merge_approval_reason") or ""
+                        ).strip()
+                        if _mrg_override_requested and _mrg_override_reason:
+                            from meridian.worktree_merge_guard import (  # noqa: PLC0415
+                                record_merge_approval_override,
+                            )
+                            _merge_approval_override = await record_merge_approval_override(
+                                db, args["project_id"], args["item_id"],
+                                actor=_complete_actor,
+                                reason=_mrg_override_reason,
+                                worktree=_wt,
+                                tenant_id=(tenant or {}).get("id"),
+                            )
+                        else:
+                            return {
+                                "error": "MERGE_APPROVAL_REQUIRED",
+                                "item_id": args["item_id"],
+                                "worktree_id": _wt["id"],
+                                "worktree_branch": _wt["branch"],
+                                "worktree_path": _wt["path"],
+                                "message": (
+                                    f"Refusing to complete {args['item_id']}: session "
+                                    f"{_complete_session_id!r} has an active, unmerged "
+                                    f"worktree on branch '{_wt['branch']}' at "
+                                    f"'{_wt['path']}' and this project requires strict "
+                                    "merge approval (require_merge_approval=2). Merge it "
+                                    f"first (git checkout dev && git merge {_wt['branch']} "
+                                    "--no-edit), or pass override_merge_approval=true "
+                                    "with a non-empty override_merge_approval_reason to "
+                                    "explicitly acknowledge and complete anyway (audited)."
+                                ),
+                            }
+
                     _hitl = await db_module.request_hitl(
                         db, args["project_id"],
                         f"Session has active worktree on branch '{_wt['branch']}' "
@@ -1167,6 +1228,8 @@ async def handle_complete_sprint_item(
                         "hitl_id": (_hitl or {}).get("id"),
                         "message": "Merge reminder filed — see HITL queue.",
                     }
+                    if _merge_approval_override:
+                        _merge_warning["override"] = _merge_approval_override
         except Exception:  # noqa: BLE001
             pass
 
@@ -1213,7 +1276,9 @@ async def handle_complete_sprint_item(
                 ),
             }
 
-    _complete_actor = args.get("actor") or _complete_session_id or None
+    # e7548587 — _complete_actor is now computed up top (alongside
+    # _complete_session_id), before the merge-approval block that needs it
+    # for record_merge_approval_override's audit trail.
 
     # 5fe3502e — STRICT (fail-closed) evidence gate. OPT-IN ONLY: engages when
     # the caller explicitly passes strict_evidence=true, or the item itself

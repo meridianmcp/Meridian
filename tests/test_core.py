@@ -14719,6 +14719,56 @@ async def test_register_and_remove_worktree(db):
 
 
 @pytest.mark.asyncio
+async def test_get_active_worktree_for_session_none_when_never_registered(db):
+    """e7548587 — the common case: a session that manages its own git
+    worktree manually (raw ``git worktree add``/cherry-pick, never calling
+    Meridian's create_worktree/register_worktree MCP tools) has NO
+    active_worktrees row at all. get_active_worktree_for_session must return
+    None for it — this is the structural reason complete_sprint_item's
+    merge-approval gate stays default-safe for most callers in a
+    multi-session repo, even in strict mode."""
+    p = await db_module.create_project(db, "no-registered-worktree")
+    session = await db_module.register_session(db, p["id"], "manual-git-session")
+
+    wt = await db_module.get_active_worktree_for_session(db, session["id"])
+    assert wt is None
+
+
+@pytest.mark.asyncio
+async def test_update_project_settings_require_merge_approval_tri_state(db):
+    """e7548587 — require_merge_approval is now a tri-state (0=off,
+    1=advisory, 2=strict), mirroring hitl_auto_answer's existing 0/1/2
+    pattern. update_project_settings must clamp into [0, 2] rather than
+    collapsing any truthy value down to 1 (the pre-fix bool-coercion bug that
+    would have silently downgraded a caller's requested strict=2 to
+    advisory=1)."""
+    p = await db_module.create_project(db, "merge-approval-tri-state")
+
+    # Default (never set) reads back as 1 (advisory) — unchanged behavior for
+    # every pre-existing project.
+    default_settings = await db_module.get_project_settings(db, p["id"])
+    assert default_settings["require_merge_approval"] == 1
+
+    strict = await db_module.update_project_settings(db, p["id"], require_merge_approval=2)
+    assert strict["require_merge_approval"] == 2
+    reread = await db_module.get_project_settings(db, p["id"])
+    assert reread["require_merge_approval"] == 2
+
+    off = await db_module.update_project_settings(db, p["id"], require_merge_approval=0)
+    assert off["require_merge_approval"] == 0
+
+    advisory = await db_module.update_project_settings(db, p["id"], require_merge_approval=1)
+    assert advisory["require_merge_approval"] == 1
+
+    # Out-of-range values clamp rather than raising or silently truncating to
+    # a bool (matches hitl_auto_answer's own clamp behavior).
+    clamped_high = await db_module.update_project_settings(db, p["id"], require_merge_approval=99)
+    assert clamped_high["require_merge_approval"] == 2
+    clamped_low = await db_module.update_project_settings(db, p["id"], require_merge_approval=-5)
+    assert clamped_low["require_merge_approval"] == 0
+
+
+@pytest.mark.asyncio
 async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     """claim_sprint_item adds worktree_suggested fields when executor isolation=worktree."""
     import json as _json

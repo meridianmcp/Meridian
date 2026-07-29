@@ -1554,6 +1554,9 @@ async def get_project_settings(
         "hitl_auto_answer": int(data.get("hitl_auto_answer") or 0),
         # 0716c9e0 — parallel safety toggles; default ON (1).
         "auto_worktrees": int(data.get("auto_worktrees") if data.get("auto_worktrees") is not None else 1),
+        # e7548587 — tri-state: 0=off, 1=advisory (default, warn only via
+        # HITL), 2=strict (blocks completion on a genuine active, unmerged
+        # worktree unless explicitly overridden).
         "require_merge_approval": int(data.get("require_merge_approval") if data.get("require_merge_approval") is not None else 1),
         # Sprint-2/3 — codebase-memory-mcp toggle.
         "code_intel_enabled": int(data.get("code_intel_enabled") or 0),
@@ -1597,8 +1600,12 @@ async def update_project_settings(
         updates.append("auto_worktrees = ?")
         params.append(1 if auto_worktrees else 0)
     if require_merge_approval is not None:
+        # e7548587 — tri-state: 0=off, 1=advisory (warn only), 2=strict
+        # (blocks). Clamp like hitl_auto_answer's own tri-state, not a bool
+        # coercion — a bare truthy coercion here would silently collapse a
+        # caller's requested strict (2) down to advisory (1).
         updates.append("require_merge_approval = ?")
-        params.append(1 if require_merge_approval else 0)
+        params.append(max(0, min(2, int(require_merge_approval))))
     if code_intel_enabled is not None:
         updates.append("code_intel_enabled = ?")
         params.append(1 if code_intel_enabled else 0)

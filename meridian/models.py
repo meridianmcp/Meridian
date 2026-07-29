@@ -183,8 +183,11 @@ class ProjectSettings(BaseModel):
     require_merge_approval: int = Field(
         default=1,
         ge=0,
-        le=1,
-        description="0716c9e0: warn via HITL when completing an item with an active worktree (default ON).",
+        le=2,
+        description="0716c9e0/e7548587: merge-approval mode for completing an item with an "
+        "active worktree. 0=off (no check), 1=advisory (warn via HITL, proceed — "
+        "default), 2=strict (BLOCKS completion on a genuine active, unmerged worktree "
+        "unless explicitly overridden with override_merge_approval + a reason).",
     )
     code_intel_enabled: int = Field(
         default=0,
@@ -207,7 +210,7 @@ class ProjectSettingsPatch(BaseModel):
     executor_config: ExecutorConfig | None = None
     hitl_auto_answer: int | None = Field(default=None, ge=0, le=2)
     auto_worktrees: int | None = Field(default=None, ge=0, le=1)
-    require_merge_approval: int | None = Field(default=None, ge=0, le=1)
+    require_merge_approval: int | None = Field(default=None, ge=0, le=2)
     code_intel_enabled: int | None = Field(default=None, ge=0, le=1)
     execution_mode: Literal["autonomous", "interactive"] | None = None
 
