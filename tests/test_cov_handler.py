@@ -1652,6 +1652,151 @@ def test_sprint_item_advisory_never_blocks_on_commit_fetch_error(monkeypatch):
         _run(db.close())
 
 
+# ---------------------------------------------------------------------------
+# 5fe3502e — strict (fail-closed) evidence gate, full-stack via the MCP
+# complete_sprint_item dispatch. These prove the OPT-IN wiring itself (not
+# the typed-check logic, covered unit-style in
+# test_1ec33edf_stored_evidence_verification.py): default behavior is
+# byte-for-byte unchanged when strict_evidence is never requested, and the
+# gate only engages when a caller (or the item itself) explicitly asks.
+# ---------------------------------------------------------------------------
+
+def test_strict_evidence_default_off_never_blocks():
+    """DEFAULT CASE — no strict_evidence arg, no require_strict_evidence flag:
+    an item with ZERO evidence still completes exactly as it always has. This
+    is the backward-compatibility guarantee point 4 of 5fe3502e requires."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-default-off"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Bare item, no evidence", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert "error" not in done
+        assert done["status"] == "done"
+    finally:
+        _run(db.close())
+
+
+def test_strict_evidence_true_blocks_when_no_evidence():
+    """strict_evidence=true + zero evidence -> STRICT_EVIDENCE_BLOCKED, item
+    stays NOT done, and the typed EVIDENCE_ABSENT code is surfaced."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-blocked"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict bare item", "version": "v1"}, db, "/tmp"))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "strict_evidence": True}, db, "/tmp"))
+        assert result.get("error") == "STRICT_EVIDENCE_BLOCKED"
+        codes = [e["code"] for e in result.get("evidence_errors", [])]
+        assert "EVIDENCE_ABSENT" in codes
+        still = _run(db_module.get_sprint_item(db, item["id"]))
+        assert still["status"] != "done"
+    finally:
+        _run(db.close())
+
+
+def test_strict_evidence_true_with_notes_completes():
+    """strict_evidence=true + real evidence (notes=) -> completes normally,
+    no STRICT_EVIDENCE_BLOCKED."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-with-notes"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict item with notes", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "strict_evidence": True,
+             "notes": "shipped it; verified via pixi run test"}, db, "/tmp"))
+        assert "error" not in done
+        assert done["status"] == "done"
+    finally:
+        _run(db.close())
+
+
+def test_strict_evidence_override_without_reason_still_blocks():
+    """override_strict_evidence=true alone (no reason) does NOT bypass the
+    gate — an override can never be the silent default (5fe3502e point 3)."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-override-noreason"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict override no reason", "version": "v1"}, db, "/tmp"))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "strict_evidence": True,
+             "override_strict_evidence": True}, db, "/tmp"))
+        assert result.get("error") == "STRICT_EVIDENCE_BLOCKED"
+    finally:
+        _run(db.close())
+
+
+def test_strict_evidence_override_with_reason_completes_and_is_audited():
+    """override_strict_evidence=true + a non-empty override_reason bypasses
+    the block, completes the item, and writes an auditable action_audit_log
+    row (who/when/why) — surfaced on the response too."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-override-audited"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict override audited", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "strict_evidence": True,
+             "override_strict_evidence": True,
+             "override_reason": "verified outside Meridian, evidence not machine-declared",
+             "actor": "executor-1"}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert "strict_evidence_override" in done
+        assert done["strict_evidence_override"]["actor"] == "executor-1"
+
+        log = _run(db_module.get_action_audit_log(
+            db, project_id=pid, event_type="sprint_item_strict_evidence_override",
+        ))
+        assert len(log) == 1
+        assert "verified outside Meridian" in log[0]["detail"]
+    finally:
+        _run(db.close())
+
+
+def test_require_strict_evidence_item_flag_engages_gate_without_call_arg():
+    """The item-level require_strict_evidence flag (set via update_sprint_item)
+    is sufficient on its own — a caller need not pass strict_evidence=true on
+    every completion call once the item itself is flagged."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-item-flag"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Item-flagged strict item", "version": "v1"}, db, "/tmp"))
+        _run(mh._dispatch_mcp_tool(
+            "update_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "require_strict_evidence": True}, db, "/tmp"))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert result.get("error") == "STRICT_EVIDENCE_BLOCKED"
+    finally:
+        _run(db.close())
+
+
 def test_read_write_claim_distinction():
     """ffa03655 — shared read claims coexist; write is exclusive and waits for readers."""
     import meridian.db as db_module

@@ -2409,6 +2409,7 @@ async def patch_sprint_item(
     prospect_bypass: Any = _UNSET,
     depends_on: Any = _UNSET,
     require_verification: Any = _UNSET,
+    require_strict_evidence: Any = _UNSET,
     required_tool: Any = _UNSET,
     tool_requirements: Any = _UNSET,
     artifact_kind: Any = _UNSET,
@@ -2457,6 +2458,17 @@ async def patch_sprint_item(
     then requires an on-file PASS filed by a session distinct from the one
     completing it), or ``False`` / ``0`` to CLEAR it (ordinary completion,
     evidence gate only).
+    ``require_strict_evidence`` (5fe3502e) uses the ``_UNSET`` sentinel: omit
+    to leave unchanged, pass ``True`` / ``1`` to SET the opt-in fail-closed
+    evidence gate (``complete_sprint_item`` calls via
+    ``meridian.mcp.handlers.sprint_tools.handle_complete_sprint_item`` then
+    refuse completion — ``STRICT_EVIDENCE_BLOCKED`` — unless declared evidence
+    is present, resolves to something real, isn't stale, matches the
+    completing session's own worktree, and no file was edited without a
+    claim; see ``meridian.sprint_evidence_guard``), or ``False`` / ``0`` to
+    CLEAR it (ordinary advisory-only evidence checks). This is the persistent,
+    per-item counterpart to passing ``strict_evidence=true`` on a single
+    ``complete_sprint_item`` call — either is sufficient to engage the gate.
     ``required_tool`` (4d1fb28f) uses the ``_UNSET`` sentinel: omit to leave
     unchanged, pass an empty string / ``None`` to CLEAR the pin (ordinary
     executor discretion), or a free-form tool/plugin name (e.g. 'Serena:
@@ -2618,6 +2630,15 @@ async def patch_sprint_item(
         # (ordinary completion, evidence gate only). Stored as INTEGER 0/1.
         ns_fields.append("require_verification = ?")
         ns_values.append(1 if require_verification else 0)
+    if require_strict_evidence is not _UNSET:
+        # 5fe3502e — True/1 SETS the opt-in fail-closed evidence gate
+        # (complete_sprint_item's handler-level strict verification refuses
+        # completion on missing/invalid/stale/wrong-worktree evidence or
+        # unclaimed edits unless explicitly, auditedly overridden);
+        # False/0/None CLEARS it (ordinary advisory-only evidence checks).
+        # Stored as INTEGER 0/1, same shape as require_verification.
+        ns_fields.append("require_strict_evidence = ?")
+        ns_values.append(1 if require_strict_evidence else 0)
     if required_tool is not _UNSET:
         # 4d1fb28f — empty string / None CLEARS the pin (ordinary executor
         # discretion); any other value sets the free-form required-tool name.

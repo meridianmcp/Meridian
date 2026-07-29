@@ -1126,6 +1126,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_wave_base_manifests(db)
     await _migrate_sprint_batch_claims(db)
     await _migrate_verification_runs(db)
+    await _migrate_sprint_item_require_strict_evidence(db)
     return db
 
 

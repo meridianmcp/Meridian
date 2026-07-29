@@ -3898,6 +3898,23 @@ async def _migrate_pg_sprint_item_artifact_declaration(conn: PostgresConnection)
     )
 
 
+async def _migrate_pg_sprint_item_require_strict_evidence(conn: PostgresConnection) -> None:
+    """5fe3502e — opt-in fail-closed completion-evidence gate flag.
+
+    require_strict_evidence (INTEGER 0/1, NOT NULL DEFAULT 0) marks a sprint
+    item as needing the STRICT (fail-closed) evidence verification in
+    meridian.sprint_evidence_guard before complete_sprint_item's handler will
+    let the completion stick. Mirrors require_verification's shape exactly.
+
+    ADD COLUMN IF NOT EXISTS is idempotent; existing rows default to 0.
+    Mirrors db.migrations._migrate_sprint_item_require_strict_evidence.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS "
+        "require_strict_evidence INTEGER NOT NULL DEFAULT 0"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -4002,4 +4019,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_wave_base_manifests,
     _migrate_pg_sprint_batch_claims,
     _migrate_pg_verification_runs,
+    _migrate_pg_sprint_item_require_strict_evidence,
 )
