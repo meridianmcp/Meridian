@@ -1861,13 +1861,17 @@ def _build_caption_paragraph(
     label_text: str,
     seq_cached: str = "1",
     ref_bookmark: str | None = None,
+    centered: bool = False,
 ) -> ET.Element:
     """Build a ``<w:p>`` element for a Word caption using the Caption style.
 
     Produces::
 
         <w:p>
-          <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+          <w:pPr>
+            <w:pStyle w:val="Caption"/>
+            <w:jc w:val="center"/>     <!-- only when centered=True -->
+          </w:pPr>
           <w:bookmarkStart w:id="0" w:name="_Ref123456789"/>
           <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
           <w:fldSimple w:instr="SEQ Figure \\* ARABIC">
@@ -1889,6 +1893,10 @@ def _build_caption_paragraph(
     inserted elsewhere (see :func:`insert_cross_reference`) resolves to just
     ``"Figure 3"`` and stays correct across reordering/renumbering on Word's
     next field refresh, instead of hand-typed prose text going stale.
+
+    4efc63fd — ``centered`` (from ``style_policy["caption_centered"]`` via
+    :func:`resolve_style_policy`) adds ``w:jc w:val="center"`` to the
+    paragraph; default ``False`` preserves this function's original output.
     """
     if kind not in ("Figure", "Table"):
         raise ValueError(f"caption kind must be 'Figure' or 'Table', got {kind!r}")
@@ -1901,6 +1909,8 @@ def _build_caption_paragraph(
     pPr = ET.SubElement(p, _q(_W, "pPr"))
     pStyle = ET.SubElement(pPr, _q(_W, "pStyle"))
     pStyle.set(_q(_W, "val"), _CAPTION_STYLE)
+    if centered:
+        ET.SubElement(pPr, _q(_W, "jc"), {_q(_W, "val"): "center"})
 
     if ref_bookmark:
         bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
@@ -2478,6 +2488,7 @@ def insert_caption(
     position: str = "after",
     section_heading: str | None = None,
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
 
@@ -2488,6 +2499,10 @@ def insert_caption(
     The SEQ number is auto-incremented: it equals the count of existing SEQ
     captions of the same kind in the document plus one.  Word will recompute
     the final numbering on the next field refresh (F9).
+
+    4efc63fd — ``style_policy["caption_centered"]`` (default ``False``, via
+    :func:`resolve_style_policy`) controls whether the new caption paragraph
+    gets ``w:jc w:val="center"``.
 
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
@@ -2505,6 +2520,8 @@ def insert_caption(
                          belongs to.  Stored in the sidecar ``section`` column.
         index_db_path:   If supplied, the sidecar SQLite index is invalidated
                          after the write so the next read auto-reindexes.
+        style_policy:    Optional overrides merged via
+                         :func:`resolve_style_policy`.
 
     Returns:
         ``{status, kind, seq_number, label_text, section_heading, ref_bookmark,
@@ -2535,6 +2552,11 @@ def insert_caption(
         return {"error": "label_text must be a non-empty string"}
 
     try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
         raw, root = _load_docx_xml_stdlib(docx_path)
     except FileNotFoundError as exc:
         return {"error": str(exc)}
@@ -2555,6 +2577,7 @@ def insert_caption(
         label_text=label_text.strip(),
         seq_cached=str(seq_number),
         ref_bookmark=ref_bookmark,
+        centered=policy["caption_centered"],
     )
 
     insert_at = child_idx if position == "before" else child_idx + 1
@@ -4135,21 +4158,399 @@ def get_local_equations(index_db_path: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Configurable document style policy (4efc63fd)
+# ---------------------------------------------------------------------------
+#
+# A single dict-shaped "style policy" that write-back functions consult
+# instead of hardcoding style choices (caption centering, equation body
+# indentation/alignment, internal-note style name + highlight color), and
+# that audit_equation_style below uses as its "expected" baseline. Plain
+# dicts -- not a dataclass -- to match this module's existing convention of
+# returning/consuming JSON-shaped dicts everywhere (MCP tool boundary).
+#
+# _style_policy_defaults() is a function (not a module-level dict literal)
+# specifically so it can reference _INTERNAL_NOTE_STYLE_DEFAULT /
+# _INTERNAL_NOTE_HIGHLIGHT_COLOR, which are defined later in this file --
+# names inside a function body resolve at CALL time, long after the whole
+# module has finished importing, so the forward reference is safe.
+
+_VALID_EQUATION_ALIGNMENTS = {"left", "center", "right", "both"}
+
+# The fixed set of values OOXML's <w:highlight w:val="..."/> accepts.
+_VALID_HIGHLIGHT_COLORS = {
+    "black", "blue", "cyan", "darkBlue", "darkCyan", "darkGray", "darkGreen",
+    "darkMagenta", "darkRed", "darkYellow", "green", "lightGray", "magenta",
+    "none", "red", "white", "yellow",
+}
+
+
+def _style_policy_defaults() -> dict[str, Any]:
+    """Built-in defaults -- reproduce today's pre-4efc63fd behavior except
+    where called out below.
+
+    ``equation_alignment`` defaults to ``"center"`` (the conventional
+    display-equation layout, matching :func:`insert_image`'s already-centered
+    figures) rather than "leave unset" -- this is a deliberate, documented
+    behavior addition for newly inserted display equations, not a bug: no
+    existing test asserts an inserted equation paragraph has no ``pPr``, and
+    keeping the audit's "expected" alignment and the writer's actual output
+    in sync (one policy, two consumers) is the whole point of this feature.
+    """
+    return {
+        "caption_centered": False,
+        "body_indent_twips": 0,
+        "equation_alignment": "center",
+        "equation_punctuation_required": True,
+        "equation_punctuation_chars": ".,;:",
+        "note_style": _INTERNAL_NOTE_STYLE_DEFAULT,
+        "note_highlight_color": _INTERNAL_NOTE_HIGHLIGHT_COLOR,
+    }
+
+
+def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """4efc63fd -- merge caller-supplied overrides onto the default document
+    style policy, validating every key/value so a malformed policy raises
+    ``ValueError`` immediately (callers turn that into ``{"error": ...}``
+    *before* touching any file) instead of producing malformed OOXML or
+    silently doing nothing.
+
+    Recognised keys (all optional -- any subset may be overridden):
+
+      caption_centered (bool):     whether :func:`insert_caption` adds
+                                    ``w:jc w:val="center"`` to new captions.
+      body_indent_twips (int>=0):  left-indent (in twips, 1/20 pt) applied to
+                                    a newly inserted DISPLAY equation
+                                    paragraph's ``pPr`` by
+                                    :func:`insert_equation_local`.
+      equation_alignment (str):    one of "left"/"center"/"right"/"both" --
+                                    both the alignment :func:`insert_equation_local`
+                                    writes into new display-equation paragraphs
+                                    AND the alignment :func:`audit_equation_style`
+                                    treats as "correct".
+      equation_punctuation_required (bool): whether
+                                    :func:`audit_equation_style` checks
+                                    trailing punctuation at all.
+      equation_punctuation_chars (str): the accepted trailing-punctuation
+                                    characters (checked by
+                                    :func:`audit_equation_style`).
+      note_style (str):            OOXML paragraph style name
+                                    :func:`insert_highlighted_note` (inline
+                                    mode) writes for new notes.
+      note_highlight_color (str):  ``<w:highlight>`` value (must be a valid
+                                    OOXML highlight color) for new notes.
+
+    Raises:
+      ValueError: an unknown key, or a value of the wrong type/out of range.
+    """
+    defaults = _style_policy_defaults()
+    if not overrides:
+        return defaults
+
+    unknown = sorted(set(overrides) - set(defaults))
+    if unknown:
+        raise ValueError(f"unknown style policy key(s): {unknown}")
+
+    policy = dict(defaults)
+    policy.update(overrides)
+
+    if not isinstance(policy["caption_centered"], bool):
+        raise ValueError("style policy 'caption_centered' must be a bool")
+
+    indent = policy["body_indent_twips"]
+    if not isinstance(indent, int) or isinstance(indent, bool) or indent < 0:
+        raise ValueError("style policy 'body_indent_twips' must be a non-negative int")
+
+    if policy["equation_alignment"] not in _VALID_EQUATION_ALIGNMENTS:
+        raise ValueError(
+            "style policy 'equation_alignment' must be one of "
+            f"{sorted(_VALID_EQUATION_ALIGNMENTS)}"
+        )
+
+    if not isinstance(policy["equation_punctuation_required"], bool):
+        raise ValueError("style policy 'equation_punctuation_required' must be a bool")
+
+    punct_chars = policy["equation_punctuation_chars"]
+    if not isinstance(punct_chars, str) or not punct_chars:
+        raise ValueError("style policy 'equation_punctuation_chars' must be a non-empty string")
+
+    note_style = policy["note_style"]
+    if not isinstance(note_style, str) or not note_style.strip():
+        raise ValueError("style policy 'note_style' must be a non-empty string")
+
+    if policy["note_highlight_color"] not in _VALID_HIGHLIGHT_COLORS:
+        raise ValueError(
+            "style policy 'note_highlight_color' must be one of "
+            f"{sorted(_VALID_HIGHLIGHT_COLORS)}"
+        )
+
+    return policy
+
+
+def _paragraph_alignment(para_elem: ET.Element) -> str | None:
+    """Return the explicit ``w:jc`` value on ``para_elem``'s ``pPr``, or
+    ``None`` when no alignment is explicitly set (Word's own default renders
+    that as left-aligned)."""
+    pPr = para_elem.find(_q(_W, "pPr"))
+    if pPr is None:
+        return None
+    jc = pPr.find(_q(_W, "jc"))
+    if jc is None:
+        return None
+    return jc.get(_q(_W, "val"))
+
+
+def _trailing_text_after_omath(para_elem: ET.Element, omath_el: ET.Element) -> str:
+    """Concatenate the text of every element following ``omath_el`` within its
+    immediate parent inside ``para_elem``.
+
+    Mirrors :func:`append_text_run_after_math`'s insertion point exactly --
+    this is how :func:`audit_equation_style` reads back whatever a prior
+    ``append_text_run_after_math`` call wrote (or detects that nothing was
+    ever appended).
+    """
+    parent = next(
+        (candidate for candidate in para_elem.iter() if omath_el in list(candidate)),
+        None,
+    )
+    if parent is None:
+        return ""
+    siblings = list(parent)
+    idx = siblings.index(omath_el)
+    w_t = _q(_W, "t")
+    return "".join(
+        "".join(t.text or "" for t in sib.iter(w_t)) for sib in siblings[idx + 1:]
+    )
+
+
+_EQ_LEADING_INT_RE = re.compile(r"^\(\s*(\d+)")
+
+
+def _leading_equation_number(number_text: str | None) -> int | None:
+    """Extract the leading integer from an equation number like ``"(2a)"`` ->
+    ``2``, or ``None`` for a non-numeric label like ``"(A.1)"``/``"(eq3)"``
+    that has no well-defined "next integer" for gap detection."""
+    if not number_text:
+        return None
+    m = _EQ_LEADING_INT_RE.match(number_text)
+    return int(m.group(1)) if m else None
+
+
+def audit_equation_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """4efc63fd -- audit every equation in a .docx and report STRUCTURED
+    findings (never free-text) covering alignment, trailing punctuation, and
+    numbering consistency, so a caller can programmatically triage a document
+    before submission instead of eyeballing it.
+
+    Three finding categories:
+
+    1. ``misaligned_equation`` -- scoped to STANDALONE equations that occupy
+       their own paragraph (a "display" equation: the paragraph's only
+       content besides ``pPr`` is the ``<m:oMath>``/``<m:oMathPara>`` --
+       exactly what :func:`insert_equation_local`'s ``before``/``after``
+       positions produce). Its paragraph-level ``w:jc`` (missing == "left")
+       is compared against ``style_policy["equation_alignment"]``. Inline
+       equations mixed into running prose, and table-numbered equations
+       (whose 2-column layout has its own alignment conventions), are
+       intentionally excluded -- neither has one well-defined "expected"
+       paragraph alignment.
+
+    2. ``missing_trailing_punctuation`` / ``incorrect_trailing_punctuation``
+       -- for the same display-equation paragraphs (skipped entirely when
+       ``style_policy["equation_punctuation_required"]`` is False), the text
+       of any run(s) immediately following the ``<m:oMath>`` -- the exact
+       spot :func:`append_text_run_after_math` writes to -- is checked
+       against ``style_policy["equation_punctuation_chars"]``. No trailing
+       text at all -> "missing"; trailing text whose last non-whitespace
+       character isn't an accepted character -> "incorrect".
+
+    3. ``duplicate_equation_number`` / ``equation_number_gap`` -- across every
+       ``table-numbered`` equation (the ``"(1)"``/``"(2a)"`` pattern
+       :func:`parse_docx_equations_local` already detects), numbers are
+       compared whitespace-normalized for exact duplicates, and each number's
+       LEADING integer (``"2a"`` -> ``2``) is checked for a contiguous
+       1..max sequence. Non-numeric labels (``"(A.1)"``, ``"(eq3)"``) still
+       participate in duplicate detection but are excluded from gap
+       detection (no well-defined "next integer").
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style policy
+                     via :func:`resolve_style_policy`.
+
+    Returns:
+      ``{docx_path, equation_count, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when the file
+      cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    equations = parse_docx_equations_local(docx_path)
+    findings: list[dict[str, Any]] = []
+
+    m_omath_tag = _qm("oMath")
+    m_omath_para_tag = _qm("oMathPara")
+
+    for eq in equations:
+        if eq["pattern"] != "standalone":
+            continue
+        located = _find_para_by_id(root, eq["para_id"])
+        if located is None:
+            continue  # unresolvable id (e.g. a table-embedded standalone) -- skip
+        _body, para_elem, _idx = located
+
+        # Resolve the paragraph's direct-child oMath(s) (unwrapping a single
+        # oMathPara if that's how it's wrapped). A paragraph containing more
+        # than one equation is ambiguous -- which one does trailing text
+        # belong to? -- so it's skipped entirely, mirroring
+        # append_text_run_after_math's own "math_index required" guard
+        # against the same ambiguity rather than guessing.
+        direct_omaths = para_elem.findall(m_omath_tag)
+        top_level_el = None
+        if direct_omaths:
+            top_level_el = direct_omaths[0] if len(direct_omaths) == 1 else None
+        else:
+            omath_para_el = para_elem.find(m_omath_para_tag)
+            if omath_para_el is not None:
+                direct_omaths = omath_para_el.findall(m_omath_tag)
+                if len(direct_omaths) == 1:
+                    top_level_el = omath_para_el
+        if len(direct_omaths) != 1 or top_level_el is None:
+            continue
+        omath_el = direct_omaths[0]
+
+        # "Display equation" = nothing but pPr precedes the equation in the
+        # paragraph. Content AFTER the equation -- e.g. a trailing
+        # punctuation run written by append_text_run_after_math -- is
+        # expected and does NOT disqualify it (that's exactly what the
+        # punctuation check below reads back). Content BEFORE the equation
+        # (prose mixed with the equation, as in an inline
+        # "Einstein: E=mc^2" sentence) DOES disqualify it -- there is no
+        # single sensible alignment/punctuation expectation for a sentence
+        # that merely contains an equation.
+        siblings = list(para_elem)
+        top_idx = siblings.index(top_level_el)
+        preceding = [c for c in siblings[:top_idx] if c.tag != _q(_W, "pPr")]
+        if preceding:
+            continue  # inline equation mixed with prose -- no alignment/punctuation check
+
+        actual_alignment = _paragraph_alignment(para_elem) or "left"
+        expected_alignment = policy["equation_alignment"]
+        if actual_alignment != expected_alignment:
+            findings.append({
+                "type": "misaligned_equation",
+                "para_id": eq["para_id"],
+                "ordinal": eq["ordinal"],
+                "expected_alignment": expected_alignment,
+                "actual_alignment": actual_alignment,
+            })
+
+        if policy["equation_punctuation_required"]:
+            trailing = _trailing_text_after_omath(para_elem, omath_el)
+            stripped = trailing.rstrip()
+            if not stripped:
+                findings.append({
+                    "type": "missing_trailing_punctuation",
+                    "para_id": eq["para_id"],
+                    "ordinal": eq["ordinal"],
+                    "expected_punctuation_chars": policy["equation_punctuation_chars"],
+                })
+            elif stripped[-1] not in policy["equation_punctuation_chars"]:
+                findings.append({
+                    "type": "incorrect_trailing_punctuation",
+                    "para_id": eq["para_id"],
+                    "ordinal": eq["ordinal"],
+                    "actual_trailing_text": trailing,
+                    "actual_char": stripped[-1],
+                    "expected_punctuation_chars": policy["equation_punctuation_chars"],
+                })
+
+    numbered = [eq for eq in equations if eq["pattern"] == "table-numbered" and eq["number"]]
+
+    grouped_by_norm: dict[str, list[dict[str, Any]]] = {}
+    for eq in numbered:
+        norm = re.sub(r"\s+", "", eq["number"])
+        grouped_by_norm.setdefault(norm, []).append(eq)
+    for group in grouped_by_norm.values():
+        if len(group) > 1:
+            findings.append({
+                "type": "duplicate_equation_number",
+                "number": group[0]["number"],
+                "para_ids": [g["para_id"] for g in group],
+                "ordinals": [g["ordinal"] for g in group],
+            })
+
+    leading_ints = sorted({
+        v for v in (_leading_equation_number(eq["number"]) for eq in numbered)
+        if v is not None
+    })
+    if leading_ints:
+        expected_range = set(range(1, leading_ints[-1] + 1))
+        for missing in sorted(expected_range - set(leading_ints)):
+            findings.append({"type": "equation_number_gap", "missing_number": missing})
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "equation_count": len(equations),
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+# ---------------------------------------------------------------------------
 # WRITE: insert / edit / remove equation
 # ---------------------------------------------------------------------------
 
-def _build_omath_paragraph(omml_raw: str) -> ET.Element:
+def _build_omath_paragraph(
+    omml_raw: str,
+    alignment: str | None = None,
+    indent_twips: int = 0,
+) -> ET.Element:
     """Wrap a raw OMML string in a new <w:p> for display-mode insertion.
 
     Produces::
 
         <w:p>
+          <w:pPr>
+            <w:jc w:val="..."/>        <!-- only when alignment is given -->
+            <w:ind w:left="..."/>      <!-- only when indent_twips > 0 -->
+          </w:pPr>
           <m:oMath>...</m:oMath>
         </w:p>
+
+    ``alignment``/``indent_twips`` (4efc63fd) come from a resolved style
+    policy (see :func:`resolve_style_policy`) so the paragraph's ``pPr`` is
+    omitted entirely when neither is set -- matching this function's
+    original (pre-4efc63fd) output exactly.
 
     The oMath element is parsed from ``omml_raw`` and appended as a child.
     """
     p = ET.Element(_q(_W, "p"))
+    if alignment or indent_twips:
+        pPr = ET.SubElement(p, _q(_W, "pPr"))
+        if alignment:
+            ET.SubElement(pPr, _q(_W, "jc"), {_q(_W, "val"): alignment})
+        if indent_twips:
+            ET.SubElement(pPr, _q(_W, "ind"), {_q(_W, "left"): str(indent_twips)})
     omath_el = ET.fromstring(omml_raw)
     p.append(omath_el)
     return p
@@ -4161,6 +4562,7 @@ def insert_equation_local(
     payload: str,
     position: str = "after",
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Insert an equation into a .docx file.
 
@@ -4177,6 +4579,12 @@ def insert_equation_local(
     the ``<m:oMath>`` element is appended as a direct child of the anchor
     ``<w:p>`` (inline equation style).
 
+    4efc63fd — ``style_policy`` (resolved via :func:`resolve_style_policy`)
+    supplies the new display paragraph's alignment (``equation_alignment``,
+    default ``"center"``) and left indentation (``body_indent_twips``,
+    default 0 / no indent). Not consulted for ``position="append"`` (inline
+    equations have no paragraph of their own to style).
+
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
         anchor_para_id:  ``w14:paraId`` or ``p{N}`` / ``tbl{N}`` of the
@@ -4186,6 +4594,9 @@ def insert_equation_local(
         position:        ``"before"``, ``"after"``, or ``"append"`` (default
                          ``"after"``).
         index_db_path:   If supplied, sidecar is invalidated after write.
+        style_policy:    Optional overrides merged via
+                         :func:`resolve_style_policy`; see that function's
+                         docstring for keys.
 
     Returns:
         ``{status, position, para_id, omml, docx_path}``
@@ -4195,6 +4606,11 @@ def insert_equation_local(
         return {"error": f"position must be 'before', 'after', or 'append', got {position!r}"}
     if not payload or not str(payload).strip():
         return {"error": "payload must be a non-empty string (OMML XML or LaTeX)"}
+
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     # Resolve OMML before touching the file — fail fast on bad input.
     try:
@@ -4223,7 +4639,11 @@ def insert_equation_local(
         anchor_elem.append(omath_el)
     else:
         # Display: insert a new <w:p> wrapping the equation.
-        new_p = _build_omath_paragraph(omml)
+        new_p = _build_omath_paragraph(
+            omml,
+            alignment=policy["equation_alignment"],
+            indent_twips=policy["body_indent_twips"],
+        )
         insert_at = child_idx if position == "before" else child_idx + 1
         body.insert(insert_at, new_p)
 
@@ -5768,7 +6188,12 @@ def _next_note_bookmark_name(root: ET.Element) -> str:
     return f"{_INTERNAL_NOTE_BOOKMARK_PREFIX}{max_seen + 1}"
 
 
-def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.Element:
+def _build_internal_note_paragraph(
+    text: str,
+    note_id: str,
+    style: str,
+    highlight_color: str = _INTERNAL_NOTE_HIGHLIGHT_COLOR,
+) -> ET.Element:
     """Build a ``<w:p>`` for a highlighted internal-author-note paragraph.
 
     Produces a paragraph styled ``style`` (falls back to Normal rendering in
@@ -5776,6 +6201,10 @@ def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.El
     ``w:highlight`` is what guarantees visible distinctiveness regardless),
     wrapped in a ``_MNote<digits>`` bookmark so :func:`list_internal_notes`
     and future tooling can locate it precisely instead of re-matching on text.
+
+    4efc63fd -- ``highlight_color`` (from
+    ``style_policy["note_highlight_color"]`` via :func:`resolve_style_policy`)
+    defaults to the original hardcoded ``"yellow"``.
     """
     p = ET.Element(_q(_W, "p"))
     pPr = ET.SubElement(p, _q(_W, "pPr"))
@@ -5789,7 +6218,7 @@ def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.El
     r = ET.SubElement(p, _q(_W, "r"))
     rPr = ET.SubElement(r, _q(_W, "rPr"))
     highlight = ET.SubElement(rPr, _q(_W, "highlight"))
-    highlight.set(_q(_W, "val"), _INTERNAL_NOTE_HIGHLIGHT_COLOR)
+    highlight.set(_q(_W, "val"), highlight_color)
     t = ET.SubElement(r, _q(_W, "t"))
     t.set(_q(_XML_NS, "space"), "preserve")
     t.text = text
@@ -6528,6 +6957,7 @@ def insert_highlighted_note(
     mode: str = "inline",
     author: str = "Meridian",
     initials: str = "M",
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Insert an internal note inline or as a native Word comment.
 
@@ -6535,6 +6965,16 @@ def insert_highlighted_note(
     mode="comment" writes Word's comments.xml part, relationship, content-type
     override, range markers, and comment reference so Microsoft Word displays
     the note in its normal review pane.
+
+    4efc63fd — ``style_policy`` (resolved via :func:`resolve_style_policy`)
+    supplies the OOXML paragraph style name (``note_style``, default
+    ``"MeridianInternalNote"``) and highlight color (``note_highlight_color``,
+    default ``"yellow"``) for ``mode="inline"`` notes. Not consulted for
+    ``mode="comment"`` (Word comments have no paragraph style/highlight of
+    their own — they live in a separate comments.xml part).  Distinct from
+    the existing ``style`` parameter above, which selects the note's
+    *category* (currently only ``"internal_note"`` is supported), not its
+    OOXML rendering.
     """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
@@ -6549,6 +6989,11 @@ def insert_highlighted_note(
         }
     if mode not in ("inline", "comment"):
         return {"error": f"mode must be 'inline' or 'comment', got {mode!r}"}
+
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     if mode == "comment":
         result = insert_word_comment(
@@ -6582,7 +7027,7 @@ def insert_highlighted_note(
 
     note_id = _next_note_bookmark_name(root)
     note_p = _build_internal_note_paragraph(
-        text.strip(), note_id, _INTERNAL_NOTE_STYLE_DEFAULT
+        text.strip(), note_id, policy["note_style"], policy["note_highlight_color"]
     )
 
     insert_at = child_idx if position == "before" else child_idx + 1
@@ -6605,7 +7050,7 @@ def insert_highlighted_note(
         "text": text.strip(),
         "anchor_para_id": anchor_para_id,
         "position": position,
-        "style": _INTERNAL_NOTE_STYLE_DEFAULT,
+        "style": policy["note_style"],
         "docx_path": docx_path,
     }
 
