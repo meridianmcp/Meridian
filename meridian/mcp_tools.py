@@ -1696,6 +1696,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                         "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."},
          "require_verification": {"type": "boolean",
                              "description": "e2e1b682 — set true to require an independent fresh-session PASS (see complete_sprint_item's verifier_session_id/verification_verdict) before the item can be completed. A same-session self-report does not satisfy this gate. Set false to re-enable ordinary completion (evidence gate only). Omit to leave unchanged."},
+         "require_strict_evidence": {"type": "boolean",
+                             "description": "5fe3502e — set true to require STRICT (fail-closed) completion-evidence verification: complete_sprint_item then refuses (STRICT_EVIDENCE_BLOCKED) unless declared evidence is present, resolves to something real on disk/in the DB, isn't stale (predates the current claim), matches the completing session's own worktree, and no file was edited without a claim_file/claim_symbol lock — unless the caller explicitly passes override_strict_evidence=true with a non-empty override_reason (audited). Set false to re-enable ordinary advisory-only evidence checks. Omit to leave unchanged. Equivalent to passing strict_evidence=true on a single complete_sprint_item call, but persists across attempts."},
          "required_tool": {"type": "string",
                   "description": "4d1fb28f — pin (or re-pin) the specific MCP tool/plugin the executor MUST use for this item, rendered as a hard directive in the /goal block — not left to executor habit. Pass an empty string to CLEAR the pin (ordinary executor discretion); omit to leave unchanged."},
          "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA,
@@ -1726,7 +1728,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "claim is stale (claimed 2h+ ago, or the claiming session is dead/closed) — the "
         "exact stale-cleanup pattern of closing items left behind by a dead session keeps "
         "working automatically. For a live, non-stale foreign claim, pass "
-        "force_foreign_claim=true to explicitly acknowledge and complete anyway.",
+        "force_foreign_claim=true to explicitly acknowledge and complete anyway. "
+        "5fe3502e — pass strict_evidence=true (or flag the item require_strict_evidence=true "
+        "via update_sprint_item) for STRICT, fail-closed evidence verification: completion is "
+        "refused (STRICT_EVIDENCE_BLOCKED, with typed evidence_errors codes — EVIDENCE_ABSENT/"
+        "EVIDENCE_INVALID/EVIDENCE_STALE/WRONG_WORKTREE/UNCLAIMED_EDIT) unless evidence is "
+        "present, verifiable, fresh, from the right worktree, and every modified file was "
+        "claimed. Default (no strict_evidence, no require_strict_evidence) behavior is exactly "
+        "the pre-existing advisory-only evidence checks — nothing changes unless you opt in.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -1737,7 +1746,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must differ from actor/session_id or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
          "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
          "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."},
-         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit override, never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."}},
+         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit override, never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "strict_evidence": {"type": "boolean", "description": "5fe3502e — opt in to the STRICT, fail-closed evidence gate for THIS call only (see meridian.sprint_evidence_guard). Omit/false preserves the exact pre-existing advisory-only behavior. Equivalent, persistent alternative: update_sprint_item(require_strict_evidence=true)."},
+         "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit, audited override of a STRICT_EVIDENCE_BLOCKED rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Never inferred; omit/false for normal strict behavior."},
+         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside override_strict_evidence=true: why the strict-evidence rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
         "Read-only: Cross-reference pending sprint items against recent git commits and "

@@ -419,6 +419,14 @@ async def handle_update_sprint_item(
     # False/0/null clears it (ordinary completion, evidence gate only).
     if "require_verification" in args:
         _patch_kwargs["require_verification"] = args.get("require_verification")
+    # 5fe3502e — set/clear require_strict_evidence. Only forward when the
+    # caller supplied the key (_UNSET sentinel). True/1 sets the opt-in
+    # fail-closed evidence gate (complete_sprint_item's handler-level strict
+    # verification refuses completion on missing/invalid/stale/wrong-worktree
+    # evidence or an unclaimed edit unless explicitly, auditedly overridden);
+    # False/0/null clears it (ordinary advisory-only evidence checks).
+    if "require_strict_evidence" in args:
+        _patch_kwargs["require_strict_evidence"] = args.get("require_strict_evidence")
     # 4d1fb28f — set/clear the required_tool pin. Only forward when the caller
     # supplied the key (_UNSET sentinel), so omitting it leaves the stored
     # value untouched; pass "" / null to clear (ordinary executor discretion),
@@ -1205,9 +1213,72 @@ async def handle_complete_sprint_item(
                 ),
             }
 
+    _complete_actor = args.get("actor") or _complete_session_id or None
+
+    # 5fe3502e — STRICT (fail-closed) evidence gate. OPT-IN ONLY: engages when
+    # the caller explicitly passes strict_evidence=true, or the item itself
+    # is flagged require_strict_evidence — mirrors eb2e44f8's worktree-merge
+    # guard exactly (a hard reject, computed BEFORE marking done, that never
+    # engages for a caller that didn't ask for it). Every OTHER completion
+    # path above/below this block is completely unaffected: the pre-existing
+    # advisory evidence checks (required_notes existence gate,
+    # _check_stored_evidence's mechanical disk/DB check inside
+    # db.complete_sprint_item) still run exactly as before regardless of this
+    # flag — this is an ADDITIONAL gate layered on top, not a replacement.
+    _strict_evidence = bool(args.get("strict_evidence")) or bool(
+        (_pre_item or {}).get("require_strict_evidence")
+    )
+    _strict_evidence_override: dict[str, Any] | None = None
+    if _strict_evidence and _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
+        from meridian.sprint_evidence_guard import (  # noqa: PLC0415
+            verify_strict_completion_evidence,
+            record_strict_evidence_override,
+        )
+        _evidence_check = await verify_strict_completion_evidence(
+            db, _server._REPO_ROOT, args["project_id"], args["item_id"], _pre_item,
+            task_id=args.get("task_id"), notes=args.get("notes"),
+            session_id=_complete_session_id or None,
+        )
+        if not _evidence_check.get("ok"):
+            _override_requested = bool(args.get("override_strict_evidence"))
+            _override_reason = (args.get("override_reason") or "").strip()
+            if _override_requested and _override_reason:
+                # 5fe3502e point 3 — an explicit override is auditable (who/
+                # when/why) and can never be the silent default: it requires
+                # BOTH override_strict_evidence=true AND a non-empty
+                # override_reason in the SAME call. record_strict_evidence_
+                # override raises ValueError if reason is empty (belt and
+                # suspenders — already guarded by the `and _override_reason`
+                # check above, but the module itself never trusts a caller
+                # to have checked).
+                _strict_evidence_override = await record_strict_evidence_override(
+                    db, args["project_id"], args["item_id"],
+                    actor=_complete_actor,
+                    reason=_override_reason,
+                    errors=_evidence_check.get("errors", []),
+                    tenant_id=(tenant or {}).get("id"),
+                )
+            else:
+                return {
+                    "error": "STRICT_EVIDENCE_BLOCKED",
+                    "item_id": args["item_id"],
+                    "evidence_errors": _evidence_check.get("errors", []),
+                    "message": (
+                        "Refusing to complete: strict evidence verification "
+                        "failed ("
+                        + ", ".join(
+                            e["code"] for e in _evidence_check.get("errors", [])
+                        )
+                        + "). Fix the underlying issue (attach real evidence, "
+                        "re-verify from the correct worktree, claim modified "
+                        "files) and retry, or pass override_strict_evidence=true "
+                        "with a non-empty override_reason to explicitly "
+                        "acknowledge and complete anyway (audited)."
+                    ),
+                }
+
     # 5823db0b — quality gate + actor attribution. Pass evidence notes and
     # the completing actor; surface the required_notes gate as a clean error.
-    _complete_actor = args.get("actor") or _complete_session_id or None
     try:
         item = await db_module.complete_sprint_item(
             db, args["project_id"], args["item_id"],
@@ -1264,6 +1335,13 @@ async def handle_complete_sprint_item(
     if _merge_warning:
         item = dict(item)
         item["merge_warning"] = _merge_warning
+    if _strict_evidence_override:
+        # 5fe3502e point 3 — surface the audited override on the response so
+        # the completion is never silently "cleaner" than what actually
+        # happened: anyone reading this item's completion can see strict
+        # evidence verification failed and was explicitly, auditedly overridden.
+        item = dict(item)
+        item["strict_evidence_override"] = _strict_evidence_override
     # fdaa5b55 — item has a linked GitHub issue: auto-close (meridian_auto)
     # or post a proposed-closure comment + non-blocking HITL (manual/unset).
     # Never lets a GitHub failure undo the completion that already succeeded
