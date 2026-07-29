@@ -4310,6 +4310,48 @@ def _run_cmd_timeout() -> float:
     return 300.0
 
 
+# 525d86bb — the environment a SHELL-STRING run_cmd inherits.
+#
+# ROOT CAUSE of the exit-status masking this item was filed to fix: on
+# Windows, ``asyncio.create_subprocess_shell`` spawns the target command via
+# ``cmd.exe /c "<cmd>"``. That cmd.exe CHILD resolves a bare program name
+# (e.g. ``python``) through ITS OWN PATH search — which does NOT get the
+# "directory the calling process loaded from" freebie Windows' CreateProcess
+# gives the EXEC form (``create_subprocess_exec``/``create_subprocess_exec``
+# with a list of tokens): the exec form finds a sibling ``python.exe`` next
+# to *this* interpreter even when that directory is nowhere on PATH, because
+# CreateProcess's own search order checks the calling process's own directory
+# first. The shell form's cmd.exe child has no such relationship to this
+# interpreter, so when the venv/pixi Scripts directory isn't separately on
+# PATH it fails with "'python' is not recognized as an internal or external
+# command" and exits 1 — cmd.exe's own honest exit code for THAT failure, not
+# the target command's real exit status. Reproduced live: identical
+# ``python -c "...sys.exit(0)"`` returns 0 via the exec form and 1 via the
+# shell form in the same process/environment. The caller cannot tell "python
+# ran and returned 1" from "cmd.exe never found python" — before this fix
+# both look identical (status='ok', exit_code=1). This is exactly the
+# wrapper-vs-wrapped ambiguity acceptance criterion 3 calls out: a wrapping
+# layer's OWN exit code must never stand in for the wrapped command's.
+#
+# The fix hands the shell child a PATH guaranteed to include the directory
+# this interpreter is running from, so a bare ``python`` (and anything
+# installed alongside it) resolves exactly as reliably for the shell form as
+# it already does for the exec form. Returns None on non-Windows (no cmd.exe
+# indirection to correct for — POSIX ``/bin/sh -c`` has no analogous gap).
+def _shell_subprocess_env() -> "dict[str, str] | None":
+    if sys.platform != "win32":
+        return None
+    py_dir = os.path.dirname(sys.executable)
+    if not py_dir:
+        return None
+    env = dict(os.environ)
+    existing_path = env.get("PATH", "")
+    parts = existing_path.split(os.pathsep) if existing_path else []
+    if py_dir not in parts:
+        env["PATH"] = py_dir + (os.pathsep + existing_path if existing_path else "")
+    return env
+
+
 async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
     """0e973e52 — spawn *cmd* as a local process and return structured results.
 
@@ -4358,6 +4400,7 @@ async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
                 stdout=_asyncio.subprocess.PIPE,
                 stderr=_asyncio.subprocess.PIPE,
                 cwd=cwd or None,
+                env=_shell_subprocess_env(),
             )
         try:
             stdout_b, stderr_b = await _asyncio.wait_for(

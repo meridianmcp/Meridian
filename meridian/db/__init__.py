@@ -1125,6 +1125,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_proposal_evidence_links(db)
     await _migrate_wave_base_manifests(db)
     await _migrate_sprint_batch_claims(db)
+    await _migrate_verification_runs(db)
     return db
 
 
@@ -10969,4 +10970,18 @@ from .batch_claim import (  # noqa: F401
     get_batch_claim_manifest_by_id,
     get_batch_claim_manifest_history,
     mark_batch_claim_outcome,
+)
+
+
+# 525d86bb — durable synchronous verification-run lifecycle records (start,
+# real exit_code/status, log artifact) for run_verification. Mirrors the
+# batch_claim import immediately above — a single-table, no-state-machine
+# shape.
+from .verification_runs import (  # noqa: F401
+    VERIFICATION_RUN_STATUSES,
+    _migrate_verification_runs,
+    create_verification_run,
+    get_verification_run,
+    list_verification_runs,
+    complete_verification_run,
 )

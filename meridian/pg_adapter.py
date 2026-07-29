@@ -2674,6 +2674,40 @@ async def _migrate_pg_sprint_batch_claims(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_verification_runs(conn: PostgresConnection) -> None:
+    """525d86bb — verification_runs: durable synchronous run_verification
+    lifecycle records (mirrors SQLite).
+
+    One row per run_verification dispatch: created with status='running'
+    before the command is sent over the tunnel, completed exactly once (by
+    db.verification_runs.complete_verification_run) with the REAL
+    exit_code/status/log artifact right after the synchronous
+    send_run_cmd_control wait resolves — no other writer, no polling.
+    Mirrors db.verification_runs._migrate_verification_runs.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS verification_runs ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    command TEXT NOT NULL,"
+        "    cwd TEXT,"
+        "    worktree TEXT,"
+        "    actor TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'running',"
+        "    exit_code INTEGER,"
+        "    passed INTEGER,"
+        "    failed INTEGER,"
+        "    stdout_tail TEXT,"
+        "    stderr_tail TEXT,"
+        "    message TEXT,"
+        f"    started_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    ended_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_verification_runs_project "
+        "ON verification_runs(project_id, started_at DESC);"
+    )
+
+
 async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> None:
     """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
 
@@ -3967,4 +4001,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_evidence_links,
     _migrate_pg_wave_base_manifests,
     _migrate_pg_sprint_batch_claims,
+    _migrate_pg_verification_runs,
 )
