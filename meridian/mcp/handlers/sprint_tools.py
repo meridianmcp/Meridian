@@ -28,7 +28,7 @@ from typing import Any
 import meridian.server as _server
 from meridian import db as db_module
 from meridian import goal_md as goal_md_module
-from meridian._deps import validate_input_size
+from meridian._deps import validate_input_size, _hosted_mode
 
 
 async def handle_add_sprint_note(
@@ -918,6 +918,13 @@ async def handle_claim_sprint_item(
             "worktree_suggested": True,
             "worktree_branch": wt_branch,
             "worktree_path": wt_path,
+            # eb2e44f8 — the base branch this worktree is expected to be
+            # created FROM. Matches worktree_merge_cmd's target below.
+            # Executors should pass this (plus the base SHA they observe
+            # right before `git worktree add`) to POST /worktrees'
+            # base_branch/base_sha so an immutable base manifest gets
+            # persisted for later merge-time validation.
+            "worktree_base_branch": "dev",
             "worktree_setup_cmd": f"git worktree add {wt_path} -b {wt_branch}",
             "worktree_cleanup_cmd": f"git worktree remove {wt_path} --force",
             "worktree_merge_cmd": (
@@ -1066,6 +1073,43 @@ async def handle_complete_sprint_item(
             if _req_merge:
                 _wt = await db_module.get_active_worktree_for_session(db, _complete_session_id)
                 if _wt:
+                    # eb2e44f8 — HARD GATE: when this worktree has a persisted
+                    # immutable base manifest, validate its actual git state
+                    # (HEAD ancestry, dirty tree, manifest staleness) before
+                    # completion is allowed to proceed at all — a real reject,
+                    # not just the advisory HITL below. Self-hosted only: the
+                    # git-level checks need local FS access, per the same
+                    # architectural law worktree_cleanup already follows.
+                    # Hosted mode and worktrees that never opted into a
+                    # manifest (base_sha/base_branch never supplied at
+                    # `POST /worktrees` time) fall through unchanged to the
+                    # pre-existing advisory-only HITL behavior below.
+                    _wt_manifest = await db_module.get_worktree_manifest(db, _wt["id"])
+                    if _wt_manifest is not None and not _hosted_mode():
+                        from meridian.worktree_merge_guard import (  # noqa: PLC0415
+                            validate_worktree_merge,
+                        )
+                        _validation = await validate_worktree_merge(
+                            db, _server._REPO_ROOT, _wt["id"]
+                        )
+                        if not _validation.get("ok"):
+                            return {
+                                "error": "WORKTREE_MERGE_BLOCKED",
+                                "item_id": args["item_id"],
+                                "worktree_id": _wt["id"],
+                                "validation": _validation,
+                                "message": (
+                                    "Refusing to complete: worktree failed pre-merge "
+                                    "validation ("
+                                    + ", ".join(
+                                        e["code"] for e in _validation.get("errors", [])
+                                    )
+                                    + "). Fix the underlying issue (commit/stash "
+                                    "uncommitted changes, reconcile the branch with its "
+                                    "recorded base, or reclaim a fresh worktree if the "
+                                    "manifest is stale) and retry."
+                                ),
+                            }
                     _hitl = await db_module.request_hitl(
                         db, args["project_id"],
                         f"Session has active worktree on branch '{_wt['branch']}' "

@@ -1171,18 +1171,54 @@ async def list_worktrees_pending_cleanup(project_id: str, request: Request) -> l
 async def create_worktree(
     project_id: str, request: Request, body: WorktreeCreate
 ) -> dict[str, Any]:
-    """Register a git worktree for a session. Call after `git worktree add`."""
-    project = await db_module.get_project(await _db(request), project_id)
+    """Register a git worktree for a session. Call after `git worktree add`.
+
+    eb2e44f8 — when the caller also supplies ``base_sha`` + ``base_branch``,
+    this additionally persists an IMMUTABLE base manifest for the worktree
+    (repo identity, base branch, base SHA, owning sprint item), returned
+    under the ``manifest`` key. That manifest is what
+    ``meridian.worktree_merge_guard.validate_worktree_merge`` checks against
+    later, before a merge/completion is allowed to proceed. Omitting
+    base_sha/base_branch skips manifest creation entirely — backward
+    compatible with callers that only register session/branch/path; no
+    retroactive validation is imposed on worktrees that never opted in.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.register_worktree(
-        await _db(request),
+    wt = await db_module.register_worktree(
+        db,
         body.session_id,
         project_id,
         body.branch,
         body.path,
         item_id=body.item_id,
+        pid=body.pid,
     )
+    if body.base_sha and body.base_branch:
+        try:
+            manifest = await db_module.persist_worktree_manifest(
+                db,
+                wt["id"],
+                project_id,
+                body.session_id,
+                body.item_id,
+                body.repo_identity or project_id,
+                body.base_branch,
+                body.base_sha,
+            )
+            wt = dict(wt)
+            wt["manifest"] = manifest
+        except ValueError as exc:
+            # Should be unreachable for a brand-new worktree row (register_worktree
+            # above always mints a fresh id) but a manifest conflict must never
+            # fail the worktree registration itself — surface it via logs instead.
+            import logging as _l
+            _l.getLogger("meridian.server").warning(
+                "create_worktree: manifest persist failed for %s: %s", wt["id"], exc
+            )
+    return wt
 
 
 @router.post("/projects/{project_id}/worktrees/sweep")
@@ -1241,7 +1277,14 @@ async def delete_worktree(
         try:
             from .. import worktree_cleanup  # noqa: PLC0415
             from meridian.server import _REPO_ROOT  # noqa: PLC0415 — lazy, avoids import cycle
-            worktree_cleanup.remove_worktree_on_disk(_REPO_ROOT, wt["path"])
+            # eb2e44f8 — guarded: re-validates this row's identity + PID
+            # liveness immediately before the real disk mutation, so a live
+            # process still using the worktree (its owning session can be
+            # marked terminal for other reasons) never gets its directory
+            # nuked out from under it.
+            worktree_cleanup.remove_worktree_on_disk_guarded(
+                _REPO_ROOT, wt, expected_worktree_id=worktree_id
+            )
         except Exception as exc:  # noqa: BLE001 — disk cleanup is best-effort
             import logging as _l
             _l.getLogger("meridian.server").warning(

@@ -1123,6 +1123,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_artifact_declaration(db)
     await _migrate_docx_merge_manifests(db)
     await _migrate_proposal_evidence_links(db)
+    await _migrate_wave_base_manifests(db)
     return db
 
 
@@ -7016,13 +7017,22 @@ async def register_worktree(
     branch: str,
     path: str,
     item_id: str | None = None,
+    pid: int | None = None,
 ) -> dict[str, Any]:
-    """Register a new active git worktree. Returns the inserted row."""
+    """Register a new active git worktree. Returns the inserted row.
+
+    ``pid`` (eb2e44f8) — the OS PID of the process that created this
+    worktree, when the caller knows it. Optional and best-effort: when set,
+    ``worktree_cleanup.validate_worktree_cleanup_target`` uses it to refuse
+    real disk removal while that process is still alive. Omitting it simply
+    skips that liveness check (same fail-open-on-absent-data posture as
+    every other optional worktree field here).
+    """
     wid = _new_id()
     await db.execute(
-        "INSERT INTO active_worktrees (id, session_id, project_id, item_id, branch, path) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (wid, session_id, project_id, item_id, branch, path),
+        "INSERT INTO active_worktrees (id, session_id, project_id, item_id, branch, path, pid) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (wid, session_id, project_id, item_id, branch, path, pid),
     )
     await db.commit()
     async with db.execute(
@@ -10930,4 +10940,16 @@ from .proposal_links import (  # noqa: F401
     get_proposal_links,
     get_proposal_evidence,
     get_proposal_ids_for_project,
+)
+
+
+# eb2e44f8 — immutable wave base manifests for git worktrees (repo identity,
+# base branch/SHA, owning sprint item), checked by
+# meridian.worktree_merge_guard.validate_worktree_merge before a
+# merge/completion is allowed to proceed.
+from .worktree_manifest import (  # noqa: F401
+    _migrate_wave_base_manifests,
+    persist_worktree_manifest,
+    get_worktree_manifest,
+    get_worktree_manifest_history,
 )

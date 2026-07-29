@@ -37,6 +37,7 @@ precedent ``_refresh_claude_md_current_state`` relies on for its
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -131,6 +132,126 @@ def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
     }
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Liveness check for a recorded worktree-owner PID.
+
+    Mirrors the exact catch tuple the existing task_log PID watchdog uses
+    (meridian/server.py's ``_auto_summary_loop``) so this repo has ONE
+    liveness-check convention, not two subtly different ones:
+    ``os.kill(pid, 0)`` signals nothing (signal 0), it only probes whether
+    the OS will let us address the PID at all. ``ProcessLookupError`` means
+    the PID is genuinely gone; ``PermissionError``/other ``OSError`` (incl.
+    Windows' WinError 87 for a non-existent PID) are both treated the same
+    as "not alive" here, matching the established repo-wide precedent rather
+    than inventing a new interpretation for this one call site.
+    """
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
+def validate_worktree_cleanup_target(
+    wt_row: dict[str, Any] | None,
+    *,
+    expected_worktree_id: str,
+    expected_path: str | None = None,
+) -> dict[str, Any]:
+    """Pre-disk-mutation sanity + liveness gate (eb2e44f8, acceptance point 4).
+
+    Re-validates a worktree row immediately before its directory is removed
+    from disk, closing two TOCTOU-shaped risk windows this module's history
+    already flagged: 13+ worktrees spawned in a single megasprint night, plus
+    the 2026-07-14 stray-process incident where a session's owning process
+    outlived its Meridian session record entirely.
+
+    1. **Identity** — the row actually being acted on still matches the id
+       (and, when supplied, the path) the caller resolved moments earlier.
+       Catches a race where the underlying row was reused/rewritten between
+       listing candidates and acting on them.
+    2. **Liveness** — if the row recorded an owning PID at registration time
+       (``active_worktrees.pid``), that process must no longer be alive. A
+       live PID means SOME process may still be reading/writing inside that
+       directory even though Meridian's own bookkeeping considers the
+       worktree terminal — deleting out from under it risks corrupting an
+       in-flight git operation.
+
+    Returns ``{"ok": bool, "reason": str | None, "detail": str | None}``.
+    A worktree with no recorded PID (``pid`` is ``None``) always passes the
+    liveness check — this mirrors the fail-open-on-absent-data posture used
+    everywhere else in this module (e.g. a missing directory counts as
+    "already removed", not an error); only a KNOWN-live PID blocks cleanup.
+    """
+    if wt_row is None:
+        return {
+            "ok": False,
+            "reason": "NOT_FOUND",
+            "detail": f"no active_worktrees row for id {expected_worktree_id}",
+        }
+    if wt_row.get("id") != expected_worktree_id:
+        return {
+            "ok": False,
+            "reason": "ID_MISMATCH",
+            "detail": f"expected worktree id {expected_worktree_id}, row has {wt_row.get('id')}",
+        }
+    if expected_path is not None and wt_row.get("path") != expected_path:
+        return {
+            "ok": False,
+            "reason": "PATH_MISMATCH",
+            "detail": f"expected path {expected_path!r}, row has {wt_row.get('path')!r}",
+        }
+    pid = wt_row.get("pid")
+    if pid is not None:
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            pid_int = None
+        if pid_int is not None and _pid_is_alive(pid_int):
+            return {
+                "ok": False,
+                "reason": "PROCESS_STILL_LIVE",
+                "detail": f"pid {pid_int} is still running — refusing to remove its worktree from disk",
+            }
+    return {"ok": True, "reason": None, "detail": None}
+
+
+def remove_worktree_on_disk_guarded(
+    repo_root: Path,
+    wt_row: dict[str, Any],
+    *,
+    expected_worktree_id: str,
+) -> dict[str, Any]:
+    """Guarded wrapper around :func:`remove_worktree_on_disk`.
+
+    Runs :func:`validate_worktree_cleanup_target` first; only calls the real
+    disk-mutating removal when the guard passes. On guard failure, returns
+    ``{"attempted": False, "removed": False, "guard_ok": False, "reason":
+    ..., "detail": ...}`` instead of touching the filesystem at all — the
+    caller decides how to surface that (skip-and-retry-later for the
+    periodic sweep, best-effort-log for the on-demand DELETE route).
+    """
+    guard = validate_worktree_cleanup_target(
+        wt_row, expected_worktree_id=expected_worktree_id
+    )
+    if not guard["ok"]:
+        logger.warning(
+            "worktree_cleanup: refusing disk removal for %s (%s): %s",
+            expected_worktree_id, guard["reason"], guard["detail"],
+        )
+        return {
+            "attempted": False,
+            "removed": False,
+            "guard_ok": False,
+            "reason": guard["reason"],
+            "detail": guard["detail"],
+        }
+    outcome = remove_worktree_on_disk(repo_root, wt_row["path"])
+    outcome = dict(outcome)
+    outcome["guard_ok"] = True
+    return outcome
+
+
 async def sweep_stale_worktrees(
     db: Any,
     repo_root: Path,
@@ -151,7 +272,14 @@ async def sweep_stale_worktrees(
     swept: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for wt in candidates:
-        outcome = remove_worktree_on_disk(repo_root, wt["path"])
+        # eb2e44f8 — guarded: re-validates identity + PID liveness immediately
+        # before the real disk mutation, so a worktree whose owning process is
+        # somehow still alive (the exact 2026-07-14 stray-process scenario)
+        # never gets nuked out from under it just because its DB row looks
+        # terminal.
+        outcome = remove_worktree_on_disk_guarded(
+            repo_root, wt, expected_worktree_id=wt["id"]
+        )
         if outcome["removed"]:
             await db_module.remove_worktree(db, wt["id"])
             swept.append({"id": wt["id"], "path": wt["path"]})

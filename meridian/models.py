@@ -397,5 +397,36 @@ class WorktreeCreate(BaseModel):
     branch: str = Field(..., min_length=1, description="Git branch name, e.g. worktree/abc12345.")
     path: str = Field(..., min_length=1, description="Filesystem path of the worktree.")
     item_id: str | None = Field(default=None, description="Sprint item this worktree was created for.")
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "eb2e44f8 — OS PID of the process that created this worktree. "
+            "Used by the cleanup guard to confirm no live process is still "
+            "using the directory before it is removed from disk."
+        ),
+    )
+    base_sha: str | None = Field(
+        default=None,
+        description=(
+            "eb2e44f8 — commit SHA the worktree was branched from. Supplying "
+            "this together with base_branch persists an IMMUTABLE base "
+            "manifest for the worktree, later checked before merge/completion "
+            "is allowed to proceed. Omitting it skips manifest creation "
+            "entirely (backward compatible)."
+        ),
+    )
+    base_branch: str | None = Field(
+        default=None,
+        description="eb2e44f8 — branch the worktree was branched from, e.g. 'dev'.",
+    )
+    repo_identity: str | None = Field(
+        default=None,
+        description=(
+            "eb2e44f8 — stable identity for the repo this worktree belongs to "
+            "(e.g. a remote URL or repo name). Free-form; recorded on the base "
+            "manifest for audit purposes only, never validated against disk. "
+            "Defaults to project_id when omitted."
+        ),
+    )
 
 
