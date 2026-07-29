@@ -906,3 +906,44 @@ async def test_b763d2ba_end_to_end_sibling_claim_and_consume_not_flagged_as_spoo
 
     # Non-regression: a truly fabricated id is still absent.
     assert "FAKE-ITEM-NEVER-CREATED-b763d2ba" not in live_ids
+
+
+# ---------------------------------------------------------------------------
+# 9c6cac08 (665 follow-up) — the goal_token is the ONE field explicitly
+# exempted from generate_handoff's determinism guarantee (it is a fresh
+# single-use nonce BY DESIGN — see test_mint_handoff_token_produces_unique_
+# tokens above). This proves the exemption is narrow: everything else in a
+# repeated /goal render against identical DB state is byte-identical.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repeated_generate_handoff_calls_differ_only_by_token(db, tmp_path):
+    p = await db_module.create_project(db, "token-determinism-scope")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "do the thing",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+
+    _path_a, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    _path_b, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+
+    token_a = _extract_token_from_goal(content_a)
+    token_b = _extract_token_from_goal(content_b)
+    assert token_a is not None and token_b is not None
+    assert token_a != token_b, "each call must mint a fresh single-use token"
+
+    stripped_a = content_a.replace(token_a, "STRIPPED", 1)
+    stripped_b = content_b.replace(token_b, "STRIPPED", 1)
+    assert stripped_a == stripped_b, (
+        "generate_handoff output must be byte-identical for identical DB "
+        "state once the single-use token is normalized out"
+    )

@@ -11,9 +11,12 @@ A ``range`` selector is used for the end-to-end cases because it is self-resolvi
 test is deterministic on both SQLite and Postgres.
 """
 
+import re
+
 import pytest
 
 from meridian import db as db_module
+from meridian import executor_contract as ec
 from meridian import handoff as handoff_module
 
 
@@ -246,3 +249,90 @@ async def test_generate_handoff_survives_pointer_resolve_blowup(db, tmp_path, mo
     )
     assert "resilient item" in content
     assert "Resolved pointers:" not in content
+
+
+# ---------------------------------------------------------------------------
+# 9c6cac08 (665 follow-up) — pointer rendering must be deterministic across
+# repeated calls, and the human-readable inline text must agree with the
+# structured executor_contract pointer target for the SAME pointer (text
+# and JSON projections of one underlying record, never independently
+# re-derived numbers that could drift apart).
+# ---------------------------------------------------------------------------
+
+_GOAL_TOKEN_RE = re.compile(r"<goal_token>[^<]*</goal_token>")
+
+
+def _strip_goal_token(content: str) -> str:
+    return _GOAL_TOKEN_RE.sub("<goal_token>STRIPPED</goal_token>", content)
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_pointer_rendering_deterministic_across_repeated_calls(
+    db, tmp_path
+):
+    p = await db_module.create_project(db, "inline-determinism")
+    await db_module.set_goal(db, p["id"], "ship inline pointers")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the migration guard")
+    await db_module.add_sprint_item_pointer(
+        db,
+        p["id"],
+        item["id"],
+        "code",
+        [
+            {
+                "uri": "file:meridian/db/migrations.py",
+                "selector": {"type": "range", "start_line": 100, "end_line": 120},
+            }
+        ],
+        label="guard site",
+    )
+
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert _strip_goal_token(content_a) == _strip_goal_token(content_b)
+    for c in (content_a, content_b):
+        assert "meridian/db/migrations.py:100-120" in c
+
+
+@pytest.mark.asyncio
+async def test_resolved_pointer_text_matches_executor_contract_structured_target(
+    db, tmp_path
+):
+    """The plain-text 'Resolved pointers:' line generate_handoff renders and
+    the structured target executor_contract.build_executor_contract reports
+    for the SAME durable pointer must describe the identical file:line-range
+    location — no independent formatting that could silently disagree."""
+    p = await db_module.create_project(db, "inline-vs-structured")
+    await db_module.set_goal(db, p["id"], "ship inline pointers")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the migration guard")
+    await db_module.add_sprint_item_pointer(
+        db,
+        p["id"],
+        item["id"],
+        "code",
+        [
+            {
+                "uri": "file:meridian/db/migrations.py",
+                "selector": {"type": "range", "start_line": 100, "end_line": 120},
+            }
+        ],
+        label="guard site",
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    contract = await ec.build_executor_contract(db, p["id"], fresh)
+    target = contract["pointers"]["pointers"][0]["targets"][0]
+    expected_location = (
+        f"{target['uri'].split(':', 1)[1]}:"
+        f"{target['selector']['start_line']}-{target['selector']['end_line']}"
+    )
+    assert expected_location in content
+    assert expected_location == "meridian/db/migrations.py:100-120"

@@ -8,12 +8,18 @@ pure helpers, and the HTTP endpoints (including error paths).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import re
 
 import pytest
 
+from meridian import capability_contract as cc
 from meridian import db as db_module
+from meridian import executor_contract as ec
 from meridian import handoff as handoff_module
+import meridian.server  # noqa: F401 — load the server before handler to avoid its import cycle
+from meridian.mcp import handler as mcp_handler
 
 
 def _run(coro):
@@ -2204,3 +2210,515 @@ async def test_generate_handoff_full_renders_session_span(db, tmp_path):
     )
     assert "## Session span" in content
     assert "calendar day" in content
+
+
+# ---------------------------------------------------------------------------
+# 9c6cac08 (665 follow-up) — deterministic paste-ready handoff serialization
+# and scope fidelity.
+#
+# Item 23e20656 built ONE canonical, hashable per-item executor_contract
+# (meridian.executor_contract.build_executor_contract) with pure JSON/XML/
+# text projections (to_json / render_xml_clause / render_text). This section
+# proves — end-to-end, through generate_handoff / the MCP dispatch, not just
+# the isolated module already covered by tests/test_executor_contract.py —
+# that:
+#   1. the canonical serialization format itself is pinned (golden payloads),
+#   2. two calls against IDENTICAL DB state produce materially identical
+#      output (modulo the single-use goal_token/timestamps),
+#   3. the /goal text's <tool_requirements>/<sprint_item_pointers> XML
+#      clauses carry the SAME canonical JSON the sibling capability_contract
+#      field embeds — no independent re-derivation that could drift,
+#   4. a requested scope (a sprint version) is fully accounted for — every
+#      pending item is visible somewhere (claimable batch or a structured
+#      exclusion note), and nothing outside the requested scope leaks in,
+#   5. a non-executable state (an unavailable required tool) is visible
+#      across all three projections, not silently dropped.
+# ---------------------------------------------------------------------------
+
+
+_GOAL_TOKEN_RE = re.compile(r"<goal_token>[^<]*</goal_token>")
+
+
+def _strip_goal_token(content: str) -> str:
+    """Replace the single-use provenance token (dd07ece0) with a fixed
+    placeholder so two otherwise-identical /goal renders can be diffed
+    byte-for-byte. The token is a fresh nonce BY DESIGN (a new one is minted
+    on every call, see test_mint_handoff_token_produces_unique_tokens in
+    test_dd07ece0_handoff_token.py) — the one field explicitly exempted,
+    alongside timestamps/session ids, from the determinism guarantee."""
+    return _GOAL_TOKEN_RE.sub("<goal_token>STRIPPED</goal_token>", content)
+
+
+def _extract_xml_tag_body(content: str, tag: str) -> str:
+    """Pull the body text out of the FIRST ``<tag ...>...</tag>`` occurrence
+    and XML-unescape it — the tool_requirements/sprint_item_pointers clauses
+    embed canonical JSON, which needs unescaping before json.loads (the
+    renderer only escapes &/</>, not quotes, so this round-trips cleanly).
+    Attribute-agnostic: matches both a bare ``<tag>`` and an attributed
+    ``<tag count="1">`` opening (e.g. excluded_unprospected/
+    excluded_wave_gate_pending)."""
+    from xml.sax.saxutils import unescape as _xml_unescape
+
+    open_start = content.index(f"<{tag}")
+    open_end = content.index(">", open_start) + 1
+    end_marker = f"</{tag}>"
+    end = content.index(end_marker, open_end)
+    return _xml_unescape(content[open_end:end])
+
+
+# ---------------------------------------------------------------------------
+# (1) Golden canonical payloads — pins the EXACT serialization format so any
+# accidental drift (indent added, separators changed, key order changed)
+# breaks immediately, not just "still looks like JSON/XML/text".
+# ---------------------------------------------------------------------------
+
+
+def test_golden_executor_contract_json_xml_text_simple():
+    contract = {
+        "schema_version": 1,
+        "item_id": "golden-item",
+        "version": "v1",
+        "mode": "autonomous",
+        "executable": True,
+        "executable_reasons": [],
+        "allowed_tools": [],
+        "forbidden_tools": [],
+        "steps": [{
+            "order": 1, "kind": "finish",
+            "description": "Call complete_sprint_item(item_id, project_id).",
+        }],
+        "gate_after": None,
+        "contract_hash": "deadbeef",
+    }
+    assert ec.to_json(contract) == (
+        '{"allowed_tools":[],"contract_hash":"deadbeef","executable":true,'
+        '"executable_reasons":[],"forbidden_tools":[],"gate_after":null,'
+        '"item_id":"golden-item","mode":"autonomous","schema_version":1,'
+        '"steps":[{"description":"Call complete_sprint_item(item_id, project_id).",'
+        '"kind":"finish","order":1}],"version":"v1"}'
+    )
+    assert ec.render_xml_clause(contract) == (
+        '<executor_contract item_id="golden-item" mode="autonomous" '
+        'executable="true" contract_hash="deadbeef">\n'
+        '  <step order="1" kind="finish">Call complete_sprint_item(item_id, project_id).</step>\n'
+        "</executor_contract>"
+    )
+    assert ec.render_text(contract) == (
+        "Executor contract — item golden-item (version=v1, mode=autonomous)\n"
+        "Steps:\n"
+        "  1. Call complete_sprint_item(item_id, project_id)."
+    )
+
+
+def test_golden_executor_contract_serialize_and_hash_for_non_executable_contract():
+    """A richer, non-executable contract (missing required tool, an active
+    step, populated dependency/completion_checks/scope) — pins
+    serialize_executor_contract's canonical JSON exactly, then proves
+    contract_hash IS sha256 of that exact canonical form (computed in-test
+    via hashlib, not hand-transcribed, so this also guards the hashing
+    contract itself without risking a transcription typo on a 64-char hex
+    string)."""
+    contract = {
+        "schema_version": 1,
+        "item_id": "golden-item-2",
+        "version": "v1",
+        "scope": {
+            "project_id": "proj-1", "requested_version": None, "wave": None,
+            "track": None, "milestone_type": None, "priority": None,
+        },
+        "mode": "autonomous",
+        "executable": False,
+        "executable_reasons": ["missing_required_tools:Serena: find_symbol"],
+        "allowed_tools": [{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+            "call_template": None, "fallback": [], "risk_class": "read",
+            "availability_status": "missing", "fallback_used": None,
+        }],
+        "forbidden_tools": [{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "reason": "required tool unavailable; no fallback declared",
+        }],
+        "scheduling": {"touches_resources": []},
+        "steps": [
+            {
+                "order": 1, "kind": "tool_call",
+                "description": "Use Serena: find_symbol — locate target",
+                "tool": {
+                    "name": "find_symbol", "server_or_namespace": "Serena",
+                    "call_template": None,
+                },
+            },
+            {
+                "order": 2, "kind": "finish",
+                "description": "Call complete_sprint_item(item_id, project_id).",
+            },
+        ],
+        "gate_after": None,
+        "gate_blocking": None,
+        "dependency": {
+            "depends_on": None, "failure_mode": "continue",
+            "blocking_item": None, "satisfied": True,
+        },
+        "output_requirements": {
+            "artifact_kind": None, "planned_output": None, "policy": None,
+            "declared": False,
+        },
+        "pointers": None,
+        "completion_checks": {
+            "required_notes": False, "required_notes_satisfied": True,
+            "require_verification": False, "require_verification_satisfied": True,
+            "verification_on_file": None,
+            "prospecting": {
+                "declares_resources": False, "has_pointer_evidence": False,
+                "prospected": True, "prospect_bypass": False,
+            },
+        },
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "contract_hash": "fixedhash123",
+    }
+    expected_serialized = (
+        '{"allowed_tools":[{"availability_status":"missing","call_template":null,'
+        '"fallback":[],"fallback_used":null,"name":"find_symbol","purpose":"locate target",'
+        '"required_or_preferred":"required","risk_class":"read","server_or_namespace":"Serena"}],'
+        '"completion_checks":{"prospecting":{"declares_resources":false,"has_pointer_evidence":false,'
+        '"prospect_bypass":false,"prospected":true},"require_verification":false,'
+        '"require_verification_satisfied":true,"required_notes":false,"required_notes_satisfied":true,'
+        '"verification_on_file":null},"dependency":{"blocking_item":null,"depends_on":null,'
+        '"failure_mode":"continue","satisfied":true},"executable":false,'
+        '"executable_reasons":["missing_required_tools:Serena: find_symbol"],'
+        '"forbidden_tools":[{"name":"find_symbol","reason":"required tool unavailable; no fallback declared",'
+        '"server_or_namespace":"Serena"}],"gate_after":null,"gate_blocking":null,'
+        '"item_id":"golden-item-2","mode":"autonomous","output_requirements":{"artifact_kind":null,'
+        '"declared":false,"planned_output":null,"policy":null},"pointers":null,'
+        '"scheduling":{"touches_resources":[]},"schema_version":1,"scope":{"milestone_type":null,'
+        '"priority":null,"project_id":"proj-1","requested_version":null,"track":null,"wave":null},'
+        '"steps":[{"description":"Use Serena: find_symbol \\u2014 locate target","kind":"tool_call",'
+        '"order":1,"tool":{"call_template":null,"name":"find_symbol","server_or_namespace":"Serena"}},'
+        '{"description":"Call complete_sprint_item(item_id, project_id).","kind":"finish","order":2}],'
+        '"version":"v1"}'
+    )
+    serialized = ec.serialize_executor_contract(contract)
+    assert serialized == expected_serialized
+    assert "2026-01-01T00:00:00" not in serialized  # generated_at excluded
+    assert "fixedhash123" not in serialized  # contract_hash excluded
+    assert ec.executor_contract_hash(contract) == hashlib.sha256(
+        expected_serialized.encode("utf-8")
+    ).hexdigest()
+
+    # And the XML/text projections of the SAME contract make the
+    # non-executable state visible, not just the JSON.
+    xml = ec.render_xml_clause(contract)
+    text = ec.render_text(contract)
+    assert 'executable="false"' in xml
+    assert "<forbidden_tool>Serena: find_symbol</forbidden_tool>" in xml
+    assert "NOT EXECUTABLE" in text
+    assert "Do NOT rely on (confirmed unavailable):" in text
+
+
+# ---------------------------------------------------------------------------
+# (2) Repeated-run determinism — identical DB state, two calls, diff modulo
+# the goal_token / generated_at fields.
+# ---------------------------------------------------------------------------
+
+
+async def test_generate_handoff_goal_mode_deterministic_modulo_token(db, tmp_path):
+    p = await db_module.create_project(db, "determinism-goal-text")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "Refactor the parser",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+            "fallback": ["grep_search"],
+        }],
+    )
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    # Tokens themselves must differ (fresh nonce each call)...
+    assert content_a != content_b
+    # ...but everything else must be byte-identical.
+    assert _strip_goal_token(content_a) == _strip_goal_token(content_b)
+
+
+async def test_generate_handoff_capability_contract_deterministic_across_repeated_mcp_calls(
+    db, tmp_path
+):
+    """Same guarantee as test_capability_contract.py's
+    test_contract_serialize_is_byte_stable_for_same_state, but proven through
+    the REAL MCP generate_handoff dispatch (mcp/handler.py), which is what
+    actually ships to a caller — not just a direct build_capability_contract
+    unit call."""
+    p = await db_module.create_project(db, "determinism-mcp-contract")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "Refactor the auth handshake",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+    result_a = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    result_b = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    cc_a, cc_b = result_a["capability_contract"], result_b["capability_contract"]
+    assert cc_a["contract_hash"] == cc_b["contract_hash"]
+    assert cc.serialize_contract(cc_a) == cc.serialize_contract(cc_b)
+    assert _strip_goal_token(result_a["content"]) == _strip_goal_token(result_b["content"])
+
+
+# ---------------------------------------------------------------------------
+# (3) XML/JSON projection parity — the /goal text's typed clauses must carry
+# the SAME canonical JSON as the sibling capability_contract field, for the
+# SAME request (never two independent derivations that could silently
+# drift).
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_requirements_xml_clause_matches_capability_contract_json(db, tmp_path):
+    p = await db_module.create_project(db, "parity-toolreq")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Needs a specific tool",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+            "fallback": ["grep_search"],
+        }],
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    from_xml = json.loads(_extract_xml_tag_body(result["content"], "tool_requirements"))
+    assert from_xml == result["capability_contract"]["item_tool_requirements"]
+    assert any(e["item_id"] == item["id"] for e in from_xml)
+
+
+async def test_sprint_item_pointers_xml_clause_matches_capability_contract_json(db, tmp_path):
+    p = await db_module.create_project(db, "parity-pointers")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Touches a real file",
+        touches_resources=["file:meridian/parser.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "file:meridian/parser.py", "selector": {"type": "range", "start_line": 1, "end_line": 5}}],
+        label="entry point",
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    from_xml = json.loads(_extract_xml_tag_body(result["content"], "sprint_item_pointers"))
+    assert from_xml == result["capability_contract"]["item_sprint_item_pointers"]
+    assert any(e["item_id"] == item["id"] for e in from_xml)
+
+
+# ---------------------------------------------------------------------------
+# (4) Requested-vs-emitted scope fidelity — every pending item for the
+# requested version is visible SOMEWHERE (claimable batch or a structured
+# exclusion note); nothing silently vanishes, nothing outside scope leaks in.
+# ---------------------------------------------------------------------------
+
+
+async def test_requested_scope_fully_accounted_for_no_silent_drop(db, tmp_path):
+    p = await db_module.create_project(db, "scope-accounting")
+    item_plain = await db_module.add_sprint_item(db, p["id"], "v1", "Plain claimable item")
+    item_manual = await db_module.add_sprint_item(
+        db, p["id"], "v1", "MANUAL: publish blog post"
+    )
+    item_backburner = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Backburnered work", track="backburner"
+    )
+    item_wave_gated = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Deploy notification service", wave="wave-2"
+    )
+    item_unprospected = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Touches ghost file", touches_resources=["file:ghost.py"]
+    )
+    item_other_version = await db_module.add_sprint_item(
+        db, p["id"], "v2", "Other version item, must not leak into v1 scope"
+    )
+    await db_module.configure_wave_gate(
+        db, p["id"], wave_end="wave-1", actions=[{"type": "wait", "seconds": 1}],
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal", version="v1",
+    )
+
+    # Every requested-scope item is visible somewhere — claimable or excluded
+    # with a structured, named reason. Nothing silently disappears.
+    for it in (item_plain, item_manual, item_backburner, item_wave_gated, item_unprospected):
+        assert it["id"] in content, f"{it['title']!r} vanished from the requested-scope handoff"
+
+    # Only the genuinely-claimable item is in the claimable batch itself.
+    start = content.rindex("<sprint_items>") + len("<sprint_items>")
+    end = content.index("</sprint_items>", start)
+    assert content[start:end].strip() == f"Complete sprint items: {item_plain['id']}."
+
+    # And the two items with a UNIQUELY-tagged exclusion reason (manual/
+    # backburner share a generic <exclusions> tag, checked above via plain
+    # membership — wave-gate/unprospected each get their own distinct tag)
+    # are excluded for the RIGHT documented reason, not just "somewhere".
+    assert item_wave_gated["id"] in _extract_xml_tag_body(
+        content, "excluded_wave_gate_pending"
+    )
+    assert item_unprospected["id"] in _extract_xml_tag_body(content, "excluded_unprospected")
+    # Neither of those two structurally-excluded items is ALSO claimable.
+    assert item_wave_gated["id"] not in content[start:end]
+    assert item_unprospected["id"] not in content[start:end]
+
+    # No silent broadening: an item from an entirely different version never
+    # appears anywhere in this version-scoped handoff.
+    assert item_other_version["id"] not in content
+
+
+async def test_nonexistent_version_scope_does_not_broaden_to_whole_board(db, tmp_path):
+    """Requesting a version with zero pending items (typo'd/stale reference)
+    must FAIL VISIBLY — an empty, honestly-scoped /goal — never silently
+    broaden to show the rest of the board."""
+    p = await db_module.create_project(db, "nonexistent-version-scope")
+    item_v1 = await db_module.add_sprint_item(db, p["id"], "v1", "Real v1 item")
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+        version="v999-typo-does-not-exist",
+    )
+    assert item_v1["id"] not in content
+    assert "<executor_directive>Verify remaining work is complete.</executor_directive>" in content
+
+    # The MCP surface's own scope metadata makes the requested (empty) scope
+    # explicit rather than silently indistinguishable from "unscoped".
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff",
+        {"project_id": p["id"], "mode": "goal", "version": "v999-typo-does-not-exist"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["scope"]["requested_version"] == "v999-typo-does-not-exist"
+    assert result["scope"]["effective_version"] == "v999-typo-does-not-exist"
+
+
+# ---------------------------------------------------------------------------
+# (5) The embedded per-item executor_contract must never drift from a
+# standalone build of the SAME live state — and an unavailable required tool
+# must fail visibly across every projection, not just the JSON.
+# ---------------------------------------------------------------------------
+
+
+async def test_item_executor_contract_embedded_matches_standalone_build(db, tmp_path):
+    p = await db_module.create_project(db, "embed-vs-standalone")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Refactor the payments module",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    embedded = next(
+        e for e in result["capability_contract"]["item_executor_contracts"]
+        if e["item_id"] == item["id"]
+    )
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    standalone = await ec.build_executor_contract(db, p["id"], fresh)
+    # The embedded entry's own generated_at was already stripped at build
+    # time (23e20656); serialize_executor_contract strips both sides' anyway,
+    # so the two must be byte-identical AND hash-identical.
+    assert ec.serialize_executor_contract(embedded) == ec.serialize_executor_contract(standalone)
+    assert embedded["contract_hash"] == standalone["contract_hash"]
+
+
+async def test_unavailable_required_tool_fails_visibly_across_all_three_projections(db):
+    """An item whose required tool is CONFIRMED unavailable (a live inventory
+    shows the plugin disabled, not merely 'unknown') must be visibly
+    non-executable in the JSON, the XML clause, AND the human-text
+    projection — proving the executor_contract really is the single source
+    of truth all three renderings agree on, not just the JSON field a caller
+    might not even look at."""
+    p = await db_module.create_project(db, "unavailable-tool-visibility")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Needs a dead tool",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+    inventory = {
+        "tunnel_reachable": True,
+        "builtin_tools": set(),
+        "plugins": {"Serena": {"enabled": False, "invocable": False, "tools": set()}},
+        "stdio_registry": {},
+    }
+    contract = await ec.build_executor_contract(db, p["id"], item, tool_inventory=inventory)
+    assert contract["executable"] is False
+
+    as_json = ec.to_json(contract)
+    as_xml = ec.render_xml_clause(contract)
+    as_text = ec.render_text(contract)
+
+    assert contract["forbidden_tools"], "forbidden_tools must be non-empty in the built object"
+    assert json.loads(as_json)["forbidden_tools"][0]["name"] == "find_symbol"
+    assert 'executable="false"' in as_xml
+    assert "<forbidden_tool>Serena: find_symbol</forbidden_tool>" in as_xml
+    assert "NOT EXECUTABLE" in as_text
+    assert "Do NOT rely on (confirmed unavailable):" in as_text
+    assert "Serena: find_symbol" in as_text
+
+
+# ---------------------------------------------------------------------------
+# (6) A fresh session's /goal block alone must be sufficient to start — no
+# missing context a human would need to fill in by hand.
+# ---------------------------------------------------------------------------
+
+
+async def test_fresh_session_goal_block_self_sufficient_no_manual_reconstruction(db, tmp_path):
+    p = await db_module.create_project(db, "self-sufficient-goal")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the migration guard",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+            "fallback": ["grep_search"],
+        }],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "file:meridian/db/migrations.py", "selector": {"type": "range", "start_line": 100, "end_line": 120}}],
+        label="guard site",
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+
+    # Structurally self-contained: a fresh executor needs nothing beyond this
+    # single string to know WHAT to do, WHICH tool to use, WHERE to look, and
+    # WHEN to stop.
+    assert content.strip().startswith("/goal") or content.strip().startswith("/loop /goal")
+    assert "<executor_directive>" in content
+    assert item["id"] in content
+    assert "meridian/db/migrations.py:100-120" in content  # concrete pointer, inlined
+    assert "guard site" in content
+    assert "<goal_token>" in content  # provenance, verifiable on receipt
+    assert "<stop_conditions>" in content
+    assert "<completion_criteria>" in content
+    assert "<execution_policy" in content  # required_first_action etc., not just prose
+    # The typed tool-requirement contract is present verbatim, not just a
+    # hint the executor has to remember from earlier conversation turns.
+    tool_reqs = json.loads(_extract_xml_tag_body(content, "tool_requirements"))
+    assert any(
+        e["item_id"] == item["id"]
+        and any(r.get("name") == "find_symbol" for r in e.get("requirements", []))
+        for e in tool_reqs
+    )
