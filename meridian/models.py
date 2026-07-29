@@ -340,6 +340,13 @@ class HandoffResult(BaseModel):
     # the lookup itself failed (best-effort); empty list means no linked
     # proposals yet.
     proposal_evidence: list[dict[str, Any]] | None = None
+    # d09c29fe -- machine-readable DOCX-integrity gate (see
+    # meridian.docx_integrity_gate): per-artifact render/equation-audit/
+    # provenance findings plus the executable/executable_reasons readiness
+    # signal. dict, not a typed submodel, for the same forward-compat reason
+    # as capability_contract above. None only if gate-building itself failed
+    # (best-effort).
+    docx_integrity: dict[str, Any] | None = None
 
 
 class TaskUpdate(BaseModel):

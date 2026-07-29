@@ -36,6 +36,7 @@ from . import artifact_classification as artifact_classification_module
 from . import artifact_declaration as artifact_declaration_module
 from . import capability_contract as capability_contract_module
 from . import db as db_module
+from . import docx_integrity_gate as docx_integrity_gate_module
 from . import tool_requirements as tool_requirements_module
 from .db.sprint_items import (
     _is_deferred,
@@ -4546,6 +4547,43 @@ async def build_proposal_evidence_for_handoff(
             for pid in proposal_ids
         ]
     except Exception:  # noqa: BLE001 — proposal evidence is best-effort
+        return None
+
+
+async def build_docx_integrity_gate_for_handoff(
+    db: Any, project_id: str, *,
+    pending_items: "list[dict[str, Any]] | None" = None,
+    proposal_evidence: "list[dict[str, Any]] | None" = None,
+) -> "dict[str, Any] | None":
+    """d09c29fe — thin, fully-guarded wrapper over
+    :func:`meridian.docx_integrity_gate.build_docx_integrity_gate`, mirroring
+    :func:`build_effective_capability_contract` / :func:`build_proposal_evidence_for_handoff`'s
+    own wrapper style so all three "best-effort structured field" emissions
+    follow one convention. Emitted alongside every ``generate_handoff`` mode
+    the same way those two already are.
+
+    Composes 93cd9798 (render-capability detection), 4efc63fd (equation-style
+    audit), and dccc2311 (write-transaction integrity concept) into a single
+    per-artifact ``ready``/``executable`` verdict — see
+    ``meridian.docx_integrity_gate`` module docstring for the full
+    composition. ``proposal_evidence`` should be the SAME list
+    :func:`build_proposal_evidence_for_handoff` already produced for this
+    handoff (6cdc5df3 tie-in — a proposal's linked ``.docx`` artifact
+    evidence is gated too, not just an item's own pointer); pass ``None``
+    when unavailable, which degrades to item-pointer-only coverage rather
+    than failing.
+
+    Returns ``None`` on any failure so a caller can simply skip attaching the
+    field, exactly like the two sibling wrappers above — never breaks the
+    mandatory handoff.
+    """
+    try:
+        return await docx_integrity_gate_module.build_docx_integrity_gate(
+            db, project_id,
+            pending_items=pending_items,
+            proposal_evidence=proposal_evidence,
+        )
+    except Exception:  # noqa: BLE001 — docx integrity gate is best-effort
         return None
 
 
