@@ -2905,6 +2905,15 @@ async def _handle_task_tools(
         _proposal_evidence = await handoff_module_local.build_proposal_evidence_for_handoff(
             db, args["project_id"],
         )
+        # d09c29fe — machine-readable DOCX-integrity gate, emitted on every
+        # generate_handoff mode alongside the two fields above. Tied to the
+        # proposal evidence just built (6cdc5df3) so a proposal-linked .docx
+        # artifact is gated too, not just an item's own pointer. Fully
+        # guarded — a failure degrades to no field rather than breaking the
+        # mandatory handoff.
+        _docx_integrity = await handoff_module_local.build_docx_integrity_gate_for_handoff(
+            db, args["project_id"], proposal_evidence=_proposal_evidence,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -2922,6 +2931,10 @@ async def _handle_task_tools(
             # 6cdc5df3 — one entry per proposal id with linked evidence in this
             # project (see meridian.db.proposal_links.get_proposal_evidence).
             "proposal_evidence": _proposal_evidence,
+            # d09c29fe — DOCX audit status/findings/provenance for items/
+            # artifacts this handoff covers, plus the executable/executable_reasons
+            # readiness signal (see meridian.docx_integrity_gate).
+            "docx_integrity": _docx_integrity,
             # b8f89491 — machine-readable scope: which sprint-version bucket
             # this handoff actually resolved to, and why (explicit argument vs.
             # session-derived vs. unscoped). effective_version is None when the

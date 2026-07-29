@@ -50,6 +50,12 @@ async def planner_handoff_endpoint(
     proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
         db, project_id,
     )
+    # d09c29fe — machine-readable DOCX-integrity gate; best-effort, never
+    # breaks the planner handoff. Tied to the proposal evidence above so a
+    # proposal-linked .docx artifact is gated too (6cdc5df3).
+    docx_integrity = await handoff_module.build_docx_integrity_gate_for_handoff(
+        db, project_id, proposal_evidence=proposal_evidence,
+    )
     return {
         # a5e8aa74 — route through the same shared helper the MCP handler/stdio
         # transports use so all transports share one raw-text contract (this
@@ -59,6 +65,7 @@ async def planner_handoff_endpoint(
         "mode": "planner",
         "capability_contract": capability_contract,
         "proposal_evidence": proposal_evidence,
+        "docx_integrity": docx_integrity,
     }
 
 
@@ -120,6 +127,12 @@ async def generate_handoff_endpoint(
     proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
         db, project_id,
     )
+    # d09c29fe — machine-readable DOCX-integrity gate; best-effort, never
+    # breaks the mandatory handoff. Tied to the proposal evidence above so a
+    # proposal-linked .docx artifact is gated too (6cdc5df3).
+    docx_integrity = await handoff_module.build_docx_integrity_gate_for_handoff(
+        db, project_id, proposal_evidence=proposal_evidence,
+    )
     return {
         # a5e8aa74 — same shared helper as the planner endpoint above and both
         # MCP transports; see format_handoff_mcp_content's docstring.
@@ -127,4 +140,5 @@ async def generate_handoff_endpoint(
         "mode": mode,
         "capability_contract": capability_contract,
         "proposal_evidence": proposal_evidence,
+        "docx_integrity": docx_integrity,
     }
