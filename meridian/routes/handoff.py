@@ -51,7 +51,12 @@ async def planner_handoff_endpoint(
         db, project_id,
     )
     return {
-        "path": path, "content": content, "mode": "planner",
+        # a5e8aa74 — route through the same shared helper the MCP handler/stdio
+        # transports use so all transports share one raw-text contract (this
+        # endpoint was already raw; this just makes that guarantee explicit and
+        # keeps the three transports from being able to drift independently).
+        "path": path, "content": handoff_module.format_handoff_mcp_content(content),
+        "mode": "planner",
         "capability_contract": capability_contract,
         "proposal_evidence": proposal_evidence,
     }
@@ -116,7 +121,10 @@ async def generate_handoff_endpoint(
         db, project_id,
     )
     return {
-        "path": path, "content": content, "mode": mode,
+        # a5e8aa74 — same shared helper as the planner endpoint above and both
+        # MCP transports; see format_handoff_mcp_content's docstring.
+        "path": path, "content": handoff_module.format_handoff_mcp_content(content),
+        "mode": mode,
         "capability_contract": capability_contract,
         "proposal_evidence": proposal_evidence,
     }

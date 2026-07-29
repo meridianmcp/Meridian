@@ -550,6 +550,29 @@ def _format_content(content) -> str:
     return json.dumps(content, indent=2)
 
 
+def format_handoff_mcp_content(content: str) -> str:
+    """Return the exact ``content`` string every MCP transport must emit.
+
+    a5e8aa74 — ``generate_handoff`` already renders raw, correct text; the
+    bug was that ``meridian/mcp/handler.py`` and
+    ``meridian/mcp/stdio_handler.py`` each independently wrapped that text in
+    a four-backtick Markdown code fence (5234877f) before returning it as the
+    MCP tool result's ``content`` field. That wrapping meant a receiving
+    Claude Code session could never forward the field verbatim as a single
+    paste-ready ``/goal`` block — it had to strip a fence first, and the two
+    independent wrap sites could silently drift out of sync with each other.
+
+    Both transports (and the HTTP route in ``meridian/routes/handoff.py``,
+    which never wrapped to begin with) now call this ONE helper so there is
+    exactly one place that defines the wire contract: the ``content`` field
+    is byte-identical to what ``generate_handoff`` rendered — no code fence,
+    no header, no blockquote, no other wrapping added on the way out. Any
+    future transport must call this helper too rather than re-implementing
+    (or re-breaking) the contract independently.
+    """
+    return content
+
+
 # 08c355c2 — staleness threshold for the legacy goal_states.sprint free-text
 # field. Once sprint-item tracking is in use, this field is never updated, so
 # months-old text silently renders at equal weight to current data. Any sprint
