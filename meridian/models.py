@@ -333,6 +333,13 @@ class HandoffResult(BaseModel):
     # the 02038afe/ac80aaaf sibling items land) without a models.py migration
     # each time. None only if contract-building itself failed (best-effort).
     capability_contract: dict[str, Any] | None = None
+    # 6cdc5df3 — machine-readable proposal-to-evidence linkage (see
+    # meridian.db.proposal_links): one hydrated entry per proposal id with
+    # evidence linked in this project. list, not a typed submodel, for the
+    # same forward-compat reason as capability_contract above. None only if
+    # the lookup itself failed (best-effort); empty list means no linked
+    # proposals yet.
+    proposal_evidence: list[dict[str, Any]] | None = None
 
 
 class TaskUpdate(BaseModel):

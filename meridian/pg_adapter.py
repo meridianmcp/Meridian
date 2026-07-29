@@ -2571,6 +2571,36 @@ async def _migrate_pg_docx_merge_manifests(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_proposal_evidence_links(conn: PostgresConnection) -> None:
+    """6cdc5df3 — proposal_evidence_links: durable, typed proposal-to-evidence
+    linkage (notes/findings/sprint_items/decisions/artifacts). Mirrors
+    db.proposal_links._migrate_proposal_evidence_links. Not present in the
+    base CREATE_TABLES_CORE literal — this guarded migration is the only
+    creation path on Postgres, matching _migrate_pg_docx_merge_manifests.
+
+    The UNIQUE index is what makes link_proposal_evidence's
+    ``ON CONFLICT ... DO NOTHING`` idempotent-insert pattern work.
+    """
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS proposal_evidence_links ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    project_id TEXT NOT NULL,"
+        f"    proposal_id TEXT NOT NULL,"
+        f"    entity_type TEXT NOT NULL,"
+        f"    entity_id TEXT NOT NULL,"
+        f"    label TEXT,"
+        f"    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_evidence_links_unique "
+        f"ON proposal_evidence_links(project_id, proposal_id, entity_type, entity_id);"
+        f"CREATE INDEX IF NOT EXISTS idx_proposal_evidence_links_proposal "
+        f"ON proposal_evidence_links(project_id, proposal_id);"
+        f"CREATE INDEX IF NOT EXISTS idx_proposal_evidence_links_entity "
+        f"ON proposal_evidence_links(entity_type, entity_id);"
+    )
+
+
 async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> None:
     """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
 
@@ -3861,4 +3891,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_tool_requirements,
     _migrate_pg_sprint_item_artifact_declaration,
     _migrate_pg_docx_merge_manifests,
+    _migrate_pg_proposal_evidence_links,
 )

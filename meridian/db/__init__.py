@@ -1122,6 +1122,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_tool_requirements(db)
     await _migrate_sprint_item_artifact_declaration(db)
     await _migrate_docx_merge_manifests(db)
+    await _migrate_proposal_evidence_links(db)
     return db
 
 
@@ -1433,6 +1434,7 @@ _MERGE_PROJECT_TABLES: tuple[str, ...] = (
     "session_messages",
     "session_graph_snapshots",
     "sprint_item_pointers",
+    "proposal_evidence_links",
 )
 
 
@@ -10911,4 +10913,21 @@ from .hooks import (  # noqa: F401
     get_custom_hook,
     update_custom_hook,
     delete_custom_hook,
+)
+
+
+# 6cdc5df3 — durable, typed proposal-to-evidence linkage. Imported LAST (after
+# sprint_items / workspace) since link_proposal_evidence validates entity_ids
+# against get_sprint_item's table (sprint_items), project_notes, and
+# decisions_pinned, all defined earlier in this module or in sprint_items.py.
+from .proposal_links import (  # noqa: F401
+    _VALID_PROPOSAL_ENTITY_TYPES,
+    _PROPOSAL_ENTITY_TABLE,
+    _PROPOSAL_ENTITY_BUCKET,
+    _migrate_proposal_evidence_links,
+    link_proposal_evidence,
+    unlink_proposal_evidence,
+    get_proposal_links,
+    get_proposal_evidence,
+    get_proposal_ids_for_project,
 )

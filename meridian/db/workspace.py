@@ -742,6 +742,29 @@ async def promote_workspace_proposal(
         row = await cur.fetchone()
     promoted_proposal = _row_to_dict(row)
 
+    # 6cdc5df3 — first-class proposal-to-evidence linkage. promoted_to_sprint_item_id
+    # (set above) is a single free column that only ever holds ONE id and has no
+    # query path of its own; this writes the SAME relationship as a durable,
+    # typed, queryable row in proposal_evidence_links so "what's linked to
+    # proposal X" (get_proposal_evidence) can find this sprint item, and so
+    # every FUTURE evidence linked to the same proposal_id (a note, a finding,
+    # a decision, another sprint item, an artifact) composes with it. Lazy
+    # import: link_proposal_evidence lives in meridian.db.proposal_links,
+    # imported onto meridian.db AFTER this module — same pattern as the
+    # request_hitl lazy import below.
+    evidence_link: dict[str, Any] | None = None
+    try:
+        from meridian.db import link_proposal_evidence  # noqa: PLC0415
+
+        evidence_link = await link_proposal_evidence(
+            db, project_id, proposal_id, "sprint_item", si_id,
+            label=title, actor=tenant_id,
+        )
+    except Exception:  # noqa: BLE001 — promotion itself must never be blocked
+        # by an evidence-linking failure; promoted_to_sprint_item_id above
+        # already recorded the canonical single link regardless.
+        evidence_link = None
+
     # 3999d90f — conditional proposal-to-GitHub-issue workflow via HITL. When
     # the promoted proposal is code-related (the same inferred-resources
     # signal used for touches_resources above) AND the target project has a
@@ -798,6 +821,9 @@ async def promote_workspace_proposal(
         "sprint_item_touches_resources": resources_json,
         "sprint_item_notes": item_notes,
         "github_issue_hitl": github_issue_hitl,
+        # 6cdc5df3 — the durable proposal_evidence_links row for this
+        # promotion, or None if evidence-linking failed (never blocks promotion).
+        "evidence_link": evidence_link,
     }
 
 

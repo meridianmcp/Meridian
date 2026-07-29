@@ -502,6 +502,53 @@ async def build_capability_contract(
     except Exception:  # noqa: BLE001 — contract building must never break on this
         item_sprint_item_pointers = []
 
+    # 23e20656 (665 follow-up) — one canonical per-item executor_contract,
+    # composing item_tool_requirements/item_sprint_item_pointers above with
+    # output/dependency/wave/gate/completion-check state (see
+    # meridian.executor_contract.build_executor_contract). Lazy import: the
+    # executor_contract module itself imports THIS module (to reuse
+    # extract_sprint_item_pointers), so a top-level import here would be
+    # circular. Pre-fetches wave_gate_configs/project ONCE and threads them
+    # into every per-item build so N items don't repeat the same two
+    # project-scoped queries. Fully guarded per item — one item's failure
+    # degrades to that item simply being absent from the list, never breaks
+    # the mandatory contract.
+    item_executor_contracts: list[dict[str, Any]] = []
+    try:
+        from . import executor_contract as _executor_contract  # noqa: PLC0415
+
+        try:
+            _wave_gate_configs = await db_module.get_wave_gate_configs(db, project_id)
+        except Exception:  # noqa: BLE001
+            _wave_gate_configs = None
+        try:
+            _project_row = await db_module.get_project(db, project_id)
+        except Exception:  # noqa: BLE001
+            _project_row = None
+        for _it in _pending_items_for_tool_reqs:
+            if not isinstance(_it, dict) or not _it.get("id"):
+                continue
+            try:
+                _ec = await _executor_contract.build_executor_contract(
+                    db, project_id, _it, version=version,
+                    wave_gate_configs=_wave_gate_configs, project=_project_row,
+                )
+            except Exception:  # noqa: BLE001 — one item's failure must not break the batch
+                continue
+            # Strip the per-item wall-clock generated_at before embedding: this
+            # module's own serialize_contract only strips the TOP-LEVEL
+            # generated_at/contract_hash, so a nested wall-clock field here
+            # would otherwise make the outer project contract_hash non-
+            # deterministic across two builds of the SAME underlying state.
+            # contract_hash itself is unaffected (already computed excluding
+            # its own generated_at) and is kept.
+            _ec = dict(_ec)
+            _ec.pop("generated_at", None)
+            item_executor_contracts.append(_ec)
+        item_executor_contracts.sort(key=lambda c: c.get("item_id") or "")
+    except Exception:  # noqa: BLE001 — executor_contract is best-effort enrichment
+        item_executor_contracts = []
+
     effective_capabilities, effective_source = _resolve_effective_capabilities(
         db, project_id, requested_capabilities, resolver=effective_resolver,
     )
@@ -569,6 +616,7 @@ async def build_capability_contract(
         "manifest_hash": effective_hash,
         "item_tool_requirements": item_tool_requirements,
         "item_sprint_item_pointers": item_sprint_item_pointers,
+        "item_executor_contracts": item_executor_contracts,
         "board_stale": bool(board_stale),
         "executable": executable,
         "executable_reasons": executable_reasons,

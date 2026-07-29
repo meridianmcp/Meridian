@@ -4392,6 +4392,37 @@ async def build_effective_capability_contract(
         return None
 
 
+async def build_proposal_evidence_for_handoff(
+    db: Any, project_id: str, *, limit: int = 10,
+) -> "list[dict[str, Any]] | None":
+    """6cdc5df3 — machine-readable proposal-to-evidence linkage, emitted
+    alongside every ``generate_handoff`` mode (mirrors
+    :func:`build_effective_capability_contract`'s fully-guarded wrapper
+    style). Answers "what's linked to proposal X" directly from the handoff
+    read path, replacing the old approach of grepping ``item_group`` strings
+    for a proposal-id prefix (see ``meridian.db.proposal_links`` module
+    docstring for that history).
+
+    Returns one entry per proposal id that currently has at least one
+    evidence link in this project (most-recently-linked first, capped at
+    ``limit``), each entry being the full hydrated
+    :func:`meridian.db.proposal_links.get_proposal_evidence` result for that
+    id. An empty list means the project has no linked proposals yet (not an
+    error). ``None`` only when the lookup itself failed — best-effort, never
+    breaks the mandatory handoff.
+    """
+    try:
+        proposal_ids = await db_module.get_proposal_ids_for_project(
+            db, project_id, limit=limit,
+        )
+        return [
+            await db_module.get_proposal_evidence(db, project_id, pid)
+            for pid in proposal_ids
+        ]
+    except Exception:  # noqa: BLE001 — proposal evidence is best-effort
+        return None
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,

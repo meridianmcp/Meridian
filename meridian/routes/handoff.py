@@ -45,9 +45,15 @@ async def planner_handoff_endpoint(
     capability_contract = await handoff_module.build_effective_capability_contract(
         db, project_id,
     )
+    # 6cdc5df3 — machine-readable proposal-to-evidence linkage; best-effort,
+    # never breaks the planner handoff.
+    proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
+        db, project_id,
+    )
     return {
         "path": path, "content": content, "mode": "planner",
         "capability_contract": capability_contract,
+        "proposal_evidence": proposal_evidence,
     }
 
 
@@ -104,7 +110,13 @@ async def generate_handoff_endpoint(
     capability_contract = await handoff_module.build_effective_capability_contract(
         db, project_id, board_stale=_board_stale,
     )
+    # 6cdc5df3 — machine-readable proposal-to-evidence linkage; best-effort,
+    # never breaks the mandatory handoff.
+    proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
+        db, project_id,
+    )
     return {
         "path": path, "content": content, "mode": mode,
         "capability_contract": capability_contract,
+        "proposal_evidence": proposal_evidence,
     }
